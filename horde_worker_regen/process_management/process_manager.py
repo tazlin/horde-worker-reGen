@@ -91,6 +91,7 @@ from horde_worker_regen.process_management.messages import (
 )
 from horde_worker_regen.process_management.worker_entry_points import start_inference_process, start_safety_process
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
+from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.reporting.status_reporter import StatusReporter
 from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer as _base64_image_to_stream_buffer
@@ -3297,115 +3298,20 @@ class HordeWorkerProcessManager:
                         f"Job {completed_job_info.sdk_api_job_info.id_} not found in jobs_lookup "
                         "during submit. Creating a new HordeJobInfo object.",
                     )
-                # TODO: Too much indent. Split into own method
+
+                # Record kudos training data if enabled
                 if self.bridge_data.capture_kudos_training_data:
-                    if self.bridge_data.kudos_training_data_file is None:
-                        self.bridge_data.kudos_training_data_file = "kudos_training_data.json"
-                        logger.warning(
-                            "Kudos training data capture is enabled but no file has been specified. "
-                            f"Defaulting to {self.bridge_data.kudos_training_data_file}",
-                        )
-                    # if the file self.bridge_data.kudos_training_data_file exists
-                    # we will append the entry from the jobs lookup to it as a new json entry
-                    # if the file does not exist, we will create it and write the first entry
+                    recorder = KudosTrainingRecorder(
+                        training_data_file=self.bridge_data.kudos_training_data_file,
+                        stable_diffusion_reference=self.stable_diffusion_reference,
+                    )
 
-                    # If the current file is greater than 2mb, we will create a new file with a sequential number
-
-                    file_name_to_use = f"kudos_model_training/{self.bridge_data.kudos_training_data_file}"
-                    os.makedirs("kudos_model_training", exist_ok=True)
-                    if os.path.exists(file_name_to_use) and os.path.getsize(file_name_to_use) > 2 * 1024 * 1024:
-                        for i in range(1, 10000):
-                            new_file_name = f"kudos_model_training/{self.bridge_data.kudos_training_data_file}.{i}"
-                            if os.path.exists(new_file_name) and os.path.getsize(new_file_name) > 2 * 1024 * 1024:
-                                continue
-
-                            file_name_to_use = new_file_name
-                            break
-
-                    try:
-                        with logger.catch(reraise=False):
-                            if completed_job_info.sdk_api_job_info in self.jobs_lookup:
-                                hji = self.jobs_lookup[completed_job_info.sdk_api_job_info]
-                            else:
-                                logger.error(
-                                    f"Job {completed_job_info.sdk_api_job_info.id_} not found in jobs_lookup "
-                                    " during kudos training data capture.",
-                                )
-                            if (
-                                self.stable_diffusion_reference is not None
-                                and hji.sdk_api_job_info.model is not None
-                                and hji.sdk_api_job_info.model in self.stable_diffusion_reference.root
-                            ):
-
-                                model_dump = hji.model_dump(
-                                    exclude=_excludes_for_job_dump,  # type: ignore
-                                )
-                                if (
-                                    self.stable_diffusion_reference is not None
-                                    and hji.sdk_api_job_info.model is not None
-                                ):
-                                    model_dump["sdk_api_job_info"]["model_baseline"] = (
-                                        self.stable_diffusion_reference.root[hji.sdk_api_job_info.model].baseline
-                                    )
-                                # Preparation for multiple schedulers
-                                if hji.sdk_api_job_info.payload.karras:
-                                    model_dump["sdk_api_job_info"]["payload"]["scheduler"] = "karras"
-                                else:
-                                    model_dump["sdk_api_job_info"]["payload"]["scheduler"] = "simple"
-                                del model_dump["sdk_api_job_info"]["payload"]["karras"]
-                                model_dump["sdk_api_job_info"]["payload"]["lora_count"] = (
-                                    len(
-                                        model_dump["sdk_api_job_info"]["payload"]["loras"],
-                                    )
-                                    if model_dump["sdk_api_job_info"]["payload"]["loras"]
-                                    else 0
-                                )
-                                model_dump["sdk_api_job_info"]["payload"]["ti_count"] = (
-                                    len(
-                                        model_dump["sdk_api_job_info"]["payload"]["tis"],
-                                    )
-                                    if model_dump["sdk_api_job_info"]["payload"]["tis"]
-                                    else 0
-                                )
-                                model_dump["sdk_api_job_info"]["extra_source_images_count"] = (
-                                    len(hji.sdk_api_job_info.extra_source_images)
-                                    if hji.sdk_api_job_info.extra_source_images
-                                    else 0
-                                )
-                                esi_combined_size = 0
-                                if hji.sdk_api_job_info.extra_source_images:
-                                    for esi in hji.sdk_api_job_info.extra_source_images:
-                                        esi_combined_size += len(esi.image)
-                                model_dump["sdk_api_job_info"]["extra_source_images_combined_size"] = esi_combined_size
-                                model_dump["sdk_api_job_info"]["source_image_size"] = (
-                                    len(hji.sdk_api_job_info._downloaded_source_image)
-                                    if hji.sdk_api_job_info._downloaded_source_image
-                                    else 0
-                                )
-                                model_dump["sdk_api_job_info"]["source_mask_size"] = (
-                                    len(hji.sdk_api_job_info._downloaded_source_mask)
-                                    if hji.sdk_api_job_info._downloaded_source_mask
-                                    else 0
-                                )
-                                if not os.path.exists(file_name_to_use):
-                                    with open(file_name_to_use, "w") as f:
-                                        json.dump([model_dump], f, indent=4)
-                                elif hji.sdk_api_job_info.payload.n_iter == 1:
-                                    data = []
-                                    with open(file_name_to_use) as f:
-                                        data = json.load(f)
-                                        if not isinstance(data, list):
-                                            logger.warning(
-                                                f"Kudos training data file {file_name_to_use} " "is not a list",
-                                            )
-                                            data = []
-                                    data.append(model_dump)
-                                    with open(file_name_to_use, "w") as f:
-                                        json.dump(data, f, indent=4)
-                    except Exception as e:
+                    if completed_job_info.sdk_api_job_info in self.jobs_lookup:
+                        recorder.record_job_data(self.jobs_lookup[completed_job_info.sdk_api_job_info])
+                    else:
                         logger.error(
-                            f"Failed to write kudos training data for job {completed_job_info.sdk_api_job_info.id_} "
-                            f"{type(e)}: {e}",
+                            f"Job {completed_job_info.sdk_api_job_info.id_} not found in jobs_lookup "
+                            "during kudos training data capture.",
                         )
 
                 if completed_job_info in self.jobs_pending_submit:

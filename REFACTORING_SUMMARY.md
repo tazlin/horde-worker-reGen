@@ -1,8 +1,8 @@
-# Complexity Reduction Refactoring - Phases 1 & 2 (Quick Wins)
+# Complexity Reduction Refactoring - Phases 1, 2 & 3 (Quick Wins)
 
 ## Summary
 
-This refactoring focused on extracting complexity from the monolithic `HordeWorkerProcessManager` class and the `reGenBridgeData` model to improve maintainability, testability, and code organization. The work was completed in two phases.
+This refactoring focused on extracting complexity from the monolithic `HordeWorkerProcessManager` class and the `reGenBridgeData` model to improve maintainability, testability, and code organization. The work was completed in three phases.
 
 ## Changes Made
 
@@ -46,7 +46,12 @@ Created new reporting modules in `horde_worker_regen/reporting/`:
 - **Impact**: Reduced `print_status_method()` from 228 lines to 47 lines (79% reduction!)
 - **Benefit**: Complex status reporting logic now isolated, testable, and maintainable
 
-**Total lines removed from god class**: ~285 lines (includes Phase 1 + Phase 2)
+#### `kudos_training_recorder.py` (Phase 3)
+- **Extracted**: `KudosTrainingRecorder` class
+- **Impact**: Reduced `api_submit_job()` inline code from 109 lines to 13 lines (88% reduction!)
+- **Benefit**: Kudos training data recording isolated, file rotation logic encapsulated, fully testable
+
+**Total lines removed from god class**: ~394 lines (includes Phases 1, 2 & 3)
 
 ### 3. Validation Logic Extracted
 
@@ -66,8 +71,9 @@ Created test files in `tests/`:
 - `test_utils_image.py` - 6 test cases for image utility functions
 - `test_utils_job.py` - 11 test cases for job calculation logic
 - `test_utils_kudos.py` - 9 test cases for kudos string generation
+- `test_kudos_training_recorder.py` (Phase 3) - 14 test cases for training data recording
 
-**Total new test cases**: 26 tests
+**Total new test cases**: 40 tests
 
 ## Metrics
 
@@ -76,8 +82,9 @@ Created test files in `tests/`:
 #### HordeWorkerProcessManager
 - **Before**: 4,191 lines, 61 methods
 - **Phase 1**: ~4,016 lines (4.2% reduction)
-- **Phase 2**: ~3,983 lines (5.0% total reduction)
-- **Methods reduced in complexity**: 6 methods now delegate to external modules
+- **Phase 2**: ~3,983 lines (5.0% reduction)
+- **Phase 3**: ~3,887 lines (7.3% total reduction)
+- **Methods reduced in complexity**: 7 methods now delegate to external modules
 
 #### reGenBridgeData
 - **Before**: 335 lines
@@ -85,10 +92,10 @@ Created test files in `tests/`:
 
 ### Code Organization
 
-- **New modules created**: 10 files
+- **New modules created**: 11 files
 - **New directories**: 3 (`utils/`, `reporting/`, `validation/`)
-- **Lines of code extracted**: ~470 lines
-- **Test coverage added**: 26 test cases
+- **Lines of code extracted**: ~580 lines
+- **Test coverage added**: 40 test cases
 
 ## Benefits
 
@@ -100,7 +107,7 @@ Created test files in `tests/`:
 
 ## Next Steps (Future Phases)
 
-### Phase 3 - Continued Refactoring (Recommended)
+### Phase 4 - Continued Refactoring (Recommended)
 
 1. **Implement Command Pattern** for message handling (379 lines in `receive_and_handle_process_messages`)
 2. **Split ProcessMap** into focused classes (502 lines):
@@ -108,7 +115,7 @@ Created test files in `tests/`:
    - ProcessQueryService (all the `num_*` and `get_*` methods)
    - ProcessLifecycleManager (heartbeats, state changes)
 
-### Phase 4 - Domain-Driven Design (Long-term)
+### Phase 5 - Domain-Driven Design (Long-term)
 
 1. Create bounded contexts for:
    - Job management
