@@ -1,8 +1,8 @@
-# Complexity Reduction Refactoring - Phase 1 (Quick Wins)
+# Complexity Reduction Refactoring - Phases 1 & 2 (Quick Wins)
 
 ## Summary
 
-This refactoring phase focused on extracting complexity from the monolithic `HordeWorkerProcessManager` class and the `reGenBridgeData` model to improve maintainability, testability, and code organization.
+This refactoring focused on extracting complexity from the monolithic `HordeWorkerProcessManager` class and the `reGenBridgeData` model to improve maintainability, testability, and code organization. The work was completed in two phases.
 
 ## Changes Made
 
@@ -41,7 +41,12 @@ Created new reporting modules in `horde_worker_regen/reporting/`:
 - **Impact**: Simplified `log_kudos_info()` method from 30 lines to 11 lines
 - **Benefit**: Logging logic separated, parameters made explicit
 
-**Total lines removed from god class**: ~52 lines
+#### `status_reporter.py` (Phase 2)
+- **Extracted**: `StatusReporter` class
+- **Impact**: Reduced `print_status_method()` from 228 lines to 47 lines (79% reduction!)
+- **Benefit**: Complex status reporting logic now isolated, testable, and maintainable
+
+**Total lines removed from god class**: ~285 lines (includes Phase 1 + Phase 2)
 
 ### 3. Validation Logic Extracted
 
@@ -70,8 +75,9 @@ Created test files in `tests/`:
 
 #### HordeWorkerProcessManager
 - **Before**: 4,191 lines, 61 methods
-- **After**: ~4,016 lines (4.2% reduction)
-- **Methods reduced in complexity**: 5 methods now delegate to external modules
+- **Phase 1**: ~4,016 lines (4.2% reduction)
+- **Phase 2**: ~3,983 lines (5.0% total reduction)
+- **Methods reduced in complexity**: 6 methods now delegate to external modules
 
 #### reGenBridgeData
 - **Before**: 335 lines
@@ -79,9 +85,9 @@ Created test files in `tests/`:
 
 ### Code Organization
 
-- **New modules created**: 9 files
+- **New modules created**: 10 files
 - **New directories**: 3 (`utils/`, `reporting/`, `validation/`)
-- **Lines of code extracted**: ~285 lines
+- **Lines of code extracted**: ~470 lines
 - **Test coverage added**: 26 test cases
 
 ## Benefits
@@ -94,16 +100,15 @@ Created test files in `tests/`:
 
 ## Next Steps (Future Phases)
 
-### Phase 2 - Architectural Refactoring (Recommended)
+### Phase 3 - Continued Refactoring (Recommended)
 
-1. **Extract StatusReporter** class (237 lines)
-2. **Implement Command Pattern** for message handling (379 lines)
-3. **Split ProcessMap** into:
-   - ProcessRegistry
-   - ProcessQueryService
-   - ProcessLifecycleManager
+1. **Implement Command Pattern** for message handling (379 lines in `receive_and_handle_process_messages`)
+2. **Split ProcessMap** into focused classes (502 lines):
+   - ProcessRegistry (CRUD operations)
+   - ProcessQueryService (all the `num_*` and `get_*` methods)
+   - ProcessLifecycleManager (heartbeats, state changes)
 
-### Phase 3 - Domain-Driven Design (Long-term)
+### Phase 4 - Domain-Driven Design (Long-term)
 
 1. Create bounded contexts for:
    - Job management

@@ -92,6 +92,7 @@ from horde_worker_regen.process_management.messages import (
 from horde_worker_regen.process_management.worker_entry_points import start_inference_process, start_safety_process
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
+from horde_worker_regen.reporting.status_reporter import StatusReporter
 from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer as _base64_image_to_stream_buffer
 from horde_worker_regen.utils.job_utils import get_single_job_effective_megapixelsteps as _get_single_job_effective_megapixelsteps
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
@@ -4521,232 +4522,52 @@ class HordeWorkerProcessManager:
 
     def print_status_method(self) -> None:
         """Print the status of the worker if it's time to do so."""
-        if self._last_pop_maintenance_mode:
+        reporter = StatusReporter(
+            last_status_message_time=self._last_status_message_time,
+            status_message_frequency=self._status_message_frequency,
+        )
+
+        if not reporter.should_print_status(self._last_pop_maintenance_mode):
             return
 
-        cur_time = time.time()
-        if cur_time - self._last_status_message_time > self._status_message_frequency:
-            AIWORKER_LIMITED_CONSOLE_MESSAGES = os.getenv("AIWORKER_LIMITED_CONSOLE_MESSAGES", False)
+        # Gather active models
+        active_models = {
+            process.loaded_horde_model_name
+            for process in self._process_map.values()
+            if process.loaded_horde_model_name is not None
+        }
 
-            logging_function = logger.opt(ansi=True).info
+        # Print status and get updated frequency
+        updated_frequency = reporter.print_status(
+            bridge_data=self.bridge_data,
+            process_info_strings=self._process_map.get_process_info_strings(),
+            api_messages_received=self._api_messages_received,
+            jobs_pending_inference=self.jobs_pending_inference,
+            active_models=active_models,
+            pending_megapixelsteps=self.get_pending_megapixelsteps(),
+            num_jobs_total=self.num_jobs_total,
+            total_num_completed_jobs=self.total_num_completed_jobs,
+            num_jobs_faulted=self._num_jobs_faulted,
+            num_job_slowdowns=self._num_job_slowdowns,
+            num_process_recoveries=self._num_process_recoveries,
+            time_spent_no_jobs_available=self._time_spent_no_jobs_available,
+            user_info=self.user_info,
+            max_concurrent_inference_processes=self.max_concurrent_inference_processes,
+            device_map=self._device_map,
+            too_many_consecutive_failed_jobs=self._too_many_consecutive_failed_jobs,
+            too_many_consecutive_failed_jobs_time=self._too_many_consecutive_failed_jobs_time,
+            too_many_consecutive_failed_jobs_wait_time=self._too_many_consecutive_failed_jobs_wait_time,
+            session_start_time=self.session_start_time,
+            shutting_down=self._shutting_down,
+            jobs_pending_safety_check=len(self.jobs_pending_safety_check),
+            jobs_being_safety_checked=len(self.jobs_being_safety_checked),
+            jobs_in_progress=len(self.jobs_in_progress),
+            total_ram_gigabytes=self.total_ram_gigabytes,
+        )
 
-            if AIWORKER_LIMITED_CONSOLE_MESSAGES:
-                logging_function = logger.opt(ansi=True).success
-
-            process_info_strings = self._process_map.get_process_info_strings()
-
-            logging_function("<fg #dddddd>" + str("^" * 80) + "</>")
-
-            if len(self._api_messages_received) > 0:
-                logging_function("<b>API Messages:</b>")
-                for message_id, message in self._api_messages_received.items():
-                    try:
-                        message_text = message.message_text or ""
-                        log_safe_message = message_text.replace("<", "&lt;").replace(">", "&gt;")
-                        log_safe_message = log_safe_message.replace("\n", " ")
-                        log_safe_message = log_safe_message.replace("\r", " ")
-                        log_safe_message = log_safe_message.replace("\t", " ")
-                        log_safe_message = log_safe_message.replace("{", "{{").replace("}", "}}")
-                        log_safe_message = log_safe_message.replace('"', "'")
-                        log_safe_message = log_safe_message.replace("'", "'")
-
-                        logging_function(
-                            f"  <fg #000><bg #0ff127>{log_safe_message} "
-                            f"(from {message.message_origin}, expires {message.message_expiry}, "
-                            f"message_id: {message_id[:8]})</></>",
-                            "</></>",
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to print API message: {e}")
-
-            logging_function("<b>Process info:</b>")
-            for process_info_string in process_info_strings:
-                logging_function("  " + process_info_string)
-
-            logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
-
-            logging_function("<b>Job Info:</b>")
-            jobs = []
-            for x in self.jobs_pending_inference:
-                shortened_id = str(x.id_.root)[:8] if x.id_ is not None else "None?"
-                jobs.append(f"<{shortened_id}: <u>{x.model}></u>")
-
-            logging_function(f'  Jobs: {", ".join(jobs)}')
-
-            active_models = {
-                process.loaded_horde_model_name
-                for process in self._process_map.values()
-                if process.loaded_horde_model_name is not None
-            }
-
-            logger.debug(f"Active models: {active_models}")
-
-            job_info_message = "  Session job info: " + " | ".join(
-                [
-                    f"pending start: {len(self.jobs_pending_inference)} (eMPS: {self.get_pending_megapixelsteps()})",
-                    f"jobs popped: {self.num_jobs_total}",
-                    f"submitted: {self.total_num_completed_jobs}",
-                    f"faulted: {self._num_jobs_faulted}",
-                    f"slow_jobs: {self._num_job_slowdowns}",
-                    f"process_recoveries: {self._num_process_recoveries}",
-                    f"{self._time_spent_no_jobs_available:.2f} seconds without jobs",
-                ],
-            )
-
-            logging_function(
-                f"<fg #7dcea0>{job_info_message}</>",
-            )
-            logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
-
-            logging_function("<b>Worker Info:</b>")
-
-            max_power_dimension = int(math.sqrt(self.bridge_data.max_power * 8 * 64 * 64))
-            logger.info(
-                "  "
-                + " | ".join(
-                    [
-                        f"dreamer_name: {self.bridge_data.dreamer_worker_name}",
-                        f"(v{horde_worker_regen.__version__})",
-                        f"horde user: {self.user_info.username if self.user_info is not None else 'Unknown'}",
-                        f"num_models: {len(self.bridge_data.image_models_to_load)}",
-                        f"custom_models: {bool(self.bridge_data.custom_models)}",
-                        f"max_power: {self.bridge_data.max_power} ({max_power_dimension}x{max_power_dimension})",
-                        f"max_threads: {self.max_concurrent_inference_processes}",
-                        f"queue_size: {self.bridge_data.queue_size}",
-                        f"safety_on_gpu: {self.bridge_data.safety_on_gpu}",
-                    ],
-                ),
-            )
-            logger.info(
-                "  "
-                + " | ".join(
-                    [
-                        f"allow_img2img: {self.bridge_data.allow_img2img}",
-                        f"allow_lora: {self.bridge_data.allow_lora}",
-                        f"allow_controlnet: {self.bridge_data.allow_controlnet}",
-                        f"allow_sdxl_controlnet: {self.bridge_data.allow_sdxl_controlnet}",
-                        f"allow_post_processing: {self.bridge_data.allow_post_processing}",
-                        f"post_process_job_overlap: {self.bridge_data.post_process_job_overlap}",
-                    ],
-                ),
-            )
-
-            logger.info(
-                "  "
-                + " | ".join(
-                    [
-                        f"unload_models_from_vram_often: {self.bridge_data.unload_models_from_vram_often}",
-                        f"high_performance_mode: {self.bridge_data.high_performance_mode}",
-                        f"moderate_performance_mode: {self.bridge_data.moderate_performance_mode}",
-                        f"high_memory_mode: {self.bridge_data.high_memory_mode}",
-                    ],
-                ),
-            )
-
-            logger.debug(
-                " | ".join(
-                    [
-                        f"preload_timeout: {self.bridge_data.preload_timeout}",
-                        f"download_timeout: {self.bridge_data.download_timeout}",
-                        f"post_process_timeout: {self.bridge_data.post_process_timeout}",
-                        f"very_high_memory_mode: {self.bridge_data.very_high_memory_mode}",
-                        f"cycle_process_on_model_change: {self.bridge_data.cycle_process_on_model_change}",
-                        f"exit_on_unhandled_faults: {self.bridge_data.exit_on_unhandled_faults}",
-                        f"jobs_pending_safety_check: {len(self.jobs_pending_safety_check)}",
-                        f"jobs_being_safety_checked: {len(self.jobs_being_safety_checked)}",
-                        f"jobs_in_progress: {len(self.jobs_in_progress)}",
-                    ],
-                ),
-            )
-
-            if os.getenv("AIWORKER_NOT_REQUIRED_VERSION"):
-                logger.warning(
-                    "There is a required update available for the AI Worker. "
-                    "`git pull` and `update-runtime` to update.",
-                )
-            elif os.getenv("AIWORKER_NOT_RECOMMENDED_VERSION"):
-                logger.warning(
-                    "There is a recommended update available for the AI Worker. "
-                    "`git pull` and `update-runtime` to update.",
-                )
-
-            if self.bridge_data.extra_slow_worker:
-                if not self.bridge_data.limit_max_steps:
-                    logger.warning(
-                        "Extra slow worker mode is enabled, but limit_max_steps is not enabled. "
-                        "Consider enabling limit_max_steps to prevent long running jobs.",
-                    )
-                if self.bridge_data.max_batch > 1:
-                    logger.warning(
-                        "Extra slow worker mode is enabled, but max_batch is greater than 1. "
-                        "Consider setting max_batch to 1 to prevent long running batch jobs.",
-                    )
-                if self.bridge_data.allow_sdxl_controlnet:
-                    logger.warning(
-                        "Extra slow worker mode is enabled, but allow_sdxl_controlnet is enabled. "
-                        "Consider disabling allow_sdxl_controlnet to prevent long running jobs.",
-                    )
-
-            for device in self._device_map.root.values():
-                total_memory_mb = device.total_memory / 1024 / 1024
-                if total_memory_mb < 10_000 and self.bridge_data.high_memory_mode:
-                    logger.warning(
-                        f"Device {device.device_name} ({device.device_index}) has less than 10GB of memory. "
-                        "This may cause issues with `high_memory_mode` enabled.",
-                    )
-                elif (
-                    total_memory_mb > 20_000
-                    and not self.bridge_data.high_memory_mode
-                    and self.bridge_data.max_threads == 1
-                    and self.total_ram_gigabytes > 32
-                ):
-                    logger.warning(
-                        f"Device {device.device_name} ({device.device_index}) has more than 20GB of memory. "
-                        "You should enable `high_memory_mode` in your config to take advantage of this.",
-                    )
-                elif total_memory_mb > 20_000 and self.bridge_data.extra_slow_worker:
-                    logger.warning(
-                        f"Device {device.device_name} ({device.device_index}) has more than 20GB of memory. "
-                        "There are very few GPUs with this much memory that should be running in extra slow worker "
-                        "mode. Consider disabling `extra_slow_worker` in your config.",
-                    )
-
-            if self._too_many_consecutive_failed_jobs:
-                time_since_failure = cur_time - self._too_many_consecutive_failed_jobs_time
-                logger.error(
-                    "Too many consecutive failed jobs. This may be due to a misconfiguration or other issue. "
-                    "Please check your logs and configuration.",
-                )
-                logger.error(
-                    f"Time since last job failure: {time_since_failure:.2f}s. "
-                    f"{self._too_many_consecutive_failed_jobs_wait_time} seconds must pass before resuming.",
-                )
-
-            minutes_allowed_without_jobs = self.bridge_data.minutes_allowed_without_jobs
-            seconds_allowed_without_jobs = minutes_allowed_without_jobs * 60
-            cur_session_minutes = (cur_time - self.session_start_time) / 60
-            if self._time_spent_no_jobs_available > seconds_allowed_without_jobs:
-                if not self.bridge_data.suppress_speed_warnings:
-                    logger.warning(
-                        f"Your worker spent more than {minutes_allowed_without_jobs} minutes combined throughout this "
-                        f"session ({self._time_spent_no_jobs_available/60:.2f}/{cur_session_minutes:.2f} minutes) "
-                        "without jobs. This may be due to low demand. However, offering more models or increasing "
-                        "your max_power may help increase the number of jobs you receive and reduce downtime.",
-                    )
-                else:
-                    logger.debug(
-                        "Suppressed warning about time spent without jobs "
-                        f"for {minutes_allowed_without_jobs} minutes",
-                    )
-
-            if self._shutting_down:
-                logger.warning("*" * 80)
-                logger.warning("Shutting down after current jobs are finished...")
-                self._status_message_frequency = 5.0
-                logger.warning("*" * 80)
-
-            self._last_status_message_time = cur_time
-            logging_function("<fg #dddddd>" + str("v" * 80) + "</>")
+        # Update state from reporter
+        self._last_status_message_time = reporter.last_status_message_time
+        self._status_message_frequency = updated_frequency
 
     _bridge_data_loop_interval = 1.0
     """The interval between bridge data loop iterations."""
