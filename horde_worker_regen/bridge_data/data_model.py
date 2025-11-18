@@ -12,6 +12,7 @@ from ruamel.yaml import YAML
 
 from horde_worker_regen.consts import TOTAL_LORA_DOWNLOAD_TIMEOUT
 from horde_worker_regen.locale_info.regen_bridge_data_fields import BRIDGE_DATA_FIELD_DESCRIPTIONS
+from horde_worker_regen.validation.performance_validator import PerformanceModeValidator
 
 
 class reGenBridgeData(CombinedHordeBridgeData):
@@ -119,112 +120,9 @@ class reGenBridgeData(CombinedHordeBridgeData):
         """Validate the performance modes and set the appropriate values.
 
         Returns:
-            reGenBridgeData: The config model with the performance modes set appropriately.
+            The config model with the performance modes set appropriately.
         """
-        if self.max_threads >= 2 and self.queue_size > 3:
-            self.queue_size = 3
-            logger.warning(
-                "The queue_size value has been set to 3 because the max_threads value is 2.",
-            )
-
-        if self.high_performance_mode:
-            process_timeout_changed_message = (
-                "High performance mode is enabled, so the process_timeout value has "
-                f"been set to 1/3 of the default value. The new value is {self.process_timeout}."
-            )
-            default_process_timeout = self.model_fields["process_timeout"].default
-
-            if self.process_timeout == default_process_timeout:
-                logger.debug(process_timeout_changed_message)
-            else:
-                logger.warning(process_timeout_changed_message)
-
-            self.process_timeout = default_process_timeout // 3
-        elif self.moderate_performance_mode:
-            process_timeout_changed_message = (
-                "Moderate performance mode is enabled, so the process_timeout value has "
-                f"been set to 1/2 of the default value. The new value is {self.process_timeout}."
-            )
-            default_process_timeout = self.model_fields["process_timeout"].default
-
-            if self.process_timeout == default_process_timeout:
-                logger.debug(process_timeout_changed_message)
-            else:
-                logger.warning(process_timeout_changed_message)
-
-            self.process_timeout = default_process_timeout // 2
-
-        if self.extra_slow_worker:
-            if self.high_performance_mode:
-                self.high_performance_mode = False
-                logger.warning(
-                    "Extra slow worker is enabled, so the high_performance_mode value has been set to False.",
-                )
-            if self.moderate_performance_mode:
-                self.moderate_performance_mode = False
-                logger.warning(
-                    "Extra slow worker is enabled, so the moderate_performance_mode value has been set to False.",
-                )
-            if self.high_memory_mode:
-                self.high_memory_mode = False
-                logger.warning(
-                    "Extra slow worker is enabled, so the high_memory_mode value has been set to False.",
-                )
-            if self.very_high_memory_mode:
-                self.very_high_memory_mode = False
-                logger.warning(
-                    "Extra slow worker is enabled, so the very_high_memory_mode value has been set to False.",
-                )
-            if self.queue_size > 0:
-                self.queue_size = 0
-                logger.warning(
-                    "Extra slow worker is enabled, so the queue_size value has been set to 0. "
-                    "This behavior may change in the future.",
-                )
-            if self.max_threads > 1:
-                self.max_threads = 1
-                logger.warning(
-                    "Extra slow worker is enabled, so the max_threads value has been set to 1. "
-                    "This behavior may change in the future.",
-                )
-            if self.preload_timeout < 120:
-                self.preload_timeout = 120
-                logger.warning(
-                    "Extra slow worker is enabled, so the preload_timeout value has been set to 120. "
-                    "This behavior may change in the future.",
-                )
-
-        if self.very_high_memory_mode and not self.high_memory_mode:
-            self.high_memory_mode = True
-            logger.debug(
-                "Very high memory mode is enabled, so the high_memory_mode value has been set to True.",
-            )
-
-        if self.high_memory_mode:
-            # if self.max_threads == 1:
-            #     logger.warning(
-            #         "High memory mode is enabled, you should consider setting max_threads to 2.",
-            #     )
-
-            if self.queue_size == 0:
-                logger.warning(
-                    "High memory mode is enabled, you should consider setting queue_size to 1 or higher. "
-                    "Increasing this value increases system memory usage. See the bridgeData_template.yaml for more "
-                    "information.",
-                )
-
-            if self.unload_models_from_vram_often:
-                logger.warning(
-                    "High memory mode is enabled, you should consider setting unload_models_from_vram_often to False.",
-                )
-
-            if self.cycle_process_on_model_change:
-                self.cycle_process_on_model_change = False
-                logger.warning(
-                    "High memory mode is enabled, so the cycle_process_on_model_change value has been set to False.",
-                )
-
-        return self
+        return PerformanceModeValidator.validate_and_adjust_performance_modes(self)
 
     @field_validator("dreamer_worker_name", mode="after")
     def validate_dreamer_worker_name(cls, value: str) -> str:

@@ -90,6 +90,11 @@ from horde_worker_regen.process_management.messages import (
     ModelLoadState,
 )
 from horde_worker_regen.process_management.worker_entry_points import start_inference_process, start_safety_process
+from horde_worker_regen.reporting.kudos_logger import KudosLogger
+from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
+from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer as _base64_image_to_stream_buffer
+from horde_worker_regen.utils.job_utils import get_single_job_effective_megapixelsteps as _get_single_job_effective_megapixelsteps
+from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
 
 sslcontext = ssl.create_default_context(cafile=certifi.where())
 
@@ -2940,20 +2945,7 @@ class HordeWorkerProcessManager:
         Returns:
             A BytesIO stream buffer containing the image, or None if the conversion failed.
         """
-        try:
-            image_as_pil = PIL.Image.open(BytesIO(base64.b64decode(image_base64)))
-            image_buffer = BytesIO()
-            image_as_pil.save(
-                image_buffer,
-                format="WebP",
-                quality=95,  # FIXME # TODO
-                method=6,
-            )
-
-            return image_buffer
-        except Exception as e:
-            logger.error(f"Failed to convert base64 image to stream buffer: {e}")
-            return None
+        return _base64_image_to_stream_buffer(image_base64)
 
     _num_job_slowdowns = 0
     """The number of jobs which did not meet the minimum expected kudos/second rate."""
@@ -3528,52 +3520,12 @@ class HordeWorkerProcessManager:
         """Return the number of megapixelsteps for a single job.
 
         Args:
-            job (ImageGenerateJobPopResponse): The job to get the number of megapixelsteps for.
+            job: The job to get the number of megapixelsteps for.
 
         Returns:
-            int: The number of effective megapixelsteps for the job.
+            The number of effective megapixelsteps for the job.
         """
-        has_upscaler = any(pp in [u.value for u in KNOWN_UPSCALERS] for pp in job.payload.post_processing)
-        upscaler_multiplier = 1 if has_upscaler else 0
-        job_pixels = job.payload.width * job.payload.height
-
-        # Each extra batched image increases our difficulty by 20%
-        batching_multiplier = 1 + ((job.payload.n_iter - 1) * 0.2)
-
-        lora_adjustment = 0
-        if job.payload.loras is not None:
-            lora_adjustment = 4 * 1_000_000 if len(job.payload.loras) > 0 else 0
-
-        hires_fix_adjustment = 0
-
-        if job.payload.hires_fix:
-            hires_fix_adjustment = 512 * 512 * job.payload.ddim_steps
-
-        # If upscaling was requested, due to it being serial, each extra image in the batch
-        # Further increases our difficulty.
-        # In this calculation we treat each upscaler as adding 20 steps per image
-        upscaling_adjustment = job_pixels * 20 * upscaler_multiplier * job.payload.n_iter
-        job_effective_pixel_steps = (
-            (job_pixels * batching_multiplier * job.payload.ddim_steps)
-            + upscaling_adjustment
-            + lora_adjustment
-            + hires_fix_adjustment
-        )
-
-        # Hard model difficulty is increased due to variations in the performance
-        # of different architectures. This look up is a rough estimate based on a median case
-        if job.model in KNOWN_SLOW_MODELS_DIFFICULTIES:
-            job_effective_pixel_steps *= KNOWN_SLOW_MODELS_DIFFICULTIES[job.model]
-
-        # We treat slow workflows add extra slowdowns (as they might perform many more steps of inference)
-        if job.payload.workflow in KNOWN_SLOW_WORKFLOWS:
-            job_effective_pixel_steps *= KNOWN_SLOW_WORKFLOWS[job.payload.workflow]
-
-        # Some workflows by default require controlnets, but the user doesn't have to specify them.
-        # In this case, we use this to know when we have SDXL workflows, as they can double the VRAM usage
-        if job.payload.workflow in KNOWN_CONTROLNET_WORKFLOWS:
-            job_effective_pixel_steps *= 2
-        return int(job_effective_pixel_steps / 1_000_000)
+        return _get_single_job_effective_megapixelsteps(job)
 
     def get_pending_megapixelsteps(self) -> int:
         """Return the number of megapixelsteps that are pending in the job deque."""
@@ -3747,37 +3699,7 @@ class HordeWorkerProcessManager:
 
     def print_maint_mode_messages(self) -> None:
         """Print the information about maintenance mode to the user."""
-
-        def warning_function_no_format(x):  # noqa: ANN001, ANN202
-            return logger.opt(ansi=True, raw=True).warning(
-                "<fg #f1c40f>" + x + "</>\n",
-            )
-
-        warning_function_no_format(
-            "Your worker is in maintenance mode. Set your API key at https://tinybots.net/artbot/settings, "
-            "click save, then click unpause on https://tinybots.net/artbot/settings?panel=workers while the worker "
-            "is running to clear this message.",
-        )
-        warning_function_no_format(
-            "If you didn't expect seeing this message, its probable that the worker "
-            "dropped too many jobs, and the server stepped in to prevent further jobs from being "
-            "dropped. Please check the logs above, and possibly your logs/ folder as well.",
-        )
-        warning_function_no_format("Common reasons for forced maintenance mode are: ")
-        warning_function_no_format("  - `max_threads` is too high.")
-        warning_function_no_format("  - `queue_size` is too high.")
-        warning_function_no_format("  - `max_batch` is too high.")
-        warning_function_no_format("  - `max_power` is too high.")
-        warning_function_no_format("  - The worker can't handle, SDXL, Cascade, or Flux models.")
-        warning_function_no_format(
-            "  - If you have the equivalent GPU of a 1070 or less, set"
-            " limit_max_steps or extra_slow_worker. "
-            "This should only be done as a last resort.",
-        )
-
-        warning_function_no_format(
-            "If you continue to see this message, come to the official discord (https://discord.gg/3DxrhksKzn).",
-        )
+        MaintenanceModeMessenger.print_maintenance_mode_messages()
 
     @logger.catch(reraise=True)
     async def api_job_pop(self) -> None:
@@ -4201,78 +4123,37 @@ class HordeWorkerProcessManager:
         """Generate a string with information about the kudos generated in the current session.
 
         Args:
-            time_since_session_start (float): The time since the session started.
-            kudos_per_hour_session (float): The kudos per hour generated in the current session.
-            kudos_total_past_hour (float): The total kudos generated in the past hour.
-            active_kudos_per_hour (float): The kudos per hour generated while active (jobs available).
+            time_since_session_start: The time since the session started.
+            kudos_per_hour_session: The kudos per hour generated in the current session.
+            kudos_total_past_hour: The total kudos generated in the past hour.
+            active_kudos_per_hour: The kudos per hour generated while active (jobs available).
 
         Returns:
-            str: A string with information about the kudos generated in the current session.
+            A string with information about the kudos generated in the current session.
         """
-        kudos_info_string_elements = []
-        if time_since_session_start < 3600:
-            kudos_info_string_elements = [
-                f"Total Session Kudos: {self.kudos_generated_this_session:,.2f} over "
-                f"{time_since_session_start / 60:.2f} minutes",
-            ]
-        else:
-            kudos_info_string_elements = [
-                f"Total Session Kudos: {self.kudos_generated_this_session:,.2f} over "
-                f"{time_since_session_start / 3600:.2f} hours",
-            ]
-
-        if time_since_session_start > 3600:
-            kudos_info_string_elements.append(
-                f"Session: {kudos_per_hour_session:,.2f} (actual) kudos/hr",
-            )
-            # kudos_info_string_elements.append(
-            #     f"Last Hour: {kudos_total_past_hour:,.2f} kudos",
-            # )
-        else:
-            kudos_info_string_elements.append(
-                f"Session: {kudos_per_hour_session:,.2f} (extrapolated) kudos/hr",
-            )
-            # kudos_info_string_elements.append(
-            #     "Last Hour: (pending) kudos",
-            # )
-
-        if self._time_spent_no_jobs_available > self._max_time_spent_no_jobs_available:
-            kudos_info_string_elements.append(
-                f"Active (jobs available): {active_kudos_per_hour:,.2f} kudos/hr",
-            )
-
-        return " | ".join(kudos_info_string_elements)
+        return _generate_kudos_info_string(
+            kudos_generated_this_session=self.kudos_generated_this_session,
+            time_since_session_start=time_since_session_start,
+            kudos_per_hour_session=kudos_per_hour_session,
+            kudos_total_past_hour=kudos_total_past_hour,
+            active_kudos_per_hour=active_kudos_per_hour,
+            time_spent_no_jobs_available=self._time_spent_no_jobs_available,
+            max_time_spent_no_jobs_available=self._max_time_spent_no_jobs_available,
+        )
 
     def log_kudos_info(self, kudos_info_string: str) -> None:
         """Log the kudos information string.
 
         Args:
-            kudos_info_string (str): The kudos information string to log.
+            kudos_info_string: The kudos information string to log.
         """
-        log_function = logger.opt(ansi=True).info
-
-        if self.bridge_data.limited_console_messages:
-            log_function = logger.opt(ansi=True).success
-
-        if self.kudos_generated_this_session > 0:
-            log_function(
-                f"<fg #7dcea0>{kudos_info_string}</>",
-            )
-
         logger.debug(f"len(kudos_events): {len(self.kudos_events)}")
-        if self.user_info is not None and self.user_info.kudos_details is not None:
-            log_function(
-                "<fg #7dcea0>"
-                f"Total Kudos Accumulated: {self.user_info.kudos_details.accumulated:,.2f} "
-                f"(all workers for {self.user_info.username})"
-                "</>",
-            )
-            if self.user_info.kudos_details.accumulated is not None and self.user_info.kudos_details.accumulated < 0:
-                log_function(
-                    "<fg #7dcea0>"
-                    "Negative kudos means you've requested more than you've earned. This can be normal."
-                    "</>",
-                )
+        KudosLogger.log_kudos_info(
+            kudos_info_string=kudos_info_string,
+            kudos_generated_this_session=self.kudos_generated_this_session,
+            user_info=self.user_info,
+            limited_console_messages=self.bridge_data.limited_console_messages,
+        )
 
     async def api_get_user_info(self) -> None:
         """Get the information associated with this API key from the API."""
