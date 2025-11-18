@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from horde_worker_regen.utils.job_utils import get_single_job_effective_megapixelsteps
@@ -15,7 +16,7 @@ class JobQueueAnalyzer:
 
     @staticmethod
     def calculate_pending_megapixelsteps(
-        jobs_pending_inference: list[ImageGenerateJobPopResponse],
+        jobs_pending_inference: Iterable[ImageGenerateJobPopResponse],
         jobs_pending_submit_count: int,
     ) -> int:
         """Calculate the total number of megapixelsteps pending in the job queues.

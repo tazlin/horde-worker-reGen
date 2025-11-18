@@ -1167,8 +1167,8 @@ class HordeWorkerProcessManager:
 
     kudos_generated_this_session: float = 0
     """The amount of kudos generated this entire session."""
-    kudos_events: list[tuple[float, float]]
-    """A deque of kudos events, each is a tuple of the time the event occurred and the amount of kudos generated."""
+    kudos_events: deque[tuple[float, float]]
+    """A deque of kudos events, each is a tuple of the time the event occurred and the kudos generated."""
     session_start_time: float = 0
     """The time at which the session started in epoch time."""
 
@@ -1407,7 +1407,7 @@ class HordeWorkerProcessManager:
 
         self._process_message_queue = multiprocessing.Queue()
 
-        self.kudos_events: list[tuple[float, float]] = []
+        self.kudos_events: deque[tuple[float, float]] = deque()
 
         self._api_messages_received = {}
 

@@ -27,7 +27,7 @@ def generate_kudos_info_string(
         A string with information about the kudos generated in the current session.
     """
     kudos_info_string_elements = []
-    if time_since_session_start < 3600:
+    if time_since_session_start <= 3600:
         kudos_info_string_elements = [
             f"Total Session Kudos: {kudos_generated_this_session:,.2f} over "
             f"{time_since_session_start / 60:.2f} minutes",

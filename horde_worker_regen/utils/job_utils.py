@@ -53,12 +53,16 @@ def get_single_job_effective_megapixelsteps(job: ImageGenerateJobPopResponse) ->
     if job.model in KNOWN_SLOW_MODELS_DIFFICULTIES:
         job_effective_pixel_steps *= KNOWN_SLOW_MODELS_DIFFICULTIES[job.model]
 
+    workflow_name = job.payload.workflow
+
     # We treat slow workflows add extra slowdowns (as they might perform many more steps of inference)
-    if job.payload.workflow in KNOWN_SLOW_WORKFLOWS:
-        job_effective_pixel_steps *= KNOWN_SLOW_WORKFLOWS[job.payload.workflow]
+    slow_multiplier = KNOWN_SLOW_WORKFLOWS.get(workflow_name) if workflow_name else None
+    if slow_multiplier:
+        job_effective_pixel_steps *= slow_multiplier
 
     # Some workflows by default require controlnets, but the user doesn't have to specify them.
     # In this case, we use this to know when we have SDXL workflows, as they can double the VRAM usage
-    if job.payload.workflow in KNOWN_CONTROLNET_WORKFLOWS:
-        job_effective_pixel_steps *= 2
+    controlnet_multiplier = KNOWN_CONTROLNET_WORKFLOWS.get(workflow_name) if workflow_name else None
+    if controlnet_multiplier and not slow_multiplier:
+        job_effective_pixel_steps *= controlnet_multiplier
     return int(job_effective_pixel_steps / 1_000_000)

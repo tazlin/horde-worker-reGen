@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from horde_model_reference.model_reference_records import StableDiffusion_ModelReference
@@ -89,23 +91,23 @@ class KudosTrainingRecorder:
         Returns:
             The file path to use for writing.
         """
-        # Create base directory if it doesn't exist
-        os.makedirs(self.base_directory, exist_ok=True)
+        base_directory_path = Path.cwd() / self.base_directory
+        base_directory_path.mkdir(parents=True, exist_ok=True)
 
-        file_path = f"{self.base_directory}/{self.training_data_file}"
+        file_path = base_directory_path / self.training_data_file
 
         # Check if file exists and is larger than 2MB
-        if os.path.exists(file_path) and os.path.getsize(file_path) > 2 * 1024 * 1024:
+        if file_path.exists() and file_path.stat().st_size > 2 * 1024 * 1024:
             # Find next available file number
             for i in range(1, 10000):
-                new_file_path = f"{self.base_directory}/{self.training_data_file}.{i}"
-                if os.path.exists(new_file_path) and os.path.getsize(new_file_path) > 2 * 1024 * 1024:
+                new_file_path = base_directory_path / f"{self.training_data_file}.{i}"
+                if new_file_path.exists() and new_file_path.stat().st_size > 2 * 1024 * 1024:
                     continue
 
                 file_path = new_file_path
                 break
 
-        return file_path
+        return str(file_path)
 
     def _prepare_model_dump(self, job_info: HordeJobInfo) -> dict[str, Any]:
         """Prepare the model dump with additional fields.
@@ -116,8 +118,10 @@ class KudosTrainingRecorder:
         Returns:
             A dictionary containing the job data ready for JSON serialization.
         """
-        model_dump = job_info.model_dump(
-            exclude=_excludes_for_job_dump,  # type: ignore
+        model_dump = copy.deepcopy(
+            job_info.model_dump(
+                exclude=_excludes_for_job_dump,  # type: ignore
+            ),
         )
 
         # Add model baseline
@@ -134,7 +138,7 @@ class KudosTrainingRecorder:
             model_dump["sdk_api_job_info"]["payload"]["scheduler"] = "karras"
         else:
             model_dump["sdk_api_job_info"]["payload"]["scheduler"] = "simple"
-        del model_dump["sdk_api_job_info"]["payload"]["karras"]
+        model_dump["sdk_api_job_info"]["payload"].pop("karras", None)
 
         # Add lora and TI counts
         model_dump["sdk_api_job_info"]["payload"]["lora_count"] = (
@@ -183,19 +187,21 @@ class KudosTrainingRecorder:
             model_dump: The model data to write.
             n_iter: Number of iterations (used to skip batched jobs).
         """
-        if not os.path.exists(file_path):
+        path_obj = Path(file_path)
+
+        if not path_obj.exists():
             # Create new file with first entry
-            with open(file_path, "w") as f:
+            with open(path_obj, "w") as f:
                 json.dump([model_dump], f, indent=4)
         elif n_iter == 1:
             # Append to existing file (only for non-batched jobs)
             data = []
-            with open(file_path) as f:
+            with open(path_obj) as f:
                 data = json.load(f)
                 if not isinstance(data, list):
                     logger.warning(f"Kudos training data file {file_path} is not a list")
                     data = []
 
             data.append(model_dump)
-            with open(file_path, "w") as f:
+            with open(path_obj, "w") as f:
                 json.dump(data, f, indent=4)

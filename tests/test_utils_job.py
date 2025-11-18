@@ -1,5 +1,6 @@
 """Tests for job utility functions."""
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -40,6 +41,17 @@ def create_mock_job(
     return job
 
 
+def _get_first_upscaler_value() -> str | None:
+    """Return the first upscaler value from KNOWN_UPSCALERS, if any."""
+    upscalers = list(KNOWN_UPSCALERS)
+    if not upscalers:
+        return None
+
+    first_upscaler: Any = upscalers[0]
+    value = getattr(first_upscaler, "value", first_upscaler)
+    return str(value)
+
+
 def test_get_single_job_effective_megapixelsteps_basic() -> None:
     """Test basic megapixelsteps calculation."""
     job = create_mock_job(width=512, height=512, ddim_steps=20, n_iter=1)
@@ -64,7 +76,11 @@ def test_get_single_job_effective_megapixelsteps_with_batching() -> None:
 def test_get_single_job_effective_megapixelsteps_with_upscaler() -> None:
     """Test megapixelsteps calculation with upscaler."""
     # Get a known upscaler from the SDK
-    upscaler_value = list(KNOWN_UPSCALERS)[0].value
+    upscaler_value = _get_first_upscaler_value()
+    if upscaler_value is None:
+        pytest.skip("No upscalers available in KNOWN_UPSCALERS")
+
+    assert upscaler_value is not None
     job = create_mock_job(
         width=512,
         height=512,
@@ -165,12 +181,11 @@ def test_get_single_job_effective_megapixelsteps_large_resolution() -> None:
 def test_get_single_job_effective_megapixelsteps_complex_job() -> None:
     """Test megapixelsteps calculation with multiple factors."""
     # Get an upscaler if available
-    if KNOWN_UPSCALERS:
-        upscaler_value = list(KNOWN_UPSCALERS)[0].value
-    else:
-        upscaler_value = None
+    upscaler_value = _get_first_upscaler_value()
 
-    post_processing = [upscaler_value] if upscaler_value else []
+    post_processing: list[str] = []
+    if upscaler_value is not None:
+        post_processing = [upscaler_value]
 
     job = create_mock_job(
         width=768,

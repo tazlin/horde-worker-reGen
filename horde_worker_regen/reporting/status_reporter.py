@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import horde_worker_regen
 from loguru import logger
@@ -53,7 +53,7 @@ class StatusReporter:
         bridge_data: reGenBridgeData,
         process_info_strings: list[str],
         api_messages_received: dict[str, Any],
-        jobs_pending_inference: list[ImageGenerateJobPopResponse],
+        jobs_pending_inference: Sequence[ImageGenerateJobPopResponse],
         active_models: set[str],
         pending_megapixelsteps: int,
         num_jobs_total: int,
@@ -204,7 +204,7 @@ class StatusReporter:
     def _print_job_info(
         self,
         logging_function: Any,
-        jobs_pending_inference: list[ImageGenerateJobPopResponse],
+        jobs_pending_inference: Sequence[ImageGenerateJobPopResponse],
         active_models: set[str],
         pending_megapixelsteps: int,
         num_jobs_total: int,
