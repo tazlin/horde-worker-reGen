@@ -1,10 +1,7 @@
 import asyncio
 import asyncio.exceptions
-import base64
 import collections
 import enum
-import json
-import math
 import multiprocessing
 import os
 import queue
@@ -25,8 +22,6 @@ from multiprocessing.synchronize import Semaphore
 import aiohttp
 import aiohttp.client_exceptions
 import certifi
-import PIL
-import PIL.Image
 import psutil
 import yarl
 from aiohttp import ClientSession
@@ -49,7 +44,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     SingleWorkerDetailsResponse,
     UserDetailsResponse,
 )
-from horde_sdk.ai_horde_api.consts import KNOWN_UPSCALERS, METADATA_TYPE, METADATA_VALUE
+from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from horde_sdk.ai_horde_api.fields import JobID
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, RootModel, ValidationError
@@ -61,7 +56,6 @@ from horde_worker_regen.bridge_data.load_config import BridgeDataLoader
 from horde_worker_regen.consts import (
     BRIDGE_CONFIG_FILENAME,
     KNOWN_CONTROLNET_WORKFLOWS,
-    KNOWN_SLOW_MODELS_DIFFICULTIES,
     KNOWN_SLOW_WORKFLOWS,
     MAX_SOURCE_IMAGE_RETRIES,
     VRAM_HEAVY_MODELS,
@@ -90,6 +84,17 @@ from horde_worker_regen.process_management.messages import (
     ModelLoadState,
 )
 from horde_worker_regen.process_management.worker_entry_points import start_inference_process, start_safety_process
+from horde_worker_regen.reporting.kudos_logger import KudosLogger
+from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
+from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
+from horde_worker_regen.reporting.status_reporter import StatusReporter
+from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer as _base64_image_to_stream_buffer
+from horde_worker_regen.utils.job_queue_analyzer import JobQueueAnalyzer
+from horde_worker_regen.utils.job_utils import (
+    get_single_job_effective_megapixelsteps as _get_single_job_effective_megapixelsteps,
+)
+from horde_worker_regen.utils.kudos_calculator import KudosCalculator
+from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
 
 sslcontext = ssl.create_default_context(cafile=certifi.where())
 
@@ -1158,8 +1163,8 @@ class HordeWorkerProcessManager:
 
     kudos_generated_this_session: float = 0
     """The amount of kudos generated this entire session."""
-    kudos_events: list[tuple[float, float]]
-    """A deque of kudos events, each is a tuple of the time the event occurred and the amount of kudos generated."""
+    kudos_events: deque[tuple[float, float]]
+    """A deque of kudos events, each is a tuple of the time the event occurred and the kudos generated."""
     session_start_time: float = 0
     """The time at which the session started in epoch time."""
 
@@ -1398,7 +1403,7 @@ class HordeWorkerProcessManager:
 
         self._process_message_queue = multiprocessing.Queue()
 
-        self.kudos_events: list[tuple[float, float]] = []
+        self.kudos_events: deque[tuple[float, float]] = deque()
 
         self._api_messages_received = {}
 
@@ -1957,14 +1962,14 @@ class HordeWorkerProcessManager:
                     != HordeProcessState.UNLOADED_MODEL_FROM_RAM
                 ):
                     logger.opt(ansi=True).info(
-                        "<fg #7b7d7d>" f"Process {message.process_id} cleared RAM: {message.info}" "</>",
+                        f"<fg #7b7d7d>Process {message.process_id} cleared RAM: {message.info}</>",
                     )
                     self._process_map.on_model_ram_clear(process_id=message.process_id)
 
             if isinstance(message, HordeAuxModelStateChangeMessage):
                 if message.process_state == HordeProcessState.DOWNLOADING_AUX_MODEL:
                     logger.opt(ansi=True).info(
-                        "<fg #7b7d7d>" f"Process {message.process_id} is downloading extra models (LoRas, etc.)" "</>",
+                        f"<fg #7b7d7d>Process {message.process_id} is downloading extra models (LoRas, etc.)</>",
                     )
                     self._process_map.on_last_job_reference_change(
                         process_id=message.process_id,
@@ -2034,7 +2039,7 @@ class HordeWorkerProcessManager:
                 else:
                     # FIXME this message is wrong for download processes
                     logger.opt(ansi=True).info(
-                        "<fg #7b7d7d>" f"Process {message.process_id} unloaded model {message.horde_model_name}" "</>",
+                        f"<fg #7b7d7d>Process {message.process_id} unloaded model {message.horde_model_name}</>",
                     )
 
             # If the process is sending us an inference job result:
@@ -2940,20 +2945,7 @@ class HordeWorkerProcessManager:
         Returns:
             A BytesIO stream buffer containing the image, or None if the conversion failed.
         """
-        try:
-            image_as_pil = PIL.Image.open(BytesIO(base64.b64decode(image_base64)))
-            image_buffer = BytesIO()
-            image_as_pil.save(
-                image_buffer,
-                format="WebP",
-                quality=95,  # FIXME # TODO
-                method=6,
-            )
-
-            return image_buffer
-        except Exception as e:
-            logger.error(f"Failed to convert base64 image to stream buffer: {e}")
-            return None
+        return _base64_image_to_stream_buffer(image_base64)
 
     _num_job_slowdowns = 0
     """The number of jobs which did not meet the minimum expected kudos/second rate."""
@@ -3106,7 +3098,7 @@ class HordeWorkerProcessManager:
                 return new_submit
 
             error_string = (
-                f"Failed to submit job (API Error) " f"{new_submit.retry_attempts_string}: {job_submit_response}"
+                f"Failed to submit job (API Error) {new_submit.retry_attempts_string}: {job_submit_response}"
             )
             logger.error(error_string)
             new_submit.retry()
@@ -3194,8 +3186,7 @@ class HordeWorkerProcessManager:
 
         if completed_job_info.state == GENERATION_STATE.faulted:
             logger.error(
-                f"Job {job_info.ids} faulted, "
-                "removing from completed jobs after submitting the faults to the horde",
+                f"Job {job_info.ids} faulted, removing from completed jobs after submitting the faults to the horde",
             )
             self._consecutive_failed_jobs += 1
 
@@ -3304,115 +3295,20 @@ class HordeWorkerProcessManager:
                         f"Job {completed_job_info.sdk_api_job_info.id_} not found in jobs_lookup "
                         "during submit. Creating a new HordeJobInfo object.",
                     )
-                # TODO: Too much indent. Split into own method
+
+                # Record kudos training data if enabled
                 if self.bridge_data.capture_kudos_training_data:
-                    if self.bridge_data.kudos_training_data_file is None:
-                        self.bridge_data.kudos_training_data_file = "kudos_training_data.json"
-                        logger.warning(
-                            "Kudos training data capture is enabled but no file has been specified. "
-                            f"Defaulting to {self.bridge_data.kudos_training_data_file}",
-                        )
-                    # if the file self.bridge_data.kudos_training_data_file exists
-                    # we will append the entry from the jobs lookup to it as a new json entry
-                    # if the file does not exist, we will create it and write the first entry
+                    recorder = KudosTrainingRecorder(
+                        training_data_file=self.bridge_data.kudos_training_data_file,
+                        stable_diffusion_reference=self.stable_diffusion_reference,
+                    )
 
-                    # If the current file is greater than 2mb, we will create a new file with a sequential number
-
-                    file_name_to_use = f"kudos_model_training/{self.bridge_data.kudos_training_data_file}"
-                    os.makedirs("kudos_model_training", exist_ok=True)
-                    if os.path.exists(file_name_to_use) and os.path.getsize(file_name_to_use) > 2 * 1024 * 1024:
-                        for i in range(1, 10000):
-                            new_file_name = f"kudos_model_training/{self.bridge_data.kudos_training_data_file}.{i}"
-                            if os.path.exists(new_file_name) and os.path.getsize(new_file_name) > 2 * 1024 * 1024:
-                                continue
-
-                            file_name_to_use = new_file_name
-                            break
-
-                    try:
-                        with logger.catch(reraise=False):
-                            if completed_job_info.sdk_api_job_info in self.jobs_lookup:
-                                hji = self.jobs_lookup[completed_job_info.sdk_api_job_info]
-                            else:
-                                logger.error(
-                                    f"Job {completed_job_info.sdk_api_job_info.id_} not found in jobs_lookup "
-                                    " during kudos training data capture.",
-                                )
-                            if (
-                                self.stable_diffusion_reference is not None
-                                and hji.sdk_api_job_info.model is not None
-                                and hji.sdk_api_job_info.model in self.stable_diffusion_reference.root
-                            ):
-
-                                model_dump = hji.model_dump(
-                                    exclude=_excludes_for_job_dump,  # type: ignore
-                                )
-                                if (
-                                    self.stable_diffusion_reference is not None
-                                    and hji.sdk_api_job_info.model is not None
-                                ):
-                                    model_dump["sdk_api_job_info"]["model_baseline"] = (
-                                        self.stable_diffusion_reference.root[hji.sdk_api_job_info.model].baseline
-                                    )
-                                # Preparation for multiple schedulers
-                                if hji.sdk_api_job_info.payload.karras:
-                                    model_dump["sdk_api_job_info"]["payload"]["scheduler"] = "karras"
-                                else:
-                                    model_dump["sdk_api_job_info"]["payload"]["scheduler"] = "simple"
-                                del model_dump["sdk_api_job_info"]["payload"]["karras"]
-                                model_dump["sdk_api_job_info"]["payload"]["lora_count"] = (
-                                    len(
-                                        model_dump["sdk_api_job_info"]["payload"]["loras"],
-                                    )
-                                    if model_dump["sdk_api_job_info"]["payload"]["loras"]
-                                    else 0
-                                )
-                                model_dump["sdk_api_job_info"]["payload"]["ti_count"] = (
-                                    len(
-                                        model_dump["sdk_api_job_info"]["payload"]["tis"],
-                                    )
-                                    if model_dump["sdk_api_job_info"]["payload"]["tis"]
-                                    else 0
-                                )
-                                model_dump["sdk_api_job_info"]["extra_source_images_count"] = (
-                                    len(hji.sdk_api_job_info.extra_source_images)
-                                    if hji.sdk_api_job_info.extra_source_images
-                                    else 0
-                                )
-                                esi_combined_size = 0
-                                if hji.sdk_api_job_info.extra_source_images:
-                                    for esi in hji.sdk_api_job_info.extra_source_images:
-                                        esi_combined_size += len(esi.image)
-                                model_dump["sdk_api_job_info"]["extra_source_images_combined_size"] = esi_combined_size
-                                model_dump["sdk_api_job_info"]["source_image_size"] = (
-                                    len(hji.sdk_api_job_info._downloaded_source_image)
-                                    if hji.sdk_api_job_info._downloaded_source_image
-                                    else 0
-                                )
-                                model_dump["sdk_api_job_info"]["source_mask_size"] = (
-                                    len(hji.sdk_api_job_info._downloaded_source_mask)
-                                    if hji.sdk_api_job_info._downloaded_source_mask
-                                    else 0
-                                )
-                                if not os.path.exists(file_name_to_use):
-                                    with open(file_name_to_use, "w") as f:
-                                        json.dump([model_dump], f, indent=4)
-                                elif hji.sdk_api_job_info.payload.n_iter == 1:
-                                    data = []
-                                    with open(file_name_to_use) as f:
-                                        data = json.load(f)
-                                        if not isinstance(data, list):
-                                            logger.warning(
-                                                f"Kudos training data file {file_name_to_use} " "is not a list",
-                                            )
-                                            data = []
-                                    data.append(model_dump)
-                                    with open(file_name_to_use, "w") as f:
-                                        json.dump(data, f, indent=4)
-                    except Exception as e:
+                    if completed_job_info.sdk_api_job_info in self.jobs_lookup:
+                        recorder.record_job_data(self.jobs_lookup[completed_job_info.sdk_api_job_info])
+                    else:
                         logger.error(
-                            f"Failed to write kudos training data for job {completed_job_info.sdk_api_job_info.id_} "
-                            f"{type(e)}: {e}",
+                            f"Job {completed_job_info.sdk_api_job_info.id_} not found in jobs_lookup "
+                            "during kudos training data capture.",
                         )
 
                 if completed_job_info in self.jobs_pending_submit:
@@ -3528,70 +3424,28 @@ class HordeWorkerProcessManager:
         """Return the number of megapixelsteps for a single job.
 
         Args:
-            job (ImageGenerateJobPopResponse): The job to get the number of megapixelsteps for.
+            job: The job to get the number of megapixelsteps for.
 
         Returns:
-            int: The number of effective megapixelsteps for the job.
+            The number of effective megapixelsteps for the job.
         """
-        has_upscaler = any(pp in [u.value for u in KNOWN_UPSCALERS] for pp in job.payload.post_processing)
-        upscaler_multiplier = 1 if has_upscaler else 0
-        job_pixels = job.payload.width * job.payload.height
-
-        # Each extra batched image increases our difficulty by 20%
-        batching_multiplier = 1 + ((job.payload.n_iter - 1) * 0.2)
-
-        lora_adjustment = 0
-        if job.payload.loras is not None:
-            lora_adjustment = 4 * 1_000_000 if len(job.payload.loras) > 0 else 0
-
-        hires_fix_adjustment = 0
-
-        if job.payload.hires_fix:
-            hires_fix_adjustment = 512 * 512 * job.payload.ddim_steps
-
-        # If upscaling was requested, due to it being serial, each extra image in the batch
-        # Further increases our difficulty.
-        # In this calculation we treat each upscaler as adding 20 steps per image
-        upscaling_adjustment = job_pixels * 20 * upscaler_multiplier * job.payload.n_iter
-        job_effective_pixel_steps = (
-            (job_pixels * batching_multiplier * job.payload.ddim_steps)
-            + upscaling_adjustment
-            + lora_adjustment
-            + hires_fix_adjustment
-        )
-
-        # Hard model difficulty is increased due to variations in the performance
-        # of different architectures. This look up is a rough estimate based on a median case
-        if job.model in KNOWN_SLOW_MODELS_DIFFICULTIES:
-            job_effective_pixel_steps *= KNOWN_SLOW_MODELS_DIFFICULTIES[job.model]
-
-        # We treat slow workflows add extra slowdowns (as they might perform many more steps of inference)
-        if job.payload.workflow in KNOWN_SLOW_WORKFLOWS:
-            job_effective_pixel_steps *= KNOWN_SLOW_WORKFLOWS[job.payload.workflow]
-
-        # Some workflows by default require controlnets, but the user doesn't have to specify them.
-        # In this case, we use this to know when we have SDXL workflows, as they can double the VRAM usage
-        if job.payload.workflow in KNOWN_CONTROLNET_WORKFLOWS:
-            job_effective_pixel_steps *= 2
-        return int(job_effective_pixel_steps / 1_000_000)
+        return _get_single_job_effective_megapixelsteps(job)
 
     def get_pending_megapixelsteps(self) -> int:
         """Return the number of megapixelsteps that are pending in the job deque."""
-        job_deque_megapixelsteps = 0
-        for job in self.jobs_pending_inference:
-            job_megapixelsteps = self.get_single_job_effective_megapixelsteps(job)
-            job_deque_megapixelsteps += job_megapixelsteps
-
-        for _ in self.jobs_pending_submit:
-            job_deque_megapixelsteps += 4
-
-        return job_deque_megapixelsteps
+        return JobQueueAnalyzer.calculate_pending_megapixelsteps(
+            self.jobs_pending_inference,
+            len(self.jobs_pending_submit),
+        )
 
     def should_wait_for_pending_megapixelsteps(self) -> bool:
         """Check if the number of megapixelsteps in the job deque is above the limit."""
         # TODO: Option to increase the limit for higher end GPUs
-
-        return self.get_pending_megapixelsteps() > self._max_pending_megapixelsteps
+        pending_megapixelsteps = self.get_pending_megapixelsteps()
+        return JobQueueAnalyzer.should_wait_for_pending_megapixelsteps(
+            pending_megapixelsteps,
+            self._max_pending_megapixelsteps,
+        )
 
     async def _get_source_images(self, job_pop_response: ImageGenerateJobPopResponse) -> ImageGenerateJobPopResponse:
         # Adding this to stop mypy complaining
@@ -3643,7 +3497,6 @@ class HordeWorkerProcessManager:
                     and len(download_extra_source_images) != len(job_pop_response.extra_source_images)
                 )
             ):
-
                 download_tasks.append(
                     asyncio.create_task(
                         job_pop_response.async_download_extra_source_images(
@@ -3747,37 +3600,7 @@ class HordeWorkerProcessManager:
 
     def print_maint_mode_messages(self) -> None:
         """Print the information about maintenance mode to the user."""
-
-        def warning_function_no_format(x):  # noqa: ANN001, ANN202
-            return logger.opt(ansi=True, raw=True).warning(
-                "<fg #f1c40f>" + x + "</>\n",
-            )
-
-        warning_function_no_format(
-            "Your worker is in maintenance mode. Set your API key at https://tinybots.net/artbot/settings, "
-            "click save, then click unpause on https://tinybots.net/artbot/settings?panel=workers while the worker "
-            "is running to clear this message.",
-        )
-        warning_function_no_format(
-            "If you didn't expect seeing this message, its probable that the worker "
-            "dropped too many jobs, and the server stepped in to prevent further jobs from being "
-            "dropped. Please check the logs above, and possibly your logs/ folder as well.",
-        )
-        warning_function_no_format("Common reasons for forced maintenance mode are: ")
-        warning_function_no_format("  - `max_threads` is too high.")
-        warning_function_no_format("  - `queue_size` is too high.")
-        warning_function_no_format("  - `max_batch` is too high.")
-        warning_function_no_format("  - `max_power` is too high.")
-        warning_function_no_format("  - The worker can't handle, SDXL, Cascade, or Flux models.")
-        warning_function_no_format(
-            "  - If you have the equivalent GPU of a 1070 or less, set"
-            " limit_max_steps or extra_slow_worker. "
-            "This should only be done as a last resort.",
-        )
-
-        warning_function_no_format(
-            "If you continue to see this message, come to the official discord (https://discord.gg/3DxrhksKzn).",
-        )
+        MaintenanceModeMessenger.print_maintenance_mode_messages()
 
     @logger.catch(reraise=True)
     async def api_job_pop(self) -> None:
@@ -4132,7 +3955,7 @@ class HordeWorkerProcessManager:
                     jobs.append(f"<{str(job.id_)[:8]}: {job.model}>")
                 else:
                     jobs.append(f"<{job.model}>")
-            logger.info(f'Job queue: {", ".join(jobs)}')
+            logger.info(f"Job queue: {', '.join(jobs)}")
             # self._testing_jobs_added += 1
             self.job_pop_timestamps[job_pop_response] = time.time()
             self.jobs_lookup[job_pop_response] = HordeJobInfo(
@@ -4151,13 +3974,22 @@ class HordeWorkerProcessManager:
 
     def calculate_kudos_info(self) -> None:
         """Calculate and log information about the kudos generated in the current session."""
-        time_since_session_start = time.time() - self.session_start_time
-        kudos_per_hour_session = self.kudos_generated_this_session / time_since_session_start * 3600
-        active_kudos_per_hour = (
-            self.kudos_generated_this_session / (time_since_session_start - self._time_spent_no_jobs_available) * 3600
+        # Use KudosCalculator to compute all metrics
+        (
+            time_since_session_start,
+            kudos_per_hour_session,
+            kudos_total_past_hour,
+            active_kudos_per_hour,
+            cleaned_events,
+        ) = KudosCalculator.calculate_all_metrics(
+            self.kudos_generated_this_session,
+            self.session_start_time,
+            self._time_spent_no_jobs_available,
+            self.kudos_events,
         )
 
-        kudos_total_past_hour = self.calculate_kudos_totals()
+        # Update the events deque with cleaned version
+        self.kudos_events = cleaned_events
 
         kudos_info_string = self.generate_kudos_info_string(
             time_since_session_start,
@@ -4174,21 +4006,11 @@ class HordeWorkerProcessManager:
         Returns:
             float: The total kudos generated in the past hour.
         """
-        kudos_total_past_hour = 0.0
-        num_events_found = 0
-        current_time = time.time()
-
-        for event_time, kudos in reversed(self.kudos_events):
-            if current_time - event_time > 3600:
-                break
-
-            num_events_found += 1
-            kudos_total_past_hour += kudos
-
-        elements_to_remove = len(self.kudos_events) - num_events_found
-        if elements_to_remove > 0:
-            self.kudos_events = self.kudos_events[:-elements_to_remove]
-
+        # Delegate to KudosCalculator
+        kudos_total_past_hour, cleaned_events = KudosCalculator.calculate_kudos_totals_past_hour(
+            self.kudos_events,
+        )
+        self.kudos_events = cleaned_events
         return kudos_total_past_hour
 
     def generate_kudos_info_string(
@@ -4201,78 +4023,37 @@ class HordeWorkerProcessManager:
         """Generate a string with information about the kudos generated in the current session.
 
         Args:
-            time_since_session_start (float): The time since the session started.
-            kudos_per_hour_session (float): The kudos per hour generated in the current session.
-            kudos_total_past_hour (float): The total kudos generated in the past hour.
-            active_kudos_per_hour (float): The kudos per hour generated while active (jobs available).
+            time_since_session_start: The time since the session started.
+            kudos_per_hour_session: The kudos per hour generated in the current session.
+            kudos_total_past_hour: The total kudos generated in the past hour.
+            active_kudos_per_hour: The kudos per hour generated while active (jobs available).
 
         Returns:
-            str: A string with information about the kudos generated in the current session.
+            A string with information about the kudos generated in the current session.
         """
-        kudos_info_string_elements = []
-        if time_since_session_start < 3600:
-            kudos_info_string_elements = [
-                f"Total Session Kudos: {self.kudos_generated_this_session:,.2f} over "
-                f"{time_since_session_start / 60:.2f} minutes",
-            ]
-        else:
-            kudos_info_string_elements = [
-                f"Total Session Kudos: {self.kudos_generated_this_session:,.2f} over "
-                f"{time_since_session_start / 3600:.2f} hours",
-            ]
-
-        if time_since_session_start > 3600:
-            kudos_info_string_elements.append(
-                f"Session: {kudos_per_hour_session:,.2f} (actual) kudos/hr",
-            )
-            # kudos_info_string_elements.append(
-            #     f"Last Hour: {kudos_total_past_hour:,.2f} kudos",
-            # )
-        else:
-            kudos_info_string_elements.append(
-                f"Session: {kudos_per_hour_session:,.2f} (extrapolated) kudos/hr",
-            )
-            # kudos_info_string_elements.append(
-            #     "Last Hour: (pending) kudos",
-            # )
-
-        if self._time_spent_no_jobs_available > self._max_time_spent_no_jobs_available:
-            kudos_info_string_elements.append(
-                f"Active (jobs available): {active_kudos_per_hour:,.2f} kudos/hr",
-            )
-
-        return " | ".join(kudos_info_string_elements)
+        return _generate_kudos_info_string(
+            kudos_generated_this_session=self.kudos_generated_this_session,
+            time_since_session_start=time_since_session_start,
+            kudos_per_hour_session=kudos_per_hour_session,
+            kudos_total_past_hour=kudos_total_past_hour,
+            active_kudos_per_hour=active_kudos_per_hour,
+            time_spent_no_jobs_available=self._time_spent_no_jobs_available,
+            max_time_spent_no_jobs_available=self._max_time_spent_no_jobs_available,
+        )
 
     def log_kudos_info(self, kudos_info_string: str) -> None:
         """Log the kudos information string.
 
         Args:
-            kudos_info_string (str): The kudos information string to log.
+            kudos_info_string: The kudos information string to log.
         """
-        log_function = logger.opt(ansi=True).info
-
-        if self.bridge_data.limited_console_messages:
-            log_function = logger.opt(ansi=True).success
-
-        if self.kudos_generated_this_session > 0:
-            log_function(
-                f"<fg #7dcea0>{kudos_info_string}</>",
-            )
-
         logger.debug(f"len(kudos_events): {len(self.kudos_events)}")
-        if self.user_info is not None and self.user_info.kudos_details is not None:
-            log_function(
-                "<fg #7dcea0>"
-                f"Total Kudos Accumulated: {self.user_info.kudos_details.accumulated:,.2f} "
-                f"(all workers for {self.user_info.username})"
-                "</>",
-            )
-            if self.user_info.kudos_details.accumulated is not None and self.user_info.kudos_details.accumulated < 0:
-                log_function(
-                    "<fg #7dcea0>"
-                    "Negative kudos means you've requested more than you've earned. This can be normal."
-                    "</>",
-                )
+        KudosLogger.log_kudos_info(
+            kudos_info_string=kudos_info_string,
+            kudos_generated_this_session=self.kudos_generated_this_session,
+            user_info=self.user_info,
+            limited_console_messages=self.bridge_data.limited_console_messages,
+        )
 
     async def api_get_user_info(self) -> None:
         """Get the information associated with this API key from the API."""
@@ -4640,232 +4421,52 @@ class HordeWorkerProcessManager:
 
     def print_status_method(self) -> None:
         """Print the status of the worker if it's time to do so."""
-        if self._last_pop_maintenance_mode:
+        reporter = StatusReporter(
+            last_status_message_time=self._last_status_message_time,
+            status_message_frequency=self._status_message_frequency,
+        )
+
+        if not reporter.should_print_status(self._last_pop_maintenance_mode):
             return
 
-        cur_time = time.time()
-        if cur_time - self._last_status_message_time > self._status_message_frequency:
-            AIWORKER_LIMITED_CONSOLE_MESSAGES = os.getenv("AIWORKER_LIMITED_CONSOLE_MESSAGES", False)
+        # Gather active models
+        active_models = {
+            process.loaded_horde_model_name
+            for process in self._process_map.values()
+            if process.loaded_horde_model_name is not None
+        }
 
-            logging_function = logger.opt(ansi=True).info
+        # Print status and get updated frequency
+        updated_frequency = reporter.print_status(
+            bridge_data=self.bridge_data,
+            process_info_strings=self._process_map.get_process_info_strings(),
+            api_messages_received=self._api_messages_received,
+            jobs_pending_inference=self.jobs_pending_inference,
+            active_models=active_models,
+            pending_megapixelsteps=self.get_pending_megapixelsteps(),
+            num_jobs_total=self.num_jobs_total,
+            total_num_completed_jobs=self.total_num_completed_jobs,
+            num_jobs_faulted=self._num_jobs_faulted,
+            num_job_slowdowns=self._num_job_slowdowns,
+            num_process_recoveries=self._num_process_recoveries,
+            time_spent_no_jobs_available=self._time_spent_no_jobs_available,
+            user_info=self.user_info,
+            max_concurrent_inference_processes=self.max_concurrent_inference_processes,
+            device_map=self._device_map,
+            too_many_consecutive_failed_jobs=self._too_many_consecutive_failed_jobs,
+            too_many_consecutive_failed_jobs_time=self._too_many_consecutive_failed_jobs_time,
+            too_many_consecutive_failed_jobs_wait_time=self._too_many_consecutive_failed_jobs_wait_time,
+            session_start_time=self.session_start_time,
+            shutting_down=self._shutting_down,
+            jobs_pending_safety_check=len(self.jobs_pending_safety_check),
+            jobs_being_safety_checked=len(self.jobs_being_safety_checked),
+            jobs_in_progress=len(self.jobs_in_progress),
+            total_ram_gigabytes=self.total_ram_gigabytes,
+        )
 
-            if AIWORKER_LIMITED_CONSOLE_MESSAGES:
-                logging_function = logger.opt(ansi=True).success
-
-            process_info_strings = self._process_map.get_process_info_strings()
-
-            logging_function("<fg #dddddd>" + str("^" * 80) + "</>")
-
-            if len(self._api_messages_received) > 0:
-                logging_function("<b>API Messages:</b>")
-                for message_id, message in self._api_messages_received.items():
-                    try:
-                        message_text = message.message_text or ""
-                        log_safe_message = message_text.replace("<", "&lt;").replace(">", "&gt;")
-                        log_safe_message = log_safe_message.replace("\n", " ")
-                        log_safe_message = log_safe_message.replace("\r", " ")
-                        log_safe_message = log_safe_message.replace("\t", " ")
-                        log_safe_message = log_safe_message.replace("{", "{{").replace("}", "}}")
-                        log_safe_message = log_safe_message.replace('"', "'")
-                        log_safe_message = log_safe_message.replace("'", "'")
-
-                        logging_function(
-                            f"  <fg #000><bg #0ff127>{log_safe_message} "
-                            f"(from {message.message_origin}, expires {message.message_expiry}, "
-                            f"message_id: {message_id[:8]})</></>",
-                            "</></>",
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to print API message: {e}")
-
-            logging_function("<b>Process info:</b>")
-            for process_info_string in process_info_strings:
-                logging_function("  " + process_info_string)
-
-            logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
-
-            logging_function("<b>Job Info:</b>")
-            jobs = []
-            for x in self.jobs_pending_inference:
-                shortened_id = str(x.id_.root)[:8] if x.id_ is not None else "None?"
-                jobs.append(f"<{shortened_id}: <u>{x.model}></u>")
-
-            logging_function(f'  Jobs: {", ".join(jobs)}')
-
-            active_models = {
-                process.loaded_horde_model_name
-                for process in self._process_map.values()
-                if process.loaded_horde_model_name is not None
-            }
-
-            logger.debug(f"Active models: {active_models}")
-
-            job_info_message = "  Session job info: " + " | ".join(
-                [
-                    f"pending start: {len(self.jobs_pending_inference)} (eMPS: {self.get_pending_megapixelsteps()})",
-                    f"jobs popped: {self.num_jobs_total}",
-                    f"submitted: {self.total_num_completed_jobs}",
-                    f"faulted: {self._num_jobs_faulted}",
-                    f"slow_jobs: {self._num_job_slowdowns}",
-                    f"process_recoveries: {self._num_process_recoveries}",
-                    f"{self._time_spent_no_jobs_available:.2f} seconds without jobs",
-                ],
-            )
-
-            logging_function(
-                f"<fg #7dcea0>{job_info_message}</>",
-            )
-            logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
-
-            logging_function("<b>Worker Info:</b>")
-
-            max_power_dimension = int(math.sqrt(self.bridge_data.max_power * 8 * 64 * 64))
-            logger.info(
-                "  "
-                + " | ".join(
-                    [
-                        f"dreamer_name: {self.bridge_data.dreamer_worker_name}",
-                        f"(v{horde_worker_regen.__version__})",
-                        f"horde user: {self.user_info.username if self.user_info is not None else 'Unknown'}",
-                        f"num_models: {len(self.bridge_data.image_models_to_load)}",
-                        f"custom_models: {bool(self.bridge_data.custom_models)}",
-                        f"max_power: {self.bridge_data.max_power} ({max_power_dimension}x{max_power_dimension})",
-                        f"max_threads: {self.max_concurrent_inference_processes}",
-                        f"queue_size: {self.bridge_data.queue_size}",
-                        f"safety_on_gpu: {self.bridge_data.safety_on_gpu}",
-                    ],
-                ),
-            )
-            logger.info(
-                "  "
-                + " | ".join(
-                    [
-                        f"allow_img2img: {self.bridge_data.allow_img2img}",
-                        f"allow_lora: {self.bridge_data.allow_lora}",
-                        f"allow_controlnet: {self.bridge_data.allow_controlnet}",
-                        f"allow_sdxl_controlnet: {self.bridge_data.allow_sdxl_controlnet}",
-                        f"allow_post_processing: {self.bridge_data.allow_post_processing}",
-                        f"post_process_job_overlap: {self.bridge_data.post_process_job_overlap}",
-                    ],
-                ),
-            )
-
-            logger.info(
-                "  "
-                + " | ".join(
-                    [
-                        f"unload_models_from_vram_often: {self.bridge_data.unload_models_from_vram_often}",
-                        f"high_performance_mode: {self.bridge_data.high_performance_mode}",
-                        f"moderate_performance_mode: {self.bridge_data.moderate_performance_mode}",
-                        f"high_memory_mode: {self.bridge_data.high_memory_mode}",
-                    ],
-                ),
-            )
-
-            logger.debug(
-                " | ".join(
-                    [
-                        f"preload_timeout: {self.bridge_data.preload_timeout}",
-                        f"download_timeout: {self.bridge_data.download_timeout}",
-                        f"post_process_timeout: {self.bridge_data.post_process_timeout}",
-                        f"very_high_memory_mode: {self.bridge_data.very_high_memory_mode}",
-                        f"cycle_process_on_model_change: {self.bridge_data.cycle_process_on_model_change}",
-                        f"exit_on_unhandled_faults: {self.bridge_data.exit_on_unhandled_faults}",
-                        f"jobs_pending_safety_check: {len(self.jobs_pending_safety_check)}",
-                        f"jobs_being_safety_checked: {len(self.jobs_being_safety_checked)}",
-                        f"jobs_in_progress: {len(self.jobs_in_progress)}",
-                    ],
-                ),
-            )
-
-            if os.getenv("AIWORKER_NOT_REQUIRED_VERSION"):
-                logger.warning(
-                    "There is a required update available for the AI Worker. "
-                    "`git pull` and `update-runtime` to update.",
-                )
-            elif os.getenv("AIWORKER_NOT_RECOMMENDED_VERSION"):
-                logger.warning(
-                    "There is a recommended update available for the AI Worker. "
-                    "`git pull` and `update-runtime` to update.",
-                )
-
-            if self.bridge_data.extra_slow_worker:
-                if not self.bridge_data.limit_max_steps:
-                    logger.warning(
-                        "Extra slow worker mode is enabled, but limit_max_steps is not enabled. "
-                        "Consider enabling limit_max_steps to prevent long running jobs.",
-                    )
-                if self.bridge_data.max_batch > 1:
-                    logger.warning(
-                        "Extra slow worker mode is enabled, but max_batch is greater than 1. "
-                        "Consider setting max_batch to 1 to prevent long running batch jobs.",
-                    )
-                if self.bridge_data.allow_sdxl_controlnet:
-                    logger.warning(
-                        "Extra slow worker mode is enabled, but allow_sdxl_controlnet is enabled. "
-                        "Consider disabling allow_sdxl_controlnet to prevent long running jobs.",
-                    )
-
-            for device in self._device_map.root.values():
-                total_memory_mb = device.total_memory / 1024 / 1024
-                if total_memory_mb < 10_000 and self.bridge_data.high_memory_mode:
-                    logger.warning(
-                        f"Device {device.device_name} ({device.device_index}) has less than 10GB of memory. "
-                        "This may cause issues with `high_memory_mode` enabled.",
-                    )
-                elif (
-                    total_memory_mb > 20_000
-                    and not self.bridge_data.high_memory_mode
-                    and self.bridge_data.max_threads == 1
-                    and self.total_ram_gigabytes > 32
-                ):
-                    logger.warning(
-                        f"Device {device.device_name} ({device.device_index}) has more than 20GB of memory. "
-                        "You should enable `high_memory_mode` in your config to take advantage of this.",
-                    )
-                elif total_memory_mb > 20_000 and self.bridge_data.extra_slow_worker:
-                    logger.warning(
-                        f"Device {device.device_name} ({device.device_index}) has more than 20GB of memory. "
-                        "There are very few GPUs with this much memory that should be running in extra slow worker "
-                        "mode. Consider disabling `extra_slow_worker` in your config.",
-                    )
-
-            if self._too_many_consecutive_failed_jobs:
-                time_since_failure = cur_time - self._too_many_consecutive_failed_jobs_time
-                logger.error(
-                    "Too many consecutive failed jobs. This may be due to a misconfiguration or other issue. "
-                    "Please check your logs and configuration.",
-                )
-                logger.error(
-                    f"Time since last job failure: {time_since_failure:.2f}s. "
-                    f"{self._too_many_consecutive_failed_jobs_wait_time} seconds must pass before resuming.",
-                )
-
-            minutes_allowed_without_jobs = self.bridge_data.minutes_allowed_without_jobs
-            seconds_allowed_without_jobs = minutes_allowed_without_jobs * 60
-            cur_session_minutes = (cur_time - self.session_start_time) / 60
-            if self._time_spent_no_jobs_available > seconds_allowed_without_jobs:
-                if not self.bridge_data.suppress_speed_warnings:
-                    logger.warning(
-                        f"Your worker spent more than {minutes_allowed_without_jobs} minutes combined throughout this "
-                        f"session ({self._time_spent_no_jobs_available/60:.2f}/{cur_session_minutes:.2f} minutes) "
-                        "without jobs. This may be due to low demand. However, offering more models or increasing "
-                        "your max_power may help increase the number of jobs you receive and reduce downtime.",
-                    )
-                else:
-                    logger.debug(
-                        "Suppressed warning about time spent without jobs "
-                        f"for {minutes_allowed_without_jobs} minutes",
-                    )
-
-            if self._shutting_down:
-                logger.warning("*" * 80)
-                logger.warning("Shutting down after current jobs are finished...")
-                self._status_message_frequency = 5.0
-                logger.warning("*" * 80)
-
-            self._last_status_message_time = cur_time
-            logging_function("<fg #dddddd>" + str("v" * 80) + "</>")
+        # Update state from reporter
+        self._last_status_message_time = reporter.last_status_message_time
+        self._status_message_frequency = updated_frequency
 
     _bridge_data_loop_interval = 1.0
     """The interval between bridge data loop iterations."""
