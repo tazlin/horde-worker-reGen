@@ -157,7 +157,7 @@ def test_calculate_kudos_totals_past_hour_all_old() -> None:
 
 def test_calculate_kudos_totals_past_hour_empty() -> None:
     """Test calculating kudos totals with empty events."""
-    kudos_events = deque([], maxlen=100)
+    kudos_events: deque[tuple[float, float]] = deque([], maxlen=100)
 
     total, cleaned = KudosCalculator.calculate_kudos_totals_past_hour(kudos_events)
 
