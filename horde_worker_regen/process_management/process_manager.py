@@ -95,7 +95,9 @@ from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRe
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.reporting.status_reporter import StatusReporter
 from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer as _base64_image_to_stream_buffer
+from horde_worker_regen.utils.job_queue_analyzer import JobQueueAnalyzer
 from horde_worker_regen.utils.job_utils import get_single_job_effective_megapixelsteps as _get_single_job_effective_megapixelsteps
+from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
 
 sslcontext = ssl.create_default_context(cafile=certifi.where())
@@ -3436,21 +3438,19 @@ class HordeWorkerProcessManager:
 
     def get_pending_megapixelsteps(self) -> int:
         """Return the number of megapixelsteps that are pending in the job deque."""
-        job_deque_megapixelsteps = 0
-        for job in self.jobs_pending_inference:
-            job_megapixelsteps = self.get_single_job_effective_megapixelsteps(job)
-            job_deque_megapixelsteps += job_megapixelsteps
-
-        for _ in self.jobs_pending_submit:
-            job_deque_megapixelsteps += 4
-
-        return job_deque_megapixelsteps
+        return JobQueueAnalyzer.calculate_pending_megapixelsteps(
+            self.jobs_pending_inference,
+            len(self.jobs_pending_submit),
+        )
 
     def should_wait_for_pending_megapixelsteps(self) -> bool:
         """Check if the number of megapixelsteps in the job deque is above the limit."""
         # TODO: Option to increase the limit for higher end GPUs
-
-        return self.get_pending_megapixelsteps() > self._max_pending_megapixelsteps
+        pending_megapixelsteps = self.get_pending_megapixelsteps()
+        return JobQueueAnalyzer.should_wait_for_pending_megapixelsteps(
+            pending_megapixelsteps,
+            self._max_pending_megapixelsteps,
+        )
 
     async def _get_source_images(self, job_pop_response: ImageGenerateJobPopResponse) -> ImageGenerateJobPopResponse:
         # Adding this to stop mypy complaining
@@ -3980,13 +3980,22 @@ class HordeWorkerProcessManager:
 
     def calculate_kudos_info(self) -> None:
         """Calculate and log information about the kudos generated in the current session."""
-        time_since_session_start = time.time() - self.session_start_time
-        kudos_per_hour_session = self.kudos_generated_this_session / time_since_session_start * 3600
-        active_kudos_per_hour = (
-            self.kudos_generated_this_session / (time_since_session_start - self._time_spent_no_jobs_available) * 3600
+        # Use KudosCalculator to compute all metrics
+        (
+            time_since_session_start,
+            kudos_per_hour_session,
+            kudos_total_past_hour,
+            active_kudos_per_hour,
+            cleaned_events,
+        ) = KudosCalculator.calculate_all_metrics(
+            self.kudos_generated_this_session,
+            self.session_start_time,
+            self._time_spent_no_jobs_available,
+            self.kudos_events,
         )
 
-        kudos_total_past_hour = self.calculate_kudos_totals()
+        # Update the events deque with cleaned version
+        self.kudos_events = cleaned_events
 
         kudos_info_string = self.generate_kudos_info_string(
             time_since_session_start,
@@ -4003,21 +4012,11 @@ class HordeWorkerProcessManager:
         Returns:
             float: The total kudos generated in the past hour.
         """
-        kudos_total_past_hour = 0.0
-        num_events_found = 0
-        current_time = time.time()
-
-        for event_time, kudos in reversed(self.kudos_events):
-            if current_time - event_time > 3600:
-                break
-
-            num_events_found += 1
-            kudos_total_past_hour += kudos
-
-        elements_to_remove = len(self.kudos_events) - num_events_found
-        if elements_to_remove > 0:
-            self.kudos_events = self.kudos_events[:-elements_to_remove]
-
+        # Delegate to KudosCalculator
+        kudos_total_past_hour, cleaned_events = KudosCalculator.calculate_kudos_totals_past_hour(
+            self.kudos_events,
+        )
+        self.kudos_events = cleaned_events
         return kudos_total_past_hour
 
     def generate_kudos_info_string(
