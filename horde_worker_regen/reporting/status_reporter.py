@@ -5,15 +5,18 @@ from __future__ import annotations
 import math
 import os
 import time
-from typing import TYPE_CHECKING, Any, Sequence
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
+
+from loguru import logger
 
 import horde_worker_regen
-from loguru import logger
 
 if TYPE_CHECKING:
     from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, UserDetailsResponse
+
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-    from horde_worker_regen.process_management.process_manager import TorchDeviceMap
+    from horde_worker_regen.process_management.process_manager import APIWorkerMessage, TorchDeviceMap
 
 
 class StatusReporter:
@@ -52,7 +55,7 @@ class StatusReporter:
         self,
         bridge_data: reGenBridgeData,
         process_info_strings: list[str],
-        api_messages_received: dict[str, Any],
+        api_messages_received: dict[str, APIWorkerMessage],
         jobs_pending_inference: Sequence[ImageGenerateJobPopResponse],
         active_models: set[str],
         pending_megapixelsteps: int,
@@ -177,7 +180,11 @@ class StatusReporter:
 
         return updated_frequency
 
-    def _print_api_messages(self, logging_function: Any, api_messages_received: dict[str, Any]) -> None:
+    def _print_api_messages(
+        self,
+        logging_function: Callable[..., None],
+        api_messages_received: dict[str, APIWorkerMessage],
+    ) -> None:
         """Print API messages if any."""
         if len(api_messages_received) > 0:
             logging_function("<b>API Messages:</b>")
@@ -203,7 +210,7 @@ class StatusReporter:
 
     def _print_job_info(
         self,
-        logging_function: Any,
+        logging_function: Callable[..., None],
         jobs_pending_inference: Sequence[ImageGenerateJobPopResponse],
         active_models: set[str],
         pending_megapixelsteps: int,
@@ -221,7 +228,7 @@ class StatusReporter:
             shortened_id = str(x.id_.root)[:8] if x.id_ is not None else "None?"
             jobs.append(f"<{shortened_id}: <u>{x.model}></u>")
 
-        logging_function(f'  Jobs: {", ".join(jobs)}')
+        logging_function(f"  Jobs: {', '.join(jobs)}")
 
         logger.debug(f"Active models: {active_models}")
 
@@ -315,7 +322,7 @@ class StatusReporter:
     def _print_warnings(
         self,
         bridge_data: reGenBridgeData,
-        device_map: Any,
+        device_map: TorchDeviceMap,
         too_many_consecutive_failed_jobs: bool,
         too_many_consecutive_failed_jobs_time: float,
         too_many_consecutive_failed_jobs_wait_time: float,
@@ -327,8 +334,7 @@ class StatusReporter:
         # Version warnings
         if os.getenv("AIWORKER_NOT_REQUIRED_VERSION"):
             logger.warning(
-                "There is a required update available for the AI Worker. "
-                "`git pull` and `update-runtime` to update.",
+                "There is a required update available for the AI Worker. `git pull` and `update-runtime` to update.",
             )
         elif os.getenv("AIWORKER_NOT_RECOMMENDED_VERSION"):
             logger.warning(
@@ -401,12 +407,11 @@ class StatusReporter:
             if not bridge_data.suppress_speed_warnings:
                 logger.warning(
                     f"Your worker spent more than {minutes_allowed_without_jobs} minutes combined throughout this "
-                    f"session ({time_spent_no_jobs_available/60:.2f}/{cur_session_minutes:.2f} minutes) "
+                    f"session ({time_spent_no_jobs_available / 60:.2f}/{cur_session_minutes:.2f} minutes) "
                     "without jobs. This may be due to low demand. However, offering more models or increasing "
                     "your max_power may help increase the number of jobs you receive and reduce downtime.",
                 )
             else:
                 logger.debug(
-                    "Suppressed warning about time spent without jobs "
-                    f"for {minutes_allowed_without_jobs} minutes",
+                    f"Suppressed warning about time spent without jobs for {minutes_allowed_without_jobs} minutes",
                 )

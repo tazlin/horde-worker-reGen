@@ -4,7 +4,6 @@ import base64
 from io import BytesIO
 
 import PIL.Image
-import pytest
 
 from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer
 

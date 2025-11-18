@@ -1,6 +1,5 @@
 """Tests for kudos utility functions."""
 
-import pytest
 
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string
 

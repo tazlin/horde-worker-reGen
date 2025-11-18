@@ -3,36 +3,38 @@
 import json
 import os
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock, Mock
 
 import pytest
 from horde_model_reference.meta_consts import STABLE_DIFFUSION_BASELINE_CATEGORY
 from horde_model_reference.model_reference_records import StableDiffusion_ModelReference
-from horde_sdk.ai_horde_api.consts import GENERATION_STATE
+from pytest import MonkeyPatch
 
 from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
 
 
 @pytest.fixture
-def temp_dir():
+def temp_dir() -> Iterator[str]:
     """Create a temporary directory for testing."""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield tmpdir
 
 
 @pytest.fixture
-def mock_model_reference():
+def mock_model_reference() -> StableDiffusion_ModelReference:
     """Create a mock model reference."""
     ref = MagicMock(spec=StableDiffusion_ModelReference)
     ref.root = {
         "test_model": Mock(baseline=STABLE_DIFFUSION_BASELINE_CATEGORY.stable_diffusion_1),
     }
-    return ref
+    return cast(StableDiffusion_ModelReference, ref)
 
 
 @pytest.fixture
-def mock_job_info():
+def mock_job_info() -> MagicMock:
     """Create a mock job info object."""
     job_info = MagicMock()
     job_info.sdk_api_job_info.id_ = "test_job_123"
@@ -60,7 +62,9 @@ def mock_job_info():
     return job_info
 
 
-def test_kudos_training_recorder_init_with_file(mock_model_reference):
+def test_kudos_training_recorder_init_with_file(
+    mock_model_reference: StableDiffusion_ModelReference,
+) -> None:
     """Test initialization with a specified file."""
     recorder = KudosTrainingRecorder(
         training_data_file="custom_file.json",
@@ -72,7 +76,9 @@ def test_kudos_training_recorder_init_with_file(mock_model_reference):
     assert recorder.base_directory == "kudos_model_training"
 
 
-def test_kudos_training_recorder_init_default_file(mock_model_reference):
+def test_kudos_training_recorder_init_default_file(
+    mock_model_reference: StableDiffusion_ModelReference,
+) -> None:
     """Test initialization with default file."""
     recorder = KudosTrainingRecorder(
         training_data_file=None,
@@ -82,7 +88,12 @@ def test_kudos_training_recorder_init_default_file(mock_model_reference):
     assert recorder.training_data_file == "kudos_training_data.json"
 
 
-def test_record_job_data_creates_new_file(temp_dir, mock_model_reference, mock_job_info, monkeypatch):
+def test_record_job_data_creates_new_file(
+    temp_dir: str,
+    mock_model_reference: StableDiffusion_ModelReference,
+    mock_job_info: MagicMock,
+    monkeypatch: MonkeyPatch,
+) -> None:
     """Test that recording creates a new file when it doesn't exist."""
     # Change to temp directory
     monkeypatch.chdir(temp_dir)
@@ -107,7 +118,12 @@ def test_record_job_data_creates_new_file(temp_dir, mock_model_reference, mock_j
     assert "sdk_api_job_info" in data[0]
 
 
-def test_record_job_data_appends_to_existing_file(temp_dir, mock_model_reference, mock_job_info, monkeypatch):
+def test_record_job_data_appends_to_existing_file(
+    temp_dir: str,
+    mock_model_reference: StableDiffusion_ModelReference,
+    mock_job_info: MagicMock,
+    monkeypatch: MonkeyPatch,
+) -> None:
     """Test that recording appends to an existing file."""
     # Change to temp directory
     monkeypatch.chdir(temp_dir)
@@ -132,7 +148,12 @@ def test_record_job_data_appends_to_existing_file(temp_dir, mock_model_reference
     assert len(data) == 2
 
 
-def test_record_job_data_skips_batched_jobs(temp_dir, mock_model_reference, mock_job_info, monkeypatch):
+def test_record_job_data_skips_batched_jobs(
+    temp_dir: str,
+    mock_model_reference: StableDiffusion_ModelReference,
+    mock_job_info: MagicMock,
+    monkeypatch: MonkeyPatch,
+) -> None:
     """Test that batched jobs (n_iter > 1) are not appended to existing files."""
     # Change to temp directory
     monkeypatch.chdir(temp_dir)
@@ -158,7 +179,10 @@ def test_record_job_data_skips_batched_jobs(temp_dir, mock_model_reference, mock
     assert len(data) == 1
 
 
-def test_prepare_model_dump_adds_scheduler(mock_model_reference, mock_job_info):
+def test_prepare_model_dump_adds_scheduler(
+    mock_model_reference: StableDiffusion_ModelReference,
+    mock_job_info: MagicMock,
+) -> None:
     """Test that _prepare_model_dump adds scheduler field."""
     recorder = KudosTrainingRecorder(
         training_data_file="test.json",
@@ -189,7 +213,10 @@ def test_prepare_model_dump_adds_scheduler(mock_model_reference, mock_job_info):
     assert dump["sdk_api_job_info"]["payload"]["scheduler"] == "simple"
 
 
-def test_prepare_model_dump_adds_counts(mock_model_reference, mock_job_info):
+def test_prepare_model_dump_adds_counts(
+    mock_model_reference: StableDiffusion_ModelReference,
+    mock_job_info: MagicMock,
+) -> None:
     """Test that _prepare_model_dump adds lora and TI counts."""
     recorder = KudosTrainingRecorder(
         training_data_file="test.json",
@@ -216,7 +243,10 @@ def test_prepare_model_dump_adds_counts(mock_model_reference, mock_job_info):
     assert dump["sdk_api_job_info"]["payload"]["ti_count"] == 1
 
 
-def test_prepare_model_dump_adds_model_baseline(mock_model_reference, mock_job_info):
+def test_prepare_model_dump_adds_model_baseline(
+    mock_model_reference: StableDiffusion_ModelReference,
+    mock_job_info: MagicMock,
+) -> None:
     """Test that _prepare_model_dump adds model baseline."""
     recorder = KudosTrainingRecorder(
         training_data_file="test.json",
@@ -229,7 +259,10 @@ def test_prepare_model_dump_adds_model_baseline(mock_model_reference, mock_job_i
     assert dump["sdk_api_job_info"]["model_baseline"] == STABLE_DIFFUSION_BASELINE_CATEGORY.stable_diffusion_1
 
 
-def test_prepare_model_dump_handles_extra_source_images(mock_model_reference, mock_job_info):
+def test_prepare_model_dump_handles_extra_source_images(
+    mock_model_reference: StableDiffusion_ModelReference,
+    mock_job_info: MagicMock,
+) -> None:
     """Test that _prepare_model_dump handles extra source images."""
     recorder = KudosTrainingRecorder(
         training_data_file="test.json",
@@ -247,7 +280,12 @@ def test_prepare_model_dump_handles_extra_source_images(mock_model_reference, mo
     assert dump["sdk_api_job_info"]["extra_source_images_combined_size"] == 300
 
 
-def test_record_job_data_skips_unknown_models(temp_dir, mock_model_reference, mock_job_info, monkeypatch):
+def test_record_job_data_skips_unknown_models(
+    temp_dir: str,
+    mock_model_reference: StableDiffusion_ModelReference,
+    mock_job_info: MagicMock,
+    monkeypatch: MonkeyPatch,
+) -> None:
     """Test that jobs with unknown models are skipped."""
     # Change to temp directory
     monkeypatch.chdir(temp_dir)
@@ -267,7 +305,11 @@ def test_record_job_data_skips_unknown_models(temp_dir, mock_model_reference, mo
     assert not file_path.exists()
 
 
-def test_record_job_data_handles_none_reference(temp_dir, mock_job_info, monkeypatch):
+def test_record_job_data_handles_none_reference(
+    temp_dir: str,
+    mock_job_info: MagicMock,
+    monkeypatch: MonkeyPatch,
+) -> None:
     """Test that jobs are skipped when model reference is None."""
     # Change to temp directory
     monkeypatch.chdir(temp_dir)
@@ -284,7 +326,11 @@ def test_record_job_data_handles_none_reference(temp_dir, mock_job_info, monkeyp
     assert not file_path.exists()
 
 
-def test_get_file_path_with_rotation(temp_dir, mock_model_reference, monkeypatch):
+def test_get_file_path_with_rotation(
+    temp_dir: str,
+    mock_model_reference: StableDiffusion_ModelReference,
+    monkeypatch: MonkeyPatch,
+) -> None:
     """Test file rotation when file exceeds 2MB."""
     # Change to temp directory
     monkeypatch.chdir(temp_dir)

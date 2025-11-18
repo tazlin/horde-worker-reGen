@@ -1,10 +1,7 @@
 import asyncio
 import asyncio.exceptions
-import base64
 import collections
 import enum
-import json
-import math
 import multiprocessing
 import os
 import queue
@@ -25,8 +22,6 @@ from multiprocessing.synchronize import Semaphore
 import aiohttp
 import aiohttp.client_exceptions
 import certifi
-import PIL
-import PIL.Image
 import psutil
 import yarl
 from aiohttp import ClientSession
@@ -49,7 +44,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     SingleWorkerDetailsResponse,
     UserDetailsResponse,
 )
-from horde_sdk.ai_horde_api.consts import KNOWN_UPSCALERS, METADATA_TYPE, METADATA_VALUE
+from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from horde_sdk.ai_horde_api.fields import JobID
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, RootModel, ValidationError
@@ -61,7 +56,6 @@ from horde_worker_regen.bridge_data.load_config import BridgeDataLoader
 from horde_worker_regen.consts import (
     BRIDGE_CONFIG_FILENAME,
     KNOWN_CONTROLNET_WORKFLOWS,
-    KNOWN_SLOW_MODELS_DIFFICULTIES,
     KNOWN_SLOW_WORKFLOWS,
     MAX_SOURCE_IMAGE_RETRIES,
     VRAM_HEAVY_MODELS,
@@ -96,7 +90,9 @@ from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMe
 from horde_worker_regen.reporting.status_reporter import StatusReporter
 from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer as _base64_image_to_stream_buffer
 from horde_worker_regen.utils.job_queue_analyzer import JobQueueAnalyzer
-from horde_worker_regen.utils.job_utils import get_single_job_effective_megapixelsteps as _get_single_job_effective_megapixelsteps
+from horde_worker_regen.utils.job_utils import (
+    get_single_job_effective_megapixelsteps as _get_single_job_effective_megapixelsteps,
+)
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
 
@@ -1966,14 +1962,14 @@ class HordeWorkerProcessManager:
                     != HordeProcessState.UNLOADED_MODEL_FROM_RAM
                 ):
                     logger.opt(ansi=True).info(
-                        "<fg #7b7d7d>" f"Process {message.process_id} cleared RAM: {message.info}" "</>",
+                        f"<fg #7b7d7d>Process {message.process_id} cleared RAM: {message.info}</>",
                     )
                     self._process_map.on_model_ram_clear(process_id=message.process_id)
 
             if isinstance(message, HordeAuxModelStateChangeMessage):
                 if message.process_state == HordeProcessState.DOWNLOADING_AUX_MODEL:
                     logger.opt(ansi=True).info(
-                        "<fg #7b7d7d>" f"Process {message.process_id} is downloading extra models (LoRas, etc.)" "</>",
+                        f"<fg #7b7d7d>Process {message.process_id} is downloading extra models (LoRas, etc.)</>",
                     )
                     self._process_map.on_last_job_reference_change(
                         process_id=message.process_id,
@@ -2043,7 +2039,7 @@ class HordeWorkerProcessManager:
                 else:
                     # FIXME this message is wrong for download processes
                     logger.opt(ansi=True).info(
-                        "<fg #7b7d7d>" f"Process {message.process_id} unloaded model {message.horde_model_name}" "</>",
+                        f"<fg #7b7d7d>Process {message.process_id} unloaded model {message.horde_model_name}</>",
                     )
 
             # If the process is sending us an inference job result:
@@ -3102,7 +3098,7 @@ class HordeWorkerProcessManager:
                 return new_submit
 
             error_string = (
-                f"Failed to submit job (API Error) " f"{new_submit.retry_attempts_string}: {job_submit_response}"
+                f"Failed to submit job (API Error) {new_submit.retry_attempts_string}: {job_submit_response}"
             )
             logger.error(error_string)
             new_submit.retry()
@@ -3190,8 +3186,7 @@ class HordeWorkerProcessManager:
 
         if completed_job_info.state == GENERATION_STATE.faulted:
             logger.error(
-                f"Job {job_info.ids} faulted, "
-                "removing from completed jobs after submitting the faults to the horde",
+                f"Job {job_info.ids} faulted, removing from completed jobs after submitting the faults to the horde",
             )
             self._consecutive_failed_jobs += 1
 
@@ -3502,7 +3497,6 @@ class HordeWorkerProcessManager:
                     and len(download_extra_source_images) != len(job_pop_response.extra_source_images)
                 )
             ):
-
                 download_tasks.append(
                     asyncio.create_task(
                         job_pop_response.async_download_extra_source_images(
@@ -3961,7 +3955,7 @@ class HordeWorkerProcessManager:
                     jobs.append(f"<{str(job.id_)[:8]}: {job.model}>")
                 else:
                     jobs.append(f"<{job.model}>")
-            logger.info(f'Job queue: {", ".join(jobs)}')
+            logger.info(f"Job queue: {', '.join(jobs)}")
             # self._testing_jobs_added += 1
             self.job_pop_timestamps[job_pop_response] = time.time()
             self.jobs_lookup[job_pop_response] = HordeJobInfo(

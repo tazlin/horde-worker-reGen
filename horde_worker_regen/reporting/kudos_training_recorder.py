@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -81,8 +80,7 @@ class KudosTrainingRecorder:
 
         except Exception as e:
             logger.error(
-                f"Failed to write kudos training data for job {job_info.sdk_api_job_info.id_} "
-                f"{type(e)}: {e}",
+                f"Failed to write kudos training data for job {job_info.sdk_api_job_info.id_} {type(e)}: {e}",
             )
 
     def _get_file_path_with_rotation(self) -> str:
@@ -125,13 +123,10 @@ class KudosTrainingRecorder:
         )
 
         # Add model baseline
-        if (
-            self.stable_diffusion_reference is not None
-            and job_info.sdk_api_job_info.model is not None
-        ):
-            model_dump["sdk_api_job_info"]["model_baseline"] = (
-                self.stable_diffusion_reference.root[job_info.sdk_api_job_info.model].baseline
-            )
+        if self.stable_diffusion_reference is not None and job_info.sdk_api_job_info.model is not None:
+            model_dump["sdk_api_job_info"]["model_baseline"] = self.stable_diffusion_reference.root[
+                job_info.sdk_api_job_info.model
+            ].baseline
 
         # Add scheduler information (preparation for multiple schedulers)
         if job_info.sdk_api_job_info.payload.karras:
@@ -154,9 +149,7 @@ class KudosTrainingRecorder:
 
         # Add extra source images count and size
         model_dump["sdk_api_job_info"]["extra_source_images_count"] = (
-            len(job_info.sdk_api_job_info.extra_source_images)
-            if job_info.sdk_api_job_info.extra_source_images
-            else 0
+            len(job_info.sdk_api_job_info.extra_source_images) if job_info.sdk_api_job_info.extra_source_images else 0
         )
 
         esi_combined_size = 0

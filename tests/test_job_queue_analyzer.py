@@ -2,8 +2,6 @@
 
 from unittest.mock import Mock
 
-import pytest
-
 from horde_worker_regen.utils.job_queue_analyzer import JobQueueAnalyzer
 
 
@@ -38,7 +36,7 @@ def create_mock_job(
     return job
 
 
-def test_calculate_pending_megapixelsteps_empty_queues():
+def test_calculate_pending_megapixelsteps_empty_queues() -> None:
     """Test calculating pending megapixelsteps with empty queues."""
     result = JobQueueAnalyzer.calculate_pending_megapixelsteps(
         jobs_pending_inference=[],
@@ -48,7 +46,7 @@ def test_calculate_pending_megapixelsteps_empty_queues():
     assert result == 0
 
 
-def test_calculate_pending_megapixelsteps_single_job():
+def test_calculate_pending_megapixelsteps_single_job() -> None:
     """Test calculating pending megapixelsteps with a single job."""
     job = create_mock_job(width=512, height=512, ddim_steps=30, n_iter=1)
 
@@ -62,7 +60,7 @@ def test_calculate_pending_megapixelsteps_single_job():
     assert result == 7
 
 
-def test_calculate_pending_megapixelsteps_multiple_jobs():
+def test_calculate_pending_megapixelsteps_multiple_jobs() -> None:
     """Test calculating pending megapixelsteps with multiple jobs."""
     job1 = create_mock_job(width=512, height=512, ddim_steps=30, n_iter=1)
     job2 = create_mock_job(width=1024, height=1024, ddim_steps=50, n_iter=1)
@@ -76,7 +74,7 @@ def test_calculate_pending_megapixelsteps_multiple_jobs():
     assert result == 59
 
 
-def test_calculate_pending_megapixelsteps_with_submit_queue():
+def test_calculate_pending_megapixelsteps_with_submit_queue() -> None:
     """Test calculating pending megapixelsteps with jobs pending submit."""
     job = create_mock_job(width=512, height=512, ddim_steps=30, n_iter=1)
 
@@ -89,7 +87,7 @@ def test_calculate_pending_megapixelsteps_with_submit_queue():
     assert result == 15
 
 
-def test_calculate_pending_megapixelsteps_only_submit_queue():
+def test_calculate_pending_megapixelsteps_only_submit_queue() -> None:
     """Test calculating pending megapixelsteps with only jobs pending submit."""
     result = JobQueueAnalyzer.calculate_pending_megapixelsteps(
         jobs_pending_inference=[],
@@ -100,7 +98,7 @@ def test_calculate_pending_megapixelsteps_only_submit_queue():
     assert result == 20
 
 
-def test_calculate_pending_megapixelsteps_large_job():
+def test_calculate_pending_megapixelsteps_large_job() -> None:
     """Test calculating pending megapixelsteps with a large resolution job."""
     job = create_mock_job(width=2048, height=2048, ddim_steps=100, n_iter=1)
 
@@ -113,7 +111,7 @@ def test_calculate_pending_megapixelsteps_large_job():
     assert result == 419
 
 
-def test_calculate_pending_megapixelsteps_batched_job():
+def test_calculate_pending_megapixelsteps_batched_job() -> None:
     """Test calculating pending megapixelsteps with a batched job (n_iter > 1)."""
     job = create_mock_job(width=512, height=512, ddim_steps=30, n_iter=4)
 
@@ -127,7 +125,7 @@ def test_calculate_pending_megapixelsteps_batched_job():
     assert result == 12
 
 
-def test_should_wait_for_pending_megapixelsteps_below_limit():
+def test_should_wait_for_pending_megapixelsteps_below_limit() -> None:
     """Test should_wait when pending is below limit."""
     result = JobQueueAnalyzer.should_wait_for_pending_megapixelsteps(
         pending_megapixelsteps=50,
@@ -137,7 +135,7 @@ def test_should_wait_for_pending_megapixelsteps_below_limit():
     assert result is False
 
 
-def test_should_wait_for_pending_megapixelsteps_at_limit():
+def test_should_wait_for_pending_megapixelsteps_at_limit() -> None:
     """Test should_wait when pending equals limit."""
     result = JobQueueAnalyzer.should_wait_for_pending_megapixelsteps(
         pending_megapixelsteps=100,
@@ -147,7 +145,7 @@ def test_should_wait_for_pending_megapixelsteps_at_limit():
     assert result is False
 
 
-def test_should_wait_for_pending_megapixelsteps_above_limit():
+def test_should_wait_for_pending_megapixelsteps_above_limit() -> None:
     """Test should_wait when pending exceeds limit."""
     result = JobQueueAnalyzer.should_wait_for_pending_megapixelsteps(
         pending_megapixelsteps=150,
@@ -157,7 +155,7 @@ def test_should_wait_for_pending_megapixelsteps_above_limit():
     assert result is True
 
 
-def test_should_wait_for_pending_megapixelsteps_slightly_above():
+def test_should_wait_for_pending_megapixelsteps_slightly_above() -> None:
     """Test should_wait when pending slightly exceeds limit."""
     result = JobQueueAnalyzer.should_wait_for_pending_megapixelsteps(
         pending_megapixelsteps=101,
@@ -167,7 +165,7 @@ def test_should_wait_for_pending_megapixelsteps_slightly_above():
     assert result is True
 
 
-def test_should_wait_for_pending_megapixelsteps_zero():
+def test_should_wait_for_pending_megapixelsteps_zero() -> None:
     """Test should_wait when pending is zero."""
     result = JobQueueAnalyzer.should_wait_for_pending_megapixelsteps(
         pending_megapixelsteps=0,
@@ -177,7 +175,7 @@ def test_should_wait_for_pending_megapixelsteps_zero():
     assert result is False
 
 
-def test_should_wait_for_pending_megapixelsteps_zero_limit():
+def test_should_wait_for_pending_megapixelsteps_zero_limit() -> None:
     """Test should_wait with zero limit (edge case)."""
     result = JobQueueAnalyzer.should_wait_for_pending_megapixelsteps(
         pending_megapixelsteps=1,
@@ -187,7 +185,7 @@ def test_should_wait_for_pending_megapixelsteps_zero_limit():
     assert result is True
 
 
-def test_calculate_pending_megapixelsteps_mixed_sizes():
+def test_calculate_pending_megapixelsteps_mixed_sizes() -> None:
     """Test calculating pending megapixelsteps with various job sizes."""
     jobs = [
         create_mock_job(width=512, height=512, ddim_steps=20, n_iter=1),

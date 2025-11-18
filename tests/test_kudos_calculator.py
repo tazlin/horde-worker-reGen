@@ -3,12 +3,10 @@
 import time
 from collections import deque
 
-import pytest
-
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 
 
-def test_calculate_kudos_per_hour_normal():
+def test_calculate_kudos_per_hour_normal() -> None:
     """Test kudos per hour calculation with normal values."""
     kudos_generated = 100.0
     time_elapsed = 1800  # 30 minutes
@@ -19,7 +17,7 @@ def test_calculate_kudos_per_hour_normal():
     assert result == 200.0
 
 
-def test_calculate_kudos_per_hour_zero_time():
+def test_calculate_kudos_per_hour_zero_time() -> None:
     """Test kudos per hour calculation with zero time elapsed."""
     kudos_generated = 100.0
     time_elapsed = 0
@@ -29,7 +27,7 @@ def test_calculate_kudos_per_hour_zero_time():
     assert result == 0.0
 
 
-def test_calculate_kudos_per_hour_one_hour():
+def test_calculate_kudos_per_hour_one_hour() -> None:
     """Test kudos per hour calculation with exactly one hour."""
     kudos_generated = 150.0
     time_elapsed = 3600  # 1 hour
@@ -39,7 +37,7 @@ def test_calculate_kudos_per_hour_one_hour():
     assert result == 150.0
 
 
-def test_calculate_active_kudos_per_hour_normal():
+def test_calculate_active_kudos_per_hour_normal() -> None:
     """Test active kudos per hour calculation with normal values."""
     kudos_generated = 100.0
     time_elapsed = 1800  # 30 minutes
@@ -55,7 +53,7 @@ def test_calculate_active_kudos_per_hour_normal():
     assert result == 240.0
 
 
-def test_calculate_active_kudos_per_hour_no_idle_time():
+def test_calculate_active_kudos_per_hour_no_idle_time() -> None:
     """Test active kudos per hour calculation with no idle time."""
     kudos_generated = 100.0
     time_elapsed = 1800  # 30 minutes
@@ -71,7 +69,7 @@ def test_calculate_active_kudos_per_hour_no_idle_time():
     assert result == 200.0
 
 
-def test_calculate_active_kudos_per_hour_all_idle():
+def test_calculate_active_kudos_per_hour_all_idle() -> None:
     """Test active kudos per hour calculation when all time is idle."""
     kudos_generated = 100.0
     time_elapsed = 1800  # 30 minutes
@@ -87,7 +85,7 @@ def test_calculate_active_kudos_per_hour_all_idle():
     assert result == 0.0
 
 
-def test_calculate_active_kudos_per_hour_more_idle_than_elapsed():
+def test_calculate_active_kudos_per_hour_more_idle_than_elapsed() -> None:
     """Test active kudos per hour calculation when idle time exceeds elapsed time."""
     kudos_generated = 100.0
     time_elapsed = 1800  # 30 minutes
@@ -103,7 +101,7 @@ def test_calculate_active_kudos_per_hour_more_idle_than_elapsed():
     assert result == 0.0
 
 
-def test_calculate_kudos_totals_past_hour_all_recent():
+def test_calculate_kudos_totals_past_hour_all_recent() -> None:
     """Test calculating kudos totals when all events are within past hour."""
     current_time = time.time()
     kudos_events = deque(
@@ -121,7 +119,7 @@ def test_calculate_kudos_totals_past_hour_all_recent():
     assert len(cleaned) == 3
 
 
-def test_calculate_kudos_totals_past_hour_some_old():
+def test_calculate_kudos_totals_past_hour_some_old() -> None:
     """Test calculating kudos totals when some events are older than 1 hour."""
     current_time = time.time()
     kudos_events = deque(
@@ -140,7 +138,7 @@ def test_calculate_kudos_totals_past_hour_some_old():
     assert len(cleaned) == 2
 
 
-def test_calculate_kudos_totals_past_hour_all_old():
+def test_calculate_kudos_totals_past_hour_all_old() -> None:
     """Test calculating kudos totals when all events are older than 1 hour."""
     current_time = time.time()
     kudos_events = deque(
@@ -157,7 +155,7 @@ def test_calculate_kudos_totals_past_hour_all_old():
     assert len(cleaned) == 0
 
 
-def test_calculate_kudos_totals_past_hour_empty():
+def test_calculate_kudos_totals_past_hour_empty() -> None:
     """Test calculating kudos totals with empty events."""
     kudos_events = deque([], maxlen=100)
 
@@ -167,7 +165,7 @@ def test_calculate_kudos_totals_past_hour_empty():
     assert len(cleaned) == 0
 
 
-def test_calculate_kudos_totals_past_hour_maxlen_preserved():
+def test_calculate_kudos_totals_past_hour_maxlen_preserved() -> None:
     """Test that maxlen is preserved in cleaned deque."""
     current_time = time.time()
     original_maxlen = 50
@@ -184,7 +182,7 @@ def test_calculate_kudos_totals_past_hour_maxlen_preserved():
     assert cleaned.maxlen == original_maxlen
 
 
-def test_calculate_all_metrics_integration():
+def test_calculate_all_metrics_integration() -> None:
     """Test calculate_all_metrics returns all expected values."""
     current_time = time.time()
     kudos_generated_this_session = 200.0
@@ -228,7 +226,7 @@ def test_calculate_all_metrics_integration():
     assert len(cleaned_events) == 2
 
 
-def test_calculate_all_metrics_with_old_events():
+def test_calculate_all_metrics_with_old_events() -> None:
     """Test calculate_all_metrics properly cleans old events."""
     current_time = time.time()
     kudos_generated_this_session = 300.0
@@ -264,7 +262,7 @@ def test_calculate_all_metrics_with_old_events():
     assert len(cleaned_events) == 2
 
 
-def test_calculate_all_metrics_no_idle_time():
+def test_calculate_all_metrics_no_idle_time() -> None:
     """Test calculate_all_metrics with no idle time."""
     current_time = time.time()
     kudos_generated_this_session = 100.0
