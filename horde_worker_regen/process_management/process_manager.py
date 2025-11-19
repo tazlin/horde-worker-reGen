@@ -84,6 +84,14 @@ from horde_worker_regen.process_management.messages import (
     ModelLoadState,
 )
 from horde_worker_regen.process_management.worker_entry_points import start_inference_process, start_safety_process
+
+# Mock process imports (for testing/development)
+from horde_worker_regen.process_management.mock import (
+    MockConfig,
+    start_mock_inference_process,
+    start_mock_safety_process,
+)
+
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
@@ -1297,6 +1305,12 @@ class HordeWorkerProcessManager:
 
         self.horde_model_reference_manager = horde_model_reference_manager
 
+        # Create mock config if mock mode is enabled
+        self._mock_config: MockConfig | None = None
+        if bridge_data.enable_mock_processes:
+            self._mock_config = MockConfig.from_bridge_data(bridge_data)
+            logger.info(f"Mock mode active with config: {self._mock_config.to_dict()}")
+
         self._process_map = ProcessMap({})
         self._horde_model_map = HordeModelMap(root={})
 
@@ -1570,23 +1584,39 @@ class HordeWorkerProcessManager:
 
             cpu_only = not self.bridge_data.safety_on_gpu
 
-            # Create a new process that will run the start_safety_process function
-            process = multiprocessing.Process(
-                target=start_safety_process,
-                args=(
-                    pid,
-                    self._process_message_queue,
-                    child_pipe_connection,
-                    self._disk_lock,
-                    self.num_processes_launched,
-                    cpu_only,
-                ),
-                kwargs={
-                    "high_memory_mode": self.bridge_data.high_memory_mode,
-                    "amd_gpu": self._amd_gpu,
-                    "directml": self._directml,
-                },
-            )
+            # Create a new process that will run the safety process function
+            # Use mock process if mock mode is enabled, otherwise use real GPU process
+            if self.bridge_data.enable_mock_processes:
+                # Use mock process (no GPU required)
+                process = multiprocessing.Process(
+                    target=start_mock_safety_process,
+                    args=(
+                        pid,
+                        self._process_message_queue,
+                        child_pipe_connection,
+                        self._disk_lock,
+                        self.num_processes_launched,
+                        self._mock_config,  # Pass mock config
+                    ),
+                )
+            else:
+                # Use real process (requires GPU)
+                process = multiprocessing.Process(
+                    target=start_safety_process,
+                    args=(
+                        pid,
+                        self._process_message_queue,
+                        child_pipe_connection,
+                        self._disk_lock,
+                        self.num_processes_launched,
+                        cpu_only,
+                    ),
+                    kwargs={
+                        "high_memory_mode": self.bridge_data.high_memory_mode,
+                        "amd_gpu": self._amd_gpu,
+                        "directml": self._directml,
+                    },
+                )
 
             process.start()
 
@@ -1640,27 +1670,46 @@ class HordeWorkerProcessManager:
         vram_heavy_models = any(model in VRAM_HEAVY_MODELS for model in self.bridge_data.image_models_to_load)
 
         pipe_connection, child_pipe_connection = multiprocessing.Pipe(duplex=True)
-        # Create a new process that will run the start_inference_process function
-        process = multiprocessing.Process(
-            target=start_inference_process,
-            args=(
-                pid,
-                self._process_message_queue,
-                child_pipe_connection,
-                self._inference_semaphore,
-                self._disk_lock,
-                self._aux_model_lock,
-                self._vae_decode_semaphore,
-                self.num_processes_launched,
-            ),
-            kwargs={
-                "very_high_memory_mode": self.bridge_data.very_high_memory_mode,
-                "high_memory_mode": self.bridge_data.high_memory_mode,
-                "amd_gpu": self._amd_gpu,
-                "directml": self._directml,
-                "vram_heavy_models": vram_heavy_models,
-            },
-        )
+
+        # Choose between real and mock inference processes
+        if self.bridge_data.enable_mock_processes:
+            # Use mock process (no GPU required)
+            process = multiprocessing.Process(
+                target=start_mock_inference_process,
+                args=(
+                    pid,
+                    self._process_message_queue,
+                    child_pipe_connection,
+                    self._inference_semaphore,
+                    self._disk_lock,
+                    self._aux_model_lock,
+                    self._vae_decode_semaphore,
+                    self.num_processes_launched,
+                    self._mock_config,  # Pass mock config
+                ),
+            )
+        else:
+            # Use real process (requires GPU)
+            process = multiprocessing.Process(
+                target=start_inference_process,
+                args=(
+                    pid,
+                    self._process_message_queue,
+                    child_pipe_connection,
+                    self._inference_semaphore,
+                    self._disk_lock,
+                    self._aux_model_lock,
+                    self._vae_decode_semaphore,
+                    self.num_processes_launched,
+                ),
+                kwargs={
+                    "very_high_memory_mode": self.bridge_data.very_high_memory_mode,
+                    "high_memory_mode": self.bridge_data.high_memory_mode,
+                    "amd_gpu": self._amd_gpu,
+                    "directml": self._directml,
+                    "vram_heavy_models": vram_heavy_models,
+                },
+            )
         process.start()
         # Add the process to the process map
         process_info = HordeProcessInfo(
