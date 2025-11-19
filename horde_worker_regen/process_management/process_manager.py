@@ -92,6 +92,19 @@ from horde_worker_regen.process_management.mock import (
     start_mock_safety_process,
 )
 
+# Event system imports
+from horde_worker_regen.events import (
+    EventDispatcher,
+    JobCompletedEvent,
+    JobPoppedEvent,
+    JobStartedEvent,
+    ModelDownloadStartedEvent,
+    ModelLoadedEvent,
+    ProcessHeartbeatEvent,
+    ProcessMemoryUpdatedEvent,
+    ProcessStateChangedEvent,
+)
+
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
@@ -362,6 +375,11 @@ class ProcessMap(dict[int, HordeProcessInfo]):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    def __init__(self, *args, event_dispatcher: EventDispatcher | None = None, **kwargs):
+        """Initialize ProcessMap with optional event dispatcher."""
+        super().__init__(*args, **kwargs)
+        self._event_dispatcher = event_dispatcher
+
     def on_heartbeat(
         self,
         process_id: int,
@@ -387,6 +405,16 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             self[process_id].heartbeats_inference_steps = 0
 
         self[process_id].last_heartbeat_percent_complete = percent_complete
+
+        # Emit heartbeat event
+        if self._event_dispatcher:
+            event = ProcessHeartbeatEvent(
+                process_id=process_id,
+                heartbeat_type=heartbeat_type,
+                state=self[process_id].last_process_state,
+                percent_complete=percent_complete,
+            )
+            self._event_dispatcher.emit(event)
 
     def on_process_ending(self, process_id: int) -> None:
         """Update the process map when a process has ended.
@@ -430,6 +458,16 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             f"ram: {ram_usage_bytes} vram: {vram_usage_bytes} total vram: {total_vram_bytes}",
         )
 
+        # Emit memory update event
+        if self._event_dispatcher:
+            event = ProcessMemoryUpdatedEvent(
+                process_id=process_id,
+                ram_usage_bytes=ram_usage_bytes,
+                vram_usage_bytes=vram_usage_bytes or 0,
+                total_vram_bytes=total_vram_bytes or 0,
+            )
+            self._event_dispatcher.emit(event)
+
     def on_process_state_change(self, process_id: int, new_state: HordeProcessState) -> None:
         """Update the process state for the given process ID.
 
@@ -437,8 +475,19 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             process_id (int): The ID of the process to update.
             new_state (HordeProcessState): The new state of the process.
         """
+        old_state = self[process_id].last_process_state
         self[process_id].last_process_state = new_state
         self[process_id].last_received_timestamp = time.time()
+
+        # Emit process state change event
+        if self._event_dispatcher:
+            event = ProcessStateChangedEvent(
+                process_id=process_id,
+                old_state=old_state,
+                new_state=new_state,
+                loaded_model_name=self[process_id].loaded_horde_model_name,
+            )
+            self._event_dispatcher.emit(event)
 
         if (
             new_state == HordeProcessState.INFERENCE_COMPLETE
@@ -1311,7 +1360,11 @@ class HordeWorkerProcessManager:
             self._mock_config = MockConfig.from_bridge_data(bridge_data)
             logger.info(f"Mock mode active with config: {self._mock_config.to_dict()}")
 
-        self._process_map = ProcessMap({})
+        # Create event dispatcher for terminal UI and monitoring
+        self.event_dispatcher = EventDispatcher(enable_logging=False)
+        logger.debug("Event dispatcher initialized")
+
+        self._process_map = ProcessMap({}, event_dispatcher=self.event_dispatcher)
         self._horde_model_map = HordeModelMap(root={})
 
         self.max_safety_processes = max_safety_processes
@@ -3998,6 +4051,16 @@ class HordeWorkerProcessManager:
 
         async with self._jobs_pending_inference_lock, self._job_pop_timestamps_lock:
             self.jobs_pending_inference.append(job_pop_response)
+
+            # Emit job popped event
+            if job_pop_response.id_ is not None:
+                event = JobPoppedEvent(
+                    job_id=JobID(job_pop_response.id_),
+                    model_name=job_pop_response.model,
+                    queue_position=len(self.jobs_pending_inference),
+                )
+                self.event_dispatcher.emit(event)
+
             jobs = []
             for job in self.jobs_pending_inference:
                 if job.id_ is not None:
