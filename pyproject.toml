@@ -26,6 +26,8 @@ classifiers = [
 "Homepage" = "https://github.com/Haidra-Org/AI-Horde-Worker"
 "Bug Tracker" = "https://github.com/Haidra-Org/AI-Horde-Worker"
 
+[project.optional-dependencies]
+tui = ["textual>=0.47.0"]
 
 [project.scripts]
 run_worker = "horde_worker_regen.run_worker:start"

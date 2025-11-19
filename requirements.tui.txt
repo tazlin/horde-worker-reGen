@@ -1,0 +1,2 @@
+# Optional dependencies for the Textual UI dashboard
+textual>=0.47.0

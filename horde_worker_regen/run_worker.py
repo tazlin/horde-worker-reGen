@@ -25,6 +25,7 @@ def main(
     *,
     amd_gpu: bool = False,
     directml: int | None = None,
+    use_tui: bool = False,
 ) -> None:
     """Check for a valid config and start the driver ('main') process for the reGen worker."""
     from horde_model_reference.model_reference_manager import ModelReferenceManager
@@ -105,6 +106,7 @@ def main(
         horde_model_reference_manager=horde_model_reference_manager,
         amd_gpu=amd_gpu,
         directml=directml,
+        use_tui=use_tui,
     )
 
     logger.info("Worker has finished working.")
@@ -204,6 +206,12 @@ def init() -> None:
         default=None,
         help="Enable directml and specify device to use.",
     )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        default=False,
+        help="Enable the Textual UI dashboard for monitoring the worker (requires textual package)",
+    )
 
     args = parser.parse_args()
 
@@ -263,6 +271,7 @@ def init() -> None:
         args.load_config_from_env_vars,
         amd_gpu=args.amd,
         directml=args.directml,
+        use_tui=args.tui,
     )
 
 
