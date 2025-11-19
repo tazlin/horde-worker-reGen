@@ -25,6 +25,9 @@ def main(
     *,
     amd_gpu: bool = False,
     directml: int | None = None,
+    enable_mock: bool = False,
+    mock_speed: float | None = None,
+    mock_scenario: str | None = None,
 ) -> None:
     """Check for a valid config and start the driver ('main') process for the reGen worker."""
     from horde_model_reference.model_reference_manager import ModelReferenceManager
@@ -96,6 +99,17 @@ def main(
     if not bridge_data:
         logger.error("Failed to load bridge data. Exiting...")
         return
+
+    # Apply CLI overrides for mock configuration
+    if enable_mock:
+        bridge_data.enable_mock_processes = True
+        if mock_speed is not None:
+            bridge_data.mock_speed_multiplier = mock_speed
+        if mock_scenario is not None:
+            bridge_data.mock_scenario = mock_scenario
+
+        # Re-validate to trigger mock configuration warnings
+        bridge_data = bridge_data.model_validate(bridge_data.model_dump())
 
     bridge_data.load_env_vars()
 
@@ -205,12 +219,43 @@ def init() -> None:
         help="Enable directml and specify device to use.",
     )
 
+    # Mock process arguments (for testing/development without GPU)
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        default=False,
+        help="Enable mock processes for GPU-free testing (NOT for production use)",
+    )
+    parser.add_argument(
+        "--mock-speed",
+        type=float,
+        default=None,
+        help="Speed multiplier for mock processes (e.g., 10.0 for 10x faster). Requires --mock.",
+    )
+    parser.add_argument(
+        "--mock-scenario",
+        type=str,
+        default=None,
+        choices=["HAPPY_PATH", "RANDOM_FAILURES", "SLOW_INFERENCE", "STUCK_PROCESS",
+                 "DOWNLOAD_FAILURES", "MEMORY_PRESSURE", "RAPID_FIRE"],
+        help="Predefined mock scenario for testing specific behaviors. Requires --mock.",
+    )
+
     args = parser.parse_args()
 
     os.environ["HORDE_SDK_DISABLE_CUSTOM_SINKS"] = "1"
 
     if args.worker_name:
         os.environ["AIWORKER_DREAMER_WORKER_NAME"] = args.worker_name
+
+    # Validate mock process arguments
+    if args.mock_speed is not None and not args.mock:
+        logger.warning("--mock-speed requires --mock to be enabled. Ignoring.")
+        args.mock_speed = None
+
+    if args.mock_scenario is not None and not args.mock:
+        logger.warning("--mock-scenario requires --mock to be enabled. Ignoring.")
+        args.mock_scenario = None
 
     from horde_worker_regen.load_env_vars import load_env_vars_from_config
 
@@ -263,6 +308,9 @@ def init() -> None:
         args.load_config_from_env_vars,
         amd_gpu=args.amd,
         directml=args.directml,
+        enable_mock=args.mock,
+        mock_speed=args.mock_speed,
+        mock_scenario=args.mock_scenario,
     )
 
 
