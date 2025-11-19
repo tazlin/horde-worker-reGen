@@ -13,6 +13,7 @@ def start_working(
     *,
     amd_gpu: bool = False,
     directml: int | None = None,
+    enable_tui: bool = False,
 ) -> None:
     """Create and start process manager."""
     process_manager = HordeWorkerProcessManager(
@@ -21,6 +22,7 @@ def start_working(
         horde_model_reference_manager=horde_model_reference_manager,
         amd_gpu=amd_gpu,
         directml=directml,
+        enable_tui=enable_tui,
     )
 
     process_manager.start()

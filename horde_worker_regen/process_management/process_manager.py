@@ -1271,6 +1271,7 @@ class HordeWorkerProcessManager:
         max_download_processes: int = 1,
         amd_gpu: bool = False,
         directml: int | None = None,
+        enable_tui: bool = False,
     ) -> None:
         """Initialise the process manager.
 
@@ -1288,8 +1289,11 @@ class HordeWorkerProcessManager:
                 Defaults to 1.
             amd_gpu (bool, optional): Whether or not the GPU is an AMD GPU. Defaults to False.
             directml (int, optional): ID of the potential directml device. Defaults to None.
+            enable_tui (bool, optional): Whether or not to enable the Textual TUI interface. Defaults to False.
         """
         self.session_start_time = time.time()
+        self.enable_tui = enable_tui
+        self.tui_app = None
 
         self.bridge_data = bridge_data
         logger.debug(f"Models to load: {bridge_data.image_models_to_load}")
@@ -4577,8 +4581,40 @@ class HordeWorkerProcessManager:
     def start(self) -> None:
         """Start the process manager."""
         import signal
+        import threading
 
         signal.signal(signal.SIGINT, self.signal_handler)
+
+        # Initialize and start TUI if enabled
+        if self.enable_tui:
+            try:
+                from horde_worker_regen.tui import HordeWorkerTUI
+
+                self.tui_app = HordeWorkerTUI(
+                    bridge_data=self.bridge_data,
+                    process_manager=self,
+                )
+
+                # Run TUI in a separate thread
+                def run_tui() -> None:
+                    try:
+                        self.tui_app.run()
+                    except Exception as e:
+                        logger.error(f"TUI error: {e}")
+
+                tui_thread = threading.Thread(target=run_tui, daemon=True)
+                tui_thread.start()
+                logger.info("Textual TUI started")
+            except ImportError:
+                logger.error(
+                    "Textual TUI enabled but textual package not installed. "
+                    "Install it with: pip install textual"
+                )
+                self.enable_tui = False
+            except Exception as e:
+                logger.error(f"Failed to start TUI: {e}")
+                self.enable_tui = False
+
         asyncio.run(self._main_loop())
 
     def signal_handler(self, sig: int, frame: object) -> None:

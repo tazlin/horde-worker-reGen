@@ -22,3 +22,6 @@ StrEnum
 loguru
 
 babel
+
+# Optional: Textual TUI interface
+textual>=0.47.0
