@@ -1,0 +1,59 @@
+# Example bridgeData.yaml configuration for MOCK MODE
+# This configuration enables mock processes for testing the worker
+# without requiring GPU hardware.
+
+# ⚠️  WARNING: This configuration is for TESTING AND DEVELOPMENT ONLY!
+# Mock processes generate FAKE images, not real ones. Never use this in production!
+
+# Basic worker configuration
+dreamer_worker_name: "MockWorker_TestOnly"
+api_key: "your_test_api_key_here"  # Use a test API key, not your production key!
+
+# Model configuration (still required even in mock mode)
+image_models_to_load:
+  - "stable_diffusion_2.1"
+  - "SDXL_beta::stability.ai#6901"
+
+# Performance settings (ignored in mock mode, but keep for consistency)
+max_threads: 2
+max_power: 32
+queue_size: 1
+
+# MOCK MODE CONFIGURATION
+# Enable mock processes (no GPU required!)
+enable_mock_processes: true
+
+# Speed multiplier: Higher = faster testing
+# 1.0 = real-time, 10.0 = 10x faster, 100.0 = 100x faster
+mock_speed_multiplier: 10.0
+
+# Optional: Enable failure simulation for testing error handling
+mock_enable_failures: false
+mock_failure_rate: 0.05  # 5% of jobs will fail (if enabled)
+
+# Optional: Enable slowdown simulation for testing timeouts
+mock_enable_slowdowns: false
+mock_slowdown_rate: 0.1  # 10% of jobs will be slow (if enabled)
+mock_slowdown_multiplier: 3.0  # Slow jobs are 3x slower
+
+# Optional: Simulated resource usage
+mock_vram_usage_mb: 8192  # Pretend to use 8GB VRAM
+mock_ram_usage_mb: 4096   # Pretend to use 4GB RAM
+
+# Optional: Use a predefined scenario
+# Options: "HAPPY_PATH", "RANDOM_FAILURES", "SLOW_INFERENCE", "STUCK_PROCESS",
+#          "DOWNLOAD_FAILURES", "MEMORY_PRESSURE", "RAPID_FIRE"
+# mock_scenario: "RAPID_FIRE"  # Uncomment for 100x speed testing
+
+# Terminal UI (optional - for testing terminal UI)
+disable_terminal_ui: true  # Set to false when testing terminal UI
+
+# Other settings work as normal
+safety_on_gpu: false  # Mock safety process runs on CPU anyway
+allow_img2img: true
+allow_lora: true
+allow_controlnet: true
+allow_post_processing: true
+
+# Note: Even in mock mode, some settings like max_threads still affect
+# how many mock processes are created and how job queuing works.

@@ -115,6 +115,49 @@ class reGenBridgeData(CombinedHordeBridgeData):
     Set stats_output_frequency (in seconds) for control over the status message.
     """
 
+    # Mock process configuration (for testing/development)
+    enable_mock_processes: bool = Field(default=False)
+    """If true, use mock processes instead of real GPU processes (for testing/development).
+
+    ⚠️ WARNING: Mock processes generate fake images and should NEVER be used in production!
+    This mode is intended for testing the terminal UI, event system, and worker orchestration
+    without requiring GPU hardware.
+    """
+
+    mock_speed_multiplier: float = Field(default=1.0, ge=0.1, le=1000.0)
+    """Speed multiplier for mock processes (e.g., 10.0 = 10x faster, 0.1 = 10x slower).
+
+    Higher values speed up testing and development. Only applies when enable_mock_processes=True.
+    """
+
+    mock_enable_failures: bool = Field(default=False)
+    """Enable random job failures in mock processes for testing error handling."""
+
+    mock_failure_rate: float = Field(default=0.05, ge=0.0, le=1.0)
+    """Probability of job failure in mock processes (0.0-1.0). Default is 5% failure rate."""
+
+    mock_enable_slowdowns: bool = Field(default=False)
+    """Enable random job slowdowns in mock processes for testing timeout handling."""
+
+    mock_slowdown_rate: float = Field(default=0.1, ge=0.0, le=1.0)
+    """Probability of slow job in mock processes (0.0-1.0). Default is 10% slowdown rate."""
+
+    mock_slowdown_multiplier: float = Field(default=3.0, ge=1.0, le=100.0)
+    """How much slower a slow job should be in mock processes. Default is 3x slower."""
+
+    mock_vram_usage_mb: int = Field(default=8192, ge=0)
+    """Simulated VRAM usage for mock processes in megabytes. Default is 8GB."""
+
+    mock_ram_usage_mb: int = Field(default=4096, ge=0)
+    """Simulated RAM usage for mock processes in megabytes. Default is 4GB."""
+
+    mock_scenario: str | None = Field(default=None)
+    """Predefined mock scenario name for testing specific behaviors.
+
+    Options: "HAPPY_PATH", "RANDOM_FAILURES", "SLOW_INFERENCE", "STUCK_PROCESS",
+    "DOWNLOAD_FAILURES", "MEMORY_PRESSURE", "RAPID_FIRE"
+    """
+
     @model_validator(mode="after")
     def validate_performance_modes(self) -> reGenBridgeData:
         """Validate the performance modes and set the appropriate values.
@@ -136,6 +179,33 @@ class reGenBridgeData(CombinedHordeBridgeData):
             return AIWORKER_DREAMER_WORKER_NAME
 
         return value
+
+    @model_validator(mode="after")
+    def validate_mock_configuration(self) -> reGenBridgeData:
+        """Validate and warn about mock process configuration."""
+        if self.enable_mock_processes:
+            logger.warning("=" * 80)
+            logger.warning("⚠️  MOCK MODE ENABLED ⚠️")
+            logger.warning("=" * 80)
+            logger.warning("Mock processes will be used instead of real GPU processes!")
+            logger.warning("Generated images will be FAKE placeholders, NOT real images.")
+            logger.warning("This mode is for TESTING AND DEVELOPMENT ONLY.")
+            logger.warning("DO NOT use mock mode in production or for real work!")
+            logger.warning("=" * 80)
+
+            if self.mock_scenario:
+                logger.info(f"Mock scenario: {self.mock_scenario}")
+            if self.mock_speed_multiplier != 1.0:
+                logger.info(f"Mock speed multiplier: {self.mock_speed_multiplier}x")
+            if self.mock_enable_failures:
+                logger.info(f"Mock failure simulation enabled ({self.mock_failure_rate * 100:.1f}% rate)")
+            if self.mock_enable_slowdowns:
+                logger.info(
+                    f"Mock slowdown simulation enabled ({self.mock_slowdown_rate * 100:.1f}% rate, "
+                    f"{self.mock_slowdown_multiplier}x slower)",
+                )
+
+        return self
 
     def prepare_custom_models(self) -> None:
         """Prepare the custom models."""
