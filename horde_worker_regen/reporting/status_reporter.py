@@ -16,7 +16,8 @@ if TYPE_CHECKING:
     from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, UserDetailsResponse
 
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-    from horde_worker_regen.process_management.process_manager import APIWorkerMessage, TorchDeviceMap
+    from horde_worker_regen.process_management.device_info import TorchDeviceMap
+    from horde_worker_regen.process_management.job_models import APIWorkerMessage
 
 
 class StatusReporter:

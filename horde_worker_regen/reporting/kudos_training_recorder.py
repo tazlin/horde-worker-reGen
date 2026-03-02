@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -11,7 +10,7 @@ from horde_model_reference.model_reference_records import StableDiffusion_ModelR
 from loguru import logger
 
 if TYPE_CHECKING:
-    from horde_worker_regen.process_management.process_manager import HordeJobInfo
+    from horde_worker_regen.process_management.job_models import HordeJobInfo
 
 
 _excludes_for_job_dump = {
@@ -116,55 +115,40 @@ class KudosTrainingRecorder:
         Returns:
             A dictionary containing the job data ready for JSON serialization.
         """
-        model_dump = copy.deepcopy(
-            job_info.model_dump(
-                exclude=_excludes_for_job_dump,  # type: ignore
-            ),
+        model_dump = job_info.model_dump(
+            exclude=_excludes_for_job_dump,  # type: ignore
+            mode="json",
         )
+
+        api_job = model_dump["sdk_api_job_info"]
+        payload = api_job["payload"]
 
         # Add model baseline
         if self.stable_diffusion_reference is not None and job_info.sdk_api_job_info.model is not None:
-            model_dump["sdk_api_job_info"]["model_baseline"] = self.stable_diffusion_reference.root[
-                job_info.sdk_api_job_info.model
-            ].baseline
+            api_job["model_baseline"] = self.stable_diffusion_reference.root[job_info.sdk_api_job_info.model].baseline
 
         # Add scheduler information (preparation for multiple schedulers)
-        if job_info.sdk_api_job_info.payload.karras:
-            model_dump["sdk_api_job_info"]["payload"]["scheduler"] = "karras"
-        else:
-            model_dump["sdk_api_job_info"]["payload"]["scheduler"] = "simple"
-        model_dump["sdk_api_job_info"]["payload"].pop("karras", None)
+        payload["scheduler"] = "karras" if job_info.sdk_api_job_info.payload.karras else "simple"
+        payload.pop("karras", None)
 
         # Add lora and TI counts
-        model_dump["sdk_api_job_info"]["payload"]["lora_count"] = (
-            len(model_dump["sdk_api_job_info"]["payload"]["loras"])
-            if model_dump["sdk_api_job_info"]["payload"]["loras"]
-            else 0
-        )
-        model_dump["sdk_api_job_info"]["payload"]["ti_count"] = (
-            len(model_dump["sdk_api_job_info"]["payload"]["tis"])
-            if model_dump["sdk_api_job_info"]["payload"]["tis"]
-            else 0
-        )
+        payload["lora_count"] = len(payload["loras"]) if payload["loras"] else 0
+        payload["ti_count"] = len(payload["tis"]) if payload["tis"] else 0
 
         # Add extra source images count and size
-        model_dump["sdk_api_job_info"]["extra_source_images_count"] = (
-            len(job_info.sdk_api_job_info.extra_source_images) if job_info.sdk_api_job_info.extra_source_images else 0
+        extra_images = job_info.sdk_api_job_info.extra_source_images
+        api_job["extra_source_images_count"] = len(extra_images) if extra_images else 0
+        api_job["extra_source_images_combined_size"] = (
+            sum(len(esi.image) for esi in extra_images) if extra_images else 0
         )
 
-        esi_combined_size = 0
-        if job_info.sdk_api_job_info.extra_source_images:
-            for esi in job_info.sdk_api_job_info.extra_source_images:
-                esi_combined_size += len(esi.image)
-        model_dump["sdk_api_job_info"]["extra_source_images_combined_size"] = esi_combined_size
-
         # Add source image and mask sizes
-        model_dump["sdk_api_job_info"]["source_image_size"] = (
+        api_job["source_image_size"] = (
             len(job_info.sdk_api_job_info._downloaded_source_image)
             if job_info.sdk_api_job_info._downloaded_source_image
             else 0
         )
-        model_dump["sdk_api_job_info"]["source_mask_size"] = (
+        api_job["source_mask_size"] = (
             len(job_info.sdk_api_job_info._downloaded_source_mask)
             if job_info.sdk_api_job_info._downloaded_source_mask
             else 0

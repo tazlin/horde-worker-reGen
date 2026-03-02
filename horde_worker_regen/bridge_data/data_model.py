@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 
+from typing_extensions import Self
+
 from horde_sdk.ai_horde_worker.bridge_data import CombinedHordeBridgeData
 from loguru import logger
 from pydantic import Field, field_validator, model_validator
@@ -12,7 +14,170 @@ from ruamel.yaml import YAML
 
 from horde_worker_regen.consts import TOTAL_LORA_DOWNLOAD_TIMEOUT
 from horde_worker_regen.locale_info.regen_bridge_data_fields import BRIDGE_DATA_FIELD_DESCRIPTIONS
-from horde_worker_regen.validation.performance_validator import PerformanceModeValidator
+
+
+def _compute_extra_slow_overrides(
+    *,
+    high_performance_mode: bool,
+    moderate_performance_mode: bool,
+    high_memory_mode: bool,
+    very_high_memory_mode: bool,
+    queue_size: int,
+    max_threads: int,
+    preload_timeout: int,
+    log: bool = False,
+) -> dict[str, bool | int]:
+    """Compute field overrides required when extra_slow_worker is enabled.
+
+    Returns:
+        A dict of field names to their overridden values.
+    """
+    overrides: dict[str, bool | int] = {}
+
+    if high_performance_mode:
+        overrides["high_performance_mode"] = False
+        if log:
+            logger.warning("Extra slow worker is enabled, so high_performance_mode has been set to False.")
+    if moderate_performance_mode:
+        overrides["moderate_performance_mode"] = False
+        if log:
+            logger.warning("Extra slow worker is enabled, so moderate_performance_mode has been set to False.")
+    if high_memory_mode:
+        overrides["high_memory_mode"] = False
+        if log:
+            logger.warning("Extra slow worker is enabled, so high_memory_mode has been set to False.")
+    if very_high_memory_mode:
+        overrides["very_high_memory_mode"] = False
+        if log:
+            logger.warning("Extra slow worker is enabled, so very_high_memory_mode has been set to False.")
+    if queue_size > 0:
+        overrides["queue_size"] = 0
+        if log:
+            logger.warning(
+                "Extra slow worker is enabled, so queue_size has been set to 0. "
+                "This behavior may change in the future.",
+            )
+    if max_threads > 1:
+        overrides["max_threads"] = 1
+        if log:
+            logger.warning(
+                "Extra slow worker is enabled, so max_threads has been set to 1. "
+                "This behavior may change in the future.",
+            )
+    if preload_timeout < 120:
+        overrides["preload_timeout"] = 120
+        if log:
+            logger.warning(
+                "Extra slow worker is enabled, so preload_timeout has been set to 120. "
+                "This behavior may change in the future.",
+            )
+
+    return overrides
+
+
+def compute_performance_timeout(
+    *,
+    high_performance_mode: bool,
+    moderate_performance_mode: bool,
+    default_timeout: int,
+    current_timeout: int,
+    log: bool = False,
+) -> int:
+    """Compute process_timeout based on the active performance mode.
+
+    Returns:
+        The adjusted process timeout value.
+    """
+    if high_performance_mode:
+        adjusted = default_timeout // 3
+        if log:
+            msg = f"High performance mode: process_timeout set to {adjusted} (1/3 of default)."
+            if current_timeout == default_timeout:
+                logger.debug(msg)
+            else:
+                logger.warning(msg)
+        return adjusted
+
+    if moderate_performance_mode:
+        adjusted = default_timeout // 2
+        if log:
+            msg = f"Moderate performance mode: process_timeout set to {adjusted} (1/2 of default)."
+            if current_timeout == default_timeout:
+                logger.debug(msg)
+            else:
+                logger.warning(msg)
+        return adjusted
+
+    return current_timeout
+
+
+def cap_queue_size(*, max_threads: int, queue_size: int, log: bool = False) -> int:
+    """Cap queue_size to 3 when max_threads >= 2.
+
+    Returns:
+        The (possibly capped) queue_size.
+    """
+    if max_threads >= 2 and queue_size > 3:
+        if log:
+            logger.warning("queue_size has been set to 3 because max_threads is >= 2.")
+        return 3
+    return queue_size
+
+
+def _resolve_high_memory_from_very_high(
+    *,
+    very_high_memory_mode: bool,
+    high_memory_mode: bool,
+    log: bool = False,
+) -> bool:
+    """Ensure very_high_memory_mode implies high_memory_mode.
+
+    Returns:
+        The resolved high_memory_mode value.
+    """
+    if very_high_memory_mode and not high_memory_mode:
+        if log:
+            logger.debug("very_high_memory_mode is enabled, so high_memory_mode has been set to True.")
+        return True
+    return high_memory_mode
+
+
+def _apply_high_memory_constraints(
+    *,
+    high_memory_mode: bool,
+    queue_size: int,
+    unload_models_from_vram_often: bool,
+    cycle_process_on_model_change: bool,
+    log: bool = False,
+) -> bool:
+    """Apply constraints and emit warnings for high_memory_mode.
+
+    Returns:
+        The adjusted cycle_process_on_model_change value.
+    """
+    if not high_memory_mode:
+        return cycle_process_on_model_change
+
+    if log:
+        if queue_size == 0:
+            logger.warning(
+                "High memory mode is enabled, you should consider setting queue_size to 1 or higher. "
+                "Increasing this value increases system memory usage. See the bridgeData_template.yaml for more "
+                "information.",
+            )
+        if unload_models_from_vram_often:
+            logger.warning(
+                "High memory mode is enabled, you should consider setting unload_models_from_vram_often to False.",
+            )
+
+    if cycle_process_on_model_change:
+        if log:
+            logger.warning(
+                "High memory mode is enabled, so cycle_process_on_model_change has been set to False.",
+            )
+        return False
+
+    return cycle_process_on_model_change
 
 
 class reGenBridgeData(CombinedHordeBridgeData):
@@ -116,13 +281,51 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """
 
     @model_validator(mode="after")
-    def validate_performance_modes(self) -> reGenBridgeData:
-        """Validate the performance modes and set the appropriate values.
+    def validate_performance_modes(self) -> Self:
+        """Validate and adjust performance mode settings based on cross-field constraints."""
+        # Extra slow worker takes priority over all performance/memory settings
+        if self.extra_slow_worker:
+            for field_name, value in _compute_extra_slow_overrides(
+                high_performance_mode=self.high_performance_mode,
+                moderate_performance_mode=self.moderate_performance_mode,
+                high_memory_mode=self.high_memory_mode,
+                very_high_memory_mode=self.very_high_memory_mode,
+                queue_size=self.queue_size,
+                max_threads=self.max_threads,
+                preload_timeout=self.preload_timeout,
+                log=True,
+            ).items():
+                setattr(self, field_name, value)
 
-        Returns:
-            The config model with the performance modes set appropriately.
-        """
-        return PerformanceModeValidator.validate_and_adjust_performance_modes(self)
+        self.process_timeout = compute_performance_timeout(
+            high_performance_mode=self.high_performance_mode,
+            moderate_performance_mode=self.moderate_performance_mode,
+            default_timeout=self.model_fields["process_timeout"].default,
+            current_timeout=self.process_timeout,
+            log=True,
+        )
+
+        self.queue_size = cap_queue_size(
+            max_threads=self.max_threads,
+            queue_size=self.queue_size,
+            log=True,
+        )
+
+        self.high_memory_mode = _resolve_high_memory_from_very_high(
+            very_high_memory_mode=self.very_high_memory_mode,
+            high_memory_mode=self.high_memory_mode,
+            log=True,
+        )
+
+        self.cycle_process_on_model_change = _apply_high_memory_constraints(
+            high_memory_mode=self.high_memory_mode,
+            queue_size=self.queue_size,
+            unload_models_from_vram_often=self.unload_models_from_vram_often,
+            cycle_process_on_model_change=self.cycle_process_on_model_change,
+            log=True,
+        )
+
+        return self
 
     @field_validator("dreamer_worker_name", mode="after")
     def validate_dreamer_worker_name(cls, value: str) -> str:
