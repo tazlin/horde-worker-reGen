@@ -66,7 +66,13 @@ def do_version_check() -> None:
         version_meta = get_local_version_meta()
 
     # If the required_min_version is not satisfied, raise an error
-    if not semver.compare(horde_worker_regen.__version__, version_meta.required_min_version) >= 0:
+    if (
+        semver.version.Version.compare(
+            semver.version.Version.parse(horde_worker_regen.__version__),
+            semver.version.Version.parse(version_meta.required_min_version),
+        )
+        < 0
+    ):
         # Get the reason for the required update
         reason_for_update = version_meta.required_min_version_info[version_meta.required_min_version].reason_for_update
 
@@ -99,7 +105,13 @@ def do_version_check() -> None:
             input("Press Enter to continue...")
             exit(1)
 
-    if not semver.compare(horde_worker_regen.__version__, version_meta.recommended_version) >= 0:
+    if (
+        semver.version.Version.compare(
+            semver.version.Version.parse(horde_worker_regen.__version__),
+            semver.version.Version.parse(version_meta.recommended_version),
+        )
+        < 0
+    ):
         logger.warning(
             f"Current worker version {horde_worker_regen.__version__} is not the recommended version. "
             f"Please consider updating to {version_meta.recommended_version}.",

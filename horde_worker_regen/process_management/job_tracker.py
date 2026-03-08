@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from asyncio import Lock as Lock_Asyncio
 from collections import deque
+from collections.abc import AsyncIterator
 
 from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
@@ -64,6 +66,20 @@ class JobTracker:
         self.pending_inference_lock = Lock_Asyncio()
         self.pop_timestamps_lock = Lock_Asyncio()
 
+        self._all_locks = (
+            self.lookup_lock,
+            self.pending_inference_lock,
+            self.safety_check_lock,
+            self.completed_jobs_lock,
+        )
+        self._all_locks_with_timestamps = (
+            self.lookup_lock,
+            self.pending_inference_lock,
+            self.safety_check_lock,
+            self.completed_jobs_lock,
+            self.pop_timestamps_lock,
+        )
+
         self._num_jobs_faulted = 0
         self.total_num_completed_jobs = 0
         self._max_pending_megapixelsteps = 25
@@ -71,6 +87,15 @@ class JobTracker:
         self._triggered_max_pending_megapixelsteps_time = 0.0
         self._last_job_submitted_time = time.time()
         self._skipped_line_next_job_and_process = None
+
+    @contextlib.asynccontextmanager
+    async def all_locks(self, *, include_timestamps: bool = False) -> AsyncIterator[None]:
+        """Acquire all job-related locks."""
+        locks = self._all_locks_with_timestamps if include_timestamps else self._all_locks
+        async with contextlib.AsyncExitStack() as stack:
+            for lock in locks:
+                await stack.enter_async_context(lock)
+            yield
 
     @property
     def num_jobs_total(self) -> int:

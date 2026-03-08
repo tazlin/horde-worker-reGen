@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import multiprocessing
 import time
-from typing import TYPE_CHECKING
 
 from horde_model_reference.meta_consts import STABLE_DIFFUSION_BASELINE_CATEGORY
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse

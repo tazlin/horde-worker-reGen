@@ -24,6 +24,7 @@ from horde_worker_regen.process_management.messages import (
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_entry_points import start_inference_process, start_safety_process
+from horde_worker_regen.process_management.worker_state import WorkerState
 
 
 class ProcessLifecycleManager:
@@ -43,8 +44,7 @@ class ProcessLifecycleManager:
     _amd_gpu: bool
     _directml: int | None
     _abort_callback: Callable[[], None]
-    _is_shutting_down: Callable[[], bool]
-    _get_shutting_down_time: Callable[[], float]
+    _state: WorkerState
 
     num_processes_launched: int
     _num_process_recoveries: int
@@ -71,8 +71,7 @@ class ProcessLifecycleManager:
         amd_gpu: bool,
         directml: int | None,
         abort_callback: Callable[[], None],
-        is_shutting_down: Callable[[], bool],
-        get_shutting_down_time: Callable[[], float],
+        state: WorkerState,
     ) -> None:
         """Initialize with shared references and callbacks from the parent manager."""
         self._process_map = process_map
@@ -89,8 +88,7 @@ class ProcessLifecycleManager:
         self._amd_gpu = amd_gpu
         self._directml = directml
         self._abort_callback = abort_callback
-        self._is_shutting_down = is_shutting_down
-        self._get_shutting_down_time = get_shutting_down_time
+        self._state = state
 
         self.num_processes_launched = 0
         self._num_process_recoveries = 0
@@ -100,7 +98,6 @@ class ProcessLifecycleManager:
         self._hung_processes_detected = False
         self._hung_processes_detected_time = 0.0
         self._any_replaced = False
-        self.__last_pop_no_jobs_available = False
 
     @property
     def recently_recovered(self) -> bool:
@@ -226,7 +223,7 @@ class ProcessLifecycleManager:
     ) -> None:
         """End any inference processes above the configured limit, or all of them if shutting down."""
         if force:
-            if not self._is_shutting_down():
+            if not self._state.shutting_down:
                 logger.error("Forcing inference processes to end without shutting down")
 
             for process in self._process_map.get_inference_processes():
@@ -240,7 +237,7 @@ class ProcessLifecycleManager:
         processes_with_model_for_queued_job: list[int] = self.get_processes_with_model_for_queued_job()
 
         if (
-            self._is_shutting_down()
+            self._state.shutting_down
             and len(self._job_tracker.jobs_pending_inference) == 0
             and len(self._job_tracker.jobs_in_progress) == 0
         ):
@@ -262,7 +259,7 @@ class ProcessLifecycleManager:
         try:
             process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
         except BrokenPipeError:
-            if not self._is_shutting_down():
+            if not self._state.shutting_down:
                 logger.debug(f"Process {process_info.process_id} control channel vanished")
         try:
             process_info.mp_process.join(timeout=1)
@@ -270,7 +267,7 @@ class ProcessLifecycleManager:
         except Exception as e:
             logger.error(f"Failed to kill process {process_info.process_id}: {e}")
 
-        if not self._is_shutting_down():
+        if not self._state.shutting_down:
             logger.info(f"Ended inference process {process_info.process_id}")
 
     def end_safety_processes(self) -> None:
@@ -473,7 +470,7 @@ class ProcessLifecycleManager:
                         "seems to be stuck post processing",
                     ),
                 ]
-                if self._last_pop_no_jobs_available:
+                if self._state.last_pop_no_jobs_available:
                     continue
 
                 for timeout, state, error_message in conditions:
@@ -481,7 +478,7 @@ class ProcessLifecycleManager:
                         any_replaced = True
                         self._recently_recovered = True
 
-        if self._last_pop_no_jobs_available:
+        if self._state.last_pop_no_jobs_available:
             return any_replaced
 
         all_processes_timed_out = all(
@@ -489,9 +486,9 @@ class ProcessLifecycleManager:
             for process_info in self._process_map.values()
         )
 
-        shutdown_timed_out = self._is_shutting_down() and (now - self._get_shutting_down_time()) > (60 * 5)
+        shutdown_timed_out = self._state.shutting_down and (now - self._state.shutting_down_time) > (60 * 5)
 
-        if (all_processes_timed_out and not (self._last_pop_no_jobs_available or self._recently_recovered)) or (
+        if (all_processes_timed_out and not (self._state.last_pop_no_jobs_available or self._recently_recovered)) or (
             shutdown_timed_out
         ):
             if not self._hung_processes_detected:
@@ -505,7 +502,7 @@ class ProcessLifecycleManager:
 
             self._job_tracker._purge_jobs()
 
-            if bridge_data.exit_on_unhandled_faults or self._is_shutting_down():
+            if bridge_data.exit_on_unhandled_faults or self._state.shutting_down:
                 logger.error("All processes have been unresponsive for too long, exiting.")
 
                 self._abort_callback()
@@ -530,18 +527,6 @@ class ProcessLifecycleManager:
             threading.Thread(target=timed_unset_recently_recovered).start()
 
         return any_replaced
-
-    @property
-    def _last_pop_no_jobs_available(self) -> bool:
-        """Delegate to manager's state. Injected via the _get_bridge_data pattern won't work here.
-
-        This is read from the manager. We store a reference setter instead.
-        """
-        return self.__last_pop_no_jobs_available
-
-    @_last_pop_no_jobs_available.setter
-    def _last_pop_no_jobs_available(self, value: bool) -> None:
-        self.__last_pop_no_jobs_available = value
 
     @property
     def safety_processes_should_be_replaced(self) -> bool:

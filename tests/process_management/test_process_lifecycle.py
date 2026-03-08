@@ -8,6 +8,7 @@ from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import HordeProcessState
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.worker_state import WorkerState
 
 
 def _make_plm(
@@ -44,8 +45,7 @@ def _make_plm(
         amd_gpu=False,
         directml=None,
         abort_callback=Mock(),
-        is_shutting_down=lambda: False,
-        get_shutting_down_time=lambda: 0.0,
+        state=WorkerState(),
     )
 
 
