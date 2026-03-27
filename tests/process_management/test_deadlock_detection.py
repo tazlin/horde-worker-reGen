@@ -16,7 +16,7 @@ from horde_worker_regen.process_management.worker_state import WorkerState
 from .conftest import make_mock_bridge_data, make_mock_process_info
 
 
-def _make_dispatcher(
+def _make_message_dispatcher(
     *,
     state: WorkerState | None = None,
     process_map: ProcessMap | None = None,
@@ -53,129 +53,131 @@ class TestDetectDeadlock:
 
     def test_no_jobs_no_deadlock(self) -> None:
         """Deadlocks should never be considered to exist if there are no jobs."""
-        md = _make_dispatcher()
-        md.detect_deadlock()
-        assert md._in_deadlock is False
-        assert md._in_queue_deadlock is False
+        message_dispatcher = _make_message_dispatcher()
+        message_dispatcher.detect_deadlock()
+        assert message_dispatcher._in_deadlock is False
+        assert message_dispatcher._in_queue_deadlock is False
 
     def test_recent_pop_skips_detection(self) -> None:
         """Deadlocks should not be detected if a job was just popped."""
         state = WorkerState(last_job_pop_time=time.time())
-        jt = JobTracker()
+        job_tracker = JobTracker()
         job = Mock()
         job.model = "stable_diffusion"
-        jt.jobs_pending_inference.append(job)
+        job_tracker.jobs_pending_inference.append(job)
 
-        md = _make_dispatcher(state=state, job_tracker=jt)
-        md.detect_deadlock()
-        assert md._in_deadlock is False
+        message_dispatcher = _make_message_dispatcher(state=state, job_tracker=job_tracker)
+        message_dispatcher.detect_deadlock()
+        assert message_dispatcher._in_deadlock is False
 
     def test_detects_queue_deadlock_when_all_waiting_with_matching_model(self) -> None:
         """When all processes are waiting and one has the needed model, it's a queue deadlock."""
         state = WorkerState(last_job_pop_time=time.time() - 20)
-        proc = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.WAITING_FOR_JOB)
-        proc.last_process_state = HordeProcessState.WAITING_FOR_JOB
-        proc.loaded_horde_model_name = "stable_diffusion"
-        process_map = ProcessMap({0: proc})
+        process_info = make_mock_process_info(
+            0, model_name="stable_diffusion", state=HordeProcessState.WAITING_FOR_JOB
+        )
+        process_info.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        process_info.loaded_horde_model_name = "stable_diffusion"
+        process_map = ProcessMap({0: process_info})
 
-        jt = JobTracker()
+        job_tracker = JobTracker()
         job = Mock()
         job.model = "stable_diffusion"
-        jt.jobs_pending_inference.append(job)
+        job_tracker.jobs_pending_inference.append(job)
 
-        md = _make_dispatcher(state=state, process_map=process_map, job_tracker=jt)
-        md.detect_deadlock()
-        assert md._in_queue_deadlock is True
-        assert md._queue_deadlock_model == "stable_diffusion"
-        assert md._queue_deadlock_process_id == 0
+        message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker)
+        message_dispatcher.detect_deadlock()
+        assert message_dispatcher._in_queue_deadlock is True
+        assert message_dispatcher._queue_deadlock_model == "stable_diffusion"
+        assert message_dispatcher._queue_deadlock_process_id == 0
 
     def test_detects_queue_deadlock_no_model_match_uses_first_job(self) -> None:
         """When all processes are waiting but none has the needed model, still a queue deadlock."""
         state = WorkerState(last_job_pop_time=time.time() - 20)
-        proc = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
-        proc.last_process_state = HordeProcessState.WAITING_FOR_JOB
-        proc.loaded_horde_model_name = None
-        process_map = ProcessMap({0: proc})
+        process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        process_info.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        process_info.loaded_horde_model_name = None
+        process_map = ProcessMap({0: process_info})
 
-        jt = JobTracker()
+        job_tracker = JobTracker()
         job = Mock()
         job.model = "some_model"
-        jt.jobs_pending_inference.append(job)
+        job_tracker.jobs_pending_inference.append(job)
 
-        md = _make_dispatcher(state=state, process_map=process_map, job_tracker=jt)
-        md.detect_deadlock()
-        assert md._in_queue_deadlock is True
-        assert md._queue_deadlock_model == "some_model"
+        message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker)
+        message_dispatcher.detect_deadlock()
+        assert message_dispatcher._in_queue_deadlock is True
+        assert message_dispatcher._queue_deadlock_model == "some_model"
 
     def test_detects_general_deadlock_no_processes(self) -> None:
         """General deadlock: jobs exist but no processes are busy and none waiting."""
         state = WorkerState(last_job_pop_time=time.time() - 20)
         process_map = ProcessMap({})
 
-        jt = JobTracker()
+        job_tracker = JobTracker()
         job = Mock()
         job.model = "stable_diffusion"
-        jt.jobs_pending_inference.append(job)
+        job_tracker.jobs_pending_inference.append(job)
 
-        md = _make_dispatcher(state=state, process_map=process_map, job_tracker=jt)
-        md.detect_deadlock()
-        assert md._in_deadlock is True
+        message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker)
+        message_dispatcher.detect_deadlock()
+        assert message_dispatcher._in_deadlock is True
 
     def test_deadlock_clears_when_processes_become_busy(self) -> None:
         """If a process starts working, the deadlock should clear."""
         state = WorkerState(last_job_pop_time=time.time() - 60)
-        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
-        process_map = ProcessMap({0: proc})
+        process_info = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        process_map = ProcessMap({0: process_info})
 
-        jt = JobTracker()
+        job_tracker = JobTracker()
         job = Mock()
         job.model = "stable_diffusion"
-        jt.jobs_pending_inference.append(job)
+        job_tracker.jobs_pending_inference.append(job)
 
-        md = _make_dispatcher(state=state, process_map=process_map, job_tracker=jt)
-        md._in_deadlock = True
-        md._last_deadlock_detected_time = time.time() - 8
+        message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker)
+        message_dispatcher._in_deadlock = True
+        message_dispatcher._last_deadlock_detected_time = time.time() - 8
 
-        md.detect_deadlock()
-        assert md._in_deadlock is False
+        message_dispatcher.detect_deadlock()
+        assert message_dispatcher._in_deadlock is False
 
     def test_queue_deadlock_resolves_after_timeout(self) -> None:
         """Queue deadlock should resolve after a timeout period."""
         state = WorkerState(last_job_pop_time=time.time() - 60)
         process_map = ProcessMap({})
 
-        md = _make_dispatcher(state=state, process_map=process_map)
-        md._in_queue_deadlock = True
-        md._last_queue_deadlock_detected_time = time.time() - 35
-        md._queue_deadlock_model = "stable_diffusion"
-        md._queue_deadlock_process_id = 0
+        message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map)
+        message_dispatcher._in_queue_deadlock = True
+        message_dispatcher._last_queue_deadlock_detected_time = time.time() - 35
+        message_dispatcher._queue_deadlock_model = "stable_diffusion"
+        message_dispatcher._queue_deadlock_process_id = 0
 
-        md.detect_deadlock()
-        assert md._in_queue_deadlock is False
-        assert md._queue_deadlock_model is None
+        message_dispatcher.detect_deadlock()
+        assert message_dispatcher._in_queue_deadlock is False
+        assert message_dispatcher._queue_deadlock_model is None
 
     def test_queue_deadlock_waits_if_processes_starting(self) -> None:
         """Queue deadlock should wait if processes are starting."""
         state = WorkerState(last_job_pop_time=time.time() - 60)
-        proc = make_mock_process_info(0, state=HordeProcessState.PROCESS_STARTING)
-        proc.last_process_state = HordeProcessState.PROCESS_STARTING
-        process_map = ProcessMap({0: proc})
+        process_info = make_mock_process_info(0, state=HordeProcessState.PROCESS_STARTING)
+        process_info.last_process_state = HordeProcessState.PROCESS_STARTING
+        process_map = ProcessMap({0: process_info})
 
-        md = _make_dispatcher(state=state, process_map=process_map)
-        md._in_queue_deadlock = True
-        md._last_queue_deadlock_detected_time = time.time() - 35
+        message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map)
+        message_dispatcher._in_queue_deadlock = True
+        message_dispatcher._last_queue_deadlock_detected_time = time.time() - 35
 
-        md.detect_deadlock()
-        assert md._in_queue_deadlock is True
+        message_dispatcher.detect_deadlock()
+        assert message_dispatcher._in_queue_deadlock is True
 
     def test_deadlock_persists_then_clears_after_10_seconds(self) -> None:
         """Deadlock should persist for a short period and then clear after 10 seconds."""
         state = WorkerState(last_job_pop_time=time.time() - 60)
         process_map = ProcessMap({})
 
-        md = _make_dispatcher(state=state, process_map=process_map)
-        md._in_deadlock = True
-        md._last_deadlock_detected_time = time.time() - 12
+        message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map)
+        message_dispatcher._in_deadlock = True
+        message_dispatcher._last_deadlock_detected_time = time.time() - 12
 
-        md.detect_deadlock()
-        assert md._in_deadlock is False
+        message_dispatcher.detect_deadlock()
+        assert message_dispatcher._in_deadlock is False

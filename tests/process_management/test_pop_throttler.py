@@ -180,28 +180,28 @@ class TestShouldWaitForMegapixelsteps:
 
     def test_no_wait_when_pending_below_threshold(self) -> None:
         """When pending MPS is low enough, no waiting should occur."""
-        jt = JobTracker()
+        job_tracker = JobTracker()
         # No jobs in queue → pending MPS = 0
-        throttler = _make_throttler(job_tracker=jt)
+        throttler = _make_throttler(job_tracker=job_tracker)
         bd = self._make_bridge_data()
 
         assert throttler.should_wait_for_megapixelsteps(bd) is False
 
     def test_no_wait_resets_trigger_flag(self) -> None:
         """When we drop below threshold, the trigger flag must be cleared."""
-        jt = JobTracker()
-        jt._triggered_max_pending_megapixelsteps = True
-        throttler = _make_throttler(job_tracker=jt)
+        job_tracker = JobTracker()
+        job_tracker._triggered_max_pending_megapixelsteps = True
+        throttler = _make_throttler(job_tracker=job_tracker)
         bd = self._make_bridge_data()
 
         throttler.should_wait_for_megapixelsteps(bd)
-        assert jt._triggered_max_pending_megapixelsteps is False
+        assert job_tracker._triggered_max_pending_megapixelsteps is False
 
     def test_first_call_above_threshold_sets_trigger(self) -> None:
         """First time we're above max pending MPS, the trigger flag and time should be set."""
-        jt = JobTracker()
-        jt._max_pending_megapixelsteps = 5
-        throttler = _make_throttler(job_tracker=jt)
+        job_tracker = JobTracker()
+        job_tracker._max_pending_megapixelsteps = 5
+        throttler = _make_throttler(job_tracker=job_tracker)
         bd = self._make_bridge_data()
 
         # Add many large jobs to push pending MPS above threshold
@@ -215,20 +215,20 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
-        assert jt.should_wait_for_pending_megapixelsteps() is True
+        assert job_tracker.should_wait_for_pending_megapixelsteps() is True
 
         result = throttler.should_wait_for_megapixelsteps(bd)
         assert result is True
-        assert jt._triggered_max_pending_megapixelsteps is True
-        assert jt._triggered_max_pending_megapixelsteps_time > 0
+        assert job_tracker._triggered_max_pending_megapixelsteps is True
+        assert job_tracker._triggered_max_pending_megapixelsteps_time > 0
 
     def test_returns_true_while_within_wait_period(self) -> None:
         """While within the calculated wait window, should keep returning True."""
-        jt = JobTracker()
-        jt._max_pending_megapixelsteps = 5
-        throttler = _make_throttler(job_tracker=jt)
+        job_tracker = JobTracker()
+        job_tracker._max_pending_megapixelsteps = 5
+        throttler = _make_throttler(job_tracker=job_tracker)
         bd = self._make_bridge_data()
 
         # Add jobs above threshold
@@ -242,7 +242,7 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
         # First call sets the trigger
         throttler.should_wait_for_megapixelsteps(bd)
@@ -251,9 +251,9 @@ class TestShouldWaitForMegapixelsteps:
 
     def test_returns_false_after_wait_time_elapses(self) -> None:
         """After the calculated wait period, waiting should end."""
-        jt = JobTracker()
-        jt._max_pending_megapixelsteps = 5
-        throttler = _make_throttler(job_tracker=jt)
+        job_tracker = JobTracker()
+        job_tracker._max_pending_megapixelsteps = 5
+        throttler = _make_throttler(job_tracker=job_tracker)
         bd = self._make_bridge_data()
 
         for _ in range(10):
@@ -266,21 +266,21 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
         # Trigger the wait
         throttler.should_wait_for_megapixelsteps(bd)
 
         # Fast forward past wait time by backdating the trigger
-        jt._triggered_max_pending_megapixelsteps_time = time.time() - 1000
+        job_tracker._triggered_max_pending_megapixelsteps_time = time.time() - 1000
 
         assert throttler.should_wait_for_megapixelsteps(bd) is False
-        assert jt._triggered_max_pending_megapixelsteps is False
+        assert job_tracker._triggered_max_pending_megapixelsteps is False
 
     def test_high_performance_mode_reduces_wait(self) -> None:
         """High performance mode should give a much shorter wait time than normal."""
-        jt = JobTracker()
-        throttler = _make_throttler(job_tracker=jt)
+        job_tracker = JobTracker()
+        throttler = _make_throttler(job_tracker=job_tracker)
 
         bd_normal = self._make_bridge_data(high_performance_mode=False, moderate_performance_mode=False)
         bd_high = self._make_bridge_data(high_performance_mode=True)
@@ -300,7 +300,7 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
         normal_wait = throttler._calculate_megapixelstep_wait(bd_normal)
         high_wait = throttler._calculate_megapixelstep_wait(bd_high)
@@ -308,8 +308,8 @@ class TestShouldWaitForMegapixelsteps:
         assert high_wait < normal_wait
 
     def test_moderate_performance_mode_reduces_wait(self) -> None:
-        jt = JobTracker()
-        throttler = _make_throttler(job_tracker=jt)
+        job_tracker = JobTracker()
+        throttler = _make_throttler(job_tracker=job_tracker)
 
         for _ in range(5):
             job = Mock()
@@ -321,7 +321,7 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
         bd_normal = self._make_bridge_data(high_performance_mode=False, moderate_performance_mode=False)
         bd_moderate = self._make_bridge_data(moderate_performance_mode=True, high_performance_mode=False)
@@ -332,8 +332,8 @@ class TestShouldWaitForMegapixelsteps:
         assert moderate_wait < normal_wait
 
     def test_multi_thread_reduces_wait(self) -> None:
-        jt = JobTracker()
-        throttler = _make_throttler(job_tracker=jt)
+        job_tracker = JobTracker()
+        throttler = _make_throttler(job_tracker=job_tracker)
 
         for _ in range(5):
             job = Mock()
@@ -345,7 +345,7 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
         bd_single = self._make_bridge_data(max_threads=1)
         bd_multi = self._make_bridge_data(max_threads=2)
@@ -361,10 +361,10 @@ class TestCalculateMegapixelstepWait:
 
     def _make_throttler_with_pending(self, pending_mps: int) -> PopThrottler:
         """Make a throttler whose JobTracker reports the given pending MPS."""
-        jt = JobTracker()
-        throttler = _make_throttler(job_tracker=jt)
+        job_tracker = JobTracker()
+        throttler = _make_throttler(job_tracker=job_tracker)
         # Patch get_pending_megapixelsteps to return exactly what we want
-        jt.get_pending_megapixelsteps = Mock(return_value=pending_mps)  # type: ignore[method-assign]
+        job_tracker.get_pending_megapixelsteps = Mock(return_value=pending_mps)  # type: ignore[method-assign]
         return throttler
 
     def test_low_pending_tier(self) -> None:

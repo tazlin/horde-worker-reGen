@@ -92,8 +92,8 @@ class TestApiSubmitJob:
         from horde_worker_regen.process_management.job_models import HordeJobInfo
 
         state = WorkerState()
-        jt = JobTracker()
-        submitter = _make_submitter(state=state, job_tracker=jt)
+        job_tracker = JobTracker()
+        submitter = _make_submitter(state=state, job_tracker=job_tracker)
 
         job = make_job_pop_response("stable_diffusion", r2_upload="https://example.com/upload")
 
@@ -106,9 +106,9 @@ class TestApiSubmitJob:
         job_info.censored = False
         job_info.time_to_generate = 1.0
 
-        jt.jobs_pending_submit.append(job_info)
-        jt.jobs_lookup[job] = job_info
-        jt.job_pop_timestamps[job] = 0.0
+        job_tracker.jobs_pending_submit.append(job_info)
+        job_tracker.jobs_lookup[job] = job_info
+        job_tracker.job_pop_timestamps[job] = 0.0
 
         faulted_submit = Mock(spec=PendingSubmitJob)
         faulted_submit.is_finished = True

@@ -121,32 +121,32 @@ class TestJobTrackerResetMegapixelstepTrigger:
     """Tests for JobTracker.reset_megapixelstep_trigger."""
 
     def test_clears_trigger_flag(self) -> None:
-        jt = JobTracker()
-        jt._triggered_max_pending_megapixelsteps = True
+        job_tracker = JobTracker()
+        job_tracker._triggered_max_pending_megapixelsteps = True
 
-        jt.reset_megapixelstep_trigger()
+        job_tracker.reset_megapixelstep_trigger()
 
-        assert jt._triggered_max_pending_megapixelsteps is False
+        assert job_tracker._triggered_max_pending_megapixelsteps is False
 
     def test_idempotent_when_already_false(self) -> None:
-        jt = JobTracker()
-        assert jt._triggered_max_pending_megapixelsteps is False
+        job_tracker = JobTracker()
+        assert job_tracker._triggered_max_pending_megapixelsteps is False
 
-        jt.reset_megapixelstep_trigger()
+        job_tracker.reset_megapixelstep_trigger()
 
-        assert jt._triggered_max_pending_megapixelsteps is False
+        assert job_tracker._triggered_max_pending_megapixelsteps is False
 
 
 class TestJobTrackerShouldWaitForPendingMegapixelsteps:
     """Tests for the should_wait check that drives throttling."""
 
     def test_empty_queue_does_not_wait(self) -> None:
-        jt = JobTracker()
-        assert jt.should_wait_for_pending_megapixelsteps() is False
+        job_tracker = JobTracker()
+        assert job_tracker.should_wait_for_pending_megapixelsteps() is False
 
     def test_queue_below_threshold_does_not_wait(self) -> None:
-        jt = JobTracker()
-        jt._max_pending_megapixelsteps = 100
+        job_tracker = JobTracker()
+        job_tracker._max_pending_megapixelsteps = 100
 
         # Add one small job
         job = Mock()
@@ -160,13 +160,13 @@ class TestJobTrackerShouldWaitForPendingMegapixelsteps:
         job.payload.hires_fix = False
         job.model = "test_model"
         job.payload.workflow = None
-        jt.jobs_pending_inference.append(job)
+        job_tracker.jobs_pending_inference.append(job)
 
-        assert jt.should_wait_for_pending_megapixelsteps() is False
+        assert job_tracker.should_wait_for_pending_megapixelsteps() is False
 
     def test_queue_above_threshold_waits(self) -> None:
-        jt = JobTracker()
-        jt._max_pending_megapixelsteps = 1  # Very low threshold
+        job_tracker = JobTracker()
+        job_tracker._max_pending_megapixelsteps = 1  # Very low threshold
 
         # Add a large job
         job = Mock()
@@ -180,26 +180,26 @@ class TestJobTrackerShouldWaitForPendingMegapixelsteps:
         job.payload.hires_fix = False
         job.model = "test_model"
         job.payload.workflow = None
-        jt.jobs_pending_inference.append(job)
+        job_tracker.jobs_pending_inference.append(job)
 
-        assert jt.should_wait_for_pending_megapixelsteps() is True
+        assert job_tracker.should_wait_for_pending_megapixelsteps() is True
 
 
 class TestJobTrackerSetPerformanceModeThresholds:
     """Tests for dynamic threshold adjustment."""
 
     def test_sets_new_threshold(self) -> None:
-        jt = JobTracker()
-        original = jt._max_pending_megapixelsteps
+        job_tracker = JobTracker()
+        original = job_tracker._max_pending_megapixelsteps
 
-        jt.set_performance_mode_thresholds(100)
+        job_tracker.set_performance_mode_thresholds(100)
 
-        assert jt._max_pending_megapixelsteps == 100
-        assert jt._max_pending_megapixelsteps != original
+        assert job_tracker._max_pending_megapixelsteps == 100
+        assert job_tracker._max_pending_megapixelsteps != original
 
     def test_zero_threshold_makes_everything_wait(self) -> None:
-        jt = JobTracker()
-        jt.set_performance_mode_thresholds(0)
+        job_tracker = JobTracker()
+        job_tracker.set_performance_mode_thresholds(0)
 
         # Need a job large enough to round to at least 1 MPS after int truncation
         job = Mock()
@@ -213,7 +213,7 @@ class TestJobTrackerSetPerformanceModeThresholds:
         job.payload.hires_fix = False
         job.model = "test_model"
         job.payload.workflow = None
-        jt.jobs_pending_inference.append(job)
+        job_tracker.jobs_pending_inference.append(job)
 
         # Pending MPS > 0 and threshold is 0 → should wait
-        assert jt.get_pending_megapixelsteps() > 0
+        assert job_tracker.get_pending_megapixelsteps() > 0

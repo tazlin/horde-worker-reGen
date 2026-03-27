@@ -144,8 +144,8 @@ class TestDownloadRetryBehavior:
 
     def test_retries_on_exception(self) -> None:
         """When a download raises an exception, it should retry up to MAX_SOURCE_IMAGE_RETRIES."""
-        jt = JobTracker()
-        downloader = _make_downloader(job_tracker=jt)
+        job_tracker = JobTracker()
+        downloader = _make_downloader(job_tracker=job_tracker)
         job = _make_job_response(source_image="https://example.com/img.png")
 
         call_count = 0
@@ -156,7 +156,7 @@ class TestDownloadRetryBehavior:
             raise ConnectionError("download failed")
 
         job.async_download_source_image = failing_download  # type: ignore[assignment]
-        jt.job_faults[job.id_] = []
+        job_tracker.job_faults[job.id_] = []
 
         asyncio.run(downloader.download_source_images(job))
 
@@ -164,8 +164,8 @@ class TestDownloadRetryBehavior:
 
     def test_records_fault_after_max_retries_exhausted(self) -> None:
         """After exhausting retries, a fault should be recorded on the job tracker."""
-        jt = JobTracker()
-        downloader = _make_downloader(job_tracker=jt)
+        job_tracker = JobTracker()
+        downloader = _make_downloader(job_tracker=job_tracker)
         job = _make_job_response(source_image="https://example.com/img.png")
 
         async def failing_download(*args: object) -> None:
@@ -175,15 +175,15 @@ class TestDownloadRetryBehavior:
 
         asyncio.run(downloader.download_source_images(job))
 
-        assert job.id_ in jt.job_faults
-        faults = jt.job_faults[job.id_]
+        assert job.id_ in job_tracker.job_faults
+        faults = job_tracker.job_faults[job.id_]
         assert len(faults) >= 1
         assert any(f.ref == "source_image" for f in faults)
 
     def test_records_mask_fault_after_max_retries(self) -> None:
         """Mask download failures should also be recorded as faults."""
-        jt = JobTracker()
-        downloader = _make_downloader(job_tracker=jt)
+        job_tracker = JobTracker()
+        downloader = _make_downloader(job_tracker=job_tracker)
         job = _make_job_response(source_mask="https://example.com/mask.png")
 
         async def failing_download(*args: object) -> None:
@@ -193,8 +193,8 @@ class TestDownloadRetryBehavior:
 
         asyncio.run(downloader.download_source_images(job))
 
-        assert job.id_ in jt.job_faults
-        faults = jt.job_faults[job.id_]
+        assert job.id_ in job_tracker.job_faults
+        faults = job_tracker.job_faults[job.id_]
         assert any(f.ref == "source_mask" for f in faults)
 
 
@@ -239,8 +239,8 @@ class TestRecordDownloadFaults:
 
     def test_creates_fault_list_if_missing(self) -> None:
         """If job_faults doesn't have an entry for this job, one should be created."""
-        jt = JobTracker()
-        downloader = _make_downloader(job_tracker=jt)
+        job_tracker = JobTracker()
+        downloader = _make_downloader(job_tracker=job_tracker)
 
         job = _make_job_response(source_image="https://example.com/img.png")
         job.get_downloaded_source_image.return_value = None
@@ -253,16 +253,16 @@ class TestRecordDownloadFaults:
             any_extra_source_images_are_urls=False,
         )
 
-        assert job.id_ in jt.job_faults
-        assert len(jt.job_faults[job.id_]) == 1
+        assert job.id_ in job_tracker.job_faults
+        assert len(job_tracker.job_faults[job.id_]) == 1
 
     def test_appends_to_existing_fault_list(self) -> None:
         """If faults already exist for this job, new ones should be appended."""
-        jt = JobTracker()
+        job_tracker = JobTracker()
         existing_fault = Mock()
-        jt.job_faults["test-job-123"] = [existing_fault]
+        job_tracker.job_faults["test-job-123"] = [existing_fault]
 
-        downloader = _make_downloader(job_tracker=jt)
+        downloader = _make_downloader(job_tracker=job_tracker)
         job = _make_job_response(source_image="https://example.com/img.png")
         job.get_downloaded_source_image.return_value = None
 
@@ -273,13 +273,13 @@ class TestRecordDownloadFaults:
             any_extra_source_images_are_urls=False,
         )
 
-        assert len(jt.job_faults["test-job-123"]) == 2
-        assert jt.job_faults["test-job-123"][0] is existing_fault
+        assert len(job_tracker.job_faults["test-job-123"]) == 2
+        assert job_tracker.job_faults["test-job-123"][0] is existing_fault
 
     def test_no_fault_when_download_succeeded(self) -> None:
         """If the source image WAS downloaded, no fault should be recorded."""
-        jt = JobTracker()
-        downloader = _make_downloader(job_tracker=jt)
+        job_tracker = JobTracker()
+        downloader = _make_downloader(job_tracker=job_tracker)
 
         job = _make_job_response(source_image="https://example.com/img.png")
         job.get_downloaded_source_image.return_value = b"downloaded"
@@ -291,13 +291,13 @@ class TestRecordDownloadFaults:
             any_extra_source_images_are_urls=False,
         )
 
-        faults = jt.job_faults.get(job.id_, [])
+        faults = job_tracker.job_faults.get(job.id_, [])
         assert len(faults) == 0
 
     def test_both_image_and_mask_failures(self) -> None:
         """Both source image and mask failures produce separate faults."""
-        jt = JobTracker()
-        downloader = _make_downloader(job_tracker=jt)
+        job_tracker = JobTracker()
+        downloader = _make_downloader(job_tracker=job_tracker)
 
         job = _make_job_response(
             source_image="https://example.com/img.png",
@@ -313,7 +313,7 @@ class TestRecordDownloadFaults:
             any_extra_source_images_are_urls=False,
         )
 
-        faults = jt.job_faults[job.id_]
+        faults = job_tracker.job_faults[job.id_]
         refs = [f.ref for f in faults]
         assert "source_image" in refs
         assert "source_mask" in refs

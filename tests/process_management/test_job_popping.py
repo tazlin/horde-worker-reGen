@@ -155,14 +155,14 @@ class TestApiJobPopGuardClauses:
 
     def test_full_queue_returns_early(self) -> None:
         """Queue at capacity should prevent further pops."""
-        jt = JobTracker()
+        job_tracker = JobTracker()
         # Default bridge data: queue_size=1, max_threads=1 → max_jobs_in_queue = 2
         for _ in range(10):
             job = Mock()
             job.model = "stable_diffusion"
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
-        popper = _make_popper(job_tracker=jt)
+        popper = _make_popper(job_tracker=job_tracker)
         asyncio.run(popper.api_job_pop())
 
     def test_no_safety_process_returns_early(self) -> None:
@@ -196,13 +196,13 @@ class TestApiJobPopGuardClauses:
 
     def test_first_job_not_submitted_blocks_second_pop(self) -> None:
         """When there are pending jobs but none submitted yet, don't pop more."""
-        jt = JobTracker()
+        job_tracker = JobTracker()
         job = Mock()
         job.model = "stable_diffusion"
-        jt.jobs_pending_inference.append(job)
+        job_tracker.jobs_pending_inference.append(job)
         # jobs_pending_submit is 0 (default)
 
-        popper = _make_popper(job_tracker=jt)
+        popper = _make_popper(job_tracker=job_tracker)
         asyncio.run(popper.api_job_pop())
 
 
@@ -279,52 +279,52 @@ class TestIsQueueFull:
         assert popper._is_queue_full(bd) is False
 
     def test_queue_at_capacity_is_full(self) -> None:
-        jt = JobTracker()
+        job_tracker = JobTracker()
         # queue_size=1, max_threads=1 → max_jobs_in_queue = 2
         for _ in range(2):
             job = Mock()
             job.model = "stable_diffusion"
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
-        popper = _make_popper(job_tracker=jt)
+        popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=1, max_threads=1)
 
         assert popper._is_queue_full(bd) is True
 
     def test_multi_thread_increases_capacity(self) -> None:
         """max_threads > 1 should increase allowed queue depth."""
-        jt = JobTracker()
+        job_tracker = JobTracker()
         for _ in range(2):
             job = Mock()
             job.model = "stable_diffusion"
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
-        popper = _make_popper(job_tracker=jt)
+        popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=1, max_threads=2)
 
         # max_jobs_in_queue = queue_size + 1 + (max_threads - 1) = 1 + 1 + 1 = 3
         assert popper._is_queue_full(bd) is False
 
     def test_queue_one_below_capacity_not_full(self) -> None:
-        jt = JobTracker()
+        job_tracker = JobTracker()
         job = Mock()
         job.model = "stable_diffusion"
-        jt.jobs_pending_inference.append(job)
+        job_tracker.jobs_pending_inference.append(job)
 
-        popper = _make_popper(job_tracker=jt)
+        popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=1, max_threads=1)
 
         # max_jobs_in_queue = 2, current = 1 → not full
         assert popper._is_queue_full(bd) is False
 
     def test_large_queue_size(self) -> None:
-        jt = JobTracker()
+        job_tracker = JobTracker()
         for _ in range(5):
             job = Mock()
             job.model = "stable_diffusion"
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
-        popper = _make_popper(job_tracker=jt)
+        popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=10, max_threads=1)
 
         # max_jobs_in_queue = 10 + 1 = 11, current = 5 → not full
@@ -554,50 +554,50 @@ class TestEnqueuePoppedJob:
     """Tests for _enqueue_popped_job."""
 
     def test_job_added_to_pending_inference(self) -> None:
-        jt = JobTracker()
-        popper = _make_popper(job_tracker=jt)
+        job_tracker = JobTracker()
+        popper = _make_popper(job_tracker=job_tracker)
         job = make_job_pop_response()
 
         asyncio.run(popper._enqueue_popped_job(job))
 
-        assert len(jt.jobs_pending_inference) == 1
-        assert jt.jobs_pending_inference[0] is job
+        assert len(job_tracker.jobs_pending_inference) == 1
+        assert job_tracker.jobs_pending_inference[0] is job
 
     def test_pop_timestamp_recorded(self) -> None:
-        jt = JobTracker()
-        popper = _make_popper(job_tracker=jt)
+        job_tracker = JobTracker()
+        popper = _make_popper(job_tracker=job_tracker)
         job = make_job_pop_response()
 
         asyncio.run(popper._enqueue_popped_job(job))
 
-        assert job in jt.job_pop_timestamps
-        assert jt.job_pop_timestamps[job] > 0
+        assert job in job_tracker.job_pop_timestamps
+        assert job_tracker.job_pop_timestamps[job] > 0
 
     def test_jobs_lookup_entry_created(self) -> None:
-        jt = JobTracker()
-        popper = _make_popper(job_tracker=jt)
+        job_tracker = JobTracker()
+        popper = _make_popper(job_tracker=job_tracker)
         job = make_job_pop_response()
 
         asyncio.run(popper._enqueue_popped_job(job))
 
-        assert job in jt.jobs_lookup
-        info = jt.jobs_lookup[job]
+        assert job in job_tracker.jobs_lookup
+        info = job_tracker.jobs_lookup[job]
         assert info.sdk_api_job_info is job
         assert info.state is None
         assert info.time_popped > 0
 
     def test_multiple_jobs_enqueued_in_order(self) -> None:
-        jt = JobTracker()
-        popper = _make_popper(job_tracker=jt)
+        job_tracker = JobTracker()
+        popper = _make_popper(job_tracker=job_tracker)
         job1 = make_job_pop_response(model="model_a")
         job2 = make_job_pop_response(model="model_b")
 
         asyncio.run(popper._enqueue_popped_job(job1))
         asyncio.run(popper._enqueue_popped_job(job2))
 
-        assert len(jt.jobs_pending_inference) == 2
-        assert jt.jobs_pending_inference[0] is job1
-        assert jt.jobs_pending_inference[1] is job2
+        assert len(job_tracker.jobs_pending_inference) == 2
+        assert job_tracker.jobs_pending_inference[0] is job1
+        assert job_tracker.jobs_pending_inference[1] is job2
 
 
 # ── Full pop flow with API mock ──────────────────────────────────────────
@@ -715,12 +715,12 @@ class TestApiJobPopFullFlow:
         horde_session = AsyncMock()
         horde_session.submit_request = AsyncMock(side_effect=ConnectionError("network down"))
 
-        jt = JobTracker()
+        job_tracker = JobTracker()
 
         popper = _make_popper(
             state=WorkerState(last_job_pop_time=0.0),
             process_map=_make_process_map_with_available_processes(),
-            job_tracker=jt,
+            job_tracker=job_tracker,
             horde_client_session=horde_session,
         )
 
@@ -738,13 +738,13 @@ class TestApiJobPopFullFlow:
         horde_session = AsyncMock()
         horde_session.submit_request = AsyncMock(return_value=error_resp)
 
-        jt = JobTracker()
+        job_tracker = JobTracker()
 
         state = WorkerState(last_job_pop_time=0.0)
         popper = _make_popper(
             state=state,
             process_map=_make_process_map_with_available_processes(),
-            job_tracker=jt,
+            job_tracker=job_tracker,
             horde_client_session=horde_session,
         )
 

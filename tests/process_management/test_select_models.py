@@ -16,30 +16,48 @@ class TestSelectModelsForPopBasic:
 
     def test_returns_configured_models(self) -> None:
         """All configured models should be returned when there are no constraints."""
-        bd = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
-        pm = ProcessMap({})
-        jt = JobTracker()
+        bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
+        )
 
         assert result == {"model_a", "model_b"}
 
     def test_empty_models_returns_none(self) -> None:
         """No configured models → no pop should happen."""
-        bd = make_mock_bridge_data(image_models_to_load=[])
-        pm = ProcessMap({})
-        jt = JobTracker()
+        bridge_data = make_mock_bridge_data(image_models_to_load=[])
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
+        )
 
         assert result is None
 
     def test_single_model(self) -> None:
-        bd = make_mock_bridge_data(image_models_to_load=["stable_diffusion"])
-        pm = ProcessMap({})
-        jt = JobTracker()
+        bridge_data = make_mock_bridge_data(image_models_to_load=["stable_diffusion"])
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=1, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=1,
+            last_pop_had_no_jobs=False,
+        )
 
         assert result == {"stable_diffusion"}
 
@@ -49,63 +67,75 @@ class TestDuplicateModelFiltering:
 
     def test_model_with_two_queued_jobs_excluded(self) -> None:
         """A model that already has 2 jobs queued should be removed from pop candidates."""
-        bd = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
-        pm = ProcessMap({})
-        jt = JobTracker()
+        bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
         job1 = Mock()
         job1.model = "model_a"
         job2 = Mock()
         job2.model = "model_a"
-        jt.jobs_pending_inference.extend([job1, job2])
+        job_tracker.jobs_pending_inference.extend([job1, job2])
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
+        )
 
         assert result is not None
         assert "model_a" not in result
         assert "model_b" in result
 
     def test_model_with_one_queued_job_not_excluded(self) -> None:
-        bd = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
-        pm = ProcessMap({})
-        jt = JobTracker()
+        bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
         job1 = Mock()
         job1.model = "model_a"
-        jt.jobs_pending_inference.append(job1)
+        job_tracker.jobs_pending_inference.append(job1)
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+        )
 
         assert result is not None
         assert "model_a" in result
 
     def test_all_models_excluded_returns_none(self) -> None:
         """If all models have >=2 queued jobs, no models are eligible → returns None."""
-        bd = make_mock_bridge_data(image_models_to_load=["model_a"])
-        pm = ProcessMap({})
-        jt = JobTracker()
+        bridge_data = make_mock_bridge_data(image_models_to_load=["model_a"])
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
         for _ in range(2):
             job = Mock()
             job.model = "model_a"
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+        )
 
         assert result is None
 
     def test_three_queued_jobs_also_excluded(self) -> None:
         """Model with 3+ jobs should also be excluded (threshold is >= 2)."""
-        bd = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
-        pm = ProcessMap({})
-        jt = JobTracker()
+        bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
         for _ in range(3):
             job = Mock()
             job.model = "model_a"
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+        )
 
         assert result is not None
         assert "model_a" not in result
@@ -116,16 +146,18 @@ class TestStickyModels:
 
     def test_no_stickiness_returns_all_models(self) -> None:
         """With stickiness=0, all models should be returned."""
-        bd = make_mock_bridge_data(
+        bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a", "model_b", "model_c"],
             horde_model_stickiness=0,
         )
-        proc = make_mock_process_info(0, model_name="model_a")
-        pm = ProcessMap({0: proc})
-        jt = JobTracker()
+        process_info = make_mock_process_info(0, model_name="model_a")
+        process_map = ProcessMap({0: process_info})
+        job_tracker = JobTracker()
 
         result = _select_models_for_pop(
-            bd, pm, jt,
+            bridge_data,
+            process_map,
+            job_tracker,
             max_inference_processes=1,
             last_pop_had_no_jobs=False,
         )
@@ -134,19 +166,21 @@ class TestStickyModels:
 
     def test_stickiness_one_always_sticks(self) -> None:
         """With stickiness=1.0, the random check always passes → only loaded models."""
-        bd = make_mock_bridge_data(
+        bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a", "model_b", "model_c"],
             horde_model_stickiness=1.0,
         )
         from horde_worker_regen.process_management.messages import HordeProcessState
 
-        proc = make_mock_process_info(0, model_name="model_a", state=HordeProcessState.WAITING_FOR_JOB)
-        pm = ProcessMap({0: proc})
-        jt = JobTracker()
+        process_info = make_mock_process_info(0, model_name="model_a", state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: process_info})
+        job_tracker = JobTracker()
 
         # Models to load (3) > max_inference_processes (1) and loaded == max → sticky path
         result = _select_models_for_pop(
-            bd, pm, jt,
+            bridge_data,
+            process_map,
+            job_tracker,
             max_inference_processes=1,
             last_pop_had_no_jobs=False,
         )
@@ -161,16 +195,18 @@ class TestStickyModels:
 
     def test_stickiness_skipped_when_last_pop_had_no_jobs(self) -> None:
         """When last pop returned no jobs, stickiness is bypassed to try different models."""
-        bd = make_mock_bridge_data(
+        bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a", "model_b", "model_c"],
             horde_model_stickiness=1.0,
         )
-        proc = make_mock_process_info(0, model_name="model_a")
-        pm = ProcessMap({0: proc})
-        jt = JobTracker()
+        process_info = make_mock_process_info(0, model_name="model_a")
+        process_map = ProcessMap({0: process_info})
+        job_tracker = JobTracker()
 
         result = _select_models_for_pop(
-            bd, pm, jt,
+            bridge_data,
+            process_map,
+            job_tracker,
             max_inference_processes=1,
             last_pop_had_no_jobs=True,  # bypass stickiness
         )
@@ -181,16 +217,18 @@ class TestStickyModels:
 
     def test_stickiness_not_applied_when_fewer_models_than_processes(self) -> None:
         """When models_to_load <= max_inference_processes, stickiness path isn't entered."""
-        bd = make_mock_bridge_data(
+        bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a"],
             horde_model_stickiness=1.0,
         )
-        proc = make_mock_process_info(0, model_name="model_a")
-        pm = ProcessMap({0: proc})
-        jt = JobTracker()
+        process_info = make_mock_process_info(0, model_name="model_a")
+        process_map = ProcessMap({0: process_info})
+        job_tracker = JobTracker()
 
         result = _select_models_for_pop(
-            bd, pm, jt,
+            bridge_data,
+            process_map,
+            job_tracker,
             max_inference_processes=2,
             last_pop_had_no_jobs=False,
         )
@@ -199,18 +237,20 @@ class TestStickyModels:
 
     def test_stickiness_not_applied_when_not_all_slots_loaded(self) -> None:
         """Stickiness requires loaded_models == max_inference_processes."""
-        bd = make_mock_bridge_data(
+        bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a", "model_b", "model_c"],
             horde_model_stickiness=1.0,
         )
         # Only 1 of 2 processes has a model loaded
         proc0 = make_mock_process_info(0, model_name="model_a")
         proc1 = make_mock_process_info(1, model_name=None)
-        pm = ProcessMap({0: proc0, 1: proc1})
-        jt = JobTracker()
+        process_map = ProcessMap({0: proc0, 1: proc1})
+        job_tracker = JobTracker()
 
         result = _select_models_for_pop(
-            bd, pm, jt,
+            bridge_data,
+            process_map,
+            job_tracker,
             max_inference_processes=2,
             last_pop_had_no_jobs=False,
         )
@@ -224,14 +264,16 @@ class TestCustomModels:
 
     def test_custom_models_added(self) -> None:
         """Custom models should be added to the set on top of configured models."""
-        bd = make_mock_bridge_data(
+        bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a"],
             custom_models=[{"name": "custom_model_1"}, {"name": "custom_model_2"}],
         )
-        pm = ProcessMap({})
-        jt = JobTracker()
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+        )
 
         assert result is not None
         assert "model_a" in result
@@ -239,39 +281,45 @@ class TestCustomModels:
         assert "custom_model_2" in result
 
     def test_empty_custom_models_no_effect(self) -> None:
-        bd = make_mock_bridge_data(
+        bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a"],
             custom_models=[],
         )
-        pm = ProcessMap({})
-        jt = JobTracker()
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+        )
 
         assert result == {"model_a"}
 
     def test_none_custom_models_no_effect(self) -> None:
-        bd = make_mock_bridge_data(
+        bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a"],
             custom_models=None,
         )
-        pm = ProcessMap({})
-        jt = JobTracker()
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+        )
 
         assert result == {"model_a"}
 
     def test_custom_model_duplicates_regular_model(self) -> None:
         """Custom model with same name as configured model doesn't create duplicates (it's a set)."""
-        bd = make_mock_bridge_data(
+        bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a"],
             custom_models=[{"name": "model_a"}],
         )
-        pm = ProcessMap({})
-        jt = JobTracker()
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+        )
 
         assert result == {"model_a"}
 
@@ -281,20 +329,22 @@ class TestSelectModelsForPopCombinations:
 
     def test_custom_model_survives_duplicate_filter(self) -> None:
         """A custom model without queued jobs should survive duplicate filtering."""
-        bd = make_mock_bridge_data(
+        bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a"],
             custom_models=[{"name": "custom_1"}],
         )
-        pm = ProcessMap({})
-        jt = JobTracker()
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
         # model_a has 2 jobs, should be filtered
         for _ in range(2):
             job = Mock()
             job.model = "model_a"
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=2, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+        )
 
         assert result is not None
         assert "model_a" not in result
@@ -303,17 +353,19 @@ class TestSelectModelsForPopCombinations:
     def test_many_models_with_partial_queue(self) -> None:
         """With many models, only the ones with <2 queue slots should be in the result."""
         models = [f"model_{i}" for i in range(5)]
-        bd = make_mock_bridge_data(image_models_to_load=models)
-        pm = ProcessMap({})
-        jt = JobTracker()
+        bridge_data = make_mock_bridge_data(image_models_to_load=models)
+        process_map = ProcessMap({})
+        job_tracker = JobTracker()
 
         # model_0 and model_2 have 2 jobs each
         for model_name in ["model_0", "model_0", "model_2", "model_2"]:
             job = Mock()
             job.model = model_name
-            jt.jobs_pending_inference.append(job)
+            job_tracker.jobs_pending_inference.append(job)
 
-        result = _select_models_for_pop(bd, pm, jt, max_inference_processes=5, last_pop_had_no_jobs=False)
+        result = _select_models_for_pop(
+            bridge_data, process_map, job_tracker, max_inference_processes=5, last_pop_had_no_jobs=False
+        )
 
         assert result is not None
         assert "model_0" not in result

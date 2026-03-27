@@ -42,118 +42,118 @@ class TestIsTimeForShutdown:
     """Tests for is_time_for_shutdown."""
 
     def test_not_shutting_down_returns_false(self) -> None:
-        sm = _make_shutdown_manager()
-        assert sm.is_time_for_shutdown() is False
+        shutdown_manager = _make_shutdown_manager()
+        assert shutdown_manager.is_time_for_shutdown() is False
 
     def test_recently_recovered_returns_false(self) -> None:
         state = WorkerState(shutting_down=True)
-        sm = _make_shutdown_manager(state=state)
-        sm._process_lifecycle.recently_recovered = True
+        shutdown_manager = _make_shutdown_manager(state=state)
+        shutdown_manager._process_lifecycle.recently_recovered = True
 
-        assert sm.is_time_for_shutdown() is False
+        assert shutdown_manager.is_time_for_shutdown() is False
 
     def test_jobs_pending_submit_returns_false(self) -> None:
         state = WorkerState(shutting_down=True)
-        jt = JobTracker()
-        jt.jobs_pending_submit.append(Mock())
+        job_tracker = JobTracker()
+        job_tracker.jobs_pending_submit.append(Mock())
 
-        sm = _make_shutdown_manager(state=state, job_tracker=jt)
-        assert sm.is_time_for_shutdown() is False
+        shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
+        assert shutdown_manager.is_time_for_shutdown() is False
 
     def test_jobs_being_safety_checked_returns_false(self) -> None:
         state = WorkerState(shutting_down=True)
-        jt = JobTracker()
-        jt.jobs_being_safety_checked.append(Mock())
+        job_tracker = JobTracker()
+        job_tracker.jobs_being_safety_checked.append(Mock())
 
-        sm = _make_shutdown_manager(state=state, job_tracker=jt)
-        assert sm.is_time_for_shutdown() is False
+        shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
+        assert shutdown_manager.is_time_for_shutdown() is False
 
     def test_jobs_pending_safety_check_returns_false(self) -> None:
         state = WorkerState(shutting_down=True)
-        jt = JobTracker()
-        jt.jobs_pending_safety_check.append(Mock())
+        job_tracker = JobTracker()
+        job_tracker.jobs_pending_safety_check.append(Mock())
 
-        sm = _make_shutdown_manager(state=state, job_tracker=jt)
-        assert sm.is_time_for_shutdown() is False
+        shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
+        assert shutdown_manager.is_time_for_shutdown() is False
 
     def test_jobs_in_progress_returns_false(self) -> None:
         state = WorkerState(shutting_down=True)
-        jt = JobTracker()
-        jt.jobs_in_progress.append(Mock())
+        job_tracker = JobTracker()
+        job_tracker.jobs_in_progress.append(Mock())
 
-        sm = _make_shutdown_manager(state=state, job_tracker=jt)
-        assert sm.is_time_for_shutdown() is False
+        shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
+        assert shutdown_manager.is_time_for_shutdown() is False
 
     def test_jobs_pending_inference_returns_false(self) -> None:
         state = WorkerState(shutting_down=True)
-        jt = JobTracker()
-        jt.jobs_pending_inference.append(Mock())
+        job_tracker = JobTracker()
+        job_tracker.jobs_pending_inference.append(Mock())
 
-        sm = _make_shutdown_manager(state=state, job_tracker=jt)
-        assert sm.is_time_for_shutdown() is False
+        shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
+        assert shutdown_manager.is_time_for_shutdown() is False
 
     def test_all_processes_ending_returns_true(self) -> None:
         state = WorkerState(shutting_down=True)
-        proc = make_mock_process_info(0, state=HordeProcessState.PROCESS_ENDING)
-        process_map = ProcessMap({0: proc})
+        process_info = make_mock_process_info(0, state=HordeProcessState.PROCESS_ENDING)
+        process_map = ProcessMap({0: process_info})
 
-        sm = _make_shutdown_manager(state=state, process_map=process_map)
-        assert sm.is_time_for_shutdown() is True
+        shutdown_manager = _make_shutdown_manager(state=state, process_map=process_map)
+        assert shutdown_manager.is_time_for_shutdown() is True
 
     def test_no_processes_returns_true(self) -> None:
         state = WorkerState(shutting_down=True)
-        sm = _make_shutdown_manager(state=state)
-        assert sm.is_time_for_shutdown() is True
+        shutdown_manager = _make_shutdown_manager(state=state)
+        assert shutdown_manager.is_time_for_shutdown() is True
 
 
 class TestShutdown:
     """Tests for shutdown."""
 
     def test_shutdown_sets_flag(self) -> None:
-        sm = _make_shutdown_manager()
-        assert sm._state.shutting_down is False
+        shutdown_manager = _make_shutdown_manager()
+        assert shutdown_manager._state.shutting_down is False
 
-        sm.shutdown()
-        assert sm._state.shutting_down is True
-        assert sm._state.shutting_down_time > 0
+        shutdown_manager.shutdown()
+        assert shutdown_manager._state.shutting_down is True
+        assert shutdown_manager._state.shutting_down_time > 0
 
     def test_double_shutdown_no_effect(self) -> None:
-        sm = _make_shutdown_manager()
-        sm.shutdown()
-        first_time = sm._state.shutting_down_time
+        shutdown_manager = _make_shutdown_manager()
+        shutdown_manager.shutdown()
+        first_time = shutdown_manager._state.shutting_down_time
 
-        sm.shutdown()
-        assert sm._state.shutting_down_time == first_time
+        shutdown_manager.shutdown()
+        assert shutdown_manager._state.shutting_down_time == first_time
 
 
 class TestAbort:
     """Tests for abort."""
 
     def test_abort_purges_jobs_and_shuts_down(self) -> None:
-        sm = _make_shutdown_manager()
-        sm._job_tracker._purge_jobs = Mock()
-        sm._process_lifecycle._hard_kill_processes = Mock()
+        shutdown_manager = _make_shutdown_manager()
+        shutdown_manager._job_tracker._purge_jobs = Mock()
+        shutdown_manager._process_lifecycle._hard_kill_processes = Mock()
 
-        sm.abort()
+        shutdown_manager.abort()
 
-        assert sm._state.shutting_down is True
-        sm._job_tracker._purge_jobs.assert_called_once()
-        sm._process_lifecycle._hard_kill_processes.assert_called_once()
+        assert shutdown_manager._state.shutting_down is True
+        shutdown_manager._job_tracker._purge_jobs.assert_called_once()
+        shutdown_manager._process_lifecycle._hard_kill_processes.assert_called_once()
 
 
 class TestSignalHandler:
     """Tests for signal_handler."""
 
     def test_first_signal_initiates_shutdown(self) -> None:
-        sm = _make_shutdown_manager()
-        sm.signal_handler(2, None)
+        shutdown_manager = _make_shutdown_manager()
+        shutdown_manager.signal_handler(2, None)
 
-        assert sm._state.shutting_down is True
-        assert sm._caught_sigints == 1
+        assert shutdown_manager._state.shutting_down is True
+        assert shutdown_manager._caught_sigints == 1
 
     def test_second_signal_increments_count(self) -> None:
-        sm = _make_shutdown_manager()
-        sm.signal_handler(2, None)
-        sm.signal_handler(2, None)
+        shutdown_manager = _make_shutdown_manager()
+        shutdown_manager.signal_handler(2, None)
+        shutdown_manager.signal_handler(2, None)
 
-        assert sm._caught_sigints == 2
+        assert shutdown_manager._caught_sigints == 2
