@@ -67,6 +67,10 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.limit_max_steps = False
     bd.allow_lora = True
     bd._loaded_from_env_vars = False
+    bd.dry_run_skip_inference = False
+    bd.dry_run_skip_safety = False
+    bd.dry_run_skip_api = False
+    bd.dry_run_inference_delay = 1.0
     for k, v in overrides.items():
         setattr(bd, k, v)
     return bd

@@ -229,6 +229,10 @@ def init() -> None:
     rewriter_stderr = LogConsoleRewriter(sys.stderr)  # type: ignore
     sys.stderr = rewriter_stderr
 
+    from horde_worker_regen.telemetry import configure_telemetry
+
+    # configure_telemetry()
+
     AIWORKER_LIMITED_CONSOLE_MESSAGES = os.getenv("AIWORKER_LIMITED_CONSOLE_MESSAGES")
 
     logger.remove()

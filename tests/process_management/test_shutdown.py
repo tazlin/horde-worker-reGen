@@ -95,9 +95,9 @@ class TestIsTimeForShutdown:
     def test_all_processes_ending_returns_true(self) -> None:
         state = WorkerState(shutting_down=True)
         proc = make_mock_process_info(0, state=HordeProcessState.PROCESS_ENDING)
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
 
-        sm = _make_shutdown_manager(state=state, process_map=pm)
+        sm = _make_shutdown_manager(state=state, process_map=process_map)
         assert sm.is_time_for_shutdown() is True
 
     def test_no_processes_returns_true(self) -> None:

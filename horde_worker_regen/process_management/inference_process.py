@@ -93,6 +93,8 @@ class HordeInferenceProcess(HordeProcess):
         process_launch_identifier: int,
         *,
         high_memory_mode: bool = False,
+        dry_run_skip_inference: bool = False,
+        dry_run_inference_delay: float = 1.0,
     ) -> None:
         """Initialise the HordeInferenceProcess.
 
@@ -109,6 +111,9 @@ class HordeInferenceProcess(HordeProcess):
             high_memory_mode (bool, optional): Whether or not to use high memory mode. This mode uses more memory, but\
                 may be faster if the system has enough memory and VRAM. \
                 Defaults to False.
+            dry_run_skip_inference (bool, optional): Skip real inference and return a dummy image. Defaults to False.
+            dry_run_inference_delay (float, optional): Seconds to sleep when dry-run inference is active. \
+                Defaults to 1.0.
         """
         super().__init__(
             process_id=process_id,
@@ -119,61 +124,69 @@ class HordeInferenceProcess(HordeProcess):
         )
 
         self._aux_model_lock = aux_model_lock
-
-        # We import these here to guard against potentially importing them in the main process
-        # which would create shared objects, potentially causing issues
-        try:
-            with logger.catch(reraise=True):
-                from hordelib.horde import HordeLib
-                from hordelib.shared_model_manager import SharedModelManager
-        except Exception as e:
-            logger.critical(f"Failed to import HordeLib or SharedModelManager: {type(e).__name__} {e}")
-            sys.exit(1)
+        self._dry_run_skip_inference = dry_run_skip_inference
+        self._dry_run_inference_delay = dry_run_inference_delay
 
         self._inference_semaphore = inference_semaphore
         self._vae_decode_semaphore = vae_decode_semaphore
 
-        from hordelib.nodes.node_model_loader import HordeCheckpointLoader
+        if dry_run_skip_inference:
+            logger.info("Dry-run mode: skipping HordeLib/SharedModelManager initialisation")
+            self._horde = None  # type: ignore[assignment]
+            self._shared_model_manager = None  # type: ignore[assignment]
+            self._checkpoint_loader = None  # type: ignore[assignment]
+        else:
+            # We import these here to guard against potentially importing them in the main process
+            # which would create shared objects, potentially causing issues
+            try:
+                with logger.catch(reraise=True):
+                    from hordelib.horde import HordeLib
+                    from hordelib.shared_model_manager import SharedModelManager
+            except Exception as e:
+                logger.critical(f"Failed to import HordeLib or SharedModelManager: {type(e).__name__} {e}")
+                sys.exit(1)
 
-        try:
-            logger.info(f"Initialising HordeLib with high_memory_mode={high_memory_mode}")
-            with logger.catch(reraise=True):
-                self._horde = HordeLib(
-                    comfyui_callback=self._comfyui_callback,
-                    aggressive_unloading=not high_memory_mode,
+            from hordelib.nodes.node_model_loader import HordeCheckpointLoader
+
+            try:
+                logger.info(f"Initialising HordeLib with high_memory_mode={high_memory_mode}")
+                with logger.catch(reraise=True):
+                    self._horde = HordeLib(
+                        comfyui_callback=self._comfyui_callback,
+                        aggressive_unloading=not high_memory_mode,
+                    )
+                    self._shared_model_manager = SharedModelManager(do_not_load_model_mangers=True)
+            except Exception as e:
+                logger.critical(f"Failed to initialise HordeLib: {type(e).__name__} {e}")
+                sys.exit(1)
+
+            try:
+                with logger.catch(reraise=True):
+                    self._checkpoint_loader = HordeCheckpointLoader()
+            except Exception as e:
+                logger.critical(f"Failed to initialise HordeCheckpointLoader: {type(e).__name__} {e}")
+                sys.exit(1)
+
+            SharedModelManager.load_model_managers(
+                multiprocessing_lock=self.disk_lock,
+                download_legacy_references=process_id == 1,
+            )
+
+            if SharedModelManager.manager.compvis is None:
+                logger.critical("Failed to initialise SharedModelManager")
+                self.send_process_state_change_message(
+                    process_state=HordeProcessState.PROCESS_ENDED,
+                    info="Failed to initialise compvis in SharedModelManager",
                 )
-                self._shared_model_manager = SharedModelManager(do_not_load_model_mangers=True)
-        except Exception as e:
-            logger.critical(f"Failed to initialise HordeLib: {type(e).__name__} {e}")
-            sys.exit(1)
+                sys.exit(1)
 
-        try:
-            with logger.catch(reraise=True):
-                self._checkpoint_loader = HordeCheckpointLoader()
-        except Exception as e:
-            logger.critical(f"Failed to initialise HordeCheckpointLoader: {type(e).__name__} {e}")
-            sys.exit(1)
-
-        SharedModelManager.load_model_managers(
-            multiprocessing_lock=self.disk_lock,
-            download_legacy_references=process_id == 1,  # Only download legacy references in the first process
-        )
-
-        if SharedModelManager.manager.compvis is None:
-            logger.critical("Failed to initialise SharedModelManager")
-            self.send_process_state_change_message(
-                process_state=HordeProcessState.PROCESS_ENDED,
-                info="Failed to initialise compvis in SharedModelManager",
-            )
-            sys.exit(1)
-
-        if len(SharedModelManager.manager.compvis.available_models) == 0:
-            logger.critical("No models available in SharedModelManager")
-            self.send_process_state_change_message(
-                process_state=HordeProcessState.PROCESS_ENDED,
-                info="No models available in SharedModelManager",
-            )
-            sys.exit(1)
+            if len(SharedModelManager.manager.compvis.available_models) == 0:
+                logger.critical("No models available in SharedModelManager")
+                self.send_process_state_change_message(
+                    process_state=HordeProcessState.PROCESS_ENDED,
+                    info="No models available in SharedModelManager",
+                )
+                sys.exit(1)
 
         logger.info("HordeInferenceProcess initialised")
 
@@ -533,7 +546,19 @@ class HordeInferenceProcess(HordeProcess):
 
             with logger.catch(reraise=True):
                 self._start_inference_time = time.time()
-                results = self._horde.basic_inference(job_info, progress_callback=self.progress_callback)
+                if self._dry_run_skip_inference:
+                    time.sleep(self._dry_run_inference_delay)
+                    results = self._make_dummy_inference_result(job_info)
+                else:
+                    from horde_worker_regen.telemetry_spans import span_inference
+
+                    with span_inference(
+                        model=job_info.model or "unknown",
+                        steps=job_info.payload.ddim_steps,
+                        width=job_info.payload.width,
+                        height=job_info.payload.height,
+                    ):
+                        results = self._horde.basic_inference(job_info, progress_callback=self.progress_callback)
         except Exception as e:
             logger.critical(f"Inference failed: {type(e).__name__} {e}")
             return None
@@ -547,6 +572,43 @@ class HordeInferenceProcess(HordeProcess):
                 self._inference_semaphore.release()
                 self._vae_decode_semaphore.release()
         return results
+
+    @staticmethod
+    def _make_dummy_inference_result(
+        job_info: ImageGenerateJobPopResponse,
+    ) -> list[ResultingImageReturn]:
+        """Create a minimal 1x1 PNG result for dry-run mode."""
+        import io
+        import struct
+        import zlib
+
+        def _make_1x1_png() -> bytes:
+            raw_data = b"\x00\x00\x00\x00"
+            compressed = zlib.compress(raw_data)
+            chunks: list[bytes] = []
+            sig = b"\x89PNG\r\n\x1a\n"
+            chunks.append(sig)
+
+            def _chunk(ctype: bytes, data: bytes) -> bytes:
+                c = struct.pack(">I", len(data)) + ctype + data
+                crc = struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
+                return c + crc
+
+            ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+            chunks.append(_chunk(b"IHDR", ihdr))
+            chunks.append(_chunk(b"IDAT", compressed))
+            chunks.append(_chunk(b"IEND", b""))
+            return b"".join(chunks)
+
+        png_bytes = _make_1x1_png()
+        buf = io.BytesIO(png_bytes)
+
+        n_iter = job_info.payload.n_iter if job_info.payload.n_iter else 1
+        results = []
+        for _ in range(n_iter):
+            buf.seek(0)
+            results.append({"image": buf, "seed": job_info.payload.seed or "0"})  # type: ignore[dict-item]
+        return results  # type: ignore[return-value]
 
     @staticmethod
     def clear_gc_and_torch_cache() -> None:

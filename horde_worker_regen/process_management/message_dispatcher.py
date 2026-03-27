@@ -14,6 +14,12 @@ from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
+from horde_worker_regen.telemetry_spans import (
+    inference_duration_histogram,
+    jobs_completed_counter,
+    jobs_faulted_counter,
+    queue_depth_counter,
+)
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import (
     HordeAuxModelStateChangeMessage,
@@ -29,6 +35,7 @@ from horde_worker_regen.process_management.messages import (
 )
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.protocols import BridgeDataProvider
 from horde_worker_regen.process_management.worker_state import WorkerState
 
 if TYPE_CHECKING:
@@ -46,7 +53,7 @@ class MessageDispatcher:
     _process_message_queue: Queue  # type: ignore[type-arg]
 
     _get_model_baseline: Callable[[str], STABLE_DIFFUSION_BASELINE_CATEGORY | str | None]
-    _get_bridge_data: Callable[[], reGenBridgeData]
+    _get_bridge_data: BridgeDataProvider
     _on_unload_vram: Callable[[HordeProcessInfo], None]
 
     _last_deadlock_detected_time: float = 0.0
@@ -64,7 +71,7 @@ class MessageDispatcher:
         job_tracker: JobTracker,
         process_message_queue: Queue,  # type: ignore[type-arg]
         get_model_baseline: Callable[[str], STABLE_DIFFUSION_BASELINE_CATEGORY | str | None],
-        get_bridge_data: Callable[[], reGenBridgeData],
+        get_bridge_data: BridgeDataProvider,
         on_unload_vram: Callable[[HordeProcessInfo], None],
         state: WorkerState,
     ) -> None:
@@ -327,11 +334,13 @@ class MessageDispatcher:
                 break
 
         self._job_tracker.total_num_completed_jobs += 1
+        queue_depth_counter.add(-1)
         bridge_data = self._get_bridge_data()
         if bridge_data.unload_models_from_vram_often:
             self._on_unload_vram(self._process_map[message.process_id])
 
         if message.time_elapsed is not None:
+            inference_duration_histogram.record(message.time_elapsed)
             inference_finished_string = (
                 "\0<fg #da9dff>"
                 f"Inference finished for job {str(message.sdk_api_job_info.id_)[:8]} "
@@ -351,8 +360,10 @@ class MessageDispatcher:
             job_info.time_to_generate = message.time_elapsed
             job_info.job_image_results = message.job_image_results
 
+            jobs_completed_counter.add(1)
             self._job_tracker.jobs_pending_safety_check.append(job_info)
         else:
+            jobs_faulted_counter.add(1)
             logger.error(
                 f"Job {message.sdk_api_job_info.id_} faulted on process {message.process_id}: {message.info}",
             )

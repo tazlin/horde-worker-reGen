@@ -23,6 +23,7 @@ from horde_worker_regen.process_management.messages import (
 )
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.protocols import BridgeDataProvider
 from horde_worker_regen.process_management.worker_entry_points import start_inference_process, start_safety_process
 from horde_worker_regen.process_management.worker_state import WorkerState
 
@@ -38,7 +39,7 @@ class ProcessLifecycleManager:
     _disk_lock: Lock_MultiProcessing
     _aux_model_lock: Lock_MultiProcessing
     _vae_decode_semaphore: Semaphore
-    _get_bridge_data: Callable[[], reGenBridgeData]
+    _get_bridge_data: BridgeDataProvider
     _max_inference_processes: int
     _max_safety_processes: int
     _amd_gpu: bool
@@ -65,7 +66,7 @@ class ProcessLifecycleManager:
         disk_lock: Lock_MultiProcessing,
         aux_model_lock: Lock_MultiProcessing,
         vae_decode_semaphore: Semaphore,
-        get_bridge_data: Callable[[], reGenBridgeData],
+        get_bridge_data: BridgeDataProvider,
         max_inference_processes: int,
         max_safety_processes: int,
         amd_gpu: bool,
@@ -136,6 +137,7 @@ class ProcessLifecycleManager:
                     "high_memory_mode": bridge_data.high_memory_mode,
                     "amd_gpu": self._amd_gpu,
                     "directml": self._directml,
+                    "dry_run_skip_safety": bridge_data.dry_run_skip_safety,
                 },
             )
 
@@ -202,6 +204,8 @@ class ProcessLifecycleManager:
                 "amd_gpu": self._amd_gpu,
                 "directml": self._directml,
                 "vram_heavy_models": vram_heavy_models,
+                "dry_run_skip_inference": bridge_data.dry_run_skip_inference,
+                "dry_run_inference_delay": bridge_data.dry_run_inference_delay,
             },
         )
         process.start()

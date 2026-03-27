@@ -26,9 +26,11 @@ from horde_worker_regen.process_management.messages import (
     HordeProcessState,
     ModelLoadState,
 )
+from horde_worker_regen.telemetry_spans import span_preload_model
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.protocols import BridgeDataProvider
 from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.utils.job_utils import (
     get_single_job_effective_megapixelsteps as _get_single_job_effective_megapixelsteps,
@@ -43,7 +45,7 @@ class InferenceScheduler:
     _horde_model_map: HordeModelMap
     _job_tracker: JobTracker
     _process_lifecycle: ProcessLifecycleManager
-    _get_bridge_data: Callable[[], reGenBridgeData]
+    _get_bridge_data: BridgeDataProvider
     _get_model_baseline: Callable[[str], STABLE_DIFFUSION_BASELINE_CATEGORY | str | None]
     _get_stable_diffusion_reference: Callable[[], StableDiffusion_ModelReference | None]
     _max_concurrent_inference_processes: int
@@ -63,7 +65,7 @@ class InferenceScheduler:
         horde_model_map: HordeModelMap,
         job_tracker: JobTracker,
         process_lifecycle: ProcessLifecycleManager,
-        get_bridge_data: Callable[[], reGenBridgeData],
+        get_bridge_data: BridgeDataProvider,
         get_model_baseline: Callable[[str], STABLE_DIFFUSION_BASELINE_CATEGORY | str | None],
         get_stable_diffusion_reference: Callable[[], StableDiffusion_ModelReference | None],
         max_concurrent_inference_processes: int,
@@ -202,15 +204,18 @@ class InferenceScheduler:
             will_load_loras = job.payload.loras is not None and len(job.payload.loras) > 0
             seamless_tiling_enabled = job.payload.tiling is not None and job.payload.tiling
 
-            if available_process.safe_send_message(
-                HordePreloadInferenceModelMessage(
-                    control_flag=HordeControlFlag.PRELOAD_MODEL,
-                    horde_model_name=job.model,
-                    will_load_loras=will_load_loras,
-                    seamless_tiling_enabled=seamless_tiling_enabled,
-                    sdk_api_job_info=job,
-                ),
-            ):
+            with span_preload_model(model_name=job.model, process_id=available_process.process_id):
+                preload_sent = available_process.safe_send_message(
+                    HordePreloadInferenceModelMessage(
+                        control_flag=HordeControlFlag.PRELOAD_MODEL,
+                        horde_model_name=job.model,
+                        will_load_loras=will_load_loras,
+                        seamless_tiling_enabled=seamless_tiling_enabled,
+                        sdk_api_job_info=job,
+                    ),
+                )
+
+            if preload_sent:
                 available_process.last_control_flag = HordeControlFlag.PRELOAD_MODEL
 
                 self._horde_model_map.update_entry(

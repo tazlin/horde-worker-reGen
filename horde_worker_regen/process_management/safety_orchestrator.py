@@ -12,8 +12,10 @@ from horde_worker_regen.process_management.messages import (
     HordeProcessState,
     HordeSafetyControlMessage,
 )
+from horde_worker_regen.telemetry_spans import span_safety_check
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.protocols import BridgeDataProvider
 from horde_worker_regen.process_management.worker_state import WorkerState
 
 
@@ -24,7 +26,7 @@ class SafetyOrchestrator:
     _job_tracker: JobTracker
     _process_lifecycle: ProcessLifecycleManager
 
-    _get_bridge_data: Callable[[], reGenBridgeData]
+    _get_bridge_data: BridgeDataProvider
     _get_stable_diffusion_reference: Callable[[], StableDiffusion_ModelReference | None]
 
     def __init__(
@@ -33,7 +35,7 @@ class SafetyOrchestrator:
         process_map: ProcessMap,
         job_tracker: JobTracker,
         process_lifecycle: ProcessLifecycleManager,
-        get_bridge_data: Callable[[], reGenBridgeData],
+        get_bridge_data: BridgeDataProvider,
         get_stable_diffusion_reference: Callable[[], StableDiffusion_ModelReference | None],
         state: WorkerState,
     ) -> None:
@@ -101,17 +103,18 @@ class SafetyOrchestrator:
         model_info = {}
         if completed_job_info.sdk_api_job_info.model in stable_diffusion_reference.root:
             model_info = stable_diffusion_reference.root[completed_job_info.sdk_api_job_info.model].model_dump()
-        safety_message_sent_succeeded = safety_process.safe_send_message(
-            HordeSafetyControlMessage(
-                control_flag=HordeControlFlag.EVALUATE_SAFETY,
-                job_id=completed_job_info.sdk_api_job_info.id_,
-                images_base64=completed_job_info.images_base64,
-                prompt=completed_job_info.sdk_api_job_info.payload.prompt,
-                censor_nsfw=completed_job_info.sdk_api_job_info.payload.use_nsfw_censor,
-                sfw_worker=not bridge_data.nsfw,
-                horde_model_info=model_info,
-            ),
-        )
+        with span_safety_check(job_id=str(completed_job_info.sdk_api_job_info.id_)):
+            safety_message_sent_succeeded = safety_process.safe_send_message(
+                HordeSafetyControlMessage(
+                    control_flag=HordeControlFlag.EVALUATE_SAFETY,
+                    job_id=completed_job_info.sdk_api_job_info.id_,
+                    images_base64=completed_job_info.images_base64,
+                    prompt=completed_job_info.sdk_api_job_info.payload.prompt,
+                    censor_nsfw=completed_job_info.sdk_api_job_info.payload.use_nsfw_censor,
+                    sfw_worker=not bridge_data.nsfw,
+                    horde_model_info=model_info,
+                ),
+            )
 
         safety_process = self._process_map.get_safety_process()
         if not safety_message_sent_succeeded:

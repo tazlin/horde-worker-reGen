@@ -163,7 +163,7 @@ class NextJobAndProcess(BaseModel):
 class APIWorkerMessage(BaseModel):
     """A message sent to the worker from the API."""
 
-    message_id: str
+    message_id: str | None
     """The ID of the message."""
 
     message_text: str | None
@@ -174,3 +174,19 @@ class APIWorkerMessage(BaseModel):
 
     message_expiry: str | None
     """The expiry time of the message."""
+
+    @classmethod
+    def from_raw_dict(cls, raw: dict) -> APIWorkerMessage:  # type: ignore[type-arg]
+        """Build from the untyped dict the SDK currently returns.
+
+        TODO: Remove once the SDK provides a proper model for these messages.
+        """
+        message_id = raw.get("id")
+        if message_id is not None:
+            message_id = str(message_id)
+        return cls(
+            message_id=message_id,
+            message_text=str(raw.get("message")),
+            message_origin=raw.get("origin"),
+            message_expiry=raw.get("expiry"),
+        )

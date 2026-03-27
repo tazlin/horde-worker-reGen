@@ -71,6 +71,8 @@ class HordeSafetyProcess(HordeProcess):
     censor_sfw_request_image_base64: str
     censor_sfw_worker_image_base64: str
 
+    _dry_run_skip_safety: bool
+
     def __init__(
         self,
         process_id: int,
@@ -79,6 +81,8 @@ class HordeSafetyProcess(HordeProcess):
         disk_lock: Lock,
         process_launch_identifier: int,
         cpu_only: bool = True,
+        *,
+        dry_run_skip_safety: bool = False,
     ) -> None:
         """Initialise the safety process.
 
@@ -89,6 +93,7 @@ class HordeSafetyProcess(HordeProcess):
             disk_lock (Lock): The lock to use when accessing the disk.
             process_launch_identifier (int): The unique identifier for this launch.
             cpu_only (bool, optional): Whether to only use the CPU. Defaults to True.
+            dry_run_skip_safety (bool, optional): Skip real safety evaluation. Defaults to False.
         """
         super().__init__(
             process_id=process_id,
@@ -98,37 +103,42 @@ class HordeSafetyProcess(HordeProcess):
             process_launch_identifier=process_launch_identifier,
         )
 
-        try:
-            from horde_safety.deep_danbooru_model import get_deep_danbooru_model
-            from horde_safety.interrogate import get_interrogator_no_blip
-        except Exception as e:
-            logger.error(f"Failed to import horde_safety: {type(e).__name__} {e}")
-            raise
+        self._dry_run_skip_safety = dry_run_skip_safety
 
-        try:
-            logger.debug(f"Initialising horde_safety with cpu_only={cpu_only}")
-            self._deep_danbooru_model = get_deep_danbooru_model(device="cpu" if cpu_only else "cuda")
-            self._interrogator = get_interrogator_no_blip(device="cpu" if cpu_only else "cuda")
-        except Exception as e:
-            logger.error(f"Failed to initialise horde_safety: {type(e).__name__} {e}")
-            raise
+        if not dry_run_skip_safety:
+            try:
+                from horde_safety.deep_danbooru_model import get_deep_danbooru_model
+                from horde_safety.interrogate import get_interrogator_no_blip
+            except Exception as e:
+                logger.error(f"Failed to import horde_safety: {type(e).__name__} {e}")
+                raise
 
-        try:
-            from horde_safety.nsfw_checker_class import NSFWChecker
+            try:
+                logger.debug(f"Initialising horde_safety with cpu_only={cpu_only}")
+                self._deep_danbooru_model = get_deep_danbooru_model(device="cpu" if cpu_only else "cuda")
+                self._interrogator = get_interrogator_no_blip(device="cpu" if cpu_only else "cuda")
+            except Exception as e:
+                logger.error(f"Failed to initialise horde_safety: {type(e).__name__} {e}")
+                raise
 
-            self._nsfw_checker = NSFWChecker(
-                self._interrogator,
-                self._deep_danbooru_model,  # Optional, significantly improves results for anime images
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialise NSFWChecker: {type(e).__name__} {e}")
-            raise
+            try:
+                from horde_safety.nsfw_checker_class import NSFWChecker
 
-        try:
-            self.load_censor_files()
-        except Exception as e:
-            logger.error(f"Failed to load censor files: {type(e).__name__} {e}")
-            raise
+                self._nsfw_checker = NSFWChecker(
+                    self._interrogator,
+                    self._deep_danbooru_model,
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialise NSFWChecker: {type(e).__name__} {e}")
+                raise
+
+            try:
+                self.load_censor_files()
+            except Exception as e:
+                logger.error(f"Failed to load censor files: {type(e).__name__} {e}")
+                raise
+        else:
+            logger.info("Dry-run mode: skipping safety model initialisation")
 
         info_message = "Horde safety process started."
 
@@ -138,9 +148,10 @@ class HordeSafetyProcess(HordeProcess):
             info=info_message,
         )
 
-        logger.info(
-            "The first job will always take several seconds longer when on CPU. Subsequent jobs will be faster.",
-        )
+        if not dry_run_skip_safety:
+            logger.info(
+                "The first job will always take several seconds longer when on CPU. Subsequent jobs will be faster.",
+            )
 
     def _set_censor_image(self, reason: CensorReason, image_base64: str) -> None:
         if reason == CensorReason.CSAM:
@@ -174,6 +185,24 @@ class HordeSafetyProcess(HordeProcess):
 
         if message.control_flag != HordeControlFlag.EVALUATE_SAFETY:
             raise ValueError(f"Expected {HordeControlFlag.EVALUATE_SAFETY}, got {message.control_flag}")
+
+        if self._dry_run_skip_safety:
+            logger.info(f"Dry-run: skipping safety evaluation for job {message.job_id}")
+            self.process_message_queue.put(
+                HordeSafetyResultMessage(
+                    process_id=self.process_id,
+                    process_launch_identifier=self.process_launch_identifier,
+                    info=f"Dry-run safety evaluation for job {message.job_id}",
+                    time_elapsed=0.0,
+                    job_id=message.job_id,
+                    safety_evaluations=[
+                        HordeSafetyEvaluation(is_nsfw=False, is_csam=False, replacement_image_base64=None)
+                        for _ in message.images_base64
+                    ],
+                ),
+            )
+            self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
+            return
 
         self.send_memory_report_message(include_vram=False)
 

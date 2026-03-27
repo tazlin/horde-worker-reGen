@@ -12,7 +12,7 @@ authors = [
     {name = "Jug", email = "jugdev@proton.me"},
 ]
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 license = {file = "LICENSE"}
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -38,12 +38,13 @@ dependencies = [
     "loguru",
     "babel",
     "textual>=2.1.0",
+    "logfire>=4.6.0",
+    "mediapipe==0.10.21",
 ]
 
 [project.optional-dependencies]
 cu128 = [
     "torch==2.9.1",
-    "mediapipe==0.10.21",
 ]
 rocm = [
     "torch==2.9.1",
@@ -178,6 +179,7 @@ extend-exclude = ["conda", "model-stats.py", "amd_go_fast.py"]
 [tool.ruff.lint.per-file-ignores]
 "download_models.py" = ["E402"]
 "run_worker.py" = ["E402"]
+"benchmark/runner.py" = ["E402"]
 "convert_config_to_env.py" = ["E402"]
 
 

@@ -68,52 +68,52 @@ class TestPreloadModels:
 
     def test_model_already_loaded_returns_false(self) -> None:
         proc = make_mock_process_info(0, model_name="stable_diffusion")
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         jt = JobTracker()
 
         job = make_job_pop_response("stable_diffusion")
         jt.jobs_pending_inference.append(job)
 
-        sched = _make_scheduler(process_map=pm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, job_tracker=jt)
         assert sched.preload_models() is False
 
     def test_preload_sends_message_when_process_available(self) -> None:
         proc = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         jt = JobTracker()
 
         job = make_job_pop_response("new_model")
         jt.jobs_pending_inference.append(job)
 
-        sched = _make_scheduler(process_map=pm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, job_tracker=jt)
         result = sched.preload_models()
         assert result is True
         assert proc.last_control_flag == HordeControlFlag.PRELOAD_MODEL
 
     def test_no_available_process_returns_false(self) -> None:
         proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         jt = JobTracker()
 
         job = make_job_pop_response("new_model")
         jt.jobs_pending_inference.append(job)
 
-        sched = _make_scheduler(process_map=pm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, job_tracker=jt)
         assert sched.preload_models() is False
 
     def test_clears_preloaded_model_no_longer_needed(self) -> None:
         proc = make_mock_process_info(0, model_name="old_model", state=HordeProcessState.PRELOADED_MODEL)
-        pm = ProcessMap({0: proc})
-        pm.on_process_state_change = Mock()  # type: ignore
+        process_map = ProcessMap({0: proc})
+        process_map.on_process_state_change = Mock()  # type: ignore
         jt = JobTracker()
 
         job = make_job_pop_response("different_model")
         jt.jobs_pending_inference.append(job)
 
-        sched = _make_scheduler(process_map=pm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, job_tracker=jt)
         sched.preload_models()
 
-        pm.on_process_state_change.assert_called_with(  # type: ignore
+        process_map.on_process_state_change.assert_called_with(  # type: ignore
             process_id=0,
             new_state=HordeProcessState.WAITING_FOR_JOB,
         )
@@ -128,7 +128,7 @@ class TestGetNextJobAndProcess:
 
     def test_returns_job_with_matching_process(self) -> None:
         proc = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.PRELOADED_MODEL)
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         hmm = HordeModelMap(root={})
         jt = JobTracker()
 
@@ -141,7 +141,7 @@ class TestGetNextJobAndProcess:
             process_id=0,
         )
 
-        sched = _make_scheduler(process_map=pm, horde_model_map=hmm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, horde_model_map=hmm, job_tracker=jt)
         result = sched.get_next_job_and_process()
         assert result is not None
         assert result.next_job is job
@@ -149,18 +149,18 @@ class TestGetNextJobAndProcess:
 
     def test_no_process_with_model_returns_none(self) -> None:
         proc = make_mock_process_info(0, model_name="other_model")
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         jt = JobTracker()
 
         job = make_job_pop_response("stable_diffusion")
         jt.jobs_pending_inference.append(job)
 
-        sched = _make_scheduler(process_map=pm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, job_tracker=jt)
         assert sched.get_next_job_and_process() is None
 
     def test_max_concurrent_reached_returns_none(self) -> None:
         proc = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.PRELOADED_MODEL)
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         jt = JobTracker()
 
         job_in_progress = make_job_pop_response("stable_diffusion")
@@ -169,7 +169,7 @@ class TestGetNextJobAndProcess:
         job = make_job_pop_response("stable_diffusion")
         jt.jobs_pending_inference.append(job)
 
-        sched = _make_scheduler(process_map=pm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, job_tracker=jt)
         assert sched.get_next_job_and_process() is None
 
     def test_skipped_line_is_returned_on_second_call(self) -> None:
@@ -181,14 +181,14 @@ class TestGetNextJobAndProcess:
 
     def test_job_in_progress_is_skipped(self) -> None:
         proc = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.PRELOADED_MODEL)
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         jt = JobTracker()
 
         job = make_job_pop_response("stable_diffusion")
         jt.jobs_pending_inference.append(job)
         jt.jobs_in_progress.append(job)
 
-        sched = _make_scheduler(process_map=pm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, job_tracker=jt)
         assert sched.get_next_job_and_process() is None
 
 
@@ -201,7 +201,7 @@ class TestStartInference:
 
     def test_successful_start_adds_to_in_progress(self) -> None:
         proc = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.PRELOADED_MODEL)
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         hmm = HordeModelMap(root={})
         jt = JobTracker()
 
@@ -214,7 +214,7 @@ class TestStartInference:
             process_id=0,
         )
 
-        sched = _make_scheduler(process_map=pm, horde_model_map=hmm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, horde_model_map=hmm, job_tracker=jt)
         result = sched.start_inference()
         assert result is True
         assert job in jt.jobs_in_progress
@@ -227,7 +227,7 @@ class TestStartInference:
             state=HordeProcessState.PRELOADED_MODEL,
             safe_send_returns=False,
         )
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         hmm = HordeModelMap(root={})
         jt = JobTracker()
 
@@ -240,7 +240,7 @@ class TestStartInference:
             process_id=0,
         )
 
-        sched = _make_scheduler(process_map=pm, horde_model_map=hmm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, horde_model_map=hmm, job_tracker=jt)
         result = sched.start_inference()
         assert result is True
         assert job not in jt.jobs_in_progress
@@ -259,9 +259,9 @@ class TestUnloadModels:
         jt.jobs_pending_inference.append(job)
 
         proc = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.PRELOADED_MODEL)
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
 
-        sched = _make_scheduler(process_map=pm, job_tracker=jt)
+        sched = _make_scheduler(process_map=process_map, job_tracker=jt)
         assert sched.unload_models() is False
         assert proc.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM
 
@@ -291,17 +291,17 @@ class TestUnloadModels:
 
     def test_unload_from_ram_non_inference_warns(self) -> None:
         proc = make_mock_process_info(0, process_type=HordeProcessType.SAFETY)
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
 
-        sched = _make_scheduler(process_map=pm)
+        sched = _make_scheduler(process_map=process_map)
         sched.unload_from_ram(0)
 
     def test_unload_from_ram_recently_unloaded_skips(self) -> None:
         proc = make_mock_process_info(0)
         proc.recently_unloaded_from_ram = True
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
 
-        sched = _make_scheduler(process_map=pm)
+        sched = _make_scheduler(process_map=process_map)
         old_control_flag = proc.last_control_flag
         sched.unload_from_ram(0)
         assert proc.last_control_flag == old_control_flag

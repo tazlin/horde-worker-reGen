@@ -76,8 +76,8 @@ class TestReceiveAndHandleProcessMessages:
     def test_heartbeat_updates_process_map(self) -> None:
         proc = make_mock_process_info(0)
         proc.process_launch_identifier = 0
-        pm = ProcessMap({0: proc})
-        md = _make_dispatcher(process_map=pm)
+        process_map = ProcessMap({0: proc})
+        md = _make_dispatcher(process_map=process_map)
 
         msg = Mock(spec=HordeProcessHeartbeatMessage)
         msg.process_id = 0
@@ -93,10 +93,10 @@ class TestReceiveAndHandleProcessMessages:
     def test_memory_report_updates_process_map(self) -> None:
         proc = make_mock_process_info(0)
         proc.process_launch_identifier = 0
-        pm = ProcessMap({0: proc})
-        pm.on_memory_report = Mock()
+        process_map = ProcessMap({0: proc})
+        process_map.on_memory_report = Mock()
 
-        md = _make_dispatcher(process_map=pm)
+        md = _make_dispatcher(process_map=process_map)
 
         msg = Mock(spec=HordeProcessMemoryMessage)
         msg.process_id = 0
@@ -109,7 +109,7 @@ class TestReceiveAndHandleProcessMessages:
         _enqueue(md, msg)
         md.receive_and_handle_process_messages()
 
-        pm.on_memory_report.assert_called_once_with(
+        process_map.on_memory_report.assert_called_once_with(
             process_id=0,
             ram_usage_bytes=1024,
             vram_usage_bytes=2048,
@@ -122,10 +122,10 @@ class TestReceiveAndHandleProcessMessages:
         proc.loaded_horde_model_name = "test_model"
         proc.batch_amount = 1
         proc.last_process_state = HordeProcessState.PRELOADED_MODEL
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         hmm = HordeModelMap(root={})
 
-        md = _make_dispatcher(process_map=pm, horde_model_map=hmm)
+        md = _make_dispatcher(process_map=process_map, horde_model_map=hmm)
 
         msg = Mock(spec=HordeProcessStateChangeMessage)
         msg.process_id = 0
@@ -141,9 +141,9 @@ class TestReceiveAndHandleProcessMessages:
     def test_mismatched_launch_identifier_is_ignored(self) -> None:
         proc = make_mock_process_info(0)
         proc.process_launch_identifier = 5
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
 
-        md = _make_dispatcher(process_map=pm)
+        md = _make_dispatcher(process_map=process_map)
 
         msg = Mock(spec=HordeProcessStateChangeMessage)
         msg.process_id = 0
@@ -171,11 +171,11 @@ class TestReceiveAndHandleProcessMessages:
         proc = make_mock_process_info(0)
         proc.process_launch_identifier = 0
         proc.last_process_state = HordeProcessState.WAITING_FOR_JOB
-        pm = ProcessMap({0: proc})
-        pm.on_process_ending = Mock()
-        pm.on_process_state_change = Mock()
+        process_map = ProcessMap({0: proc})
+        process_map.on_process_ending = Mock()
+        process_map.on_process_state_change = Mock()
 
-        md = _make_dispatcher(process_map=pm)
+        md = _make_dispatcher(process_map=process_map)
 
         msg = Mock(spec=HordeProcessStateChangeMessage)
         msg.process_id = 0
@@ -186,7 +186,7 @@ class TestReceiveAndHandleProcessMessages:
         _enqueue(md, msg)
         md.receive_and_handle_process_messages()
 
-        pm.on_process_ending.assert_called_once_with(process_id=0)
+        process_map.on_process_ending.assert_called_once_with(process_id=0)
 
 
 class TestHandleInferenceResult:
@@ -195,7 +195,7 @@ class TestHandleInferenceResult:
     def test_inference_result_moves_job_to_safety_check(self) -> None:
         proc = make_mock_process_info(0)
         proc.process_launch_identifier = 0
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         jt = JobTracker()
 
         job = Mock()
@@ -209,7 +209,7 @@ class TestHandleInferenceResult:
         jt.jobs_lookup[job] = job_info
         jt.jobs_in_progress.append(job)
 
-        md = _make_dispatcher(process_map=pm, job_tracker=jt)
+        md = _make_dispatcher(process_map=process_map, job_tracker=jt)
 
         msg = Mock(spec=HordeInferenceResultMessage)
         msg.process_id = 0
@@ -233,7 +233,7 @@ class TestHandleInferenceResult:
 
         proc = make_mock_process_info(0)
         proc.process_launch_identifier = 0
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         jt = JobTracker()
 
         job = Mock()
@@ -245,7 +245,7 @@ class TestHandleInferenceResult:
         jt.jobs_lookup[job] = job_info
         jt.jobs_in_progress.append(job)
 
-        md = _make_dispatcher(process_map=pm, job_tracker=jt)
+        md = _make_dispatcher(process_map=process_map, job_tracker=jt)
 
         msg = Mock(spec=HordeInferenceResultMessage)
         msg.process_id = 0
@@ -265,9 +265,9 @@ class TestHandleInferenceResult:
     def test_inference_result_unknown_job_is_handled(self) -> None:
         proc = make_mock_process_info(0)
         proc.process_launch_identifier = 0
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
 
-        md = _make_dispatcher(process_map=pm)
+        md = _make_dispatcher(process_map=process_map)
 
         job = Mock()
         job.id_ = "unknown-job"
@@ -341,10 +341,10 @@ class TestHandleModelStateChange:
 
     def test_model_loaded_in_ram_updates_maps(self) -> None:
         proc = make_mock_process_info(0)
-        pm = ProcessMap({0: proc})
+        process_map = ProcessMap({0: proc})
         hmm = HordeModelMap(root={})
 
-        md = _make_dispatcher(process_map=pm, horde_model_map=hmm)
+        md = _make_dispatcher(process_map=process_map, horde_model_map=hmm)
 
         md._handle_model_state_change(
             Mock(
@@ -360,10 +360,10 @@ class TestHandleModelStateChange:
 
     def test_model_on_disk_does_not_update_process_map(self) -> None:
         proc = make_mock_process_info(0)
-        pm = ProcessMap({0: proc})
-        pm.on_model_load_state_change = Mock()
+        process_map = ProcessMap({0: proc})
+        process_manageron_model_load_state_change = Mock()
 
-        md = _make_dispatcher(process_map=pm)
+        md = _make_dispatcher(process_map=process_map)
 
         md._handle_model_state_change(
             Mock(
@@ -375,7 +375,7 @@ class TestHandleModelStateChange:
             ),
         )
 
-        pm.on_model_load_state_change.assert_not_called()
+        process_manageron_model_load_state_change.assert_not_called()
 
 
 class TestHandleAuxModelStateChange:
@@ -383,10 +383,10 @@ class TestHandleAuxModelStateChange:
 
     def test_downloading_aux_model_updates_last_job(self) -> None:
         proc = make_mock_process_info(0)
-        pm = ProcessMap({0: proc})
-        pm.on_last_job_reference_change = Mock()
+        process_map = ProcessMap({0: proc})
+        process_map.on_last_job_reference_change = Mock()
 
-        md = _make_dispatcher(process_map=pm)
+        md = _make_dispatcher(process_map=process_map)
 
         job = Mock()
 
@@ -399,7 +399,7 @@ class TestHandleAuxModelStateChange:
             ),
         )
 
-        pm.on_last_job_reference_change.assert_called_once_with(
+        process_map.on_last_job_reference_change.assert_called_once_with(
             process_id=0,
             last_job_referenced=job,
         )

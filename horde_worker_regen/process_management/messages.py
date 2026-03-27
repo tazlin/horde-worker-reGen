@@ -305,12 +305,18 @@ class HordePreloadInferenceModelMessage(HordeControlModelMessage):
 
     sdk_api_job_info: ImageGenerateJobPopResponse
 
+    trace_context: str | None = None
+    """W3C traceparent string for cross-process span correlation."""
+
 
 class HordeInferenceControlMessage(HordeControlModelMessage):
     """Inference control messages that are sent from the main process to the child processes."""
 
     sdk_api_job_info: ImageGenerateJobPopResponse
     """The job as sent by the API."""
+
+    trace_context: str | None = None
+    """W3C traceparent string for cross-process span correlation."""
 
 
 class HordeSafetyControlMessage(HordeControlMessage):

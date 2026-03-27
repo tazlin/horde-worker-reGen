@@ -15,35 +15,35 @@ class TestStartEvaluateSafety:
     """Tests for start_evaluate_safety."""
 
     def test_no_pending_safety_checks_returns_early(self) -> None:
-        pm = make_testable_process_manager()
-        pm.start_evaluate_safety()
+        process_manager = make_testable_process_manager()
+        process_manager.start_evaluate_safety()
 
     def test_no_safety_process_returns_early(self) -> None:
-        pm = make_testable_process_manager()
+        process_manager = make_testable_process_manager()
         job_info = Mock()
-        pm._job_tracker.jobs_pending_safety_check.append(job_info)
+        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
 
-        pm.start_evaluate_safety()
+        process_manager.start_evaluate_safety()
 
-        assert job_info in pm._job_tracker.jobs_pending_safety_check
-        assert job_info not in pm._job_tracker.jobs_being_safety_checked
+        assert job_info in process_manager._job_tracker.jobs_pending_safety_check
+        assert job_info not in process_manager._job_tracker.jobs_being_safety_checked
 
     def test_successful_safety_eval_moves_job(self) -> None:
-        pm = make_testable_process_manager()
+        process_manager = make_testable_process_manager()
         safety_proc = make_mock_process_info(
             10,
             model_name=None,
             state=HordeProcessState.WAITING_FOR_JOB,
             process_type=HordeProcessType.SAFETY,
         )
-        pm._process_map.clear()
-        pm._process_map.update({10: safety_proc})
+        process_manager._process_map.clear()
+        process_manager._process_map.update({10: safety_proc})
 
         sd_ref = Mock()
         model_record = Mock()
         model_record.model_dump.return_value = {"name": "test"}
         sd_ref.root = {"stable_diffusion": model_record}
-        pm.stable_diffusion_reference = sd_ref
+        process_manager._stable_diffusion_reference = sd_ref
 
         job = Mock()
         job.id_ = uuid.uuid4()
@@ -60,27 +60,27 @@ class TestStartEvaluateSafety:
         job_info.job_image_results = [image_result]
         job_info.images_base64 = ["base64data"]
 
-        pm._job_tracker.jobs_pending_safety_check.append(job_info)
+        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
 
-        pm.start_evaluate_safety()
+        process_manager.start_evaluate_safety()
 
-        assert job_info not in pm._job_tracker.jobs_pending_safety_check
-        assert job_info in pm._job_tracker.jobs_being_safety_checked
+        assert job_info not in process_manager._job_tracker.jobs_pending_safety_check
+        assert job_info in process_manager._job_tracker.jobs_being_safety_checked
 
     def test_critical_fault_missing_image_results(self) -> None:
-        pm = make_testable_process_manager()
+        process_manager = make_testable_process_manager()
         safety_proc = make_mock_process_info(
             10,
             model_name=None,
             state=HordeProcessState.WAITING_FOR_JOB,
             process_type=HordeProcessType.SAFETY,
         )
-        pm._process_map.clear()
-        pm._process_map.update({10: safety_proc})
+        process_manager._process_map.clear()
+        process_manager._process_map.update({10: safety_proc})
 
         sd_ref = Mock()
         sd_ref.root = {}
-        pm.stable_diffusion_reference = sd_ref
+        process_manager._stable_diffusion_reference = sd_ref
 
         job = Mock()
         job.id_ = "fault-test"
@@ -92,26 +92,26 @@ class TestStartEvaluateSafety:
         job_info.sdk_api_job_info = job
         job_info.job_image_results = None
 
-        pm._job_tracker.jobs_pending_safety_check.append(job_info)
+        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
 
-        pm.start_evaluate_safety()
+        process_manager.start_evaluate_safety()
 
-        assert job_info not in pm._job_tracker.jobs_pending_safety_check
+        assert job_info not in process_manager._job_tracker.jobs_pending_safety_check
 
     def test_critical_fault_missing_job_id(self) -> None:
-        pm = make_testable_process_manager()
+        process_manager = make_testable_process_manager()
         safety_proc = make_mock_process_info(
             10,
             model_name=None,
             state=HordeProcessState.WAITING_FOR_JOB,
             process_type=HordeProcessType.SAFETY,
         )
-        pm._process_map.clear()
-        pm._process_map.update({10: safety_proc})
+        process_manager._process_map.clear()
+        process_manager._process_map.update({10: safety_proc})
 
         sd_ref = Mock()
         sd_ref.root = {}
-        pm.stable_diffusion_reference = sd_ref
+        process_manager._stable_diffusion_reference = sd_ref
 
         job = Mock()
         job.id_ = None
@@ -123,17 +123,17 @@ class TestStartEvaluateSafety:
         job_info.sdk_api_job_info = job
         job_info.job_image_results = [Mock()]
 
-        pm._job_tracker.jobs_pending_safety_check.append(job_info)
+        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
 
-        pm.start_evaluate_safety()
+        process_manager.start_evaluate_safety()
 
-        assert job_info not in pm._job_tracker.jobs_pending_safety_check
+        assert job_info not in process_manager._job_tracker.jobs_pending_safety_check
 
     def test_sd_reference_none_raises(self) -> None:
         import pytest
 
-        pm = make_testable_process_manager()
-        pm.stable_diffusion_reference = None
+        process_manager = make_testable_process_manager()
+        process_manager.stable_diffusion_reference = None
 
         safety_proc = make_mock_process_info(
             10,
@@ -141,14 +141,14 @@ class TestStartEvaluateSafety:
             state=HordeProcessState.WAITING_FOR_JOB,
             process_type=HordeProcessType.SAFETY,
         )
-        pm._process_map.clear()
-        pm._process_map.update({10: safety_proc})
+        process_manager._process_map.clear()
+        process_manager._process_map.update({10: safety_proc})
 
         job_info = Mock()
-        pm._job_tracker.jobs_pending_safety_check.append(job_info)
+        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
 
         with pytest.raises(ValueError, match="stable_diffusion_reference is None"):
-            pm.start_evaluate_safety()
+            process_manager.start_evaluate_safety()
 
     def test_failed_send_returns_early_when_process_not_alive(self) -> None:
         """When send fails and is_process_alive returns False, the method returns early.
@@ -157,7 +157,7 @@ class TestStartEvaluateSafety:
         due to `or HordeProcessState.PROCESS_ENDED` being always truthy. This test
         documents the current (buggy) behavior.
         """
-        pm = make_testable_process_manager()
+        process_manager = make_testable_process_manager()
         safety_proc = make_mock_process_info(
             10,
             model_name=None,
@@ -165,14 +165,14 @@ class TestStartEvaluateSafety:
             process_type=HordeProcessType.SAFETY,
             safe_send_returns=False,
         )
-        pm._process_map.clear()
-        pm._process_map.update({10: safety_proc})
+        process_manager._process_map.clear()
+        process_manager._process_map.update({10: safety_proc})
 
         sd_ref = Mock()
         model_record = Mock()
         model_record.model_dump.return_value = {"name": "test"}
         sd_ref.root = {"stable_diffusion": model_record}
-        pm.stable_diffusion_reference = sd_ref
+        process_manager._stable_diffusion_reference = sd_ref
 
         job = Mock()
         job.id_ = uuid.uuid4()
@@ -186,10 +186,10 @@ class TestStartEvaluateSafety:
         job_info.job_image_results = [Mock()]
         job_info.images_base64 = ["base64data"]
 
-        pm._job_tracker.jobs_pending_safety_check.append(job_info)
+        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
 
-        pm.start_evaluate_safety()
+        process_manager.start_evaluate_safety()
 
         # is_process_alive() always returns False due to the operator precedence bug,
         # so the code returns early without setting replacement flag
-        assert pm._process_lifecycle._safety_processes_should_be_replaced is False
+        assert process_manager._process_lifecycle._safety_processes_should_be_replaced is False

@@ -28,6 +28,8 @@ def start_inference_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     vram_heavy_models: bool = False,
+    dry_run_skip_inference: bool = False,
+    dry_run_inference_delay: float = 1.0,
 ) -> None:
     """Start an inference process.
 
@@ -49,12 +51,13 @@ def start_inference_process(
         directml (int | None, optional): If not None, the process will attempt to use DirectML \
             with the specified device
         vram_heavy_models (bool, optional): If true, the process will attempt to reserve more VRAM. Defaults to False.
+        dry_run_skip_inference (bool, optional): If true, skip real inference and return a dummy image. Defaults to False.
+        dry_run_inference_delay (float, optional): Seconds to sleep when dry-run inference is active. Defaults to 1.0.
     """
     with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
         logger.remove()
 
         try:
-            import hordelib
             from hordelib.utils.logger import HordeLog
 
             HordeLog.initialise(
@@ -63,62 +66,71 @@ def start_inference_process(
                 verbosity_count=5,  # FIXME
             )
 
-            logger.debug(
-                f"Initialising hordelib with process_id={process_id}, "
-                f"process_launch_identifier={process_launch_identifier}, "
-                f"high_memory_mode={high_memory_mode} "
-                f"and amd_gpu={amd_gpu}, low_memory_mode={low_memory_mode}, "
-                f"very_high_memory_mode={very_high_memory_mode}",
-            )
+            from horde_worker_regen.telemetry import configure_child_telemetry
 
-            extra_comfyui_args = ["--disable-smart-memory"]
+            configure_child_telemetry(process_id)
 
-            if amd_gpu:
-                extra_comfyui_args.append("--use-pytorch-cross-attention")
+            if not dry_run_skip_inference:
+                import hordelib
 
-            if directml is not None:
-                extra_comfyui_args.append(f"--directml={directml}")
-
-            models_not_to_force_load = ["flux"]
-
-            if very_high_memory_mode:
-                extra_comfyui_args.append("--gpu-only")
-            elif high_memory_mode:
-                # extra_comfyui_args.append("--normalvram")
-                models_not_to_force_load.extend(
-                    [
-                        "cascade",
-                    ],
+                logger.debug(
+                    f"Initialising hordelib with process_id={process_id}, "
+                    f"process_launch_identifier={process_launch_identifier}, "
+                    f"high_memory_mode={high_memory_mode} "
+                    f"and amd_gpu={amd_gpu}, low_memory_mode={low_memory_mode}, "
+                    f"very_high_memory_mode={very_high_memory_mode}",
                 )
-            elif low_memory_mode:
-                extra_comfyui_args.append("--novram")
-                models_not_to_force_load.extend(
-                    [
-                        "sdxl",
-                        "cascade",
-                    ],
-                )
-            elif not vram_heavy_models:
-                logger.info("Reserving 1.4GB VRAM.")
-                extra_comfyui_args.extend(["--reserve-vram", "1.4"])
 
-            if high_memory_mode and vram_heavy_models:
-                logger.info("High memory mode and vram heavy models are both enabled. Reserving 6GB VRAM.")
-                extra_comfyui_args.extend(["--reserve-vram", "6"])
+                extra_comfyui_args = ["--disable-smart-memory"]
 
-            if "--reserve-vram" not in extra_comfyui_args:
-                logger.warning("No VRAM reservation specified.")
+                if amd_gpu:
+                    extra_comfyui_args.append("--use-pytorch-cross-attention")
 
-            with logger.catch(reraise=True):
-                logger.debug(f"Using extra comfyui args: {extra_comfyui_args}")
-                hordelib.initialise(
-                    setup_logging=None,
-                    process_id=process_id,
-                    logging_verbosity=0,
-                    force_normal_vram_mode=False,
-                    models_not_to_force_load=models_not_to_force_load,
-                    extra_comfyui_args=extra_comfyui_args,
-                )
+                if directml is not None:
+                    extra_comfyui_args.append(f"--directml={directml}")
+
+                models_not_to_force_load = ["flux"]
+
+                if very_high_memory_mode:
+                    extra_comfyui_args.append("--gpu-only")
+                elif high_memory_mode:
+                    # extra_comfyui_args.append("--normalvram")
+                    models_not_to_force_load.extend(
+                        [
+                            "cascade",
+                        ],
+                    )
+                elif low_memory_mode:
+                    extra_comfyui_args.append("--novram")
+                    models_not_to_force_load.extend(
+                        [
+                            "sdxl",
+                            "cascade",
+                        ],
+                    )
+                elif not vram_heavy_models:
+                    logger.info("Reserving 1.4GB VRAM.")
+                    extra_comfyui_args.extend(["--reserve-vram", "1.4"])
+
+                if high_memory_mode and vram_heavy_models:
+                    logger.info("High memory mode and vram heavy models are both enabled. Reserving 6GB VRAM.")
+                    extra_comfyui_args.extend(["--reserve-vram", "6"])
+
+                if "--reserve-vram" not in extra_comfyui_args:
+                    logger.warning("No VRAM reservation specified.")
+
+                with logger.catch(reraise=True):
+                    logger.debug(f"Using extra comfyui args: {extra_comfyui_args}")
+                    hordelib.initialise(
+                        setup_logging=None,
+                        process_id=process_id,
+                        logging_verbosity=0,
+                        force_normal_vram_mode=False,
+                        models_not_to_force_load=models_not_to_force_load,
+                        extra_comfyui_args=extra_comfyui_args,
+                    )
+            else:
+                logger.info(f"Dry-run mode: skipping hordelib initialisation for process {process_id}")
 
         except Exception as e:
             logger.critical(f"Failed to initialise hordelib: {type(e).__name__} {e}")
@@ -135,6 +147,8 @@ def start_inference_process(
             aux_model_lock=aux_model_lock,
             vae_decode_semaphore=vae_decode_semaphore,
             process_launch_identifier=process_launch_identifier,
+            dry_run_skip_inference=dry_run_skip_inference,
+            dry_run_inference_delay=dry_run_inference_delay,
         )
 
         worker_process.main_loop()
@@ -151,6 +165,7 @@ def start_safety_process(
     high_memory_mode: bool = False,
     amd_gpu: bool = False,
     directml: int | None = None,
+    dry_run_skip_safety: bool = False,
 ) -> None:
     """Start a safety process.
 
@@ -178,6 +193,10 @@ def start_safety_process(
                 process_id=process_id,
                 verbosity_count=5,  # FIXME
             )
+
+            from horde_worker_regen.telemetry import configure_child_telemetry
+
+            configure_child_telemetry(process_id)
 
             logger.debug(f"Initialising hordelib with process_id={process_id} and high_memory_mode={high_memory_mode}")
 
@@ -208,6 +227,7 @@ def start_safety_process(
             disk_lock=disk_lock,
             process_launch_identifier=process_launch_identifier,
             cpu_only=cpu_only,
+            dry_run_skip_safety=dry_run_skip_safety,
         )
 
         worker_process.main_loop()

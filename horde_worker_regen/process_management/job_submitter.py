@@ -27,12 +27,13 @@ from horde_worker_regen.process_management.job_models import (
     PendingSubmitJob,
 )
 from horde_worker_regen.process_management.job_tracker import JobTracker
+from horde_worker_regen.process_management.protocols import AiohttpSessionProvider, BridgeDataProvider
 from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
-from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer as _base64_image_to_stream_buffer
+from horde_worker_regen.telemetry_spans import span_job_submit
+from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer
 
 if TYPE_CHECKING:
-    from aiohttp import ClientSession
     from horde_sdk.ai_horde_worker.model_meta import ImageModelLoadResolver
 
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -53,10 +54,10 @@ class JobSubmitter:
     _state: WorkerState
     _job_tracker: JobTracker
     _shutdown_manager: ShutdownManager
-    _get_bridge_data: Callable[[], reGenBridgeData]
+    _get_bridge_data: BridgeDataProvider
     _get_stable_diffusion_reference: Callable[[], ImageModelLoadResolver | None]
     _get_horde_client_session: Callable[[], object]
-    _get_aiohttp_session: Callable[[], ClientSession]
+    _get_aiohttp_session: AiohttpSessionProvider
 
     _num_job_slowdowns: int
     _job_submit_loop_interval: float
@@ -67,10 +68,11 @@ class JobSubmitter:
         state: WorkerState,
         job_tracker: JobTracker,
         shutdown_manager: ShutdownManager,
-        get_bridge_data: Callable[[], reGenBridgeData],
+        get_bridge_data: BridgeDataProvider,
         get_stable_diffusion_reference: Callable[[], ImageModelLoadResolver | None],
         get_horde_client_session: Callable[[], object],
-        get_aiohttp_session: Callable[[], ClientSession],
+        get_aiohttp_session: AiohttpSessionProvider,
+        dry_run_skip_api: bool = False,
     ) -> None:
         self._state = state
         self._job_tracker = job_tracker
@@ -79,6 +81,7 @@ class JobSubmitter:
         self._get_stable_diffusion_reference = get_stable_diffusion_reference
         self._get_horde_client_session = get_horde_client_session
         self._get_aiohttp_session = get_aiohttp_session
+        self._dry_run_skip_api = dry_run_skip_api
 
         self._num_job_slowdowns = 0
         self._job_submit_loop_interval = 0.02
@@ -99,11 +102,6 @@ class JobSubmitter:
     def stable_diffusion_reference(self) -> ImageModelLoadResolver | None:
         return self._get_stable_diffusion_reference()
 
-    @staticmethod
-    def base64_image_to_stream_buffer(image_base64: str) -> BytesIO | None:
-        """Convert a base64 image to a BytesIO stream buffer."""
-        return _base64_image_to_stream_buffer(image_base64)
-
     @logger.catch(reraise=True)
     async def submit_single_generation(self, new_submit: PendingSubmitJob) -> PendingSubmitJob:
         """Tries to upload and submit a single image from a batch.
@@ -114,6 +112,11 @@ class JobSubmitter:
         Returns:
             The modified in place job with the results of the submission attempt.
         """
+        if self._dry_run_skip_api:
+            logger.debug(f"Dry-run: skipping upload/submit for job {new_submit.job_id}")
+            new_submit.succeed(0, 0.0)
+            return new_submit
+
         logger.debug(f"Preparing to submit job {new_submit.job_id}")
 
         if new_submit.image_result is None and not new_submit.is_faulted:
@@ -122,7 +125,7 @@ class JobSubmitter:
             return new_submit
 
         if new_submit.image_result is not None:
-            image_in_buffer = self.base64_image_to_stream_buffer(
+            image_in_buffer = base64_image_to_stream_buffer(
                 new_submit.image_result.image_base64,
             )
             if image_in_buffer is None:

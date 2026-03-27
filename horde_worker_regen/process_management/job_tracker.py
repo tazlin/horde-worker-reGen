@@ -211,6 +211,10 @@ class JobTracker:
             self._max_pending_megapixelsteps,
         )
 
+    def reset_megapixelstep_trigger(self) -> None:
+        """Clear the megapixelstep wait trigger so pop throttling can resume."""
+        self._triggered_max_pending_megapixelsteps = False
+
     def set_performance_mode_thresholds(self, max_pending_megapixelsteps: int) -> None:
         """Set the max pending megapixelsteps threshold.
 

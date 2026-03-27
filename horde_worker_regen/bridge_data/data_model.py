@@ -279,6 +279,18 @@ class reGenBridgeData(CombinedHordeBridgeData):
     Set stats_output_frequency (in seconds) for control over the status message.
     """
 
+    dry_run_skip_inference: bool = Field(default=False)
+    """Skip real GPU inference and return a dummy 1x1 image instead."""
+
+    dry_run_skip_safety: bool = Field(default=False)
+    """Skip the safety (NSFW/CSAM) evaluation model."""
+
+    dry_run_skip_api: bool = Field(default=False)
+    """Skip API calls (job pop and submit) and use canned scenarios."""
+
+    dry_run_inference_delay: float = Field(default=1.0, ge=0.0)
+    """Seconds to sleep when dry-run inference is active, simulating work."""
+
     @model_validator(mode="after")
     def validate_performance_modes(self) -> Self:
         """Validate and adjust performance mode settings based on cross-field constraints."""

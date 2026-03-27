@@ -498,6 +498,7 @@ class HordeWorkerProcessManager:
             get_stable_diffusion_reference=lambda: self.stable_diffusion_reference,
             get_horde_client_session=lambda: self.horde_client_session,
             get_aiohttp_session=lambda: self._aiohttp_client_session,
+            dry_run_skip_api=bridge_data.dry_run_skip_api,
         )
 
         self._job_popper = JobPopper(
@@ -513,6 +514,7 @@ class HordeWorkerProcessManager:
             ),
             max_inference_processes=self.max_inference_processes,
             max_concurrent_inference_processes=self._max_concurrent_inference_processes,
+            dry_run_skip_api=bridge_data.dry_run_skip_api,
         )
 
         if stable_diffusion_reference is not None:
@@ -1040,6 +1042,11 @@ class HordeWorkerProcessManager:
 
     async def _main_loop(self) -> None:
         self._aiohttp_client_session = ClientSession(requote_redirect_url=False)
+
+        import logfire
+
+        logfire.instrument_aiohttp_client()
+
         self.horde_client_session = AIHordeAPIAsyncClientSession(
             aiohttp_session=self._aiohttp_client_session,
             apikey=self.bridge_data.api_key,
