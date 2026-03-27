@@ -79,7 +79,7 @@ def do_version_check() -> None:
         reason_for_update_str = f"Reason for update: {reason_for_update}" if reason_for_update else ""
 
         # UTC time
-        current_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        current_date = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
 
         # If we're before the required_version_update_date, just warn, otherwise raise an error
         if current_date < version_meta.required_min_version_update_date:

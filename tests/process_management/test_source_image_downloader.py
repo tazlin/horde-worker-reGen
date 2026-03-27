@@ -94,6 +94,7 @@ class TestDownloadSourceImagesHappyPath:
         job.async_download_source_image.assert_called()
 
     def test_url_source_mask_triggers_download(self) -> None:
+        """A source_mask starting with 'http' should trigger a download."""
         session = Mock()
         downloader = _make_downloader(aiohttp_session=session)
         job = _make_job_response(source_mask="https://example.com/mask.png")

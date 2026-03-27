@@ -15,14 +15,13 @@ try:
 except Exception:
     from multiprocessing.connection import Connection  # type: ignore
 from multiprocessing.synchronize import Lock, Semaphore
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopResponse,
 )
 from loguru import logger
-from typing_extensions import override
 
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.horde_process import HordeProcess

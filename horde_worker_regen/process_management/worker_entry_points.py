@@ -51,7 +51,10 @@ def start_inference_process(
         directml (int | None, optional): If not None, the process will attempt to use DirectML \
             with the specified device
         vram_heavy_models (bool, optional): If true, the process will attempt to reserve more VRAM. Defaults to False.
-        dry_run_skip_inference (bool, optional): If true, skip real inference and return a dummy image. Defaults to False.
+        dry_run_skip_inference (bool, optional): If true, skip real inference and return a dummy image.
+            Defaults to False.
+        dry_run_skip_safety (bool, optional): If true, skip real safety checks and return a dummy result.
+            Defaults to False.
         dry_run_inference_delay (float, optional): Seconds to sleep when dry-run inference is active. Defaults to 1.0.
     """
     with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
@@ -181,6 +184,8 @@ def start_safety_process(
             Defaults to False.
         directml (int | None, optional): If not None, the process will attempt to use DirectML \
             with the specified device
+        dry_run_skip_safety (bool, optional): If true, skip real safety checks and return a dummy result.
+            Defaults to False.
     """
     with contextlib.nullcontext():  # contextlib.redirect_stdout(), contextlib.redirect_stderr():
         logger.remove()

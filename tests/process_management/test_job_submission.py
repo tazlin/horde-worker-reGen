@@ -48,6 +48,7 @@ class TestSubmitSingleGeneration:
     """Tests for submit_single_generation."""
 
     def test_no_image_result_faults(self) -> None:
+        """If there is no image result and the job is not already faulted, the method faults the job."""
         submitter = _make_submitter()
 
         new_submit = Mock(spec=PendingSubmitJob)
@@ -75,7 +76,7 @@ class TestSubmitSingleGeneration:
         new_submit.is_faulted = True
         new_submit.completed_job_info = completed_info
 
-        result = asyncio.run(submitter.submit_single_generation(new_submit))
+        asyncio.run(submitter.submit_single_generation(new_submit))
         new_submit.fault.assert_not_called()
 
 
@@ -83,10 +84,12 @@ class TestApiSubmitJob:
     """Tests for api_submit_job."""
 
     def test_no_pending_submits_returns_early(self) -> None:
+        """If there are no pending submits, the method should return early without doing anything."""
         submitter = _make_submitter()
         asyncio.run(submitter.api_submit_job())
 
     def test_faulted_job_increments_consecutive_failures(self) -> None:
+        """If a job submission results in a faulted job, the consecutive_failed_jobs counter should be incremented."""
         from horde_sdk.ai_horde_api import GENERATION_STATE
 
         from horde_worker_regen.process_management.job_models import HordeJobInfo

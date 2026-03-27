@@ -15,10 +15,12 @@ class TestStartEvaluateSafety:
     """Tests for start_evaluate_safety."""
 
     def test_no_pending_safety_checks_returns_early(self) -> None:
+        """If there are no jobs pending safety checks, the method should return early without doing anything."""
         process_manager = make_testable_process_manager()
         process_manager.start_evaluate_safety()
 
     def test_no_safety_process_returns_early(self) -> None:
+        """If there are jobs pending safety checks but no safety process, the method should return early."""
         process_manager = make_testable_process_manager()
         job_info = Mock()
         process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
@@ -29,6 +31,7 @@ class TestStartEvaluateSafety:
         assert job_info not in process_manager._job_tracker.jobs_being_safety_checked
 
     def test_successful_safety_eval_moves_job(self) -> None:
+        """If a safety evaluation is successful, the job should be moved from pending to being checked."""
         process_manager = make_testable_process_manager()
         safety_proc = make_mock_process_info(
             10,
@@ -68,6 +71,12 @@ class TestStartEvaluateSafety:
         assert job_info in process_manager._job_tracker.jobs_being_safety_checked
 
     def test_critical_fault_missing_image_results(self) -> None:
+        """If job_image_results is None, it should be cleaned up and not cause a crash.
+
+        - It should:
+            - log an error about missing image results.
+            - remove the job from pending safety checks to avoid blocking the queue.
+        """
         process_manager = make_testable_process_manager()
         safety_proc = make_mock_process_info(
             10,
@@ -99,6 +108,12 @@ class TestStartEvaluateSafety:
         assert job_info not in process_manager._job_tracker.jobs_pending_safety_check
 
     def test_critical_fault_missing_job_id(self) -> None:
+        """If job id is None, it should be cleaned up and not cause a crash.
+
+        - It should:
+            - log an error about missing job id.
+            - remove the job from pending safety checks to avoid blocking the queue.
+        """
         process_manager = make_testable_process_manager()
         safety_proc = make_mock_process_info(
             10,
@@ -130,6 +145,7 @@ class TestStartEvaluateSafety:
         assert job_info not in process_manager._job_tracker.jobs_pending_safety_check
 
     def test_sd_reference_none_raises(self) -> None:
+        """Test that if stable_diffusion_reference is None, a ValueError is raised."""
         import pytest
 
         process_manager = make_testable_process_manager()

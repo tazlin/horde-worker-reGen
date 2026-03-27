@@ -9,19 +9,16 @@ from horde_worker_regen.process_management._canned_scenarios import (
     SCENARIO_TRIVIAL,
     get_dry_run_job,
 )
-from horde_worker_regen.process_management.messages import (
-    HordeSafetyControlMessage,
-    HordeSafetyEvaluation,
-    HordeSafetyResultMessage,
-)
 
 
 def test_canned_scenario_trivial_has_one_job() -> None:
+    """SCENARIO_TRIVIAL should contain exactly one job, which should be for the Deliberate model."""
     assert len(SCENARIO_TRIVIAL) == 1
     assert SCENARIO_TRIVIAL[0].model == "Deliberate"
 
 
 def test_canned_scenario_basic_has_five_jobs() -> None:
+    """SCENARIO_BASIC should contain exactly five jobs, all for the Deliberate model."""
     assert len(SCENARIO_BASIC) == 5
     for job in SCENARIO_BASIC:
         assert job.model == "Deliberate"

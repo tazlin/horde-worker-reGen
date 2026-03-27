@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Self
 
 from horde_sdk.ai_horde_worker.bridge_data import CombinedHordeBridgeData
 from loguru import logger
 from pydantic import Field, field_validator, model_validator
 from ruamel.yaml import YAML
-from typing_extensions import Self
 
 from horde_worker_regen.consts import TOTAL_LORA_DOWNLOAD_TIMEOUT
 from horde_worker_regen.locale_info.regen_bridge_data_fields import BRIDGE_DATA_FIELD_DESCRIPTIONS

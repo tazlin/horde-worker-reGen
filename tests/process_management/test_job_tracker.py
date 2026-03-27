@@ -8,6 +8,7 @@ from horde_worker_regen.process_management.job_tracker import JobTracker
 
 
 def test_init_empty_collections(job_tracker: JobTracker) -> None:
+    """Test that the constructor initializes all collections to empty."""
     assert len(job_tracker.jobs_lookup) == 0
     assert len(job_tracker.jobs_in_progress) == 0
     assert len(job_tracker.job_faults) == 0
@@ -29,10 +30,12 @@ def test_init_empty_collections(job_tracker: JobTracker) -> None:
 
 
 def test_num_jobs_total_empty(job_tracker: JobTracker) -> None:
+    """If there are no jobs in any collection, num_jobs_total should return 0."""
     assert job_tracker.num_jobs_total == 0
 
 
 def test_num_jobs_total_counts_all_stages(job_tracker: JobTracker) -> None:
+    """num_jobs_total should return the total number of jobs across all collections."""
     job_tracker.jobs_pending_inference.append(Mock())
     job_tracker.jobs_in_progress.append(Mock())
     job_tracker.jobs_pending_safety_check.append(Mock())
@@ -43,6 +46,7 @@ def test_num_jobs_total_counts_all_stages(job_tracker: JobTracker) -> None:
 
 
 def test_current_queue_size(job_tracker: JobTracker) -> None:
+    """current_queue_size should return the number of jobs pending inference."""
     assert job_tracker.current_queue_size == 0
     job_tracker.jobs_pending_inference.append(Mock())
     job_tracker.jobs_pending_inference.append(Mock())
@@ -54,6 +58,7 @@ def test_handle_job_fault_removes_from_pending_inference(
     mock_job_pop_response: Mock,
     mock_horde_job_info: Mock,
 ) -> None:
+    """When a job fault occurs, it should be removed from the pending inference list."""
     job_tracker.jobs_lookup[mock_job_pop_response] = mock_horde_job_info
     job_tracker.jobs_pending_inference.append(mock_job_pop_response)
 
@@ -68,6 +73,7 @@ def test_handle_job_fault_removes_from_in_progress(
     mock_job_pop_response: Mock,
     mock_horde_job_info: Mock,
 ) -> None:
+    """When a job fault occurs, it should be removed from the in-progress list."""
     job_tracker.jobs_lookup[mock_job_pop_response] = mock_horde_job_info
     job_tracker.jobs_in_progress.append(mock_job_pop_response)
 
@@ -80,6 +86,7 @@ def test_handle_job_fault_removes_from_pending_safety_check(
     job_tracker: JobTracker,
     mock_job_pop_response: Mock,
 ) -> None:
+    """When a job fault occurs, it should be removed from the pending safety check list."""
     # The code checks `faulted_job in jobs_pending_safety_check` which requires
     # the faulted_job (a pop response) to compare equal to a HordeJobInfo.
     # We make the job_info compare equal to the pop response so the `in` check
@@ -112,6 +119,7 @@ def test_handle_job_fault_clears_skipped_line(
     mock_job_pop_response: Mock,
     mock_horde_job_info: Mock,
 ) -> None:
+    """If the faulted job is the one in _skipped_line_next_job_and_process, that should be cleared."""
     skipped = Mock()
     skipped.next_job = Mock()
     skipped.next_job.model = mock_job_pop_response.model
@@ -128,6 +136,7 @@ def test_handle_job_fault_no_double_add(
     mock_job_pop_response: Mock,
     mock_horde_job_info: Mock,
 ) -> None:
+    """If a job fault occurs, the job should not be added multiple times to pending submit."""
     job_tracker.jobs_lookup[mock_job_pop_response] = mock_horde_job_info
     job_tracker.jobs_pending_submit.append(mock_horde_job_info)
 
@@ -137,6 +146,7 @@ def test_handle_job_fault_no_double_add(
 
 
 def test_purge_jobs_clears_all(job_tracker: JobTracker) -> None:
+    """_purge_jobs should clear all job collections and reset skipped line."""
     job_tracker.jobs_pending_inference.append(Mock())
     job_tracker.jobs_being_safety_checked.append(Mock())
     job_tracker.jobs_pending_safety_check.append(Mock())
@@ -157,6 +167,7 @@ def test_purge_jobs_clears_all(job_tracker: JobTracker) -> None:
 
 
 def test_purge_jobs_updates_last_submitted_time(job_tracker: JobTracker) -> None:
+    """After purging jobs, _last_job_submitted_time should be updated to current time."""
     import time
 
     old_time = job_tracker._last_job_submitted_time
@@ -169,16 +180,19 @@ def test_purge_jobs_updates_last_submitted_time(job_tracker: JobTracker) -> None
 
 
 def test_purge_jobs_empty_noop(job_tracker: JobTracker) -> None:
+    """Calling _purge_jobs when there are no jobs should not raise an error."""
     job_tracker._purge_jobs()
     # Should not raise
 
 
 def test_set_performance_mode_thresholds(job_tracker: JobTracker) -> None:
+    """set_performance_mode_thresholds correctly updates the max pending megapixelsteps threshold."""
     job_tracker.set_performance_mode_thresholds(80)
     assert job_tracker._max_pending_megapixelsteps == 80
 
 
 def test_should_wait_for_pending_megapixelsteps(job_tracker: JobTracker) -> None:
+    """should_wait_for_pending_megapixelsteps returns True when pending megapixelsteps exceed the threshold."""
     job_tracker.set_performance_mode_thresholds(10)
     assert not job_tracker.should_wait_for_pending_megapixelsteps()
 

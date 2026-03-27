@@ -47,6 +47,7 @@ class TestSelectModelsForPopBasic:
         assert result is None
 
     def test_single_model(self) -> None:
+        """With only one model configured, that model should be returned."""
         bridge_data = make_mock_bridge_data(image_models_to_load=["stable_diffusion"])
         process_map = ProcessMap({})
         job_tracker = JobTracker()
@@ -90,6 +91,7 @@ class TestDuplicateModelFiltering:
         assert "model_b" in result
 
     def test_model_with_one_queued_job_not_excluded(self) -> None:
+        """A model that has only 1 job queued should still be a candidate."""
         bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
         process_map = ProcessMap({})
         job_tracker = JobTracker()
@@ -99,7 +101,11 @@ class TestDuplicateModelFiltering:
         job_tracker.jobs_pending_inference.append(job1)
 
         result = _select_models_for_pop(
-            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
         )
 
         assert result is not None
@@ -117,7 +123,11 @@ class TestDuplicateModelFiltering:
             job_tracker.jobs_pending_inference.append(job)
 
         result = _select_models_for_pop(
-            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
         )
 
         assert result is None
@@ -134,7 +144,11 @@ class TestDuplicateModelFiltering:
             job_tracker.jobs_pending_inference.append(job)
 
         result = _select_models_for_pop(
-            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
         )
 
         assert result is not None
@@ -272,7 +286,11 @@ class TestCustomModels:
         job_tracker = JobTracker()
 
         result = _select_models_for_pop(
-            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
         )
 
         assert result is not None
@@ -281,6 +299,7 @@ class TestCustomModels:
         assert "custom_model_2" in result
 
     def test_empty_custom_models_no_effect(self) -> None:
+        """Empty custom models list should have no effect on results."""
         bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a"],
             custom_models=[],
@@ -289,12 +308,17 @@ class TestCustomModels:
         job_tracker = JobTracker()
 
         result = _select_models_for_pop(
-            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
         )
 
         assert result == {"model_a"}
 
     def test_none_custom_models_no_effect(self) -> None:
+        """None custom models should have no effect on results."""
         bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a"],
             custom_models=None,
@@ -303,7 +327,11 @@ class TestCustomModels:
         job_tracker = JobTracker()
 
         result = _select_models_for_pop(
-            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
         )
 
         assert result == {"model_a"}
@@ -318,7 +346,11 @@ class TestCustomModels:
         job_tracker = JobTracker()
 
         result = _select_models_for_pop(
-            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
         )
 
         assert result == {"model_a"}
@@ -343,7 +375,11 @@ class TestSelectModelsForPopCombinations:
             job_tracker.jobs_pending_inference.append(job)
 
         result = _select_models_for_pop(
-            bridge_data, process_map, job_tracker, max_inference_processes=2, last_pop_had_no_jobs=False
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
         )
 
         assert result is not None
@@ -364,7 +400,11 @@ class TestSelectModelsForPopCombinations:
             job_tracker.jobs_pending_inference.append(job)
 
         result = _select_models_for_pop(
-            bridge_data, process_map, job_tracker, max_inference_processes=5, last_pop_had_no_jobs=False
+            bridge_data,
+            process_map,
+            job_tracker,
+            max_inference_processes=5,
+            last_pop_had_no_jobs=False,
         )
 
         assert result is not None

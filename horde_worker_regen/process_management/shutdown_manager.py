@@ -33,6 +33,18 @@ class ShutdownManager:
         process_map: ProcessMap,
         process_lifecycle: ProcessLifecycleManager,
     ) -> None:
+        """Initialize the manager with references to the components it needs to manage.
+
+        Args:
+            state (WorkerState): The worker's state object, containing all of the mutable flags
+                relating to the worker's active state and lifecycle.
+            job_tracker (JobTracker): The worker's JobTracker, which tracks all jobs in-flight
+                and is responsible for managing their state transitions.
+            process_map (ProcessMap): The worker's ProcessMap, which tracks all active processes and
+                their states.
+            process_lifecycle (ProcessLifecycleManager): The worker's ProcessLifecycleManager, which is responsible
+                for launching, monitoring, and killing processes as needed.
+        """
         self._state = state
         self._job_tracker = job_tracker
         self._process_map = process_map

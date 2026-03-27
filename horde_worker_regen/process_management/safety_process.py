@@ -12,11 +12,11 @@ try:
 except Exception:
     from multiprocessing.connection import Connection  # type: ignore
 from multiprocessing.synchronize import Lock
+from typing import override
 
 import PIL
 import PIL.Image
 from loguru import logger
-from typing_extensions import override
 
 from horde_worker_regen import ASSETS_FOLDER_PATH
 from horde_worker_regen.process_management._aliased_types import ProcessQueue

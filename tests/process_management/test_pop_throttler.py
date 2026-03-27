@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 
@@ -35,6 +35,7 @@ class TestPopFrequencyDefaults:
     """Constructor sets frequencies correctly."""
 
     def test_default_frequency_is_one_second(self) -> None:
+        """By default, pop frequency should be 1 second."""
         throttler = _make_throttler()
         assert throttler.current_pop_frequency == 1.0
 
@@ -43,6 +44,7 @@ class TestPopFrequencyDefaults:
         assert throttler.current_pop_frequency == 2.5
 
     def test_custom_error_frequency(self) -> None:
+        """If we set a custom error frequency, it should be used when on_pop_error is called."""
         throttler = _make_throttler(error_pop_frequency=10.0)
         throttler.on_pop_error()
         assert throttler.current_pop_frequency == 10.0

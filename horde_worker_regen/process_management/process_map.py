@@ -20,7 +20,15 @@ from horde_worker_regen.process_management.process_info import HordeProcessInfo
 
 
 class ProcessMap(dict[int, HordeProcessInfo]):
-    """A mapping of process IDs to HordeProcessInfo objects. Contains some helper methods."""
+    """A mapping of process IDs to HordeProcessInfo objects.
+
+    There are a number of helper methods on this class for querying the state of processes, such as how many are
+    busy, how many are doing inference, etc. In addition, there are a number of methods for updating the state of
+    processes based on messages received from them, such as heartbeats, memory reports, and process state changes.
+
+    See `on_heartbeat`, `on_memory_report`, `on_process_state_change`, `on_last_job_reference_change`, and
+    `on_model_load_state_change` for more details on how the process map is updated based on messages from processes.
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

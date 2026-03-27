@@ -65,7 +65,7 @@ def span_inference(
     steps: int,
     width: int,
     height: int,
-    **extra: Any,
+    **extra: Any,  # type: ignore # noqa
 ) -> Iterator[logfire.LogfireSpan]:
     """Wrap the basic_inference call in the child process."""
     with logfire.span(

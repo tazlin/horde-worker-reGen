@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import enum
 from enum import auto
+from typing import override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from horde_sdk.ai_horde_api.fields import JobID
 from pydantic import BaseModel, ConfigDict
-from typing_extensions import override
 
 from horde_worker_regen.process_management.messages import HordeImageResult
 from horde_worker_regen.process_management.process_info import HordeProcessInfo

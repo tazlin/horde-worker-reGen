@@ -50,6 +50,7 @@ def _make_plm(
 
 
 def test_init_stores_references() -> None:
+    """Test that the constructor properly stores references to its dependencies."""
     plm = _make_plm()
     assert plm.num_processes_launched == 0
     assert plm._num_process_recoveries == 0
@@ -61,12 +62,14 @@ def test_init_stores_references() -> None:
 
 
 def test_get_processes_with_model_for_queued_job_empty() -> None:
+    """If there are no processes or no jobs pending inference, the result should be empty."""
     plm = _make_plm()
     result = plm.get_processes_with_model_for_queued_job()
     assert result == []
 
 
 def test_get_processes_with_model_for_queued_job_matches() -> None:
+    """If there is a waiting process with the needed model, it should be returned."""
     process_map = ProcessMap({})
     job_tracker = JobTracker()
 
@@ -89,6 +92,7 @@ def test_get_processes_with_model_for_queued_job_matches() -> None:
 
 
 def test_get_processes_with_model_for_queued_job_preloaded() -> None:
+    """If there is a preloaded process with the needed model, it should be returned."""
     process_map = ProcessMap({})
 
     proc = Mock()
@@ -104,6 +108,7 @@ def test_get_processes_with_model_for_queued_job_preloaded() -> None:
 
 
 def test_recently_recovered_property() -> None:
+    """Test the recently_recovered property getter and setter."""
     plm = _make_plm()
     assert plm.recently_recovered is False
 
@@ -112,6 +117,7 @@ def test_recently_recovered_property() -> None:
 
 
 def test_safety_processes_should_be_replaced_property() -> None:
+    """Test the safety_processes_should_be_replaced property getter and setter."""
     plm = _make_plm()
     assert plm.safety_processes_should_be_replaced is False
 

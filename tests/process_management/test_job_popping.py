@@ -12,7 +12,6 @@ import asyncio
 import time
 from unittest.mock import AsyncMock, Mock, patch
 
-import pytest
 from horde_sdk import RequestErrorResponse
 
 from horde_worker_regen.process_management.horde_process import HordeProcessType
@@ -222,6 +221,7 @@ class TestHandleConsecutiveFailures:
         assert state.too_many_consecutive_failed_jobs is False
 
     def test_zero_failures_returns_false(self) -> None:
+        """0 failures should not trigger pause."""
         state = WorkerState(consecutive_failed_jobs=0)
         popper = _make_popper(state=state)
         bd = make_mock_bridge_data()
@@ -229,6 +229,7 @@ class TestHandleConsecutiveFailures:
         assert popper._handle_consecutive_failures(bd, time.time()) is False
 
     def test_exactly_three_failures_triggers(self) -> None:
+        """Exactly 3 failures should trigger pause."""
         state = WorkerState(consecutive_failed_jobs=3)
         popper = _make_popper(state=state)
         bd = make_mock_bridge_data()
@@ -239,6 +240,7 @@ class TestHandleConsecutiveFailures:
         assert state.too_many_consecutive_failed_jobs is True
 
     def test_active_pause_returns_true_within_window(self) -> None:
+        """When already in a failure pause, the method should return True to indicate the pause is still active."""
         state = WorkerState(
             too_many_consecutive_failed_jobs=True,
             too_many_consecutive_failed_jobs_time=time.time(),
@@ -249,6 +251,7 @@ class TestHandleConsecutiveFailures:
         assert popper._handle_consecutive_failures(bd, time.time()) is True
 
     def test_active_pause_resets_after_wait_window(self) -> None:
+        """After the wait window, the method should return True once to indicate reset, then clear the failure."""
         expired_time = time.time() - CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS - 1
         state = WorkerState(
             too_many_consecutive_failed_jobs=True,
@@ -273,12 +276,14 @@ class TestIsQueueFull:
     """Tests for _is_queue_full."""
 
     def test_empty_queue_not_full(self) -> None:
+        """With no pending jobs, the queue should not be considered full."""
         popper = _make_popper()
         bd = make_mock_bridge_data(queue_size=1, max_threads=1)
 
         assert popper._is_queue_full(bd) is False
 
     def test_queue_at_capacity_is_full(self) -> None:
+        """When pending jobs reach the max allowed, the queue should be considered full."""
         job_tracker = JobTracker()
         # queue_size=1, max_threads=1 → max_jobs_in_queue = 2
         for _ in range(2):
@@ -306,6 +311,7 @@ class TestIsQueueFull:
         assert popper._is_queue_full(bd) is False
 
     def test_queue_one_below_capacity_not_full(self) -> None:
+        """When pending jobs are one below the max allowed, the queue should not be considered full."""
         job_tracker = JobTracker()
         job = Mock()
         job.model = "stable_diffusion"
@@ -318,6 +324,7 @@ class TestIsQueueFull:
         assert popper._is_queue_full(bd) is False
 
     def test_large_queue_size(self) -> None:
+        """With a larger queue_size, the method should calculate capacity accordingly."""
         job_tracker = JobTracker()
         for _ in range(5):
             job = Mock()
@@ -347,6 +354,7 @@ class TestProcessApiMessages:
         assert len(popper._api_messages_received) == 0
 
     def test_none_messages(self) -> None:
+        """If messages is None, it should be treated the same as an empty list (no messages)."""
         popper = _make_popper()
         response = Mock()
         response.messages = None
@@ -356,6 +364,7 @@ class TestProcessApiMessages:
         assert len(popper._api_messages_received) == 0
 
     def test_empty_messages(self) -> None:
+        """If messages is an empty list, it should simply result in no messages being processed."""
         popper = _make_popper()
         response = Mock()
         response.messages = []
@@ -365,6 +374,7 @@ class TestProcessApiMessages:
         assert len(popper._api_messages_received) == 0
 
     def test_new_message_stored(self) -> None:
+        """A message with a new ID should be stored in _api_messages_received."""
         popper = _make_popper()
         response = Mock()
         response.messages = [
@@ -394,6 +404,7 @@ class TestProcessApiMessages:
         assert popper._api_messages_received["msg-1"].message_text == "first"
 
     def test_multiple_messages_in_one_response(self) -> None:
+        """Multiple messages in a single response should all be processed."""
         popper = _make_popper()
         response = Mock()
         response.messages = [
@@ -428,6 +439,7 @@ class TestHandlePopErrorResponse:
         return resp
 
     def test_maintenance_mode_sets_state_flag(self) -> None:
+        """Maintenance mode messages cause last_pop_maintenance_mode and last_pop_no_jobs_available to be True."""
         state = WorkerState()
         popper = _make_popper(state=state)
 
@@ -449,6 +461,7 @@ class TestHandlePopErrorResponse:
         popper._handle_pop_error_response(resp)
 
     def test_wrong_credentials_message(self) -> None:
+        """Wrong credentials messages cause last_pop_no_jobs_available to be True."""
         state = WorkerState()
         popper = _make_popper(state=state)
 
@@ -459,6 +472,7 @@ class TestHandlePopErrorResponse:
         assert state.last_pop_no_jobs_available is True
 
     def test_unrecognized_model_message(self) -> None:
+        """Unrecognized model messages cause last_pop_no_jobs_available to be True."""
         state = WorkerState()
         popper = _make_popper(state=state)
 
@@ -469,6 +483,7 @@ class TestHandlePopErrorResponse:
         assert state.last_pop_no_jobs_available is True
 
     def test_generic_error_message(self) -> None:
+        """Generic error messages should not set any state flags."""
         state = WorkerState()
         popper = _make_popper(state=state)
 
@@ -479,6 +494,7 @@ class TestHandlePopErrorResponse:
         assert state.last_pop_no_jobs_available is True
 
     def test_error_response_slows_throttler(self) -> None:
+        """Any error response should cause the pop frequency to slow down."""
         popper = _make_popper()
         original_frequency = popper._throttler.current_pop_frequency
 
@@ -554,6 +570,7 @@ class TestEnqueuePoppedJob:
     """Tests for _enqueue_popped_job."""
 
     def test_job_added_to_pending_inference(self) -> None:
+        """When a job is enqueued, it should be added to the jobs_pending_inference list."""
         job_tracker = JobTracker()
         popper = _make_popper(job_tracker=job_tracker)
         job = make_job_pop_response()
@@ -564,6 +581,7 @@ class TestEnqueuePoppedJob:
         assert job_tracker.jobs_pending_inference[0] is job
 
     def test_pop_timestamp_recorded(self) -> None:
+        """When a job is enqueued, the current time should be recorded in job_pop_timestamps for that job."""
         job_tracker = JobTracker()
         popper = _make_popper(job_tracker=job_tracker)
         job = make_job_pop_response()
@@ -574,6 +592,7 @@ class TestEnqueuePoppedJob:
         assert job_tracker.job_pop_timestamps[job] > 0
 
     def test_jobs_lookup_entry_created(self) -> None:
+        """When a job is enqueued, an entry should be created in jobs_lookup with the correct info."""
         job_tracker = JobTracker()
         popper = _make_popper(job_tracker=job_tracker)
         job = make_job_pop_response()
@@ -587,6 +606,7 @@ class TestEnqueuePoppedJob:
         assert info.time_popped > 0
 
     def test_multiple_jobs_enqueued_in_order(self) -> None:
+        """When multiple jobs are enqueued, they should be added to the pending list in the order enqueued."""
         job_tracker = JobTracker()
         popper = _make_popper(job_tracker=job_tracker)
         job1 = make_job_pop_response(model="model_a")
@@ -621,7 +641,7 @@ def _full_flow_patches(fn):  # noqa: ANN001, ANN202
     fn = patch(_SPAN_POP_PATH, _noop_span)(fn)
     fn = patch(_POP_REQUEST_PATH)(fn)
     fn = patch(_VERSION_PATH, "0.0.0-test", create=True)(fn)
-    return fn
+    return fn  # noqa: RET504
 
 
 class TestApiJobPopFullFlow:
@@ -671,6 +691,10 @@ class TestApiJobPopFullFlow:
 
     @_full_flow_patches
     def test_successful_pop_resets_maintenance_flag(self, _mock_req_cls: Mock) -> None:
+        """After a successful pop, last_pop_maintenance_mode should be reset to False.
+
+        This is so that future maintenance mode responses will log a warning again.
+        """
         state = WorkerState(last_job_pop_time=0.0)
         popper = self._make_ready_popper(
             api_response=make_job_pop_response(),
@@ -684,6 +708,7 @@ class TestApiJobPopFullFlow:
 
     @_full_flow_patches
     def test_successful_pop_resets_throttler_to_default(self, _mock_req_cls: Mock) -> None:
+        """After a successful pop, the throttler should reset to default frequency."""
         popper = self._make_ready_popper(api_response=make_job_pop_response())
         popper._throttler.on_pop_error()  # put throttler in error state
 
@@ -779,17 +804,21 @@ class TestJobPopFrequency:
     """Tests for pop frequency state management."""
 
     def test_last_pop_recently_true(self) -> None:
+        """When last_job_pop_time is very recent, last_pop_recently should return True."""
         state = WorkerState(last_job_pop_time=time.time())
         assert state.last_pop_recently() is True
 
     def test_last_pop_recently_false(self) -> None:
+        """When last_job_pop_time is not recent, last_pop_recently should return False."""
         state = WorkerState(last_job_pop_time=time.time() - 20)
         assert state.last_pop_recently() is False
 
     def test_default_pop_frequency(self) -> None:
+        """Default pop frequency should be 1.0 seconds."""
         popper = _make_popper()
         assert popper._throttler._current_pop_frequency == 1.0
 
     def test_error_pop_frequency(self) -> None:
+        """Error pop frequency should be 5.0 seconds."""
         popper = _make_popper()
         assert popper._throttler._error_pop_frequency == 5.0

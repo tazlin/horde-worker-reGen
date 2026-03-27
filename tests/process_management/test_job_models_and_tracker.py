@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-import pytest
-
 from horde_worker_regen.process_management.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.job_tracker import JobTracker
 
@@ -85,6 +83,7 @@ class TestAPIWorkerMessageFromRawDict:
         assert msg.message_text == "test"
 
     def test_message_text_preserves_special_characters(self) -> None:
+        """Message text should preserve special characters and emojis without alteration."""
         raw = {"id": "msg-004", "message": "Update: v2.0! 🚀 (breaking changes)"}
 
         msg = APIWorkerMessage.from_raw_dict(raw)
@@ -100,6 +99,7 @@ class TestAPIWorkerMessageFromRawDict:
         assert msg.message_text == "None"
 
     def test_message_text_with_empty_string(self) -> None:
+        """Explicitly setting message to an empty string should produce an empty string."""
         raw = {"id": "msg-006", "message": ""}
 
         msg = APIWorkerMessage.from_raw_dict(raw)
@@ -121,6 +121,7 @@ class TestJobTrackerResetMegapixelstepTrigger:
     """Tests for JobTracker.reset_megapixelstep_trigger."""
 
     def test_clears_trigger_flag(self) -> None:
+        """After calling reset_megapixelstep_trigger, _triggered_max_pending_megapixelsteps should be False."""
         job_tracker = JobTracker()
         job_tracker._triggered_max_pending_megapixelsteps = True
 
@@ -129,6 +130,7 @@ class TestJobTrackerResetMegapixelstepTrigger:
         assert job_tracker._triggered_max_pending_megapixelsteps is False
 
     def test_idempotent_when_already_false(self) -> None:
+        """Calling reset_megapixelstep_trigger when the flag is already False should keep it False."""
         job_tracker = JobTracker()
         assert job_tracker._triggered_max_pending_megapixelsteps is False
 
@@ -141,10 +143,12 @@ class TestJobTrackerShouldWaitForPendingMegapixelsteps:
     """Tests for the should_wait check that drives throttling."""
 
     def test_empty_queue_does_not_wait(self) -> None:
+        """If there are no jobs pending inference, should_wait_for_pending_megapixelsteps should return False."""
         job_tracker = JobTracker()
         assert job_tracker.should_wait_for_pending_megapixelsteps() is False
 
     def test_queue_below_threshold_does_not_wait(self) -> None:
+        """If pending megapixelsteps is below threshold, should_wait_for_pending_megapixelsteps should return False."""
         job_tracker = JobTracker()
         job_tracker._max_pending_megapixelsteps = 100
 
@@ -165,6 +169,7 @@ class TestJobTrackerShouldWaitForPendingMegapixelsteps:
         assert job_tracker.should_wait_for_pending_megapixelsteps() is False
 
     def test_queue_above_threshold_waits(self) -> None:
+        """If pending megapixelsteps exceeds threshold, should_wait_for_pending_megapixelsteps should return True."""
         job_tracker = JobTracker()
         job_tracker._max_pending_megapixelsteps = 1  # Very low threshold
 
@@ -189,6 +194,7 @@ class TestJobTrackerSetPerformanceModeThresholds:
     """Tests for dynamic threshold adjustment."""
 
     def test_sets_new_threshold(self) -> None:
+        """Setting a new threshold should update the internal max_pending_megapixelsteps value."""
         job_tracker = JobTracker()
         original = job_tracker._max_pending_megapixelsteps
 
@@ -198,6 +204,7 @@ class TestJobTrackerSetPerformanceModeThresholds:
         assert job_tracker._max_pending_megapixelsteps != original
 
     def test_zero_threshold_makes_everything_wait(self) -> None:
+        """Setting threshold to 0 should cause all jobs to trigger the wait condition."""
         job_tracker = JobTracker()
         job_tracker.set_performance_mode_thresholds(0)
 
