@@ -21,6 +21,7 @@ classifiers = [
     "Development Status :: 2 - Pre-Alpha",
 ]
 dependencies = [
+    "aiodns>=3.0.0,<4.0.0",
     "qrcode==7.4.2",
     "certifi",
     "horde_sdk~=0.20.1",
