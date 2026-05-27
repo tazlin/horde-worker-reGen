@@ -21,7 +21,15 @@ from horde_worker_regen.process_management.messages import (
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
-from .conftest import make_mock_bridge_data, make_mock_process_info
+from .conftest import (
+    make_job_pop_response,
+    make_mock_bridge_data,
+    make_mock_process_info,
+    make_test_model_metadata,
+    make_test_runtime_config,
+    mark_job_in_progress_async,
+    move_job_to_being_safety_checked_async,
+)
 
 
 def _make_dispatcher(
@@ -52,8 +60,8 @@ def _make_dispatcher(
         horde_model_map=horde_model_map,
         job_tracker=job_tracker,
         process_message_queue=process_message_queue,
-        get_model_baseline=lambda name: None,
-        get_bridge_data=lambda: bridge_data,
+        runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+        model_metadata=make_test_model_metadata(),
         on_unload_vram=Mock(),
         state=state,
     )
@@ -68,13 +76,13 @@ def _enqueue(message_dispatcher: MessageDispatcher, message: object) -> None:
 class TestReceiveAndHandleProcessMessages:
     """Tests for receive_and_handle_process_messages."""
 
-    def test_empty_queue_does_nothing(self) -> None:
+    async def test_empty_queue_does_nothing(self) -> None:
         """If the message queue is empty, the method should return without doing anything."""
         message_dispatcher = _make_dispatcher()
         message_dispatcher._process_message_queue.empty.return_value = True
-        message_dispatcher.receive_and_handle_process_messages()
+        await message_dispatcher.receive_and_handle_process_messages()
 
-    def test_heartbeat_updates_process_map(self) -> None:
+    async def test_heartbeat_updates_process_map(self) -> None:
         """When a heartbeat message is received, the process map's on_heartbeat callback is called."""
         process_info = make_mock_process_info(0)
         process_info.process_launch_identifier = 0
@@ -90,9 +98,9 @@ class TestReceiveAndHandleProcessMessages:
         msg.info = "heartbeat"
 
         _enqueue(message_dispatcher, msg)
-        message_dispatcher.receive_and_handle_process_messages()
+        await message_dispatcher.receive_and_handle_process_messages()
 
-    def test_memory_report_updates_process_map(self) -> None:
+    async def test_memory_report_updates_process_map(self) -> None:
         """When a memory report message is received, the process map's on_memory_report callback is called."""
         process_info = make_mock_process_info(0)
         process_info.process_launch_identifier = 0
@@ -110,7 +118,7 @@ class TestReceiveAndHandleProcessMessages:
         msg.info = "memory"
 
         _enqueue(message_dispatcher, msg)
-        message_dispatcher.receive_and_handle_process_messages()
+        await message_dispatcher.receive_and_handle_process_messages()
 
         process_map.on_memory_report.assert_called_once_with(
             process_id=0,
@@ -119,7 +127,7 @@ class TestReceiveAndHandleProcessMessages:
             total_vram_bytes=4096,
         )
 
-    def test_state_change_to_inference_starting_updates_model_map(self) -> None:
+    async def test_state_change_to_inference_starting_updates_model_map(self) -> None:
         """When a process state changes to INFERENCE_STARTING, the model map should be updated."""
         process_info = make_mock_process_info(0, model_name="test_model")
         process_info.process_launch_identifier = 0
@@ -138,11 +146,11 @@ class TestReceiveAndHandleProcessMessages:
         msg.info = "starting inference"
 
         _enqueue(message_dispatcher, msg)
-        message_dispatcher.receive_and_handle_process_messages()
+        await message_dispatcher.receive_and_handle_process_messages()
 
         assert hmm.root.get("test_model") is not None
 
-    def test_mismatched_launch_identifier_is_ignored(self) -> None:
+    async def test_mismatched_launch_identifier_is_ignored(self) -> None:
         """Ignore if a message is received with a launch identifier that doesn't match the process's current one."""
         process_info = make_mock_process_info(0)
         process_info.process_launch_identifier = 5
@@ -157,9 +165,9 @@ class TestReceiveAndHandleProcessMessages:
         msg.info = "stale"
 
         _enqueue(message_dispatcher, msg)
-        message_dispatcher.receive_and_handle_process_messages()
+        await message_dispatcher.receive_and_handle_process_messages()
 
-    def test_unknown_process_id_raises(self) -> None:
+    async def test_unknown_process_id_raises(self) -> None:
         """If a message is received for an unknown process ID, a ValueError should be raised."""
         message_dispatcher = _make_dispatcher()
 
@@ -171,9 +179,9 @@ class TestReceiveAndHandleProcessMessages:
 
         _enqueue(message_dispatcher, msg)
         with pytest.raises(ValueError, match="unknown process"):
-            message_dispatcher.receive_and_handle_process_messages()
+            await message_dispatcher.receive_and_handle_process_messages()
 
-    def test_process_ending_calls_on_process_ending(self) -> None:
+    async def test_process_ending_calls_on_process_ending(self) -> None:
         """When a process is ending, the process map's on_process_ending callback is called."""
         process_info = make_mock_process_info(0)
         process_info.process_launch_identifier = 0
@@ -191,7 +199,7 @@ class TestReceiveAndHandleProcessMessages:
         msg.info = "ending"
 
         _enqueue(message_dispatcher, msg)
-        message_dispatcher.receive_and_handle_process_messages()
+        await message_dispatcher.receive_and_handle_process_messages()
 
         process_map.on_process_ending.assert_called_once_with(process_id=0)
 
@@ -199,23 +207,17 @@ class TestReceiveAndHandleProcessMessages:
 class TestHandleInferenceResult:
     """Tests for _handle_inference_result."""
 
-    def test_inference_result_moves_job_to_safety_check(self) -> None:
+    async def test_inference_result_moves_job_to_safety_check(self) -> None:
         """When an inference result is received for a job in progress, it should be moved to pending safety check."""
         process_info = make_mock_process_info(0)
         process_info.process_launch_identifier = 0
         process_map = ProcessMap({0: process_info})
         job_tracker = JobTracker()
 
-        job = Mock()
-        job.id_ = "test-id"
-        job.model = "stable_diffusion"
-        job.payload = Mock()
-        job.payload.n_iter = 1
+        job = make_job_pop_response(model="stable_diffusion")
 
-        job_info = Mock()
-        job_info.sdk_api_job_info = job
-        job_tracker.jobs_lookup[job] = job_info
-        job_tracker.jobs_in_progress.append(job)
+        job_info = await job_tracker.record_popped_job(job)
+        await mark_job_in_progress_async(job_tracker, job)
 
         message_dispatcher = _make_dispatcher(process_map=process_map, job_tracker=job_tracker)
 
@@ -231,12 +233,12 @@ class TestHandleInferenceResult:
         msg.faults_count = 0
 
         _enqueue(message_dispatcher, msg)
-        message_dispatcher.receive_and_handle_process_messages()
+        await message_dispatcher.receive_and_handle_process_messages()
 
         assert job not in job_tracker.jobs_in_progress
         assert job_info in job_tracker.jobs_pending_safety_check
 
-    def test_faulted_inference_result_moves_to_pending_submit(self) -> None:
+    async def test_faulted_inference_result_moves_to_pending_submit(self) -> None:
         """If an inference result is faulted, it should be moved to pending submit."""
         from horde_sdk.ai_horde_api import GENERATION_STATE
 
@@ -245,14 +247,10 @@ class TestHandleInferenceResult:
         process_map = ProcessMap({0: process_info})
         job_tracker = JobTracker()
 
-        job = Mock()
-        job.id_ = "test-id"
-        job.model = "stable_diffusion"
+        job = make_job_pop_response(model="stable_diffusion")
 
-        job_info = Mock()
-        job_info.sdk_api_job_info = job
-        job_tracker.jobs_lookup[job] = job_info
-        job_tracker.jobs_in_progress.append(job)
+        job_info = await job_tracker.record_popped_job(job)
+        await mark_job_in_progress_async(job_tracker, job)
 
         message_dispatcher = _make_dispatcher(process_map=process_map, job_tracker=job_tracker)
 
@@ -267,11 +265,11 @@ class TestHandleInferenceResult:
         msg.faults_count = 1
 
         _enqueue(message_dispatcher, msg)
-        message_dispatcher.receive_and_handle_process_messages()
+        await message_dispatcher.receive_and_handle_process_messages()
 
         assert job_info in job_tracker.jobs_pending_submit
 
-    def test_inference_result_unknown_job_is_handled(self) -> None:
+    async def test_inference_result_unknown_job_is_handled(self) -> None:
         """If an inference result is received for a job that isn't in progress, it should be handled gracefully."""
         process_info = make_mock_process_info(0)
         process_info.process_launch_identifier = 0
@@ -294,13 +292,13 @@ class TestHandleInferenceResult:
         msg.faults_count = 0
 
         _enqueue(message_dispatcher, msg)
-        message_dispatcher.receive_and_handle_process_messages()
+        await message_dispatcher.receive_and_handle_process_messages()
 
 
 class TestHandleSafetyResult:
     """Tests for _handle_safety_result."""
 
-    def test_safety_result_moves_job_to_pending_submit(self) -> None:
+    async def test_safety_result_moves_job_to_pending_submit(self) -> None:
         """When a safety result is received for a job being safety checked it should be moved to pending submit.
 
         This should be regardless of the evaluation outcome (safety checks don't gate submission,
@@ -317,8 +315,7 @@ class TestHandleSafetyResult:
         job_info = Mock()
         job_info.sdk_api_job_info = job
         job_info.job_image_results = [image_result]
-        job_tracker.jobs_being_safety_checked.append(job_info)
-        job_tracker.job_faults[job.id_] = []
+        await move_job_to_being_safety_checked_async(job_tracker, job_info)
 
         message_dispatcher = _make_dispatcher(job_tracker=job_tracker)
 
@@ -328,7 +325,7 @@ class TestHandleSafetyResult:
         safety_eval.is_csam = False
         safety_eval.is_nsfw = False
 
-        message_dispatcher._handle_safety_result(
+        await message_dispatcher._handle_safety_result(
             Mock(
                 job_id=job.id_,
                 safety_evaluations=[safety_eval],
@@ -339,11 +336,11 @@ class TestHandleSafetyResult:
         assert job_info in job_tracker.jobs_pending_submit
         assert job_info not in job_tracker.jobs_being_safety_checked
 
-    def test_safety_result_not_found_logs_error(self) -> None:
+    async def test_safety_result_not_found_logs_error(self) -> None:
         """Test that if a safety result is received for a job ID that isn't being safety checked, it is handled."""
         message_dispatcher = _make_dispatcher()
 
-        message_dispatcher._handle_safety_result(
+        await message_dispatcher._handle_safety_result(
             Mock(
                 job_id="nonexistent",
                 safety_evaluations=[],
@@ -402,7 +399,7 @@ class TestHandleModelStateChange:
 class TestHandleAuxModelStateChange:
     """Tests for _handle_aux_model_state_change."""
 
-    def test_downloading_aux_model_updates_last_job(self) -> None:
+    async def test_downloading_aux_model_updates_last_job(self) -> None:
         """When a process reports that it's downloading an aux model, the last job it referenced should be updated."""
         process_info = make_mock_process_info(0)
         process_map = ProcessMap({0: process_info})
@@ -412,7 +409,7 @@ class TestHandleAuxModelStateChange:
 
         job = Mock()
 
-        message_dispatcher._handle_aux_model_state_change(
+        await message_dispatcher._handle_aux_model_state_change(
             Mock(
                 process_state=HordeProcessState.DOWNLOADING_AUX_MODEL,
                 process_id=0,
@@ -426,17 +423,15 @@ class TestHandleAuxModelStateChange:
             last_job_referenced=job,
         )
 
-    def test_download_aux_complete_records_time(self) -> None:
+    async def test_download_aux_complete_records_time(self) -> None:
         """When an aux model finishes downloading, the time to download should be recorded on the job info."""
         job_tracker = JobTracker()
-        job = Mock()
-        job.id_ = "aux-test"
-        job_info = Mock()
-        job_tracker.jobs_lookup[job] = job_info
+        job = make_job_pop_response(model="stable_diffusion")
+        job_info = await job_tracker.record_popped_job(job)
 
         message_dispatcher = _make_dispatcher(job_tracker=job_tracker)
 
-        message_dispatcher._handle_aux_model_state_change(
+        await message_dispatcher._handle_aux_model_state_change(
             Mock(
                 process_state=HordeProcessState.DOWNLOAD_AUX_COMPLETE,
                 process_id=0,

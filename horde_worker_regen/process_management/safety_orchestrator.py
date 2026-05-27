@@ -1,22 +1,19 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-
-from horde_model_reference.model_reference_records import StableDiffusion_ModelReference
 from loguru import logger
 
-from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import (
     HordeControlFlag,
     HordeProcessState,
     HordeSafetyControlMessage,
 )
-from horde_worker_regen.telemetry_spans import span_safety_check
+from horde_worker_regen.process_management.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.protocols import BridgeDataProvider
+from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.telemetry_spans import span_safety_check
 
 
 class SafetyOrchestrator:
@@ -25,9 +22,8 @@ class SafetyOrchestrator:
     _process_map: ProcessMap
     _job_tracker: JobTracker
     _process_lifecycle: ProcessLifecycleManager
-
-    _get_bridge_data: BridgeDataProvider
-    _get_stable_diffusion_reference: Callable[[], StableDiffusion_ModelReference | None]
+    _runtime_config: RuntimeConfig
+    _model_metadata: ModelMetadata
 
     def __init__(
         self,
@@ -35,18 +31,30 @@ class SafetyOrchestrator:
         process_map: ProcessMap,
         job_tracker: JobTracker,
         process_lifecycle: ProcessLifecycleManager,
-        get_bridge_data: BridgeDataProvider,
-        get_stable_diffusion_reference: Callable[[], StableDiffusion_ModelReference | None],
+        runtime_config: RuntimeConfig,
+        model_metadata: ModelMetadata,
         state: WorkerState,
     ) -> None:
+        """Initialize the orchestrator with references to its dependencies.
+
+        Args:
+            process_map (ProcessMap): The process map to use for finding safety processes.
+            job_tracker (JobTracker): The job tracker to use for moving jobs between pending and being
+                checked.
+            process_lifecycle (ProcessLifecycleManager): The process lifecycle manager to signal if safety
+                processes need to be replaced.
+            runtime_config (RuntimeConfig): Holds the current bridge configuration snapshot.
+            model_metadata (ModelMetadata): Provides lookups against the stable-diffusion model reference.
+            state (WorkerState): The worker state to check for dry-run mode.
+        """
         self._process_map = process_map
         self._job_tracker = job_tracker
         self._process_lifecycle = process_lifecycle
-        self._get_bridge_data = get_bridge_data
-        self._get_stable_diffusion_reference = get_stable_diffusion_reference
+        self._runtime_config = runtime_config
+        self._model_metadata = model_metadata
         self._state = state
 
-    def start_evaluate_safety(self) -> None:
+    async def start_evaluate_safety(self) -> None:
         """Start evaluating the safety of the next job pending a safety check, if any."""
         if len(self._job_tracker.jobs_pending_safety_check) == 0:
             return
@@ -58,11 +66,9 @@ class SafetyOrchestrator:
 
         completed_job_info = self._job_tracker.jobs_pending_safety_check[0]
 
-        stable_diffusion_reference = self._get_stable_diffusion_reference()
-        if stable_diffusion_reference is None:
-            raise ValueError("stable_diffusion_reference is None")
+        stable_diffusion_reference = self._model_metadata.require_reference()
 
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
 
         critical_fault = False
 
@@ -83,13 +89,13 @@ class SafetyOrchestrator:
             critical_fault = True
 
         if critical_fault:
-            self._job_tracker.handle_job_fault(
+            await self._job_tracker.handle_job_fault(
                 faulted_job=completed_job_info.sdk_api_job_info,
                 process_info=safety_process,
                 process_timeout=bridge_data.process_timeout,
             )
             logger.error(f"Failed to start safety evaluation for job {completed_job_info.sdk_api_job_info.id_}")
-            self._job_tracker.jobs_pending_safety_check.remove(completed_job_info)
+            await self._job_tracker.abandon_pending_safety(completed_job_info)
 
             return
 
@@ -129,9 +135,6 @@ class SafetyOrchestrator:
 
             logger.error(f"Failed to start safety evaluation for job {completed_job_info.sdk_api_job_info.id_}")
             self._process_lifecycle.safety_processes_should_be_replaced = True
-            if len(self._job_tracker.jobs_being_safety_checked) > 0:
-                for job_info in self._job_tracker.jobs_being_safety_checked:
-                    self._job_tracker.jobs_pending_safety_check.append(job_info)
+            await self._job_tracker.requeue_being_safety_checked()
         else:
-            self._job_tracker.jobs_pending_safety_check.remove(completed_job_info)
-            self._job_tracker.jobs_being_safety_checked.append(completed_job_info)
+            await self._job_tracker.begin_safety_check(completed_job_info)

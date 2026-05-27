@@ -19,9 +19,9 @@ import aiohttp
 import aiohttp.client_exceptions
 import certifi
 from aiohttp import ClientSession
-from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY, STABLE_DIFFUSION_BASELINE_CATEGORY
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
 from horde_model_reference.model_reference_manager import ModelReferenceManager
-from horde_model_reference.model_reference_records import StableDiffusion_ModelReference
+from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk import RequestErrorResponse
 from horde_sdk.ai_horde_api.ai_horde_clients import (
     AIHordeAPIAsyncClientSession,
@@ -43,6 +43,7 @@ from horde_worker_regen.consts import (
     VRAM_HEAVY_MODELS,
 )
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
@@ -53,9 +54,11 @@ from horde_worker_regen.process_management.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.lru_cache import LRUCache
 from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
+from horde_worker_regen.process_management.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.safety_orchestrator import SafetyOrchestrator
 from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
 from horde_worker_regen.process_management.worker_state import WorkerState
@@ -84,6 +87,11 @@ class SystemResources:
         device_map = TorchDeviceMap(root={})
         for i in range(torch.cuda.device_count()):
             device = torch.cuda.get_device_properties(i)
+
+            if not hasattr(device, "name") or not hasattr(device, "total_memory"):
+                logger.debug(f"Skipping CUDA device {i} due to missing attributes.")
+                continue
+
             device_map.root[i] = TorchDeviceInfo(
                 device_name=device.name,
                 device_index=i,
@@ -135,8 +143,18 @@ _caught_signal = False
 class HordeWorkerProcessManager:
     """Manages and controls processes to act as a horde worker."""
 
-    bridge_data: reGenBridgeData
-    """The bridge data for this worker."""
+    _runtime_config: RuntimeConfig
+    _api_sessions: ApiSessions
+    _model_metadata: ModelMetadata
+
+    @property
+    def bridge_data(self) -> reGenBridgeData:
+        """The bridge data for this worker."""
+        return self._runtime_config.bridge_data
+
+    @bridge_data.setter
+    def bridge_data(self, value: reGenBridgeData) -> None:
+        self._runtime_config.update(value)
 
     horde_model_reference_manager: ModelReferenceManager
     """The model reference manager for this worker."""
@@ -231,24 +249,27 @@ class HordeWorkerProcessManager:
     session_start_time: float = 0
     """The time at which the session started in epoch time."""
 
-    _aiohttp_client_session: aiohttp.ClientSession
-    """The aiohttp client session to use for making network calls."""
+    @property
+    def stable_diffusion_reference(self) -> dict[str, ImageGenerationModelRecord] | None:
+        """The class which contains the list of models from horde_model_reference."""
+        return self._model_metadata.reference
 
-    stable_diffusion_reference: StableDiffusion_ModelReference | None
-    """The class which contains the list of models from horde_model_reference."""
+    @stable_diffusion_reference.setter
+    def stable_diffusion_reference(self, value: dict[str, ImageGenerationModelRecord] | None) -> None:
+        self._model_metadata.set_reference(value)
 
-    def get_model_baseline(self, model_name: str) -> STABLE_DIFFUSION_BASELINE_CATEGORY | str | None:
+    def get_model_baseline(self, model_name: str) -> KNOWN_IMAGE_GENERATION_BASELINE | str | None:
         """Return the baseline of the model."""
-        if self.stable_diffusion_reference is None:
-            return None
+        return self._model_metadata.get_baseline(model_name)
 
-        if model_name not in self.stable_diffusion_reference.root:
-            return None
+    @property
+    def horde_client_session(self) -> AIHordeAPIAsyncClientSession:
+        """The context manager for the horde sdk client."""
+        return self._api_sessions.require_horde_client_session()
 
-        return self.stable_diffusion_reference.root[model_name].baseline
-
-    horde_client_session: AIHordeAPIAsyncClientSession
-    """The context manager for the horde sdk client."""
+    @horde_client_session.setter
+    def horde_client_session(self, value: AIHordeAPIAsyncClientSession) -> None:
+        self._api_sessions.set_horde_client_session(value)
 
     user_info: UserDetailsResponse | None = None
     """The user info for the user that this worker is logged in as."""
@@ -323,7 +344,7 @@ class HordeWorkerProcessManager:
         system_resources: SystemResources | None = None,
         mp_primitives: MultiprocessingPrimitives | None = None,
         skip_api_init: bool = False,
-        stable_diffusion_reference: StableDiffusion_ModelReference | None = None,
+        stable_diffusion_reference: dict[str, ImageGenerationModelRecord] | None = None,
     ) -> None:
         """Initialise the process manager.
 
@@ -345,7 +366,9 @@ class HordeWorkerProcessManager:
         self.session_start_time = time.time()
         self._state = WorkerState()
 
-        self.bridge_data = bridge_data
+        self._runtime_config = RuntimeConfig(initial=bridge_data)
+        self._api_sessions = ApiSessions()
+        self._model_metadata = ModelMetadata()
         logger.debug(f"Models to load: {bridge_data.image_models_to_load}")
         logger.debug(f"Custom Models to load: {bridge_data.custom_models}")
 
@@ -373,7 +396,6 @@ class HordeWorkerProcessManager:
 
         self.target_vram_overhead_bytes_map = target_vram_overhead_bytes_map  # TODO
 
-        # Detect or use provided system resources
         if system_resources is None:
             system_resources = SystemResources.detect()
 
@@ -413,7 +435,6 @@ class HordeWorkerProcessManager:
                 logger.warning(e)
                 logger.warning("Error trying to unset maintenance. Did this worker not exist yet?")
 
-        # Create or use provided multiprocessing primitives
         if mp_primitives is None:
             vae_decode_semaphore_max = 1
             if self.bridge_data.high_memory_mode:
@@ -440,7 +461,7 @@ class HordeWorkerProcessManager:
             disk_lock=self._disk_lock,
             aux_model_lock=self._aux_model_lock,
             vae_decode_semaphore=self._vae_decode_semaphore,
-            get_bridge_data=lambda: self.bridge_data,
+            runtime_config=self._runtime_config,
             max_inference_processes=self.max_inference_processes,
             max_safety_processes=self.max_safety_processes,
             amd_gpu=self._amd_gpu,
@@ -454,8 +475,8 @@ class HordeWorkerProcessManager:
             horde_model_map=self._horde_model_map,
             job_tracker=self._job_tracker,
             process_message_queue=self._process_message_queue,
-            get_model_baseline=self.get_model_baseline,
-            get_bridge_data=lambda: self.bridge_data,
+            runtime_config=self._runtime_config,
+            model_metadata=self._model_metadata,
             on_unload_vram=self.unload_models_from_vram,
             state=self._state,
         )
@@ -464,8 +485,8 @@ class HordeWorkerProcessManager:
             process_map=self._process_map,
             job_tracker=self._job_tracker,
             process_lifecycle=self._process_lifecycle,
-            get_bridge_data=lambda: self.bridge_data,
-            get_stable_diffusion_reference=lambda: self.stable_diffusion_reference,
+            runtime_config=self._runtime_config,
+            model_metadata=self._model_metadata,
             state=self._state,
         )
 
@@ -482,9 +503,8 @@ class HordeWorkerProcessManager:
             horde_model_map=self._horde_model_map,
             job_tracker=self._job_tracker,
             process_lifecycle=self._process_lifecycle,
-            get_bridge_data=lambda: self.bridge_data,
-            get_model_baseline=self.get_model_baseline,
-            get_stable_diffusion_reference=lambda: self.stable_diffusion_reference,
+            runtime_config=self._runtime_config,
+            model_metadata=self._model_metadata,
             max_concurrent_inference_processes=self._max_concurrent_inference_processes,
             max_inference_processes=self.max_inference_processes,
             lru=self._lru,
@@ -494,10 +514,9 @@ class HordeWorkerProcessManager:
             state=self._state,
             job_tracker=self._job_tracker,
             shutdown_manager=self._shutdown_manager,
-            get_bridge_data=lambda: self.bridge_data,
-            get_stable_diffusion_reference=lambda: self.stable_diffusion_reference,
-            get_horde_client_session=lambda: self.horde_client_session,
-            get_aiohttp_session=lambda: self._aiohttp_client_session,
+            runtime_config=self._runtime_config,
+            api_sessions=self._api_sessions,
+            model_metadata=self._model_metadata,
             dry_run_skip_api=bridge_data.dry_run_skip_api,
         )
 
@@ -506,12 +525,8 @@ class HordeWorkerProcessManager:
             process_map=self._process_map,
             job_tracker=self._job_tracker,
             shutdown_manager=self._shutdown_manager,
-            get_bridge_data=lambda: self.bridge_data,
-            get_horde_client_session=lambda: self.horde_client_session,
-            get_aiohttp_session=lambda: self._aiohttp_client_session,
-            get_effective_megapixelsteps=lambda job: self._inference_scheduler.get_single_job_effective_megapixelsteps(
-                job,
-            ),
+            runtime_config=self._runtime_config,
+            api_sessions=self._api_sessions,
             max_inference_processes=self.max_inference_processes,
             max_concurrent_inference_processes=self._max_concurrent_inference_processes,
             dry_run_skip_api=bridge_data.dry_run_skip_api,
@@ -532,10 +547,13 @@ class HordeWorkerProcessManager:
                     override_existing=False,
                 )
                 all_refs = horde_model_reference_manager.get_all_model_references(False)
-                _sd_ref = all_refs[MODEL_REFERENCE_CATEGORY.stable_diffusion]
+                _sd_ref = all_refs[MODEL_REFERENCE_CATEGORY.image_generation]
 
-                if not isinstance(_sd_ref, StableDiffusion_ModelReference):
-                    raise ValueError("Expected StableDiffusion_ModelReference")
+                if not isinstance(_sd_ref, dict):
+                    raise ValueError(
+                        "Expected dict[str, ImageGenerationModelRecord] for stable diffusion reference, got "
+                        + str(type(_sd_ref)),
+                    )
 
                 self.stable_diffusion_reference = _sd_ref
             except Exception as e:
@@ -608,36 +626,36 @@ class HordeWorkerProcessManager:
         if self.stable_diffusion_reference is None:
             raise ValueError("stable_diffusion_reference is None")
 
-        horde_model_record = self.stable_diffusion_reference.root[horde_model_name]
+        horde_model_record = self.stable_diffusion_reference[horde_model_name]
 
-        if horde_model_record.baseline == STABLE_DIFFUSION_BASELINE_CATEGORY.stable_diffusion_1:
+        if horde_model_record.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1:
             return int(3 * 1024 * 1024 * 1024)
-        if horde_model_record.baseline == STABLE_DIFFUSION_BASELINE_CATEGORY.stable_diffusion_2_512:
+        if horde_model_record.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_2_512:
             return 4 * 1024 * 1024 * 1024
-        if horde_model_record.baseline == STABLE_DIFFUSION_BASELINE_CATEGORY.stable_diffusion_2_768:
+        if horde_model_record.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_2_768:
             return 5 * 1024 * 1024 * 1024
-        if horde_model_record.baseline == STABLE_DIFFUSION_BASELINE_CATEGORY.stable_diffusion_xl:
+        if horde_model_record.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl:
             return int(5.75 * 1024 * 1024 * 1024)
 
         raise ValueError(f"Model {horde_model_name} has an unknown baseline {horde_model_record.baseline}")
 
-    def receive_and_handle_process_messages(self) -> None:
+    async def receive_and_handle_process_messages(self) -> None:
         """Receive and handle any messages from the child processes.
 
         Delegates to MessageDispatcher.
         """
-        self._message_dispatcher.receive_and_handle_process_messages()
+        await self._message_dispatcher.receive_and_handle_process_messages()
 
-    def unload_models_from_vram(
+    async def unload_models_from_vram(
         self,
         process_with_model: HordeProcessInfo,
     ) -> None:
         """Unload models from VRAM from processes that are not running a job."""
         self._inference_scheduler.unload_models_from_vram(process_with_model)
 
-    def start_evaluate_safety(self) -> None:
+    async def start_evaluate_safety(self) -> None:
         """Start evaluating the safety of the next job pending a safety check, if any."""
-        self._safety_orchestrator.start_evaluate_safety()
+        await self._safety_orchestrator.start_evaluate_safety()
 
     @property
     def _num_job_slowdowns(self) -> int:
@@ -656,7 +674,7 @@ class HordeWorkerProcessManager:
 
     @property
     def _time_spent_no_jobs_available(self) -> float:
-        return self._job_popper._time_spent_no_jobs_available
+        return self._job_popper._pop_throttler._time_spent_no_jobs_available
 
     @property
     def _too_many_consecutive_failed_jobs(self) -> bool:
@@ -675,8 +693,8 @@ class HordeWorkerProcessManager:
         self._state.too_many_consecutive_failed_jobs_time = value
 
     @property
-    def _too_many_consecutive_failed_jobs_wait_time(self) -> int:
-        return self._job_popper._too_many_consecutive_failed_jobs_wait_time
+    def _too_many_consecutive_failed_jobs_wait_time(self) -> float:
+        return self._state.too_many_consecutive_failed_jobs_wait_time
 
     _user_info_failed = False
     """Whether the API request to fetch user info failed."""
@@ -749,7 +767,7 @@ class HordeWorkerProcessManager:
             kudos_total_past_hour=kudos_total_past_hour,
             active_kudos_per_hour=active_kudos_per_hour,
             time_spent_no_jobs_available=self._time_spent_no_jobs_available,
-            max_time_spent_no_jobs_available=self._job_popper._max_time_spent_no_jobs_available,
+            max_time_spent_no_jobs_available=self._job_popper._pop_throttler._max_time_spent_no_jobs_available,
         )
 
     def log_kudos_info(self, kudos_info_string: str) -> None:
@@ -841,13 +859,11 @@ class HordeWorkerProcessManager:
                 with logger.catch(reraise=True):
                     await asyncio.sleep(self._loop_interval)
 
-                    async with self._job_tracker.all_locks():
-                        self.receive_and_handle_process_messages()
-                        self.detect_deadlock()
+                    await self.receive_and_handle_process_messages()
+                    self.detect_deadlock()
 
                     if len(self._job_tracker.jobs_pending_safety_check) > 0:
-                        async with self._job_tracker.safety_check_lock:
-                            self.start_evaluate_safety()
+                        await self.start_evaluate_safety()
 
                     free_process_or_model_loaded = (
                         self.is_free_inference_process_available() or self.is_any_model_preloaded()
@@ -870,16 +886,14 @@ class HordeWorkerProcessManager:
                         MaintenanceModeMessenger.print_maintenance_mode_messages()
 
                     if free_process_or_model_loaded and len(self._job_tracker.jobs_pending_inference) > 0:
-                        async with self._job_tracker.all_locks(include_timestamps=True):
-                            self._inference_scheduler.run_scheduling_cycle(self.stable_diffusion_reference)
+                        await self._inference_scheduler.run_scheduling_cycle(self.stable_diffusion_reference)
 
-                    async with self._job_tracker.all_locks():
-                        await asyncio.sleep(self._loop_interval)
-                        self.receive_and_handle_process_messages()
-                        if self._process_lifecycle.replace_hung_processes():
-                            await asyncio.sleep(self._loop_interval / 2)
-                            await asyncio.sleep(self._loop_interval / 2)
-                        self._process_lifecycle._replace_all_safety_process()
+                    await asyncio.sleep(self._loop_interval)
+                    await self.receive_and_handle_process_messages()
+                    if self._process_lifecycle.replace_hung_processes():
+                        await asyncio.sleep(self._loop_interval / 2)
+                        await asyncio.sleep(self._loop_interval / 2)
+                    self._process_lifecycle._replace_all_safety_process()
 
                     if self._shutting_down and not self._last_pop_recently():
                         self._process_lifecycle.end_inference_processes()
@@ -897,10 +911,9 @@ class HordeWorkerProcessManager:
 
         while len(self._job_tracker.jobs_pending_inference) > 0:
             await asyncio.sleep(0.2)
-            async with self._job_tracker.all_locks():
-                self.receive_and_handle_process_messages()
-                self.detect_deadlock()
-                self._process_lifecycle.replace_hung_processes()
+            await self.receive_and_handle_process_messages()
+            self.detect_deadlock()
+            self._process_lifecycle.replace_hung_processes()
             await asyncio.sleep(0.2)
 
         self._process_lifecycle.end_inference_processes(force=True)
@@ -947,7 +960,7 @@ class HordeWorkerProcessManager:
             pending_megapixelsteps=self._job_tracker.get_pending_megapixelsteps(),
             num_jobs_total=self.num_jobs_total,
             total_num_completed_jobs=self._job_tracker.total_num_completed_jobs,
-            num_jobs_faulted=self._job_tracker._num_jobs_faulted,
+            num_jobs_faulted=self._job_tracker.num_jobs_faulted,
             num_job_slowdowns=self._num_job_slowdowns,
             num_process_recoveries=self._process_lifecycle._num_process_recoveries,
             time_spent_no_jobs_available=self._time_spent_no_jobs_available,
@@ -965,7 +978,6 @@ class HordeWorkerProcessManager:
             total_ram_gigabytes=self.total_ram_gigabytes,
         )
 
-        # Update state from reporter
         self._last_status_message_time = reporter.last_status_message_time
         self._status_message_frequency = updated_frequency
 
@@ -1000,7 +1012,6 @@ class HordeWorkerProcessManager:
                 logger.error(f"Could not find {BRIDGE_CONFIG_FILENAME}. Please create it and try again.")
 
             if isinstance(e, ValidationError):
-                # Print a list of fields that failed validation
                 logger.error(f"The following fields in {BRIDGE_CONFIG_FILENAME} failed validation:")
                 for error in e.errors():
                     logger.error(f"{error['loc'][0]}: {error['msg']}")
@@ -1041,32 +1052,39 @@ class HordeWorkerProcessManager:
                 logger.exception(ex)
 
     async def _main_loop(self) -> None:
-        self._aiohttp_client_session = ClientSession(requote_redirect_url=False)
+        await self._job_tracker.start_actor()
+        aiohttp_session = ClientSession(requote_redirect_url=False)
 
         import logfire
 
         logfire.instrument_aiohttp_client()
 
-        self.horde_client_session = AIHordeAPIAsyncClientSession(
-            aiohttp_session=self._aiohttp_client_session,
+        horde_session = AIHordeAPIAsyncClientSession(
+            aiohttp_session=aiohttp_session,
             apikey=self.bridge_data.api_key,
         )
 
-        async with self._aiohttp_client_session, self.horde_client_session:
-            coroutines = [
-                self._process_control_loop(),
-                self._job_popper.run(),
-                self._api_get_user_info_loop(),
-                self._job_submitter.run(),
-            ]
-            if not self.bridge_data._loaded_from_env_vars:
-                coroutines.append(self._bridge_data_loop())
+        self._api_sessions.set_aiohttp_session(aiohttp_session)
+        self._api_sessions.set_horde_client_session(horde_session)
 
-            tasks = [asyncio.create_task(coro) for coro in coroutines]
-            for task in tasks:
-                task.add_done_callback(self._handle_exception)
+        try:
+            async with aiohttp_session, horde_session:
+                coroutines = [
+                    self._process_control_loop(),
+                    self._job_popper.run(),
+                    self._api_get_user_info_loop(),
+                    self._job_submitter.run(),
+                ]
+                if not self.bridge_data._loaded_from_env_vars:
+                    coroutines.append(self._bridge_data_loop())
 
-            await asyncio.gather(*tasks)
+                tasks = [asyncio.create_task(coro) for coro in coroutines]
+                for task in tasks:
+                    task.add_done_callback(self._handle_exception)
+
+                await asyncio.gather(*tasks)
+        finally:
+            await self._job_tracker.stop_actor()
 
     def start(self) -> None:
         """Start the process manager."""

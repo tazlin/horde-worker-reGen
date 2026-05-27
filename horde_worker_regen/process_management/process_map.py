@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import time
 
-from horde_model_reference.meta_consts import STABLE_DIFFUSION_BASELINE_CATEGORY
-from horde_model_reference.model_reference_records import StableDiffusion_ModelReference
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 from pydantic import ConfigDict
@@ -142,7 +142,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self,
         process_id: int,
         horde_model_name: str | None,
-        horde_model_baseline: STABLE_DIFFUSION_BASELINE_CATEGORY | str | None = None,
+        horde_model_baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None = None,
         last_job_referenced: ImageGenerateJobPopResponse | None = None,
     ) -> None:
         """Update the model load state for the given process ID.
@@ -150,7 +150,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         Args:
             process_id (int): The ID of the process to update.
             horde_model_name (str): The name of the horde model to update.
-            horde_model_baseline (STABLE_DIFFUSION_BASELINE_CATEGORY): The baseline of the horde model to update.
+            horde_model_baseline (KNOWN_IMAGE_GENERATION_BASELINE): The baseline of the horde model to update.
             load_state (ModelLoadState): The load state of the model.
             last_job_referenced (ImageGenerateJobPopResponse | None, optional): The last job referenced by this \
                  process. Defaults to None.
@@ -266,7 +266,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     def keep_single_inference(
         self,
         *,
-        stable_diffusion_model_reference: StableDiffusion_ModelReference,
+        stable_diffusion_model_reference: dict[str, ImageGenerationModelRecord],
         post_process_job_overlap: bool,
     ) -> tuple[bool, str]:
         """Return true if we should keep only a single inference process running.
@@ -307,7 +307,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                     logger.debug(f"Model {model} not found in stable diffusion model reference. Is it a custom model?")
                     continue
 
-                if model_info.baseline == STABLE_DIFFUSION_BASELINE_CATEGORY.stable_diffusion_xl and (
+                if model_info.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl and (
                     p.can_accept_job() or p.last_process_state == HordeProcessState.INFERENCE_POST_PROCESSING
                 ):
                     return True, "ControlNet XL"

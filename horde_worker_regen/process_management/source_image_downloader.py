@@ -13,8 +13,8 @@ from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from loguru import logger
 
 from horde_worker_regen.consts import MAX_SOURCE_IMAGE_RETRIES
+from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.protocols import AiohttpSessionProvider
 
 
 class SourceImageDownloader:
@@ -24,17 +24,17 @@ class SourceImageDownloader:
     can be reported back to the API when the job is submitted.
     """
 
-    _get_aiohttp_session: AiohttpSessionProvider
+    _api_sessions: ApiSessions
     _job_tracker: JobTracker
 
     def __init__(
         self,
         *,
-        get_aiohttp_session: AiohttpSessionProvider,
+        api_sessions: ApiSessions,
         job_tracker: JobTracker,
     ) -> None:
-        """Initialize with an aiohttp session provider and job tracker."""
-        self._get_aiohttp_session = get_aiohttp_session
+        """Initialize with an api-sessions holder and job tracker."""
+        self._api_sessions = api_sessions
         self._job_tracker = job_tracker
 
     async def download_source_images(
@@ -52,16 +52,14 @@ class SourceImageDownloader:
             logger.error("Received ImageGenerateJobPopResponse with id_ is None. Please let the devs know!")
             return job_pop_response
 
-        source_image_is_url = (
-            job_pop_response.source_image is not None
-            and job_pop_response.source_image.startswith("http")
+        source_image_is_url = job_pop_response.source_image is not None and job_pop_response.source_image.startswith(
+            "http",
         )
         if source_image_is_url:
             logger.debug(f"Source image for job {job_pop_response.id_} is a URL")
 
-        source_mask_is_url = (
-            job_pop_response.source_mask is not None
-            and job_pop_response.source_mask.startswith("http")
+        source_mask_is_url = job_pop_response.source_mask is not None and job_pop_response.source_mask.startswith(
+            "http",
         )
         if source_mask_is_url:
             logger.debug(f"Source mask for job {job_pop_response.id_} is a URL")
@@ -82,13 +80,17 @@ class SourceImageDownloader:
                 and job_pop_response.source_image is not None
                 and job_pop_response.get_downloaded_source_image() is None
             ):
-                download_tasks.append(job_pop_response.async_download_source_image(self._get_aiohttp_session()))
+                download_tasks.append(
+                    job_pop_response.async_download_source_image(self._api_sessions.require_aiohttp_session()),
+                )
             if (
                 source_mask_is_url
                 and job_pop_response.source_mask is not None
                 and job_pop_response.get_downloaded_source_mask() is None
             ):
-                download_tasks.append(job_pop_response.async_download_source_mask(self._get_aiohttp_session()))
+                download_tasks.append(
+                    job_pop_response.async_download_source_mask(self._api_sessions.require_aiohttp_session()),
+                )
 
             download_extra_source_images = job_pop_response.get_downloaded_extra_source_images()
             if (
@@ -103,7 +105,7 @@ class SourceImageDownloader:
                 download_tasks.append(
                     asyncio.create_task(
                         job_pop_response.async_download_extra_source_images(
-                            self._get_aiohttp_session(),
+                            self._api_sessions.require_aiohttp_session(),
                             max_retries=MAX_SOURCE_IMAGE_RETRIES,
                         ),
                     ),
@@ -120,7 +122,7 @@ class SourceImageDownloader:
                 break
 
         if attempts >= MAX_SOURCE_IMAGE_RETRIES:
-            self._record_download_faults(
+            await self._record_download_faults(
                 job_pop_response,
                 source_image_is_url=source_image_is_url,
                 source_mask_is_url=source_mask_is_url,
@@ -129,7 +131,7 @@ class SourceImageDownloader:
 
         return job_pop_response
 
-    def _record_download_faults(
+    async def _record_download_faults(
         self,
         job_pop_response: ImageGenerateJobPopResponse,
         *,
@@ -139,15 +141,12 @@ class SourceImageDownloader:
     ) -> None:
         """Record download failures as job faults for later reporting."""
         assert job_pop_response.id_ is not None  # caller guarantees this
-
-        if self._job_tracker.job_faults.get(job_pop_response.id_) is None:
-            self._job_tracker.job_faults[job_pop_response.id_] = []
-
-        faults = self._job_tracker.job_faults[job_pop_response.id_]
+        job_id = job_pop_response.id_
 
         if source_image_is_url and job_pop_response.get_downloaded_source_image() is None:
-            logger.error(f"Failed to download source image for job {job_pop_response.id_}")
-            faults.append(
+            logger.error(f"Failed to download source image for job {job_id}")
+            await self._job_tracker.record_source_image_fault(
+                job_id,
                 GenMetadataEntry(
                     type=METADATA_TYPE.source_image,
                     value=METADATA_VALUE.download_failed,
@@ -156,8 +155,9 @@ class SourceImageDownloader:
             )
 
         if source_mask_is_url and job_pop_response.get_downloaded_source_mask() is None:
-            logger.error(f"Failed to download source mask for job {job_pop_response.id_}")
-            faults.append(
+            logger.error(f"Failed to download source mask for job {job_id}")
+            await self._job_tracker.record_source_image_fault(
+                job_id,
                 GenMetadataEntry(
                     type=METADATA_TYPE.source_mask,
                     value=METADATA_VALUE.download_failed,
@@ -175,7 +175,7 @@ class SourceImageDownloader:
                 and len(downloaded_extra_source_images) != len(job_pop_response.extra_source_images)
             )
         ):
-            logger.error(f"Failed to download extra source images for job {job_pop_response.id_}")
+            logger.error(f"Failed to download extra source images for job {job_id}")
 
             ref = []
             if job_pop_response.extra_source_images is not None and downloaded_extra_source_images is not None:
@@ -191,7 +191,8 @@ class SourceImageDownloader:
                 ref = [str(i) for i in range(len(job_pop_response.extra_source_images))]
 
             for r in ref:
-                faults.append(
+                await self._job_tracker.record_source_image_fault(
+                    job_id,
                     GenMetadataEntry(
                         type=METADATA_TYPE.extra_source_images,
                         value=METADATA_VALUE.download_failed,

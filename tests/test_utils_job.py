@@ -5,14 +5,14 @@ from unittest.mock import MagicMock
 
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
-from horde_sdk.ai_horde_api.consts import KNOWN_UPSCALERS
+from horde_sdk.generation_parameters import KNOWN_UPSCALERS
 
 from horde_worker_regen.consts import (
     KNOWN_CONTROLNET_WORKFLOWS,
     KNOWN_SLOW_MODELS_DIFFICULTIES,
     KNOWN_SLOW_WORKFLOWS,
 )
-from horde_worker_regen.utils.job_utils import get_single_job_effective_megapixelsteps
+from horde_worker_regen.utils.job_utils import get_single_job_magnitude
 
 
 def create_mock_job(
@@ -55,7 +55,7 @@ def _get_first_upscaler_value() -> str | None:
 def test_get_single_job_effective_megapixelsteps_basic() -> None:
     """Test basic megapixelsteps calculation."""
     job = create_mock_job(width=512, height=512, ddim_steps=20, n_iter=1)
-    result = get_single_job_effective_megapixelsteps(job)
+    result = get_single_job_magnitude(job)
 
     # 512 * 512 * 20 = 5,242,880 pixels * steps
     # Divided by 1,000,000 = 5 megapixelsteps
@@ -65,7 +65,7 @@ def test_get_single_job_effective_megapixelsteps_basic() -> None:
 def test_get_single_job_effective_megapixelsteps_with_batching() -> None:
     """Test megapixelsteps calculation with batching multiplier."""
     job = create_mock_job(width=512, height=512, ddim_steps=20, n_iter=3)
-    result = get_single_job_effective_megapixelsteps(job)
+    result = get_single_job_magnitude(job)
 
     # Base: 512 * 512 * 20 = 5,242,880
     # With n_iter=3: batching_multiplier = 1 + ((3-1) * 0.2) = 1.4
@@ -88,7 +88,7 @@ def test_get_single_job_effective_megapixelsteps_with_upscaler() -> None:
         n_iter=1,
         post_processing=[upscaler_value],
     )
-    result = get_single_job_effective_megapixelsteps(job)
+    result = get_single_job_magnitude(job)
 
     # Base: 512 * 512 * 20 = 5,242,880
     # Upscaling adjustment: 512 * 512 * 20 * 1 * 1 = 5,242,880
@@ -99,7 +99,7 @@ def test_get_single_job_effective_megapixelsteps_with_upscaler() -> None:
 def test_get_single_job_effective_megapixelsteps_with_loras() -> None:
     """Test megapixelsteps calculation with LoRAs."""
     job = create_mock_job(width=512, height=512, ddim_steps=20, n_iter=1, loras=[{"name": "test_lora"}])
-    result = get_single_job_effective_megapixelsteps(job)
+    result = get_single_job_magnitude(job)
 
     # Base: 512 * 512 * 20 = 5,242,880
     # LoRA adjustment: 4,000,000
@@ -110,7 +110,7 @@ def test_get_single_job_effective_megapixelsteps_with_loras() -> None:
 def test_get_single_job_effective_megapixelsteps_with_hires_fix() -> None:
     """Test megapixelsteps calculation with hires fix."""
     job = create_mock_job(width=512, height=512, ddim_steps=20, n_iter=1, hires_fix=True)
-    result = get_single_job_effective_megapixelsteps(job)
+    result = get_single_job_magnitude(job)
 
     # Base: 512 * 512 * 20 = 5,242,880
     # Hires fix: 512 * 512 * 20 = 5,242,880
@@ -126,7 +126,7 @@ def test_get_single_job_effective_megapixelsteps_with_slow_model() -> None:
         multiplier = KNOWN_SLOW_MODELS_DIFFICULTIES[slow_model]
 
         job = create_mock_job(width=512, height=512, ddim_steps=20, n_iter=1, model=slow_model)
-        result = get_single_job_effective_megapixelsteps(job)
+        result = get_single_job_magnitude(job)
 
         # Base: 512 * 512 * 20 = 5,242,880
         # Multiplied by model difficulty
@@ -143,7 +143,7 @@ def test_get_single_job_effective_megapixelsteps_with_slow_workflow() -> None:
         multiplier = KNOWN_SLOW_WORKFLOWS[slow_workflow]
 
         job = create_mock_job(width=512, height=512, ddim_steps=20, n_iter=1, workflow=slow_workflow)
-        result = get_single_job_effective_megapixelsteps(job)
+        result = get_single_job_magnitude(job)
 
         # Base: 512 * 512 * 20 = 5,242,880
         # Multiplied by workflow difficulty
@@ -159,7 +159,7 @@ def test_get_single_job_effective_megapixelsteps_with_controlnet_workflow() -> N
         controlnet_workflow = list(KNOWN_CONTROLNET_WORKFLOWS.keys())[0]
 
         job = create_mock_job(width=512, height=512, ddim_steps=20, n_iter=1, workflow=controlnet_workflow)
-        result = get_single_job_effective_megapixelsteps(job)
+        result = get_single_job_magnitude(job)
 
         # Base: 512 * 512 * 20 = 5,242,880
         # Multiplied by 2 for controlnet
@@ -172,7 +172,7 @@ def test_get_single_job_effective_megapixelsteps_with_controlnet_workflow() -> N
 def test_get_single_job_effective_megapixelsteps_large_resolution() -> None:
     """Test megapixelsteps calculation with large resolution."""
     job = create_mock_job(width=1024, height=1024, ddim_steps=30, n_iter=1)
-    result = get_single_job_effective_megapixelsteps(job)
+    result = get_single_job_magnitude(job)
 
     # 1024 * 1024 * 30 = 31,457,280 / 1,000,000 = 31 megapixelsteps
     assert result == 31
@@ -196,7 +196,7 @@ def test_get_single_job_effective_megapixelsteps_complex_job() -> None:
         loras=[{"name": "lora1"}],
         hires_fix=True,
     )
-    result = get_single_job_effective_megapixelsteps(job)
+    result = get_single_job_magnitude(job)
 
     # This should be a higher value due to all the factors
     assert result > 20  # At least 20 megapixelsteps with all these factors

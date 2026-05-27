@@ -32,6 +32,7 @@ class PopThrottler:
 
     _last_pop_no_jobs_available_time: float
     _time_spent_no_jobs_available: float
+    _max_time_spent_no_jobs_available: float
 
     def __init__(
         self,
@@ -48,6 +49,7 @@ class PopThrottler:
 
         self._last_pop_no_jobs_available_time = 0.0
         self._time_spent_no_jobs_available = 0.0
+        self._max_time_spent_no_jobs_available = 0.0
 
     @property
     def current_pop_frequency(self) -> float:
@@ -72,6 +74,8 @@ class PopThrottler:
             if self._last_pop_no_jobs_available_time == 0.0:
                 self._last_pop_no_jobs_available_time = cur_time
             self._time_spent_no_jobs_available += cur_time - self._last_pop_no_jobs_available_time
+            if self._time_spent_no_jobs_available > self._max_time_spent_no_jobs_available:
+                self._max_time_spent_no_jobs_available = self._time_spent_no_jobs_available
             self._last_pop_no_jobs_available_time = cur_time
 
     def on_job_popped(self) -> None:

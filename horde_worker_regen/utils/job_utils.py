@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
-from horde_sdk.ai_horde_api.consts import KNOWN_UPSCALERS
+from horde_sdk.generation_parameters import KNOWN_UPSCALERS
 
 from horde_worker_regen.consts import (
     KNOWN_CONTROLNET_WORKFLOWS,
@@ -12,8 +12,8 @@ from horde_worker_regen.consts import (
 )
 
 
-def get_single_job_effective_megapixelsteps(job: ImageGenerateJobPopResponse) -> int:
-    """Return the number of megapixelsteps for a single job.
+def get_single_job_magnitude(job: ImageGenerateJobPopResponse) -> int:
+    """Return an approximate magnitude of a single job based on megapixelsteps and other factors.
 
     Args:
         job: The job to get the number of megapixelsteps for.

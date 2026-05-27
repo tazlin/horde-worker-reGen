@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 from horde_worker_regen.process_management.job_models import PendingSubmitJob
@@ -10,7 +9,15 @@ from horde_worker_regen.process_management.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.worker_state import WorkerState
 
-from .conftest import make_job_pop_response, make_mock_bridge_data
+from .conftest import (
+    make_job_pop_response,
+    make_mock_bridge_data,
+    make_test_api_sessions,
+    make_test_model_metadata,
+    make_test_runtime_config,
+    queue_job_for_submit_async,
+    track_popped_job_async,
+)
 
 
 def _make_submitter(
@@ -37,17 +44,19 @@ def _make_submitter(
         state=state,
         job_tracker=job_tracker,
         shutdown_manager=Mock(),
-        get_bridge_data=lambda: bridge_data,
-        get_stable_diffusion_reference=lambda: None,
-        get_horde_client_session=lambda: horde_client_session,
-        get_aiohttp_session=lambda: aiohttp_session,
+        runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+        api_sessions=make_test_api_sessions(
+            horde_client_session=horde_client_session,
+            aiohttp_session=aiohttp_session,
+        ),
+        model_metadata=make_test_model_metadata(),
     )
 
 
 class TestSubmitSingleGeneration:
     """Tests for submit_single_generation."""
 
-    def test_no_image_result_faults(self) -> None:
+    async def test_no_image_result_faults(self) -> None:
         """If there is no image result and the job is not already faulted, the method faults the job."""
         submitter = _make_submitter()
 
@@ -56,10 +65,10 @@ class TestSubmitSingleGeneration:
         new_submit.image_result = None
         new_submit.is_faulted = False
 
-        asyncio.run(submitter.submit_single_generation(new_submit))
+        await submitter.submit_single_generation(new_submit)
         new_submit.fault.assert_called_once()
 
-    def test_already_faulted_no_image_proceeds_to_submit(self) -> None:
+    async def test_already_faulted_no_image_proceeds_to_submit(self) -> None:
         """When already faulted and no image, the code skips upload and submits fault metadata."""
         submitter = _make_submitter(horde_client_session=AsyncMock())
 
@@ -76,19 +85,19 @@ class TestSubmitSingleGeneration:
         new_submit.is_faulted = True
         new_submit.completed_job_info = completed_info
 
-        asyncio.run(submitter.submit_single_generation(new_submit))
+        await submitter.submit_single_generation(new_submit)
         new_submit.fault.assert_not_called()
 
 
 class TestApiSubmitJob:
     """Tests for api_submit_job."""
 
-    def test_no_pending_submits_returns_early(self) -> None:
+    async def test_no_pending_submits_returns_early(self) -> None:
         """If there are no pending submits, the method should return early without doing anything."""
         submitter = _make_submitter()
-        asyncio.run(submitter.api_submit_job())
+        await submitter.api_submit_job()
 
-    def test_faulted_job_increments_consecutive_failures(self) -> None:
+    async def test_faulted_job_increments_consecutive_failures(self) -> None:
         """If a job submission results in a faulted job, the consecutive_failed_jobs counter should be incremented."""
         from horde_sdk.ai_horde_api import GENERATION_STATE
 
@@ -109,9 +118,8 @@ class TestApiSubmitJob:
         job_info.censored = False
         job_info.time_to_generate = 1.0
 
-        job_tracker.jobs_pending_submit.append(job_info)
-        job_tracker.jobs_lookup[job] = job_info
-        job_tracker.job_pop_timestamps[job] = 0.0
+        await track_popped_job_async(job_tracker, job, time_popped=0.0)
+        await queue_job_for_submit_async(job_tracker, job_info)
 
         faulted_submit = Mock(spec=PendingSubmitJob)
         faulted_submit.is_finished = True
@@ -121,6 +129,6 @@ class TestApiSubmitJob:
 
         with patch.object(submitter, "submit_single_generation", new_callable=AsyncMock) as mock_submit:
             mock_submit.return_value = faulted_submit
-            asyncio.run(submitter.api_submit_job())
+            await submitter.api_submit_job()
 
         assert state.consecutive_failed_jobs >= 1

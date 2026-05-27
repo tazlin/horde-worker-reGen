@@ -10,7 +10,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
     ImageGenerateJobPopResponse,
 )
-from horde_sdk.ai_horde_api.fields import JobID
+from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 
@@ -256,7 +256,7 @@ class HordeSafetyEvaluation(BaseModel):
 class HordeSafetyResultMessage(HordeProcessMessage):
     """Safety result messages that are sent from the child processes to the main process."""
 
-    job_id: JobID
+    job_id: GenerationID
     """The ID of the job that was evaluated."""
     safety_evaluations: list[HordeSafetyEvaluation]
     """A list of safety evaluations for each image in the job."""
@@ -322,7 +322,7 @@ class HordeInferenceControlMessage(HordeControlModelMessage):
 class HordeSafetyControlMessage(HordeControlMessage):
     """Message with images and other information to be evaluated for safety."""
 
-    job_id: JobID
+    job_id: GenerationID
     """The ID of the job that was evaluated."""
     prompt: str
     """The prompt used to generate the images."""

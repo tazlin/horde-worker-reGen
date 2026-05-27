@@ -9,8 +9,8 @@ from typing import cast
 from unittest.mock import MagicMock, Mock
 
 import pytest
-from horde_model_reference.meta_consts import STABLE_DIFFUSION_BASELINE_CATEGORY
-from horde_model_reference.model_reference_records import StableDiffusion_ModelReference
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from pytest import MonkeyPatch
 
 from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
@@ -24,13 +24,13 @@ def temp_dir() -> Iterator[str]:
 
 
 @pytest.fixture
-def mock_model_reference() -> StableDiffusion_ModelReference:
+def mock_model_reference() -> dict[str, ImageGenerationModelRecord]:
     """Create a mock model reference."""
-    ref = MagicMock(spec=StableDiffusion_ModelReference)
+    ref = MagicMock(spec=dict)
     ref.root = {
-        "test_model": Mock(baseline=STABLE_DIFFUSION_BASELINE_CATEGORY.stable_diffusion_1),
+        "test_model": Mock(baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1),
     }
-    return cast(StableDiffusion_ModelReference, ref)
+    return cast(dict[str, ImageGenerationModelRecord], ref)
 
 
 @pytest.fixture
@@ -63,7 +63,7 @@ def mock_job_info() -> MagicMock:
 
 
 def test_kudos_training_recorder_init_with_file(
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
 ) -> None:
     """Test initialization with a specified file."""
     recorder = KudosTrainingRecorder(
@@ -77,7 +77,7 @@ def test_kudos_training_recorder_init_with_file(
 
 
 def test_kudos_training_recorder_init_default_file(
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
 ) -> None:
     """Test initialization with default file."""
     recorder = KudosTrainingRecorder(
@@ -90,7 +90,7 @@ def test_kudos_training_recorder_init_default_file(
 
 def test_record_job_data_creates_new_file(
     temp_dir: str,
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
     mock_job_info: MagicMock,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -120,7 +120,7 @@ def test_record_job_data_creates_new_file(
 
 def test_record_job_data_appends_to_existing_file(
     temp_dir: str,
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
     mock_job_info: MagicMock,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -150,7 +150,7 @@ def test_record_job_data_appends_to_existing_file(
 
 def test_record_job_data_skips_batched_jobs(
     temp_dir: str,
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
     mock_job_info: MagicMock,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -180,7 +180,7 @@ def test_record_job_data_skips_batched_jobs(
 
 
 def test_prepare_model_dump_adds_scheduler(
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
     mock_job_info: MagicMock,
 ) -> None:
     """Test that _prepare_model_dump adds scheduler field."""
@@ -214,7 +214,7 @@ def test_prepare_model_dump_adds_scheduler(
 
 
 def test_prepare_model_dump_adds_counts(
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
     mock_job_info: MagicMock,
 ) -> None:
     """Test that _prepare_model_dump adds lora and TI counts."""
@@ -244,7 +244,7 @@ def test_prepare_model_dump_adds_counts(
 
 
 def test_prepare_model_dump_adds_model_baseline(
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
     mock_job_info: MagicMock,
 ) -> None:
     """Test that _prepare_model_dump adds model baseline."""
@@ -256,11 +256,11 @@ def test_prepare_model_dump_adds_model_baseline(
     dump = recorder._prepare_model_dump(mock_job_info)
 
     assert "model_baseline" in dump["sdk_api_job_info"]
-    assert dump["sdk_api_job_info"]["model_baseline"] == STABLE_DIFFUSION_BASELINE_CATEGORY.stable_diffusion_1
+    assert dump["sdk_api_job_info"]["model_baseline"] == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
 
 
 def test_prepare_model_dump_handles_extra_source_images(
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
     mock_job_info: MagicMock,
 ) -> None:
     """Test that _prepare_model_dump handles extra source images."""
@@ -282,7 +282,7 @@ def test_prepare_model_dump_handles_extra_source_images(
 
 def test_record_job_data_skips_unknown_models(
     temp_dir: str,
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
     mock_job_info: MagicMock,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -328,7 +328,7 @@ def test_record_job_data_handles_none_reference(
 
 def test_get_file_path_with_rotation(
     temp_dir: str,
-    mock_model_reference: StableDiffusion_ModelReference,
+    mock_model_reference: dict[str, ImageGenerationModelRecord],
     monkeypatch: MonkeyPatch,
 ) -> None:
     """Test file rotation when file exceeds 2MB."""

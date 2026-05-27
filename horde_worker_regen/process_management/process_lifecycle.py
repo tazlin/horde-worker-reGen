@@ -10,7 +10,6 @@ from multiprocessing.synchronize import Semaphore
 
 from loguru import logger
 
-from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.consts import VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
@@ -23,7 +22,7 @@ from horde_worker_regen.process_management.messages import (
 )
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.protocols import BridgeDataProvider
+from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_entry_points import start_inference_process, start_safety_process
 from horde_worker_regen.process_management.worker_state import WorkerState
 
@@ -39,7 +38,7 @@ class ProcessLifecycleManager:
     _disk_lock: Lock_MultiProcessing
     _aux_model_lock: Lock_MultiProcessing
     _vae_decode_semaphore: Semaphore
-    _get_bridge_data: BridgeDataProvider
+    _runtime_config: RuntimeConfig
     _max_inference_processes: int
     _max_safety_processes: int
     _amd_gpu: bool
@@ -66,7 +65,7 @@ class ProcessLifecycleManager:
         disk_lock: Lock_MultiProcessing,
         aux_model_lock: Lock_MultiProcessing,
         vae_decode_semaphore: Semaphore,
-        get_bridge_data: BridgeDataProvider,
+        runtime_config: RuntimeConfig,
         max_inference_processes: int,
         max_safety_processes: int,
         amd_gpu: bool,
@@ -83,7 +82,7 @@ class ProcessLifecycleManager:
         self._disk_lock = disk_lock
         self._aux_model_lock = aux_model_lock
         self._vae_decode_semaphore = vae_decode_semaphore
-        self._get_bridge_data = get_bridge_data
+        self._runtime_config = runtime_config
         self._max_inference_processes = max_inference_processes
         self._max_safety_processes = max_safety_processes
         self._amd_gpu = amd_gpu
@@ -107,7 +106,7 @@ class ProcessLifecycleManager:
 
     def start_safety_processes(self) -> None:
         """Start all the safety processes configured to be used."""
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
         num_processes_to_start = self._max_safety_processes - self._process_map.num_safety_processes()
 
         if num_processes_to_start < 0:
@@ -181,7 +180,7 @@ class ProcessLifecycleManager:
         :param pid: process ID to assign to the process
         :return: The new HordeProcessInfo
         """
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
         logger.info(f"Starting inference process on PID {pid}")
         vram_heavy_models = any(model in VRAM_HEAVY_MODELS for model in bridge_data.image_models_to_load)
 
@@ -311,7 +310,7 @@ class ProcessLifecycleManager:
 
     def _replace_inference_process(self, process_info: HordeProcessInfo) -> None:
         """Replaces an inference process (for whatever reason; probably because it crashed)."""
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
         logger.debug(f"Replacing {process_info}")
         job_to_remove = None
         for process in self._process_map.values():
@@ -352,7 +351,7 @@ class ProcessLifecycleManager:
             self._horde_model_map.expire_entry(process_info.loaded_horde_model_name)
 
         if job_to_remove is not None:
-            self._job_tracker.handle_job_fault(
+            self._job_tracker.handle_job_fault_now(
                 faulted_job=job_to_remove,
                 process_info=process_info,
                 process_timeout=bridge_data.process_timeout,
@@ -367,10 +366,17 @@ class ProcessLifecycleManager:
         """Get the processes that have the model for any queued job."""
         processes_with_model_for_queued_job: list[int] = []
 
+        queued_models = {
+            job.model for job in self._job_tracker.jobs_pending_inference if getattr(job, "model", None) is not None
+        }
+        in_progress_models = {
+            job.model for job in self._job_tracker.jobs_in_progress if getattr(job, "model", None) is not None
+        }
+
         for p in self._process_map.values():
             if (
-                p.loaded_horde_model_name in self._job_tracker.jobs_pending_inference
-                or p.loaded_horde_model_name in self._job_tracker.jobs_in_progress
+                p.loaded_horde_model_name in queued_models
+                or p.loaded_horde_model_name in in_progress_models
                 or p.last_process_state == HordeProcessState.PRELOADED_MODEL
             ):
                 processes_with_model_for_queued_job.append(p.process_id)
@@ -432,7 +438,7 @@ class ProcessLifecycleManager:
 
         import threading
 
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
 
         def timed_unset_recently_recovered() -> None:
             time.sleep(bridge_data.inference_step_timeout)

@@ -27,6 +27,7 @@ class WorkerState:
     consecutive_failed_jobs: int = 0
     too_many_consecutive_failed_jobs: bool = False
     too_many_consecutive_failed_jobs_time: float = 0.0
+    too_many_consecutive_failed_jobs_wait_time: float = 60 * 10
 
     kudos_generated_this_session: float = 0.0
     kudos_events: deque[tuple[float, float]] = dataclasses.field(default_factory=deque)

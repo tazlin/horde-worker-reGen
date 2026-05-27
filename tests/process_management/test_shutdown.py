@@ -10,7 +10,14 @@ from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
 from horde_worker_regen.process_management.worker_state import WorkerState
 
-from .conftest import make_mock_process_info
+from .conftest import (
+    make_mock_process_info,
+    mark_job_in_progress_async,
+    move_job_to_being_safety_checked_async,
+    queue_job_for_safety_async,
+    queue_job_for_submit_async,
+    track_popped_job_async,
+)
 
 
 def _make_shutdown_manager(
@@ -54,47 +61,47 @@ class TestIsTimeForShutdown:
 
         assert shutdown_manager.is_time_for_shutdown() is False
 
-    def test_jobs_pending_submit_returns_false(self) -> None:
+    async def test_jobs_pending_submit_returns_false(self) -> None:
         """Jobs pending submit should prevent actually shutting down."""
         state = WorkerState(shutting_down=True)
         job_tracker = JobTracker()
-        job_tracker.jobs_pending_submit.append(Mock())
+        await queue_job_for_submit_async(job_tracker, Mock())
 
         shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
         assert shutdown_manager.is_time_for_shutdown() is False
 
-    def test_jobs_being_safety_checked_returns_false(self) -> None:
+    async def test_jobs_being_safety_checked_returns_false(self) -> None:
         """Jobs being safety checked should prevent actually shutting down."""
         state = WorkerState(shutting_down=True)
         job_tracker = JobTracker()
-        job_tracker.jobs_being_safety_checked.append(Mock())
+        await move_job_to_being_safety_checked_async(job_tracker, Mock())
 
         shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
         assert shutdown_manager.is_time_for_shutdown() is False
 
-    def test_jobs_pending_safety_check_returns_false(self) -> None:
+    async def test_jobs_pending_safety_check_returns_false(self) -> None:
         """Jobs pending safety check should prevent actually shutting down."""
         state = WorkerState(shutting_down=True)
         job_tracker = JobTracker()
-        job_tracker.jobs_pending_safety_check.append(Mock())
+        await queue_job_for_safety_async(job_tracker, Mock())
 
         shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
         assert shutdown_manager.is_time_for_shutdown() is False
 
-    def test_jobs_in_progress_returns_false(self) -> None:
+    async def test_jobs_in_progress_returns_false(self) -> None:
         """Jobs in progress should prevent actually shutting down."""
         state = WorkerState(shutting_down=True)
         job_tracker = JobTracker()
-        job_tracker.jobs_in_progress.append(Mock())
+        await mark_job_in_progress_async(job_tracker, Mock())
 
         shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
         assert shutdown_manager.is_time_for_shutdown() is False
 
-    def test_jobs_pending_inference_returns_false(self) -> None:
+    async def test_jobs_pending_inference_returns_false(self) -> None:
         """Jobs pending inference should prevent actually shutting down."""
         state = WorkerState(shutting_down=True)
         job_tracker = JobTracker()
-        job_tracker.jobs_pending_inference.append(Mock())
+        await track_popped_job_async(job_tracker, Mock())
 
         shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
         assert shutdown_manager.is_time_for_shutdown() is False

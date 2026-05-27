@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from horde_model_reference.model_reference_records import StableDiffusion_ModelReference
+from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -33,7 +33,7 @@ class KudosTrainingRecorder:
     def __init__(
         self,
         training_data_file: str | None,
-        stable_diffusion_reference: StableDiffusion_ModelReference | None,
+        stable_diffusion_reference: dict[str, ImageGenerationModelRecord] | None,
     ) -> None:
         """Initialize the kudos training recorder.
 

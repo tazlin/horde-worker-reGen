@@ -2,24 +2,15 @@ from __future__ import annotations
 
 import queue
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from multiprocessing import Queue
-from typing import TYPE_CHECKING
 
-from horde_model_reference.meta_consts import STABLE_DIFFUSION_BASELINE_CATEGORY
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import GenMetadataEntry
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from loguru import logger
 
-from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.telemetry_spans import (
-    inference_duration_histogram,
-    jobs_completed_counter,
-    jobs_faulted_counter,
-    queue_depth_counter,
-)
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import (
     HordeAuxModelStateChangeMessage,
@@ -33,13 +24,17 @@ from horde_worker_regen.process_management.messages import (
     HordeSafetyResultMessage,
     ModelLoadState,
 )
+from horde_worker_regen.process_management.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.protocols import BridgeDataProvider
+from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_state import WorkerState
-
-if TYPE_CHECKING:
-    from horde_worker_regen.process_management.job_models import HordeJobInfo
+from horde_worker_regen.telemetry_spans import (
+    inference_duration_histogram,
+    jobs_completed_counter,
+    jobs_faulted_counter,
+    queue_depth_counter,
+)
 
 _excludes_for_job_dump = {"source_image", "source_mask", "extra_source_images", "r2_upload"}
 
@@ -52,9 +47,9 @@ class MessageDispatcher:
     _job_tracker: JobTracker
     _process_message_queue: Queue  # type: ignore[type-arg]
 
-    _get_model_baseline: Callable[[str], STABLE_DIFFUSION_BASELINE_CATEGORY | str | None]
-    _get_bridge_data: BridgeDataProvider
-    _on_unload_vram: Callable[[HordeProcessInfo], None]
+    _runtime_config: RuntimeConfig
+    _model_metadata: ModelMetadata
+    _on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]]
 
     _last_deadlock_detected_time: float = 0.0
     _in_deadlock: bool = False
@@ -70,21 +65,36 @@ class MessageDispatcher:
         horde_model_map: HordeModelMap,
         job_tracker: JobTracker,
         process_message_queue: Queue,  # type: ignore[type-arg]
-        get_model_baseline: Callable[[str], STABLE_DIFFUSION_BASELINE_CATEGORY | str | None],
-        get_bridge_data: BridgeDataProvider,
-        on_unload_vram: Callable[[HordeProcessInfo], None],
+        runtime_config: RuntimeConfig,
+        model_metadata: ModelMetadata,
+        on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]],
         state: WorkerState,
     ) -> None:
+        """Initialize the dispatcher with references to shared state and the message queue.
+
+        Args:
+            process_map (ProcessMap): The shared process map to update based on messages from child processes.
+            horde_model_map (HordeModelMap): The shared model map to update based on messages from child processes.
+            job_tracker (JobTracker): The job tracker to update based on messages from child processes.
+            process_message_queue (Queue): The queue from which to receive messages from child processes.
+            runtime_config (RuntimeConfig): Holds the current bridge configuration snapshot.
+            model_metadata (ModelMetadata): Provides lookups against the stable-diffusion model reference.
+            on_unload_vram (Callable[[HordeProcessInfo], None]): A callback to invoke when a process reports that it
+                has unloaded a model from VRAM. This is used to trigger the unloading of the model from any other
+                processes that have it loaded, if the current bridge configuration requires aggressive VRAM management.
+            state (WorkerState): The shared worker state, which tracks various flags and timestamps related to the
+                worker's operation, such as whether it's currently in a deadlock, when the last job was popped, etc.
+        """
         self._process_map = process_map
         self._horde_model_map = horde_model_map
         self._job_tracker = job_tracker
         self._process_message_queue = process_message_queue
-        self._get_model_baseline = get_model_baseline
-        self._get_bridge_data = get_bridge_data
+        self._runtime_config = runtime_config
+        self._model_metadata = model_metadata
         self._on_unload_vram = on_unload_vram
         self._state = state
 
-    def receive_and_handle_process_messages(self) -> None:
+    async def receive_and_handle_process_messages(self) -> None:
         """Receive and handle any messages from the child processes."""
         while not self._process_message_queue.empty():
             try:
@@ -133,15 +143,15 @@ class MessageDispatcher:
                 self._handle_process_state_change(message)
 
             if isinstance(message, HordeAuxModelStateChangeMessage):
-                self._handle_aux_model_state_change(message)
+                await self._handle_aux_model_state_change(message)
 
             if isinstance(message, HordeModelStateChangeMessage):
                 self._handle_model_state_change(message)
 
             if isinstance(message, HordeInferenceResultMessage):
-                self._handle_inference_result(message)
+                await self._handle_inference_result(message)
             elif isinstance(message, HordeSafetyResultMessage):
-                self._handle_safety_result(message)
+                await self._handle_safety_result(message)
 
     def _handle_heartbeat(self, message: HordeProcessHeartbeatMessage) -> None:
         """Handle a heartbeat message from a child process."""
@@ -159,7 +169,7 @@ class MessageDispatcher:
             logger.warning(f"Process {message.process_id} warning: {message.process_warning}")
 
             model_name = self._process_map[message.process_id].loaded_horde_model_name
-            model_baseline = self._get_model_baseline(model_name) if model_name is not None else None
+            model_baseline = self._model_metadata.get_baseline(model_name) if model_name is not None else None
 
             if model_baseline is not None:
                 logger.warning(f"Model baseline triggering warning: {model_baseline}")
@@ -222,7 +232,7 @@ class MessageDispatcher:
             )
             self._process_map.on_model_ram_clear(process_id=message.process_id)
 
-    def _handle_aux_model_state_change(self, message: HordeAuxModelStateChangeMessage) -> None:
+    async def _handle_aux_model_state_change(self, message: HordeAuxModelStateChangeMessage) -> None:
         """Handle an auxiliary model state change message (e.g., LoRa downloads)."""
         if message.process_state == HordeProcessState.DOWNLOADING_AUX_MODEL:
             logger.opt(ansi=True).info(
@@ -250,8 +260,10 @@ class MessageDispatcher:
                     )
                 logger.debug(f"Jobs lookup: {self._job_tracker.jobs_lookup}")
             else:
-                job_info = self._job_tracker.jobs_lookup[message.sdk_api_job_info]
-                job_info.time_to_download_aux_models = message.time_elapsed
+                await self._job_tracker.set_job_time_to_download_aux_models(
+                    message.sdk_api_job_info,
+                    message.time_elapsed,
+                )
 
     def _handle_model_state_change(self, message: HordeModelStateChangeMessage) -> None:
         """Handle a model state change message."""
@@ -261,7 +273,7 @@ class MessageDispatcher:
             process_id=message.process_id,
         )
 
-        model_baseline = self._get_model_baseline(message.horde_model_name)
+        model_baseline = self._model_metadata.get_baseline(message.horde_model_name)
 
         if message.horde_model_state != ModelLoadState.ON_DISK:
             self._process_map.on_model_load_state_change(
@@ -299,9 +311,10 @@ class MessageDispatcher:
                 f"<fg #7b7d7d>Process {message.process_id} unloaded model {message.horde_model_name}</>",
             )
 
-    def _handle_inference_result(self, message: HordeInferenceResultMessage) -> None:
+    async def _handle_inference_result(self, message: HordeInferenceResultMessage) -> None:
         """Handle an inference job result message."""
-        if message.sdk_api_job_info not in self._job_tracker.jobs_lookup:
+        job_info = await self._job_tracker.get_job_info(message.sdk_api_job_info)
+        if job_info is None:
             logger.error(
                 f"Job {message.sdk_api_job_info.id_} not found in jobs_lookup. (Process {message.process_id})",
             )
@@ -309,35 +322,29 @@ class MessageDispatcher:
                 logger.error(
                     f"Job {message.sdk_api_job_info.id_} found in jobs_in_progress. (Process {message.process_id})",
                 )
-                self._job_tracker.jobs_in_progress.remove(message.sdk_api_job_info)
+                await self._job_tracker.release_in_progress(message.sdk_api_job_info)
             if message.sdk_api_job_info in self._job_tracker.jobs_pending_inference:
                 logger.error(
                     f"Job {message.sdk_api_job_info.id_} found in job_deque. (Process {message.process_id})",
                 )
-                self._job_tracker.jobs_pending_inference.remove(message.sdk_api_job_info)
+                await self._job_tracker.drop_pending_inference(message.sdk_api_job_info)
             return
 
-        job_info = self._job_tracker.jobs_lookup[message.sdk_api_job_info]
-
-        if message.sdk_api_job_info in self._job_tracker.jobs_in_progress:
-            self._job_tracker.jobs_in_progress.remove(message.sdk_api_job_info)
-        else:
+        if not await self._job_tracker.release_in_progress(message.sdk_api_job_info):
             logger.error(
                 f"Job {message.sdk_api_job_info.id_} not found in jobs_in_progress. "
                 "Did it fault? "
                 f"(Process {message.process_id})",
             )
 
-        for job in self._job_tracker.jobs_pending_inference:
-            if job.id_ == message.sdk_api_job_info.id_:
-                self._job_tracker.jobs_pending_inference.remove(job)
-                break
+        if message.sdk_api_job_info.id_ is not None:
+            await self._job_tracker.drop_pending_inference_by_id(message.sdk_api_job_info.id_)
 
-        self._job_tracker.total_num_completed_jobs += 1
+        await self._job_tracker.increment_jobs_completed()
         queue_depth_counter.add(-1)
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
         if bridge_data.unload_models_from_vram_often:
-            self._on_unload_vram(self._process_map[message.process_id])
+            await self._on_unload_vram(self._process_map[message.process_id])
 
         if message.time_elapsed is not None:
             inference_duration_histogram.record(message.time_elapsed)
@@ -361,7 +368,7 @@ class MessageDispatcher:
             job_info.job_image_results = message.job_image_results
 
             jobs_completed_counter.add(1)
-            self._job_tracker.jobs_pending_safety_check.append(job_info)
+            await self._job_tracker.queue_for_safety(job_info)
         else:
             jobs_faulted_counter.add(1)
             logger.error(
@@ -372,15 +379,11 @@ class MessageDispatcher:
                 f"Job data: {message.sdk_api_job_info.model_dump(exclude=_excludes_for_job_dump)}",  # type: ignore
             )
 
-            self._job_tracker.jobs_pending_submit.append(job_info)
+            await self._job_tracker.queue_for_submit(job_info)
 
-    def _handle_safety_result(self, message: HordeSafetyResultMessage) -> None:
+    async def _handle_safety_result(self, message: HordeSafetyResultMessage) -> None:
         """Handle a safety check result message."""
-        completed_job_info: HordeJobInfo | None = None
-        for i, job_being_safety_checked in enumerate(self._job_tracker.jobs_being_safety_checked):
-            if job_being_safety_checked.sdk_api_job_info.id_ == message.job_id:
-                completed_job_info = self._job_tracker.jobs_being_safety_checked.pop(i)
-                break
+        completed_job_info = await self._job_tracker.take_being_safety_checked(message.job_id)
 
         if completed_job_info is None or completed_job_info.job_image_results is None:
             logger.error(
@@ -394,12 +397,12 @@ class MessageDispatcher:
 
         any_safety_failed = False
 
+        job_fault_entries = await self._job_tracker.get_faults_for_job(message.job_id)
+
         for i in range(len(completed_job_info.job_image_results)):
             if completed_job_info.sdk_api_job_info.id_ is None:
                 continue
-            completed_job_info.job_image_results[i].generation_faults += self._job_tracker.job_faults[
-                completed_job_info.sdk_api_job_info.id_
-            ]
+            completed_job_info.job_image_results[i].generation_faults += job_fault_entries
             replacement_image = message.safety_evaluations[i].replacement_image_base64
 
             if message.safety_evaluations[i].failed:
@@ -415,11 +418,8 @@ class MessageDispatcher:
                 num_images_censored += 1
                 if message.safety_evaluations[i].is_csam:
                     num_images_csam += 1
-        if (
-            completed_job_info.sdk_api_job_info.id_ is not None
-            and completed_job_info.sdk_api_job_info.id_ in self._job_tracker.job_faults
-        ):
-            del self._job_tracker.job_faults[completed_job_info.sdk_api_job_info.id_]
+        if completed_job_info.sdk_api_job_info.id_ is not None and job_fault_entries:
+            await self._job_tracker.clear_faults_for_job(completed_job_info.sdk_api_job_info.id_)
         else:
             logger.error(
                 f"Job {message.job_id} was not found in job_faults. This is unexpected.",
@@ -459,7 +459,7 @@ class MessageDispatcher:
                     if completed_job_info.state != GENERATION_STATE.csam:
                         completed_job_info.state = GENERATION_STATE.censored
 
-        self._job_tracker.jobs_pending_submit.append(completed_job_info)
+        await self._job_tracker.queue_for_submit(completed_job_info)
 
     def detect_deadlock(self) -> None:
         """Detect if there are jobs in the queue but no processes doing anything."""
@@ -470,7 +470,7 @@ class MessageDispatcher:
             logger.debug(f"Jobs pending safety check: {len(self._job_tracker.jobs_pending_safety_check)}")
             logger.debug(f"Jobs being safety checked: {len(self._job_tracker.jobs_being_safety_checked)}")
             logger.debug(f"Jobs completed: {len(self._job_tracker.jobs_pending_submit)}")
-            logger.debug(f"Jobs faulted: {self._job_tracker._num_jobs_faulted}")
+            logger.debug(f"Jobs faulted: {self._job_tracker.num_jobs_faulted}")
             logger.debug(f"horde_model_map: {self._horde_model_map}")
             logger.debug(f"process_map: {self._process_map}")
 

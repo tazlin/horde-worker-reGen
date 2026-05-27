@@ -7,6 +7,8 @@ from unittest.mock import Mock
 from horde_worker_regen.process_management.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.job_tracker import JobTracker
 
+from .conftest import track_popped_job_async
+
 
 class TestAPIWorkerMessageFromRawDict:
     """Test the from_raw_dict classmethod that parses untyped SDK dicts."""
@@ -147,10 +149,10 @@ class TestJobTrackerShouldWaitForPendingMegapixelsteps:
         job_tracker = JobTracker()
         assert job_tracker.should_wait_for_pending_megapixelsteps() is False
 
-    def test_queue_below_threshold_does_not_wait(self) -> None:
+    async def test_queue_below_threshold_does_not_wait(self) -> None:
         """If pending megapixelsteps is below threshold, should_wait_for_pending_megapixelsteps should return False."""
         job_tracker = JobTracker()
-        job_tracker._max_pending_megapixelsteps = 100
+        job_tracker.set_performance_mode_thresholds(100)
 
         # Add one small job
         job = Mock()
@@ -164,14 +166,14 @@ class TestJobTrackerShouldWaitForPendingMegapixelsteps:
         job.payload.hires_fix = False
         job.model = "test_model"
         job.payload.workflow = None
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         assert job_tracker.should_wait_for_pending_megapixelsteps() is False
 
-    def test_queue_above_threshold_waits(self) -> None:
+    async def test_queue_above_threshold_waits(self) -> None:
         """If pending megapixelsteps exceeds threshold, should_wait_for_pending_megapixelsteps should return True."""
         job_tracker = JobTracker()
-        job_tracker._max_pending_megapixelsteps = 1  # Very low threshold
+        job_tracker.set_performance_mode_thresholds(1)  # Very low threshold
 
         # Add a large job
         job = Mock()
@@ -185,7 +187,7 @@ class TestJobTrackerShouldWaitForPendingMegapixelsteps:
         job.payload.hires_fix = False
         job.model = "test_model"
         job.payload.workflow = None
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         assert job_tracker.should_wait_for_pending_megapixelsteps() is True
 
@@ -203,7 +205,7 @@ class TestJobTrackerSetPerformanceModeThresholds:
         assert job_tracker._max_pending_megapixelsteps == 100
         assert job_tracker._max_pending_megapixelsteps != original
 
-    def test_zero_threshold_makes_everything_wait(self) -> None:
+    async def test_zero_threshold_makes_everything_wait(self) -> None:
         """Setting threshold to 0 should cause all jobs to trigger the wait condition."""
         job_tracker = JobTracker()
         job_tracker.set_performance_mode_thresholds(0)
@@ -220,7 +222,7 @@ class TestJobTrackerSetPerformanceModeThresholds:
         job.payload.hires_fix = False
         job.model = "test_model"
         job.payload.workflow = None
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         # Pending MPS > 0 and threshold is 0 → should wait
         assert job_tracker.get_pending_megapixelsteps() > 0

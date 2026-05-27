@@ -5,7 +5,7 @@ from __future__ import annotations
 import multiprocessing
 import time
 
-from horde_model_reference.meta_consts import STABLE_DIFFUSION_BASELINE_CATEGORY
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
@@ -52,7 +52,7 @@ class HordeProcessInfo:
     """Last time we updated the process info. If we're regularly working, then this value should change frequently."""
     loaded_horde_model_name: str | None
     """The name of the horde model that is (supposedly) currently loaded in this process."""
-    loaded_horde_model_baseline: STABLE_DIFFUSION_BASELINE_CATEGORY | str | None
+    loaded_horde_model_baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None
     """The baseline of the horde model that is (supposedly) currently loaded in this process."""
     last_control_flag: HordeControlFlag | None
     """The last control flag sent, to avoid duplication."""

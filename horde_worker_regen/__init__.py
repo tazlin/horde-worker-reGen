@@ -7,3 +7,5 @@ load_dotenv()
 from pathlib import Path  # noqa: E402
 
 ASSETS_FOLDER_PATH = Path(__file__).parent / "assets"
+
+__version__ = "12.0.0"

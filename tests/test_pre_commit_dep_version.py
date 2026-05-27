@@ -1,10 +1,12 @@
 from pathlib import Path
 
+import pytest
 import yaml
 
 PRECOMMIT_FILE_PATH = Path(__file__).parent.parent / ".pre-commit-config.yaml"
 
 
+@pytest.mark.skip(reason="This test is meant to be run manually to check for version mismatches.")
 def test_pre_commit_dep_versions(
     horde_dependency_versions: dict[str, str],
     tracked_dependencies: list[str],

@@ -8,16 +8,107 @@ from unittest.mock import Mock
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
+from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_manager import (
     HordeWorkerProcessManager,
     MultiprocessingPrimitives,
     SystemResources,
 )
+from horde_worker_regen.process_management.runtime_config import RuntimeConfig
+
+
+async def track_popped_job_async(
+    job_tracker: JobTracker,
+    job: object,
+    *,
+    time_popped: float | None = None,
+) -> ImageGenerateJobPopResponse:
+    """Record a popped job in JobTracker using the async mutation API.
+
+    If ``job`` is not already an ``ImageGenerateJobPopResponse``, this helper
+    will coerce it into one using any compatible attributes found on the object.
+    """
+    if isinstance(job, ImageGenerateJobPopResponse):
+        pop_response = job
+    else:
+        payload = getattr(job, "payload", None)
+
+        def _coerce_int(value: object, default: int) -> int:
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            if isinstance(value, str):
+                try:
+                    return int(value)
+                except ValueError:
+                    return default
+            return default
+
+        model = getattr(job, "model", "stable_diffusion") or "stable_diffusion"
+        width = _coerce_int(getattr(payload, "width", 512), 512)
+        height = _coerce_int(getattr(payload, "height", 512), 512)
+        ddim_steps = _coerce_int(getattr(payload, "ddim_steps", 30), 30)
+        n_iter = _coerce_int(getattr(payload, "n_iter", 1), 1)
+        seed = getattr(payload, "seed", "42")
+        prompt = getattr(payload, "prompt", "test prompt")
+
+        loras = getattr(payload, "loras", None)
+        if not isinstance(loras, list):
+            loras = None
+
+        r2_upload = getattr(job, "r2_upload", None)
+        if r2_upload is not None and not isinstance(r2_upload, str):
+            r2_upload = None
+
+        pop_response = make_job_pop_response(
+            model=str(model),
+            width=width,
+            height=height,
+            ddim_steps=ddim_steps,
+            n_iter=n_iter,
+            seed=str(seed) if seed is not None else "42",
+            prompt=str(prompt) if prompt is not None else "test prompt",
+            loras=loras,
+            r2_upload=r2_upload,
+        )
+
+    await job_tracker.record_popped_job(pop_response, time_popped=time_popped)
+    return pop_response
+
+
+async def mark_job_in_progress_async(job_tracker: JobTracker, job: object) -> None:
+    """Mark a job as in-progress using the async mutation API."""
+    await job_tracker.mark_inference_started(job)  # type: ignore[arg-type]
+
+
+async def queue_job_for_safety_async(job_tracker: JobTracker, job_info: object) -> None:
+    """Queue a completed job for safety checking via JobTracker."""
+    await job_tracker.queue_for_safety(job_info)  # type: ignore[arg-type]
+
+
+async def queue_job_for_submit_async(job_tracker: JobTracker, job_info: object) -> None:
+    """Queue a completed job for submission via JobTracker."""
+    await job_tracker.queue_for_submit(job_info)  # type: ignore[arg-type]
+
+
+async def move_job_to_being_safety_checked_async(job_tracker: JobTracker, job_info: object) -> None:
+    """Move a job into the being-safety-checked collection via JobTracker."""
+    await queue_job_for_safety_async(job_tracker, job_info)
+    await job_tracker.begin_safety_check(job_info)  # type: ignore[arg-type]
+
+
+async def add_job_fault_async(job_tracker: JobTracker, job_id: object, fault_entry: object) -> None:
+    """Append a fault entry for a job via JobTracker."""
+    await job_tracker.record_source_image_fault(job_id, fault_entry)  # type: ignore[arg-type]
 
 
 def make_mock_bridge_data(**overrides: object) -> Mock:
@@ -77,10 +168,44 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
 
 
 def make_mock_sd_reference() -> Mock:
-    """Create a mock StableDiffusion_ModelReference."""
+    """Create a mock ImageGenerationModelRecord reference."""
     ref = Mock()
     ref.root = {}
     return ref
+
+
+def make_test_runtime_config(
+    bridge_data: Mock | None = None,
+    **bridge_overrides: object,
+) -> RuntimeConfig:
+    """Create a RuntimeConfig wrapping a mock bridge data for testing."""
+    if bridge_data is None:
+        bridge_data = make_mock_bridge_data(**bridge_overrides)
+    return RuntimeConfig(initial=bridge_data)  # type: ignore[arg-type]
+
+
+def make_test_api_sessions(
+    *,
+    horde_client_session: object | None = None,
+    aiohttp_session: object | None = None,
+) -> ApiSessions:
+    """Create an ApiSessions with optional mocked session handles."""
+    sessions = ApiSessions()
+    if horde_client_session is not None:
+        sessions.set_horde_client_session(horde_client_session)  # type: ignore[arg-type]
+    if aiohttp_session is not None:
+        sessions.set_aiohttp_session(aiohttp_session)  # type: ignore[arg-type]
+    return sessions
+
+
+def make_test_model_metadata(
+    reference: object | None = None,
+) -> ModelMetadata:
+    """Create a ModelMetadata, optionally pre-loaded with a reference."""
+    metadata = ModelMetadata()
+    if reference is not None:
+        metadata.set_reference(reference)  # type: ignore[arg-type]
+    return metadata
 
 
 def make_job_pop_response(
@@ -124,9 +249,11 @@ def make_test_system_resources(
     total_ram_bytes: int = 32 * 1024 * 1024 * 1024,
 ) -> SystemResources:
     """Create a SystemResources with fake hardware info."""
-    device_map = TorchDeviceMap(root={
-        0: TorchDeviceInfo(device_name="TestGPU", device_index=0, total_memory=8 * 1024 * 1024 * 1024),
-    })
+    device_map = TorchDeviceMap(
+        root={
+            0: TorchDeviceInfo(device_name="TestGPU", device_index=0, total_memory=8 * 1024 * 1024 * 1024),
+        },
+    )
     return SystemResources(total_ram_bytes=total_ram_bytes, device_map=device_map)
 
 
@@ -209,32 +336,9 @@ def make_mock_process_info(
 
 
 @pytest.fixture()
-def mock_job_pop_response() -> Mock:
-    """Create a mock ImageGenerateJobPopResponse."""
-    job = Mock()
-    job.id_ = "test-job-id-1234"
-    job.ids = ["test-job-id-1234"]
-    job.model = "stable_diffusion"
-    job.payload = Mock()
-    job.payload.width = 512
-    job.payload.height = 512
-    job.payload.ddim_steps = 30
-    job.payload.n_iter = 1
-    job.payload.post_processing = []
-    job.payload.loras = []
-    job.payload.hires_fix = False
-    job.payload.control_type = None
-    job.payload.seed = 42
-    job.payload.tiling = None
-    job.payload.tis = []
-    job.payload.sampler_name = "k_euler"
-    job.payload.workflow = None
-    job.payload.use_nsfw_censor = False
-    job.payload.prompt = "a test prompt"
-    job.source_image = None
-    job.source_mask = None
-    job.extra_source_images = None
-    return job
+def mock_job_pop_response() -> ImageGenerateJobPopResponse:
+    """Create a concrete ImageGenerateJobPopResponse."""
+    return make_job_pop_response(model="stable_diffusion")
 
 
 @pytest.fixture()
@@ -257,7 +361,7 @@ def job_tracker() -> JobTracker:
 
 
 @pytest.fixture()
-def mock_process_info() -> Mock:
+def mock_process_info() -> HordeProcessInfo:
     """Create a mock HordeProcessInfo."""
     return make_mock_process_info()
 

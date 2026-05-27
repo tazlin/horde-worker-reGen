@@ -8,7 +8,6 @@ higher-level api_job_pop flow.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -22,7 +21,14 @@ from horde_worker_regen.process_management.pop_throttler import CONSECUTIVE_FAIL
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
-from .conftest import make_job_pop_response, make_mock_bridge_data, make_mock_process_info
+from .conftest import (
+    make_job_pop_response,
+    make_mock_bridge_data,
+    make_mock_process_info,
+    make_test_api_sessions,
+    make_test_runtime_config,
+    track_popped_job_async,
+)
 
 
 def _make_popper(
@@ -63,10 +69,11 @@ def _make_popper(
         process_map=process_map,
         job_tracker=job_tracker,
         shutdown_manager=shutdown_manager,
-        get_bridge_data=lambda: bridge_data,
-        get_horde_client_session=lambda: horde_client_session,
-        get_aiohttp_session=lambda: aiohttp_session,
-        get_effective_megapixelsteps=lambda job: 1,
+        runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+        api_sessions=make_test_api_sessions(
+            horde_client_session=horde_client_session,
+            aiohttp_session=aiohttp_session,
+        ),
         max_inference_processes=max_inference_processes,
         max_concurrent_inference_processes=max_concurrent_inference_processes,
         dry_run_skip_api=dry_run_skip_api,
@@ -89,22 +96,19 @@ def _make_process_map_with_available_processes() -> ProcessMap:
     return ProcessMap({10: safety_proc, 0: inf_proc})
 
 
-# ── Early-return guard clause tests ──────────────────────────────────────
-
-
 class TestApiJobPopGuardClauses:
     """Each guard clause in api_job_pop should short-circuit cleanly."""
 
-    def test_shutting_down_returns_early_and_clears_flag(self) -> None:
+    async def test_shutting_down_returns_early_and_clears_flag(self) -> None:
         """When shutting_down is True, pop exits immediately and clears last_pop_no_jobs."""
         state = WorkerState(shutting_down=True, last_pop_no_jobs_available=True)
         popper = _make_popper(state=state)
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
         assert state.last_pop_no_jobs_available is False
 
-    def test_too_many_consecutive_failures_blocks_pop(self) -> None:
+    async def test_too_many_consecutive_failures_blocks_pop(self) -> None:
         """Active failure pause prevents any pop attempt."""
         state = WorkerState(
             too_many_consecutive_failed_jobs=True,
@@ -112,12 +116,12 @@ class TestApiJobPopGuardClauses:
         )
         popper = _make_popper(state=state)
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
         # Still in failure state
         assert state.too_many_consecutive_failed_jobs is True
 
-    def test_consecutive_failure_pause_expires_and_resets(self) -> None:
+    async def test_consecutive_failure_pause_expires_and_resets(self) -> None:
         """After CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS, the pause should lift."""
         state = WorkerState(
             too_many_consecutive_failed_jobs=True,
@@ -126,50 +130,50 @@ class TestApiJobPopGuardClauses:
         )
         popper = _make_popper(state=state)
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
         assert state.too_many_consecutive_failed_jobs is False
         assert state.consecutive_failed_jobs == 0
 
-    def test_reaching_failure_threshold_activates_pause(self) -> None:
+    async def test_reaching_failure_threshold_activates_pause(self) -> None:
         """When consecutive_failed_jobs hits 3, pause should activate."""
         state = WorkerState(consecutive_failed_jobs=3)
         popper = _make_popper(state=state)
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
         assert state.too_many_consecutive_failed_jobs is True
         assert state.too_many_consecutive_failed_jobs_time > 0
 
-    def test_failure_threshold_with_exit_on_faults_shuts_down(self) -> None:
+    async def test_failure_threshold_with_exit_on_faults_shuts_down(self) -> None:
         """When exit_on_unhandled_faults is True, reaching threshold triggers shutdown."""
         state = WorkerState(consecutive_failed_jobs=3)
         bd = make_mock_bridge_data(exit_on_unhandled_faults=True)
         shutdown_mgr = Mock()
         popper = _make_popper(state=state, bridge_data=bd, shutdown_manager=shutdown_mgr)
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
         shutdown_mgr.shutdown.assert_called_once()
 
-    def test_full_queue_returns_early(self) -> None:
+    async def test_full_queue_returns_early(self) -> None:
         """Queue at capacity should prevent further pops."""
         job_tracker = JobTracker()
         # Default bridge data: queue_size=1, max_threads=1 → max_jobs_in_queue = 2
         for _ in range(10):
             job = Mock()
             job.model = "stable_diffusion"
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         popper = _make_popper(job_tracker=job_tracker)
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
-    def test_no_safety_process_returns_early(self) -> None:
+    async def test_no_safety_process_returns_early(self) -> None:
         """Without an available safety process, pop should not proceed."""
         popper = _make_popper(process_map=ProcessMap({}))
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
-    def test_no_inference_process_returns_early(self) -> None:
+    async def test_no_inference_process_returns_early(self) -> None:
         """With safety but no inference process, pop should not proceed."""
         safety_proc = make_mock_process_info(
             10,
@@ -178,34 +182,31 @@ class TestApiJobPopGuardClauses:
             process_type=HordeProcessType.SAFETY,
         )
         popper = _make_popper(process_map=ProcessMap({10: safety_proc}))
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
-    def test_no_models_configured_returns_early(self) -> None:
+    async def test_no_models_configured_returns_early(self) -> None:
         """Empty model list should prevent pops (with a sleep penalty)."""
         process_map = _make_process_map_with_available_processes()
         popper = _make_popper(process_map=process_map, image_models_to_load=[])
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
-    def test_too_frequent_pop_returns_early(self) -> None:
+    async def test_too_frequent_pop_returns_early(self) -> None:
         """Popping again within the throttle window should be skipped."""
         state = WorkerState(last_job_pop_time=time.time())
         process_map = _make_process_map_with_available_processes()
         popper = _make_popper(state=state, process_map=process_map)
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
-    def test_first_job_not_submitted_blocks_second_pop(self) -> None:
+    async def test_first_job_not_submitted_blocks_second_pop(self) -> None:
         """When there are pending jobs but none submitted yet, don't pop more."""
         job_tracker = JobTracker()
         job = Mock()
         job.model = "stable_diffusion"
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
         # jobs_pending_submit is 0 (default)
 
         popper = _make_popper(job_tracker=job_tracker)
-        asyncio.run(popper.api_job_pop())
-
-
-# ── Consecutive failure handling ─────────────────────────────────────────
+        await popper.api_job_pop()
 
 
 class TestHandleConsecutiveFailures:
@@ -269,9 +270,6 @@ class TestHandleConsecutiveFailures:
         assert state.consecutive_failed_jobs == 0
 
 
-# ── Queue capacity checks ───────────────────────────────────────────────
-
-
 class TestIsQueueFull:
     """Tests for _is_queue_full."""
 
@@ -282,27 +280,27 @@ class TestIsQueueFull:
 
         assert popper._is_queue_full(bd) is False
 
-    def test_queue_at_capacity_is_full(self) -> None:
+    async def test_queue_at_capacity_is_full(self) -> None:
         """When pending jobs reach the max allowed, the queue should be considered full."""
         job_tracker = JobTracker()
         # queue_size=1, max_threads=1 → max_jobs_in_queue = 2
         for _ in range(2):
             job = Mock()
             job.model = "stable_diffusion"
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=1, max_threads=1)
 
         assert popper._is_queue_full(bd) is True
 
-    def test_multi_thread_increases_capacity(self) -> None:
+    async def test_multi_thread_increases_capacity(self) -> None:
         """max_threads > 1 should increase allowed queue depth."""
         job_tracker = JobTracker()
         for _ in range(2):
             job = Mock()
             job.model = "stable_diffusion"
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=1, max_threads=2)
@@ -310,12 +308,12 @@ class TestIsQueueFull:
         # max_jobs_in_queue = queue_size + 1 + (max_threads - 1) = 1 + 1 + 1 = 3
         assert popper._is_queue_full(bd) is False
 
-    def test_queue_one_below_capacity_not_full(self) -> None:
+    async def test_queue_one_below_capacity_not_full(self) -> None:
         """When pending jobs are one below the max allowed, the queue should not be considered full."""
         job_tracker = JobTracker()
         job = Mock()
         job.model = "stable_diffusion"
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=1, max_threads=1)
@@ -323,22 +321,19 @@ class TestIsQueueFull:
         # max_jobs_in_queue = 2, current = 1 → not full
         assert popper._is_queue_full(bd) is False
 
-    def test_large_queue_size(self) -> None:
+    async def test_large_queue_size(self) -> None:
         """With a larger queue_size, the method should calculate capacity accordingly."""
         job_tracker = JobTracker()
         for _ in range(5):
             job = Mock()
             job.model = "stable_diffusion"
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=10, max_threads=1)
 
         # max_jobs_in_queue = 10 + 1 = 11, current = 5 → not full
         assert popper._is_queue_full(bd) is False
-
-
-# ── API message processing ───────────────────────────────────────────────
 
 
 class TestProcessApiMessages:
@@ -427,9 +422,6 @@ class TestProcessApiMessages:
         popper._process_api_messages(response)
 
 
-# ── Error response handling ──────────────────────────────────────────────
-
-
 class TestHandlePopErrorResponse:
     """Tests for _handle_pop_error_response."""
 
@@ -496,16 +488,13 @@ class TestHandlePopErrorResponse:
     def test_error_response_slows_throttler(self) -> None:
         """Any error response should cause the pop frequency to slow down."""
         popper = _make_popper()
-        original_frequency = popper._throttler.current_pop_frequency
+        original_frequency = popper._pop_throttler.current_pop_frequency
 
         resp = self._make_error_response("Server error")
 
         popper._handle_pop_error_response(resp)
 
-        assert popper._throttler.current_pop_frequency > original_frequency
-
-
-# ── SDK workaround tests ─────────────────────────────────────────────────
+        assert popper._pop_throttler.current_pop_frequency > original_frequency
 
 
 class TestApplySdkWorkarounds:
@@ -563,41 +552,38 @@ class TestApplySdkWorkarounds:
         assert result.id_ == job.id_
 
 
-# ── Enqueue popped job ───────────────────────────────────────────────────
-
-
 class TestEnqueuePoppedJob:
     """Tests for _enqueue_popped_job."""
 
-    def test_job_added_to_pending_inference(self) -> None:
+    async def test_job_added_to_pending_inference(self) -> None:
         """When a job is enqueued, it should be added to the jobs_pending_inference list."""
         job_tracker = JobTracker()
         popper = _make_popper(job_tracker=job_tracker)
         job = make_job_pop_response()
 
-        asyncio.run(popper._enqueue_popped_job(job))
+        await popper._enqueue_popped_job(job)
 
         assert len(job_tracker.jobs_pending_inference) == 1
         assert job_tracker.jobs_pending_inference[0] is job
 
-    def test_pop_timestamp_recorded(self) -> None:
+    async def test_pop_timestamp_recorded(self) -> None:
         """When a job is enqueued, the current time should be recorded in job_pop_timestamps for that job."""
         job_tracker = JobTracker()
         popper = _make_popper(job_tracker=job_tracker)
         job = make_job_pop_response()
 
-        asyncio.run(popper._enqueue_popped_job(job))
+        await popper._enqueue_popped_job(job)
 
         assert job in job_tracker.job_pop_timestamps
         assert job_tracker.job_pop_timestamps[job] > 0
 
-    def test_jobs_lookup_entry_created(self) -> None:
+    async def test_jobs_lookup_entry_created(self) -> None:
         """When a job is enqueued, an entry should be created in jobs_lookup with the correct info."""
         job_tracker = JobTracker()
         popper = _make_popper(job_tracker=job_tracker)
         job = make_job_pop_response()
 
-        asyncio.run(popper._enqueue_popped_job(job))
+        await popper._enqueue_popped_job(job)
 
         assert job in job_tracker.jobs_lookup
         info = job_tracker.jobs_lookup[job]
@@ -605,22 +591,20 @@ class TestEnqueuePoppedJob:
         assert info.state is None
         assert info.time_popped > 0
 
-    def test_multiple_jobs_enqueued_in_order(self) -> None:
+    async def test_multiple_jobs_enqueued_in_order(self) -> None:
         """When multiple jobs are enqueued, they should be added to the pending list in the order enqueued."""
         job_tracker = JobTracker()
         popper = _make_popper(job_tracker=job_tracker)
         job1 = make_job_pop_response(model="model_a")
         job2 = make_job_pop_response(model="model_b")
 
-        asyncio.run(popper._enqueue_popped_job(job1))
-        asyncio.run(popper._enqueue_popped_job(job2))
+        await popper._enqueue_popped_job(job1)
+        await popper._enqueue_popped_job(job2)
 
         assert len(job_tracker.jobs_pending_inference) == 2
         assert job_tracker.jobs_pending_inference[0] is job1
         assert job_tracker.jobs_pending_inference[1] is job2
 
-
-# ── Full pop flow with API mock ──────────────────────────────────────────
 
 # Patch paths in the module under test to bypass SDK and telemetry dependencies
 _POP_REQUEST_PATH = "horde_worker_regen.process_management.job_popper.ImageGenerateJobPopRequest"
@@ -679,18 +663,18 @@ class TestApiJobPopFullFlow:
         )
 
     @_full_flow_patches
-    def test_successful_pop_enqueues_job(self, _mock_req_cls: Mock) -> None:
+    async def test_successful_pop_enqueues_job(self, _mock_req_cls: Mock) -> None:
         """A successful pop with a valid job should add it to the queue."""
         job_response = make_job_pop_response()
         popper = self._make_ready_popper(api_response=job_response)
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
         assert len(popper._job_tracker.jobs_pending_inference) == 1
         assert popper._state.last_pop_no_jobs_available is False
 
     @_full_flow_patches
-    def test_successful_pop_resets_maintenance_flag(self, _mock_req_cls: Mock) -> None:
+    async def test_successful_pop_resets_maintenance_flag(self, _mock_req_cls: Mock) -> None:
         """After a successful pop, last_pop_maintenance_mode should be reset to False.
 
         This is so that future maintenance mode responses will log a warning again.
@@ -702,22 +686,22 @@ class TestApiJobPopFullFlow:
         )
         popper._state.last_pop_maintenance_mode = True
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
         assert popper._state.last_pop_maintenance_mode is False
 
     @_full_flow_patches
-    def test_successful_pop_resets_throttler_to_default(self, _mock_req_cls: Mock) -> None:
+    async def test_successful_pop_resets_throttler_to_default(self, _mock_req_cls: Mock) -> None:
         """After a successful pop, the throttler should reset to default frequency."""
         popper = self._make_ready_popper(api_response=make_job_pop_response())
-        popper._throttler.on_pop_error()  # put throttler in error state
+        popper._pop_throttler.on_pop_error()  # put throttler in error state
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
-        assert popper._throttler.current_pop_frequency == popper._throttler._default_pop_frequency
+        assert popper._pop_throttler.current_pop_frequency == popper._pop_throttler._default_pop_frequency
 
     @_full_flow_patches
-    def test_no_job_available_sets_flag(self, _mock_req_cls: Mock) -> None:
+    async def test_no_job_available_sets_flag(self, _mock_req_cls: Mock) -> None:
         """When API returns a response with id_ = None (no job), flag should be set."""
         # Build a mock that quacks like an empty ImageGenerateJobPopResponse
         empty_response = Mock()
@@ -729,13 +713,13 @@ class TestApiJobPopFullFlow:
 
         popper = self._make_ready_popper(api_response=empty_response)
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
         assert popper._state.last_pop_no_jobs_available is True
         assert len(popper._job_tracker.jobs_pending_inference) == 0
 
     @_full_flow_patches
-    def test_api_exception_slows_throttler(self, _mock_req_cls: Mock) -> None:
+    async def test_api_exception_slows_throttler(self, _mock_req_cls: Mock) -> None:
         """When the API call raises, the throttler should switch to error frequency."""
         horde_session = AsyncMock()
         horde_session.submit_request = AsyncMock(side_effect=ConnectionError("network down"))
@@ -749,12 +733,12 @@ class TestApiJobPopFullFlow:
             horde_client_session=horde_session,
         )
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
-        assert popper._throttler.current_pop_frequency == popper._throttler._error_pop_frequency
+        assert popper._pop_throttler.current_pop_frequency == popper._pop_throttler._error_pop_frequency
 
     @_full_flow_patches
-    def test_error_response_handled(self, _mock_req_cls: Mock) -> None:
+    async def test_error_response_handled(self, _mock_req_cls: Mock) -> None:
         """RequestErrorResponse should be handled by _handle_pop_error_response."""
         error_resp = Mock(spec=RequestErrorResponse)
         error_resp.message = "Server is in maintenance mode"
@@ -773,31 +757,28 @@ class TestApiJobPopFullFlow:
             horde_client_session=horde_session,
         )
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
     @_full_flow_patches
-    def test_job_faults_initialized_for_popped_job(self, _mock_req_cls: Mock) -> None:
+    async def test_job_faults_initialized_for_popped_job(self, _mock_req_cls: Mock) -> None:
         """When a job is popped, its fault list should be initialized."""
         job_response = make_job_pop_response()
         popper = self._make_ready_popper(api_response=job_response)
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
         assert job_response.id_ in popper._job_tracker.job_faults
         assert popper._job_tracker.job_faults[job_response.id_] == []
 
     @_full_flow_patches
-    def test_pop_updates_last_pop_time(self, _mock_req_cls: Mock) -> None:
+    async def test_pop_updates_last_pop_time(self, _mock_req_cls: Mock) -> None:
         """Successful or not, api_job_pop should update last_job_pop_time."""
         state = WorkerState(last_job_pop_time=0.0)
         popper = self._make_ready_popper(api_response=make_job_pop_response(), state=state)
 
-        asyncio.run(popper.api_job_pop())
+        await popper.api_job_pop()
 
         assert state.last_job_pop_time > 0
-
-
-# ── WorkerState integration ─────────────────────────────────────────────
 
 
 class TestJobPopFrequency:
@@ -816,9 +797,9 @@ class TestJobPopFrequency:
     def test_default_pop_frequency(self) -> None:
         """Default pop frequency should be 1.0 seconds."""
         popper = _make_popper()
-        assert popper._throttler._current_pop_frequency == 1.0
+        assert popper._pop_throttler._current_pop_frequency == 1.0
 
     def test_error_pop_frequency(self) -> None:
         """Error pop frequency should be 5.0 seconds."""
         popper = _make_popper()
-        assert popper._throttler._error_pop_frequency == 5.0
+        assert popper._pop_throttler._error_pop_frequency == 5.0

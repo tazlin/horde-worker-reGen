@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
 
-from horde_model_reference.meta_consts import STABLE_DIFFUSION_BASELINE_CATEGORY
-from horde_model_reference.model_reference_records import StableDiffusion_ModelReference
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
-from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.consts import KNOWN_SLOW_WORKFLOWS, VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.job_models import NextJobAndProcess
+from horde_worker_regen.process_management.job_models import LineSkip, NextJobAndProcess
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.lru_cache import LRUCache
 from horde_worker_regen.process_management.messages import (
@@ -26,14 +24,15 @@ from horde_worker_regen.process_management.messages import (
     HordeProcessState,
     ModelLoadState,
 )
-from horde_worker_regen.telemetry_spans import span_preload_model
+from horde_worker_regen.process_management.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.protocols import BridgeDataProvider
+from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.telemetry_spans import span_preload_model
 from horde_worker_regen.utils.job_utils import (
-    get_single_job_effective_megapixelsteps as _get_single_job_effective_megapixelsteps,
+    get_single_job_magnitude as _get_single_job_effective_megapixelsteps,
 )
 
 
@@ -45,9 +44,8 @@ class InferenceScheduler:
     _horde_model_map: HordeModelMap
     _job_tracker: JobTracker
     _process_lifecycle: ProcessLifecycleManager
-    _get_bridge_data: BridgeDataProvider
-    _get_model_baseline: Callable[[str], STABLE_DIFFUSION_BASELINE_CATEGORY | str | None]
-    _get_stable_diffusion_reference: Callable[[], StableDiffusion_ModelReference | None]
+    _runtime_config: RuntimeConfig
+    _model_metadata: ModelMetadata
     _max_concurrent_inference_processes: int
     _max_inference_processes: int
     _lru: LRUCache
@@ -56,6 +54,7 @@ class InferenceScheduler:
     _model_recently_missing: bool
     _model_recently_missing_time: float
     _batch_wait_log_time: float
+    _pending_line_skip: NextJobAndProcess | None
 
     def __init__(
         self,
@@ -65,21 +64,39 @@ class InferenceScheduler:
         horde_model_map: HordeModelMap,
         job_tracker: JobTracker,
         process_lifecycle: ProcessLifecycleManager,
-        get_bridge_data: BridgeDataProvider,
-        get_model_baseline: Callable[[str], STABLE_DIFFUSION_BASELINE_CATEGORY | str | None],
-        get_stable_diffusion_reference: Callable[[], StableDiffusion_ModelReference | None],
+        runtime_config: RuntimeConfig,
+        model_metadata: ModelMetadata,
         max_concurrent_inference_processes: int,
         max_inference_processes: int,
         lru: LRUCache,
     ) -> None:
+        """Initialize the scheduler with references to the components it needs to manage.
+
+        Args:
+            state (WorkerState): The worker's state object, containing all of the mutable flags
+                relating to the worker's active state and lifecycle.
+            process_map (ProcessMap): The worker's ProcessMap, which tracks all active processes and
+                their states.
+            horde_model_map (HordeModelMap): The worker's HordeModelMap, which tracks the load state of all models
+                and which processes they are loaded on.
+            job_tracker (JobTracker): The worker's JobTracker, which tracks all jobs in-flight
+                and is responsible for managing their state transitions.
+            process_lifecycle (ProcessLifecycleManager): The worker's ProcessLifecycleManager, which is responsible
+                for launching, monitoring, and killing processes as needed.
+            runtime_config (RuntimeConfig): Holds the current bridge configuration snapshot.
+            model_metadata (ModelMetadata): Provides lookups against the stable-diffusion model reference.
+            max_concurrent_inference_processes (int): The maximum number of inference processes to run at once.
+            max_inference_processes (int): The maximum number of inference processes to have launched at once,
+                including those that are preloading or downloading models.
+            lru (LRUCache): The worker's LRU cache, used to track recently used models for unloading decisions.
+        """
         self._state = state
         self._process_map = process_map
         self._horde_model_map = horde_model_map
         self._job_tracker = job_tracker
         self._process_lifecycle = process_lifecycle
-        self._get_bridge_data = get_bridge_data
-        self._get_model_baseline = get_model_baseline
-        self._get_stable_diffusion_reference = get_stable_diffusion_reference
+        self._runtime_config = runtime_config
+        self._model_metadata = model_metadata
         self._max_concurrent_inference_processes = max_concurrent_inference_processes
         self._max_inference_processes = max_inference_processes
         self._lru = lru
@@ -88,11 +105,12 @@ class InferenceScheduler:
         self._model_recently_missing = False
         self._model_recently_missing_time = 0.0
         self._batch_wait_log_time = 0.0
+        self._pending_line_skip = None
 
     @property
     def post_process_job_overlap_allowed(self) -> bool:
         """Return true if post processing jobs are allowed to overlap."""
-        bd = self._get_bridge_data()
+        bd = self._runtime_config.bridge_data
         return (bd.moderate_performance_mode or bd.high_performance_mode) and bd.post_process_job_overlap
 
     def get_single_job_effective_megapixelsteps(self, job: ImageGenerateJobPopResponse) -> int:
@@ -105,7 +123,7 @@ class InferenceScheduler:
         Returns:
             True if a model was preloaded, False otherwise.
         """
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
         loaded_models = {process.loaded_horde_model_name for process in self._process_map.values()}
         loaded_models = loaded_models.union(
             model.horde_model_name
@@ -224,7 +242,7 @@ class InferenceScheduler:
                     process_id=available_process.process_id,
                 )
 
-                model_baseline = self._get_model_baseline(job.model)
+                model_baseline = self._model_metadata.get_baseline(job.model)
 
                 self._process_map.on_model_load_state_change(
                     process_id=available_process.process_id,
@@ -237,15 +255,34 @@ class InferenceScheduler:
 
         return False
 
-    def get_next_job_and_process(
+    async def get_next_job_and_process(
         self,
         information_only: bool = False,
     ) -> NextJobAndProcess | None:
-        """Get the next job and process that can be started, if any."""
-        if self._job_tracker._skipped_line_next_job_and_process is not None:
-            return self._job_tracker._skipped_line_next_job_and_process
+        """Get the next job and process that can be started, if any.
 
-        bridge_data = self._get_bridge_data()
+        A single scheduling cycle calls this twice: once with ``information_only=True``
+        (to look ahead for heavy-model / single-inference decisions) and once from
+        :meth:`start_inference` to actually launch. The two calls must agree on which
+        job is selected. Normal selection is deterministic given the queue and process
+        states, but the line-skip branch below depends on transient process state
+        (e.g. a process being mid aux-model download), so a line-skip decision is
+        cached in ``self._pending_line_skip`` and returned on the second call. The
+        cache is cleared at the start of each scheduling cycle (see
+        :meth:`run_scheduling_cycle`) and at the end of :meth:`start_inference`.
+        """
+        cached = self._pending_line_skip
+        if cached is not None:
+            cached_job = cached.next_job
+            if (
+                cached_job in self._job_tracker.jobs_pending_inference
+                and cached_job not in self._job_tracker.jobs_in_progress
+                and cached.process_with_model.can_accept_job()
+            ):
+                return cached
+            self._pending_line_skip = None
+
+        bridge_data = self._runtime_config.bridge_data
 
         next_job: ImageGenerateJobPopResponse | None = None
         next_n_jobs: list[ImageGenerateJobPopResponse] = []
@@ -271,10 +308,9 @@ class InferenceScheduler:
             return None
 
         process_with_model = self._process_map.get_process_by_horde_model_name(next_job.model)
-        skipped_line = False
-        skipped_line_for = None
+        line_skip: LineSkip | None = None
 
-        def handle_process_missing(job: ImageGenerateJobPopResponse) -> None:
+        async def handle_process_missing(job: ImageGenerateJobPopResponse) -> None:
             if self._model_recently_missing:
                 return
             logger.warning(
@@ -290,7 +326,7 @@ class InferenceScheduler:
                 if process_with_model is not None:
                     logger.debug(f"Clearing process {process_with_model.process_id} of model {job.model}")
 
-                    horde_model_baseline = self._get_model_baseline(job.model)
+                    horde_model_baseline = self._model_metadata.get_baseline(job.model)
 
                     self._process_map.on_model_load_state_change(
                         process_id=process_with_model.process_id,
@@ -306,9 +342,7 @@ class InferenceScheduler:
                 logger.debug(f"Last missing time: {self._model_recently_missing_time}")
                 self._model_recently_missing_time = time.time()
 
-                try:
-                    self._job_tracker.jobs_in_progress.remove(job)
-                except ValueError:
+                if not await self._job_tracker.release_in_progress(job):
                     logger.debug(f"Job {job.id_} not found in jobs_in_progress.")
 
         if process_with_model is None:
@@ -318,7 +352,7 @@ class InferenceScheduler:
                 or information_only
             ):
                 return None
-            handle_process_missing(next_job)
+            await handle_process_missing(next_job)
             return None
 
         candidate_job_size = 25
@@ -350,8 +384,7 @@ class InferenceScheduler:
                             and self.get_single_job_effective_megapixelsteps(candidate_small_job) <= candidate_job_size
                             and candidate_process_with_model.can_accept_job()
                         ):
-                            skipped_line = True
-                            skipped_line_for = next_job
+                            line_skip = LineSkip(displaced_job=next_job)
 
                             next_job = candidate_small_job
                             process_with_model = candidate_process_with_model
@@ -366,30 +399,29 @@ class InferenceScheduler:
         next_job_and_process = NextJobAndProcess(
             next_job=next_job,
             process_with_model=process_with_model,
-            skipped_line=skipped_line,
-            skipped_line_for=skipped_line_for,
+            line_skip=line_skip,
         )
 
-        if skipped_line:
-            self._job_tracker._skipped_line_next_job_and_process = next_job_and_process
+        if line_skip is not None:
+            self._pending_line_skip = next_job_and_process
 
         return next_job_and_process
 
-    def start_inference(self) -> bool:
+    async def start_inference(self) -> bool:
         """Start inference for the next job in jobs_pending_inference, if possible."""
-        next_job_and_process = self.get_next_job_and_process()
+        next_job_and_process = await self.get_next_job_and_process()
 
         if next_job_and_process is None:
             return False
 
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
         process_with_model = next_job_and_process.process_with_model
         next_job = next_job_and_process.next_job
 
-        if next_job_and_process.skipped_line and next_job_and_process.skipped_line_for is not None:
+        if next_job_and_process.line_skip is not None:
             logger.info(
                 f"Job {next_job_and_process.next_job.id_} skipped the line and will be run on process "
-                f"{process_with_model.process_id} before job {next_job_and_process.skipped_line_for.id_}"
+                f"{process_with_model.process_id} before job {next_job_and_process.line_skip.displaced_job.id_}"
                 "which is currently downloading extra models.",
             )
 
@@ -483,25 +515,25 @@ class InferenceScheduler:
                 sdk_api_job_info=next_job,
             ),
         ):
-            self._job_tracker.jobs_in_progress.append(next_job)
+            await self._job_tracker.mark_inference_started(next_job)
 
             process_with_model.last_control_flag = HordeControlFlag.START_INFERENCE
             process_with_model.last_job_referenced = next_job
             process_with_model.loaded_horde_model_name = next_job.model
-            horde_model_baseline = self._get_model_baseline(next_job.model)
+            horde_model_baseline = self._model_metadata.get_baseline(next_job.model)
             process_with_model.loaded_horde_model_baseline = horde_model_baseline
 
         else:
             logger.error(
                 f"Failed to start inference for job {next_job.id_} on process {process_with_model.process_id}",
             )
-            self._job_tracker.handle_job_fault(
+            await self._job_tracker.handle_job_fault(
                 faulted_job=next_job,
                 process_info=process_with_model,
                 process_timeout=bridge_data.process_timeout,
             )
 
-        self._job_tracker._skipped_line_next_job_and_process = None
+        self._pending_line_skip = None
 
         return True
 
@@ -510,7 +542,7 @@ class InferenceScheduler:
         process_with_model: HordeProcessInfo,
     ) -> None:
         """Unload models from VRAM from processes that are not running a job."""
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
         next_n_models = list(self.get_next_n_models(self._max_inference_processes))
         logger.debug(f"Next n models: {next_n_models}")
         next_model = None
@@ -643,7 +675,7 @@ class InferenceScheduler:
 
     def unload_models(self) -> bool:
         """Unload models that are no longer needed."""
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
 
         if len(self._job_tracker.jobs_pending_inference) == 0:
             return False
@@ -679,26 +711,27 @@ class InferenceScheduler:
 
         return False
 
-    def run_scheduling_cycle(self, stable_diffusion_reference: StableDiffusion_ModelReference) -> None:
+    async def run_scheduling_cycle(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
         """Run a single scheduling cycle: preload, detect heavy model/batch, start inference, unload.
 
         This absorbs the inline orchestration block from _process_control_loop.
         """
-        bridge_data = self._get_bridge_data()
+        self._pending_line_skip = None
+        bridge_data = self._runtime_config.bridge_data
 
         if not self.preload_models():
-            next_job_and_process = self.get_next_job_and_process(information_only=True)
+            next_job_and_process = await self.get_next_job_and_process(information_only=True)
 
             next_job_heavy_model_and_workflow = False
             if next_job_and_process is not None:
                 next_model = next_job_and_process.next_job.model
                 if next_model is not None:
-                    next_model_baseline = stable_diffusion_reference.root.get(next_model)
+                    next_model_baseline = stable_diffusion_reference.get(next_model)
                     next_workflow = next_job_and_process.next_job.payload.workflow
 
                     next_job_heavy_model_and_workflow = (
                         next_model_baseline is not None
-                        and next_model_baseline == STABLE_DIFFUSION_BASELINE_CATEGORY.stable_diffusion_xl
+                        and next_model_baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
                         and next_workflow in KNOWN_SLOW_WORKFLOWS
                     )
 
@@ -716,18 +749,13 @@ class InferenceScheduler:
             if keep_single_inference and pending_and_active > 1:
                 if (time.time() - self._batch_wait_log_time > 10) and bridge_data.max_threads > 1:
                     logger.opt(ansi=True).info(
-                        "<fg #7b7d7d>"
-                        f"<i>Blocking further inference due to {single_inf_reason}.</i>"
-                        "</>",
+                        f"<fg #7b7d7d><i>Blocking further inference due to {single_inf_reason}.</i></>",
                     )
                     self._batch_wait_log_time = time.time()
 
             elif (
                 next_job_and_process is not None
-                and (
-                    next_job_and_process.next_job.payload.n_iter > 1
-                    or next_job_heavy_model_and_workflow
-                )
+                and (next_job_and_process.next_job.payload.n_iter > 1 or next_job_heavy_model_and_workflow)
                 and (
                     self._process_map.num_busy_with_inference() > 0
                     or self._process_map.num_busy_with_post_processing() > 0
@@ -743,5 +771,5 @@ class InferenceScheduler:
                     )
                     self._batch_wait_log_time = time.time()
             else:
-                if not self.start_inference():
+                if not await self.start_inference():
                     self.unload_models()

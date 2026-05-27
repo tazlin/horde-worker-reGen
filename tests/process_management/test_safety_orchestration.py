@@ -8,29 +8,29 @@ from unittest.mock import Mock
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.messages import HordeProcessState
 
-from .conftest import make_mock_process_info, make_testable_process_manager
+from .conftest import make_mock_process_info, make_testable_process_manager, queue_job_for_safety_async
 
 
 class TestStartEvaluateSafety:
     """Tests for start_evaluate_safety."""
 
-    def test_no_pending_safety_checks_returns_early(self) -> None:
+    async def test_no_pending_safety_checks_returns_early(self) -> None:
         """If there are no jobs pending safety checks, the method should return early without doing anything."""
         process_manager = make_testable_process_manager()
-        process_manager.start_evaluate_safety()
+        await process_manager.start_evaluate_safety()
 
-    def test_no_safety_process_returns_early(self) -> None:
+    async def test_no_safety_process_returns_early(self) -> None:
         """If there are jobs pending safety checks but no safety process, the method should return early."""
         process_manager = make_testable_process_manager()
         job_info = Mock()
-        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
+        await queue_job_for_safety_async(process_manager._job_tracker, job_info)
 
-        process_manager.start_evaluate_safety()
+        await process_manager.start_evaluate_safety()
 
         assert job_info in process_manager._job_tracker.jobs_pending_safety_check
         assert job_info not in process_manager._job_tracker.jobs_being_safety_checked
 
-    def test_successful_safety_eval_moves_job(self) -> None:
+    async def test_successful_safety_eval_moves_job(self) -> None:
         """If a safety evaluation is successful, the job should be moved from pending to being checked."""
         process_manager = make_testable_process_manager()
         safety_proc = make_mock_process_info(
@@ -46,7 +46,7 @@ class TestStartEvaluateSafety:
         model_record = Mock()
         model_record.model_dump.return_value = {"name": "test"}
         sd_ref.root = {"stable_diffusion": model_record}
-        process_manager._stable_diffusion_reference = sd_ref
+        process_manager.stable_diffusion_reference = sd_ref
 
         job = Mock()
         job.id_ = uuid.uuid4()
@@ -63,14 +63,14 @@ class TestStartEvaluateSafety:
         job_info.job_image_results = [image_result]
         job_info.images_base64 = ["base64data"]
 
-        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
+        await queue_job_for_safety_async(process_manager._job_tracker, job_info)
 
-        process_manager.start_evaluate_safety()
+        await process_manager.start_evaluate_safety()
 
         assert job_info not in process_manager._job_tracker.jobs_pending_safety_check
         assert job_info in process_manager._job_tracker.jobs_being_safety_checked
 
-    def test_critical_fault_missing_image_results(self) -> None:
+    async def test_critical_fault_missing_image_results(self) -> None:
         """If job_image_results is None, it should be cleaned up and not cause a crash.
 
         - It should:
@@ -89,7 +89,7 @@ class TestStartEvaluateSafety:
 
         sd_ref = Mock()
         sd_ref.root = {}
-        process_manager._stable_diffusion_reference = sd_ref
+        process_manager.stable_diffusion_reference = sd_ref
 
         job = Mock()
         job.id_ = "fault-test"
@@ -101,13 +101,13 @@ class TestStartEvaluateSafety:
         job_info.sdk_api_job_info = job
         job_info.job_image_results = None
 
-        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
+        await queue_job_for_safety_async(process_manager._job_tracker, job_info)
 
-        process_manager.start_evaluate_safety()
+        await process_manager.start_evaluate_safety()
 
         assert job_info not in process_manager._job_tracker.jobs_pending_safety_check
 
-    def test_critical_fault_missing_job_id(self) -> None:
+    async def test_critical_fault_missing_job_id(self) -> None:
         """If job id is None, it should be cleaned up and not cause a crash.
 
         - It should:
@@ -126,7 +126,7 @@ class TestStartEvaluateSafety:
 
         sd_ref = Mock()
         sd_ref.root = {}
-        process_manager._stable_diffusion_reference = sd_ref
+        process_manager.stable_diffusion_reference = sd_ref
 
         job = Mock()
         job.id_ = None
@@ -138,14 +138,14 @@ class TestStartEvaluateSafety:
         job_info.sdk_api_job_info = job
         job_info.job_image_results = [Mock()]
 
-        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
+        await queue_job_for_safety_async(process_manager._job_tracker, job_info)
 
-        process_manager.start_evaluate_safety()
+        await process_manager.start_evaluate_safety()
 
         assert job_info not in process_manager._job_tracker.jobs_pending_safety_check
 
-    def test_sd_reference_none_raises(self) -> None:
-        """Test that if stable_diffusion_reference is None, a ValueError is raised."""
+    async def test_sd_reference_none_raises(self) -> None:
+        """Test that if stable_diffusion_reference is None, a RuntimeError is raised."""
         import pytest
 
         process_manager = make_testable_process_manager()
@@ -161,12 +161,12 @@ class TestStartEvaluateSafety:
         process_manager._process_map.update({10: safety_proc})
 
         job_info = Mock()
-        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
+        await queue_job_for_safety_async(process_manager._job_tracker, job_info)
 
-        with pytest.raises(ValueError, match="stable_diffusion_reference is None"):
-            process_manager.start_evaluate_safety()
+        with pytest.raises(RuntimeError, match="stable diffusion reference accessed before it was loaded"):
+            await process_manager.start_evaluate_safety()
 
-    def test_failed_send_returns_early_when_process_not_alive(self) -> None:
+    async def test_failed_send_returns_early_when_process_not_alive(self) -> None:
         """When send fails and is_process_alive returns False, the method returns early.
 
         Note: HordeProcessInfo.is_process_alive has a bug where it always returns False
@@ -188,7 +188,7 @@ class TestStartEvaluateSafety:
         model_record = Mock()
         model_record.model_dump.return_value = {"name": "test"}
         sd_ref.root = {"stable_diffusion": model_record}
-        process_manager._stable_diffusion_reference = sd_ref
+        process_manager.stable_diffusion_reference = sd_ref
 
         job = Mock()
         job.id_ = uuid.uuid4()
@@ -202,9 +202,9 @@ class TestStartEvaluateSafety:
         job_info.job_image_results = [Mock()]
         job_info.images_base64 = ["base64data"]
 
-        process_manager._job_tracker.jobs_pending_safety_check.append(job_info)
+        await queue_job_for_safety_async(process_manager._job_tracker, job_info)
 
-        process_manager.start_evaluate_safety()
+        await process_manager.start_evaluate_safety()
 
         # is_process_alive() always returns False due to the operator precedence bug,
         # so the code returns early without setting replacement flag

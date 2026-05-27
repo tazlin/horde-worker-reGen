@@ -8,10 +8,6 @@ from typing import Any
 
 import logfire
 
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
 inference_duration_histogram = logfire.metric_histogram(
     "inference.duration_seconds",
     unit="s",
@@ -38,10 +34,6 @@ queue_depth_counter = logfire.metric_up_down_counter(
     "queue.depth",
     description="Current number of jobs in the queue",
 )
-
-# ---------------------------------------------------------------------------
-# Span context managers
-# ---------------------------------------------------------------------------
 
 
 @contextlib.contextmanager

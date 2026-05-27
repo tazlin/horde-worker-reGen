@@ -2,7 +2,7 @@
 import pathlib
 
 import pytest
-from horde_model_reference.model_reference_manager import ModelReferenceManager
+from horde_model_reference.model_reference_manager import GitHubBackend, ModelReferenceManager, PrefetchStrategy
 from horde_sdk.generic_api.consts import ANON_API_KEY
 from ruamel.yaml import YAML
 
@@ -33,14 +33,15 @@ def test_bridge_data_yaml() -> None:
     assert len(parsed_bridge_data.meta_load_instructions) == 1
 
 
-def test_bridge_data_loader_yaml_template() -> None:
+async def test_bridge_data_loader_yaml_template() -> None:
     """Test that the bridge data template file can be loaded and parsed by a BridgeDataLoader."""
     bridge_data_loader = BridgeDataLoader()
 
-    horde_model_reference_manager = ModelReferenceManager(
-        download_and_convert_legacy_dbs=True,
-        override_existing=True,
-    )
+    if not ModelReferenceManager.has_instance():
+        horde_model_reference_manager = ModelReferenceManager()
+    else:
+        horde_model_reference_manager = ModelReferenceManager.get_instance()
+
     bridge_data = bridge_data_loader.load(
         file_path="bridgeData_template.yaml",
         file_format=ConfigFormat.yaml,
@@ -52,14 +53,18 @@ def test_bridge_data_loader_yaml_template() -> None:
     assert bridge_data.api_key == ANON_API_KEY
 
 
-def test_bridge_data_loader_yaml_local_if_present() -> None:
+async def test_bridge_data_loader_yaml_local_if_present() -> None:
     """Test that the bridge data file can be loaded and parsed by a BridgeDataLoader (if present)."""
     bridge_data_loader = BridgeDataLoader()
 
-    horde_model_reference_manager = ModelReferenceManager(
-        download_and_convert_legacy_dbs=True,
-        override_existing=True,
-    )
+    if not ModelReferenceManager.has_instance():
+        horde_model_reference_manager = ModelReferenceManager(
+            backend=GitHubBackend(),
+            prefetch_strategy=PrefetchStrategy.DEFERRED,
+        )
+        await horde_model_reference_manager.deferred_prefetch_handle
+    else:
+        horde_model_reference_manager = ModelReferenceManager.get_instance()
 
     if not pathlib.Path("bridgeData.yaml").is_file():
         pytest.skip("bridgeData.yaml not found")
@@ -75,17 +80,21 @@ def test_bridge_data_loader_yaml_local_if_present() -> None:
     assert len(bridge_data.image_models_to_load) > 0
 
 
-def test_bridge_data_load_from_env_vars() -> None:
+async def test_bridge_data_load_from_env_vars() -> None:
     """Test that the bridge data can be loaded from environment variables."""
     import os
 
     os.environ["AIWORKER_REGEN_HORDE_URL"] = "https://localhost:8080"
     os.environ["AIWORKER_REGEN_MODELS_TO_LOAD"] = "['model1', 'model2']"
 
-    horde_model_reference_manager = ModelReferenceManager(
-        download_and_convert_legacy_dbs=True,
-        override_existing=True,
-    )
+    if not ModelReferenceManager.has_instance():
+        horde_model_reference_manager = ModelReferenceManager(
+            backend=GitHubBackend(),
+            prefetch_strategy=PrefetchStrategy.DEFERRED,
+        )
+        await horde_model_reference_manager.deferred_prefetch_handle
+    else:
+        horde_model_reference_manager = ModelReferenceManager.get_instance()
 
     bridge_data = BridgeDataLoader.load_from_env_vars(
         horde_model_reference_manager=horde_model_reference_manager,

@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ssl
 import time
 from asyncio import CancelledError, Task
-from collections.abc import Callable
-from io import BytesIO
 from typing import TYPE_CHECKING
 
 import aiohttp
 import certifi
 import yarl
-from horde_sdk.ai_horde_api import GENERATION_STATE
+from horde_sdk.ai_horde_api import GENERATION_STATE, AIHordeAPIAsyncClientSession
 from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
     JobSubmitResponse,
@@ -22,19 +21,19 @@ from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from horde_sdk.generic_api.apimodels import RequestErrorResponse
 from loguru import logger
 
+from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.job_models import (
-    HordeJobInfo,
     PendingSubmitJob,
 )
 from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.protocols import AiohttpSessionProvider, BridgeDataProvider
+from horde_worker_regen.process_management.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
-from horde_worker_regen.telemetry_spans import span_job_submit
 from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer
 
 if TYPE_CHECKING:
-    from horde_sdk.ai_horde_worker.model_meta import ImageModelLoadResolver
+    from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
     from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
@@ -42,10 +41,8 @@ if TYPE_CHECKING:
 _sslcontext = ssl.create_default_context(cafile=certifi.where())
 
 _async_client_exceptions: tuple[type[Exception], ...] = (TimeoutError, aiohttp.client_exceptions.ClientError, OSError)
-try:
+with contextlib.suppress(AttributeError):
     _async_client_exceptions = (asyncio.exceptions.TimeoutError, aiohttp.client_exceptions.ClientError, OSError)
-except AttributeError:
-    pass
 
 
 class JobSubmitter:
@@ -54,10 +51,9 @@ class JobSubmitter:
     _state: WorkerState
     _job_tracker: JobTracker
     _shutdown_manager: ShutdownManager
-    _get_bridge_data: BridgeDataProvider
-    _get_stable_diffusion_reference: Callable[[], ImageModelLoadResolver | None]
-    _get_horde_client_session: Callable[[], object]
-    _get_aiohttp_session: AiohttpSessionProvider
+    _runtime_config: RuntimeConfig
+    _api_sessions: ApiSessions
+    _model_metadata: ModelMetadata
 
     _num_job_slowdowns: int
     _job_submit_loop_interval: float
@@ -68,19 +64,30 @@ class JobSubmitter:
         state: WorkerState,
         job_tracker: JobTracker,
         shutdown_manager: ShutdownManager,
-        get_bridge_data: BridgeDataProvider,
-        get_stable_diffusion_reference: Callable[[], ImageModelLoadResolver | None],
-        get_horde_client_session: Callable[[], object],
-        get_aiohttp_session: AiohttpSessionProvider,
+        runtime_config: RuntimeConfig,
+        api_sessions: ApiSessions,
+        model_metadata: ModelMetadata,
         dry_run_skip_api: bool = False,
     ) -> None:
+        """Initialize the submitter with references to shared state and a shutdown manager.
+
+        Args:
+            state (WorkerState): The mutable flags relating to the worker's active state and lifecycle.
+            job_tracker (JobTracker): The shared job tracker.
+            shutdown_manager (ShutdownManager): The shutdown manager for coordinating shutdown across components.
+            runtime_config (RuntimeConfig): Holds the current bridge configuration snapshot.
+            api_sessions (ApiSessions): Holds the horde-sdk client and aiohttp sessions.
+            model_metadata (ModelMetadata): Provides lookups against the stable-diffusion model reference.
+            dry_run_skip_api (bool, optional): If true, skip all real API interactions and return dummy results. \
+                Defaults to False.
+
+        """
         self._state = state
         self._job_tracker = job_tracker
         self._shutdown_manager = shutdown_manager
-        self._get_bridge_data = get_bridge_data
-        self._get_stable_diffusion_reference = get_stable_diffusion_reference
-        self._get_horde_client_session = get_horde_client_session
-        self._get_aiohttp_session = get_aiohttp_session
+        self._runtime_config = runtime_config
+        self._api_sessions = api_sessions
+        self._model_metadata = model_metadata
         self._dry_run_skip_api = dry_run_skip_api
 
         self._num_job_slowdowns = 0
@@ -88,19 +95,23 @@ class JobSubmitter:
 
     @property
     def bridge_data(self) -> reGenBridgeData:
-        return self._get_bridge_data()
+        """Return the current bridge configuration."""
+        return self._runtime_config.bridge_data
 
     @property
-    def horde_client_session(self) -> object:
-        return self._get_horde_client_session()
+    def horde_client_session(self) -> AIHordeAPIAsyncClientSession:
+        """Return the horde client session, or raise if it is not set."""
+        return self._api_sessions.require_horde_client_session()
 
     @property
-    def aiohttp_client_session(self) -> ClientSession:
-        return self._get_aiohttp_session()
+    def aiohttp_client_session(self) -> aiohttp.ClientSession:
+        """Return the aiohttp client session, or raise if it is not set."""
+        return self._api_sessions.require_aiohttp_session()
 
     @property
-    def stable_diffusion_reference(self) -> ImageModelLoadResolver | None:
-        return self._get_stable_diffusion_reference()
+    def stable_diffusion_reference(self) -> dict[str, ImageGenerationModelRecord] | None:
+        """Return the current stable diffusion reference, or None if it is not set."""
+        return self._model_metadata.reference
 
     @logger.catch(reraise=True)
     async def submit_single_generation(self, new_submit: PendingSubmitJob) -> PendingSubmitJob:
@@ -267,21 +278,20 @@ class JobSubmitter:
             return new_submit
 
         # Get the time the job was popped from the job deque
-        async with self._job_tracker.pop_timestamps_lock:
-            time_popped = self._job_tracker.job_pop_timestamps.get(new_submit.completed_job_info.sdk_api_job_info)
-            if time_popped is None:
-                logger.warning(
-                    f"Failed to get time_popped for job {new_submit.completed_job_info.sdk_api_job_info.id_}. "
-                    "This is likely a bug.",
-                )
-                time_popped = time.time()
+        time_popped = await self._job_tracker.get_time_popped(new_submit.completed_job_info.sdk_api_job_info)
+        if time_popped is None:
+            logger.warning(
+                f"Failed to get time_popped for job {new_submit.completed_job_info.sdk_api_job_info.id_}. "
+                "This is likely a bug.",
+            )
+            time_popped = time.time()
 
-            elif time_popped == -1:
-                logger.warning(
-                    f"Job {new_submit.completed_job_info.sdk_api_job_info.id_} will have an incorrect kudos/second "
-                    "calculation.",
-                )
-                time_popped = time.time()
+        elif time_popped == -1:
+            logger.warning(
+                f"Job {new_submit.completed_job_info.sdk_api_job_info.id_} will have an incorrect kudos/second "
+                "calculation.",
+            )
+            time_popped = time.time()
 
         time_taken = round(time.time() - time_popped, 2)
 
@@ -321,7 +331,7 @@ class JobSubmitter:
                 f"Job popped {time_taken} seconds ago and took "
                 f"{new_submit.completed_job_info.time_to_generate:.2f} to generate.",
             )
-            self._job_tracker._num_jobs_faulted += 1
+            await self._job_tracker.increment_jobs_faulted()
 
         self._state.kudos_generated_this_session += job_submit_response.reward
         self._state.kudos_events.append((time.time(), job_submit_response.reward))
@@ -400,14 +410,12 @@ class JobSubmitter:
                 submit_tasks.append(asyncio.create_task(self.submit_single_generation(retry_submit)))
 
         # Get the time the job was popped from the job deque
-        async with self._job_tracker.pop_timestamps_lock:
-            time_popped = self._job_tracker.job_pop_timestamps.get(completed_job_info.sdk_api_job_info)
-            if time_popped is None:
-                logger.warning(
-                    f"Failed to get time_popped for job {completed_job_info.sdk_api_job_info.id_}. "
-                    "This is likely a bug.",
-                )
-                time_popped = time.time()
+        time_popped = await self._job_tracker.get_time_popped(completed_job_info.sdk_api_job_info)
+        if time_popped is None:
+            logger.warning(
+                f"Failed to get time_popped for job {completed_job_info.sdk_api_job_info.id_}. This is likely a bug.",
+            )
+            time_popped = time.time()
         time_taken = round(time.time() - time_popped, 2)
         # If the job took a long time to generate, log a warning (unless speed warnings are suppressed)
         if not self.bridge_data.suppress_speed_warnings:
@@ -426,77 +434,31 @@ class JobSubmitter:
                 )
 
         # Finally, remove the job from the completed jobs list and reset the number of consecutive failed job
-        async with self._job_tracker.lookup_lock, self._job_tracker.completed_jobs_lock:
-            for submit_job in finished_submit_jobs:
-                if submit_job.is_faulted:
-                    job_faulted = True
-                    self._state.consecutive_failed_jobs += 1
-                    break
-            if not job_faulted:
-                # If any of the submits failed, we consider the whole job failed
-                self._state.consecutive_failed_jobs = 0
-            try:
-                if completed_job_info.sdk_api_job_info in self._job_tracker.jobs_lookup:
-                    self._job_tracker.jobs_lookup[completed_job_info.sdk_api_job_info].time_submitted = time.time()
-                else:
-                    self._job_tracker.jobs_lookup[completed_job_info.sdk_api_job_info] = HordeJobInfo(
-                        sdk_api_job_info=completed_job_info.sdk_api_job_info,
-                        time_popped=-1,
-                        job_image_results=completed_job_info.job_image_results,
-                        state=completed_job_info.state,
-                        censored=completed_job_info.censored,
-                        time_to_generate=completed_job_info.time_to_generate,
-                        time_to_download_aux_models=completed_job_info.time_to_download_aux_models,
-                    )
-                    logger.error(
-                        f"Job {completed_job_info.sdk_api_job_info.id_} not found in jobs_lookup "
-                        "during submit. Creating a new HordeJobInfo object.",
-                    )
+        for submit_job in finished_submit_jobs:
+            if submit_job.is_faulted:
+                job_faulted = True
+                self._state.consecutive_failed_jobs += 1
+                break
+        if not job_faulted:
+            # If any of the submits failed, we consider the whole job failed
+            self._state.consecutive_failed_jobs = 0
 
-                # Record kudos training data if enabled
-                if self.bridge_data.capture_kudos_training_data:
-                    recorder = KudosTrainingRecorder(
-                        training_data_file=self.bridge_data.kudos_training_data_file,
-                        stable_diffusion_reference=self.stable_diffusion_reference,
-                    )
+        tracked_job_info = await self._job_tracker.ensure_submitted_job_info(completed_job_info)
 
-                    if completed_job_info.sdk_api_job_info in self._job_tracker.jobs_lookup:
-                        recorder.record_job_data(self._job_tracker.jobs_lookup[completed_job_info.sdk_api_job_info])
-                    else:
-                        logger.error(
-                            f"Job {completed_job_info.sdk_api_job_info.id_} not found in jobs_lookup "
-                            "during kudos training data capture.",
-                        )
+        if self.bridge_data.capture_kudos_training_data:
+            recorder = KudosTrainingRecorder(
+                training_data_file=self.bridge_data.kudos_training_data_file,
+                stable_diffusion_reference=self.stable_diffusion_reference,
+            )
+            recorder.record_job_data(tracked_job_info)
 
-                if completed_job_info in self._job_tracker.jobs_pending_submit:
-                    self._job_tracker.jobs_pending_submit.remove(completed_job_info)
-                else:
-                    logger.warning(f"Job {completed_job_info.sdk_api_job_info.id_} not found in completed_jobs")
-
-                if completed_job_info.sdk_api_job_info in self._job_tracker.jobs_lookup:
-                    del self._job_tracker.jobs_lookup[completed_job_info.sdk_api_job_info]
-                else:
-                    logger.warning(f"Job {completed_job_info.sdk_api_job_info.id_} not found in jobs_lookup")
-
-                self._job_tracker._last_job_submitted_time = time.time()
-
-            except ValueError:
-                logger.debug(
-                    f"Tried to remove completed_job_info "
-                    f"{completed_job_info.sdk_api_job_info.id_} but it has already been removed.",
-                )
-
-            if completed_job_info.sdk_api_job_info in self._job_tracker.job_pop_timestamps:
-                self._job_tracker.job_pop_timestamps.pop(completed_job_info.sdk_api_job_info)
-                logger.debug(f"Removed {completed_job_info.sdk_api_job_info.id_} from job_pop_timestamps")
-
-            if completed_job_info.sdk_api_job_info in self._job_tracker.jobs_in_progress:
-                self._job_tracker.jobs_in_progress.remove(completed_job_info.sdk_api_job_info)
-                logger.debug(f"Removed {completed_job_info.sdk_api_job_info.id_} from jobs_in_progress")
-
-            if completed_job_info.sdk_api_job_info in self._job_tracker.jobs_lookup:
-                self._job_tracker.jobs_lookup.pop(completed_job_info.sdk_api_job_info)
-                logger.debug(f"Removed {completed_job_info.sdk_api_job_info.id_} from jobs_lookup")
+        try:
+            await self._job_tracker.finalize_submitted(completed_job_info)
+        except ValueError:
+            logger.debug(
+                f"Tried to remove completed_job_info "
+                f"{completed_job_info.sdk_api_job_info.id_} but it has already been removed.",
+            )
 
     async def run(self) -> None:
         """Run the job submit loop."""

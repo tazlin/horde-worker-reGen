@@ -19,7 +19,15 @@ from horde_worker_regen.process_management.messages import (
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
-from .conftest import make_job_pop_response, make_mock_bridge_data, make_mock_process_info
+from .conftest import (
+    make_job_pop_response,
+    make_mock_bridge_data,
+    make_mock_process_info,
+    make_test_model_metadata,
+    make_test_runtime_config,
+    mark_job_in_progress_async,
+    track_popped_job_async,
+)
 
 
 def _make_inference_scheduler(
@@ -50,9 +58,8 @@ def _make_inference_scheduler(
         horde_model_map=horde_model_map,
         job_tracker=job_tracker,
         process_lifecycle=Mock(get_processes_with_model_for_queued_job=Mock(return_value=[])),
-        get_bridge_data=lambda: bridge_data,
-        get_model_baseline=lambda name: None,
-        get_stable_diffusion_reference=lambda: None,
+        runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+        model_metadata=make_test_model_metadata(),
         max_concurrent_inference_processes=max_concurrent,
         max_inference_processes=max_inference,
         lru=LRUCache(max_inference),
@@ -67,45 +74,45 @@ class TestPreloadModels:
         inference_scheduler = _make_inference_scheduler()
         assert inference_scheduler.preload_models() is False
 
-    def test_model_already_loaded_returns_false(self) -> None:
+    async def test_model_already_loaded_returns_false(self) -> None:
         """Preload should return False if the needed model is already loaded in a process."""
         process_info = make_mock_process_info(0, model_name="stable_diffusion")
         process_map = ProcessMap({0: process_info})
         job_tracker = JobTracker()
 
         job = make_job_pop_response("stable_diffusion")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         inference_scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
         assert inference_scheduler.preload_models() is False
 
-    def test_preload_sends_message_when_process_available(self) -> None:
+    async def test_preload_sends_message_when_process_available(self) -> None:
         """Preload should send a message to a process to load the model if it's not already loaded."""
         process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         process_map = ProcessMap({0: process_info})
         job_tracker = JobTracker()
 
         job = make_job_pop_response("new_model")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         inference_scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
         result = inference_scheduler.preload_models()
         assert result is True
         assert process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
 
-    def test_no_available_process_returns_false(self) -> None:
+    async def test_no_available_process_returns_false(self) -> None:
         """Preload should return False if there are no available processes to load the model."""
         process_info = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
         process_map = ProcessMap({0: process_info})
         job_tracker = JobTracker()
 
         job = make_job_pop_response("new_model")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         inference_scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
         assert inference_scheduler.preload_models() is False
 
-    def test_clears_preloaded_model_no_longer_needed(self) -> None:
+    async def test_clears_preloaded_model_no_longer_needed(self) -> None:
         """If a model was preloaded for a job but that job is no longer pending, the model should be cleared."""
         process_info = make_mock_process_info(0, model_name="old_model", state=HordeProcessState.PRELOADED_MODEL)
         process_map = ProcessMap({0: process_info})
@@ -113,7 +120,7 @@ class TestPreloadModels:
         job_tracker = JobTracker()
 
         job = make_job_pop_response("different_model")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         inference_scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
         inference_scheduler.preload_models()
@@ -127,12 +134,12 @@ class TestPreloadModels:
 class TestGetNextJobAndProcess:
     """Tests for get_next_job_and_process."""
 
-    def test_no_pending_jobs_returns_none(self) -> None:
+    async def test_no_pending_jobs_returns_none(self) -> None:
         """get_next_job_and_process should return None if there are no pending jobs."""
         inference_scheduler = _make_inference_scheduler()
-        assert inference_scheduler.get_next_job_and_process() is None
+        assert await inference_scheduler.get_next_job_and_process() is None
 
-    def test_returns_job_with_matching_process(self) -> None:
+    async def test_returns_job_with_matching_process(self) -> None:
         """get_next_job_and_process should return a job and process that match if one is available."""
         process_info = make_mock_process_info(
             0,
@@ -144,7 +151,7 @@ class TestGetNextJobAndProcess:
         job_tracker = JobTracker()
 
         job = make_job_pop_response("stable_diffusion")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         hmm.update_entry(
             horde_model_name="stable_diffusion",
@@ -153,49 +160,65 @@ class TestGetNextJobAndProcess:
         )
 
         sched = _make_inference_scheduler(process_map=process_map, horde_model_map=hmm, job_tracker=job_tracker)
-        result = sched.get_next_job_and_process()
+        result = await sched.get_next_job_and_process()
         assert result is not None
         assert result.next_job is job
         assert result.process_with_model is process_info
 
-    def test_no_process_with_model_returns_none(self) -> None:
+    async def test_no_process_with_model_returns_none(self) -> None:
         """get_next_job_and_process should return None if there is no process with the required model."""
         process_info = make_mock_process_info(0, model_name="other_model")
         process_map = ProcessMap({0: process_info})
         job_tracker = JobTracker()
 
         job = make_job_pop_response("stable_diffusion")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         inference_scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
-        assert inference_scheduler.get_next_job_and_process() is None
+        assert await inference_scheduler.get_next_job_and_process() is None
 
-    def test_max_concurrent_reached_returns_none(self) -> None:
+    async def test_max_concurrent_reached_returns_none(self) -> None:
         """get_next_job_and_process should return None if the maximum number of concurrent jobs is reached."""
         process_info = make_mock_process_info(
-            0, model_name="stable_diffusion", state=HordeProcessState.PRELOADED_MODEL
+            0,
+            model_name="stable_diffusion",
+            state=HordeProcessState.PRELOADED_MODEL,
         )
         process_map = ProcessMap({0: process_info})
         job_tracker = JobTracker()
 
         job_in_progress = make_job_pop_response("stable_diffusion")
-        job_tracker.jobs_in_progress.append(job_in_progress)
+        await mark_job_in_progress_async(job_tracker, job_in_progress)
 
         job = make_job_pop_response("stable_diffusion")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         inference_scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
-        assert inference_scheduler.get_next_job_and_process() is None
+        assert await inference_scheduler.get_next_job_and_process() is None
 
-    def test_skipped_line_is_returned_on_second_call(self) -> None:
-        """get_next_job_and_process should return the skipped line on the second call."""
-        inference_scheduler = _make_inference_scheduler()
-        next_job_process = Mock()
-        inference_scheduler._job_tracker._skipped_line_next_job_and_process = next_job_process
+    async def test_skipped_line_is_returned_on_second_call(self) -> None:
+        """A cached line-skip decision should be returned on the next call within the same cycle."""
+        process_info = make_mock_process_info(
+            0,
+            model_name="stable_diffusion",
+            state=HordeProcessState.PRELOADED_MODEL,
+        )
+        process_map = ProcessMap({0: process_info})
+        job_tracker = JobTracker()
 
-        assert inference_scheduler.get_next_job_and_process() is next_job_process
+        job = make_job_pop_response("stable_diffusion")
+        await track_popped_job_async(job_tracker, job)
 
-    def test_job_in_progress_is_skipped(self) -> None:
+        inference_scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        cached = Mock()
+        cached.next_job = job
+        cached.process_with_model = process_info
+        process_info.can_accept_job = Mock(return_value=True)  # type: ignore[method-assign]
+        inference_scheduler._pending_line_skip = cached
+
+        assert await inference_scheduler.get_next_job_and_process() is cached
+
+    async def test_job_in_progress_is_skipped(self) -> None:
         """get_next_job_and_process should skip jobs that are already in progress."""
         process_info = make_mock_process_info(
             0,
@@ -206,22 +229,22 @@ class TestGetNextJobAndProcess:
         job_tracker = JobTracker()
 
         job = make_job_pop_response("stable_diffusion")
-        job_tracker.jobs_pending_inference.append(job)
-        job_tracker.jobs_in_progress.append(job)
+        await track_popped_job_async(job_tracker, job)
+        await mark_job_in_progress_async(job_tracker, job)
 
         inference_scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
-        assert inference_scheduler.get_next_job_and_process() is None
+        assert await inference_scheduler.get_next_job_and_process() is None
 
 
 class TestStartInference:
     """Tests for start_inference."""
 
-    def test_no_next_job_returns_false(self) -> None:
+    async def test_no_next_job_returns_false(self) -> None:
         """start_inference should return False if there is no next job."""
         inference_scheduler = _make_inference_scheduler()
-        assert inference_scheduler.start_inference() is False
+        assert await inference_scheduler.start_inference() is False
 
-    def test_successful_start_adds_to_in_progress(self) -> None:
+    async def test_successful_start_adds_to_in_progress(self) -> None:
         """start_inference should add the job to in_progress if it starts successfully."""
         process_info = make_mock_process_info(
             0,
@@ -233,7 +256,7 @@ class TestStartInference:
         job_tracker = JobTracker()
 
         job = make_job_pop_response("stable_diffusion")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         horde_model_map.update_entry(
             horde_model_name="stable_diffusion",
@@ -246,12 +269,12 @@ class TestStartInference:
             horde_model_map=horde_model_map,
             job_tracker=job_tracker,
         )
-        result = inference_scheduler.start_inference()
+        result = await inference_scheduler.start_inference()
         assert result is True
         assert job in job_tracker.jobs_in_progress
         assert process_info.last_control_flag == HordeControlFlag.START_INFERENCE
 
-    def test_failed_send_faults_job(self) -> None:
+    async def test_failed_send_faults_job(self) -> None:
         """If sending the message to start inference fails, the job should be faulted and not added to in_progress."""
         process_info = make_mock_process_info(
             0,
@@ -264,7 +287,7 @@ class TestStartInference:
         job_tracker = JobTracker()
 
         job = make_job_pop_response("stable_diffusion")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         horde_model_map.update_entry(
             horde_model_name="stable_diffusion",
@@ -277,7 +300,7 @@ class TestStartInference:
             horde_model_map=horde_model_map,
             job_tracker=job_tracker,
         )
-        result = inference_scheduler.start_inference()
+        result = await inference_scheduler.start_inference()
         assert result is True
         assert job not in job_tracker.jobs_in_progress
 
@@ -290,14 +313,16 @@ class TestUnloadModels:
         inference_scheduler = _make_inference_scheduler()
         assert inference_scheduler.unload_models() is False
 
-    def test_unload_models_pending_job_returns_false_for_needed_model(self) -> None:
+    async def test_unload_models_pending_job_returns_false_for_needed_model(self) -> None:
         """unload_models should return False if there is a pending job for the model."""
         job_tracker = JobTracker()
         job = make_job_pop_response("stable_diffusion")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         process_info = make_mock_process_info(
-            0, model_name="stable_diffusion", state=HordeProcessState.PRELOADED_MODEL
+            0,
+            model_name="stable_diffusion",
+            state=HordeProcessState.PRELOADED_MODEL,
         )
         process_map = ProcessMap({0: process_info})
 
@@ -305,7 +330,7 @@ class TestUnloadModels:
         assert inference_scheduler.unload_models() is False
         assert process_info.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM
 
-    def test_unload_models_single_thread_single_model_returns_false(self) -> None:
+    async def test_unload_models_single_thread_single_model_returns_false(self) -> None:
         """If there is only one inference process and one model, unload_models should return False.
 
         This is because we don't want to unload the only model we have if we only have one process,
@@ -313,18 +338,20 @@ class TestUnloadModels:
         """
         job_tracker = JobTracker()
         job = make_job_pop_response("stable_diffusion")
-        job_tracker.jobs_pending_inference.append(job)
+        await track_popped_job_async(job_tracker, job)
 
         inference_scheduler = _make_inference_scheduler(job_tracker=job_tracker)
         assert inference_scheduler.unload_models() is False
 
-    def test_get_next_n_models_returns_correct(self) -> None:
+    async def test_get_next_n_models_returns_correct(self) -> None:
         """get_next_n_models should return a list of unique model names for the next n pending inference jobs."""
         job_tracker = JobTracker()
         job1 = make_job_pop_response("model_a")
         job2 = make_job_pop_response("model_b")
         job3 = make_job_pop_response("model_a")
-        job_tracker.jobs_pending_inference.extend([job1, job2, job3])
+        await track_popped_job_async(job_tracker, job1)
+        await track_popped_job_async(job_tracker, job2)
+        await track_popped_job_async(job_tracker, job3)
 
         inference_scheduler = _make_inference_scheduler(job_tracker=job_tracker)
         result = inference_scheduler.get_next_n_models(3)

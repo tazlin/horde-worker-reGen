@@ -38,7 +38,7 @@ def create_mock_job(
 
 def test_calculate_pending_megapixelsteps_empty_queues() -> None:
     """Test calculating pending megapixelsteps with empty queues."""
-    result = JobQueueAnalyzer.calculate_pending_megapixelsteps(
+    result = JobQueueAnalyzer.calculate_pending_job_magnitude(
         jobs_pending_inference=[],
         jobs_pending_submit_count=0,
     )
@@ -50,7 +50,7 @@ def test_calculate_pending_megapixelsteps_single_job() -> None:
     """Test calculating pending megapixelsteps with a single job."""
     job = create_mock_job(width=512, height=512, ddim_steps=30, n_iter=1)
 
-    result = JobQueueAnalyzer.calculate_pending_megapixelsteps(
+    result = JobQueueAnalyzer.calculate_pending_job_magnitude(
         jobs_pending_inference=[job],
         jobs_pending_submit_count=0,
     )
@@ -65,7 +65,7 @@ def test_calculate_pending_megapixelsteps_multiple_jobs() -> None:
     job1 = create_mock_job(width=512, height=512, ddim_steps=30, n_iter=1)
     job2 = create_mock_job(width=1024, height=1024, ddim_steps=50, n_iter=1)
 
-    result = JobQueueAnalyzer.calculate_pending_megapixelsteps(
+    result = JobQueueAnalyzer.calculate_pending_job_magnitude(
         jobs_pending_inference=[job1, job2],
         jobs_pending_submit_count=0,
     )
@@ -78,7 +78,7 @@ def test_calculate_pending_megapixelsteps_with_submit_queue() -> None:
     """Test calculating pending megapixelsteps with jobs pending submit."""
     job = create_mock_job(width=512, height=512, ddim_steps=30, n_iter=1)
 
-    result = JobQueueAnalyzer.calculate_pending_megapixelsteps(
+    result = JobQueueAnalyzer.calculate_pending_job_magnitude(
         jobs_pending_inference=[job],
         jobs_pending_submit_count=2,
     )
@@ -89,7 +89,7 @@ def test_calculate_pending_megapixelsteps_with_submit_queue() -> None:
 
 def test_calculate_pending_megapixelsteps_only_submit_queue() -> None:
     """Test calculating pending megapixelsteps with only jobs pending submit."""
-    result = JobQueueAnalyzer.calculate_pending_megapixelsteps(
+    result = JobQueueAnalyzer.calculate_pending_job_magnitude(
         jobs_pending_inference=[],
         jobs_pending_submit_count=5,
     )
@@ -102,7 +102,7 @@ def test_calculate_pending_megapixelsteps_large_job() -> None:
     """Test calculating pending megapixelsteps with a large resolution job."""
     job = create_mock_job(width=2048, height=2048, ddim_steps=100, n_iter=1)
 
-    result = JobQueueAnalyzer.calculate_pending_megapixelsteps(
+    result = JobQueueAnalyzer.calculate_pending_job_magnitude(
         jobs_pending_inference=[job],
         jobs_pending_submit_count=0,
     )
@@ -115,7 +115,7 @@ def test_calculate_pending_megapixelsteps_batched_job() -> None:
     """Test calculating pending megapixelsteps with a batched job (n_iter > 1)."""
     job = create_mock_job(width=512, height=512, ddim_steps=30, n_iter=4)
 
-    result = JobQueueAnalyzer.calculate_pending_megapixelsteps(
+    result = JobQueueAnalyzer.calculate_pending_job_magnitude(
         jobs_pending_inference=[job],
         jobs_pending_submit_count=0,
     )
@@ -193,7 +193,7 @@ def test_calculate_pending_megapixelsteps_mixed_sizes() -> None:
         create_mock_job(width=1024, height=1024, ddim_steps=40, n_iter=1),
     ]
 
-    result = JobQueueAnalyzer.calculate_pending_megapixelsteps(
+    result = JobQueueAnalyzer.calculate_pending_job_magnitude(
         jobs_pending_inference=jobs,
         jobs_pending_submit_count=1,
     )

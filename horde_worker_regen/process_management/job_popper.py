@@ -7,7 +7,6 @@ import collections
 import random
 import time
 from asyncio import CancelledError
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from horde_sdk import RequestErrorResponse
@@ -18,25 +17,20 @@ from horde_sdk.ai_horde_api.apimodels import (
 from loguru import logger
 
 import horde_worker_regen
-from horde_worker_regen.process_management.job_models import (
-    APIWorkerMessage,
-    HordeJobInfo,
-)
+from horde_worker_regen.process_management.api_sessions import ApiSessions
+from horde_worker_regen.process_management.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
     PopThrottler,
 )
 from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.protocols import (
-    AiohttpSessionProvider,
-    BridgeDataProvider,
-    HordeClientSessionProvider,
-)
+from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.source_image_downloader import SourceImageDownloader
 from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.telemetry_spans import queue_depth_counter, span_job_pop
+from horde_worker_regen.utils.job_utils import get_single_job_magnitude
 
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -120,11 +114,10 @@ class JobPopper:
     _process_map: ProcessMap
     _job_tracker: JobTracker
     _shutdown_manager: ShutdownManager
-    _get_bridge_data: BridgeDataProvider
-    _get_horde_client_session: HordeClientSessionProvider
-    _get_effective_megapixelsteps: Callable[[ImageGenerateJobPopResponse], int]
+    _runtime_config: RuntimeConfig
+    _api_sessions: ApiSessions
 
-    _throttler: PopThrottler
+    _pop_throttler: PopThrottler
     _source_image_downloader: SourceImageDownloader
 
     _replaced_due_to_maintenance: bool
@@ -141,10 +134,8 @@ class JobPopper:
         process_map: ProcessMap,
         job_tracker: JobTracker,
         shutdown_manager: ShutdownManager,
-        get_bridge_data: BridgeDataProvider,
-        get_horde_client_session: HordeClientSessionProvider,
-        get_aiohttp_session: AiohttpSessionProvider,
-        get_effective_megapixelsteps: Callable[[ImageGenerateJobPopResponse], int],
+        runtime_config: RuntimeConfig,
+        api_sessions: ApiSessions,
         max_inference_processes: int,
         max_concurrent_inference_processes: int,
         dry_run_skip_api: bool = False,
@@ -154,16 +145,16 @@ class JobPopper:
         self._process_map = process_map
         self._job_tracker = job_tracker
         self._shutdown_manager = shutdown_manager
-        self._get_bridge_data = get_bridge_data
-        self._get_horde_client_session = get_horde_client_session
-        self._get_effective_megapixelsteps = get_effective_megapixelsteps
+        self._runtime_config = runtime_config
+        self._api_sessions = api_sessions
+
         self._max_inference_processes = max_inference_processes
         self._max_concurrent_inference_processes = max_concurrent_inference_processes
         self._dry_run_skip_api = dry_run_skip_api
 
-        self._throttler = PopThrottler(job_tracker=job_tracker)
+        self._pop_throttler = PopThrottler(job_tracker=job_tracker)
         self._source_image_downloader = SourceImageDownloader(
-            get_aiohttp_session=get_aiohttp_session,
+            api_sessions=api_sessions,
             job_tracker=job_tracker,
         )
 
@@ -180,10 +171,7 @@ class JobPopper:
             True if the pop should be skipped this cycle.
         """
         if self._state.too_many_consecutive_failed_jobs:
-            if (
-                cur_time - self._state.too_many_consecutive_failed_jobs_time
-                > CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
-            ):
+            if cur_time - self._state.too_many_consecutive_failed_jobs_time > CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS:
                 self._state.consecutive_failed_jobs = 0
                 self._state.too_many_consecutive_failed_jobs = False
                 logger.debug("Resuming job pops after too many consecutive failed jobs")
@@ -257,7 +245,7 @@ class JobPopper:
         else:
             logger.error(f"Failed to pop job (API Error): {response}")
 
-        self._throttler.on_pop_error()
+        self._pop_throttler.on_pop_error()
         self._state.last_pop_no_jobs_available = True
 
     @staticmethod
@@ -293,21 +281,14 @@ class JobPopper:
         job_pop_response: ImageGenerateJobPopResponse,
     ) -> None:
         """Add a successfully popped job to the pending inference queue."""
-        async with self._job_tracker.pending_inference_lock, self._job_tracker.pop_timestamps_lock:
-            self._job_tracker.jobs_pending_inference.append(job_pop_response)
-            jobs = []
-            for job in self._job_tracker.jobs_pending_inference:
-                if job.id_ is not None:
-                    jobs.append(f"<{str(job.id_)[:8]}: {job.model}>")
-                else:
-                    jobs.append(f"<{job.model}>")
-            logger.info(f"Job queue: {', '.join(jobs)}")
-            self._job_tracker.job_pop_timestamps[job_pop_response] = time.time()
-            self._job_tracker.jobs_lookup[job_pop_response] = HordeJobInfo(
-                sdk_api_job_info=job_pop_response,
-                state=None,
-                time_popped=self._job_tracker.job_pop_timestamps[job_pop_response],
-            )
+        await self._job_tracker.record_popped_job(job_pop_response)
+        jobs = []
+        for job in self._job_tracker.jobs_pending_inference:
+            if job.id_ is not None:
+                jobs.append(f"<{str(job.id_)[:8]}: {job.model}>")
+            else:
+                jobs.append(f"<{job.model}>")
+        logger.info(f"Job queue: {', '.join(jobs)}")
 
     # endregion
 
@@ -319,7 +300,7 @@ class JobPopper:
             return
 
         cur_time = time.time()
-        bridge_data = self._get_bridge_data()
+        bridge_data = self._runtime_config.bridge_data
 
         if self._handle_consecutive_failures(bridge_data, cur_time):
             return
@@ -328,7 +309,7 @@ class JobPopper:
             return
 
         # Let the first job complete before queuing more
-        if len(self._job_tracker.jobs_pending_inference) != 0 and self._job_tracker.jobs_pending_submit == 0:
+        if len(self._job_tracker.jobs_pending_inference) != 0 and len(self._job_tracker.jobs_pending_submit) == 0:
             return
 
         if self._process_map.get_first_available_safety_process() is None:
@@ -342,10 +323,10 @@ class JobPopper:
             await asyncio.sleep(3)
             return
 
-        if self._throttler.should_wait_for_megapixelsteps(bridge_data):
+        if self._pop_throttler.should_wait_for_megapixelsteps(bridge_data):
             return
 
-        if self._throttler.is_pop_too_soon(self._state.last_job_pop_time):
+        if self._pop_throttler.is_pop_too_soon(self._state.last_job_pop_time):
             return
 
         self._state.last_job_pop_time = time.time()
@@ -390,7 +371,7 @@ class JobPopper:
                 queue_depth_counter.add(1)
             else:
                 with span_job_pop(models=",".join(sorted(models))):
-                    job_pop_response = await self._get_horde_client_session().submit_request(
+                    job_pop_response = await self._api_sessions.require_horde_client_session().submit_request(
                         job_pop_request,
                         ImageGenerateJobPopResponse,
                     )
@@ -402,16 +383,16 @@ class JobPopper:
                 return
 
         except Exception as e:
-            if self._throttler.current_pop_frequency == self._throttler._error_pop_frequency:
+            if self._pop_throttler.current_pop_frequency == self._pop_throttler._error_pop_frequency:
                 logger.error(f"Failed to pop job (Unexpected Error): {e}")
             else:
                 logger.warning(f"Failed to pop job (Unexpected Error): {e}")
-            self._throttler.on_pop_error()
+            self._pop_throttler.on_pop_error()
             return
 
         self._state.last_pop_maintenance_mode = False
         self._replaced_due_to_maintenance = False
-        self._throttler.on_pop_success()
+        self._pop_throttler.on_pop_success()
 
         info_string = "No job available. "
         if len(self._job_tracker.jobs_pending_inference) > 0:
@@ -428,16 +409,14 @@ class JobPopper:
         if job_pop_response.id_ is None:
             self._state.last_pop_no_jobs_available = True
             logger.info(info_string)
-            self._throttler.on_no_jobs_available(
+            self._pop_throttler.on_no_jobs_available(
                 cur_time,
                 queue_empty=len(self._job_tracker.jobs_pending_inference) == 0,
             )
             return
 
-        self._job_tracker.job_faults[job_pop_response.id_] = []
-
         self._state.last_pop_no_jobs_available = False
-        self._throttler.on_job_popped()
+        self._pop_throttler.on_job_popped()
 
         has_loras = job_pop_response.payload.loras is not None and len(job_pop_response.payload.loras) > 0
         has_post_processing = (
@@ -450,7 +429,7 @@ class JobPopper:
         logger.opt(ansi=True).info(
             "<fg #a200ff>"
             f"Popped job {job_pop_response.id_} "
-            f"({self._get_effective_megapixelsteps(job_pop_response)} eMPS) "
+            f"({get_single_job_magnitude(job_pop_response)} eMPS) "
             f"(model: {job_pop_response.model}, batch: {job_pop_response.payload.n_iter}, "
             f"loras: {has_loras}, post_processing: {has_post_processing})"
             "</>",

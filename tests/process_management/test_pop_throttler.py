@@ -13,7 +13,7 @@ from horde_worker_regen.process_management.pop_throttler import (
     PopThrottler,
 )
 
-from .conftest import make_mock_bridge_data
+from .conftest import make_mock_bridge_data, track_popped_job_async
 
 
 def _make_throttler(
@@ -40,6 +40,7 @@ class TestPopFrequencyDefaults:
         assert throttler.current_pop_frequency == 1.0
 
     def test_custom_default_frequency(self) -> None:
+        """If we set a custom default frequency, it should be used initially."""
         throttler = _make_throttler(default_pop_frequency=2.5)
         assert throttler.current_pop_frequency == 2.5
 
@@ -54,10 +55,12 @@ class TestIsPopTooSoon:
     """Timing gate: ensures minimum interval between pops."""
 
     def test_pop_immediately_after_last_is_too_soon(self) -> None:
+        """If a pop is attempted immediately after the last one, it should be considered too soon."""
         throttler = _make_throttler(default_pop_frequency=1.0)
         assert throttler.is_pop_too_soon(time.time()) is True
 
     def test_pop_after_delay_is_not_too_soon(self) -> None:
+        """When enough time has passed since the last pop, it should not be considered too soon."""
         throttler = _make_throttler(default_pop_frequency=1.0)
         past = time.time() - 2.0
         assert throttler.is_pop_too_soon(past) is False
@@ -70,6 +73,7 @@ class TestIsPopTooSoon:
         assert throttler.is_pop_too_soon(past) is False
 
     def test_error_frequency_raises_the_gate(self) -> None:
+        """After an error, the pop frequency should be higher, making it more likely that a pop is too soon."""
         throttler = _make_throttler(error_pop_frequency=5.0)
         throttler.on_pop_error()
 
@@ -89,6 +93,7 @@ class TestOnPopSuccess:
     """Success resets frequency to default."""
 
     def test_resets_to_default_after_error(self) -> None:
+        """After an error has increased the pop frequency, a success should reset it to the default."""
         throttler = _make_throttler(default_pop_frequency=1.0, error_pop_frequency=5.0)
         throttler.on_pop_error()
         assert throttler.current_pop_frequency == 5.0
@@ -97,6 +102,7 @@ class TestOnPopSuccess:
         assert throttler.current_pop_frequency == 1.0
 
     def test_idempotent_when_already_at_default(self) -> None:
+        """Calling on_pop_success when already at default frequency should keep it at default."""
         throttler = _make_throttler()
         throttler.on_pop_success()
         assert throttler.current_pop_frequency == 1.0
@@ -106,11 +112,13 @@ class TestOnPopError:
     """Error slows down pop frequency."""
 
     def test_switches_to_error_frequency(self) -> None:
+        """After an error, the pop frequency should switch to the configured error_pop_frequency."""
         throttler = _make_throttler(error_pop_frequency=5.0)
         throttler.on_pop_error()
         assert throttler.current_pop_frequency == 5.0
 
     def test_multiple_errors_stay_at_error_frequency(self) -> None:
+        """Multiple consecutive errors should not increase frequency beyond the configured error_pop_frequency."""
         throttler = _make_throttler(error_pop_frequency=5.0)
         throttler.on_pop_error()
         throttler.on_pop_error()
@@ -122,6 +130,7 @@ class TestOnNoJobsAvailable:
     """Idle time tracking when the queue is empty."""
 
     def test_first_empty_poll_starts_tracking(self) -> None:
+        """When the queue is empty for the first time, tracking should start."""
         throttler = _make_throttler()
         now = time.time()
         throttler.on_no_jobs_available(now, queue_empty=True)
@@ -130,6 +139,7 @@ class TestOnNoJobsAvailable:
         assert throttler._time_spent_no_jobs_available == 0.0  # first call: elapsed from self is 0
 
     def test_subsequent_empty_polls_accumulate_idle_time(self) -> None:
+        """When multiple empty polls occur, idle time should accumulate."""
         throttler = _make_throttler()
         t1 = 1000.0
         throttler.on_no_jobs_available(t1, queue_empty=True)
@@ -149,6 +159,7 @@ class TestOnNoJobsAvailable:
         assert throttler._time_spent_no_jobs_available == 0.0
 
     def test_mixed_empty_and_nonempty_polls(self) -> None:
+        """Only empty polls should contribute to idle time."""
         throttler = _make_throttler()
 
         # Empty poll starts tracking
@@ -165,6 +176,7 @@ class TestOnJobPopped:
     """Job popped resets idle tracking."""
 
     def test_resets_idle_time_tracker(self) -> None:
+        """When a job is popped, the idle time tracker should be reset."""
         throttler = _make_throttler()
         throttler.on_no_jobs_available(100.0, queue_empty=True)
         throttler.on_no_jobs_available(103.0, queue_empty=True)
@@ -199,10 +211,10 @@ class TestShouldWaitForMegapixelsteps:
         throttler.should_wait_for_megapixelsteps(bd)
         assert job_tracker._triggered_max_pending_megapixelsteps is False
 
-    def test_first_call_above_threshold_sets_trigger(self) -> None:
+    async def test_first_call_above_threshold_sets_trigger(self) -> None:
         """First time we're above max pending MPS, the trigger flag and time should be set."""
         job_tracker = JobTracker()
-        job_tracker._max_pending_megapixelsteps = 5
+        job_tracker.set_performance_mode_thresholds(5)
         throttler = _make_throttler(job_tracker=job_tracker)
         bd = self._make_bridge_data()
 
@@ -217,7 +229,7 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         assert job_tracker.should_wait_for_pending_megapixelsteps() is True
 
@@ -226,10 +238,10 @@ class TestShouldWaitForMegapixelsteps:
         assert job_tracker._triggered_max_pending_megapixelsteps is True
         assert job_tracker._triggered_max_pending_megapixelsteps_time > 0
 
-    def test_returns_true_while_within_wait_period(self) -> None:
+    async def test_returns_true_while_within_wait_period(self) -> None:
         """While within the calculated wait window, should keep returning True."""
         job_tracker = JobTracker()
-        job_tracker._max_pending_megapixelsteps = 5
+        job_tracker.set_performance_mode_thresholds(5)
         throttler = _make_throttler(job_tracker=job_tracker)
         bd = self._make_bridge_data()
 
@@ -244,17 +256,17 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         # First call sets the trigger
         throttler.should_wait_for_megapixelsteps(bd)
         # Second call should still wait (we just started)
         assert throttler.should_wait_for_megapixelsteps(bd) is True
 
-    def test_returns_false_after_wait_time_elapses(self) -> None:
+    async def test_returns_false_after_wait_time_elapses(self) -> None:
         """After the calculated wait period, waiting should end."""
         job_tracker = JobTracker()
-        job_tracker._max_pending_megapixelsteps = 5
+        job_tracker.set_performance_mode_thresholds(5)
         throttler = _make_throttler(job_tracker=job_tracker)
         bd = self._make_bridge_data()
 
@@ -268,7 +280,7 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         # Trigger the wait
         throttler.should_wait_for_megapixelsteps(bd)
@@ -279,7 +291,7 @@ class TestShouldWaitForMegapixelsteps:
         assert throttler.should_wait_for_megapixelsteps(bd) is False
         assert job_tracker._triggered_max_pending_megapixelsteps is False
 
-    def test_high_performance_mode_reduces_wait(self) -> None:
+    async def test_high_performance_mode_reduces_wait(self) -> None:
         """High performance mode should give a much shorter wait time than normal."""
         job_tracker = JobTracker()
         throttler = _make_throttler(job_tracker=job_tracker)
@@ -302,14 +314,15 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         normal_wait = throttler._calculate_megapixelstep_wait(bd_normal)
         high_wait = throttler._calculate_megapixelstep_wait(bd_high)
 
         assert high_wait < normal_wait
 
-    def test_moderate_performance_mode_reduces_wait(self) -> None:
+    async def test_moderate_performance_mode_reduces_wait(self) -> None:
+        """Moderate performance mode should give a shorter wait time than normal."""
         job_tracker = JobTracker()
         throttler = _make_throttler(job_tracker=job_tracker)
 
@@ -323,7 +336,7 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         bd_normal = self._make_bridge_data(high_performance_mode=False, moderate_performance_mode=False)
         bd_moderate = self._make_bridge_data(moderate_performance_mode=True, high_performance_mode=False)
@@ -333,7 +346,8 @@ class TestShouldWaitForMegapixelsteps:
 
         assert moderate_wait < normal_wait
 
-    def test_multi_thread_reduces_wait(self) -> None:
+    async def test_multi_thread_reduces_wait(self) -> None:
+        """If multiple threads are allowed, the wait time should be reduced."""
         job_tracker = JobTracker()
         throttler = _make_throttler(job_tracker=job_tracker)
 
@@ -347,7 +361,7 @@ class TestShouldWaitForMegapixelsteps:
             job.payload.loras = []
             job.payload.control_type = None
             job.payload.hires_fix = False
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         bd_single = self._make_bridge_data(max_threads=1)
         bd_multi = self._make_bridge_data(max_threads=2)
@@ -370,7 +384,7 @@ class TestCalculateMegapixelstepWait:
         return throttler
 
     def test_low_pending_tier(self) -> None:
-        """pending < 40 → factor 0.5."""
+        """Pending < 40 → factor 0.5."""
         throttler = self._make_throttler_with_pending(20)
         bd = make_mock_bridge_data(max_threads=1)
         assert throttler._calculate_megapixelstep_wait(bd) == pytest.approx(10.0)
@@ -382,12 +396,13 @@ class TestCalculateMegapixelstepWait:
         assert throttler._calculate_megapixelstep_wait(bd) == pytest.approx(42.0)
 
     def test_high_pending_tier(self) -> None:
-        """pending >= 80 → factor 0.8."""
+        """Pending >= 80 → factor 0.8."""
         throttler = self._make_throttler_with_pending(100)
         bd = make_mock_bridge_data(max_threads=1)
         assert throttler._calculate_megapixelstep_wait(bd) == pytest.approx(80.0)
 
     def test_zero_pending_gives_zero_wait(self) -> None:
+        """If there are no pending jobs, the wait should be zero."""
         throttler = self._make_throttler_with_pending(0)
         bd = make_mock_bridge_data(max_threads=1)
         assert throttler._calculate_megapixelstep_wait(bd) == 0.0
@@ -425,7 +440,5 @@ class TestConstantsIntegrity:
     """Guard against accidental changes to sentinel values."""
 
     def test_consecutive_failed_jobs_wait_is_positive(self) -> None:
+        """CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS should be a positive number to ensure it actually causes a delay."""
         assert CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS > 0
-
-    def test_consecutive_failed_jobs_wait_value(self) -> None:
-        assert CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS == 180

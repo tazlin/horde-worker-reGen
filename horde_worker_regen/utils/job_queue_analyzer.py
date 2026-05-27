@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
-from horde_worker_regen.utils.job_utils import get_single_job_effective_megapixelsteps
+from horde_worker_regen.utils.job_utils import get_single_job_magnitude
 
 if TYPE_CHECKING:
     from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -15,11 +15,15 @@ class JobQueueAnalyzer:
     """Analyzes job queues to determine pending workload."""
 
     @staticmethod
-    def calculate_pending_megapixelsteps(
+    def calculate_pending_job_magnitude(
         jobs_pending_inference: Iterable[ImageGenerateJobPopResponse],
         jobs_pending_submit_count: int,
     ) -> int:
-        """Calculate the total number of megapixelsteps pending in the job queues.
+        """Calculate an approximate magnitude of pending jobs.
+
+        This is based on the magnitude of individual jobs, as calculated by `get_single_job_magnitude`.
+        This calculation is heavily approximate and should be used for estimation purposes only.
+
 
         Args:
             jobs_pending_inference: List of jobs pending inference.
@@ -30,12 +34,10 @@ class JobQueueAnalyzer:
         """
         job_deque_megapixelsteps = 0
 
-        # Calculate megapixelsteps for jobs pending inference
         for job in jobs_pending_inference:
-            job_megapixelsteps = get_single_job_effective_megapixelsteps(job)
+            job_megapixelsteps = get_single_job_magnitude(job)
             job_deque_megapixelsteps += job_megapixelsteps
 
-        # Add 4 megapixelsteps for each job pending submit
         job_deque_megapixelsteps += jobs_pending_submit_count * 4
 
         return job_deque_megapixelsteps

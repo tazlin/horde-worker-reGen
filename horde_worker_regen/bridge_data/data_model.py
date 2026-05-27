@@ -6,7 +6,7 @@ import json
 import os
 from typing import Self
 
-from horde_sdk.ai_horde_worker.bridge_data import CombinedHordeBridgeData
+from horde_sdk.worker.dispatch.ai_horde.bridge_data import CombinedHordeBridgeData
 from loguru import logger
 from pydantic import Field, field_validator, model_validator
 from ruamel.yaml import YAML

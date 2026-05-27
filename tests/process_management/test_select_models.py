@@ -8,7 +8,7 @@ from horde_worker_regen.process_management.job_popper import _select_models_for_
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.process_map import ProcessMap
 
-from .conftest import make_mock_bridge_data, make_mock_process_info
+from .conftest import make_mock_bridge_data, make_mock_process_info, track_popped_job_async
 
 
 class TestSelectModelsForPopBasic:
@@ -66,7 +66,7 @@ class TestSelectModelsForPopBasic:
 class TestDuplicateModelFiltering:
     """Models with >=2 jobs already queued should be excluded."""
 
-    def test_model_with_two_queued_jobs_excluded(self) -> None:
+    async def test_model_with_two_queued_jobs_excluded(self) -> None:
         """A model that already has 2 jobs queued should be removed from pop candidates."""
         bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
         process_map = ProcessMap({})
@@ -76,7 +76,8 @@ class TestDuplicateModelFiltering:
         job1.model = "model_a"
         job2 = Mock()
         job2.model = "model_a"
-        job_tracker.jobs_pending_inference.extend([job1, job2])
+        await track_popped_job_async(job_tracker, job1)
+        await track_popped_job_async(job_tracker, job2)
 
         result = _select_models_for_pop(
             bridge_data,
@@ -90,7 +91,7 @@ class TestDuplicateModelFiltering:
         assert "model_a" not in result
         assert "model_b" in result
 
-    def test_model_with_one_queued_job_not_excluded(self) -> None:
+    async def test_model_with_one_queued_job_not_excluded(self) -> None:
         """A model that has only 1 job queued should still be a candidate."""
         bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
         process_map = ProcessMap({})
@@ -98,7 +99,7 @@ class TestDuplicateModelFiltering:
 
         job1 = Mock()
         job1.model = "model_a"
-        job_tracker.jobs_pending_inference.append(job1)
+        await track_popped_job_async(job_tracker, job1)
 
         result = _select_models_for_pop(
             bridge_data,
@@ -111,7 +112,7 @@ class TestDuplicateModelFiltering:
         assert result is not None
         assert "model_a" in result
 
-    def test_all_models_excluded_returns_none(self) -> None:
+    async def test_all_models_excluded_returns_none(self) -> None:
         """If all models have >=2 queued jobs, no models are eligible → returns None."""
         bridge_data = make_mock_bridge_data(image_models_to_load=["model_a"])
         process_map = ProcessMap({})
@@ -120,7 +121,7 @@ class TestDuplicateModelFiltering:
         for _ in range(2):
             job = Mock()
             job.model = "model_a"
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         result = _select_models_for_pop(
             bridge_data,
@@ -132,7 +133,7 @@ class TestDuplicateModelFiltering:
 
         assert result is None
 
-    def test_three_queued_jobs_also_excluded(self) -> None:
+    async def test_three_queued_jobs_also_excluded(self) -> None:
         """Model with 3+ jobs should also be excluded (threshold is >= 2)."""
         bridge_data = make_mock_bridge_data(image_models_to_load=["model_a", "model_b"])
         process_map = ProcessMap({})
@@ -141,7 +142,7 @@ class TestDuplicateModelFiltering:
         for _ in range(3):
             job = Mock()
             job.model = "model_a"
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         result = _select_models_for_pop(
             bridge_data,
@@ -359,7 +360,7 @@ class TestCustomModels:
 class TestSelectModelsForPopCombinations:
     """Combined scenarios that exercise multiple code paths."""
 
-    def test_custom_model_survives_duplicate_filter(self) -> None:
+    async def test_custom_model_survives_duplicate_filter(self) -> None:
         """A custom model without queued jobs should survive duplicate filtering."""
         bridge_data = make_mock_bridge_data(
             image_models_to_load=["model_a"],
@@ -372,7 +373,7 @@ class TestSelectModelsForPopCombinations:
         for _ in range(2):
             job = Mock()
             job.model = "model_a"
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         result = _select_models_for_pop(
             bridge_data,
@@ -386,7 +387,7 @@ class TestSelectModelsForPopCombinations:
         assert "model_a" not in result
         assert "custom_1" in result
 
-    def test_many_models_with_partial_queue(self) -> None:
+    async def test_many_models_with_partial_queue(self) -> None:
         """With many models, only the ones with <2 queue slots should be in the result."""
         models = [f"model_{i}" for i in range(5)]
         bridge_data = make_mock_bridge_data(image_models_to_load=models)
@@ -397,7 +398,7 @@ class TestSelectModelsForPopCombinations:
         for model_name in ["model_0", "model_0", "model_2", "model_2"]:
             job = Mock()
             job.model = model_name
-            job_tracker.jobs_pending_inference.append(job)
+            await track_popped_job_async(job_tracker, job)
 
         result = _select_models_for_pop(
             bridge_data,

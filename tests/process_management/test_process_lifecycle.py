@@ -10,6 +10,8 @@ from horde_worker_regen.process_management.process_lifecycle import ProcessLifec
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
+from .conftest import make_test_runtime_config, track_popped_job_async
+
 
 def _make_plm(
     *,
@@ -39,7 +41,7 @@ def _make_plm(
         disk_lock=Mock(),
         aux_model_lock=Mock(),
         vae_decode_semaphore=Mock(),
-        get_bridge_data=lambda: bridge_data,
+        runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         max_inference_processes=2,
         max_safety_processes=1,
         amd_gpu=False,
@@ -68,7 +70,7 @@ def test_get_processes_with_model_for_queued_job_empty() -> None:
     assert result == []
 
 
-def test_get_processes_with_model_for_queued_job_matches() -> None:
+async def test_get_processes_with_model_for_queued_job_matches() -> None:
     """If there is a waiting process with the needed model, it should be returned."""
     process_map = ProcessMap({})
     job_tracker = JobTracker()
@@ -79,11 +81,10 @@ def test_get_processes_with_model_for_queued_job_matches() -> None:
     proc.last_process_state = HordeProcessState.WAITING_FOR_JOB
     process_map[0] = proc
 
-    # The method checks `model_name in jobs_pending_inference` which compares
-    # a string against job objects — only matches if the job object itself
-    # equals the model name string. Use the model name string directly to
-    # exercise this path.
-    job_tracker.jobs_pending_inference.append("stable_diffusion")
+    queued_job = Mock()
+    queued_job.id_ = "queued-job"
+    queued_job.model = "stable_diffusion"
+    await track_popped_job_async(job_tracker, queued_job)
 
     plm = _make_plm(process_map=process_map, job_tracker=job_tracker)
     result = plm.get_processes_with_model_for_queued_job()

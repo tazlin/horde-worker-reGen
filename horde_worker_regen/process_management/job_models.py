@@ -8,7 +8,7 @@ from typing import override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
-from horde_sdk.ai_horde_api.fields import JobID
+from horde_sdk.ai_horde_api.fields import GenerationID
 from pydantic import BaseModel, ConfigDict
 
 from horde_worker_regen.process_management.messages import HordeImageResult
@@ -121,7 +121,7 @@ class PendingSubmitJob(PendingJob):
         return None
 
     @property
-    def job_id(self) -> JobID:
+    def job_id(self) -> GenerationID:
         """Return the job ID for the job."""
         return self.completed_job_info.sdk_api_job_info.ids[self.gen_iter]
 
@@ -150,14 +150,28 @@ class PendingSubmitJob(PendingJob):
         super().succeed()
 
 
+class LineSkip(BaseModel):
+    """Records that a smaller queued job was selected ahead of an earlier-queued job.
+
+    When the head-of-queue job's process is temporarily unable to accept work
+    (e.g. it's downloading aux models), the scheduler may select a smaller
+    queued job that has a different model whose process is ready. This object
+    records which earlier job was displaced, for logging/diagnostic purposes.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    displaced_job: ImageGenerateJobPopResponse
+    """The earlier-queued job that the chosen job jumped ahead of."""
+
+
 class NextJobAndProcess(BaseModel):
     """Contains information about the next job to process and the process to process it with."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
     next_job: ImageGenerateJobPopResponse
     process_with_model: HordeProcessInfo
-    skipped_line: bool = False
-    skipped_line_for: ImageGenerateJobPopResponse | None
+    line_skip: LineSkip | None = None
+    """Non-None when ``next_job`` was chosen ahead of an earlier-queued job; see ``LineSkip``."""
 
 
 class APIWorkerMessage(BaseModel):
