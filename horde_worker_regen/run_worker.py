@@ -27,7 +27,13 @@ def main(
     directml: int | None = None,
 ) -> None:
     """Check for a valid config and start the driver ('main') process for the reGen worker."""
-    from horde_model_reference.model_reference_manager import ModelReferenceManager
+    import asyncio
+
+    from horde_model_reference.model_reference_manager import (
+        DeferredPrefetchHandle,
+        ModelReferenceManager,
+        PrefetchStrategy,
+    )
     from pydantic import ValidationError
 
     from horde_worker_regen.bridge_data.load_config import BridgeDataLoader, reGenBridgeData
@@ -35,19 +41,22 @@ def main(
     from horde_worker_regen.process_management.main_entry_point import start_working
 
     def ensure_model_db_downloaded() -> ModelReferenceManager:
-        horde_model_reference_manager = ModelReferenceManager(
-            download_and_convert_legacy_dbs=False,
-            override_existing=True,
-        )
+        horde_model_reference_manager = ModelReferenceManager(prefetch_strategy=PrefetchStrategy.DEFERRED)
 
         while True:
             try:
                 with logger.catch(reraise=True):
-                    if not horde_model_reference_manager.download_and_convert_all_legacy_dbs(override_existing=True):
-                        logger.error("Failed to download and convert legacy DBs. Retrying in 5 seconds...")
-                        time.sleep(5)
-                    else:
-                        return horde_model_reference_manager
+                    handle = horde_model_reference_manager.deferred_prefetch_handle
+                    if handle is None:
+                        raise ValueError("Failed to get deferred prefetch handle for model reference manager")
+
+                    async def _download_model_references(handle: DeferredPrefetchHandle) -> None:
+                        await handle
+
+                    asyncio.run(_download_model_references(handle))
+
+                return horde_model_reference_manager
+
             except Exception as e:
                 logger.error(f"Failed to download and convert legacy DBs: ({type(e).__name__}) {e}")
                 logger.error("Retrying in 5 seconds...")
