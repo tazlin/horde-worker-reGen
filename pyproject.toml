@@ -59,8 +59,8 @@ cpu = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/Haidra-Org/AI-Horde-Worker"
-"Bug Tracker" = "https://github.com/Haidra-Org/AI-Horde-Worker"
+"Homepage" = "https://github.com/Haidra-Org/horde-worker-reGen"
+"Bug Tracker" = "https://github.com/Haidra-Org/horde-worker-reGen/issues"
 
 [project.scripts]
 run_worker = "horde_worker_regen.run_worker:start"
@@ -93,6 +93,7 @@ dev = [
     "types-tqdm",
     "types-regex",
     "tach>=0.34.0",
+    "debugpy>=1.8.21",
 ]
 
 # -- uv configuration --
