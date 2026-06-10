@@ -467,10 +467,12 @@ class JobSubmitter:
             with logger.catch():
                 try:
                     await self.api_submit_job()
-                    if self._shutdown_manager.is_time_for_shutdown():
-                        break
                 except CancelledError as e:
                     self._shutdown_manager.shutdown()
                     logger.debug(f"CancelledError: {e}")
+
+            # Checked outside the catch block so persistent errors cannot prevent shutdown.
+            if self._shutdown_manager.is_time_for_shutdown() or self._state.shut_down:
+                break
 
             await asyncio.sleep(self._job_submit_loop_interval)

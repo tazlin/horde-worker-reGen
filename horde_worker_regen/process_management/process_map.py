@@ -302,7 +302,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                     )
                     continue
 
-                model_info = stable_diffusion_model_reference.root.get(model)
+                model_info = stable_diffusion_model_reference.get(model)
                 if model_info is None:
                     logger.debug(f"Model {model} not found in stable diffusion model reference. Is it a custom model?")
                     continue
@@ -371,6 +371,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 continue
 
             if p.is_process_busy():
+                continue
+
+            # Already ending or ended — the pipe is already closing; do not re-target.
+            if p.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
                 continue
 
             return p

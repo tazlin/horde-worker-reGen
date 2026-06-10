@@ -107,8 +107,8 @@ class SafetyOrchestrator:
             raise ValueError("completed_job_info.sdk_api_job_info.model is None")
 
         model_info = {}
-        if completed_job_info.sdk_api_job_info.model in stable_diffusion_reference.root:
-            model_info = stable_diffusion_reference.root[completed_job_info.sdk_api_job_info.model].model_dump()
+        if completed_job_info.sdk_api_job_info.model in stable_diffusion_reference:
+            model_info = stable_diffusion_reference[completed_job_info.sdk_api_job_info.model].model_dump()
         with span_safety_check(job_id=str(completed_job_info.sdk_api_job_info.id_)):
             safety_message_sent_succeeded = safety_process.safe_send_message(
                 HordeSafetyControlMessage(

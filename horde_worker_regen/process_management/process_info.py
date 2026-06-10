@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing
 import time
+from typing import override
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
@@ -162,15 +163,23 @@ class HordeProcessInfo:
         except Exception as e:
             from horde_worker_regen.process_management.process_manager import _caught_signal
 
-            if not _caught_signal:
+            # Pipe closure is expected when the child is ending/ended, or when the
+            # worker is shutting down — log at debug level to avoid noise.
+            _pipe_expected_to_close = (
+                _caught_signal
+                or self.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED)
+                or not self.mp_process.is_alive()
+            )
+            if not _pipe_expected_to_close:
                 logger.error(f"Failed to send message to process {self.process_id}: {e}")
             return False
 
+    @override
     def __repr__(self) -> str:
         """Return a string representation of the process info."""
-        return str(
+        return (
             f"HordeProcessInfo(process_id={self.process_id}, last_process_state={self.last_process_state}, "
-            f"loaded_horde_model_name={self.loaded_horde_model_name})",
+            f"loaded_horde_model_name={self.loaded_horde_model_name})"
         )
 
     def can_accept_job(self) -> bool:

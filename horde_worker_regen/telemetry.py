@@ -25,12 +25,26 @@ def configure_telemetry() -> None:
         send_to_logfire="if-token-present",
         service_name="horde-worker-regen",
     )
-    logfire.instrument_system_metrics()
+
+    try:
+        logfire.instrument_system_metrics()
+    except RuntimeError as e:
+        # The system-metrics instrumentation extras are optional; telemetry still works without them.
+        logger.debug(f"System metrics instrumentation unavailable: {e}")
 
     # Bridge loguru → logfire so spans can capture structured logs.
-    logger.add(logfire.loguru_handler(), format="{message}")
+    # loguru_handler() returns the kwargs for logger.add (sink, format, etc).
+    logger.add(**logfire.loguru_handler())
 
     _telemetry_configured = True
+
+
+def instrument_aiohttp_client() -> None:
+    """Instrument aiohttp client sessions, tolerating missing optional instrumentation extras."""
+    try:
+        logfire.instrument_aiohttp_client()
+    except RuntimeError as e:
+        logger.debug(f"aiohttp client instrumentation unavailable: {e}")
 
 
 def configure_child_telemetry(process_id: int) -> None:

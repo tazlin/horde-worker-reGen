@@ -629,7 +629,10 @@ def _noop_span(**_kwargs: object):  # noqa: ANN202
 
 
 # Stack all three patches needed for full-flow tests
-def _full_flow_patches(fn):  # noqa: ANN001, ANN202 # pyrefly: ignore - this is a decorator factory, not a regular function, so type inference isn't helpful here
+# (untyped because this is a decorator factory, not a regular function, so type inference isn't helpful here)
+def _full_flow_patches(  # noqa: ANN202
+    fn,  # noqa: ANN001
+):
     """Apply all patches needed to run api_job_pop through the full flow."""
     fn = patch(_SPAN_POP_PATH, _noop_span)(fn)
     fn = patch(_POP_REQUEST_PATH)(fn)
@@ -697,7 +700,9 @@ class TestApiJobPopFullFlow:
 
         await popper.api_job_pop()
 
-        assert popper._state.last_pop_maintenance_mode is False  # pyrefly: ignore - "always true" is wrong, api_job_pop() should mutate
+        assert (
+            popper._state.last_pop_maintenance_mode is False
+        )  # pyrefly: ignore - "always true" is wrong, api_job_pop() should mutate
 
     @_full_flow_patches
     async def test_successful_pop_resets_throttler_to_default(self, _mock_req_cls: Mock) -> None:
@@ -716,7 +721,9 @@ class TestApiJobPopFullFlow:
         empty_response = Mock()
         empty_response.id_ = None
         empty_response.skipped = Mock()
-        empty_response.skipped.model_dump.return_value = {}  #  pyrefly: ignore - we just need to ensure this doesn't raise, the actual content isn't important for this test
+        empty_response.skipped.model_dump.return_value = (
+            {}
+        )  #  pyrefly: ignore - we just need to ensure this doesn't raise, the actual content isn't important for this test
         empty_response.skipped.model_extra = None
         empty_response.messages = None
 

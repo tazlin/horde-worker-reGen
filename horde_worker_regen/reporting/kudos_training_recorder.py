@@ -62,7 +62,7 @@ class KudosTrainingRecorder:
         if (
             self.stable_diffusion_reference is None
             or job_info.sdk_api_job_info.model is None
-            or job_info.sdk_api_job_info.model not in self.stable_diffusion_reference.root
+            or job_info.sdk_api_job_info.model not in self.stable_diffusion_reference
         ):
             return
 
@@ -125,7 +125,7 @@ class KudosTrainingRecorder:
 
         # Add model baseline
         if self.stable_diffusion_reference is not None and job_info.sdk_api_job_info.model is not None:
-            api_job["model_baseline"] = self.stable_diffusion_reference.root[job_info.sdk_api_job_info.model].baseline
+            api_job["model_baseline"] = self.stable_diffusion_reference[job_info.sdk_api_job_info.model].baseline
 
         # Add scheduler information (preparation for multiple schedulers)
         payload["scheduler"] = "karras" if job_info.sdk_api_job_info.payload.karras else "simple"

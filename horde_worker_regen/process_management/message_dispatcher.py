@@ -418,12 +418,12 @@ class MessageDispatcher:
                 num_images_censored += 1
                 if message.safety_evaluations[i].is_csam:
                     num_images_csam += 1
-        if completed_job_info.sdk_api_job_info.id_ is not None and job_fault_entries:
-            await self._job_tracker.clear_faults_for_job(completed_job_info.sdk_api_job_info.id_)
-        else:
+        if completed_job_info.sdk_api_job_info.id_ is None:
             logger.error(
-                f"Job {message.job_id} was not found in job_faults. This is unexpected.",
+                f"Job {message.job_id} has no id; cannot clear its fault entries. This is unexpected.",
             )
+        elif job_fault_entries:
+            await self._job_tracker.clear_faults_for_job(completed_job_info.sdk_api_job_info.id_)
 
         logger.debug(
             f"Job {message.job_id} had {num_images_censored} images censored and took "

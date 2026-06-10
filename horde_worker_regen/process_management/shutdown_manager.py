@@ -89,7 +89,10 @@ class ShutdownManager:
                 except Exception as e:
                     logger.error(f"Failed to kill process {process}: {e}")
 
-            sys.exit(1)
+            # Only force-exit if the graceful shutdown hasn't completed; a clean exit
+            # should be left to the main thread (and embedders like the test harness).
+            if not self._state.shut_down:
+                sys.exit(1)
 
         threading.Thread(target=hard_shutdown).start()
 

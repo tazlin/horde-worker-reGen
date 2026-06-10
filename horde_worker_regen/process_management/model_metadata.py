@@ -57,6 +57,7 @@ class ModelMetadata:
         """Return the baseline category for ``model_name``, or ``None`` if unknown."""
         if self._reference is None:
             return None
-        if model_name not in self._reference.root:
+        record = self._reference.get(model_name)
+        if record is None:
             return None
-        return self._reference.root[model_name].baseline
+        return record.baseline

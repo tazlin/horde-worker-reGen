@@ -52,9 +52,9 @@ def test_pre_commit_dep_versions(
                 versions[matched_dep] = dep_version
 
     # Ensure all versions were found
-    assert all(version is not None for version in versions.values()), (
-        f"Some dependencies are missing their versions.\n{versions}"
-    )
+    assert all(
+        version is not None for version in versions.values()
+    ), f"Some dependencies are missing their versions.\n{versions}"
 
     # Check if the versions match
     matches = sum(1 for dep, version in horde_dependency_versions.items() if versions.get(dep) == version)

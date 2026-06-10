@@ -9,9 +9,9 @@ from typing import cast
 from unittest.mock import MagicMock, Mock
 
 import pytest
-from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry, TIPayloadEntry
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry, TIPayloadEntry
 from pytest import MonkeyPatch
 
 from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
@@ -27,8 +27,7 @@ def temp_dir() -> Iterator[str]:
 @pytest.fixture
 def mock_model_reference() -> dict[str, ImageGenerationModelRecord]:
     """Create a mock model reference."""
-    ref = MagicMock(spec=dict)
-    ref.root = {
+    ref = {
         "test_model": Mock(baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1),
     }
     return cast(dict[str, ImageGenerationModelRecord], ref)

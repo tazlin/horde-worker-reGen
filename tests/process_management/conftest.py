@@ -154,7 +154,9 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     """
     bd = Mock()
     bd.image_models_to_load = ["stable_diffusion"]
-    bd.custom_models = []  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
+    bd.custom_models = (
+        []
+    )  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
     bd.max_threads = 1
     bd.queue_size = 1
     bd.high_memory_mode = False
@@ -182,7 +184,9 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.api_key = "test-api-key"
     bd.dreamer_worker_name = "test-worker"
     bd.horde_model_stickiness = 0
-    bd.blacklist = []  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
+    bd.blacklist = (
+        []
+    )  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
     bd.require_upfront_kudos = False
     bd.allow_img2img = True
     bd.allow_inpainting = True
@@ -203,11 +207,9 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     return bd
 
 
-def make_mock_sd_reference() -> Mock:
-    """Create a mock ImageGenerationModelRecord reference."""
-    ref = Mock()
-    ref.root = {}  # pyrefly: ignore - we aren't testing the stable diffusion reference here, just that we can create a mock with the expected structure
-    return ref
+def make_mock_sd_reference() -> dict[str, Mock]:
+    """Create an empty stand-in for the stable diffusion model reference dict."""
+    return {}
 
 
 def make_test_runtime_config(
@@ -275,7 +277,9 @@ def make_job_pop_response(
         "source_processing": "txt2img",
     }
     if loras is not None:
-        data["payload"]["loras"] = loras  # pyrefly: ignore - type safety doesn't matter here; violations will be caught elsewhere
+        data["payload"][
+            "loras"
+        ] = loras  # pyrefly: ignore - type safety doesn't matter here; violations will be caught elsewhere
     if r2_upload is not None:
         data["r2_upload"] = r2_upload
     return ImageGenerateJobPopResponse(**data)  # pyrefly: ignore - type violations will be caught by pydantic
@@ -306,7 +310,7 @@ def make_test_mp_primitives() -> MultiprocessingPrimitives:
 
 def make_testable_process_manager(
     bridge_data: Mock | None = None,
-    stable_diffusion_reference: Mock | None = None,
+    stable_diffusion_reference: dict[str, Mock] | None = None,
     system_resources: SystemResources | None = None,
     mp_primitives: MultiprocessingPrimitives | None = None,
     **bridge_overrides: object,

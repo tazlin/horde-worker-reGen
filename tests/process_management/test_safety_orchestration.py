@@ -42,11 +42,9 @@ class TestStartEvaluateSafety:
         process_manager._process_map.clear()
         process_manager._process_map.update({10: safety_proc})
 
-        sd_ref = Mock()
         model_record = Mock()
         model_record.model_dump.return_value = {"name": "test"}
-        sd_ref.root = {"stable_diffusion": model_record}
-        process_manager.stable_diffusion_reference = sd_ref
+        process_manager.stable_diffusion_reference = {"stable_diffusion": model_record}
 
         job = Mock()
         job.id_ = uuid.uuid4()
@@ -87,9 +85,7 @@ class TestStartEvaluateSafety:
         process_manager._process_map.clear()
         process_manager._process_map.update({10: safety_proc})
 
-        sd_ref = Mock()
-        sd_ref.root = {}  # pyrefly: ignore - we aren't testing the stable diffusion reference here, just that the code handles missing data gracefully
-        process_manager.stable_diffusion_reference = sd_ref
+        process_manager.stable_diffusion_reference = {}
 
         job = Mock()
         job.id_ = "fault-test"
@@ -124,9 +120,7 @@ class TestStartEvaluateSafety:
         process_manager._process_map.clear()
         process_manager._process_map.update({10: safety_proc})
 
-        sd_ref = Mock()
-        sd_ref.root = {}  # pyrefly: ignore - we aren't testing the stable diffusion reference here, just that the code handles missing data gracefully
-        process_manager.stable_diffusion_reference = sd_ref
+        process_manager.stable_diffusion_reference = {}
 
         job = Mock()
         job.id_ = None
@@ -184,11 +178,9 @@ class TestStartEvaluateSafety:
         process_manager._process_map.clear()
         process_manager._process_map.update({10: safety_proc})
 
-        sd_ref = Mock()
         model_record = Mock()
         model_record.model_dump.return_value = {"name": "test"}
-        sd_ref.root = {"stable_diffusion": model_record}
-        process_manager.stable_diffusion_reference = sd_ref
+        process_manager.stable_diffusion_reference = {"stable_diffusion": model_record}
 
         job = Mock()
         job.id_ = uuid.uuid4()
