@@ -9,6 +9,7 @@ from typing import cast
 from unittest.mock import MagicMock, Mock
 
 import pytest
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry, TIPayloadEntry
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from pytest import MonkeyPatch
@@ -41,8 +42,10 @@ def mock_job_info() -> MagicMock:
     job_info.sdk_api_job_info.model = "test_model"
     job_info.sdk_api_job_info.payload.n_iter = 1
     job_info.sdk_api_job_info.payload.karras = True
-    job_info.sdk_api_job_info.payload.loras = []
-    job_info.sdk_api_job_info.payload.tis = []
+    loras: list[LorasPayloadEntry] = []
+    job_info.sdk_api_job_info.payload.loras = loras
+    tis: list[TIPayloadEntry] = []
+    job_info.sdk_api_job_info.payload.tis = tis
     job_info.sdk_api_job_info.extra_source_images = None
     job_info.sdk_api_job_info._downloaded_source_image = None
     job_info.sdk_api_job_info._downloaded_source_mask = None
@@ -53,8 +56,8 @@ def mock_job_info() -> MagicMock:
             "model": "test_model",
             "payload": {
                 "karras": True,
-                "loras": [],
-                "tis": [],
+                "loras": loras,
+                "tis": tis,
             },
         },
     }
@@ -195,14 +198,17 @@ def test_prepare_model_dump_adds_scheduler(
     assert dump["sdk_api_job_info"]["payload"]["scheduler"] == "karras"
     assert "karras" not in dump["sdk_api_job_info"]["payload"]
 
+    loras: list[LorasPayloadEntry] = []
+    tis: list[TIPayloadEntry] = []
+
     # Reset for next test
     mock_job_info.model_dump.return_value = {
         "sdk_api_job_info": {
             "model": "test_model",
             "payload": {
                 "karras": False,
-                "loras": [],
-                "tis": [],
+                "loras": loras,
+                "tis": tis,
             },
         },
     }

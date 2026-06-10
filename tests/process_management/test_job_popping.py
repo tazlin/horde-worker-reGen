@@ -24,6 +24,7 @@ from horde_worker_regen.process_management.worker_state import WorkerState
 from .conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
+    make_mock_job,
     make_mock_process_info,
     make_test_api_sessions,
     make_test_runtime_config,
@@ -53,7 +54,7 @@ def _make_popper(
     if job_tracker is None:
         job_tracker = JobTracker()
     if bridge_data is None:
-        kwargs: dict = {}
+        kwargs: dict = {}  # pyrefly: ignore - type inference is not useful in this test
         if image_models_to_load is not None:
             kwargs["image_models_to_load"] = image_models_to_load
         bridge_data = make_mock_bridge_data(**kwargs)
@@ -161,9 +162,7 @@ class TestApiJobPopGuardClauses:
         job_tracker = JobTracker()
         # Default bridge data: queue_size=1, max_threads=1 → max_jobs_in_queue = 2
         for _ in range(10):
-            job = Mock()
-            job.model = "stable_diffusion"
-            await track_popped_job_async(job_tracker, job)
+            await track_popped_job_async(job_tracker, make_mock_job())
 
         popper = _make_popper(job_tracker=job_tracker)
         await popper.api_job_pop()
@@ -200,9 +199,7 @@ class TestApiJobPopGuardClauses:
     async def test_first_job_not_submitted_blocks_second_pop(self) -> None:
         """When there are pending jobs but none submitted yet, don't pop more."""
         job_tracker = JobTracker()
-        job = Mock()
-        job.model = "stable_diffusion"
-        await track_popped_job_async(job_tracker, job)
+        await track_popped_job_async(job_tracker, make_mock_job())
         # jobs_pending_submit is 0 (default)
 
         popper = _make_popper(job_tracker=job_tracker)
@@ -285,9 +282,7 @@ class TestIsQueueFull:
         job_tracker = JobTracker()
         # queue_size=1, max_threads=1 → max_jobs_in_queue = 2
         for _ in range(2):
-            job = Mock()
-            job.model = "stable_diffusion"
-            await track_popped_job_async(job_tracker, job)
+            await track_popped_job_async(job_tracker, make_mock_job())
 
         popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=1, max_threads=1)
@@ -298,9 +293,7 @@ class TestIsQueueFull:
         """max_threads > 1 should increase allowed queue depth."""
         job_tracker = JobTracker()
         for _ in range(2):
-            job = Mock()
-            job.model = "stable_diffusion"
-            await track_popped_job_async(job_tracker, job)
+            await track_popped_job_async(job_tracker, make_mock_job())
 
         popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=1, max_threads=2)
@@ -311,9 +304,7 @@ class TestIsQueueFull:
     async def test_queue_one_below_capacity_not_full(self) -> None:
         """When pending jobs are one below the max allowed, the queue should not be considered full."""
         job_tracker = JobTracker()
-        job = Mock()
-        job.model = "stable_diffusion"
-        await track_popped_job_async(job_tracker, job)
+        await track_popped_job_async(job_tracker, make_mock_job())
 
         popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=1, max_threads=1)
@@ -325,9 +316,7 @@ class TestIsQueueFull:
         """With a larger queue_size, the method should calculate capacity accordingly."""
         job_tracker = JobTracker()
         for _ in range(5):
-            job = Mock()
-            job.model = "stable_diffusion"
-            await track_popped_job_async(job_tracker, job)
+            await track_popped_job_async(job_tracker, make_mock_job())
 
         popper = _make_popper(job_tracker=job_tracker)
         bd = make_mock_bridge_data(queue_size=10, max_threads=1)
@@ -362,7 +351,7 @@ class TestProcessApiMessages:
         """If messages is an empty list, it should simply result in no messages being processed."""
         popper = _make_popper()
         response = Mock()
-        response.messages = []
+        response.messages = []  # pyrefly: ignore - we don't need type inference for an empty list in this test
 
         popper._process_api_messages(response)
 
@@ -386,11 +375,21 @@ class TestProcessApiMessages:
         popper = _make_popper()
         response1 = Mock()
         response1.messages = [
-            {"id": "msg-1", "message": "first", "origin": "system", "expiry": None},
+            {
+                "id": "msg-1",
+                "message": "first",
+                "origin": "system",
+                "expiry": None,  # pyrefly: ignore - we don't need type inference for this test
+            },
         ]
         response2 = Mock()
         response2.messages = [
-            {"id": "msg-1", "message": "second", "origin": "system", "expiry": None},
+            {
+                "id": "msg-1",
+                "message": "second",
+                "origin": "system",
+                "expiry": None,  # pyrefly: ignore - we don't need type inference for this test
+            },
         ]
 
         popper._process_api_messages(response1)
@@ -403,8 +402,18 @@ class TestProcessApiMessages:
         popper = _make_popper()
         response = Mock()
         response.messages = [
-            {"id": "msg-1", "message": "a", "origin": "system", "expiry": None},
-            {"id": "msg-2", "message": "b", "origin": "admin", "expiry": None},
+            {
+                "id": "msg-1",
+                "message": "a",
+                "origin": "system",
+                "expiry": None,  # pyrefly: ignore - we don't need type inference for this test
+            },
+            {
+                "id": "msg-2",
+                "message": "b",
+                "origin": "admin",
+                "expiry": None,  # pyrefly: ignore - we don't need type inference for this test
+            },
         ]
 
         popper._process_api_messages(response)
@@ -620,7 +629,7 @@ def _noop_span(**_kwargs: object):  # noqa: ANN202
 
 
 # Stack all three patches needed for full-flow tests
-def _full_flow_patches(fn):  # noqa: ANN001, ANN202
+def _full_flow_patches(fn):  # noqa: ANN001, ANN202 # pyrefly: ignore - this is a decorator factory, not a regular function, so type inference isn't helpful here
     """Apply all patches needed to run api_job_pop through the full flow."""
     fn = patch(_SPAN_POP_PATH, _noop_span)(fn)
     fn = patch(_POP_REQUEST_PATH)(fn)
@@ -688,7 +697,7 @@ class TestApiJobPopFullFlow:
 
         await popper.api_job_pop()
 
-        assert popper._state.last_pop_maintenance_mode is False
+        assert popper._state.last_pop_maintenance_mode is False  # pyrefly: ignore - "always true" is wrong, api_job_pop() should mutate
 
     @_full_flow_patches
     async def test_successful_pop_resets_throttler_to_default(self, _mock_req_cls: Mock) -> None:
@@ -707,7 +716,7 @@ class TestApiJobPopFullFlow:
         empty_response = Mock()
         empty_response.id_ = None
         empty_response.skipped = Mock()
-        empty_response.skipped.model_dump.return_value = {}
+        empty_response.skipped.model_dump.return_value = {}  #  pyrefly: ignore - we just need to ensure this doesn't raise, the actual content isn't important for this test
         empty_response.skipped.model_extra = None
         empty_response.messages = None
 

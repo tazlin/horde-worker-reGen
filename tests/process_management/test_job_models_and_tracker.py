@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from unittest.mock import Mock
-
 from horde_worker_regen.process_management.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.job_tracker import JobTracker
 
-from .conftest import track_popped_job_async
+from .conftest import make_mock_job, track_popped_job_async
 
 
 class TestAPIWorkerMessageFromRawDict:
@@ -94,7 +92,10 @@ class TestAPIWorkerMessageFromRawDict:
 
     def test_message_text_with_none_value(self) -> None:
         """Explicitly setting message to None should produce 'None' string."""
-        raw = {"id": "msg-005", "message": None}
+        raw = {
+            "id": "msg-005",
+            "message": None,  # pyrefly: ignore - we want to ensure that None is handled gracefully and converted to the string "None"
+        }
 
         msg = APIWorkerMessage.from_raw_dict(raw)
 
@@ -155,17 +156,7 @@ class TestJobTrackerShouldWaitForPendingMegapixelsteps:
         job_tracker.set_performance_mode_thresholds(100)
 
         # Add one small job
-        job = Mock()
-        job.payload.width = 512
-        job.payload.height = 512
-        job.payload.ddim_steps = 20
-        job.payload.n_iter = 1
-        job.payload.post_processing = []
-        job.payload.loras = []
-        job.payload.control_type = None
-        job.payload.hires_fix = False
-        job.model = "test_model"
-        job.payload.workflow = None
+        job = make_mock_job(model="test_model", width=512, height=512, ddim_steps=20)
         await track_popped_job_async(job_tracker, job)
 
         assert job_tracker.should_wait_for_pending_megapixelsteps() is False
@@ -176,17 +167,7 @@ class TestJobTrackerShouldWaitForPendingMegapixelsteps:
         job_tracker.set_performance_mode_thresholds(1)  # Very low threshold
 
         # Add a large job
-        job = Mock()
-        job.payload.width = 2048
-        job.payload.height = 2048
-        job.payload.ddim_steps = 100
-        job.payload.n_iter = 1
-        job.payload.post_processing = []
-        job.payload.loras = []
-        job.payload.control_type = None
-        job.payload.hires_fix = False
-        job.model = "test_model"
-        job.payload.workflow = None
+        job = make_mock_job(model="test_model", width=2048, height=2048, ddim_steps=100)
         await track_popped_job_async(job_tracker, job)
 
         assert job_tracker.should_wait_for_pending_megapixelsteps() is True
@@ -211,17 +192,7 @@ class TestJobTrackerSetPerformanceModeThresholds:
         job_tracker.set_performance_mode_thresholds(0)
 
         # Need a job large enough to round to at least 1 MPS after int truncation
-        job = Mock()
-        job.payload.width = 1024
-        job.payload.height = 1024
-        job.payload.ddim_steps = 20
-        job.payload.n_iter = 1
-        job.payload.post_processing = []
-        job.payload.loras = []
-        job.payload.control_type = None
-        job.payload.hires_fix = False
-        job.model = "test_model"
-        job.payload.workflow = None
+        job = make_mock_job(model="test_model", width=1024, height=1024, ddim_steps=20)
         await track_popped_job_async(job_tracker, job)
 
         # Pending MPS > 0 and threshold is 0 → should wait

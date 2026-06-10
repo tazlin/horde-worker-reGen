@@ -2,6 +2,8 @@
 
 from unittest.mock import Mock
 
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
+
 from horde_worker_regen.utils.job_queue_analyzer import JobQueueAnalyzer
 
 
@@ -28,8 +30,10 @@ def create_mock_job(
     job.payload.height = height
     job.payload.ddim_steps = ddim_steps
     job.payload.n_iter = n_iter
-    job.payload.post_processing = []
-    job.payload.loras = []
+    post_processing: list[str] = []
+    job.payload.post_processing = post_processing
+    loras: list[LorasPayloadEntry] = []
+    job.payload.loras = loras
     job.payload.hires_fix = False
     job.payload.control_type = None
     job.model = "stable_diffusion"

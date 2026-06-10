@@ -4,6 +4,7 @@ import pathlib
 import pytest
 from horde_model_reference.model_reference_manager import GitHubBackend, ModelReferenceManager, PrefetchStrategy
 from horde_sdk.generic_api.consts import ANON_API_KEY
+from pydantic import JsonValue
 from ruamel.yaml import YAML
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -14,7 +15,7 @@ def test_bridge_data_yaml() -> None:
     """Test that the bridge data template file can be loaded and parsed as YAML."""
     # bridge_data_filename = "bridgeData.yaml"
     bridge_data_filename = "bridgeData_template.yaml"
-    bridge_data_raw: dict | None = None
+    bridge_data_raw: dict[str, JsonValue] | None = None
 
     yaml = YAML(typ="safe")
 
@@ -62,6 +63,7 @@ async def test_bridge_data_loader_yaml_local_if_present() -> None:
             backend=GitHubBackend(),
             prefetch_strategy=PrefetchStrategy.DEFERRED,
         )
+        assert horde_model_reference_manager.deferred_prefetch_handle is not None
         await horde_model_reference_manager.deferred_prefetch_handle
     else:
         horde_model_reference_manager = ModelReferenceManager.get_instance()
@@ -92,6 +94,7 @@ async def test_bridge_data_load_from_env_vars() -> None:
             backend=GitHubBackend(),
             prefetch_strategy=PrefetchStrategy.DEFERRED,
         )
+        assert horde_model_reference_manager.deferred_prefetch_handle is not None
         await horde_model_reference_manager.deferred_prefetch_handle
     else:
         horde_model_reference_manager = ModelReferenceManager.get_instance()

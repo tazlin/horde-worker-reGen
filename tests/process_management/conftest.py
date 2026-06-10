@@ -6,7 +6,8 @@ import uuid
 from unittest.mock import Mock
 
 import pytest
-from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
+from pydantic import JsonValue
 
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
@@ -85,6 +86,41 @@ async def track_popped_job_async(
     return pop_response
 
 
+def make_mock_job(
+    *,
+    model: str = "stable_diffusion",
+    width: int = 512,
+    height: int = 512,
+    ddim_steps: int = 30,
+    n_iter: int = 1,
+    post_processing: list[str] | None = None,
+    loras: list[LorasPayloadEntry] | None = None,
+    control_type: str | None = None,
+    hires_fix: bool = False,
+    workflow: object | None = None,
+) -> Mock:
+    """Create a mock job with sensible defaults for testing.
+
+    The returned mock has a ``.payload`` sub-mock with standard image-generation
+    fields sufficient for megapixelstep calculation and job tracking. Callers
+    can override or add any attribute after creation.
+    """
+    job = Mock()
+    job.model = model
+    job.payload.width = width
+    job.payload.height = height
+    job.payload.ddim_steps = ddim_steps
+    job.payload.n_iter = n_iter
+    default_post_processing: list[str] = []
+    job.payload.post_processing = post_processing if post_processing is not None else default_post_processing
+    default_loras: list[LorasPayloadEntry] = []
+    job.payload.loras = loras if loras is not None else default_loras
+    job.payload.control_type = control_type
+    job.payload.hires_fix = hires_fix
+    job.payload.workflow = workflow
+    return job
+
+
 async def mark_job_in_progress_async(job_tracker: JobTracker, job: object) -> None:
     """Mark a job as in-progress using the async mutation API."""
     await job_tracker.mark_inference_started(job)  # type: ignore[arg-type]
@@ -118,7 +154,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     """
     bd = Mock()
     bd.image_models_to_load = ["stable_diffusion"]
-    bd.custom_models = []
+    bd.custom_models = []  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
     bd.max_threads = 1
     bd.queue_size = 1
     bd.high_memory_mode = False
@@ -146,7 +182,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.api_key = "test-api-key"
     bd.dreamer_worker_name = "test-worker"
     bd.horde_model_stickiness = 0
-    bd.blacklist = []
+    bd.blacklist = []  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
     bd.require_upfront_kudos = False
     bd.allow_img2img = True
     bd.allow_inpainting = True
@@ -170,7 +206,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
 def make_mock_sd_reference() -> Mock:
     """Create a mock ImageGenerationModelRecord reference."""
     ref = Mock()
-    ref.root = {}
+    ref.root = {}  # pyrefly: ignore - we aren't testing the stable diffusion reference here, just that we can create a mock with the expected structure
     return ref
 
 
@@ -217,12 +253,12 @@ def make_job_pop_response(
     n_iter: int = 1,
     seed: str = "42",
     prompt: str = "test prompt",
-    loras: list[object] | None = None,
+    loras: list[LorasPayloadEntry] | None = None,
     r2_upload: str | None = None,
 ) -> ImageGenerateJobPopResponse:
     """Create a real ImageGenerateJobPopResponse for testing."""
     job_id = uuid.uuid4()
-    data: dict = {
+    data: dict[str, JsonValue] = {
         "id": str(job_id),
         "ids": [str(job_id)],
         "model": model,
@@ -239,10 +275,10 @@ def make_job_pop_response(
         "source_processing": "txt2img",
     }
     if loras is not None:
-        data["payload"]["loras"] = loras
+        data["payload"]["loras"] = loras  # pyrefly: ignore - type safety doesn't matter here; violations will be caught elsewhere
     if r2_upload is not None:
         data["r2_upload"] = r2_upload
-    return ImageGenerateJobPopResponse(**data)
+    return ImageGenerateJobPopResponse(**data)  # pyrefly: ignore - type violations will be caught by pydantic
 
 
 def make_test_system_resources(

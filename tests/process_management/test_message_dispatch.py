@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
@@ -24,6 +25,7 @@ from horde_worker_regen.process_management.worker_state import WorkerState
 from .conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
+    make_mock_job,
     make_mock_process_info,
     make_test_model_metadata,
     make_test_runtime_config,
@@ -39,7 +41,7 @@ def _make_dispatcher(
     horde_model_map: HordeModelMap | None = None,
     job_tracker: JobTracker | None = None,
     bridge_data: Mock | None = None,
-    process_message_queue: queue.Queue | None = None,
+    process_message_queue: ProcessQueue | None = None,
 ) -> MessageDispatcher:
     """Build a MessageDispatcher with mostly-mocked dependencies."""
     if state is None:
@@ -228,7 +230,7 @@ class TestHandleInferenceResult:
         msg.time_elapsed = 5.0
         msg.info = "50%"
         msg.state = Mock()
-        msg.state.__eq__ = lambda self, other: False  # not faulted
+        msg.state.__eq__ = lambda self, other: False  # pyrefly: ignore - we aren't testing state handling here, just that the message is processed and the job is moved to safety check
         msg.job_image_results = [Mock()]
         msg.faults_count = 0
 
@@ -277,9 +279,8 @@ class TestHandleInferenceResult:
 
         message_dispatcher = _make_dispatcher(process_map=process_map)
 
-        job = Mock()
+        job = make_mock_job()
         job.id_ = "unknown-job"
-        job.model = "stable_diffusion"
 
         msg = Mock(spec=HordeInferenceResultMessage)
         msg.process_id = 0
@@ -310,7 +311,7 @@ class TestHandleSafetyResult:
         job.id_ = "safety-test-id"
 
         image_result = Mock()
-        image_result.generation_faults = []
+        image_result.generation_faults = []  # pyrefly: ignore - we aren't testing fault handling here, just that the safety result is processed and the job is moved to pending submit
 
         job_info = Mock()
         job_info.sdk_api_job_info = job

@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import Mock
-
 from horde_worker_regen.process_management.job_popper import _select_models_for_pop
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.process_map import ProcessMap
 
-from .conftest import make_mock_bridge_data, make_mock_process_info, track_popped_job_async
+from .conftest import make_mock_bridge_data, make_mock_job, make_mock_process_info, track_popped_job_async
 
 
 class TestSelectModelsForPopBasic:
@@ -72,12 +70,8 @@ class TestDuplicateModelFiltering:
         process_map = ProcessMap({})
         job_tracker = JobTracker()
 
-        job1 = Mock()
-        job1.model = "model_a"
-        job2 = Mock()
-        job2.model = "model_a"
-        await track_popped_job_async(job_tracker, job1)
-        await track_popped_job_async(job_tracker, job2)
+        await track_popped_job_async(job_tracker, make_mock_job(model="model_a"))
+        await track_popped_job_async(job_tracker, make_mock_job(model="model_a"))
 
         result = _select_models_for_pop(
             bridge_data,
@@ -97,9 +91,7 @@ class TestDuplicateModelFiltering:
         process_map = ProcessMap({})
         job_tracker = JobTracker()
 
-        job1 = Mock()
-        job1.model = "model_a"
-        await track_popped_job_async(job_tracker, job1)
+        await track_popped_job_async(job_tracker, make_mock_job(model="model_a"))
 
         result = _select_models_for_pop(
             bridge_data,
@@ -119,9 +111,7 @@ class TestDuplicateModelFiltering:
         job_tracker = JobTracker()
 
         for _ in range(2):
-            job = Mock()
-            job.model = "model_a"
-            await track_popped_job_async(job_tracker, job)
+            await track_popped_job_async(job_tracker, make_mock_job(model="model_a"))
 
         result = _select_models_for_pop(
             bridge_data,
@@ -140,9 +130,7 @@ class TestDuplicateModelFiltering:
         job_tracker = JobTracker()
 
         for _ in range(3):
-            job = Mock()
-            job.model = "model_a"
-            await track_popped_job_async(job_tracker, job)
+            await track_popped_job_async(job_tracker, make_mock_job(model="model_a"))
 
         result = _select_models_for_pop(
             bridge_data,
@@ -371,9 +359,7 @@ class TestSelectModelsForPopCombinations:
 
         # model_a has 2 jobs, should be filtered
         for _ in range(2):
-            job = Mock()
-            job.model = "model_a"
-            await track_popped_job_async(job_tracker, job)
+            await track_popped_job_async(job_tracker, make_mock_job(model="model_a"))
 
         result = _select_models_for_pop(
             bridge_data,
@@ -396,9 +382,7 @@ class TestSelectModelsForPopCombinations:
 
         # model_0 and model_2 have 2 jobs each
         for model_name in ["model_0", "model_0", "model_2", "model_2"]:
-            job = Mock()
-            job.model = model_name
-            await track_popped_job_async(job_tracker, job)
+            await track_popped_job_async(job_tracker, make_mock_job(model=model_name))
 
         result = _select_models_for_pop(
             bridge_data,

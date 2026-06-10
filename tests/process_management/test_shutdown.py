@@ -57,7 +57,7 @@ class TestIsTimeForShutdown:
         """If we've recently recovered from a failure, we should delay shutdown to avoid a shutdown loop."""
         state = WorkerState(shutting_down=True)
         shutdown_manager = _make_shutdown_manager(state=state)
-        shutdown_manager._process_lifecycle.recently_recovered = True
+        shutdown_manager._process_lifecycle.recently_recovered = True  # pyrefly: ignore - we aren't testing the process lifecycle here, just that the shutdown manager respects this flag
 
         assert shutdown_manager.is_time_for_shutdown() is False
 

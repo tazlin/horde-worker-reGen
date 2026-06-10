@@ -272,7 +272,7 @@ class TestRecordDownloadFaults:
             any_extra_source_images_are_urls=False,
         )
 
-        assert len(job_tracker.job_faults["test-job-123"]) == 2
+        assert len(job_tracker.job_faults["test-job-123"]) == 2  # pyrefly: ignore - we aren't testing indexing this dict, the id is just a convenient key for the test
         assert job_tracker.job_faults["test-job-123"][0] is existing_fault
 
     async def test_no_fault_when_download_succeeded(self) -> None:

@@ -13,7 +13,7 @@ from horde_worker_regen.process_management.pop_throttler import (
     PopThrottler,
 )
 
-from .conftest import make_mock_bridge_data, track_popped_job_async
+from .conftest import make_mock_bridge_data, make_mock_job, track_popped_job_async
 
 
 def _make_throttler(
@@ -29,6 +29,17 @@ def _make_throttler(
         default_pop_frequency=default_pop_frequency,
         error_pop_frequency=error_pop_frequency,
     )
+
+
+def _make_mock_job() -> Mock:
+    """Create a standard mock job with a 1024×1024 image at 50 steps."""
+    return make_mock_job(width=1024, height=1024, ddim_steps=50)
+
+
+async def _track_mock_jobs(job_tracker: JobTracker, count: int) -> None:
+    """Create *count* standard mock jobs and track them as popped."""
+    for _ in range(count):
+        await track_popped_job_async(job_tracker, _make_mock_job())
 
 
 class TestPopFrequencyDefaults:
@@ -219,17 +230,7 @@ class TestShouldWaitForMegapixelsteps:
         bd = self._make_bridge_data()
 
         # Add many large jobs to push pending MPS above threshold
-        for _ in range(10):
-            job = Mock()
-            job.payload.width = 1024
-            job.payload.height = 1024
-            job.payload.ddim_steps = 50
-            job.payload.n_iter = 1
-            job.payload.post_processing = []
-            job.payload.loras = []
-            job.payload.control_type = None
-            job.payload.hires_fix = False
-            await track_popped_job_async(job_tracker, job)
+        await _track_mock_jobs(job_tracker, 10)
 
         assert job_tracker.should_wait_for_pending_megapixelsteps() is True
 
@@ -246,17 +247,7 @@ class TestShouldWaitForMegapixelsteps:
         bd = self._make_bridge_data()
 
         # Add jobs above threshold
-        for _ in range(10):
-            job = Mock()
-            job.payload.width = 1024
-            job.payload.height = 1024
-            job.payload.ddim_steps = 50
-            job.payload.n_iter = 1
-            job.payload.post_processing = []
-            job.payload.loras = []
-            job.payload.control_type = None
-            job.payload.hires_fix = False
-            await track_popped_job_async(job_tracker, job)
+        await _track_mock_jobs(job_tracker, 10)
 
         # First call sets the trigger
         throttler.should_wait_for_megapixelsteps(bd)
@@ -270,17 +261,7 @@ class TestShouldWaitForMegapixelsteps:
         throttler = _make_throttler(job_tracker=job_tracker)
         bd = self._make_bridge_data()
 
-        for _ in range(10):
-            job = Mock()
-            job.payload.width = 1024
-            job.payload.height = 1024
-            job.payload.ddim_steps = 50
-            job.payload.n_iter = 1
-            job.payload.post_processing = []
-            job.payload.loras = []
-            job.payload.control_type = None
-            job.payload.hires_fix = False
-            await track_popped_job_async(job_tracker, job)
+        await _track_mock_jobs(job_tracker, 10)
 
         # Trigger the wait
         throttler.should_wait_for_megapixelsteps(bd)
@@ -299,22 +280,7 @@ class TestShouldWaitForMegapixelsteps:
         bd_normal = self._make_bridge_data(high_performance_mode=False, moderate_performance_mode=False)
         bd_high = self._make_bridge_data(high_performance_mode=True)
 
-        normal_wait = throttler._calculate_megapixelstep_wait(bd_normal)
-        high_wait = throttler._calculate_megapixelstep_wait(bd_high)
-
-        # With 0 pending, both should be 0 or very small
-        # Add jobs to make the difference meaningful
-        for _ in range(5):
-            job = Mock()
-            job.payload.width = 1024
-            job.payload.height = 1024
-            job.payload.ddim_steps = 50
-            job.payload.n_iter = 1
-            job.payload.post_processing = []
-            job.payload.loras = []
-            job.payload.control_type = None
-            job.payload.hires_fix = False
-            await track_popped_job_async(job_tracker, job)
+        await _track_mock_jobs(job_tracker, 5)
 
         normal_wait = throttler._calculate_megapixelstep_wait(bd_normal)
         high_wait = throttler._calculate_megapixelstep_wait(bd_high)
@@ -326,17 +292,7 @@ class TestShouldWaitForMegapixelsteps:
         job_tracker = JobTracker()
         throttler = _make_throttler(job_tracker=job_tracker)
 
-        for _ in range(5):
-            job = Mock()
-            job.payload.width = 1024
-            job.payload.height = 1024
-            job.payload.ddim_steps = 50
-            job.payload.n_iter = 1
-            job.payload.post_processing = []
-            job.payload.loras = []
-            job.payload.control_type = None
-            job.payload.hires_fix = False
-            await track_popped_job_async(job_tracker, job)
+        await _track_mock_jobs(job_tracker, 5)
 
         bd_normal = self._make_bridge_data(high_performance_mode=False, moderate_performance_mode=False)
         bd_moderate = self._make_bridge_data(moderate_performance_mode=True, high_performance_mode=False)
@@ -351,17 +307,7 @@ class TestShouldWaitForMegapixelsteps:
         job_tracker = JobTracker()
         throttler = _make_throttler(job_tracker=job_tracker)
 
-        for _ in range(5):
-            job = Mock()
-            job.payload.width = 1024
-            job.payload.height = 1024
-            job.payload.ddim_steps = 50
-            job.payload.n_iter = 1
-            job.payload.post_processing = []
-            job.payload.loras = []
-            job.payload.control_type = None
-            job.payload.hires_fix = False
-            await track_popped_job_async(job_tracker, job)
+        await _track_mock_jobs(job_tracker, 5)
 
         bd_single = self._make_bridge_data(max_threads=1)
         bd_multi = self._make_bridge_data(max_threads=2)

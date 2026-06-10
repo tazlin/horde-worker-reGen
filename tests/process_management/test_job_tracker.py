@@ -7,6 +7,7 @@ from unittest.mock import Mock
 from horde_worker_regen.process_management.job_tracker import JobTracker, JobTrackerSnapshot, _JobTrackerState
 
 from .conftest import (
+    make_mock_job,
     mark_job_in_progress_async,
     move_job_to_being_safety_checked_async,
     queue_job_for_safety_async,
@@ -178,17 +179,7 @@ async def test_should_wait_for_pending_megapixelsteps(job_tracker: JobTracker) -
     assert not job_tracker.should_wait_for_pending_megapixelsteps()
 
     # Add a job that creates enough megapixelsteps to exceed threshold
-    big_job = Mock()
-    big_job.payload = Mock()
-    big_job.payload.width = 1024
-    big_job.payload.height = 1024
-    big_job.payload.ddim_steps = 50
-    big_job.payload.n_iter = 1
-    big_job.payload.post_processing = []
-    big_job.payload.loras = []
-    big_job.payload.hires_fix = False
-    big_job.payload.control_type = None
-    big_job.model = "stable_diffusion"
+    big_job = make_mock_job(width=1024, height=1024, ddim_steps=50)
     await track_popped_job_async(job_tracker, big_job)
 
     assert job_tracker.should_wait_for_pending_megapixelsteps()

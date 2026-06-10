@@ -88,7 +88,7 @@ class TestStartEvaluateSafety:
         process_manager._process_map.update({10: safety_proc})
 
         sd_ref = Mock()
-        sd_ref.root = {}
+        sd_ref.root = {}  # pyrefly: ignore - we aren't testing the stable diffusion reference here, just that the code handles missing data gracefully
         process_manager.stable_diffusion_reference = sd_ref
 
         job = Mock()
@@ -125,7 +125,7 @@ class TestStartEvaluateSafety:
         process_manager._process_map.update({10: safety_proc})
 
         sd_ref = Mock()
-        sd_ref.root = {}
+        sd_ref.root = {}  # pyrefly: ignore - we aren't testing the stable diffusion reference here, just that the code handles missing data gracefully
         process_manager.stable_diffusion_reference = sd_ref
 
         job = Mock()

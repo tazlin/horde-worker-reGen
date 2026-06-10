@@ -25,33 +25,36 @@ def test_pre_commit_dep_versions(
         precommit_config = yaml.safe_load(f)
 
     # Initialize a dictionary to hold the versions of the dependencies
-    versions = {dep: None for dep in tracked_dependencies}
+    versions = dict.fromkeys(tracked_dependencies)
 
     # Extract versions from the pre-commit config
     for repo in precommit_config["repos"]:
         if "mypy" in repo["repo"]:
             for dep in repo["hooks"][0]["additional_dependencies"]:
+                # Find which tracked dependency this dep string refers to
+                matched_dep = next((name for name in versions if name in dep), None)
+                if matched_dep is None:
+                    continue
+
                 try:
-                    if any(dep_name in dep for dep_name in versions):
-                        if "==" in dep:
-                            dep_name, dep_version = dep.split("==")[0], dep.split("==")[1]
-                        elif "~=" in dep:
-                            dep_name, dep_version = dep.split("~=")[0], dep.split("~=")[1]
-                        elif ">=" in dep:
-                            dep_name, dep_version = dep.split(">=")[0], dep.split(">=")[1]
-                        else:
-                            raise ValueError(f"Unsupported version pin: {dep}")
+                    if "==" in dep:
+                        dep_version = dep.split("==")[1]
+                    elif "~=" in dep:
+                        dep_version = dep.split("~=")[1]
+                    elif ">=" in dep:
+                        dep_version = dep.split(">=")[1]
+                    else:
+                        raise ValueError(f"Unsupported version pin: {dep}")
                 except Exception as e:
                     raise ValueError(
                         f"Failed to split dependency: {dep}. Are you missing an exact version pin?",
                     ) from e
-                if dep_name in versions:
-                    versions[dep_name] = dep_version
+                versions[matched_dep] = dep_version
 
     # Ensure all versions were found
-    assert all(
-        version is not None for version in versions.values()
-    ), f"Some dependencies are missing their versions.\n{versions}"
+    assert all(version is not None for version in versions.values()), (
+        f"Some dependencies are missing their versions.\n{versions}"
+    )
 
     # Check if the versions match
     matches = sum(1 for dep, version in horde_dependency_versions.items() if versions.get(dep) == version)

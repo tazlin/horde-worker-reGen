@@ -4,7 +4,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 from horde_sdk.generation_parameters import KNOWN_UPSCALERS
 
 from horde_worker_regen.consts import (
@@ -21,7 +21,7 @@ def create_mock_job(
     ddim_steps: int = 20,
     n_iter: int = 1,
     post_processing: list[str] | None = None,
-    loras: list | None = None,
+    loras: list[LorasPayloadEntry] | None = None,
     hires_fix: bool = False,
     model: str = "stable_diffusion",
     workflow: str = "txt2img",
@@ -98,7 +98,7 @@ def test_get_single_job_effective_megapixelsteps_with_upscaler() -> None:
 
 def test_get_single_job_effective_megapixelsteps_with_loras() -> None:
     """Test megapixelsteps calculation with LoRAs."""
-    job = create_mock_job(width=512, height=512, ddim_steps=20, n_iter=1, loras=[{"name": "test_lora"}])
+    job = create_mock_job(width=512, height=512, ddim_steps=20, n_iter=1, loras=[LorasPayloadEntry(name="test_lora")])
     result = get_single_job_magnitude(job)
 
     # Base: 512 * 512 * 20 = 5,242,880
@@ -193,7 +193,7 @@ def test_get_single_job_effective_megapixelsteps_complex_job() -> None:
         ddim_steps=25,
         n_iter=2,
         post_processing=post_processing,
-        loras=[{"name": "lora1"}],
+        loras=[LorasPayloadEntry(name="lora1")],
         hires_fix=True,
     )
     result = get_single_job_magnitude(job)

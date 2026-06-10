@@ -15,6 +15,7 @@ from horde_worker_regen.process_management.worker_state import WorkerState
 
 from .conftest import (
     make_mock_bridge_data,
+    make_mock_job,
     make_mock_process_info,
     make_test_model_metadata,
     make_test_runtime_config,
@@ -68,9 +69,7 @@ class TestDetectDeadlock:
         """Deadlocks should not be detected if a job was just popped."""
         state = WorkerState(last_job_pop_time=time.time())
         job_tracker = JobTracker()
-        job = Mock()
-        job.model = "stable_diffusion"
-        await track_popped_job_async(job_tracker, job)
+        await track_popped_job_async(job_tracker, make_mock_job())
 
         message_dispatcher = _make_message_dispatcher(state=state, job_tracker=job_tracker)
         message_dispatcher.detect_deadlock()
@@ -89,9 +88,7 @@ class TestDetectDeadlock:
         process_map = ProcessMap({0: process_info})
 
         job_tracker = JobTracker()
-        job = Mock()
-        job.model = "stable_diffusion"
-        await track_popped_job_async(job_tracker, job)
+        await track_popped_job_async(job_tracker, make_mock_job())
 
         message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker)
         message_dispatcher.detect_deadlock()
@@ -108,9 +105,7 @@ class TestDetectDeadlock:
         process_map = ProcessMap({0: process_info})
 
         job_tracker = JobTracker()
-        job = Mock()
-        job.model = "some_model"
-        await track_popped_job_async(job_tracker, job)
+        await track_popped_job_async(job_tracker, make_mock_job(model="some_model"))
 
         message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker)
         message_dispatcher.detect_deadlock()
@@ -123,9 +118,7 @@ class TestDetectDeadlock:
         process_map = ProcessMap({})
 
         job_tracker = JobTracker()
-        job = Mock()
-        job.model = "stable_diffusion"
-        await track_popped_job_async(job_tracker, job)
+        await track_popped_job_async(job_tracker, make_mock_job())
 
         message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker)
         message_dispatcher.detect_deadlock()
@@ -138,9 +131,7 @@ class TestDetectDeadlock:
         process_map = ProcessMap({0: process_info})
 
         job_tracker = JobTracker()
-        job = Mock()
-        job.model = "stable_diffusion"
-        await track_popped_job_async(job_tracker, job)
+        await track_popped_job_async(job_tracker, make_mock_job())
 
         message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker)
         message_dispatcher._in_deadlock = True
