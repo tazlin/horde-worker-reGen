@@ -7,7 +7,8 @@ from unittest.mock import Mock
 from horde_worker_regen.process_management._canned_scenarios import (
     SCENARIO_BASIC,
     SCENARIO_TRIVIAL,
-    get_dry_run_job,
+    CannedJobSource,
+    make_default_dry_run_source,
 )
 
 
@@ -24,15 +25,32 @@ def test_canned_scenario_basic_has_five_jobs() -> None:
         assert job.model == "Deliberate"
 
 
-def test_get_dry_run_job_cycles() -> None:
-    """get_dry_run_job should cycle through SCENARIO_BASIC indefinitely."""
+def test_default_dry_run_source_cycles() -> None:
+    """The default dry-run source should cycle through SCENARIO_BASIC indefinitely."""
+    source = make_default_dry_run_source()
     seen_ids = set()
     for _ in range(10):
-        job = get_dry_run_job()
+        job = source.next_pop_response()
         assert job.model == "Deliberate"
         assert job.id_ is not None
         seen_ids.add(job.id_)
     assert len(seen_ids) == 5
+    assert not source.exhausted
+    assert source.total_jobs is None
+
+
+def test_finite_canned_source_exhausts() -> None:
+    """A non-cycling source should hand out each job once, then report no jobs available."""
+    jobs = SCENARIO_BASIC
+    source = CannedJobSource(jobs)
+    assert source.total_jobs == len(jobs)
+
+    handed_out = [source.next_pop_response() for _ in range(len(jobs))]
+    assert [job.id_ for job in handed_out] == [job.id_ for job in jobs]
+    assert source.exhausted
+
+    empty = source.next_pop_response()
+    assert empty.id_ is None
 
 
 def test_dry_run_process_manager_has_dry_run_flags(dry_run_bridge_data: Mock) -> None:

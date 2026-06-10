@@ -43,6 +43,7 @@ from horde_worker_regen.consts import (
     VRAM_HEAVY_MODELS,
 )
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
+from horde_worker_regen.process_management._canned_scenarios import CannedJobSource
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
@@ -61,6 +62,7 @@ from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.safety_orchestrator import SafetyOrchestrator
 from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
+from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
@@ -156,8 +158,8 @@ class HordeWorkerProcessManager:
     def bridge_data(self, value: reGenBridgeData) -> None:
         self._runtime_config.update(value)
 
-    horde_model_reference_manager: ModelReferenceManager
-    """The model reference manager for this worker."""
+    horde_model_reference_manager: ModelReferenceManager | None
+    """The model reference manager for this worker. None only when a pre-loaded reference was injected."""
 
     max_inference_processes: int
     """The maximum number of inference processes that can be active. This is not the number of jobs that
@@ -334,7 +336,7 @@ class HordeWorkerProcessManager:
         *,
         ctx: BaseContext,
         bridge_data: reGenBridgeData,
-        horde_model_reference_manager: ModelReferenceManager,
+        horde_model_reference_manager: ModelReferenceManager | None,
         target_ram_overhead_bytes: int = 9 * 1024 * 1024 * 1024,
         target_vram_overhead_bytes_map: Mapping[int, int] | None = None,  # FIXME
         max_safety_processes: int = 1,
@@ -345,13 +347,17 @@ class HordeWorkerProcessManager:
         mp_primitives: MultiprocessingPrimitives | None = None,
         skip_api_init: bool = False,
         stable_diffusion_reference: dict[str, ImageGenerationModelRecord] | None = None,
+        process_entry_points: ProcessEntryPoints | None = None,
+        canned_job_source: CannedJobSource | None = None,
     ) -> None:
         """Initialise the process manager.
 
         Args:
             ctx: The multiprocessing context to use.
             bridge_data: The bridge data for this worker.
-            horde_model_reference_manager: The model reference manager for this worker.
+            horde_model_reference_manager: The model reference manager for this worker. May only be None \
+                when a pre-loaded `stable_diffusion_reference` is provided (bridge data reloads from disk \
+                are then disabled).
             target_ram_overhead_bytes: The target amount of RAM to keep free.
             target_vram_overhead_bytes_map: The target amount of VRAM to keep free.
             max_safety_processes: The maximum number of safety processes that can run at once.
@@ -362,6 +368,10 @@ class HordeWorkerProcessManager:
             mp_primitives: Pre-created multiprocessing primitives. If None, creates real ones from ctx.
             skip_api_init: If True, skip the remove_maintenance API call during init.
             stable_diffusion_reference: Pre-loaded model reference. If None, fetches from ModelReferenceManager.
+            process_entry_points: Multiprocessing targets for child processes. If None, uses the real \
+                (hordelib-backed) entry points. Test harnesses can inject fakes here.
+            canned_job_source: Source of predetermined jobs used when `dry_run_skip_api` is set. \
+                If None, an endlessly-cycling default scenario is used.
         """
         self.session_start_time = time.time()
         self._state = WorkerState()
@@ -468,6 +478,7 @@ class HordeWorkerProcessManager:
             directml=self._directml,
             abort_callback=self._abort,
             state=self._state,
+            entry_points=process_entry_points,
         )
 
         self._message_dispatcher = MessageDispatcher(
@@ -530,11 +541,16 @@ class HordeWorkerProcessManager:
             max_inference_processes=self.max_inference_processes,
             max_concurrent_inference_processes=self._max_concurrent_inference_processes,
             dry_run_skip_api=bridge_data.dry_run_skip_api,
+            canned_job_source=canned_job_source,
         )
 
         if stable_diffusion_reference is not None:
             self.stable_diffusion_reference = stable_diffusion_reference
         else:
+            if horde_model_reference_manager is None:
+                raise ValueError(
+                    "horde_model_reference_manager may only be None when stable_diffusion_reference is provided",
+                )
             self.stable_diffusion_reference = None
             self._init_model_reference()
 
@@ -789,6 +805,9 @@ class HordeWorkerProcessManager:
         if self._shutting_down or self._last_pop_maintenance_mode:
             return
 
+        if self.bridge_data.dry_run_skip_api:
+            return
+
         request = FindUserRequest(apikey=self.bridge_data.api_key)
         try:
             response = await self.horde_client_session.submit_request(request, UserDetailsResponse)
@@ -826,14 +845,19 @@ class HordeWorkerProcessManager:
         while True:
             with logger.catch():
                 try:
-                    await self.api_get_user_info()
-                    if self.is_time_for_shutdown() or self._shut_down:
-                        break
+                    if time.time() - self._last_get_user_info_time >= self._api_get_user_info_interval:
+                        self._last_get_user_info_time = time.time()
+                        await self.api_get_user_info()
                 except CancelledError as e:
                     self._shutdown()
                     logger.debug(f"CancelledError: {e}")
 
-            await asyncio.sleep(self._api_get_user_info_interval)
+            # Checked outside the catch block so persistent errors cannot prevent shutdown.
+            if self.is_time_for_shutdown() or self._shut_down:
+                break
+
+            # Sleep briefly (not the full user info interval) so shutdown is detected promptly.
+            await asyncio.sleep(1)
 
     _status_message_frequency = 20.0
     """The rate in seconds at which to print status messages with details about the current state of the worker."""
@@ -994,6 +1018,10 @@ class HordeWorkerProcessManager:
         if self.bridge_data._loaded_from_env_vars:
             return
 
+        if self.horde_model_reference_manager is None:
+            logger.debug("No model reference manager available; skipping bridge data reload")
+            return
+
         try:
             self.bridge_data = BridgeDataLoader.load(
                 file_path=BRIDGE_CONFIG_FILENAME,
@@ -1055,9 +1083,9 @@ class HordeWorkerProcessManager:
         await self._job_tracker.start_actor()
         aiohttp_session = ClientSession(requote_redirect_url=False)
 
-        import logfire
+        from horde_worker_regen.telemetry import instrument_aiohttp_client
 
-        logfire.instrument_aiohttp_client()
+        instrument_aiohttp_client()
 
         horde_session = AIHordeAPIAsyncClientSession(
             aiohttp_session=aiohttp_session,

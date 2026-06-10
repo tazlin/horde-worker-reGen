@@ -1,5 +1,6 @@
 import contextlib
 import sys
+from typing import Protocol
 
 try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
@@ -10,6 +11,53 @@ from multiprocessing.synchronize import Lock, Semaphore
 from loguru import logger
 
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.debug_attach import maybe_wait_for_process_debugger
+
+
+class InferenceProcessEntryPoint(Protocol):
+    """The signature a callable must have to serve as an inference process target."""
+
+    def __call__(
+        self,
+        process_id: int,
+        process_message_queue: ProcessQueue,
+        pipe_connection: Connection,
+        inference_semaphore: Semaphore,
+        disk_lock: Lock,
+        aux_model_lock: Lock,
+        vae_decode_semaphore: Semaphore,
+        process_launch_identifier: int,
+        *,
+        low_memory_mode: bool = False,
+        high_memory_mode: bool = False,
+        very_high_memory_mode: bool = False,
+        amd_gpu: bool = False,
+        directml: int | None = None,
+        vram_heavy_models: bool = False,
+        dry_run_skip_inference: bool = False,
+        dry_run_inference_delay: float = 1.0,
+    ) -> None:
+        """Run an inference process until told to end."""
+
+
+class SafetyProcessEntryPoint(Protocol):
+    """The signature a callable must have to serve as a safety process target."""
+
+    def __call__(
+        self,
+        process_id: int,
+        process_message_queue: ProcessQueue,
+        pipe_connection: Connection,
+        disk_lock: Lock,
+        process_launch_identifier: int,
+        cpu_only: bool = True,
+        *,
+        high_memory_mode: bool = False,
+        amd_gpu: bool = False,
+        directml: int | None = None,
+        dry_run_skip_safety: bool = False,
+    ) -> None:
+        """Run a safety process until told to end."""
 
 
 def start_inference_process(
@@ -59,6 +107,7 @@ def start_inference_process(
     """
     with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
         logger.remove()
+        maybe_wait_for_process_debugger(process_id, "inference")
 
         try:
             from hordelib.utils.logger import HordeLog
@@ -189,6 +238,7 @@ def start_safety_process(
     """
     with contextlib.nullcontext():  # contextlib.redirect_stdout(), contextlib.redirect_stderr():
         logger.remove()
+        maybe_wait_for_process_debugger(process_id, "safety")
 
         try:
             from hordelib.utils.logger import HordeLog
@@ -236,3 +286,37 @@ def start_safety_process(
         )
 
         worker_process.main_loop()
+
+
+class ProcessEntryPoints:
+    """The multiprocessing targets used when launching child worker processes.
+
+    The defaults are the real (hordelib-backed) entry points. Test harnesses can
+    substitute the fakes from ``fake_worker_processes`` to exercise the
+    orchestration layer without the ML dependency stack.
+
+    Entry points must be module-level functions (or otherwise picklable) so they
+    survive the trip to a spawned child process.
+    """
+
+    inference_entry_point: InferenceProcessEntryPoint
+    safety_entry_point: SafetyProcessEntryPoint
+
+    def __init__(
+        self,
+        *,
+        inference_entry_point: InferenceProcessEntryPoint | None = None,
+        safety_entry_point: SafetyProcessEntryPoint | None = None,
+    ) -> None:
+        """Initialise with the given entry points, defaulting to the real ones.
+
+        Args:
+            inference_entry_point (InferenceProcessEntryPoint | None, optional): The target for \
+                inference processes. Defaults to `start_inference_process`.
+            safety_entry_point (SafetyProcessEntryPoint | None, optional): The target for \
+                safety processes. Defaults to `start_safety_process`.
+        """
+        self.inference_entry_point = (
+            inference_entry_point if inference_entry_point is not None else start_inference_process
+        )
+        self.safety_entry_point = safety_entry_point if safety_entry_point is not None else start_safety_process

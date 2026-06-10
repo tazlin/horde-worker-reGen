@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import contextlib
 import gc
+import io
 import sys
 import time
+from dataclasses import dataclass, field
 
 from horde_worker_regen.consts import BASE_LORA_DOWNLOAD_TIMEOUT, EXTRA_LORA_DOWNLOAD_TIMEOUT
 
@@ -19,6 +21,7 @@ from typing import TYPE_CHECKING, override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import (
+    GenMetadataEntry,
     ImageGenerateJobPopResponse,
 )
 from loguru import logger
@@ -58,6 +61,14 @@ else:
 
     class ProgressReport:  # noqa
         pass
+
+
+@dataclass
+class _DryRunResultingImage:
+    """Duck-type stand-in for hordelib's `ResultingImageReturn` used in dry-run mode."""
+
+    rawpng: io.BytesIO
+    faults: list[GenMetadataEntry] = field(default_factory=list)
 
 
 class HordeInferenceProcess(HordeProcess):
@@ -196,6 +207,20 @@ class HordeInferenceProcess(HordeProcess):
 
     def _comfyui_callback(self, label: str, data: dict, _id: str) -> None:
         self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+
+    @override
+    def get_vram_usage_bytes(self) -> int:
+        """Return VRAM used, or 0 in dry-run mode where torch is unavailable."""
+        if self._dry_run_skip_inference:
+            return 0
+        return super().get_vram_usage_bytes()
+
+    @override
+    def get_vram_total_bytes(self) -> int:
+        """Return total VRAM, or 0 in dry-run mode where torch is unavailable."""
+        if self._dry_run_skip_inference:
+            return 0
+        return super().get_vram_total_bytes()
 
     @override
     def send_memory_report_message(self, include_vram: bool = False) -> bool:
@@ -385,7 +410,8 @@ class HordeInferenceProcess(HordeProcess):
         if self._is_busy:
             logger.warning("Cannot preload model while busy")
 
-        self.clear_gc_and_torch_cache()
+        if not self._dry_run_skip_inference:
+            self.clear_gc_and_torch_cache()
 
         logger.debug(f"Preloading model {horde_model_name}")
 
@@ -414,13 +440,14 @@ class HordeInferenceProcess(HordeProcess):
 
         time_start = time.time()
 
-        with contextlib.nullcontext():  # self.disk_lock:
-            self._checkpoint_loader.load_checkpoint(
-                will_load_loras=will_load_loras,
-                seamless_tiling_enabled=seamless_tiling_enabled,
-                horde_model_name=horde_model_name,
-                preloading=True,
-            )
+        if not self._dry_run_skip_inference:
+            with contextlib.nullcontext():  # self.disk_lock:
+                self._checkpoint_loader.load_checkpoint(
+                    will_load_loras=will_load_loras,
+                    seamless_tiling_enabled=seamless_tiling_enabled,
+                    horde_model_name=horde_model_name,
+                    preloading=True,
+                )
 
         logger.info(f"Preloaded model {horde_model_name}")
         self._active_model_name = horde_model_name
@@ -576,37 +603,21 @@ class HordeInferenceProcess(HordeProcess):
     def _make_dummy_inference_result(
         job_info: ImageGenerateJobPopResponse,
     ) -> list[ResultingImageReturn]:
-        """Create a minimal 1x1 PNG result for dry-run mode."""
+        """Create minimal 1x1 PNG results for dry-run mode.
+
+        The returned objects duck-type the parts of hordelib's ``ResultingImageReturn``
+        that ``send_inference_result_message`` consumes (``rawpng`` and ``faults``).
+        """
         import io
-        import struct
-        import zlib
 
-        def _make_1x1_png() -> bytes:
-            raw_data = b"\x00\x00\x00\x00"
-            compressed = zlib.compress(raw_data)
-            chunks: list[bytes] = []
-            sig = b"\x89PNG\r\n\x1a\n"
-            chunks.append(sig)
+        from horde_worker_regen.process_management._dummy_images import make_dummy_png_bytes
 
-            def _chunk(ctype: bytes, data: bytes) -> bytes:
-                c = struct.pack(">I", len(data)) + ctype + data
-                crc = struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
-                return c + crc
-
-            ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
-            chunks.append(_chunk(b"IHDR", ihdr))
-            chunks.append(_chunk(b"IDAT", compressed))
-            chunks.append(_chunk(b"IEND", b""))
-            return b"".join(chunks)
-
-        png_bytes = _make_1x1_png()
-        buf = io.BytesIO(png_bytes)
+        png_bytes = make_dummy_png_bytes()
 
         n_iter = job_info.payload.n_iter if job_info.payload.n_iter else 1
         results = []
         for _ in range(n_iter):
-            buf.seek(0)
-            results.append({"image": buf, "seed": job_info.payload.seed or "0"})  # type: ignore[dict-item]
+            results.append(_DryRunResultingImage(rawpng=io.BytesIO(png_bytes)))
         return results  # type: ignore[return-value]
 
     @staticmethod
@@ -620,11 +631,12 @@ class HordeInferenceProcess(HordeProcess):
     @logger.catch(reraise=True)
     def unload_models_from_vram(self) -> None:
         """Unload all models from VRAM."""
-        from hordelib.comfy_horde import unload_all_models_vram
+        if not self._dry_run_skip_inference:
+            from hordelib.comfy_horde import unload_all_models_vram
 
-        unload_all_models_vram()
+            unload_all_models_vram()
 
-        self.clear_gc_and_torch_cache()
+            self.clear_gc_and_torch_cache()
 
         if self._active_model_name is not None:
             self.on_horde_model_state_change(
@@ -646,11 +658,12 @@ class HordeInferenceProcess(HordeProcess):
     @logger.catch(reraise=True)
     def unload_models_from_ram(self) -> None:
         """Unload all models from RAM."""
-        from hordelib.comfy_horde import unload_all_models_ram
+        if not self._dry_run_skip_inference:
+            from hordelib.comfy_horde import unload_all_models_ram
 
-        unload_all_models_ram()
+            unload_all_models_ram()
 
-        self.clear_gc_and_torch_cache()
+            self.clear_gc_and_torch_cache()
 
         self.send_memory_report_message(include_vram=True)
         if self._active_model_name is not None:

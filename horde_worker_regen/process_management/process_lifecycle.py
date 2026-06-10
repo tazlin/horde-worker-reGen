@@ -23,7 +23,7 @@ from horde_worker_regen.process_management.messages import (
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.worker_entry_points import start_inference_process, start_safety_process
+from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.worker_state import WorkerState
 
 
@@ -45,6 +45,7 @@ class ProcessLifecycleManager:
     _directml: int | None
     _abort_callback: Callable[[], None]
     _state: WorkerState
+    _entry_points: ProcessEntryPoints
 
     num_processes_launched: int
     _num_process_recoveries: int
@@ -72,6 +73,7 @@ class ProcessLifecycleManager:
         directml: int | None,
         abort_callback: Callable[[], None],
         state: WorkerState,
+        entry_points: ProcessEntryPoints | None = None,
     ) -> None:
         """Initialize with shared references and callbacks from the parent manager."""
         self._process_map = process_map
@@ -89,6 +91,7 @@ class ProcessLifecycleManager:
         self._directml = directml
         self._abort_callback = abort_callback
         self._state = state
+        self._entry_points = entry_points if entry_points is not None else ProcessEntryPoints()
 
         self.num_processes_launched = 0
         self._num_process_recoveries = 0
@@ -123,7 +126,7 @@ class ProcessLifecycleManager:
             cpu_only = not bridge_data.safety_on_gpu
 
             process = multiprocessing.Process(
-                target=start_safety_process,
+                target=self._entry_points.safety_entry_point,
                 args=(
                     pid,
                     self._process_message_queue,
@@ -186,7 +189,7 @@ class ProcessLifecycleManager:
 
         pipe_connection, child_pipe_connection = multiprocessing.Pipe(duplex=True)
         process = multiprocessing.Process(
-            target=start_inference_process,
+            target=self._entry_points.inference_entry_point,
             args=(
                 pid,
                 self._process_message_queue,
@@ -278,6 +281,10 @@ class ProcessLifecycleManager:
         process_info = self._process_map.get_first_available_safety_process()
 
         if process_info is None:
+            return
+
+        # Do not re-target a safety process that is already ending.
+        if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
             return
 
         process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))

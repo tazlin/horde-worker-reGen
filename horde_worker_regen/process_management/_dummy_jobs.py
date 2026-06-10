@@ -11,6 +11,9 @@ from horde_sdk.ai_horde_api.apimodels import (
 from horde_sdk.ai_horde_api.fields import GenerationID
 from horde_sdk.generation_parameters.image.consts import KNOWN_IMAGE_SAMPLERS, KNOWN_IMAGE_SOURCE_PROCESSING
 
+DUMMY_R2_UPLOAD_URL = "https://dry-run-upload.invalid/put-target"
+"""Placeholder upload URL for canned jobs; never contacted because dry-run skips submission."""
+
 
 def dummy_job_factory(model_name: str) -> ImageGenerateJobPopResponse:
     # sampler = random.choice(list(KNOWN_IMAGE_SAMPLERS.__members__.keys()))
@@ -21,6 +24,8 @@ def dummy_job_factory(model_name: str) -> ImageGenerateJobPopResponse:
         source_processing=KNOWN_IMAGE_SOURCE_PROCESSING.txt2img,
         skipped=ImageGenerateJobPopSkippedStatus(),  # type: ignore
         model=model_name,
+        r2_upload=DUMMY_R2_UPLOAD_URL,
+        r2_uploads=[DUMMY_R2_UPLOAD_URL],
         payload=ImageGenerateJobPopPayload(
             sampler_name=sampler,
             cfg_scale=7.5,

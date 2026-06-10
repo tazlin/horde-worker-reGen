@@ -17,6 +17,7 @@ from horde_sdk.ai_horde_api.apimodels import (
 from loguru import logger
 
 import horde_worker_regen
+from horde_worker_regen.process_management._canned_scenarios import CannedJobSource, make_default_dry_run_source
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.job_tracker import JobTracker
@@ -124,6 +125,8 @@ class JobPopper:
     _api_messages_received: dict[str | None, APIWorkerMessage]
     _api_call_loop_interval: float
 
+    _canned_job_source: CannedJobSource | None
+
     _max_inference_processes: int
     _max_concurrent_inference_processes: int
 
@@ -139,8 +142,13 @@ class JobPopper:
         max_inference_processes: int,
         max_concurrent_inference_processes: int,
         dry_run_skip_api: bool = False,
+        canned_job_source: CannedJobSource | None = None,
     ) -> None:
-        """Initialize with all required dependencies for job popping."""
+        """Initialize with all required dependencies for job popping.
+
+        When `dry_run_skip_api` is set, jobs come from `canned_job_source` instead of
+        the live API; if no source is given, an endlessly-cycling default is used.
+        """
         self._state = state
         self._process_map = process_map
         self._job_tracker = job_tracker
@@ -151,6 +159,10 @@ class JobPopper:
         self._max_inference_processes = max_inference_processes
         self._max_concurrent_inference_processes = max_concurrent_inference_processes
         self._dry_run_skip_api = dry_run_skip_api
+
+        self._canned_job_source = canned_job_source
+        if dry_run_skip_api and self._canned_job_source is None:
+            self._canned_job_source = make_default_dry_run_source()
 
         self._pop_throttler = PopThrottler(job_tracker=job_tracker)
         self._source_image_downloader = SourceImageDownloader(
@@ -365,10 +377,12 @@ class JobPopper:
             )
 
             if self._dry_run_skip_api:
-                from horde_worker_regen.process_management._canned_scenarios import get_dry_run_job
+                if self._canned_job_source is None:
+                    raise RuntimeError("dry_run_skip_api is set but no canned job source is configured")
 
-                job_pop_response = get_dry_run_job()
-                queue_depth_counter.add(1)
+                job_pop_response = self._canned_job_source.next_pop_response()
+                if job_pop_response.id_ is not None:
+                    queue_depth_counter.add(1)
             else:
                 with span_job_pop(models=",".join(sorted(models))):
                     job_pop_response = await self._api_sessions.require_horde_client_session().submit_request(
@@ -452,11 +466,12 @@ class JobPopper:
             with logger.catch():
                 try:
                     await self.api_job_pop()
-
-                    if self._shutdown_manager.is_time_for_shutdown() or self._state.shut_down:
-                        break
                 except CancelledError as e:
                     self._shutdown_manager.shutdown()
                     logger.debug(f"CancelledError: {e}")
+
+            # Checked outside the catch block so persistent errors cannot prevent shutdown.
+            if self._shutdown_manager.is_time_for_shutdown() or self._state.shut_down:
+                break
 
             await asyncio.sleep(self._api_call_loop_interval)
