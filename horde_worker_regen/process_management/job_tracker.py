@@ -25,7 +25,6 @@ from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.utils.job_queue_analyzer import JobQueueAnalyzer
 
 _T = TypeVar("_T")
-_StopSentinel = object()
 
 
 @dataclass
@@ -74,13 +73,16 @@ class _JobTrackerCommand:
     response_future: asyncio.Future[Any]
 
 
+_StopSentinel = _JobTrackerCommand(handler=lambda _: None, response_future=asyncio.Future())
+
+
 class JobTracker:
     """Actor-backed owner of all job lifecycle state."""
 
     def __init__(self) -> None:
         """Initialize the job tracker."""
         self._state = _JobTrackerState()
-        self._command_queue: asyncio.Queue[_JobTrackerCommand | object] = asyncio.Queue()
+        self._command_queue: asyncio.Queue[_JobTrackerCommand] = asyncio.Queue()
         self._actor_task: asyncio.Task[None] | None = None
 
     async def start_actor(self) -> None:
