@@ -6,6 +6,8 @@ import uuid
 from unittest.mock import Mock
 
 import pytest
+from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 from pydantic import JsonValue
 
@@ -374,6 +376,21 @@ def make_mock_process_info(
     )
     proc.loaded_horde_model_name = model_name
     return proc
+
+
+def make_mock_model_reference_record(
+    model_name: str = "stable_diffusion",
+    description: str = "A test model",
+    baseline: KNOWN_IMAGE_GENERATION_BASELINE = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+    nsfw: bool = False,
+) -> ImageGenerationModelRecord:
+    """Create a mock ImageGenerationModelRecord with the given name."""
+    return ImageGenerationModelRecord(
+        name=model_name,
+        baseline=baseline,
+        nsfw=nsfw,
+        description=description,
+    )
 
 
 @pytest.fixture()

@@ -235,7 +235,7 @@ class HordeSafetyProcess(HordeProcess):
             nsfw_result: NSFWResult | None = self._nsfw_checker.check_for_nsfw(
                 image=image_as_pil,
                 prompt=message.prompt,
-                model_info=message.horde_model_info,
+                model_info=message.horde_model_info.model_dump() if message.horde_model_info is not None else None,
             )
 
             if nsfw_result is None:

@@ -8,7 +8,12 @@ from unittest.mock import Mock
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.messages import HordeProcessState
 
-from .conftest import make_mock_process_info, make_testable_process_manager, queue_job_for_safety_async
+from .conftest import (
+    make_mock_model_reference_record,
+    make_mock_process_info,
+    make_testable_process_manager,
+    queue_job_for_safety_async,
+)
 
 
 class TestStartEvaluateSafety:
@@ -42,8 +47,7 @@ class TestStartEvaluateSafety:
         process_manager._process_map.clear()
         process_manager._process_map.update({10: safety_proc})
 
-        model_record = Mock()
-        model_record.model_dump.return_value = {"name": "test"}
+        model_record = make_mock_model_reference_record("stable_diffusion")
         process_manager.stable_diffusion_reference = {"stable_diffusion": model_record}
 
         job = Mock()
@@ -177,8 +181,7 @@ class TestStartEvaluateSafety:
         process_manager._process_map.clear()
         process_manager._process_map.update({10: safety_proc})
 
-        model_record = Mock()
-        model_record.model_dump.return_value = {"name": "test"}
+        model_record = make_mock_model_reference_record("stable_diffusion")
         process_manager.stable_diffusion_reference = {"stable_diffusion": model_record}
 
         job = Mock()
