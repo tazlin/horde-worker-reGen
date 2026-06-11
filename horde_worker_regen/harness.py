@@ -21,15 +21,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import multiprocessing
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Literal
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_manager import ModelReferenceManager
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
+from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -80,6 +84,12 @@ class HarnessConfig:
     horde_model_reference_manager: ModelReferenceManager | None = None
     """Required for non-skip_api runs that need live model reference data; optional otherwise."""
 
+    fail_every_n: int = 0
+    """If > 0, every nth fake inference job reports a faulted result (fake process mode only)."""
+
+    audit: bool = True
+    """If True, attach a JobLifecycleAuditor and report invariant violations in the result."""
+
 
 @dataclass
 class HarnessResult:
@@ -90,6 +100,11 @@ class HarnessResult:
     num_jobs_faulted: int
     elapsed_seconds: float
     timed_out: bool
+    audit_failures: list[str] = field(default_factory=list)
+    """Invariant violations detected by the JobLifecycleAuditor (empty when auditing is off
+    or the run timed out, since an aborted run purges the tracker)."""
+    num_jobs_submitted_faulted: int = 0
+    """How many jobs reached submission in a faulted state (per the auditor)."""
 
     @property
     def all_jobs_accounted_for(self) -> bool:
@@ -104,29 +119,100 @@ class HarnessResult:
         )
 
 
+class JobLifecycleAuditor:
+    """Records job lifecycle events on a JobTracker and verifies invariants post-run.
+
+    The auditor wraps the tracker's ``record_popped_job`` and ``finalize_submitted``
+    methods to count per-job events, then :meth:`verify` checks:
+
+    1. Every popped job was finalized exactly once (none lost, none double-submitted).
+    2. Nothing was finalized that was never popped.
+    3. The tracker drained completely (no job left in any stage).
+
+    Not suitable for cycling job sources, which legitimately re-pop the same
+    generation IDs.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the auditor with empty event counts."""
+        self.pop_counts: Counter[GenerationID] = Counter()
+        self.finalize_counts: Counter[GenerationID] = Counter()
+        self.num_jobs_submitted_faulted = 0
+        self._manager: HordeWorkerProcessManager | None = None
+
+    def attach(self, manager: HordeWorkerProcessManager) -> None:
+        """Wrap the manager's job tracker so lifecycle events are recorded."""
+        tracker = manager._job_tracker
+        original_record = tracker.record_popped_job
+        original_finalize = tracker.finalize_submitted
+
+        @functools.wraps(original_record)
+        async def record_popped_job(job_pop_response, time_popped=None):  # type: ignore[no-untyped-def]  # noqa: ANN202, ANN001
+            if job_pop_response.id_ is not None:
+                self.pop_counts[job_pop_response.id_] += 1
+            return await original_record(job_pop_response, time_popped)
+
+        @functools.wraps(original_finalize)
+        async def finalize_submitted(completed_job_info):  # type: ignore[no-untyped-def]  # noqa: ANN202, ANN001
+            job_id = completed_job_info.sdk_api_job_info.id_
+            if job_id is not None:
+                self.finalize_counts[job_id] += 1
+                if completed_job_info.state == GENERATION_STATE.faulted:
+                    self.num_jobs_submitted_faulted += 1
+            return await original_finalize(completed_job_info)
+
+        tracker.record_popped_job = record_popped_job  # type: ignore[method-assign]
+        tracker.finalize_submitted = finalize_submitted  # type: ignore[method-assign]
+        self._manager = manager
+
+    def verify(self) -> list[str]:
+        """Return a list of invariant violations observed over the run (empty = clean)."""
+        failures: list[str] = []
+
+        for job_id, count in self.finalize_counts.items():
+            if job_id not in self.pop_counts:
+                failures.append(f"Job {job_id} was finalized but never popped")
+            if count > 1:
+                failures.append(f"Job {job_id} was finalized {count} times (double submit)")
+
+        for job_id in self.pop_counts:
+            if self.finalize_counts.get(job_id, 0) == 0:
+                failures.append(f"Job {job_id} was popped but never finalized (lost job)")
+
+        tracker = self._manager._job_tracker if self._manager is not None else None
+        if tracker is not None:
+            if tracker.num_jobs_total != 0:
+                failures.append(f"Tracker did not drain: {tracker.num_jobs_total} job(s) left in stages")
+            if len(tracker.jobs_lookup) != 0:
+                failures.append(f"Tracker lookup did not drain: {len(tracker.jobs_lookup)} entrie(s) left")
+
+        return failures
+
+
 def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerateJobPopResponse]) -> reGenBridgeData:
     """Construct bridge data appropriate for the given harness configuration."""
     models_in_scenario = sorted({job.model for job in scenario if job.model is not None})
 
     # Field aliases (dreamer_name, models_to_load) are required here: the bridge data
     # model populates by alias, matching the on-disk config file format.
-    bridge_data = reGenBridgeData(
-        api_key="0000000000",
-        dreamer_name="e2e-harness-worker",
-        models_to_load=models_in_scenario,
-        max_threads=1,
-        queue_size=1,
-        safety_on_gpu=False,
-        cycle_process_on_model_change=False,
-        remove_maintenance_on_init=False,
-        exit_on_unhandled_faults=False,
-        suppress_speed_warnings=True,
-        dry_run_skip_api=config.skip_api,
-        dry_run_skip_inference=config.process_mode != "real",
-        dry_run_skip_safety=config.process_mode != "real",
-        dry_run_inference_delay=config.job_delay_seconds,
-        **config.bridge_data_overrides,  # type: ignore[arg-type]
-    )
+    bridge_data_fields: dict[str, object] = {
+        "api_key": "0000000000",
+        "dreamer_name": "e2e-harness-worker",
+        "models_to_load": models_in_scenario,
+        "max_threads": 1,
+        "queue_size": 1,
+        "safety_on_gpu": False,
+        "cycle_process_on_model_change": False,
+        "remove_maintenance_on_init": False,
+        "exit_on_unhandled_faults": False,
+        "suppress_speed_warnings": True,
+        "dry_run_skip_api": config.skip_api,
+        "dry_run_skip_inference": config.process_mode != "real",
+        "dry_run_skip_safety": config.process_mode != "real",
+        "dry_run_inference_delay": config.job_delay_seconds,
+    }
+    bridge_data_fields.update(config.bridge_data_overrides)
+    bridge_data = reGenBridgeData(**bridge_data_fields)  # type: ignore[arg-type]
     # Prevent the manager from watching/reloading a bridge data file from disk.
     bridge_data._loaded_from_env_vars = True
     return bridge_data
@@ -178,8 +264,15 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
 
     entry_points: ProcessEntryPoints | None = None
     if config.process_mode == "fake":
+        inference_entry_point = start_fake_inference_process
+        if config.fail_every_n > 0:
+            # functools.partial of a module-level function stays picklable under spawn
+            inference_entry_point = functools.partial(
+                start_fake_inference_process,
+                fail_every_n=config.fail_every_n,
+            )
         entry_points = ProcessEntryPoints(
-            inference_entry_point=start_fake_inference_process,
+            inference_entry_point=inference_entry_point,
             safety_entry_point=start_fake_safety_process,
         )
 
@@ -240,6 +333,11 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
 
     manager, num_jobs_expected = build_harness_process_manager(config)
 
+    auditor: JobLifecycleAuditor | None = None
+    if config.audit:
+        auditor = JobLifecycleAuditor()
+        auditor.attach(manager)
+
     time_started = time.time()
 
     watcher_task = asyncio.create_task(
@@ -260,12 +358,24 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
     with contextlib.suppress(asyncio.CancelledError):
         timed_out = await watcher_task
 
+    audit_failures: list[str] = []
+    num_jobs_submitted_faulted = 0
+    if auditor is not None:
+        num_jobs_submitted_faulted = auditor.num_jobs_submitted_faulted
+        # An aborted (timed-out) run purges the tracker, so its invariants are meaningless.
+        if not timed_out:
+            audit_failures = auditor.verify()
+            for failure in audit_failures:
+                logger.error(f"Harness audit failure: {failure}")
+
     return HarnessResult(
         num_jobs_expected=num_jobs_expected,
         num_jobs_completed=manager._job_tracker.total_num_completed_jobs,
         num_jobs_faulted=manager._job_tracker.num_jobs_faulted,
         elapsed_seconds=time.time() - time_started,
         timed_out=timed_out,
+        audit_failures=audit_failures,
+        num_jobs_submitted_faulted=num_jobs_submitted_faulted,
     )
 
 

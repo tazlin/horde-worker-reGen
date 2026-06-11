@@ -376,12 +376,16 @@ def start_fake_inference_process(
     vram_heavy_models: bool = False,
     dry_run_skip_inference: bool = False,
     dry_run_inference_delay: float = 1.0,
+    fail_every_n: int = 0,
 ) -> None:
     """Start a fake inference process.
 
     Signature-compatible with ``worker_entry_points.start_inference_process`` so it can
     be injected as a drop-in multiprocessing target. Memory/GPU related arguments are
     accepted and ignored; ``dry_run_inference_delay`` controls how long fake jobs take.
+    ``fail_every_n`` makes every nth job report a faulted result (0 = never), letting
+    harnesses exercise the fault path. Inject it with ``functools.partial`` (partials of
+    module-level functions stay picklable under spawn).
     """
     logger.remove()
     maybe_wait_for_process_debugger(process_id, "fake inference")
@@ -393,6 +397,7 @@ def start_fake_inference_process(
         disk_lock=disk_lock,
         process_launch_identifier=process_launch_identifier,
         job_delay_seconds=dry_run_inference_delay,
+        fail_every_n=fail_every_n,
     )
     worker_process.main_loop()
 

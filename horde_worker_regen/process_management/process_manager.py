@@ -10,7 +10,7 @@ import sys
 import time
 from asyncio import CancelledError
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from multiprocessing.context import BaseContext
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
@@ -230,24 +230,6 @@ class HordeWorkerProcessManager:
         """The total number of jobs across all live stages."""
         return self._job_tracker.num_jobs_total
 
-    @property
-    def kudos_generated_this_session(self) -> float:
-        """The amount of kudos generated this entire session."""
-        return self._state.kudos_generated_this_session
-
-    @kudos_generated_this_session.setter
-    def kudos_generated_this_session(self, value: float) -> None:
-        self._state.kudos_generated_this_session = value
-
-    @property
-    def kudos_events(self) -> deque[tuple[float, float]]:
-        """A deque of kudos events, each is a tuple of the time the event occurred and the kudos generated."""
-        return self._state.kudos_events
-
-    @kudos_events.setter
-    def kudos_events(self, value: deque[tuple[float, float]]) -> None:
-        self._state.kudos_events = value
-
     session_start_time: float = 0
     """The time at which the session started in epoch time."""
 
@@ -286,6 +268,10 @@ class HordeWorkerProcessManager:
 
     _loop_interval: float = 0.20
     """The number of seconds to wait between each loop of the main process (inter process management) loop."""
+
+    _sleep: Callable[[float], Awaitable[None]]
+    """Pacing sleep used by the control loop. Defaults to asyncio.sleep; tests inject a no-op
+    so the loop can be driven tick-by-tick without wall-clock delays."""
     _api_get_user_info_interval = 15
     """The number of seconds to wait between each fetch of the user info."""
 
@@ -319,10 +305,6 @@ class HordeWorkerProcessManager:
 
     _directml: int | None
     """ID of the potential directml device."""
-
-    @property
-    def _api_messages_received(self) -> dict[str | None, APIWorkerMessage]:
-        return self._job_popper._api_messages_received
 
     @property
     def post_process_job_overlap_allowed(self) -> bool:
@@ -375,6 +357,7 @@ class HordeWorkerProcessManager:
         """
         self.session_start_time = time.time()
         self._state = WorkerState()
+        self._sleep = asyncio.sleep
 
         self._runtime_config = RuntimeConfig(initial=bridge_data)
         self._api_sessions = ApiSessions()
@@ -673,45 +656,6 @@ class HordeWorkerProcessManager:
         """Start evaluating the safety of the next job pending a safety check, if any."""
         await self._safety_orchestrator.start_evaluate_safety()
 
-    @property
-    def _num_job_slowdowns(self) -> int:
-        return self._job_submitter._num_job_slowdowns
-
-    def _last_pop_recently(self) -> bool:
-        return self._state.last_pop_recently()
-
-    @property
-    def _last_pop_maintenance_mode(self) -> bool:
-        return self._state.last_pop_maintenance_mode
-
-    @_last_pop_maintenance_mode.setter
-    def _last_pop_maintenance_mode(self, value: bool) -> None:
-        self._state.last_pop_maintenance_mode = value
-
-    @property
-    def _time_spent_no_jobs_available(self) -> float:
-        return self._job_popper._pop_throttler._time_spent_no_jobs_available
-
-    @property
-    def _too_many_consecutive_failed_jobs(self) -> bool:
-        return self._state.too_many_consecutive_failed_jobs
-
-    @_too_many_consecutive_failed_jobs.setter
-    def _too_many_consecutive_failed_jobs(self, value: bool) -> None:
-        self._state.too_many_consecutive_failed_jobs = value
-
-    @property
-    def _too_many_consecutive_failed_jobs_time(self) -> float:
-        return self._state.too_many_consecutive_failed_jobs_time
-
-    @_too_many_consecutive_failed_jobs_time.setter
-    def _too_many_consecutive_failed_jobs_time(self, value: float) -> None:
-        self._state.too_many_consecutive_failed_jobs_time = value
-
-    @property
-    def _too_many_consecutive_failed_jobs_wait_time(self) -> float:
-        return self._state.too_many_consecutive_failed_jobs_wait_time
-
     _user_info_failed = False
     """Whether the API request to fetch user info failed."""
     _user_info_failed_reason: str | None = None
@@ -727,14 +671,14 @@ class HordeWorkerProcessManager:
             active_kudos_per_hour,
             cleaned_events,
         ) = KudosCalculator.calculate_all_metrics(
-            self.kudos_generated_this_session,
+            self._state.kudos_generated_this_session,
             self.session_start_time,
-            self._time_spent_no_jobs_available,
-            self.kudos_events,
+            self._job_popper.time_spent_no_jobs_available,
+            self._state.kudos_events,
         )
 
         # Update the events deque with cleaned version
-        self.kudos_events = cleaned_events
+        self._state.kudos_events = cleaned_events
 
         kudos_info_string = self.generate_kudos_info_string(
             time_since_session_start,
@@ -753,9 +697,9 @@ class HordeWorkerProcessManager:
         """
         # Delegate to KudosCalculator
         kudos_total_past_hour, cleaned_events = KudosCalculator.calculate_kudos_totals_past_hour(
-            self.kudos_events,
+            self._state.kudos_events,
         )
-        self.kudos_events = cleaned_events
+        self._state.kudos_events = cleaned_events
         return kudos_total_past_hour
 
     def generate_kudos_info_string(
@@ -777,12 +721,12 @@ class HordeWorkerProcessManager:
             A string with information about the kudos generated in the current session.
         """
         return _generate_kudos_info_string(
-            kudos_generated_this_session=self.kudos_generated_this_session,
+            kudos_generated_this_session=self._state.kudos_generated_this_session,
             time_since_session_start=time_since_session_start,
             kudos_per_hour_session=kudos_per_hour_session,
             kudos_total_past_hour=kudos_total_past_hour,
             active_kudos_per_hour=active_kudos_per_hour,
-            time_spent_no_jobs_available=self._time_spent_no_jobs_available,
+            time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
             max_time_spent_no_jobs_available=self._job_popper._pop_throttler._max_time_spent_no_jobs_available,
         )
 
@@ -792,17 +736,17 @@ class HordeWorkerProcessManager:
         Args:
             kudos_info_string: The kudos information string to log.
         """
-        logger.debug(f"len(kudos_events): {len(self.kudos_events)}")
+        logger.debug(f"len(kudos_events): {len(self._state.kudos_events)}")
         KudosLogger.log_kudos_info(
             kudos_info_string=kudos_info_string,
-            kudos_generated_this_session=self.kudos_generated_this_session,
+            kudos_generated_this_session=self._state.kudos_generated_this_session,
             user_info=self.user_info,
             limited_console_messages=self.bridge_data.limited_console_messages,
         )
 
     async def api_get_user_info(self) -> None:
         """Get the information associated with this API key from the API."""
-        if self._shutting_down or self._last_pop_maintenance_mode:
+        if self._state.shutting_down or self._state.last_pop_maintenance_mode:
             return
 
         if self.bridge_data.dry_run_skip_api:
@@ -853,7 +797,7 @@ class HordeWorkerProcessManager:
                     logger.debug(f"CancelledError: {e}")
 
             # Checked outside the catch block so persistent errors cannot prevent shutdown.
-            if self.is_time_for_shutdown() or self._shut_down:
+            if self.is_time_for_shutdown() or self._state.shut_down:
                 break
 
             # Sleep briefly (not the full user info interval) so shutdown is detected promptly.
@@ -864,13 +808,61 @@ class HordeWorkerProcessManager:
     _last_status_message_time = 0.0
     """The epoch time of the last status message."""
 
-    @property
-    def _replaced_due_to_maintenance(self) -> bool:
-        return self._job_popper._replaced_due_to_maintenance
+    async def _control_loop_tick(self) -> bool:
+        """Run a single iteration of the process control loop.
 
-    @_replaced_due_to_maintenance.setter
-    def _replaced_due_to_maintenance(self, value: bool) -> None:
-        self._job_popper._replaced_due_to_maintenance = value
+        Pacing sleeps go through ``self._sleep`` so tests can drive ticks with a
+        no-op sleep and assert effects deterministically.
+
+        Returns:
+            True if the loop should keep running, False when it is time to shut down.
+        """
+        if self.stable_diffusion_reference is None:
+            raise ValueError("stable_diffusion_reference is None; cannot run the control loop")
+
+        with logger.catch(reraise=True):
+            await self._sleep(self._loop_interval)
+
+            await self.receive_and_handle_process_messages()
+            self.detect_deadlock()
+
+            if len(self._job_tracker.jobs_pending_safety_check) > 0:
+                await self.start_evaluate_safety()
+
+            free_process_or_model_loaded = self.is_free_inference_process_available() or self.is_any_model_preloaded()
+
+            if (
+                self._state.last_pop_maintenance_mode
+                and self.num_jobs_total == 0
+                and not self._job_popper._replaced_due_to_maintenance
+            ):
+                logger.warning("Reloading all process due to maintenance mode")
+                for process_info in self._process_map.values():
+                    if process_info.process_type == HordeProcessType.INFERENCE:
+                        self._process_lifecycle._replace_inference_process(process_info)
+                    self._job_popper._replaced_due_to_maintenance = True
+                MaintenanceModeMessenger.print_maintenance_mode_messages()
+
+            if free_process_or_model_loaded and len(self._job_tracker.jobs_pending_inference) > 0:
+                await self._inference_scheduler.run_scheduling_cycle(self.stable_diffusion_reference)
+
+            await self._sleep(self._loop_interval)
+            await self.receive_and_handle_process_messages()
+            if self._process_lifecycle.replace_hung_processes():
+                await self._sleep(self._loop_interval / 2)
+                await self._sleep(self._loop_interval / 2)
+            self._process_lifecycle._replace_all_safety_process()
+
+            if self._state.shutting_down and not self._state.last_pop_recently():
+                self._process_lifecycle.end_inference_processes()
+
+            if self.is_time_for_shutdown():
+                return False
+
+        self.print_status_method()
+
+        await self._sleep(self._loop_interval / 2)
+        return True
 
     async def _process_control_loop(self) -> None:
         self._process_lifecycle.start_safety_processes()
@@ -880,55 +872,9 @@ class HordeWorkerProcessManager:
             try:
                 if self.stable_diffusion_reference is None:
                     return
-                with logger.catch(reraise=True):
-                    await asyncio.sleep(self._loop_interval)
-
-                    await self.receive_and_handle_process_messages()
-                    self.detect_deadlock()
-
-                    if len(self._job_tracker.jobs_pending_safety_check) > 0:
-                        await self.start_evaluate_safety()
-
-                    free_process_or_model_loaded = (
-                        self.is_free_inference_process_available() or self.is_any_model_preloaded()
-                    )
-
-                    if (
-                        self._last_pop_maintenance_mode
-                        and len(self._job_tracker.jobs_pending_inference) == 0
-                        and len(self._job_tracker.jobs_in_progress) == 0
-                        and len(self._job_tracker.jobs_pending_safety_check) == 0
-                        and len(self._job_tracker.jobs_being_safety_checked) == 0
-                        and len(self._job_tracker.jobs_pending_submit) == 0
-                        and not self._replaced_due_to_maintenance
-                    ):
-                        logger.warning("Reloading all process due to maintenance mode")
-                        for process_info in self._process_map.values():
-                            if process_info.process_type == HordeProcessType.INFERENCE:
-                                self._process_lifecycle._replace_inference_process(process_info)
-                            self._replaced_due_to_maintenance = True
-                        MaintenanceModeMessenger.print_maintenance_mode_messages()
-
-                    if free_process_or_model_loaded and len(self._job_tracker.jobs_pending_inference) > 0:
-                        await self._inference_scheduler.run_scheduling_cycle(self.stable_diffusion_reference)
-
-                    await asyncio.sleep(self._loop_interval)
-                    await self.receive_and_handle_process_messages()
-                    if self._process_lifecycle.replace_hung_processes():
-                        await asyncio.sleep(self._loop_interval / 2)
-                        await asyncio.sleep(self._loop_interval / 2)
-                    self._process_lifecycle._replace_all_safety_process()
-
-                    if self._shutting_down and not self._last_pop_recently():
-                        self._process_lifecycle.end_inference_processes()
-
-                    if self.is_time_for_shutdown():
-                        self._start_timed_shutdown()
-                        break
-
-                self.print_status_method()
-
-                await asyncio.sleep(self._loop_interval / 2)
+                if not await self._control_loop_tick():
+                    self._start_timed_shutdown()
+                    break
             except CancelledError as e:
                 self._shutdown()
                 logger.debug(f"CancelledError: {e}")
@@ -944,7 +890,7 @@ class HordeWorkerProcessManager:
         self._process_lifecycle.end_safety_processes()
 
         logger.info("Shutting down process manager")
-        self._shut_down = True
+        self._state.shut_down = True
         for process in self._process_map.values():
             process.mp_process.terminate()
             process.mp_process.join(0.2)
@@ -964,7 +910,7 @@ class HordeWorkerProcessManager:
             status_message_frequency=self._status_message_frequency,
         )
 
-        if not reporter.should_print_status(self._last_pop_maintenance_mode):
+        if not reporter.should_print_status(self._state.last_pop_maintenance_mode):
             return
 
         # Gather active models
@@ -978,24 +924,24 @@ class HordeWorkerProcessManager:
         updated_frequency = reporter.print_status(
             bridge_data=self.bridge_data,
             process_info_strings=self._process_map.get_process_info_strings(),
-            api_messages_received=self._api_messages_received,
+            api_messages_received=self._job_popper.api_messages_received,
             jobs_pending_inference=self._job_tracker.jobs_pending_inference,
             active_models=active_models,
             pending_megapixelsteps=self._job_tracker.get_pending_megapixelsteps(),
             num_jobs_total=self.num_jobs_total,
             total_num_completed_jobs=self._job_tracker.total_num_completed_jobs,
             num_jobs_faulted=self._job_tracker.num_jobs_faulted,
-            num_job_slowdowns=self._num_job_slowdowns,
+            num_job_slowdowns=self._job_submitter.num_job_slowdowns,
             num_process_recoveries=self._process_lifecycle._num_process_recoveries,
-            time_spent_no_jobs_available=self._time_spent_no_jobs_available,
+            time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
             user_info=self.user_info,
             max_concurrent_inference_processes=self.max_concurrent_inference_processes,
             device_map=self._device_map,
-            too_many_consecutive_failed_jobs=self._too_many_consecutive_failed_jobs,
-            too_many_consecutive_failed_jobs_time=self._too_many_consecutive_failed_jobs_time,
-            too_many_consecutive_failed_jobs_wait_time=self._too_many_consecutive_failed_jobs_wait_time,
+            too_many_consecutive_failed_jobs=self._state.too_many_consecutive_failed_jobs,
+            too_many_consecutive_failed_jobs_time=self._state.too_many_consecutive_failed_jobs_time,
+            too_many_consecutive_failed_jobs_wait_time=self._state.too_many_consecutive_failed_jobs_wait_time,
             session_start_time=self.session_start_time,
-            shutting_down=self._shutting_down,
+            shutting_down=self._state.shutting_down,
             jobs_pending_safety_check=len(self._job_tracker.jobs_pending_safety_check),
             jobs_being_safety_checked=len(self._job_tracker.jobs_being_safety_checked),
             jobs_in_progress=len(self._job_tracker.jobs_in_progress),
@@ -1049,7 +995,7 @@ class HordeWorkerProcessManager:
     async def _bridge_data_loop(self) -> None:
         while True:
             try:
-                if self._shutting_down:
+                if self._state.shutting_down:
                     break
 
                 self._bridge_data_last_modified_time = os.path.getmtime(BRIDGE_CONFIG_FILENAME)
@@ -1073,14 +1019,13 @@ class HordeWorkerProcessManager:
         """
         ex = future.exception()
         if ex is not None:
-            if self._shutting_down:
+            if self._state.shutting_down:
                 logger.debug(f"exception thrown by a main loop task: {ex}")
             else:
                 logger.error(f"exception thrown by a main loop task: {ex}")
                 logger.exception(ex)
 
     async def _main_loop(self) -> None:
-        await self._job_tracker.start_actor()
         aiohttp_session = ClientSession(requote_redirect_url=False)
 
         from horde_worker_regen.telemetry import instrument_aiohttp_client
@@ -1095,24 +1040,21 @@ class HordeWorkerProcessManager:
         self._api_sessions.set_aiohttp_session(aiohttp_session)
         self._api_sessions.set_horde_client_session(horde_session)
 
-        try:
-            async with aiohttp_session, horde_session:
-                coroutines = [
-                    self._process_control_loop(),
-                    self._job_popper.run(),
-                    self._api_get_user_info_loop(),
-                    self._job_submitter.run(),
-                ]
-                if not self.bridge_data._loaded_from_env_vars:
-                    coroutines.append(self._bridge_data_loop())
+        async with aiohttp_session, horde_session:
+            coroutines = [
+                self._process_control_loop(),
+                self._job_popper.run(),
+                self._api_get_user_info_loop(),
+                self._job_submitter.run(),
+            ]
+            if not self.bridge_data._loaded_from_env_vars:
+                coroutines.append(self._bridge_data_loop())
 
-                tasks = [asyncio.create_task(coro) for coro in coroutines]
-                for task in tasks:
-                    task.add_done_callback(self._handle_exception)
+            tasks = [asyncio.create_task(coro) for coro in coroutines]
+            for task in tasks:
+                task.add_done_callback(self._handle_exception)
 
-                await asyncio.gather(*tasks)
-        finally:
-            await self._job_tracker.stop_actor()
+            await asyncio.gather(*tasks)
 
     def start(self) -> None:
         """Start the process manager."""
@@ -1130,22 +1072,6 @@ class HordeWorkerProcessManager:
 
     def _start_timed_shutdown(self) -> None:
         self._shutdown_manager.start_timed_shutdown()
-
-    @property
-    def _shutting_down(self) -> bool:
-        return self._state.shutting_down
-
-    @_shutting_down.setter
-    def _shutting_down(self, value: bool) -> None:
-        self._state.shutting_down = value
-
-    @property
-    def _shut_down(self) -> bool:
-        return self._state.shut_down
-
-    @_shut_down.setter
-    def _shut_down(self, value: bool) -> None:
-        self._state.shut_down = value
 
     def _shutdown(self) -> None:
         self._shutdown_manager.shutdown()

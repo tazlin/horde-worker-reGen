@@ -16,7 +16,6 @@ from tests.process_management.conftest import (
     make_testable_process_manager,
 )
 
-
 # On Windows the default ProactorEventLoop (IOCP-based) teardown can race with
 # VS Code's named-pipe server that vscode-pytest relies on, causing the pipe to
 # disappear before the final test report is sent.  Switching to the selector-based

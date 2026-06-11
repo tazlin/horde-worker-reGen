@@ -700,10 +700,11 @@ class InferenceScheduler:
                 ):
                     continue
 
-                if (
-                    process_info.loaded_horde_model_name in self._job_tracker.jobs_pending_inference
-                    or process_info.loaded_horde_model_name in self._job_tracker.jobs_in_progress
-                ):
+                models_still_needed = {
+                    job.model
+                    for job in (*self._job_tracker.jobs_pending_inference, *self._job_tracker.jobs_in_progress)
+                }
+                if process_info.loaded_horde_model_name in models_still_needed:
                     continue
 
                 self.unload_from_ram(process_info.process_id)

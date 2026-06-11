@@ -18,6 +18,59 @@ from horde_worker_regen.process_management.messages import (
 )
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 
+_EXPECTED_PROCESS_STATE_SOURCES: dict[HordeProcessState, frozenset[HordeProcessState]] = {
+    HordeProcessState.DOWNLOAD_COMPLETE: frozenset({HordeProcessState.DOWNLOADING_MODEL}),
+    HordeProcessState.DOWNLOAD_AUX_COMPLETE: frozenset({HordeProcessState.DOWNLOADING_AUX_MODEL}),
+    HordeProcessState.PRELOADED_MODEL: frozenset({HordeProcessState.PRELOADING_MODEL}),
+    HordeProcessState.PRELOADING_MODEL: frozenset(
+        {
+            HordeProcessState.WAITING_FOR_JOB,
+            HordeProcessState.JOB_RECEIVED,
+            HordeProcessState.DOWNLOAD_COMPLETE,
+            HordeProcessState.DOWNLOADING_AUX_MODEL,
+            HordeProcessState.DOWNLOAD_AUX_COMPLETE,
+            HordeProcessState.INFERENCE_COMPLETE,
+            HordeProcessState.INFERENCE_FAILED,
+            HordeProcessState.UNLOADED_MODEL_FROM_RAM,
+            HordeProcessState.UNLOADED_MODEL_FROM_VRAM,
+            HordeProcessState.PRELOADED_MODEL,
+        },
+    ),
+    HordeProcessState.INFERENCE_STARTING: frozenset(
+        {
+            HordeProcessState.WAITING_FOR_JOB,
+            HordeProcessState.JOB_RECEIVED,
+            HordeProcessState.PRELOADING_MODEL,
+            HordeProcessState.PRELOADED_MODEL,
+            HordeProcessState.INFERENCE_COMPLETE,
+            HordeProcessState.DOWNLOADING_AUX_MODEL,
+            HordeProcessState.DOWNLOAD_AUX_COMPLETE,
+            HordeProcessState.UNLOADED_MODEL_FROM_RAM,
+            HordeProcessState.UNLOADED_MODEL_FROM_VRAM,
+        },
+    ),
+    HordeProcessState.INFERENCE_POST_PROCESSING: frozenset({HordeProcessState.INFERENCE_STARTING}),
+    HordeProcessState.INFERENCE_COMPLETE: frozenset(
+        {HordeProcessState.INFERENCE_STARTING, HordeProcessState.INFERENCE_POST_PROCESSING},
+    ),
+    HordeProcessState.INFERENCE_FAILED: frozenset(
+        {
+            HordeProcessState.INFERENCE_STARTING,
+            HordeProcessState.INFERENCE_POST_PROCESSING,
+            HordeProcessState.JOB_RECEIVED,
+        },
+    ),
+    HordeProcessState.EVALUATING_SAFETY: frozenset({HordeProcessState.WAITING_FOR_JOB}),
+    HordeProcessState.SAFETY_FAILED: frozenset({HordeProcessState.EVALUATING_SAFETY}),
+}
+"""Expected previous states for selected process states.
+
+States absent from this table (idle/teardown states and download/unload starts) may be
+entered from anywhere; child processes are authoritative about their own state, so an
+unexpected transition is logged but never refused. Divergence here usually means the
+parent's optimistic bookkeeping and the child's reality have drifted apart.
+"""
+
 
 class ProcessMap(dict[int, HordeProcessInfo]):
     """A mapping of process IDs to HordeProcessInfo objects.
@@ -103,10 +156,21 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     def on_process_state_change(self, process_id: int, new_state: HordeProcessState) -> None:
         """Update the process state for the given process ID.
 
+        Unexpected transitions (per ``_EXPECTED_PROCESS_STATE_SOURCES``) are logged but
+        still applied, since the reporting process is the source of truth for its own state.
+
         Args:
             process_id (int): The ID of the process to update.
             new_state (HordeProcessState): The new state of the process.
         """
+        old_state = self[process_id].last_process_state
+        expected_sources = _EXPECTED_PROCESS_STATE_SOURCES.get(new_state)
+        if expected_sources is not None and old_state != new_state and old_state not in expected_sources:
+            logger.warning(
+                f"Process {process_id} made an unexpected state transition: "
+                f"{old_state.name} -> {new_state.name}",
+            )
+
         self[process_id].last_process_state = new_state
         self[process_id].last_received_timestamp = time.time()
 
@@ -251,7 +315,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """Return the number of inference processes that are available to accept jobs."""
         count = 0
         for p in self.values():
-            if p.process_type != HordeProcessType.INFERENCE and not p.is_process_busy():
+            if p.process_type == HordeProcessType.INFERENCE and not p.is_process_busy():
                 count += 1
         return count
 
@@ -314,9 +378,6 @@ class ProcessMap(dict[int, HordeProcessInfo]):
 
             if p.last_process_state == HordeProcessState.INFERENCE_POST_PROCESSING and not post_process_job_overlap:
                 return True, "Post processing overlap"
-
-            if p.can_accept_job():
-                continue
 
         return False, "None"
 

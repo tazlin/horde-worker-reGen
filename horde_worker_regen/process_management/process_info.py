@@ -146,7 +146,10 @@ class HordeProcessInfo:
         """Return true if the process is alive."""
         if not self.mp_process.is_alive():
             return False
-        return not (self.last_process_state == HordeProcessState.PROCESS_ENDING or HordeProcessState.PROCESS_ENDED)
+        return self.last_process_state not in (
+            HordeProcessState.PROCESS_ENDING,
+            HordeProcessState.PROCESS_ENDED,
+        )
 
     def safe_send_message(self, message: HordeControlMessage) -> bool:
         """Send a message to the process.

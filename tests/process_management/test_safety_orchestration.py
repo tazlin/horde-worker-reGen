@@ -160,12 +160,11 @@ class TestStartEvaluateSafety:
         with pytest.raises(RuntimeError, match="stable diffusion reference accessed before it was loaded"):
             await process_manager.start_evaluate_safety()
 
-    async def test_failed_send_returns_early_when_process_not_alive(self) -> None:
-        """When send fails and is_process_alive returns False, the method returns early.
+    async def test_failed_send_to_live_process_flags_replacement(self) -> None:
+        """When the send fails but the safety process is alive, flag it for replacement.
 
-        Note: HordeProcessInfo.is_process_alive has a bug where it always returns False
-        due to `or HordeProcessState.PROCESS_ENDED` being always truthy. This test
-        documents the current (buggy) behavior.
+        A live process that cannot receive control messages is unrecoverable from
+        the orchestrator's point of view; the lifecycle manager must replace it.
         """
         process_manager = make_testable_process_manager()
         safety_proc = make_mock_process_info(
@@ -198,6 +197,7 @@ class TestStartEvaluateSafety:
 
         await process_manager.start_evaluate_safety()
 
-        # is_process_alive() always returns False due to the operator precedence bug,
-        # so the code returns early without setting replacement flag
-        assert process_manager._process_lifecycle._safety_processes_should_be_replaced is False
+        assert process_manager._process_lifecycle._safety_processes_should_be_replaced is True
+        # The job was never moved into being_safety_checked (the send failed), so it
+        # must remain pending so a replacement safety process can pick it up.
+        assert job_info in process_manager._job_tracker.jobs_pending_safety_check

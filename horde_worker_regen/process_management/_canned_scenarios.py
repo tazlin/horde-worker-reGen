@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 
 from horde_sdk.ai_horde_api.apimodels import (
@@ -9,8 +10,9 @@ from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopResponse,
     ImageGenerateJobPopSkippedStatus,
 )
+from horde_sdk.ai_horde_api.fields import GenerationID
 
-from horde_worker_regen.process_management._dummy_jobs import dummy_job_factory
+from horde_worker_regen.process_management._dummy_jobs import DUMMY_R2_UPLOAD_URL, dummy_job_factory
 
 
 @dataclass
@@ -91,6 +93,71 @@ def make_simple_scenario(
 ) -> list[ImageGenerateJobPopResponse]:
     """Create a scenario of identical txt2img jobs for the given model."""
     return [dummy_job_factory(model_name) for _ in range(num_jobs)]
+
+
+def make_canned_job(
+    model_name: str = "Deliberate",
+    *,
+    width: int = 512,
+    height: int = 512,
+    ddim_steps: int = 30,
+    n_iter: int = 1,
+) -> ImageGenerateJobPopResponse:
+    """Create a single canned job with configurable size, steps, and batch amount.
+
+    Batched jobs (``n_iter > 1``) get one generation ID and R2 upload slot per image,
+    as the live API provides.
+    """
+    job = dummy_job_factory(model_name)
+    data = job.model_dump(by_alias=True)
+
+    ids = [GenerationID(root=uuid.uuid4()) for _ in range(n_iter)]
+    data["id"] = ids[0]
+    data["ids"] = ids
+    data["r2_uploads"] = [DUMMY_R2_UPLOAD_URL] * n_iter
+
+    data["payload"]["width"] = width
+    data["payload"]["height"] = height
+    data["payload"]["ddim_steps"] = ddim_steps
+    data["payload"]["n_iter"] = n_iter
+
+    return ImageGenerateJobPopResponse(**data)
+
+
+def make_mixed_model_scenario(
+    num_jobs: int,
+    model_names: list[str],
+) -> list[ImageGenerateJobPopResponse]:
+    """Create a scenario that alternates between the given models round-robin.
+
+    Forces the scheduler to preload, swap, and unload models between jobs.
+    """
+    if not model_names:
+        raise ValueError("model_names must not be empty")
+    return [make_canned_job(model_names[i % len(model_names)]) for i in range(num_jobs)]
+
+
+def make_batch_scenario(
+    num_jobs: int,
+    batch_size: int,
+    *,
+    model_name: str = "Deliberate",
+) -> list[ImageGenerateJobPopResponse]:
+    """Create a scenario of batched jobs (multiple images per job)."""
+    return [make_canned_job(model_name, n_iter=batch_size) for _ in range(num_jobs)]
+
+
+def make_varied_size_scenario(
+    num_jobs: int,
+    *,
+    model_name: str = "Deliberate",
+) -> list[ImageGenerateJobPopResponse]:
+    """Create a scenario mixing small and large jobs to exercise megapixelstep backpressure."""
+    sizes = [(512, 512, 20), (1024, 1024, 50), (768, 768, 30)]
+    return [
+        make_canned_job(model_name, width=w, height=h, ddim_steps=steps)
+        for w, h, steps in (sizes[i % len(sizes)] for i in range(num_jobs))
+    ]
 
 
 # ---------------------------------------------------------------------------

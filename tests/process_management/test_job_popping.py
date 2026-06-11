@@ -196,14 +196,50 @@ class TestApiJobPopGuardClauses:
         popper = _make_popper(state=state, process_map=process_map)
         await popper.api_job_pop()
 
-    async def test_first_job_not_submitted_blocks_second_pop(self) -> None:
-        """When there are pending jobs but none submitted yet, don't pop more."""
+    async def test_no_completed_session_jobs_blocks_queue_ahead(self) -> None:
+        """Until the first job of the session completes, a second pop must not happen.
+
+        This is the warm-up rule: if we're doomed to fail with 1 job, we're
+        doomed to fail with 2 jobs.
+        """
         job_tracker = JobTracker()
         await track_popped_job_async(job_tracker, make_mock_job())
-        # jobs_pending_submit is 0 (default)
+        assert job_tracker.total_num_completed_jobs == 0
 
-        popper = _make_popper(job_tracker=job_tracker)
+        session = Mock()
+        session.submit_request = AsyncMock()
+        popper = _make_popper(
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+
         await popper.api_job_pop()
+
+        session.submit_request.assert_not_awaited()
+
+    async def test_completed_session_job_allows_queue_ahead(self) -> None:
+        """Once any job has completed this session, queue-ahead pops are allowed.
+
+        Regression test: the warm-up gate must not block whenever nothing
+        happens to be pending submit; it only applies before the first
+        completion of the session.
+        """
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()
+
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="test error"))
+        popper = _make_popper(
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
 
 
 class TestHandleConsecutiveFailures:

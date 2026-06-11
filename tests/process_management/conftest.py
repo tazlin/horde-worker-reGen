@@ -181,7 +181,8 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.suppress_speed_warnings = True
     bd.capture_kudos_training_data = False
     bd.limited_console_messages = False
-    bd.api_key = "test-api-key"
+    # The SDK validates API keys as exactly 22 characters
+    bd.api_key = "T" * 22
     bd.dreamer_worker_name = "test-worker"
     bd.horde_model_stickiness = 0
     bd.blacklist = (

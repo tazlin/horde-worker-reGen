@@ -94,6 +94,11 @@ class JobSubmitter:
         self._job_submit_loop_interval = 0.02
 
     @property
+    def num_job_slowdowns(self) -> int:
+        """Return how many submitted jobs were slower than the ideal kudos rate."""
+        return self._num_job_slowdowns
+
+    @property
     def bridge_data(self) -> reGenBridgeData:
         """Return the current bridge configuration."""
         return self._runtime_config.bridge_data

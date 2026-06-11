@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management.job_tracker import JobTracker, JobTrackerSnapshot, _JobTrackerState
+from horde_worker_regen.process_management.job_tracker import JobStage, JobTracker
 
 from .conftest import (
     make_mock_job,
@@ -185,8 +185,123 @@ async def test_should_wait_for_pending_megapixelsteps(job_tracker: JobTracker) -
     assert job_tracker.should_wait_for_pending_megapixelsteps()
 
 
-def test_job_tracker_snapshot_fields_match_1_to_1() -> None:
-    """Verify the fields are exactly equal between _JobTrackerState and JobTrackerSnapshot."""
-    state_fields = {f.name for f in _JobTrackerState.__dataclass_fields__.values()}
-    snapshot_fields = {f.name for f in JobTrackerSnapshot.__dataclass_fields__.values()}
-    assert state_fields == snapshot_fields
+async def test_snapshot_reflects_tracker_state(job_tracker: JobTracker) -> None:
+    """A snapshot must reflect the live derived views at the moment it is taken."""
+    job = await track_popped_job_async(job_tracker, make_mock_job())
+    await job_tracker.increment_jobs_completed()
+
+    snapshot = job_tracker.snapshot()
+
+    assert snapshot.jobs_pending_inference == job_tracker.jobs_pending_inference
+    assert snapshot.jobs_in_progress == ()
+    assert snapshot.total_num_completed_jobs == 1
+    assert job in snapshot.jobs_lookup
+    assert job in snapshot.job_pop_timestamps
+
+
+class TestJobStages:
+    """Tests for the unified stage model: a job is in exactly one stage."""
+
+    async def test_normal_lifecycle_stages(self, job_tracker: JobTracker) -> None:
+        """A job should move through the stages of the happy path one at a time."""
+        job = await track_popped_job_async(job_tracker, make_mock_job())
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_INFERENCE
+
+        await job_tracker.mark_inference_started(job)
+        assert job_tracker.get_stage(job.id_) is JobStage.INFERENCE_IN_PROGRESS
+        # In-progress jobs remain visible in the pending-inference view
+        assert job in job_tracker.jobs_pending_inference
+
+        assert await job_tracker.release_in_progress(job)
+        assert await job_tracker.drop_pending_inference_by_id(job.id_)
+        assert job_tracker.get_stage(job.id_) is JobStage.DETACHED
+        assert job not in job_tracker.jobs_pending_inference
+
+        job_info = await job_tracker.get_job_info(job)
+        assert job_info is not None
+        await job_tracker.queue_for_safety(job_info)
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SAFETY_CHECK
+
+        await job_tracker.begin_safety_check(job_info)
+        assert job_tracker.get_stage(job.id_) is JobStage.SAFETY_CHECKING
+
+        taken = await job_tracker.take_being_safety_checked(job.id_)
+        assert taken is job_info
+        assert job_tracker.get_stage(job.id_) is JobStage.DETACHED
+
+        await job_tracker.queue_for_submit(job_info)
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+
+        await job_tracker.finalize_submitted(job_info)
+        assert job_tracker.get_stage(job.id_) is None
+        assert job_tracker.num_jobs_total == 0
+
+    async def test_job_is_never_in_two_stage_views(self, job_tracker: JobTracker) -> None:
+        """No matter the call sequence, a job appears in at most one stage-specific view.
+
+        jobs_pending_inference intentionally includes in-progress jobs, so it is
+        checked against the downstream views only.
+        """
+        job = await track_popped_job_async(job_tracker, make_mock_job())
+        job_info = await job_tracker.get_job_info(job)
+        assert job_info is not None
+
+        # Try to put the job in several stages by skipping intermediate calls
+        await job_tracker.mark_inference_started(job)
+        await job_tracker.queue_for_safety(job_info)
+        await job_tracker.queue_for_submit(job_info)
+
+        views = {
+            "in_progress": job in job_tracker.jobs_in_progress,
+            "pending_safety": job_info in job_tracker.jobs_pending_safety_check,
+            "being_checked": job_info in job_tracker.jobs_being_safety_checked,
+            "pending_submit": job_info in job_tracker.jobs_pending_submit,
+        }
+        assert sum(views.values()) == 1, f"Job is in multiple stage views: {views}"
+
+    async def test_illegal_transition_is_refused(self, job_tracker: JobTracker) -> None:
+        """A terminal-stage job cannot move back to an earlier stage."""
+        job = await track_popped_job_async(job_tracker, make_mock_job())
+        job_info = await job_tracker.get_job_info(job)
+        assert job_info is not None
+
+        await job_tracker.queue_for_submit(job_info)
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+
+        # Attempting to begin a safety check on a pending-submit job must not move it
+        await job_tracker.begin_safety_check(job_info)
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+
+    async def test_duplicate_pop_replaces_tracked_entry(self, job_tracker: JobTracker) -> None:
+        """Re-popping an already-tracked generation ID replaces the entry instead of duplicating it."""
+        job = await track_popped_job_async(job_tracker, make_mock_job())
+        await track_popped_job_async(job_tracker, job)
+
+        assert job_tracker.num_jobs_total == 1
+        assert len(job_tracker.jobs_pending_inference) == 1
+
+    async def test_lookup_is_id_based_despite_object_rebuild(self, job_tracker: JobTracker) -> None:
+        """A value-equal rebuilt response object must still resolve to the tracked job."""
+        job = await track_popped_job_async(job_tracker, make_mock_job())
+
+        rebuilt = job.model_copy(deep=True)
+        assert rebuilt is not job
+
+        assert await job_tracker.get_job_info(rebuilt) is not None
+        assert await job_tracker.get_time_popped(rebuilt) is not None
+
+    async def test_fault_during_safety_check_prevents_double_submit(self, job_tracker: JobTracker) -> None:
+        """A job faulted while being safety checked cannot be taken (and re-queued) again."""
+        job = await track_popped_job_async(job_tracker, make_mock_job())
+        job_info = await job_tracker.get_job_info(job)
+        assert job_info is not None
+
+        await job_tracker.queue_for_safety(job_info)
+        await job_tracker.begin_safety_check(job_info)
+
+        await job_tracker.handle_job_fault(faulted_job=job)
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+
+        # The (late) safety result must not be able to re-queue the job for submit
+        assert await job_tracker.take_being_safety_checked(job.id_) is None
+        assert len(job_tracker.jobs_pending_submit) == 1

@@ -174,6 +174,21 @@ class JobPopper:
         self._api_messages_received = {}
         self._api_call_loop_interval = 1
 
+    @property
+    def api_messages_received(self) -> dict[str | None, APIWorkerMessage]:
+        """Return the worker messages received from the API, keyed by message ID."""
+        return self._api_messages_received
+
+    @property
+    def time_spent_no_jobs_available(self) -> float:
+        """Return the cumulative seconds spent with no jobs available."""
+        return self._pop_throttler._time_spent_no_jobs_available
+
+    @property
+    def max_time_spent_no_jobs_available(self) -> float:
+        """Return the longest stretch of seconds spent with no jobs available."""
+        return self._pop_throttler._max_time_spent_no_jobs_available
+
     # region api_job_pop helper methods
 
     def _handle_consecutive_failures(self, bridge_data: reGenBridgeData, cur_time: float) -> bool:
@@ -320,8 +335,9 @@ class JobPopper:
         if self._is_queue_full(bridge_data):
             return
 
-        # Let the first job complete before queuing more
-        if len(self._job_tracker.jobs_pending_inference) != 0 and len(self._job_tracker.jobs_pending_submit) == 0:
+        # Warm-up rule: until the first job of the session has completed, don't queue
+        # ahead (if we're doomed to fail with 1 job, we're doomed to fail with 2).
+        if len(self._job_tracker.jobs_pending_inference) != 0 and self._job_tracker.total_num_completed_jobs == 0:
             return
 
         if self._process_map.get_first_available_safety_process() is None:

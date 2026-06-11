@@ -1,17 +1,32 @@
-"""Actor-backed job state management.
+"""Unified, ID-keyed job state management.
 
-All lifecycle mutations are serialized through a command queue so callers no
-longer coordinate lock ownership across modules.
+Every job the worker knows about is exactly one ``TrackedJob`` in a single
+``dict[GenerationID, TrackedJob]``, with an explicit :class:`JobStage`. All
+stage changes funnel through one transition method that validates legality,
+so "a job is in exactly one stage" is structural rather than emergent.
+
+Stage collections that callers previously manipulated directly
+(``jobs_pending_inference``, ``jobs_in_progress``, etc.) are now derived,
+read-only views. The mutation API is unchanged in name and signature (the
+methods remain ``async`` for interface stability) but mutations are plain
+synchronous dict operations on the event-loop thread; sequences of awaits
+can no longer interleave a partially-applied transition.
+
+Notes on intentional semantics preserved from the previous implementation:
+
+- A job remains visible in ``jobs_pending_inference`` while inference is in
+  progress; it leaves that view only when the inference result (or a fault)
+  arrives. Queue-size accounting depends on this.
+- ``job_faults`` entries are kept independent of job lifetime; they are
+  cleared explicitly via :meth:`clear_faults_for_job`, not by finalize/purge.
 """
 
 from __future__ import annotations
 
-import asyncio
+import enum
 import time
-from collections import deque
-from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from dataclasses import dataclass
+from enum import auto
 
 from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
@@ -24,26 +39,78 @@ from horde_worker_regen.process_management.job_models import HordeJobInfo
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.utils.job_queue_analyzer import JobQueueAnalyzer
 
-_T = TypeVar("_T")
+
+class JobStage(enum.Enum):
+    """The lifecycle stage a tracked job is currently in.
+
+    A job is in exactly one stage at any instant. ``DETACHED`` is a transient
+    hand-off stage: the job is tracked (still in lookup) but enqueued nowhere,
+    e.g. between an inference result arriving and the job being queued for
+    safety. Jobs must not remain ``DETACHED`` across loop iterations.
+    """
+
+    PENDING_INFERENCE = auto()
+    """Popped and waiting for (or undergoing dispatch to) an inference process."""
+    INFERENCE_IN_PROGRESS = auto()
+    """Sent to an inference process which has not yet returned a result."""
+    DETACHED = auto()
+    """Tracked but not in any queue; a transient hand-off state."""
+    PENDING_SAFETY_CHECK = auto()
+    """Inference finished; waiting for a safety process slot."""
+    SAFETY_CHECKING = auto()
+    """Sent to the safety process; awaiting its verdict."""
+    PENDING_SUBMIT = auto()
+    """Ready to be submitted to the API (success or fault)."""
+
+
+_ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
+    JobStage.PENDING_INFERENCE: frozenset(
+        {JobStage.INFERENCE_IN_PROGRESS, JobStage.DETACHED, JobStage.PENDING_SAFETY_CHECK, JobStage.PENDING_SUBMIT},
+    ),
+    JobStage.INFERENCE_IN_PROGRESS: frozenset(
+        {JobStage.PENDING_INFERENCE, JobStage.DETACHED, JobStage.PENDING_SAFETY_CHECK, JobStage.PENDING_SUBMIT},
+    ),
+    JobStage.DETACHED: frozenset(
+        {JobStage.PENDING_SAFETY_CHECK, JobStage.PENDING_SUBMIT, JobStage.PENDING_INFERENCE},
+    ),
+    JobStage.PENDING_SAFETY_CHECK: frozenset(
+        {JobStage.SAFETY_CHECKING, JobStage.PENDING_SUBMIT, JobStage.DETACHED},
+    ),
+    JobStage.SAFETY_CHECKING: frozenset(
+        {JobStage.DETACHED, JobStage.PENDING_SAFETY_CHECK, JobStage.PENDING_SUBMIT},
+    ),
+    JobStage.PENDING_SUBMIT: frozenset(),
+}
+"""Legal stage transitions. ``PENDING_SUBMIT`` is terminal; jobs leave it only by removal."""
+
+_QUEUED_STAGES: tuple[JobStage, ...] = (
+    JobStage.PENDING_INFERENCE,
+    JobStage.INFERENCE_IN_PROGRESS,
+    JobStage.PENDING_SAFETY_CHECK,
+    JobStage.SAFETY_CHECKING,
+    JobStage.PENDING_SUBMIT,
+)
+"""Stages counted by ``num_jobs_total`` (everything except ``DETACHED``)."""
 
 
 @dataclass
-class _JobTrackerState:
-    jobs_lookup: dict[ImageGenerateJobPopResponse, HordeJobInfo] = field(default_factory=dict)
-    jobs_in_progress: list[ImageGenerateJobPopResponse] = field(default_factory=list)
-    job_faults: dict[GenerationID, list[GenMetadataEntry]] = field(default_factory=dict)
-    jobs_pending_safety_check: list[HordeJobInfo] = field(default_factory=list)
-    jobs_being_safety_checked: list[HordeJobInfo] = field(default_factory=list)
-    jobs_pending_submit: list[HordeJobInfo] = field(default_factory=list)
-    jobs_pending_inference: deque[ImageGenerateJobPopResponse] = field(default_factory=deque)
-    job_pop_timestamps: dict[ImageGenerateJobPopResponse, float] = field(default_factory=dict)
+class TrackedJob:
+    """A single job known to the worker, with its current lifecycle stage."""
 
-    num_jobs_faulted: int = 0
-    total_num_completed_jobs: int = 0
-    max_pending_megapixelsteps: int = 25
-    triggered_max_pending_megapixelsteps: bool = False
-    triggered_max_pending_megapixelsteps_time: float = 0.0
-    last_job_submitted_time: float = field(default_factory=time.time)
+    job_id: GenerationID
+    """The generation ID this job is keyed by."""
+    sdk_api_job_info: ImageGenerateJobPopResponse
+    """The pop response for this job, as last seen."""
+    stage: JobStage
+    """The current lifecycle stage."""
+    job_info: HordeJobInfo | None = None
+    """Result-carrying job info. None only for jobs registered outside the normal pop path."""
+    time_popped: float | None = None
+    """Epoch time the job was popped, or None if it was never formally popped."""
+    pop_order: int = 0
+    """Monotonic sequence assigned at registration; preserves pop/queue order."""
+    stage_sequence: int = 0
+    """Monotonic sequence assigned on each stage change; preserves FIFO order within a stage."""
 
 
 @dataclass(frozen=True)
@@ -67,326 +134,425 @@ class JobTrackerSnapshot:
     last_job_submitted_time: float
 
 
-@dataclass
-class _JobTrackerCommand:
-    handler: Callable[[_JobTrackerState], Any]
-    response_future: asyncio.Future[Any]
-
-
-_StopSentinel = _JobTrackerCommand(handler=lambda _: None, response_future=asyncio.Future())
-
-
 class JobTracker:
-    """Actor-backed owner of all job lifecycle state."""
+    """Owner of all job lifecycle state, keyed by ``GenerationID``.
+
+    The mutation methods are ``async def`` so existing call sites (and any
+    future cross-loop implementation) keep working, but each mutation is a
+    single synchronous operation; there is no internal actor or queue.
+    """
 
     def __init__(self) -> None:
         """Initialize the job tracker."""
-        self._state = _JobTrackerState()
-        self._command_queue: asyncio.Queue[_JobTrackerCommand] = asyncio.Queue()
-        self._actor_task: asyncio.Task[None] | None = None
+        self._jobs: dict[GenerationID, TrackedJob] = {}
+        self._job_faults: dict[GenerationID, list[GenMetadataEntry]] = {}
 
-    async def start_actor(self) -> None:
-        """Start the internal state actor if it is not already running."""
-        if self._actor_task is not None:
-            return
-        self._actor_task = asyncio.create_task(self._run_actor(), name="JobTrackerActor")
+        self._num_jobs_faulted = 0
+        self._total_num_completed_jobs = 0
+        self._max_pending_megapixelsteps = 25
+        self._triggered_max_pending_megapixelsteps_flag = False
+        self._triggered_max_pending_megapixelsteps_time_value = 0.0
+        self._last_job_submitted_time = time.time()
 
-    async def stop_actor(self) -> None:
-        """Stop the internal state actor if it is running."""
-        if self._actor_task is None:
-            return
-        await self._command_queue.put(_StopSentinel)
-        await self._actor_task
-        self._actor_task = None
+        self._sequence_counter = 0
 
-    async def _run_actor(self) -> None:
-        while True:
-            command_or_stop = await self._command_queue.get()
-            if command_or_stop is _StopSentinel:
-                break
-            command = command_or_stop
-            try:
-                result = command.handler(self._state)
-            except Exception as exc:
-                if not command.response_future.done():
-                    command.response_future.set_exception(exc)
-            else:
-                if not command.response_future.done():
-                    command.response_future.set_result(result)
+    # region internal helpers
 
-    async def _dispatch(self, handler: Callable[[_JobTrackerState], _T]) -> _T:
-        """Dispatch a handler to the actor, returning its result."""
-        if self._actor_task is None:
-            return handler(self._state)
+    def _next_sequence(self) -> int:
+        self._sequence_counter += 1
+        return self._sequence_counter
 
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[_T] = loop.create_future()
-        await self._command_queue.put(_JobTrackerCommand(handler=handler, response_future=future))
-        return await future
+    def _tracked_by_id(self, job_id: GenerationID | None) -> TrackedJob | None:
+        if job_id is None:
+            return None
+        return self._jobs.get(job_id)
 
-    def snapshot(self) -> JobTrackerSnapshot:
-        """Return an immutable snapshot view of current job state."""
-        return JobTrackerSnapshot(
-            jobs_lookup=dict(self._state.jobs_lookup),
-            jobs_in_progress=tuple(self._state.jobs_in_progress),
-            job_faults={k: list(v) for k, v in self._state.job_faults.items()},
-            jobs_pending_safety_check=tuple(self._state.jobs_pending_safety_check),
-            jobs_being_safety_checked=tuple(self._state.jobs_being_safety_checked),
-            jobs_pending_submit=tuple(self._state.jobs_pending_submit),
-            jobs_pending_inference=tuple(self._state.jobs_pending_inference),
-            job_pop_timestamps=dict(self._state.job_pop_timestamps),
-            num_jobs_faulted=self._state.num_jobs_faulted,
-            total_num_completed_jobs=self._state.total_num_completed_jobs,
-            max_pending_megapixelsteps=self._state.max_pending_megapixelsteps,
-            triggered_max_pending_megapixelsteps=self._state.triggered_max_pending_megapixelsteps,
-            triggered_max_pending_megapixelsteps_time=self._state.triggered_max_pending_megapixelsteps_time,
-            last_job_submitted_time=self._state.last_job_submitted_time,
+    def _tracked_for(self, job: ImageGenerateJobPopResponse) -> TrackedJob | None:
+        return self._tracked_by_id(job.id_)
+
+    def _set_stage(self, tracked: TrackedJob, new_stage: JobStage) -> bool:
+        """Move a job to a new stage, validating the transition.
+
+        Returns:
+            True if the transition was applied, False if it was illegal (and logged).
+        """
+        if tracked.stage == new_stage:
+            return True
+        if new_stage not in _ALLOWED_TRANSITIONS[tracked.stage]:
+            logger.error(
+                f"Illegal job stage transition for job {tracked.job_id}: "
+                f"{tracked.stage.name} -> {new_stage.name}. Transition refused.",
+            )
+            return False
+        tracked.stage = new_stage
+        tracked.stage_sequence = self._next_sequence()
+        return True
+
+    def _register(
+        self,
+        *,
+        job_id: GenerationID,
+        sdk_api_job_info: ImageGenerateJobPopResponse,
+        stage: JobStage,
+        job_info: HordeJobInfo | None,
+        time_popped: float | None,
+    ) -> TrackedJob:
+        """Register a new tracked job, replacing (with a warning) any entry with the same ID."""
+        existing = self._jobs.get(job_id)
+        if existing is not None:
+            logger.warning(
+                f"Job {job_id} is already tracked (stage {existing.stage.name}); replacing the old entry. "
+                "This can happen when a canned scenario recycles job IDs.",
+            )
+            del self._jobs[job_id]
+
+        tracked = TrackedJob(
+            job_id=job_id,
+            sdk_api_job_info=sdk_api_job_info,
+            stage=stage,
+            job_info=job_info,
+            time_popped=time_popped,
+            pop_order=self._next_sequence(),
+            stage_sequence=self._next_sequence(),
         )
+        self._jobs[job_id] = tracked
+        return tracked
+
+    def _jobs_in_stage(self, *stages: JobStage) -> list[TrackedJob]:
+        """Return tracked jobs in the given stage(s), in stage-entry (FIFO) order."""
+        return sorted(
+            (t for t in self._jobs.values() if t.stage in stages),
+            key=lambda t: t.stage_sequence,
+        )
+
+    # endregion
+
+    # region read-only views
+
+    def get_tracked_job(self, job_id: GenerationID) -> TrackedJob | None:
+        """Return the TrackedJob for an ID, or None if it is not tracked."""
+        return self._tracked_by_id(job_id)
+
+    def get_stage(self, job_id: GenerationID) -> JobStage | None:
+        """Return the current stage of a job, or None if it is not tracked."""
+        tracked = self._tracked_by_id(job_id)
+        return tracked.stage if tracked is not None else None
 
     @property
     def jobs_lookup(self) -> dict[ImageGenerateJobPopResponse, HordeJobInfo]:
-        """Return a copy of the lookup map of jobs (`ImageGenerateJobPopResponse`) to job info (`HordeJobInfo`)."""
-        return dict(self._state.jobs_lookup)
+        """Return a mapping of pop responses to job info for all tracked jobs that carry job info."""
+        return {t.sdk_api_job_info: t.job_info for t in self._jobs.values() if t.job_info is not None}
 
     @property
     def jobs_in_progress(self) -> tuple[ImageGenerateJobPopResponse, ...]:
-        """Return a copy of the jobs currently in progress."""
-        return tuple(self._state.jobs_in_progress)
+        """Return the pop responses for jobs currently being inferred."""
+        return tuple(t.sdk_api_job_info for t in self._jobs_in_stage(JobStage.INFERENCE_IN_PROGRESS))
 
     @property
     def job_faults(self) -> dict[GenerationID, list[GenMetadataEntry]]:
         """Return a copy of the job faults dictionary."""
-        return {k: list(v) for k, v in self._state.job_faults.items()}
+        return {k: list(v) for k, v in self._job_faults.items()}
 
     @property
     def jobs_pending_safety_check(self) -> tuple[HordeJobInfo, ...]:
-        """Return a copy of the `HordeJobInfo` objects for jobs pending safety check."""
-        return tuple(self._state.jobs_pending_safety_check)
-
-    @property
-    def jobs_being_safety_checked(self) -> tuple[HordeJobInfo, ...]:
-        """Return a copy of the `HordeJobInfo` objects for jobs currently being safety checked."""
-        return tuple(self._state.jobs_being_safety_checked)
-
-    @property
-    def jobs_pending_submit(self) -> tuple[HordeJobInfo, ...]:
-        """Return a copy of the `HordeJobInfo` objects for jobs pending submit."""
-        return tuple(self._state.jobs_pending_submit)
-
-    @property
-    def jobs_pending_inference(self) -> tuple[ImageGenerateJobPopResponse, ...]:
-        """Return a copy of the job pop responses (`ImageGenerateJobPopResponse`) for jobs pending inference."""
-        return tuple(self._state.jobs_pending_inference)
-
-    @property
-    def job_pop_timestamps(self) -> dict[ImageGenerateJobPopResponse, float]:
-        """Return a copy of the job pop timestamps dictionary."""
-        return dict(self._state.job_pop_timestamps)
-
-    @property
-    def num_jobs_total(self) -> int:
-        """Return the total number of jobs across all states."""
-        return (
-            len(self._state.jobs_pending_inference)
-            + len(self._state.jobs_in_progress)
-            + len(self._state.jobs_pending_safety_check)
-            + len(self._state.jobs_being_safety_checked)
-            + len(self._state.jobs_pending_submit)
+        """Return the `HordeJobInfo` objects for jobs pending safety check."""
+        return tuple(
+            t.job_info for t in self._jobs_in_stage(JobStage.PENDING_SAFETY_CHECK) if t.job_info is not None
         )
 
     @property
+    def jobs_being_safety_checked(self) -> tuple[HordeJobInfo, ...]:
+        """Return the `HordeJobInfo` objects for jobs currently being safety checked."""
+        return tuple(t.job_info for t in self._jobs_in_stage(JobStage.SAFETY_CHECKING) if t.job_info is not None)
+
+    @property
+    def jobs_pending_submit(self) -> tuple[HordeJobInfo, ...]:
+        """Return the `HordeJobInfo` objects for jobs pending submit."""
+        return tuple(t.job_info for t in self._jobs_in_stage(JobStage.PENDING_SUBMIT) if t.job_info is not None)
+
+    @property
+    def jobs_pending_inference(self) -> tuple[ImageGenerateJobPopResponse, ...]:
+        """Return the pop responses for queued jobs, in pop order.
+
+        This intentionally includes jobs whose inference is in progress; a job
+        leaves this view only when its result (or fault) arrives. Queue-size
+        accounting and scheduling look-ahead rely on this.
+        """
+        queued = [
+            t
+            for t in self._jobs.values()
+            if t.stage in (JobStage.PENDING_INFERENCE, JobStage.INFERENCE_IN_PROGRESS) and t.time_popped is not None
+        ]
+        queued.sort(key=lambda t: t.pop_order)
+        return tuple(t.sdk_api_job_info for t in queued)
+
+    @property
+    def job_pop_timestamps(self) -> dict[ImageGenerateJobPopResponse, float]:
+        """Return a mapping of pop responses to the time they were popped."""
+        return {t.sdk_api_job_info: t.time_popped for t in self._jobs.values() if t.time_popped is not None}
+
+    @property
+    def num_jobs_total(self) -> int:
+        """Return the total number of jobs across all queued stages."""
+        return sum(1 for t in self._jobs.values() if t.stage in _QUEUED_STAGES)
+
+    @property
     def current_queue_size(self) -> int:
-        """Return the current size of the inference queue."""
-        return len(self._state.jobs_pending_inference)
+        """Return the current size of the inference queue (including jobs being inferred)."""
+        return sum(
+            1
+            for t in self._jobs.values()
+            if t.stage in (JobStage.PENDING_INFERENCE, JobStage.INFERENCE_IN_PROGRESS) and t.time_popped is not None
+        )
 
     @property
     def total_num_completed_jobs(self) -> int:
         """Return the total number of completed jobs recorded this session."""
-        return self._state.total_num_completed_jobs
+        return self._total_num_completed_jobs
 
     @property
     def num_jobs_faulted(self) -> int:
         """Return the total number of faulted jobs recorded this session."""
-        return self._state.num_jobs_faulted
+        return self._num_jobs_faulted
+
+    def snapshot(self) -> JobTrackerSnapshot:
+        """Return an immutable snapshot view of current job state."""
+        return JobTrackerSnapshot(
+            jobs_lookup=self.jobs_lookup,
+            jobs_in_progress=self.jobs_in_progress,
+            job_faults=self.job_faults,
+            jobs_pending_safety_check=self.jobs_pending_safety_check,
+            jobs_being_safety_checked=self.jobs_being_safety_checked,
+            jobs_pending_submit=self.jobs_pending_submit,
+            jobs_pending_inference=self.jobs_pending_inference,
+            job_pop_timestamps=self.job_pop_timestamps,
+            num_jobs_faulted=self._num_jobs_faulted,
+            total_num_completed_jobs=self._total_num_completed_jobs,
+            max_pending_megapixelsteps=self._max_pending_megapixelsteps,
+            triggered_max_pending_megapixelsteps=self._triggered_max_pending_megapixelsteps_flag,
+            triggered_max_pending_megapixelsteps_time=self._triggered_max_pending_megapixelsteps_time_value,
+            last_job_submitted_time=self._last_job_submitted_time,
+        )
+
+    # endregion
+
+    # region megapixelstep throttling state
 
     def set_performance_mode_thresholds(self, max_pending_megapixelsteps: int) -> None:
         """Set the performance mode thresholds."""
-        self._state.max_pending_megapixelsteps = max_pending_megapixelsteps
+        self._max_pending_megapixelsteps = max_pending_megapixelsteps
 
     def reset_megapixelstep_trigger(self) -> None:
         """Reset the megapixelstep trigger."""
-        self._state.triggered_max_pending_megapixelsteps = False
+        self._triggered_max_pending_megapixelsteps_flag = False
 
     def should_wait_for_pending_megapixelsteps(self) -> bool:
         """Return whether the system should wait based on the currently pending megapixelsteps."""
         pending_megapixelsteps = self.get_pending_megapixelsteps()
         return JobQueueAnalyzer.should_wait_for_pending_megapixelsteps(
             pending_megapixelsteps,
-            self._state.max_pending_megapixelsteps,
+            self._max_pending_megapixelsteps,
         )
 
     def get_pending_megapixelsteps(self) -> int:
         """Return the number of pending megapixelsteps."""
         return JobQueueAnalyzer.calculate_pending_job_magnitude(
-            self._state.jobs_pending_inference,
-            len(self._state.jobs_pending_submit),
+            self.jobs_pending_inference,
+            len(self.jobs_pending_submit),
         )
 
     @property
     def _triggered_max_pending_megapixelsteps(self) -> bool:
-        return self._state.triggered_max_pending_megapixelsteps
+        return self._triggered_max_pending_megapixelsteps_flag
 
     @_triggered_max_pending_megapixelsteps.setter
     def _triggered_max_pending_megapixelsteps(self, value: bool) -> None:
-        self._state.triggered_max_pending_megapixelsteps = value
+        self._triggered_max_pending_megapixelsteps_flag = value
 
     @property
     def _triggered_max_pending_megapixelsteps_time(self) -> float:
-        return self._state.triggered_max_pending_megapixelsteps_time
+        return self._triggered_max_pending_megapixelsteps_time_value
 
     @_triggered_max_pending_megapixelsteps_time.setter
     def _triggered_max_pending_megapixelsteps_time(self, value: float) -> None:
-        self._state.triggered_max_pending_megapixelsteps_time = value
+        self._triggered_max_pending_megapixelsteps_time_value = value
 
-    @property
-    def _max_pending_megapixelsteps(self) -> int:
-        return self._state.max_pending_megapixelsteps
+    # endregion
+
+    # region lifecycle mutations
 
     async def record_popped_job(
         self,
         job_pop_response: ImageGenerateJobPopResponse,
         time_popped: float | None = None,
     ) -> HordeJobInfo:
-        """Record a popped job and return its corresponding HordeJobInfo."""
+        """Record a popped job and return its corresponding HordeJobInfo.
 
-        def _apply(state: _JobTrackerState) -> HordeJobInfo:
-            stamp = time.time() if time_popped is None else time_popped
-            state.jobs_pending_inference.append(job_pop_response)
-            state.job_pop_timestamps[job_pop_response] = stamp
-            job_info = HordeJobInfo(
-                sdk_api_job_info=job_pop_response,
-                state=None,
-                time_popped=stamp,
-            )
-            state.jobs_lookup[job_pop_response] = job_info
-            if job_pop_response.id_ is not None:
-                state.job_faults.setdefault(job_pop_response.id_, [])
-            return job_info
+        Raises:
+            ValueError: If the pop response has no generation ID.
+        """
+        if job_pop_response.id_ is None:
+            raise ValueError("Cannot track a popped job without a generation ID")
 
-        return await self._dispatch(_apply)
+        stamp = time.time() if time_popped is None else time_popped
+        job_info = HordeJobInfo(
+            sdk_api_job_info=job_pop_response,
+            state=None,
+            time_popped=stamp,
+        )
+        self._register(
+            job_id=job_pop_response.id_,
+            sdk_api_job_info=job_pop_response,
+            stage=JobStage.PENDING_INFERENCE,
+            job_info=job_info,
+            time_popped=stamp,
+        )
+        self._job_faults.setdefault(job_pop_response.id_, [])
+        return job_info
 
     async def mark_inference_started(self, job: ImageGenerateJobPopResponse) -> None:
         """Mark a job as started for inference."""
-        await self._dispatch(lambda state: state.jobs_in_progress.append(job))
+        tracked = self._tracked_for(job)
+        if tracked is None:
+            if job.id_ is None:
+                logger.error("Cannot mark a job without a generation ID as in progress")
+                return
+            logger.debug(f"Job {job.id_} was not tracked when inference started; registering it now")
+            self._register(
+                job_id=job.id_,
+                sdk_api_job_info=job,
+                stage=JobStage.INFERENCE_IN_PROGRESS,
+                job_info=None,
+                time_popped=None,
+            )
+            return
+        self._set_stage(tracked, JobStage.INFERENCE_IN_PROGRESS)
 
     async def release_in_progress(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Release a job from the in-progress state."""
+        """Release a job from the in-progress state back to pending inference.
 
-        def _apply(state: _JobTrackerState) -> bool:
-            if job in state.jobs_in_progress:
-                state.jobs_in_progress.remove(job)
-                return True
+        A job that was marked in progress without ever being formally popped
+        (no pop timestamp) has nothing to return to, so releasing it forgets
+        it entirely.
+        """
+        tracked = self._tracked_for(job)
+        if tracked is None or tracked.stage != JobStage.INFERENCE_IN_PROGRESS:
             return False
-
-        return await self._dispatch(_apply)
+        if tracked.time_popped is None:
+            del self._jobs[tracked.job_id]
+            return True
+        return self._set_stage(tracked, JobStage.PENDING_INFERENCE)
 
     async def drop_pending_inference(self, job: ImageGenerateJobPopResponse) -> bool:
-        """Drop a job from the pending inference state."""
-
-        def _apply(state: _JobTrackerState) -> bool:
-            if job in state.jobs_pending_inference:
-                state.jobs_pending_inference.remove(job)
-                return True
+        """Drop a job from the pending inference queue (it remains tracked, detached)."""
+        tracked = self._tracked_for(job)
+        if tracked is None or tracked.stage != JobStage.PENDING_INFERENCE:
             return False
-
-        return await self._dispatch(_apply)
+        return self._set_stage(tracked, JobStage.DETACHED)
 
     async def drop_pending_inference_by_id(self, job_id: GenerationID) -> bool:
-        """Drop a job from the pending inference state by its ID."""
-
-        def _apply(state: _JobTrackerState) -> bool:
-            for job in state.jobs_pending_inference:
-                if job.id_ == job_id:
-                    state.jobs_pending_inference.remove(job)
-                    return True
+        """Drop a job from the pending inference queue by its ID (it remains tracked, detached)."""
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.stage != JobStage.PENDING_INFERENCE:
             return False
-
-        return await self._dispatch(_apply)
+        return self._set_stage(tracked, JobStage.DETACHED)
 
     async def queue_for_safety(self, job_info: HordeJobInfo) -> None:
         """Queue a job for safety checking."""
-        await self._dispatch(lambda state: state.jobs_pending_safety_check.append(job_info))
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None:
+            if job_info.sdk_api_job_info.id_ is None:
+                logger.error("Refusing to queue a job without a generation ID for safety; it cannot be submitted")
+                return
+            logger.debug(
+                f"Job {job_info.sdk_api_job_info.id_} was not tracked when queued for safety; registering it now",
+            )
+            self._register(
+                job_id=job_info.sdk_api_job_info.id_,
+                sdk_api_job_info=job_info.sdk_api_job_info,
+                stage=JobStage.PENDING_SAFETY_CHECK,
+                job_info=job_info,
+                time_popped=None,
+            )
+            return
+        tracked.job_info = job_info
+        self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
 
     async def queue_for_submit(self, job_info: HordeJobInfo) -> None:
         """Queue a job for submission."""
-        await self._dispatch(lambda state: state.jobs_pending_submit.append(job_info))
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None:
+            if job_info.sdk_api_job_info.id_ is None:
+                logger.error("Refusing to queue a job without a generation ID for submit; it cannot be submitted")
+                return
+            logger.debug(
+                f"Job {job_info.sdk_api_job_info.id_} was not tracked when queued for submit; registering it now",
+            )
+            self._register(
+                job_id=job_info.sdk_api_job_info.id_,
+                sdk_api_job_info=job_info.sdk_api_job_info,
+                stage=JobStage.PENDING_SUBMIT,
+                job_info=job_info,
+                time_popped=None,
+            )
+            return
+        tracked.job_info = job_info
+        self._set_stage(tracked, JobStage.PENDING_SUBMIT)
 
     async def begin_safety_check(self, job_info: HordeJobInfo) -> None:
         """Begin the safety check process for a job."""
-
-        def _apply(state: _JobTrackerState) -> None:
-            state.jobs_pending_safety_check.remove(job_info)
-            state.jobs_being_safety_checked.append(job_info)
-
-        await self._dispatch(_apply)
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None:
+            logger.error(
+                f"Job {job_info.sdk_api_job_info.id_} is not tracked; cannot begin its safety check",
+            )
+            return
+        self._set_stage(tracked, JobStage.SAFETY_CHECKING)
 
     async def abandon_pending_safety(self, job_info: HordeJobInfo) -> None:
-        """Abandon a job from the pending safety check state."""
-        await self._dispatch(lambda state: state.jobs_pending_safety_check.remove(job_info))
+        """Abandon a job from the pending safety check state (it remains tracked, detached)."""
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None or tracked.stage != JobStage.PENDING_SAFETY_CHECK:
+            return
+        self._set_stage(tracked, JobStage.DETACHED)
 
     async def requeue_being_safety_checked(self) -> None:
         """Requeue all jobs that are currently being safety checked."""
-
-        def _apply(state: _JobTrackerState) -> None:
-            if not state.jobs_being_safety_checked:
-                return
-            state.jobs_pending_safety_check.extend(state.jobs_being_safety_checked)
-            state.jobs_being_safety_checked.clear()
-
-        await self._dispatch(_apply)
+        for tracked in self._jobs_in_stage(JobStage.SAFETY_CHECKING):
+            self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
 
     async def take_being_safety_checked(self, job_id: GenerationID) -> HordeJobInfo | None:
-        """Take a job that is currently being safety checked by its ID."""
-
-        def _apply(state: _JobTrackerState) -> HordeJobInfo | None:
-            for i, job_info in enumerate(state.jobs_being_safety_checked):
-                if job_info.sdk_api_job_info.id_ == job_id:
-                    return state.jobs_being_safety_checked.pop(i)
+        """Take a job that is currently being safety checked by its ID, detaching it."""
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.stage != JobStage.SAFETY_CHECKING:
             return None
-
-        return await self._dispatch(_apply)
+        self._set_stage(tracked, JobStage.DETACHED)
+        return tracked.job_info
 
     async def record_source_image_fault(self, job_id: GenerationID, entry: GenMetadataEntry) -> None:
         """Record a fault for a job."""
-
-        def _apply(state: _JobTrackerState) -> None:
-            if state.job_faults.get(job_id) is None:
-                state.job_faults[job_id] = []
-            state.job_faults[job_id].append(entry)
-
-        await self._dispatch(_apply)
+        self._job_faults.setdefault(job_id, []).append(entry)
 
     async def clear_faults_for_job(self, job_id: GenerationID) -> None:
         """Clear all recorded faults for a job."""
-        await self._dispatch(lambda state: state.job_faults.pop(job_id, None))
+        self._job_faults.pop(job_id, None)
 
     async def get_faults_for_job(self, job_id: GenerationID) -> list[GenMetadataEntry]:
         """Get all recorded faults for a job."""
-        return await self._dispatch(lambda state: list(state.job_faults.get(job_id, [])))
+        return list(self._job_faults.get(job_id, []))
 
     async def increment_jobs_faulted(self) -> None:
         """Increment the count of jobs that have encountered faults."""
-        await self._dispatch(lambda state: setattr(state, "num_jobs_faulted", state.num_jobs_faulted + 1))
+        self._num_jobs_faulted += 1
 
     async def increment_jobs_completed(self) -> None:
         """Increment the count of jobs that have been completed."""
-        await self._dispatch(
-            lambda state: setattr(state, "total_num_completed_jobs", state.total_num_completed_jobs + 1),
-        )
+        self._total_num_completed_jobs += 1
 
     async def get_job_info(self, job: ImageGenerateJobPopResponse) -> HordeJobInfo | None:
         """Get the job info for a given job."""
-        return await self._dispatch(lambda state: state.jobs_lookup.get(job))
+        tracked = self._tracked_for(job)
+        return tracked.job_info if tracked is not None else None
 
     async def set_job_time_to_download_aux_models(
         self,
@@ -394,67 +560,54 @@ class JobTracker:
         time_elapsed: float | None,
     ) -> bool:
         """Set the time it took to download auxiliary models for a job."""
-
-        def _apply(state: _JobTrackerState) -> bool:
-            job_info = state.jobs_lookup.get(job)
-            if job_info is None:
-                return False
-            job_info.time_to_download_aux_models = time_elapsed
-            return True
-
-        return await self._dispatch(_apply)
+        tracked = self._tracked_for(job)
+        if tracked is None or tracked.job_info is None:
+            return False
+        tracked.job_info.time_to_download_aux_models = time_elapsed
+        return True
 
     async def get_time_popped(self, job: ImageGenerateJobPopResponse) -> float | None:
         """Get the time a job was popped from the queue."""
-        return await self._dispatch(lambda state: state.job_pop_timestamps.get(job))
+        tracked = self._tracked_for(job)
+        return tracked.time_popped if tracked is not None else None
 
     async def ensure_submitted_job_info(self, completed_job_info: HordeJobInfo) -> HordeJobInfo:
-        """Ensure lookup contains an entry for a completed job and mark submit time."""
-
-        def _apply(state: _JobTrackerState) -> HordeJobInfo:
-            sdk_info = completed_job_info.sdk_api_job_info
-            job_info = state.jobs_lookup.get(sdk_info)
-            if job_info is None:
-                job_info = HordeJobInfo(
-                    sdk_api_job_info=sdk_info,
-                    time_popped=-1,
-                    job_image_results=completed_job_info.job_image_results,
-                    state=completed_job_info.state,
-                    censored=completed_job_info.censored,
-                    time_to_generate=completed_job_info.time_to_generate,
-                    time_to_download_aux_models=completed_job_info.time_to_download_aux_models,
-                )
-                state.jobs_lookup[sdk_info] = job_info
-            job_info.time_submitted = time.time()
-            return job_info
-
-        return await self._dispatch(_apply)
+        """Ensure the tracker knows about a completed job and mark its submit time."""
+        tracked = self._tracked_for(completed_job_info.sdk_api_job_info)
+        if tracked is None or tracked.job_info is None:
+            logger.warning(
+                f"Job {completed_job_info.sdk_api_job_info.id_} was not tracked at submit time; registering it now",
+            )
+            tracked = self._register(
+                job_id=completed_job_info.sdk_api_job_info.id_,  # type: ignore[arg-type]
+                sdk_api_job_info=completed_job_info.sdk_api_job_info,
+                stage=JobStage.PENDING_SUBMIT,
+                job_info=completed_job_info,
+                time_popped=None,
+            )
+        job_info = tracked.job_info
+        if job_info is None:
+            job_info = completed_job_info
+            tracked.job_info = job_info
+        job_info.time_submitted = time.time()
+        return job_info
 
     async def finalize_submitted(self, completed_job_info: HordeJobInfo) -> None:
-        """Finalize a submitted job, removing it from pending and lookup states."""
+        """Finalize a submitted job, removing it from the tracker entirely."""
+        sdk_info = completed_job_info.sdk_api_job_info
+        tracked = self._tracked_for(sdk_info)
 
-        def _apply(state: _JobTrackerState) -> None:
-            sdk_info = completed_job_info.sdk_api_job_info
+        if tracked is None:
+            logger.warning(f"Job {sdk_info.id_} not found in completed_jobs")
+            return
 
-            if completed_job_info in state.jobs_pending_submit:
-                state.jobs_pending_submit.remove(completed_job_info)
-            else:
-                logger.warning(f"Job {sdk_info.id_} not found in completed_jobs")
+        if tracked.stage != JobStage.PENDING_SUBMIT:
+            logger.warning(
+                f"Job {sdk_info.id_} was finalized from stage {tracked.stage.name} (expected PENDING_SUBMIT)",
+            )
 
-            if sdk_info in state.jobs_lookup:
-                del state.jobs_lookup[sdk_info]
-            else:
-                logger.warning(f"Job {sdk_info.id_} not found in jobs_lookup")
-
-            if sdk_info in state.job_pop_timestamps:
-                state.job_pop_timestamps.pop(sdk_info)
-
-            if sdk_info in state.jobs_in_progress:
-                state.jobs_in_progress.remove(sdk_info)
-
-            state.last_job_submitted_time = time.time()
-
-        await self._dispatch(_apply)
+        del self._jobs[tracked.job_id]
+        self._last_job_submitted_time = time.time()
 
     async def handle_job_fault(
         self,
@@ -462,38 +615,8 @@ class JobTracker:
         process_info: HordeProcessInfo | None = None,
         process_timeout: float = 0.0,
     ) -> None:
-        """Handle a job that has faulted, updating its state and related queues."""
-
-        def _apply(state: _JobTrackerState) -> None:
-            job_info = state.jobs_lookup.get(faulted_job)
-
-            if job_info is None:
-                logger.error(f"Job {faulted_job.id_} not found in jobs_lookup")
-                return
-
-            if faulted_job in state.jobs_pending_inference:
-                state.jobs_pending_inference.remove(faulted_job)
-
-            job_info.fault_job()
-            job_info.time_to_generate = process_timeout
-
-            if process_info is not None:
-                logger.error(f"Job {faulted_job.id_} faulted due to process {process_info.process_id} crashing")
-
-            if faulted_job in state.jobs_in_progress:
-                state.jobs_in_progress.remove(faulted_job)
-
-            for horde_job_info in state.jobs_pending_safety_check:
-                if horde_job_info.sdk_api_job_info.id_ == faulted_job.id_:
-                    state.jobs_pending_safety_check.remove(horde_job_info)
-                    break
-
-            if job_info not in state.jobs_pending_submit:
-                state.jobs_pending_submit.append(job_info)
-            else:
-                logger.warning(f"Job {faulted_job.id_} already in completed_jobs")
-
-        await self._dispatch(_apply)
+        """Handle a job that has faulted, moving it to the pending submit stage."""
+        self._handle_job_fault_impl(faulted_job, process_info=process_info, process_timeout=process_timeout)
 
     def handle_job_fault_now(
         self,
@@ -501,55 +624,41 @@ class JobTracker:
         process_info: HordeProcessInfo | None = None,
         process_timeout: float = 0.0,
     ) -> None:
-        """Synchronous emergency fault path for legacy sync callers."""
-        job_info = self._state.jobs_lookup.get(faulted_job)
+        """Synchronous fault path for sync callers (e.g. process crash handling)."""
+        self._handle_job_fault_impl(faulted_job, process_info=process_info, process_timeout=process_timeout)
 
-        if job_info is None:
+    def _handle_job_fault_impl(
+        self,
+        faulted_job: ImageGenerateJobPopResponse,
+        *,
+        process_info: HordeProcessInfo | None,
+        process_timeout: float,
+    ) -> None:
+        tracked = self._tracked_for(faulted_job)
+
+        if tracked is None or tracked.job_info is None:
             logger.error(f"Job {faulted_job.id_} not found in jobs_lookup")
             return
 
-        if faulted_job in self._state.jobs_pending_inference:
-            self._state.jobs_pending_inference.remove(faulted_job)
-
-        job_info.fault_job()
-        job_info.time_to_generate = process_timeout
+        tracked.job_info.fault_job()
+        tracked.job_info.time_to_generate = process_timeout
 
         if process_info is not None:
             logger.error(f"Job {faulted_job.id_} faulted due to process {process_info.process_id} crashing")
 
-        if faulted_job in self._state.jobs_in_progress:
-            self._state.jobs_in_progress.remove(faulted_job)
-
-        for horde_job_info in self._state.jobs_pending_safety_check:
-            if horde_job_info.sdk_api_job_info.id_ == faulted_job.id_:
-                self._state.jobs_pending_safety_check.remove(horde_job_info)
-                break
-
-        if job_info not in self._state.jobs_pending_submit:
-            self._state.jobs_pending_submit.append(job_info)
-        else:
+        if tracked.stage == JobStage.PENDING_SUBMIT:
             logger.warning(f"Job {faulted_job.id_} already in completed_jobs")
+            return
+
+        self._set_stage(tracked, JobStage.PENDING_SUBMIT)
 
     async def purge_jobs(self) -> None:
         """Clear all jobs from the tracker."""
-
-        def _apply(state: _JobTrackerState) -> None:
-            state.jobs_pending_inference.clear()
-            state.jobs_being_safety_checked.clear()
-            state.jobs_pending_safety_check.clear()
-            state.jobs_lookup.clear()
-            state.jobs_in_progress.clear()
-            state.jobs_pending_submit.clear()
-            state.last_job_submitted_time = time.time()
-
-        await self._dispatch(_apply)
+        self._purge_jobs()
 
     def _purge_jobs(self) -> None:
-        """Emergency synchronous purge for abort/shutdown paths."""
-        self._state.jobs_pending_inference.clear()
-        self._state.jobs_being_safety_checked.clear()
-        self._state.jobs_pending_safety_check.clear()
-        self._state.jobs_lookup.clear()
-        self._state.jobs_in_progress.clear()
-        self._state.jobs_pending_submit.clear()
-        self._state.last_job_submitted_time = time.time()
+        """Synchronous purge for abort/shutdown paths."""
+        self._jobs.clear()
+        self._last_job_submitted_time = time.time()
+
+    # endregion
