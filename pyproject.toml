@@ -143,7 +143,7 @@ packages = ["horde_worker_regen"]
 "horde_worker_regen/assets" = "horde_worker_regen/assets"
 
 [tool.ruff]
-line-length = 119
+line-length = 119 # ruff format is canonical formatter
 lint.select = [
   "A",
   "I",
@@ -187,29 +187,6 @@ extend-exclude = ["conda", "model-stats.py", "amd_go_fast.py"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
-
-[tool.black]
-line-length = 119
-include = '\.pyi?$'
-exclude = '''
-/(
- \.git
- | \.hg
- | \.mypy_cache
- | \.tox
- | \.venv
- | venv
- | _build
- | buck-out
- | build
- | dist
- | conda
- | clip_blip
- | hf_transformers
- | horde_model_reference
- | amd_go_fast.py
-)/
-'''
 
 
 [tool.mypy]
