@@ -76,7 +76,7 @@ class KudosCalculator:
                 cleaned_events = deque(list(kudos_events)[-num_events_found:], maxlen=kudos_events.maxlen)
             else:
                 # All events are old, return empty deque
-                cleaned_events = deque([], maxlen=kudos_events.maxlen)
+                cleaned_events = deque(maxlen=kudos_events.maxlen)
         else:
             cleaned_events = kudos_events
 

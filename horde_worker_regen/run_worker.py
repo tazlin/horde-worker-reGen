@@ -14,6 +14,7 @@ import multiprocessing
 import os
 import time
 from multiprocessing.context import BaseContext
+from typing import override
 
 import regex as re
 from loguru import logger
@@ -131,6 +132,7 @@ class LogConsoleRewriter(io.StringIO):
 
         self.line_number_pattern = re.compile(pattern)
 
+    @override
     def write(self, message: str) -> int:
         """Rewrite the message to make it more readable where possible."""
         replacements = [
@@ -165,6 +167,7 @@ class LogConsoleRewriter(io.StringIO):
 
         return self.original_iostream.write(message)
 
+    @override
     def flush(self) -> None:
         """Flush the buffer to the original stdout."""
         self.original_iostream.flush()

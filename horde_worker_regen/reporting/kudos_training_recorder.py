@@ -172,7 +172,7 @@ class KudosTrainingRecorder:
                 json.dump([model_dump], f, indent=4)
         elif n_iter == 1:
             # Append to existing file (only for non-batched jobs)
-            data = []
+            data: list[dict[str, Any]] = []
             with open(path_obj) as f:
                 data = json.load(f)
                 if not isinstance(data, list):

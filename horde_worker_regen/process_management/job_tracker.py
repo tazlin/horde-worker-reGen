@@ -256,9 +256,7 @@ class JobTracker:
     @property
     def jobs_pending_safety_check(self) -> tuple[HordeJobInfo, ...]:
         """Return the `HordeJobInfo` objects for jobs pending safety check."""
-        return tuple(
-            t.job_info for t in self._jobs_in_stage(JobStage.PENDING_SAFETY_CHECK) if t.job_info is not None
-        )
+        return tuple(t.job_info for t in self._jobs_in_stage(JobStage.PENDING_SAFETY_CHECK) if t.job_info is not None)
 
     @property
     def jobs_being_safety_checked(self) -> tuple[HordeJobInfo, ...]:

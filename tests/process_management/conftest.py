@@ -156,9 +156,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     """
     bd = Mock()
     bd.image_models_to_load = ["stable_diffusion"]
-    bd.custom_models = (
-        []
-    )  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
+    bd.custom_models = []  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
     bd.max_threads = 1
     bd.queue_size = 1
     bd.high_memory_mode = False
@@ -187,9 +185,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.api_key = "T" * 22
     bd.dreamer_worker_name = "test-worker"
     bd.horde_model_stickiness = 0
-    bd.blacklist = (
-        []
-    )  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
+    bd.blacklist = []  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
     bd.require_upfront_kudos = False
     bd.allow_img2img = True
     bd.allow_inpainting = True
@@ -280,9 +276,7 @@ def make_job_pop_response(
         "source_processing": "txt2img",
     }
     if loras is not None:
-        data["payload"][
-            "loras"
-        ] = loras  # pyrefly: ignore - type safety doesn't matter here; violations will be caught elsewhere
+        data["payload"]["loras"] = loras  # pyrefly: ignore - type safety doesn't matter here; violations will be caught elsewhere
     if r2_upload is not None:
         data["r2_upload"] = r2_upload
     return ImageGenerateJobPopResponse(**data)  # pyrefly: ignore - type violations will be caught by pydantic
@@ -339,7 +333,6 @@ def make_testable_process_manager(
         bridge_data=bridge_data,
         horde_model_reference_manager=mock_model_ref_manager,
         max_safety_processes=1,
-        max_download_processes=1,
         system_resources=system_resources,
         mp_primitives=mp_primitives,
         skip_api_init=True,

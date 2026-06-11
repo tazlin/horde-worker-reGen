@@ -99,16 +99,13 @@ class SafetyOrchestrator:
 
             return
 
-        if completed_job_info.sdk_api_job_info.id_ is None:
-            raise ValueError("completed_job_info.sdk_api_job_info.id_ is None")
         if completed_job_info.sdk_api_job_info.payload.prompt is None:
+            # For static type checking the use below; this should never be hit at runtime, see above
             raise ValueError("completed_job_info.sdk_api_job_info.payload.prompt is None")
-        if completed_job_info.sdk_api_job_info.model is None:
-            raise ValueError("completed_job_info.sdk_api_job_info.model is None")
 
-        model_info = {}
+        model_info = None
         if completed_job_info.sdk_api_job_info.model in stable_diffusion_reference:
-            model_info = stable_diffusion_reference[completed_job_info.sdk_api_job_info.model].model_dump()
+            model_info = stable_diffusion_reference[completed_job_info.sdk_api_job_info.model]
         with span_safety_check(job_id=str(completed_job_info.sdk_api_job_info.id_)):
             safety_message_sent_succeeded = safety_process.safe_send_message(
                 HordeSafetyControlMessage(

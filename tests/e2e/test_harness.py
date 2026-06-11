@@ -31,10 +31,14 @@ async def test_full_lifecycle_fake_processes_no_api() -> None:
         ),
     )
 
-    assert not result.timed_out, "Harness run timed out before the scenario completed"
-    assert result.num_jobs_faulted == 0
-    assert result.num_jobs_completed == 3
-    assert result.succeeded
+    assert not result.timed_out, f"Harness run timed out before the scenario completed ({result.failure_summary()})"
+    assert result.num_jobs_faulted == 0, (
+        f"Expected 0 faulted jobs, got {result.num_jobs_faulted} ({result.failure_summary()})"
+    )
+    assert result.num_jobs_completed == 3, (
+        f"Expected 3 completed jobs, got {result.num_jobs_completed} ({result.failure_summary()})"
+    )
+    assert result.succeeded, f"Harness run did not succeed ({result.failure_summary()})"
 
 
 @pytest.mark.e2e
@@ -51,5 +55,7 @@ async def test_full_lifecycle_with_simulated_inference_time() -> None:
         ),
     )
 
-    assert result.succeeded
-    assert result.num_jobs_completed == len(scenario)
+    assert result.succeeded, f"Harness run did not succeed ({result.failure_summary()})"
+    assert result.num_jobs_completed == len(scenario), (
+        f"Expected {len(scenario)} completed jobs, got {result.num_jobs_completed} ({result.failure_summary()})"
+    )

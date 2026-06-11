@@ -736,9 +736,7 @@ class TestApiJobPopFullFlow:
 
         await popper.api_job_pop()
 
-        assert (
-            popper._state.last_pop_maintenance_mode is False
-        )  # pyrefly: ignore - "always true" is wrong, api_job_pop() should mutate
+        assert popper._state.last_pop_maintenance_mode is False  # pyrefly: ignore - "always true" is wrong, api_job_pop() should mutate
 
     @_full_flow_patches
     async def test_successful_pop_resets_throttler_to_default(self, _mock_req_cls: Mock) -> None:
@@ -757,9 +755,7 @@ class TestApiJobPopFullFlow:
         empty_response = Mock()
         empty_response.id_ = None
         empty_response.skipped = Mock()
-        empty_response.skipped.model_dump.return_value = (
-            {}
-        )  #  pyrefly: ignore - we just need to ensure this doesn't raise, the actual content isn't important for this test
+        empty_response.skipped.model_dump.return_value = {}  #  pyrefly: ignore - we just need to ensure this doesn't raise, the actual content isn't important for this test
         empty_response.skipped.model_extra = None
         empty_response.messages = None
 

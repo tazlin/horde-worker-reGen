@@ -10,6 +10,7 @@ from asyncio import CancelledError, Task
 from typing import TYPE_CHECKING
 
 import aiohttp
+import aiohttp.client_exceptions
 import certifi
 import yarl
 from horde_sdk.ai_horde_api import GENERATION_STATE, AIHordeAPIAsyncClientSession
@@ -200,7 +201,7 @@ class JobSubmitter:
                 logger.debug(f"{type(e).__name__}: {e}")
                 new_submit.retry()
                 return new_submit
-        metadata = []
+        metadata: list[GenMetadataEntry] = []
         if new_submit.image_result is not None:
             metadata = new_submit.image_result.generation_faults
             if new_submit.batch_count > 1:

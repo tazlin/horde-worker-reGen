@@ -1,14 +1,16 @@
-"""A simple LRU cache for tracking recently used models."""
+"""A simple LRU cache for tracking recently used models.
+
+This is implemented as an ordered set — the dictionary values are always
+``None`` and only the insertion order of keys matters.
+"""
 
 from __future__ import annotations
 
 import collections
 
-from horde_worker_regen.process_management.messages import ModelInfo
-
 
 class LRUCache:
-    """A simple LRU cache. This is used to keep track of the most recently used models."""
+    """A simple LRU cache (ordered set) for tracking the most recently used models."""
 
     def __init__(self, capacity: int) -> None:
         """Initializes the LRU cache.
@@ -17,9 +19,9 @@ class LRUCache:
             capacity: The maximum number of elements that the cache can hold.
         """
         self.capacity = capacity
-        self.cache: collections.OrderedDict[str, ModelInfo | None] = collections.OrderedDict()
+        self.cache: collections.OrderedDict[str, None] = collections.OrderedDict()
 
-    def append(self, key: str) -> object:
+    def append(self, key: str) -> str | None:
         """Adds an element to the LRU cache, and potentially bumps one from the cache.
 
         Args:

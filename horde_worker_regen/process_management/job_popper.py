@@ -75,6 +75,9 @@ def _select_models_for_pop(
                 if not process.is_process_busy() and process.loaded_horde_model_name is not None
             }
             if len(loaded_models) >= 1:
+                # free_models may be empty when all inference processes are
+                # busy; in that case no pop occurs (intentional — there is
+                # no process available to accept a new job).
                 models = free_models
             logger.debug(f"Sticky models -- popping only {models}")
             if len(bridge_data.image_models_to_load) > 10:
@@ -122,7 +125,7 @@ class JobPopper:
     _source_image_downloader: SourceImageDownloader
 
     _replaced_due_to_maintenance: bool
-    _api_messages_received: dict[str | None, APIWorkerMessage]
+    _api_messages_received: dict[str, APIWorkerMessage]
     _api_call_loop_interval: float
 
     _canned_job_source: CannedJobSource | None
@@ -175,7 +178,7 @@ class JobPopper:
         self._api_call_loop_interval = 1
 
     @property
-    def api_messages_received(self) -> dict[str | None, APIWorkerMessage]:
+    def api_messages_received(self) -> dict[str, APIWorkerMessage]:
         """Return the worker messages received from the API, keyed by message ID."""
         return self._api_messages_received
 

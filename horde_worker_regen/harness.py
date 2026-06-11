@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import functools
 import multiprocessing
+import os
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -105,6 +106,12 @@ class HarnessResult:
     or the run timed out, since an aborted run purges the tracker)."""
     num_jobs_submitted_faulted: int = 0
     """How many jobs reached submission in a faulted state (per the auditor)."""
+    exit_reason: str = ""
+    """Human-readable reason why the run ended (e.g. 'completed', 'timed_out',
+    'aborted_stale_abort_file', 'exception')."""
+    diagnostics: list[str] = field(default_factory=list)
+    """Non-fatal warnings and diagnostic messages collected during the run (e.g. zero
+    processes started, no pops). Empty list means no diagnostics."""
 
     @property
     def all_jobs_accounted_for(self) -> bool:
@@ -117,6 +124,23 @@ class HarnessResult:
         return (
             not self.timed_out and self.num_jobs_faulted == 0 and (self.num_jobs_completed >= self.num_jobs_expected)
         )
+
+    def failure_summary(self) -> str:
+        """Return a compact summary suitable for assertion error messages."""
+        parts: list[str] = []
+        if self.exit_reason and self.exit_reason != "completed":
+            parts.append(f"exit_reason={self.exit_reason}")
+        if self.timed_out:
+            parts.append("timed_out=True")
+        if self.num_jobs_faulted > 0:
+            parts.append(f"jobs_faulted={self.num_jobs_faulted}")
+        if self.num_jobs_completed < self.num_jobs_expected:
+            parts.append(f"jobs_completed={self.num_jobs_completed}/{self.num_jobs_expected}")
+        if self.audit_failures:
+            parts.append(f"audit_failures={len(self.audit_failures)}")
+        if self.diagnostics:
+            parts.append(f"diagnostics={self.diagnostics}")
+        return "; ".join(parts) if parts else "no issues detected"
 
 
 class JobLifecycleAuditor:
@@ -231,7 +255,6 @@ def build_harness_model_reference(
             baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
             nsfw=False,
             description="e2e harness model record",
-            config={},
         )
     return reference
 
@@ -325,11 +348,31 @@ async def _watch_for_scenario_completion(
             return True
 
 
+def _cleanup_stale_abort_file() -> None:
+    """Remove a stale `.abort` file left behind by a previous crashed or aborted run.
+
+    The process manager checks for this sentinel file on every control-loop tick
+    and aborts immediately if it exists.  Leaving one behind guarantees the next
+    harness run will exit instantly with zero jobs processed.
+    """
+    cwd = os.getcwd()
+    abort_path = os.path.join(cwd, ".abort")
+    if os.path.exists(abort_path):
+        logger.warning(f"Removing stale .abort file from {abort_path}")
+        os.remove(abort_path)
+
+
 async def run_harness_async(config: HarnessConfig) -> HarnessResult:
     """Run a full worker lifecycle against the configured scenario and report the outcome."""
     from horde_worker_regen.telemetry import configure_telemetry
 
     configure_telemetry()
+
+    # Remove any stale .abort sentinel before starting, so a previous crashed/
+    # aborted run doesn't cause an immediate spurious abort.
+    _cleanup_stale_abort_file()
+
+    diagnostics: list[str] = []
 
     manager, num_jobs_expected = build_harness_process_manager(config)
 
@@ -348,8 +391,12 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         ),
     )
 
+    exception_raised: BaseException | None = None
     try:
         await manager._main_loop()
+    except Exception as exc:
+        exception_raised = exc
+        logger.exception(f"Harness main loop raised an exception: {exc}")
     finally:
         if not watcher_task.done():
             watcher_task.cancel()
@@ -357,6 +404,23 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
     timed_out = False
     with contextlib.suppress(asyncio.CancelledError):
         timed_out = await watcher_task
+
+    # Determine the exit reason for diagnostic purposes.
+    exit_reason = _determine_exit_reason(
+        manager=manager,
+        num_jobs_expected=num_jobs_expected,
+        timed_out=timed_out,
+        exception_raised=exception_raised,
+    )
+
+    # Collect diagnostics about the run.
+    diagnostics.extend(
+        _collect_run_diagnostics(
+            manager=manager,
+            num_jobs_expected=num_jobs_expected,
+            elapsed=time.time() - time_started,
+        ),
+    )
 
     audit_failures: list[str] = []
     num_jobs_submitted_faulted = 0
@@ -376,7 +440,60 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         timed_out=timed_out,
         audit_failures=audit_failures,
         num_jobs_submitted_faulted=num_jobs_submitted_faulted,
+        exit_reason=exit_reason,
+        diagnostics=diagnostics,
     )
+
+
+def _determine_exit_reason(
+    *,
+    manager: HordeWorkerProcessManager,
+    num_jobs_expected: int,
+    timed_out: bool,
+    exception_raised: BaseException | None,
+) -> str:
+    """Produce a human-readable explanation of why the harness run ended."""
+    if exception_raised is not None:
+        return f"exception: {type(exception_raised).__name__}: {exception_raised}"
+    if timed_out:
+        return "timed_out"
+    jobs_accounted = manager._job_tracker.total_num_completed_jobs + manager._job_tracker.num_jobs_faulted
+    if jobs_accounted >= num_jobs_expected:
+        return "completed"
+    if manager._state.shut_down:
+        return "shut_down_before_completion"
+    return "unknown"
+
+
+def _collect_run_diagnostics(
+    *,
+    manager: HordeWorkerProcessManager,
+    num_jobs_expected: int,
+    elapsed: float,
+) -> list[str]:
+    """Collect non-fatal diagnostic messages about the run for debugging failures."""
+    diags: list[str] = []
+
+    num_inference = manager._process_map.num_inference_processes()
+    num_safety = manager._process_map.num_safety_processes()
+    if num_inference == 0:
+        diags.append("No inference processes were started")
+    if num_safety == 0:
+        diags.append("No safety processes were started")
+
+    completed = manager._job_tracker.total_num_completed_jobs
+    faulted = manager._job_tracker.num_jobs_faulted
+    if completed == 0 and faulted == 0 and elapsed > 2.0:
+        diags.append(
+            f"No jobs completed or faulted after {elapsed:.1f}s "
+            f"(expected {num_jobs_expected}); check for stale .abort file or blocked job pop"
+        )
+
+    popped = len(manager._job_tracker.jobs_lookup)
+    if popped == 0 and elapsed > 2.0:
+        diags.append("No jobs were ever popped; check canned_job_source or process availability")
+
+    return diags
 
 
 def run_harness(config: HarnessConfig) -> HarnessResult:

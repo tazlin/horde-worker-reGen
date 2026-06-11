@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import override
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
@@ -167,8 +168,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         expected_sources = _EXPECTED_PROCESS_STATE_SOURCES.get(new_state)
         if expected_sources is not None and old_state != new_state and old_state not in expected_sources:
             logger.warning(
-                f"Process {process_id} made an unexpected state transition: "
-                f"{old_state.name} -> {new_state.name}",
+                f"Process {process_id} made an unexpected state transition: {old_state.name} -> {new_state.name}",
             )
 
         self[process_id].last_process_state = new_state
@@ -528,6 +528,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 count += 1
         return count
 
+    @override
     def __repr__(self) -> str:
         """Return a string representation of the process map."""
         base_string = "Processes: "

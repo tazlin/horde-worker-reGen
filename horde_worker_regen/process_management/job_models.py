@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import enum
+import random
 from enum import auto
 from typing import override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from horde_sdk.ai_horde_api.fields import GenerationID
+from loguru import logger
 from pydantic import BaseModel, ConfigDict
 
 from horde_worker_regen.process_management.messages import HordeImageResult
@@ -96,7 +98,7 @@ class PendingJob(BaseModel):
         if self._consecutive_failed_job_submits > self._max_consecutive_failed_job_submits:
             self.state = JobSubmitState.FAULTED
 
-    def succeed(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+    def succeed(self, **kwargs: int | float) -> None:
         """Mark the job as successfully submitted."""
         self.state = JobSubmitState.SUCCESS
 
@@ -138,16 +140,22 @@ class PendingSubmitJob(PendingJob):
         return len(self.completed_job_info.sdk_api_job_info.ids)
 
     @override
-    def succeed(self, kudos_reward: int = 0, kudos_per_second: float = 0) -> None:
+    def succeed(
+        self,
+        kudos_reward: int = 0,
+        kudos_per_second: float = 0,
+        **kwargs: int | float,
+    ) -> None:
         """Mark the job as successfully submitted.
 
         Args:
             kudos_reward: The amount of kudos to reward the user.
             kudos_per_second: The amount of kudos per second to reward the user.
+            **kwargs: Additional keyword arguments.
         """
         self.kudos_reward = kudos_reward
         self.kudos_per_second = kudos_per_second
-        super().succeed()
+        super().succeed(**kwargs)
 
 
 class LineSkip(BaseModel):
@@ -177,7 +185,7 @@ class NextJobAndProcess(BaseModel):
 class APIWorkerMessage(BaseModel):
     """A message sent to the worker from the API."""
 
-    message_id: str | None
+    message_id: str
     """The ID of the message."""
 
     message_text: str | None
@@ -196,8 +204,13 @@ class APIWorkerMessage(BaseModel):
         TODO: Remove once the SDK provides a proper model for these messages.
         """
         message_id = raw.get("id")
-        if message_id is not None:
-            message_id = str(message_id)
+
+        if message_id is None:
+            logger.warning("Received API worker message with no ID; assigning None as message_id")
+            message_id = str(random.randint(1, 1_000_000_000))
+
+        message_id = str(message_id)
+
         return cls(
             message_id=message_id,
             message_text=str(raw.get("message")),

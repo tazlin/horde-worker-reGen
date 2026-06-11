@@ -490,7 +490,7 @@ class MessageDispatcher:
                     model_process_map[process.loaded_horde_model_name] = process.process_id
 
             for job in self._job_tracker.jobs_pending_inference:
-                if job.model in currently_loaded_models:
+                if job.model is not None and job.model in currently_loaded_models:
                     self._in_queue_deadlock = True
                     self._last_queue_deadlock_detected_time = time.time()
                     self._queue_deadlock_model = job.model

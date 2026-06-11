@@ -47,13 +47,13 @@ class TestAPIWorkerMessageFromRawDict:
         assert msg.message_id == "42"
         assert isinstance(msg.message_id, str)
 
-    def test_none_id_becomes_none(self) -> None:
-        """If 'id' key is absent, message_id should be None."""
+    def test_none_id_assigned_random_id(self) -> None:
+        """If 'id' key is absent, message_id should be assigned a random ID."""
         raw = {"message": "orphan message"}
 
         msg = APIWorkerMessage.from_raw_dict(raw)
 
-        assert msg.message_id is None
+        assert msg.message_id is not None
 
     def test_empty_dict(self) -> None:
         """An empty dict should produce a message with all None/default fields."""
@@ -61,7 +61,7 @@ class TestAPIWorkerMessageFromRawDict:
 
         msg = APIWorkerMessage.from_raw_dict(raw)
 
-        assert msg.message_id is None
+        assert msg.message_id is not None
         assert msg.message_text == "None"
         assert msg.message_origin is None
         assert msg.message_expiry is None

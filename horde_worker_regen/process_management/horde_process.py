@@ -251,6 +251,7 @@ class HordeProcess(abc.ABC):
     def main_loop(self) -> None:
         """Start the main loop of the process."""
         signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
 
         while not self._end_process:
             time.sleep(self._loop_interval)

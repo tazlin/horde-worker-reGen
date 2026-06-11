@@ -6,6 +6,7 @@ import asyncio
 from asyncio import Task
 
 from horde_sdk.ai_horde_api.apimodels import (
+    ExtraSourceImageEntry,
     GenMetadataEntry,
     ImageGenerateJobPopResponse,
 )
@@ -73,7 +74,7 @@ class SourceImageDownloader:
 
         attempts = 0
         while attempts < MAX_SOURCE_IMAGE_RETRIES:
-            download_tasks: list[Task] = []
+            download_tasks: list[Task[list[ExtraSourceImageEntry] | None]] = []
 
             if (
                 source_image_is_url

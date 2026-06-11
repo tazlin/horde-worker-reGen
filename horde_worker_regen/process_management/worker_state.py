@@ -27,7 +27,9 @@ class WorkerState:
     consecutive_failed_jobs: int = 0
     too_many_consecutive_failed_jobs: bool = False
     too_many_consecutive_failed_jobs_time: float = 0.0
-    too_many_consecutive_failed_jobs_wait_time: float = 60 * 10
+    # Must match CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS in pop_throttler.py;
+    # this field is used by the status reporter for display only.
+    too_many_consecutive_failed_jobs_wait_time: float = 180
 
     kudos_generated_this_session: float = 0.0
     kudos_events: deque[tuple[float, float]] = dataclasses.field(default_factory=deque)

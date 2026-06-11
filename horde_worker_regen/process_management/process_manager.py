@@ -9,7 +9,6 @@ import ssl
 import sys
 import time
 from asyncio import CancelledError
-from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from multiprocessing.context import BaseContext
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
@@ -49,7 +48,6 @@ from horde_worker_regen.process_management.device_info import TorchDeviceInfo, T
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.job_popper import JobPopper
 from horde_worker_regen.process_management.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.job_tracker import JobTracker
@@ -176,8 +174,6 @@ class HordeWorkerProcessManager:
 
     max_safety_processes: int
     """The maximum number of safety processes that can run at once."""
-    max_download_processes: int
-    """The maximum number of download processes that can run at once."""
 
     total_ram_bytes: int
     """The total amount of RAM on the system."""
@@ -278,11 +274,6 @@ class HordeWorkerProcessManager:
     _last_get_user_info_time: float = 0
     """The time at which the user info was last fetched."""
 
-    @property
-    def num_total_processes(self) -> int:
-        """The total number of processes that can be running at once (inference, safety, and download)."""
-        return self.max_inference_processes + self.max_safety_processes + self.max_download_processes
-
     _process_message_queue: ProcessQueue
     """A queue of messages sent from child processes."""
 
@@ -308,7 +299,11 @@ class HordeWorkerProcessManager:
 
     @property
     def post_process_job_overlap_allowed(self) -> bool:
-        """Return true if post processing jobs are allowed to overlap."""
+        """Return true if a new inference job can start while the previous job's post-processing is still running.
+
+        Distinct from ``allow_post_processing`` (from the SDK), which advertises
+        to the horde API that this worker accepts post-processing jobs at all.
+        """
         return (
             self.bridge_data.moderate_performance_mode or self.bridge_data.high_performance_mode
         ) and self.bridge_data.post_process_job_overlap
@@ -322,7 +317,6 @@ class HordeWorkerProcessManager:
         target_ram_overhead_bytes: int = 9 * 1024 * 1024 * 1024,
         target_vram_overhead_bytes_map: Mapping[int, int] | None = None,  # FIXME
         max_safety_processes: int = 1,
-        max_download_processes: int = 1,
         amd_gpu: bool = False,
         directml: int | None = None,
         system_resources: SystemResources | None = None,
@@ -343,7 +337,6 @@ class HordeWorkerProcessManager:
             target_ram_overhead_bytes: The target amount of RAM to keep free.
             target_vram_overhead_bytes_map: The target amount of VRAM to keep free.
             max_safety_processes: The maximum number of safety processes that can run at once.
-            max_download_processes: The maximum number of download processes that can run at once.
             amd_gpu: Whether or not the GPU is an AMD GPU.
             directml: ID of the potential directml device.
             system_resources: Pre-detected system resources. If None, auto-detects via torch/psutil.
@@ -371,7 +364,6 @@ class HordeWorkerProcessManager:
         self._horde_model_map = HordeModelMap(root={})
 
         self.max_safety_processes = max_safety_processes
-        self.max_download_processes = max_download_processes
 
         self._max_concurrent_inference_processes = bridge_data.max_threads
 
@@ -541,12 +533,11 @@ class HordeWorkerProcessManager:
         """Fetch the stable diffusion model reference, retrying on failure."""
         while self.stable_diffusion_reference is None:
             try:
-                horde_model_reference_manager = ModelReferenceManager(
-                    download_and_convert_legacy_dbs=False,
-                    override_existing=False,
-                )
-                all_refs = horde_model_reference_manager.get_all_model_references(False)
-                _sd_ref = all_refs[MODEL_REFERENCE_CATEGORY.image_generation]
+                horde_model_reference_manager = ModelReferenceManager.get_instance()
+
+                # all_refs = horde_model_reference_manager.get_all_model_references(False)
+                # _sd_ref = all_refs[MODEL_REFERENCE_CATEGORY.image_generation]
+                _sd_ref = horde_model_reference_manager.get_model_reference(MODEL_REFERENCE_CATEGORY.image_generation)
 
                 if not isinstance(_sd_ref, dict):
                     raise ValueError(
@@ -872,6 +863,12 @@ class HordeWorkerProcessManager:
             try:
                 if self.stable_diffusion_reference is None:
                     return
+                # Watch for an externally-created .abort file as a signal-less
+                # abort trigger (e.g. for process managers that cannot send signals).
+                if os.path.exists(".abort"):
+                    logger.warning("Found .abort file — aborting immediately")
+                    self._abort()
+                    break
                 if not await self._control_loop_tick():
                     self._start_timed_shutdown()
                     break
@@ -1003,7 +1000,9 @@ class HordeWorkerProcessManager:
                 if self._last_bridge_data_reload_time < self._bridge_data_last_modified_time:
                     logger.info(f"Reloading {BRIDGE_CONFIG_FILENAME}")
                     self.get_bridge_data_from_disk()
-                    self._last_bridge_data_reload_time = time.time()
+                    # Capture mtime immediately after a successful load so that
+                    # a modification during the load does not go undetected.
+                    self._last_bridge_data_reload_time = os.path.getmtime(BRIDGE_CONFIG_FILENAME)
                     logger.success(f"Reloaded {BRIDGE_CONFIG_FILENAME}")
                     self.enable_performance_mode()
                 await asyncio.sleep(self._bridge_data_loop_interval)
@@ -1011,13 +1010,13 @@ class HordeWorkerProcessManager:
                 self._shutdown()
                 logger.debug(f"CancelledError: {e}")
 
-    def _handle_exception(self, future: asyncio.Future) -> None:
+    def _handle_exception(self, task: asyncio.Task[None]) -> None:
         """Logs exceptions from asyncio tasks.
 
-        :param future: asyncio task to monitor
+        :param task: asyncio task to monitor
         :return: None
         """
-        ex = future.exception()
+        ex = task.exception()
         if ex is not None:
             if self._state.shutting_down:
                 logger.debug(f"exception thrown by a main loop task: {ex}")
@@ -1040,7 +1039,7 @@ class HordeWorkerProcessManager:
         self._api_sessions.set_aiohttp_session(aiohttp_session)
         self._api_sessions.set_horde_client_session(horde_session)
 
-        async with aiohttp_session, horde_session:
+        async with aiohttp_session, horde_session:  # pyrefly: ignore
             coroutines = [
                 self._process_control_loop(),
                 self._job_popper.run(),
@@ -1061,6 +1060,7 @@ class HordeWorkerProcessManager:
         import signal
 
         signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
         asyncio.run(self._main_loop())
 
     def signal_handler(self, sig: int, frame: object) -> None:

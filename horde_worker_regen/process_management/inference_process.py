@@ -205,7 +205,7 @@ class HordeInferenceProcess(HordeProcess):
             info="Waiting for job",
         )
 
-    def _comfyui_callback(self, label: str, data: dict, _id: str) -> None:
+    def _comfyui_callback(self, label: str, data: dict, _id: str) -> None:  # pyrefly: ignore[implicit-any-type-argument] - we don't control the type signature of this callback
         self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
 
     @override
@@ -691,6 +691,7 @@ class HordeInferenceProcess(HordeProcess):
         self._active_model_name = None
 
     @logger.catch(reraise=True)
+    @override
     def cleanup_for_exit(self) -> None:
         """Cleanup the process pending a shutdown."""
         self.unload_models_from_ram()

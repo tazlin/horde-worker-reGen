@@ -230,9 +230,7 @@ class TestHandleInferenceResult:
         msg.time_elapsed = 5.0
         msg.info = "50%"
         msg.state = Mock()
-        msg.state.__eq__ = (
-            lambda self, other: False
-        )  # pyrefly: ignore - we aren't testing state handling here, just that the message is processed and the job is moved to safety check
+        msg.state.__eq__ = lambda self, other: False  # pyrefly: ignore - we aren't testing state handling here, just that the message is processed and the job is moved to safety check
         msg.job_image_results = [Mock()]
         msg.faults_count = 0
 
@@ -313,9 +311,7 @@ class TestHandleSafetyResult:
         job.id_ = "safety-test-id"
 
         image_result = Mock()
-        image_result.generation_faults = (
-            []
-        )  # pyrefly: ignore - we aren't testing fault handling here, just that the safety result is processed and the job is moved to pending submit
+        image_result.generation_faults = []  # pyrefly: ignore - we aren't testing fault handling here, just that the safety result is processed and the job is moved to pending submit
 
         job_info = Mock()
         job_info.sdk_api_job_info = job

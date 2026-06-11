@@ -44,9 +44,9 @@ class RecordingQueue:
         """Record a message."""
         self.messages.append(message)
 
-    def of_type(self, message_type: type) -> list[object]:
-        """Return all recorded messages of the given type."""
-        return [m for m in self.messages if type(m) is message_type]
+    def of_type[T](self, message_type: type[T]) -> list[T]:
+        """Return all recorded messages of the given type, with static type preservation."""
+        return [m for m in self.messages if isinstance(m, message_type)]
 
     def state_changes(self) -> list[HordeProcessState]:
         """Return the sequence of process states reported so far."""
@@ -219,13 +219,14 @@ class TestFakeSafetyProcess:
                 censor_nsfw=True,
                 sfw_worker=True,
                 images_base64=["aaa", "bbb", "ccc"],
-                horde_model_info={},
+                horde_model_info=None,
             ),
         )
 
         result_messages = queue.of_type(HordeSafetyResultMessage)
         assert len(result_messages) == 1
         result = result_messages[0]
+        assert isinstance(result, HordeSafetyResultMessage)
         assert result.job_id == job_id
         assert len(result.safety_evaluations) == 3
         for evaluation in result.safety_evaluations:
