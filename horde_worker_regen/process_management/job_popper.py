@@ -444,7 +444,11 @@ class JobPopper:
             logger.info(info_string)
             self._pop_throttler.on_no_jobs_available(
                 cur_time,
-                queue_empty=len(self._job_tracker.jobs_pending_inference) == 0,
+                # Active alchemy work counts as the worker being busy, so an alchemy-only
+                # stretch does not accrue "time without jobs".
+                queue_empty=(
+                    len(self._job_tracker.jobs_pending_inference) == 0 and self._state.alchemy_forms_in_flight == 0
+                ),
             )
             return
 

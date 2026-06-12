@@ -246,7 +246,7 @@ def init() -> None:
     AIWORKER_LIMITED_CONSOLE_MESSAGES = os.getenv("AIWORKER_LIMITED_CONSOLE_MESSAGES")
 
     logger.remove()
-    from hordelib.utils.logger import HordeLog
+    from hordelib.api import HordeLog
 
     target_verbosity = args.v
 

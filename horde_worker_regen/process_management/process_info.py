@@ -10,7 +10,11 @@ from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
-from horde_worker_regen.process_management.horde_process import HordeProcessType
+from horde_worker_regen.process_management.horde_process import (
+    DEFAULT_CAPABILITIES,
+    HordeProcessType,
+    WorkerCapability,
+)
 from horde_worker_regen.process_management.messages import (
     HordeControlFlag,
     HordeControlMessage,
@@ -35,6 +39,8 @@ class HordeProcessInfo:
     """The ID of this process. This is not an OS process ID."""
     process_type: HordeProcessType
     """The type of this process."""
+    capabilities: WorkerCapability
+    """The kinds of work this process can be dispatched (job routing keys on this)."""
     last_process_state: HordeProcessState
     """The last known state of this process."""
 
@@ -85,6 +91,7 @@ class HordeProcessInfo:
         process_type: HordeProcessType,
         last_process_state: HordeProcessState,
         process_launch_identifier: int,
+        capabilities: WorkerCapability | None = None,
     ) -> None:
         """Initialize a new HordeProcessInfo object.
 
@@ -96,11 +103,14 @@ class HordeProcessInfo:
             last_process_state (HordeProcessState): The last known state of this process.
             process_launch_identifier (int): The identifier for the process launch. Used to track restarting of \
                 specific process slots.
+            capabilities (WorkerCapability | None, optional): The work kinds this process serves. \
+                Defaults to the process type's defaults.
         """
         self.mp_process = mp_process
         self.pipe_connection = pipe_connection
         self.process_id = process_id
         self.process_type = process_type
+        self.capabilities = capabilities if capabilities is not None else DEFAULT_CAPABILITIES[process_type]
         self.last_process_state = last_process_state
         self.last_received_timestamp = time.time()
         self.loaded_horde_model_name = None

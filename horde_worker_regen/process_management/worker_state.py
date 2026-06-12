@@ -34,6 +34,13 @@ class WorkerState:
     kudos_generated_this_session: float = 0.0
     kudos_events: deque[tuple[float, float]] = dataclasses.field(default_factory=deque)
 
+    alchemy_forms_in_flight: int = 0
+    """Alchemy forms currently anywhere in the pop->dispatch->submit pipeline.
+
+    Maintained by the AlchemyCoordinator loop so other components (e.g. the job popper's
+    no-jobs idle tracking) can treat active alchemy work as the worker being busy.
+    """
+
     def initiate_shutdown(self) -> None:
         """Mark the worker as shutting down (idempotent)."""
         if not self.shutting_down:

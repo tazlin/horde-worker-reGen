@@ -43,6 +43,7 @@ from horde_worker_regen.consts import (
 )
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management._canned_scenarios import CannedJobSource
+from horde_worker_regen.process_management.alchemy_popper import AlchemyCoordinator
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
@@ -518,6 +519,16 @@ class HordeWorkerProcessManager:
             dry_run_skip_api=bridge_data.dry_run_skip_api,
             canned_job_source=canned_job_source,
         )
+
+        self._alchemy_coordinator = AlchemyCoordinator(
+            state=self._state,
+            process_map=self._process_map,
+            job_tracker=self._job_tracker,
+            shutdown_manager=self._shutdown_manager,
+            runtime_config=self._runtime_config,
+            api_sessions=self._api_sessions,
+        )
+        self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
 
         if stable_diffusion_reference is not None:
             self.stable_diffusion_reference = stable_diffusion_reference
@@ -1045,6 +1056,7 @@ class HordeWorkerProcessManager:
                 self._job_popper.run(),
                 self._api_get_user_info_loop(),
                 self._job_submitter.run(),
+                self._alchemy_coordinator.run(),
             ]
             if not self.bridge_data._loaded_from_env_vars:
                 coroutines.append(self._bridge_data_loop())

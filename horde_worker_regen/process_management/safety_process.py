@@ -1,4 +1,9 @@
-"""Contains the classes to form a safety process, which is responsible for evaluating the safety of images."""
+"""Contains the classes to form a safety process, which is responsible for evaluating the safety of images.
+
+The safety process also serves the CLIP-stack alchemy forms (caption, interrogation, nsfw):
+it already owns the CLIP interrogator and NSFW checker, so those forms run here rather than
+in the (comfy-loaded) inference processes.
+"""
 
 import base64
 import enum
@@ -16,12 +21,21 @@ from typing import override
 
 import PIL
 import PIL.Image
+from horde_sdk.ai_horde_api import GENERATION_STATE
+from horde_sdk.generation_parameters.alchemy.consts import (
+    is_caption_form,
+    is_interrogator_form,
+    is_nsfw_detector_form,
+)
 from loguru import logger
 
 from horde_worker_regen import ASSETS_FOLDER_PATH
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.horde_process import HordeProcess
 from horde_worker_regen.process_management.messages import (
+    AlchemyFormSpec,
+    HordeAlchemyControlMessage,
+    HordeAlchemyResultMessage,
     HordeControlFlag,
     HordeControlMessage,
     HordeProcessState,
@@ -104,6 +118,7 @@ class HordeSafetyProcess(HordeProcess):
         )
 
         self._dry_run_skip_safety = dry_run_skip_safety
+        self._label_tables = {}
 
         if not dry_run_skip_safety:
             try:
@@ -178,8 +193,156 @@ class HordeSafetyProcess(HordeProcess):
             with open(ASSETS_FOLDER_PATH / file_lookup[reason], "rb") as f:
                 self._set_censor_image(reason, base64.b64encode(f.read()).decode("utf-8"))
 
+    _caption_model_loaded: bool = False
+    """Whether BLIP has been (lazily) loaded for caption forms."""
+    _ranking_lists: dict[str, list[str]] | None = None
+    """The interrogation ranking word lists, loaded on first interrogation form."""
+    _label_tables: dict[str, object]
+    """Per-category CLIP text embedding tables, built lazily from the ranking lists."""
+
+    def _ensure_caption_model(self) -> None:
+        """Load BLIP into the interrogator on first caption form (significant RAM/VRAM cost)."""
+        if self._caption_model_loaded:
+            return
+        logger.info("Loading caption (BLIP) model for the first caption alchemy form...")
+        self._interrogator.load_caption_model()  # type: ignore[attr-defined]
+        self._caption_model_loaded = True
+        self.send_memory_report_message(include_vram=False)
+
+    def _get_ranking_lists(self) -> dict[str, list[str]]:
+        """Load the legacy interrogation ranking lists (vendored from clipfree) once."""
+        if self._ranking_lists is None:
+            lists: dict[str, list[str]] = {}
+            for file in sorted((ASSETS_FOLDER_PATH / "ranking_lists").glob("*.txt")):
+                lines = file.read_text(encoding="utf-8").splitlines()
+                lists[file.stem] = [line.strip() for line in lines if line.strip()]
+            self._ranking_lists = lists
+        return self._ranking_lists
+
+    def _interrogate_image(
+        self,
+        image: PIL.Image.Image,
+        top_count: int = 5,
+    ) -> dict[str, list[dict[str, str | float]]]:
+        """Rank the legacy interrogation word lists against the image.
+
+        Reproduces the legacy alchemist result shape: ``{category: [{"text", "confidence"}, ...]}``
+        using the same softmax-of-scaled-similarities ranking the old clipfree interrogator used.
+        """
+        import torch
+        from clip_interrogator import LabelTable
+
+        image_features = self._interrogator.image_to_features(image)  # type: ignore[attr-defined]
+
+        results: dict[str, list[dict[str, str | float]]] = {}
+        for category, labels in self._get_ranking_lists().items():
+            table = self._label_tables.get(category)
+            if table is None:
+                table = LabelTable(labels, f"alchemy_{category}", self._interrogator)
+                self._label_tables[category] = table
+
+            # LabelTable.embeds entries are tensors on a fresh build but numpy arrays when
+            # clip_interrogator loads them from its on-disk cache.
+            embeds = [
+                e if isinstance(e, torch.Tensor) else torch.from_numpy(e)
+                for e in table.embeds  # type: ignore[attr-defined]
+            ]
+            text_features = torch.stack(embeds).to(image_features.device)
+            if text_features.dim() == 3:
+                text_features = text_features.squeeze(1)
+
+            with torch.no_grad():
+                similarity = (100.0 * image_features.float() @ text_features.float().T).softmax(dim=-1)
+
+            count = min(top_count, len(labels))
+            top_probs, top_idx = similarity.cpu().topk(count, dim=-1)
+            results[category] = [
+                {
+                    "text": table.labels[int(top_idx[0][i])],  # type: ignore[attr-defined]
+                    "confidence": float(top_probs[0][i]) * 100,
+                }
+                for i in range(count)
+            ]
+        return results
+
+    def start_alchemy(self, form: AlchemyFormSpec) -> None:
+        """Run a CLIP-stack alchemy form (caption/interrogation/nsfw) and report the result."""
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.ALCHEMY_STARTING,
+            info=f"Starting alchemy form {form.form} ({form.form_id})",
+        )
+
+        time_start = time.time()
+        state = GENERATION_STATE.faulted
+        result_payload: dict | None = None
+
+        try:
+            image = PIL.Image.open(BytesIO(base64.b64decode(form.source_image_base64)))
+
+            if is_caption_form(form.form):
+                self._ensure_caption_model()
+                caption = self._interrogator.generate_caption(image)  # type: ignore[attr-defined]
+                result_payload = {"caption": caption}
+            elif is_interrogator_form(form.form):
+                result_payload = {"interrogation": self._interrogate_image(image)}
+            elif is_nsfw_detector_form(form.form):
+                nsfw_result = self._nsfw_checker.check_for_nsfw(image=image)  # type: ignore[attr-defined]
+                if nsfw_result is None:
+                    raise RuntimeError("NSFW check returned no result")
+                result_payload = {"nsfw": nsfw_result.is_nsfw}
+            else:
+                raise ValueError(f"Unknown alchemy form for safety process: {form.form}")
+
+            state = GENERATION_STATE.ok
+        except Exception as e:
+            logger.error(f"Alchemy form {form.form} ({form.form_id}) failed: {type(e).__name__} {e}")
+
+        self.process_message_queue.put(
+            HordeAlchemyResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"Alchemy form {form.form} ({form.form_id})",
+                time_elapsed=time.time() - time_start,
+                form_id=form.form_id,
+                form=form.form,
+                state=state,
+                result_payload=result_payload,
+            ),
+        )
+
+        process_state = (
+            HordeProcessState.ALCHEMY_COMPLETE if state == GENERATION_STATE.ok else HordeProcessState.ALCHEMY_FAILED
+        )
+        self.send_process_state_change_message(
+            process_state=process_state,
+            info=f"Finished alchemy form {form.form} ({form.form_id})",
+        )
+        self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
+
     @override
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
+        if isinstance(message, HordeAlchemyControlMessage):
+            if message.control_flag != HordeControlFlag.START_ALCHEMY:
+                raise ValueError(f"Expected {HordeControlFlag.START_ALCHEMY}, got {message.control_flag}")
+            if self._dry_run_skip_safety:
+                logger.info(f"Dry-run: skipping alchemy form {message.form.form} ({message.form.form_id})")
+                self.process_message_queue.put(
+                    HordeAlchemyResultMessage(
+                        process_id=self.process_id,
+                        process_launch_identifier=self.process_launch_identifier,
+                        info="Dry-run alchemy form",
+                        time_elapsed=0.0,
+                        form_id=message.form.form_id,
+                        form=message.form.form,
+                        state=GENERATION_STATE.ok,
+                        result_payload={message.form.form: "dry-run"},
+                    ),
+                )
+                self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
+                return
+            self.start_alchemy(message.form)
+            return
+
         if not isinstance(message, HordeSafetyControlMessage):
             raise TypeError(f"Expected {HordeSafetyControlMessage}, got {type(message)}")
 

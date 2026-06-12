@@ -13,7 +13,7 @@ from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 from pydantic import BaseModel, ConfigDict
 
-from horde_worker_regen.process_management.messages import HordeImageResult
+from horde_worker_regen.process_management.messages import HordeAlchemyResultMessage, HordeImageResult
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 
 
@@ -155,6 +155,45 @@ class PendingSubmitJob(PendingJob):
         """
         self.kudos_reward = kudos_reward
         self.kudos_per_second = kudos_per_second
+        super().succeed(**kwargs)
+
+
+class PendingAlchemySubmitJob(PendingJob):
+    """An alchemy form result awaiting submission to the horde.
+
+    Mirrors the legacy alchemist submit protocol: image forms upload a WebP to the
+    pop-provided R2 URL and submit ``{"<form>": "R2"}``; text forms submit their result
+    dict inline.
+    """
+
+    result_message: HordeAlchemyResultMessage
+    """The result of the form as reported by the child process."""
+    r2_upload: str | None = None
+    """The R2 URL to upload the image result to, when applicable."""
+    time_popped: float
+    kudos_reward: float = 0.0
+
+    @property
+    def form_id(self) -> str:
+        """Return the generation ID of the form."""
+        return self.result_message.form_id
+
+    @property
+    def submit_result(self) -> dict[str, object]:
+        """Return the ``result`` dict for the submit request body."""
+        if self.result_message.result_payload is not None:
+            return dict(self.result_message.result_payload)
+        # Image forms: the payload value is the literal string "R2" after upload.
+        return {self.result_message.form: "R2"}
+
+    @override
+    def succeed(
+        self,
+        kudos_reward: int = 0,
+        **kwargs: int | float,
+    ) -> None:
+        """Mark the form as successfully submitted, recording the kudos reward."""
+        self.kudos_reward = kudos_reward
         super().succeed(**kwargs)
 
 

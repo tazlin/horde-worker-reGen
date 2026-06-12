@@ -21,6 +21,8 @@ def test_gpu_extras_defined() -> None:
         data = tomllib.load(f)
 
     extras = data["project"]["optional-dependencies"]
-    for extra_name in ("cu128", "rocm", "directml", "cpu"):
+    # directml was removed with the hordelib v3 catch-up: torch-directml is pinned to the
+    # torch 2.4 era and cannot satisfy horde-engine's torch/torchvision requirements.
+    for extra_name in ("cu128", "rocm", "cpu"):
         assert extra_name in extras, f"GPU extra '{extra_name}' not found in pyproject.toml"
         assert len(extras[extra_name]) > 0, f"GPU extra '{extra_name}' has no dependencies"

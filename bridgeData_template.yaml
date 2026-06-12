@@ -344,18 +344,43 @@ branded_model: true
 ## Alchemist (Image Interrogation and Post-Processing)
 #########################
 
-# Note: Scribe is not currently supported in reGen. This section is for future use.
-# Use https://github.com/Haidra-Org/AI-Horde-Worker to run an Alchemist worker.
+# Set to true to also serve alchemy (interrogation) jobs alongside image generation.
+# Image jobs always take priority. By default (alchemy_allow_concurrent) alchemy may run
+# concurrently with image generation when a process lane is spare and there is VRAM
+# headroom; otherwise it waits. Graph forms (upscalers, facefixers, strip_background) run
+# on the inference processes (shared with image generation); CLIP forms (interrogation,
+# nsfw, caption) run on the safety process.
+alchemist: false
 
-# Worker name for running an Alchemist worker.
+# Worker name for serving alchemy jobs.
 # This must be unique across the entire horde!  Do not use the default!
 # If you get the error `Wrong credentials to submit as this worker.`, try changing this name, someone else is already using it.
 alchemist_name: "An Awesome Alchemist"
 
-# Alchemy forms this worker can serve.
+# Alchemy forms this worker can serve. If unset, all of them are offered.
 forms:
   - "caption"
   - "nsfw" # Uses CPU
   # Heavier than the others, but rewards more kudos
   - "interrogation"
   - "post-process"
+
+# Caption forms load BLIP into the safety process on first use, which costs significant
+# additional RAM/VRAM, so captioning requires this explicit opt-in even when "caption"
+# is listed in forms.
+alchemy_caption_enabled: false
+
+# Allow alchemy to run alongside image generation instead of only as backfill.
+# When true, alchemy may pop while image jobs are queued, but only into a spare process
+# lane (no waiting image job needs it) and only with VRAM headroom for a typical alchemy
+# form. Set to false to restrict alchemy to popping only when the image queue is empty.
+alchemy_allow_concurrent: true
+
+# Maximum number of alchemy forms allowed in flight at once. Raise on machines with spare
+# compute/VRAM to run more alchemy concurrently with image generation.
+alchemy_max_concurrency: 1
+
+# Minimum free VRAM (MB) required before popping a graph alchemy form in concurrent mode.
+# Acts as the floor for the headroom estimator, which raises the requirement toward the
+# observed median cost of recent alchemy forms.
+alchemy_vram_headroom_mb: 2000

@@ -29,6 +29,9 @@ from loguru import logger
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.horde_process import HordeProcess
 from horde_worker_regen.process_management.messages import (
+    AlchemyFormSpec,
+    HordeAlchemyControlMessage,
+    HordeAlchemyResultMessage,
     HordeAuxModelStateChangeMessage,
     HordeControlFlag,
     HordeControlMessage,
@@ -44,15 +47,10 @@ from horde_worker_regen.process_management.messages import (
 )
 
 if TYPE_CHECKING:
-    from hordelib.horde import HordeLib, ProgressReport, ResultingImageReturn
-    from hordelib.nodes.node_model_loader import HordeCheckpointLoader
-    from hordelib.shared_model_manager import SharedModelManager
+    from hordelib.api import HordeLib, ProgressReport, ResultingImageReturn, SharedModelManager
 else:
     # Create a dummy class to prevent type errors at runtime
     # This is so we can defer the import of these classes until runtime
-    class HordeCheckpointLoader:  # noqa
-        pass
-
     class HordeLib:  # noqa
         pass
 
@@ -83,9 +81,6 @@ class HordeInferenceProcess(HordeProcess):
     """The HordeLib instance used by this process. It is not shared between processes."""
     _shared_model_manager: SharedModelManager
     """The SharedModelManager instance used by this process. It is not shared between processes (despite the name)."""
-    _checkpoint_loader: HordeCheckpointLoader
-    """The HordeCheckpointLoader instance used by this process. This is horde hordelib signals comfyui \
-        to load a model. It is not shared between processes."""
 
     _active_model_name: str | None = None
     """The name of the currently active model. Note that other models may be loaded in RAM or VRAM."""
@@ -144,19 +139,15 @@ class HordeInferenceProcess(HordeProcess):
             logger.info("Dry-run mode: skipping HordeLib/SharedModelManager initialisation")
             self._horde = None  # type: ignore[assignment]
             self._shared_model_manager = None  # type: ignore[assignment]
-            self._checkpoint_loader = None  # type: ignore[assignment]
         else:
             # We import these here to guard against potentially importing them in the main process
             # which would create shared objects, potentially causing issues
             try:
                 with logger.catch(reraise=True):
-                    from hordelib.horde import HordeLib
-                    from hordelib.shared_model_manager import SharedModelManager
+                    from hordelib.api import HordeLib, SharedModelManager
             except Exception as e:
                 logger.critical(f"Failed to import HordeLib or SharedModelManager: {type(e).__name__} {e}")
                 sys.exit(1)
-
-            from hordelib.nodes.node_model_loader import HordeCheckpointLoader
 
             try:
                 logger.info(f"Initialising HordeLib with high_memory_mode={high_memory_mode}")
@@ -170,16 +161,11 @@ class HordeInferenceProcess(HordeProcess):
                 logger.critical(f"Failed to initialise HordeLib: {type(e).__name__} {e}")
                 sys.exit(1)
 
-            try:
-                with logger.catch(reraise=True):
-                    self._checkpoint_loader = HordeCheckpointLoader()
-            except Exception as e:
-                logger.critical(f"Failed to initialise HordeCheckpointLoader: {type(e).__name__} {e}")
-                sys.exit(1)
-
             SharedModelManager.load_model_managers(
                 multiprocessing_lock=self.disk_lock,
-                download_legacy_references=process_id == 1,
+                # Reference saves are coordinated by this process under disk_lock; the lora
+                # manager's per-process backup copies are unnecessary churn.
+                lora_reference_backups=False,
             )
 
             if SharedModelManager.manager.compvis is None:
@@ -335,8 +321,6 @@ class HordeInferenceProcess(HordeProcess):
             if lora_manager is None:
                 raise RuntimeError("Failed to load LORA model manager")
 
-            lora_manager._using_multiprocessing = False
-
             performed_a_download = False
 
             loras = job_info.payload.loras or []
@@ -347,7 +331,7 @@ class HordeInferenceProcess(HordeProcess):
 
             try:
                 lora_manager.load_model_database()
-                lora_manager.reset_adhoc_loras()
+                lora_manager.reset_adhoc_cache()
             except Exception as e:
                 logger.error(f"Failed to reset adhoc loras: {type(e).__name__} {e}")
 
@@ -376,7 +360,7 @@ class HordeInferenceProcess(HordeProcess):
 
             time_elapsed = round(time.time() - time_start, 2)
 
-            lora_manager.save_cached_reference_to_disk()
+            lora_manager.save_reference_to_disk()
 
             if performed_a_download:
                 logger.info(f"Downloaded auxiliary models in {time_elapsed} seconds")
@@ -442,11 +426,10 @@ class HordeInferenceProcess(HordeProcess):
 
         if not self._dry_run_skip_inference:
             with contextlib.nullcontext():  # self.disk_lock:
-                self._checkpoint_loader.load_checkpoint(
+                self._horde.preload_model(
+                    horde_model_name,
                     will_load_loras=will_load_loras,
                     seamless_tiling_enabled=seamless_tiling_enabled,
-                    horde_model_name=horde_model_name,
-                    preloading=True,
                 )
 
         logger.info(f"Preloaded model {horde_model_name}")
@@ -480,9 +463,7 @@ class HordeInferenceProcess(HordeProcess):
         Args:
             progress_report (ProgressReport): The progress report from the HordeLib instance.
         """
-        from hordelib.comfy_horde import log_free_ram
-        from hordelib.horde import ProgressState
-        from hordelib.utils.ioredirect import ComfyUIProgressUnit
+        from hordelib.api import ComfyUIProgressUnit, ProgressState, log_free_ram
 
         if progress_report.hordelib_progress_state == ProgressState.post_processing or (
             self._in_post_processing and progress_report.hordelib_progress_state == ProgressState.progress
@@ -620,6 +601,73 @@ class HordeInferenceProcess(HordeProcess):
             results.append(_DryRunResultingImage(rawpng=io.BytesIO(png_bytes)))
         return results  # type: ignore[return-value]
 
+    def start_alchemy(self, form: AlchemyFormSpec) -> None:
+        """Run a graph-backed alchemy form (upscale/facefix/strip_background) and report the result.
+
+        The result image is WebP-encoded here (quality 95, matching the legacy alchemist)
+        so the main process can upload it to R2 without re-encoding.
+        """
+        import PIL.Image
+        from hordelib.api import classify_post_processor
+
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.ALCHEMY_STARTING,
+            info=f"Starting alchemy form {form.form} ({form.form_id})",
+        )
+
+        time_start = time.time()
+        state = GENERATION_STATE.faulted
+        image_base64: str | None = None
+
+        try:
+            kind = classify_post_processor(form.form)
+            if kind is None:
+                raise ValueError(f"Unknown alchemy form for inference process: {form.form}")
+
+            source_image = PIL.Image.open(io.BytesIO(base64.b64decode(form.source_image_base64)))
+
+            result = self._horde.post_process(
+                {
+                    "model": form.form,
+                    "source_image": source_image,
+                },
+            )
+            if result.image is None:
+                raise RuntimeError("Alchemy form produced no image")
+
+            buffer = io.BytesIO()
+            # WebP keeps submit bandwidth low; quality/method match the legacy alchemist.
+            result.image.save(buffer, format="WebP", quality=95, method=6)
+            image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            state = GENERATION_STATE.ok
+        except Exception as e:
+            logger.error(f"Alchemy form {form.form} ({form.form_id}) failed: {type(e).__name__} {e}")
+
+        self.process_message_queue.put(
+            HordeAlchemyResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"Alchemy form {form.form} ({form.form_id})",
+                time_elapsed=time.time() - time_start,
+                form_id=form.form_id,
+                form=form.form,
+                state=state,
+                image_base64=image_base64,
+            ),
+        )
+
+        process_state = (
+            HordeProcessState.ALCHEMY_COMPLETE if state == GENERATION_STATE.ok else HordeProcessState.ALCHEMY_FAILED
+        )
+        self.send_process_state_change_message(
+            process_state=process_state,
+            info=f"Finished alchemy form {form.form} ({form.form_id})",
+        )
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.WAITING_FOR_JOB,
+            info="Waiting for job",
+        )
+
     @staticmethod
     def clear_gc_and_torch_cache() -> None:
         """Clear the garbage collector and the PyTorch cache."""
@@ -632,9 +680,7 @@ class HordeInferenceProcess(HordeProcess):
     def unload_models_from_vram(self) -> None:
         """Unload all models from VRAM."""
         if not self._dry_run_skip_inference:
-            from hordelib.comfy_horde import unload_all_models_vram
-
-            unload_all_models_vram()
+            self._horde.backend.free_vram()
 
             self.clear_gc_and_torch_cache()
 
@@ -659,9 +705,7 @@ class HordeInferenceProcess(HordeProcess):
     def unload_models_from_ram(self) -> None:
         """Unload all models from RAM."""
         if not self._dry_run_skip_inference:
-            from hordelib.comfy_horde import unload_all_models_ram
-
-            unload_all_models_ram()
+            self._horde.backend.free_ram()
 
             self.clear_gc_and_torch_cache()
 
@@ -884,6 +928,12 @@ class HordeInferenceProcess(HordeProcess):
             else:
                 logger.critical(f"Received unexpected message: {message}")
                 return
+        elif isinstance(message, HordeAlchemyControlMessage):
+            if message.control_flag == HordeControlFlag.START_ALCHEMY:
+                self.start_alchemy(message.form)
+            else:
+                logger.critical(f"Received unexpected message: {message}")
+            return
         elif message.control_flag == HordeControlFlag.END_PROCESS:
             self.send_process_state_change_message(
                 process_state=HordeProcessState.PROCESS_ENDING,

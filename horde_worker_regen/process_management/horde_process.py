@@ -15,7 +15,6 @@ try:
 except Exception:
     from multiprocessing.connection import Connection  # type: ignore
 from multiprocessing.synchronize import Lock
-from typing import TYPE_CHECKING
 
 import psutil
 from loguru import logger
@@ -31,19 +30,40 @@ from horde_worker_regen.process_management.messages import (
     HordeProcessStateChangeMessage,
 )
 
-if TYPE_CHECKING:
-    from hordelib.nodes.node_model_loader import HordeCheckpointLoader
-else:
-    # Create a dummy class to prevent type errors
-    class HordeCheckpointLoader:  # noqa
-        pass
-
 
 class HordeProcessType(enum.Enum):
-    """The type of process. This distinguishes between inference, safety, and potentially other process types."""
+    """The type of process. This distinguishes between inference, safety, and potentially other process types.
+
+    Process *type* is a lifecycle concept (which entry point, restart policy); job routing is
+    driven by :class:`WorkerCapability` instead.
+    """
 
     INFERENCE = auto()
     SAFETY = auto()
+
+
+class WorkerCapability(enum.Flag):
+    """What kinds of work a process can be dispatched.
+
+    Dispatch decisions key on capabilities rather than process types, so new job kinds
+    (alchemy today; audio/video later) add a flag and a handler instead of a process type.
+    """
+
+    IMAGE_GEN = enum.auto()
+    """Image generation jobs (the inference hot path)."""
+    SAFETY_EVAL = enum.auto()
+    """Post-generation safety evaluation."""
+    ALCHEMY_GRAPH = enum.auto()
+    """Graph-backed alchemy forms: upscalers, facefixers, strip_background."""
+    ALCHEMY_CLIP = enum.auto()
+    """CLIP-stack alchemy forms: caption, interrogation, nsfw."""
+
+
+DEFAULT_CAPABILITIES: dict[HordeProcessType, WorkerCapability] = {
+    HordeProcessType.INFERENCE: WorkerCapability.IMAGE_GEN | WorkerCapability.ALCHEMY_GRAPH,
+    HordeProcessType.SAFETY: WorkerCapability.SAFETY_EVAL | WorkerCapability.ALCHEMY_CLIP,
+}
+"""The capabilities each process type declares by default."""
 
 
 class HordeProcess(abc.ABC):
@@ -81,13 +101,13 @@ class HordeProcess(abc.ABC):
 
     def get_vram_usage_bytes(self) -> int:
         """Return the number of bytes of VRAM used by the GPU."""
-        from hordelib.comfy_horde import get_torch_free_vram_mb, get_torch_total_vram_mb
+        from hordelib.api import get_torch_free_vram_mb, get_torch_total_vram_mb
 
         return get_torch_total_vram_mb() - get_torch_free_vram_mb()
 
     def get_vram_total_bytes(self) -> int:
         """Return the total number of bytes of VRAM available on the GPU."""
-        from hordelib.comfy_horde import get_torch_total_vram_mb
+        from hordelib.api import get_torch_total_vram_mb
 
         return get_torch_total_vram_mb()
 

@@ -110,7 +110,7 @@ def start_inference_process(
         maybe_wait_for_process_debugger(process_id, "inference")
 
         try:
-            from hordelib.utils.logger import HordeLog
+            from hordelib.api import HordeLog
 
             HordeLog.initialise(
                 setup_logging=True,
@@ -141,7 +141,11 @@ def start_inference_process(
                 if directml is not None:
                     extra_comfyui_args.append(f"--directml={directml}")
 
-                models_not_to_force_load = ["flux"]
+                from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+
+                # Force-load policy is expressed in horde baselines; hordelib owns the
+                # mapping to comfy model class names.
+                models_not_to_force_load: list[str] = [KNOWN_IMAGE_GENERATION_BASELINE.flux_1]
 
                 if very_high_memory_mode:
                     extra_comfyui_args.append("--gpu-only")
@@ -149,15 +153,15 @@ def start_inference_process(
                     # extra_comfyui_args.append("--normalvram")
                     models_not_to_force_load.extend(
                         [
-                            "cascade",
+                            KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade,
                         ],
                     )
                 elif low_memory_mode:
                     extra_comfyui_args.append("--novram")
                     models_not_to_force_load.extend(
                         [
-                            "sdxl",
-                            "cascade",
+                            KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+                            KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade,
                         ],
                     )
                 elif not vram_heavy_models:
@@ -241,7 +245,7 @@ def start_safety_process(
         maybe_wait_for_process_debugger(process_id, "safety")
 
         try:
-            from hordelib.utils.logger import HordeLog
+            from hordelib.api import HordeLog
 
             HordeLog.initialise(
                 setup_logging=True,

@@ -27,7 +27,7 @@ dependencies = [
     "horde_sdk~=0.20.1",
     "horde_safety~=0.3.0",
     "horde_engine~=2.20.12",
-    "horde_model_reference~=3.0.0",
+    "horde_model_reference~=4.0.0",
     "python-dotenv",
     "ruamel.yaml",
     "semver",
@@ -40,7 +40,6 @@ dependencies = [
     "babel",
     "textual>=2.1.0",
     "logfire>=4.6.0",
-    "mediapipe==0.10.21",
 ]
 
 [project.optional-dependencies]
@@ -51,9 +50,9 @@ rocm = [
     "torch==2.9.1",
     "pytorch-triton-rocm>=3.5.1 ; sys_platform == 'linux'",
 ]
-directml = [
-    "torch-directml==0.2.5.dev240914",
-]
+# NOTE: the directml extra (torch-directml==0.2.5.dev240914) was removed with the hordelib v3
+# catch-up: torch-directml is pinned to the torch 2.4 era and cannot satisfy horde-engine's
+# torch/torchvision 2.9/0.24 requirements. Restore it when torch-directml catches up.
 cpu = [
     "torch==2.9.1",
 ]
@@ -104,12 +103,14 @@ conflicts = [
     [
         {extra = "cu128"},
         {extra = "rocm"},
-        {extra = "directml"},
         {extra = "cpu"},
     ],
 ]
 
 [tool.uv.sources]
+# Local-path dev against the hordelib v3 branch; the coordinated-release PR flips this back
+# to a published horde_engine version pin (see docs/plans in the hordelib repo).
+horde_engine = {path = "../../horde/jug/hordelib", editable = true}
 torch = [
     {index = "pytorch-cu128", extra = "cu128"},
     {index = "pytorch-rocm", extra = "rocm"},

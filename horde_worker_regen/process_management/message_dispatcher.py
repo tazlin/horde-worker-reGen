@@ -13,6 +13,7 @@ from loguru import logger
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import (
+    HordeAlchemyResultMessage,
     HordeAuxModelStateChangeMessage,
     HordeInferenceResultMessage,
     HordeModelStateChangeMessage,
@@ -50,6 +51,7 @@ class MessageDispatcher:
     _runtime_config: RuntimeConfig
     _model_metadata: ModelMetadata
     _on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]]
+    _on_alchemy_result: Callable[[HordeAlchemyResultMessage], None] | None = None
 
     _last_deadlock_detected_time: float = 0.0
     _in_deadlock: bool = False
@@ -93,6 +95,10 @@ class MessageDispatcher:
         self._model_metadata = model_metadata
         self._on_unload_vram = on_unload_vram
         self._state = state
+
+    def set_alchemy_result_handler(self, handler: Callable[[HordeAlchemyResultMessage], None]) -> None:
+        """Register the callback invoked when a child process reports an alchemy form result."""
+        self._on_alchemy_result = handler
 
     async def receive_and_handle_process_messages(self) -> None:
         """Receive and handle any messages from the child processes."""
@@ -152,6 +158,11 @@ class MessageDispatcher:
                 await self._handle_inference_result(message)
             elif isinstance(message, HordeSafetyResultMessage):
                 await self._handle_safety_result(message)
+            elif isinstance(message, HordeAlchemyResultMessage):
+                if self._on_alchemy_result is not None:
+                    self._on_alchemy_result(message)
+                else:
+                    logger.error(f"Received alchemy result with no handler registered: {message.form_id}")
 
     def _handle_heartbeat(self, message: HordeProcessHeartbeatMessage) -> None:
         """Handle a heartbeat message from a child process."""

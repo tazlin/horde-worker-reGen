@@ -272,6 +272,8 @@ class HordeControlFlag(enum.Enum):
     """Signal the child process to preload a model."""
     START_INFERENCE = auto()
     """Signal the child process to start inference."""
+    START_ALCHEMY = auto()
+    """Signal the child process to run an alchemy form (upscale, caption, etc.)."""
     EVALUATE_SAFETY = auto()
     """Signal the child process to evaluate safety of images from inference."""
     UNLOAD_MODELS_FROM_VRAM = auto()
@@ -318,6 +320,53 @@ class HordeInferenceControlMessage(HordeControlModelMessage):
 
     trace_context: str | None = None
     """W3C traceparent string for cross-process span correlation."""
+
+
+class AlchemyFormSpec(BaseModel):
+    """A single alchemy form (one unit of alchemy work) ready for a child process.
+
+    The source image is already downloaded and base64 encoded by the main process, so
+    child processes never perform network IO for job inputs.
+    """
+
+    form_id: str
+    """The generation ID of this form, used for submit."""
+    form: str
+    """The form name (a `KNOWN_ALCHEMY_TYPES` value; kept as str to survive unknown forms)."""
+    source_image_base64: str
+    """The base64 encoded source image to process."""
+    r2_upload: str | None = None
+    """The R2 URL to upload image-form results to, when applicable."""
+
+
+class HordeAlchemyControlMessage(HordeControlMessage):
+    """Dispatch one alchemy form to a child process (control_flag == START_ALCHEMY)."""
+
+    form: AlchemyFormSpec
+    """The alchemy form to process."""
+
+    trace_context: str | None = None
+    """W3C traceparent string for cross-process span correlation."""
+
+
+class HordeAlchemyResultMessage(HordeProcessMessage):
+    """The result of one alchemy form, sent from a child process to the main process.
+
+    Matches the legacy alchemist submit protocol: text forms carry ``result_payload``
+    (e.g. ``{"caption": "..."}``); image forms carry ``image_base64`` (WebP, ready for R2)
+    and submit ``{"<form>": "R2"}``.
+    """
+
+    form_id: str
+    """The generation ID of the form that was processed."""
+    form: str
+    """The form name that was processed."""
+    state: GENERATION_STATE
+    """The state of the form to send to the API."""
+    result_payload: dict[str, str | bool | dict | list] | None = None
+    """The inline result for text forms (caption/interrogation/nsfw)."""
+    image_base64: str | None = None
+    """The WebP-encoded result image for graph forms, to be uploaded to R2."""
 
 
 class HordeSafetyControlMessage(HordeControlMessage):

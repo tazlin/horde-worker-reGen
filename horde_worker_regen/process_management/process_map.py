@@ -12,7 +12,7 @@ from loguru import logger
 from pydantic import ConfigDict
 
 from horde_worker_regen.consts import KNOWN_CONTROLNET_WORKFLOWS, VRAM_HEAVY_MODELS
-from horde_worker_regen.process_management.horde_process import HordeProcessType
+from horde_worker_regen.process_management.horde_process import HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.messages import (
     HordeHeartbeatType,
     HordeProcessState,
@@ -291,6 +291,58 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             and self[process_id].last_heartbeat_delta > inference_step_timeout,
         )
 
+    def get_capable_processes(self, capability: WorkerCapability) -> list[HordeProcessInfo]:
+        """Return all processes declaring the given capability.
+
+        Job routing keys on capabilities, not process types; new job kinds (alchemy now,
+        audio/video later) dispatch through this rather than growing per-type query methods.
+        """
+        return [p for p in self.values() if capability in p.capabilities]
+
+    def get_first_available(
+        self,
+        capability: WorkerCapability,
+        disallowed_processes: list[int] | None = None,
+    ) -> HordeProcessInfo | None:
+        """Return the first process with the capability that can accept a job, or None.
+
+        Processes without a loaded model are preferred (cheapest to (re)target).
+        """
+        disallowed = disallowed_processes or []
+
+        for p in self.get_capable_processes(capability):
+            if (
+                p.last_process_state in (HordeProcessState.WAITING_FOR_JOB, HordeProcessState.PRELOADED_MODEL)
+                and p.loaded_horde_model_name is None
+                and p.process_id not in disallowed
+            ):
+                return p
+
+        for p in self.get_capable_processes(capability):
+            if p.can_accept_job() and p.process_id not in disallowed:
+                return p
+
+        return None
+
+    def get_free_vram_mb(self) -> float | None:
+        """Return the most conservative free VRAM (MB) across inference processes, or None.
+
+        Child processes report ``vram_usage_bytes``/``total_vram_bytes`` (named in bytes but
+        carried in MB) computed as ``torch_total - torch_free`` and ``torch_total``, so
+        ``total - usage`` is the device-wide free VRAM at sample time. Workers are typically
+        single-GPU; the minimum free figure across reporting processes is used as a
+        conservative estimate. Returns None when no inference process has reported VRAM yet
+        (cold start, or a CPU-only deployment).
+        """
+        free_values = [
+            p.total_vram_bytes - p.vram_usage_bytes
+            for p in self.values()
+            if p.process_type == HordeProcessType.INFERENCE and p.total_vram_bytes > 0
+        ]
+        if not free_values:
+            return None
+        return float(min(free_values))
+
     def num_inference_processes(self) -> int:
         """Return the number of inference processes."""
         count = 0
@@ -390,28 +442,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         disallowed_processes: list[int] | None = None,
     ) -> HordeProcessInfo | None:
         """Return the first available inference process, or None if there are none available."""
-        if disallowed_processes is None:
-            disallowed_processes = []
-
-        for p in self.values():
-            if (
-                p.process_type == HordeProcessType.INFERENCE
-                and (
-                    p.last_process_state == HordeProcessState.WAITING_FOR_JOB
-                    or p.last_process_state == HordeProcessState.PRELOADED_MODEL
-                )
-                and p.loaded_horde_model_name is None
-                and p.process_id not in disallowed_processes
-            ):
-                return p
-
-        for p in self.values():
-            if p.process_type == HordeProcessType.INFERENCE and p.can_accept_job():
-                if p.process_id in disallowed_processes:
-                    continue
-                return p
-
-        return None
+        return self.get_first_available(WorkerCapability.IMAGE_GEN, disallowed_processes)
 
     def _get_first_inference_process_to_kill(
         self,

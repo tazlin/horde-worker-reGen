@@ -279,6 +279,47 @@ class reGenBridgeData(CombinedHordeBridgeData):
     Set stats_output_frequency (in seconds) for control over the status message.
     """
 
+    alchemist: bool = Field(default=False)
+    """If true, this worker also pops and processes alchemy jobs (/v2/interrogate/pop).
+
+    Graph forms (upscalers, facefixers, strip_background) run on the inference processes,
+    which they share with image generation; CLIP forms (interrogation, nsfw) run on the
+    safety process. Image jobs always win contention for those processes — alchemy only
+    uses a lane image work does not currently need (see `alchemy_allow_concurrent`). The
+    forms offered are controlled by the `forms` field (see `CombinedHordeBridgeData`).
+    """
+
+    alchemy_caption_enabled: bool = Field(default=False)
+    """Opt in to caption alchemy forms.
+
+    Captioning loads BLIP into the safety process on first use, which costs significant
+    additional RAM/VRAM, so it is off by default.
+    """
+
+    alchemy_allow_concurrent: bool = Field(default=True)
+    """Allow alchemy to run alongside image generation instead of only as backfill.
+
+    When true, alchemy may pop while image jobs are queued, but only when a process lane is
+    spare (no waiting image job needs it) and there is VRAM headroom for a typical alchemy
+    form. When false, the legacy behavior applies: alchemy pops only when the image queue is
+    empty.
+    """
+
+    alchemy_max_concurrency: int = Field(default=1, ge=1)
+    """Maximum number of alchemy forms allowed in flight (dispatched, awaiting result) at once.
+
+    Bounds how much of the worker alchemy can occupy concurrently with image work. Raise it
+    on machines with spare compute/VRAM headroom.
+    """
+
+    alchemy_vram_headroom_mb: int = Field(default=2000, ge=0)
+    """Minimum free VRAM (MB) required before popping a graph alchemy form in concurrent mode.
+
+    Acts as the floor for the headroom estimator, which raises the requirement toward the
+    observed median cost of recent alchemy forms. Free VRAM is read from worker memory
+    reports; when unavailable, alchemy falls back to backfill-only behavior.
+    """
+
     dry_run_skip_inference: bool = Field(default=False)
     """Skip real GPU inference and return a dummy 1x1 image instead."""
 

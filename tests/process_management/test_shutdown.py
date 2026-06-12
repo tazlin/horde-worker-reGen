@@ -147,8 +147,11 @@ class TestShutdown:
 class TestAbort:
     """Tests for abort."""
 
-    def test_abort_purges_jobs_and_shuts_down(self) -> None:
+    def test_abort_purges_jobs_and_shuts_down(self, tmp_path, monkeypatch) -> None:
         """Calling abort should set shutting_down to True, and trigger relevant cleanup actions."""
+        # abort() writes a .abort file to the CWD; isolate it so the test cannot
+        # signal-shutdown a real worker running from the repo root.
+        monkeypatch.chdir(tmp_path)
         shutdown_manager = _make_shutdown_manager()
         shutdown_manager._job_tracker._purge_jobs = Mock()
         shutdown_manager._process_lifecycle._hard_kill_processes = Mock()

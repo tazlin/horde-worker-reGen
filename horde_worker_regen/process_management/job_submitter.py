@@ -192,8 +192,9 @@ class JobSubmitter:
                 if not submit_success:
                     return new_submit
             except _async_client_exceptions as e:
-                logger.warning("Upload to AI Horde R2 timed out. Will retry.")
-                logger.debug(f"{type(e).__name__}: {e}")
+                # Not always a timeout: connection/DNS failures land here too, and hiding the
+                # cause at debug level made an unreachable R2 endpoint look like a slow one.
+                logger.warning(f"Upload to AI Horde R2 failed ({type(e).__name__}: {e}). Will retry.")
                 new_submit.retry()
                 return new_submit
             except Exception as e:
