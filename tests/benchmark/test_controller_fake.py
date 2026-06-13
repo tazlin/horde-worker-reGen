@@ -47,12 +47,43 @@ def test_fake_mode_ramp_end_to_end(tmp_path: Path) -> None:
 
 
 @pytest.mark.e2e
+def test_validation_soak_runs_after_ramp(tmp_path: Path) -> None:
+    """After the ramp, a stage-V soak runs the synthesized config under sustained generated load."""
+    ladder = _mini_ladder()
+    controller = BenchmarkController(ladder, tmp_path, process_mode="fake", validate=True, soak_seconds=18.0)
+    report = controller.run()
+
+    validation = [level for level in report.levels if level.level.stage == "V"]
+    assert len(validation) == 1
+    soak = validation[0]
+    assert soak.level.axis == "validation"
+    # The generating source fed the worker for the soak period, so real jobs flowed through.
+    assert soak.stats is not None
+    assert soak.stats.num_jobs_completed >= 1, soak.reasons
+    assert soak.stats.num_jobs_faulted == 0
+
+    report_md = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert "Validation (sustained load)" in report_md
+    assert (tmp_path / f"level_{soak.level.id}.json").exists()
+
+
+@pytest.mark.e2e
+def test_no_validate_skips_soak(tmp_path: Path) -> None:
+    """`validate=False` produces no stage-V level."""
+    ladder = _mini_ladder()
+    report = BenchmarkController(ladder, tmp_path, process_mode="fake", validate=False).run()
+    assert not any(level.level.stage == "V" for level in report.levels)
+
+
+@pytest.mark.e2e
 def test_failed_axis_skips_higher_rungs(tmp_path: Path) -> None:
     """A failing level stops higher rungs on its axis; the ramp itself continues."""
     scenario = ScenarioSpec(
         name="never-arrives",
-        image_jobs=[CannedImageJobSpec(count=1)],
-        # One job per 10 minutes: the level cannot finish within its timeout.
+        image_jobs=[CannedImageJobSpec(count=2)],
+        # Steady arrival at 0.1 jobs/min: the first job is available immediately, but the
+        # second only "arrives" after 10 minutes — far beyond the 8s level timeout — so the
+        # level can never complete all of its expected jobs and is guaranteed to time out.
         arrival_kind="steady",
         arrival_rate_per_minute=0.1,
     )

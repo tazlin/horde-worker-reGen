@@ -166,6 +166,8 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.nsfw = False
     bd.post_process_job_overlap = False
     bd.unload_models_from_vram_often = False
+    bd.gpu_sampling_lease_enabled = False
+    bd.gpu_sampling_lease_slots = 1
     bd.cycle_process_on_model_change = False
     bd.very_fast_disk_mode = False
     bd.remove_maintenance_on_init = False
@@ -302,6 +304,7 @@ def make_test_mp_primitives() -> MultiprocessingPrimitives:
         disk_lock=Mock(),
         aux_model_lock=Mock(),
         vae_decode_semaphore=Mock(),
+        gpu_sampling_lease=Mock(),
     )
 
 

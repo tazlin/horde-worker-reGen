@@ -102,6 +102,7 @@ class HordeInferenceProcess(HordeProcess):
         high_memory_mode: bool = False,
         dry_run_skip_inference: bool = False,
         dry_run_inference_delay: float = 1.0,
+        gpu_sampling_lease: Semaphore | None = None,
     ) -> None:
         """Initialise the HordeInferenceProcess.
 
@@ -121,6 +122,8 @@ class HordeInferenceProcess(HordeProcess):
             dry_run_skip_inference (bool, optional): Skip real inference and return a dummy image. Defaults to False.
             dry_run_inference_delay (float, optional): Seconds to sleep when dry-run inference is active. \
                 Defaults to 1.0.
+            gpu_sampling_lease (Semaphore | None, optional): Shared lease registered with hordelib to \
+                serialize the GPU denoising loop across processes. None disables coordination. Defaults to None.
         """
         super().__init__(
             process_id=process_id,
@@ -162,6 +165,15 @@ class HordeInferenceProcess(HordeProcess):
             except Exception as e:
                 logger.critical(f"Failed to initialise HordeLib: {type(e).__name__} {e}")
                 sys.exit(1)
+
+            if gpu_sampling_lease is not None:
+                # Coordinate the GPU denoising loop across inference processes: this process
+                # samples only while holding the shared lease, but stages its pipeline (model
+                # load, prompt encode) freely, so the GPU stays busy back-to-back across jobs.
+                from hordelib.api import set_gpu_sampling_lease
+
+                set_gpu_sampling_lease(gpu_sampling_lease)
+                logger.info("Registered GPU sampling lease for cross-process pipelining")
 
             SharedModelManager.load_model_managers(
                 multiprocessing_lock=self.disk_lock,
@@ -455,8 +467,29 @@ class HordeInferenceProcess(HordeProcess):
 
     _current_job_inference_steps_complete: bool = False
     _vae_lock_was_acquired: bool = False
+    _inference_slot_released: bool = False
 
     _last_job_inference_rate: str | None = None
+
+    def _release_inference_slot(self) -> None:
+        """Release this job's sampling-concurrency slot, at most once per job.
+
+        The slot is freed the moment sampling finishes (before VAE decode) so a queued job can
+        begin sampling on the GPU while this job decodes VAE, rather than the slot sitting idle
+        through VAE and result hand-off. This mirrors the long-standing early release at the
+        post-processing boundary, extended to the sampling->VAE boundary so plain (no-PP) jobs
+        overlap too. Idempotent: the post-sampling release and the ``finally`` cleanup both call
+        this, so the semaphore can never be released twice (which would over-subscribe it and
+        admit more concurrent sampling than ``max_threads``).
+        """
+        if self._inference_slot_released:
+            return
+        self._inference_slot_released = True
+        try:
+            self._inference_semaphore.release()
+            logger.debug("Released inference semaphore (sampling slot freed for the next job)")
+        except Exception as e:
+            logger.error(f"Failed to release inference semaphore: {type(e).__name__} {e}")
 
     def progress_callback(
         self,
@@ -478,15 +511,14 @@ class HordeInferenceProcess(HordeProcess):
                 time_elapsed=time.time() - self._start_inference_time,
             )
             self._in_post_processing = True
-            try:
-                self._inference_semaphore.release()
-                logger.debug("Released inference semaphore")
-            except Exception as e:
-                logger.error(f"Failed to release inference semaphore: {type(e).__name__} {e}")
+            self._release_inference_slot()
 
         if self._current_job_inference_steps_complete:
             if not self._vae_lock_was_acquired:
                 self._vae_lock_was_acquired = True
+                # Sampling is done; free the slot so the next job can sample on the GPU while we
+                # wait our turn for and then perform the (VRAM-serialized) VAE decode.
+                self._release_inference_slot()
                 self._vae_decode_semaphore.acquire()
                 log_free_ram()
                 logger.debug("Acquired VAE decode semaphore")
@@ -595,6 +627,8 @@ class HordeInferenceProcess(HordeProcess):
         logger.info("Acquired inference semaphore.")
         self._is_busy = True
         self._current_job_inference_steps_complete = False
+        self._inference_slot_released = False
+        self._vae_lock_was_acquired = False
         self._last_job_inference_rate = None
 
         try:
@@ -630,14 +664,19 @@ class HordeInferenceProcess(HordeProcess):
             self._is_busy = False
             self._in_post_processing = False
             self._current_job_inference_steps_complete = False
-            self._vae_lock_was_acquired = False
 
             self._send_job_metrics_message(str(job_info.id_))
             self._send_download_metrics_if_any()
 
-            with contextlib.suppress(Exception):
-                self._inference_semaphore.release()
-                self._vae_decode_semaphore.release()
+            # Idempotent: a no-op if sampling completed and the slot was already freed early;
+            # the real release for jobs that errored before reaching the VAE boundary.
+            self._release_inference_slot()
+            # Only release the VAE lock if this job actually acquired it (a job that faulted
+            # mid-sampling never did), so the semaphore is never over-released.
+            if self._vae_lock_was_acquired:
+                with contextlib.suppress(Exception):
+                    self._vae_decode_semaphore.release()
+            self._vae_lock_was_acquired = False
         return results
 
     @staticmethod

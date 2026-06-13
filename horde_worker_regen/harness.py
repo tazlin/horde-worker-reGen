@@ -42,7 +42,11 @@ from horde_worker_regen.process_management._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
     CannedJobSource,
+    GeneratingAlchemySource,
+    GeneratingJobSource,
+    SoakImageTemplate,
     TimedJobSource,
+    make_canned_job,
     make_simple_scenario,
 )
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
@@ -57,6 +61,7 @@ from horde_worker_regen.process_management.process_manager import (
 )
 from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
+from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
 
 HarnessProcessMode = Literal["fake", "dry_run", "real"]
 
@@ -101,6 +106,23 @@ class HarnessConfig:
 
     audit: bool = True
     """If True, attach a JobLifecycleAuditor and report invariant violations in the result."""
+
+    soak_seconds: float | None = None
+    """When set, run a time-bounded sustained-load soak instead of a fixed scenario.
+
+    Jobs (and alchemy forms) are *generated* continuously from `soak_image_templates`
+    (and `soak_alchemy_templates`) — minting fresh IDs each pop — keeping the worker
+    saturated for this many seconds, after which generation stops and in-flight work is
+    drained. Used by the post-ramp validation phase."""
+
+    soak_image_templates: list[SoakImageTemplate] = field(default_factory=list)
+    """Weighted job templates the soak generates image jobs from (required when soaking)."""
+
+    soak_alchemy_templates: list[tuple[str, float]] = field(default_factory=list)
+    """Weighted ``(form_name, weight)`` pairs the soak generates alchemy forms from (optional)."""
+
+    soak_drain_timeout_seconds: float = 60.0
+    """After the soak period, how long to wait for in-flight work to drain before shutting down."""
 
 
 @dataclass
@@ -259,7 +281,7 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         "dry_run_skip_safety": config.process_mode != "real",
         "dry_run_inference_delay": config.job_delay_seconds,
     }
-    if config.alchemy_forms:
+    if config.alchemy_forms or config.soak_alchemy_templates:
         bridge_data_fields["alchemist"] = True
     bridge_data_fields.update(config.bridge_data_overrides)
     bridge_data = reGenBridgeData(**bridge_data_fields)  # type: ignore[arg-type]
@@ -301,13 +323,31 @@ def _build_harness_system_resources() -> SystemResources:
     )
 
 
+def _representative_soak_scenario(templates: list[SoakImageTemplate]) -> list[ImageGenerateJobPopResponse]:
+    """One job per distinct model in the soak templates, for model-reference/bridge derivation.
+
+    The soak's actual jobs are minted on demand by `GeneratingJobSource`; this list only
+    exists so the harness can build a model reference and `models_to_load` covering them.
+    """
+    seen: dict[str, ImageGenerateJobPopResponse] = {}
+    for template in templates:
+        if template.model not in seen:
+            seen[template.model] = make_canned_job(template.model, width=template.width, height=template.height)
+    return list(seen.values())
+
+
 def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerProcessManager, int]:
     """Construct a process manager wired according to the harness configuration.
 
     Returns:
         The manager and the number of jobs the scenario expects to complete.
     """
-    scenario = config.scenario if config.scenario is not None else make_simple_scenario(config.num_jobs)
+    if config.soak_seconds is not None:
+        scenario = _representative_soak_scenario(config.soak_image_templates)
+    elif config.scenario is not None:
+        scenario = config.scenario
+    else:
+        scenario = make_simple_scenario(config.num_jobs)
 
     bridge_data = build_harness_bridge_data(config, scenario)
 
@@ -327,13 +367,17 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
 
     canned_job_source: CannedJobSource | None = None
     if config.skip_api:
-        if config.arrival is not None:
+        if config.soak_seconds is not None:
+            canned_job_source = GeneratingJobSource(config.soak_image_templates)
+        elif config.arrival is not None:
             canned_job_source = TimedJobSource(scenario, config.arrival)
         else:
             canned_job_source = CannedJobSource(scenario)
 
     canned_alchemy_source: CannedAlchemySource | None = None
-    if config.skip_api and config.alchemy_forms:
+    if config.skip_api and config.soak_seconds is not None and config.soak_alchemy_templates:
+        canned_alchemy_source = GeneratingAlchemySource(config.soak_alchemy_templates)
+    elif config.skip_api and config.alchemy_forms:
         canned_alchemy_source = CannedAlchemySource(config.alchemy_forms)
 
     system_resources = _build_harness_system_resources() if config.process_mode != "real" else None
@@ -391,6 +435,74 @@ async def _watch_for_scenario_completion(
             return True
 
 
+def _stop_soak_sources(manager: HordeWorkerProcessManager) -> None:
+    """Tell the soak's generating sources to stop minting new work."""
+    job_source = manager._job_popper._canned_job_source
+    if isinstance(job_source, GeneratingJobSource):
+        job_source.stop()
+    alchemy_source = manager._alchemy_coordinator._canned_alchemy_source
+    if isinstance(alchemy_source, GeneratingAlchemySource):
+        alchemy_source.stop()
+
+
+async def _watch_for_soak_period(
+    manager: HordeWorkerProcessManager,
+    *,
+    soak_seconds: float,
+    drain_timeout_seconds: float,
+    timeout_seconds: float,
+    gpu_sampler: GpuUtilizationSampler | None = None,
+) -> bool:
+    """Saturate the worker for `soak_seconds`, then stop generating and drain in-flight work.
+
+    GPU utilization is sampled only after the first job completes (model is loaded, pipeline
+    primed) and until the load phase ends, so the reported duty cycle reflects steady-state
+    sustained load rather than cold start.
+
+    Returns True only if the hard `timeout_seconds` was hit during the load phase (a genuine
+    failure — the worker stopped making progress); completing the period and draining cleanly
+    (or hitting the bounded drain timeout) returns False.
+    """
+    time_started = time.time()
+    gpu_sampling_started = False
+
+    # Phase 1 — sustained load: the generating sources keep the worker saturated.
+    while time.time() - time_started < soak_seconds:
+        await asyncio.sleep(0.2)
+        if (
+            not gpu_sampling_started
+            and gpu_sampler is not None
+            and manager._job_tracker.total_num_completed_jobs >= 1
+        ):
+            gpu_sampler.start()
+            gpu_sampling_started = True
+        if manager._state.shutting_down:
+            return False
+        if time.time() - time_started > timeout_seconds:
+            logger.error(f"Soak hit the hard timeout of {timeout_seconds}s during the load phase")
+            manager._abort()
+            return True
+
+    if gpu_sampler is not None:
+        gpu_sampler.stop()
+
+    # Phase 2 — drain: stop minting work and let everything already accepted finish.
+    _stop_soak_sources(manager)
+    logger.info(f"Soak period of {soak_seconds:.0f}s elapsed; draining in-flight work")
+    drain_started = time.time()
+    while time.time() - drain_started < drain_timeout_seconds:
+        await asyncio.sleep(0.2)
+        forms_in_flight = manager._state.alchemy_forms_in_flight
+        if manager._job_tracker.num_jobs_total == 0 and forms_in_flight == 0:
+            logger.info("Soak drain complete; all in-flight work finished")
+            manager._shutdown()
+            return False
+
+    logger.warning(f"Soak drain did not finish within {drain_timeout_seconds:.0f}s; shutting down anyway")
+    manager._shutdown()
+    return False
+
+
 def _cleanup_stale_abort_file() -> None:
     """Remove a stale `.abort` file left behind by a previous crashed or aborted run.
 
@@ -428,14 +540,32 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
 
     num_forms_expected = len(config.alchemy_forms) if (config.alchemy_forms and config.skip_api) else 0
 
-    watcher_task = asyncio.create_task(
-        _watch_for_scenario_completion(
-            manager,
-            num_jobs_expected=num_jobs_expected,
-            num_forms_expected=num_forms_expected,
-            timeout_seconds=config.timeout_seconds,
-        ),
+    # Sample real GPU core utilization across the soak's *steady-state* window (the watcher
+    # starts it once warmed up and stops it before the drain), so cold-start model load does
+    # not drag down the reported duty cycle.
+    gpu_sampler = (
+        GpuUtilizationSampler() if (config.process_mode == "real" and config.soak_seconds is not None) else None
     )
+
+    if config.soak_seconds is not None:
+        watcher_task = asyncio.create_task(
+            _watch_for_soak_period(
+                manager,
+                soak_seconds=config.soak_seconds,
+                drain_timeout_seconds=config.soak_drain_timeout_seconds,
+                timeout_seconds=config.timeout_seconds,
+                gpu_sampler=gpu_sampler,
+            ),
+        )
+    else:
+        watcher_task = asyncio.create_task(
+            _watch_for_scenario_completion(
+                manager,
+                num_jobs_expected=num_jobs_expected,
+                num_forms_expected=num_forms_expected,
+                timeout_seconds=config.timeout_seconds,
+            ),
+        )
 
     exception_raised: BaseException | None = None
     try:
@@ -444,6 +574,8 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         exception_raised = exc
         logger.exception(f"Harness main loop raised an exception: {exc}")
     finally:
+        if gpu_sampler is not None:
+            gpu_sampler.stop()
         if not watcher_task.done():
             watcher_task.cancel()
 
@@ -483,9 +615,33 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
             for failure in audit_failures:
                 logger.error(f"Harness audit failure: {failure}")
 
+    metrics_snapshot = manager.get_run_metrics_snapshot()
+    if gpu_sampler is not None:
+        metrics_snapshot = metrics_snapshot.model_copy(
+            update={
+                "gpu_utilization_mean_percent": gpu_sampler.mean_percent(),
+                "gpu_utilization_busy_fraction": gpu_sampler.busy_fraction(),
+                "gpu_utilization_samples": gpu_sampler.sample_count,
+            },
+        )
+        # Opt-in diagnostics: persist the timestamped util series for offline correlation with
+        # the sampling spans (e.g. util@1-active vs util@2-active to settle the duty ceiling).
+        timeline_path = os.environ.get("BENCHMARK_GPU_TIMESERIES_PATH")
+        if timeline_path:
+            gpu_sampler.dump_timeline(timeline_path)
+
+    num_jobs_completed = manager._job_tracker.total_num_completed_jobs
+    num_forms_completed = manager._alchemy_coordinator.num_canned_forms_completed
+
+    # A soak generates an open-ended amount of work, so "expected" is whatever it completed;
+    # its pass/fail rests on faults, timeout, and (in the benchmark layer) throughput retention.
+    if config.soak_seconds is not None:
+        num_jobs_expected = num_jobs_completed
+        num_forms_expected = num_forms_completed
+
     return HarnessResult(
         num_jobs_expected=num_jobs_expected,
-        num_jobs_completed=manager._job_tracker.total_num_completed_jobs,
+        num_jobs_completed=num_jobs_completed,
         num_jobs_faulted=manager._job_tracker.num_jobs_faulted,
         elapsed_seconds=time.time() - time_started,
         timed_out=timed_out,
@@ -493,9 +649,9 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         num_jobs_submitted_faulted=num_jobs_submitted_faulted,
         exit_reason=exit_reason,
         diagnostics=diagnostics,
-        metrics=manager.get_run_metrics_snapshot(),
+        metrics=metrics_snapshot,
         num_alchemy_forms_expected=num_forms_expected,
-        num_alchemy_forms_completed=manager._alchemy_coordinator.num_canned_forms_completed,
+        num_alchemy_forms_completed=num_forms_completed,
         num_alchemy_forms_faulted=manager._alchemy_coordinator.num_canned_forms_faulted,
     )
 

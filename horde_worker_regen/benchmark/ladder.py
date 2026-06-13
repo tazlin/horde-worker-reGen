@@ -24,6 +24,23 @@ BENCH_TIER_MODELS: dict[str, str] = {
     "flux": "FLUX.1 [schnell]",
 }
 
+BENCH_TIER_MODEL_POOLS: dict[str, list[str]] = {
+    # Distinct same-tier checkpoints for the multi-model soak. A single-model soak cannot
+    # saturate >2 inference jobs (the popper caps in-flight jobs at 2 per model), so the soak
+    # needs a pool of distinct models — one per inference process — to actually exercise every
+    # process and the cross-process coordination. pool[0] MUST equal BENCH_TIER_MODELS[tier]
+    # (the baseline/single-model paths use that name). All names must exist in the AI-Horde
+    # image model reference; the controller trims the pool to what fits in VRAM.
+    "sd15": [
+        "Deliberate",
+        "Dreamshaper",
+        "ICBINP - I Can't Believe It's Not Photography",
+        "Anything Diffusion",
+    ],
+    "sdxl": ["AlbedoBase XL (SDXL)"],
+    "flux": ["FLUX.1 [schnell]"],
+}
+
 _TIER_BASELINES: dict[str, str] = {
     "sd15": "stable_diffusion_1",
     "sdxl": "stable_diffusion_xl",
@@ -72,13 +89,25 @@ class LadderOptions(BaseModel):
 
 
 def _tier_job(tier: str, **overrides: object) -> CannedImageJobSpec:
-    resolution = int(overrides.pop("resolution", _TIER_RESOLUTIONS[tier]))
+    resolution_override = overrides.pop("resolution", None)
+    resolution = resolution_override if isinstance(resolution_override, int) else _TIER_RESOLUTIONS[tier]
     return CannedImageJobSpec(
         model=BENCH_TIER_MODELS[tier],
         width=resolution,
         height=resolution,
         **overrides,  # type: ignore[arg-type]
     )
+
+
+def _its_advisory_criteria() -> LevelCriteria:
+    """Criteria for levels whose raw it/s legitimately differs from the stage-A baseline.
+
+    Batch (more images per step), extra-thread (per-job it/s drops as the GPU is shared),
+    and feature levels do not have the same per-step work as the baseline, so the it/s
+    comparison is reported as an advisory rather than gating the verdict; stability still
+    decides pass/fail. See :class:`LevelCriteria.gate_its_against_baseline`.
+    """
+    return LevelCriteria(gate_its_against_baseline=False)
 
 
 def build_default_ladder(options: LadderOptions | None = None) -> list[RampLevel]:
@@ -98,6 +127,7 @@ def build_default_ladder(options: LadderOptions | None = None) -> list[RampLevel
         bridge_data_overrides: dict | None = None,
         requires_network: bool = False,
         establishes_tier_baseline: bool = False,
+        criteria: LevelCriteria | None = None,
     ) -> None:
         levels.append(
             RampLevel(
@@ -113,6 +143,7 @@ def build_default_ladder(options: LadderOptions | None = None) -> list[RampLevel
                 timeout_seconds=opts.level_timeout_seconds,
                 baseline_hordelib=_TIER_BASELINES[tier],
                 establishes_tier_baseline=establishes_tier_baseline,
+                criteria=criteria or LevelCriteria(),
             ),
         )
 
@@ -158,6 +189,7 @@ def build_default_ladder(options: LadderOptions | None = None) -> list[RampLevel
                     image_jobs=[_tier_job(tier, count=opts.jobs_per_level)],
                 ),
                 bridge_data_overrides={"max_threads": 2, "queue_size": 2},
+                criteria=_its_advisory_criteria(),
             )
             for rung, batch in enumerate((2, 4), start=1):
                 add(
@@ -171,6 +203,7 @@ def build_default_ladder(options: LadderOptions | None = None) -> list[RampLevel
                         name=f"{tier}-b{batch}",
                         image_jobs=[_tier_job(tier, count=max(2, opts.jobs_per_level // 2), n_iter=batch)],
                     ),
+                    criteria=_its_advisory_criteria(),
                 )
 
         if opts.include_features:
@@ -237,6 +270,7 @@ def build_default_ladder(options: LadderOptions | None = None) -> list[RampLevel
                     scenario=scenario,
                     bridge_data_overrides=overrides,
                     requires_network=requires_network,
+                    criteria=_its_advisory_criteria(),
                 )
 
     if opts.include_alchemy and opts.tiers:

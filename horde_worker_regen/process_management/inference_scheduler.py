@@ -24,6 +24,7 @@ from horde_worker_regen.process_management.messages import (
     HordeProcessState,
     ModelLoadState,
 )
+from horde_worker_regen.process_management.model_affinity import affinity_active, compute_protected_processes
 from horde_worker_regen.process_management.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
@@ -34,6 +35,18 @@ from horde_worker_regen.telemetry_spans import span_preload_model
 from horde_worker_regen.utils.job_utils import (
     get_single_job_magnitude as _get_single_job_effective_megapixelsteps,
 )
+
+_SPECULATIVE_DISPATCH_MIN_FREE_VRAM_MB = 3000.0
+"""Minimum device-wide free VRAM required to dispatch a job to a spare process *ahead* of a
+sampling slot opening (speculative pre-staging under the GPU sampling lease). Staging a job loads
+its model and encodes conditioning into VRAM before it can sample; this headroom guards against
+over-committing the GPU when pre-staging. Below it, dispatch falls back to the sampling-slot cap."""
+
+_RESIDENCY_GRACE_SECONDS = 30.0
+"""How long a model stays protected from RAM eviction after its last live demand, in the
+models-exceed-processes regime. Bridges the gap between a model's consecutive jobs so a
+process does not disk-reload the very model it just used when the next job for it has not yet
+been popped."""
 
 
 class InferenceScheduler:
@@ -55,6 +68,7 @@ class InferenceScheduler:
     _model_recently_missing_time: float
     _batch_wait_log_time: float
     _pending_line_skip: NextJobAndProcess | None
+    _model_last_in_demand: dict[str, float]
 
     def __init__(
         self,
@@ -106,6 +120,7 @@ class InferenceScheduler:
         self._model_recently_missing_time = 0.0
         self._batch_wait_log_time = 0.0
         self._pending_line_skip = None
+        self._model_last_in_demand = {}
 
     @property
     def post_process_job_overlap_allowed(self) -> bool:
@@ -116,6 +131,28 @@ class InferenceScheduler:
     def get_single_job_effective_megapixelsteps(self, job: ImageGenerateJobPopResponse) -> int:
         """Return the number of effective megapixelsteps for a single job."""
         return _get_single_job_effective_megapixelsteps(job)
+
+    def _max_jobs_in_progress_allowed(self, processes_post_processing: int) -> int:
+        """The cap on concurrently in-progress jobs for this scheduling decision.
+
+        Without the GPU sampling lease, the inference semaphore is the sole denoise gate, so this
+        is the concurrent-sampling count — dispatching more would over-subscribe the GPU. With the
+        lease enabled, the lease (not this cap) limits actual concurrent sampling, so spare
+        inference processes are allowed to receive jobs and stage their pipeline (model load,
+        prompt encode) *ahead* while others sample — filling the inter-job gaps where the GPU
+        would otherwise go dark. That pre-staging is permitted up to the full inference-process
+        count, but only while there is enough free VRAM to hold another staged model; otherwise it
+        falls back to the sampling-slot cap so speculation never over-commits the device.
+        """
+        base = self._max_concurrent_inference_processes + processes_post_processing
+        if not self._runtime_config.bridge_data.gpu_sampling_lease_enabled:
+            return base
+
+        free_vram_mb = self._process_map.get_free_vram_mb()
+        if free_vram_mb is None or free_vram_mb < _SPECULATIVE_DISPATCH_MIN_FREE_VRAM_MB:
+            return base
+
+        return self._max_inference_processes + processes_post_processing
 
     def preload_models(self) -> bool:
         """Preload models that are likely to be used soon.
@@ -166,6 +203,28 @@ class InferenceScheduler:
                 processes_with_model_for_queued_job = [
                     p.process_id for p in self._process_map.values() if p.is_process_busy()
                 ]
+
+            # Model->process affinity: in the models<=processes regime, never displace the last
+            # resident copy of a still-wanted model. Without this, hot models' second instances
+            # (the 2-per-model cap) consume the spare processes and the fallback evicts a cold
+            # model's only copy, forcing it to disk-reload on its next job — the dominant
+            # GPU-duty-cycle tax measured on the multi-model soak. The working model set is taken
+            # from live state (loaded + in-flight + pending), not bridge_data.image_models_to_load,
+            # because the harness/canned path never resolves that config field.
+            inference_process_models = {
+                p.process_id: p.loaded_horde_model_name
+                for p in self._process_map.values()
+                if p.process_type == HordeProcessType.INFERENCE
+            }
+            wanted_models: set[str] = {m for m in inference_process_models.values() if m is not None}
+            wanted_models.update(j.model for j in self._job_tracker.jobs_pending_inference if j.model is not None)
+            wanted_models.update(j.model for j in self._job_tracker.jobs_in_progress if j.model is not None)
+            if affinity_active(len(wanted_models), self._max_inference_processes):
+                protected = compute_protected_processes(inference_process_models, wanted_models)
+                if protected:
+                    processes_with_model_for_queued_job = list(
+                        set(processes_with_model_for_queued_job) | protected,
+                    )
 
             available_process = self._process_map.get_first_available_inference_process(
                 disallowed_processes=processes_with_model_for_queued_job,
@@ -304,7 +363,7 @@ class InferenceScheduler:
             processes_post_processing = self._process_map.num_busy_with_post_processing()
 
         jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
-        if jobs_in_progress_count >= (self._max_concurrent_inference_processes + processes_post_processing):
+        if jobs_in_progress_count >= self._max_jobs_in_progress_allowed(processes_post_processing):
             return None
 
         process_with_model = self._process_map.get_process_by_horde_model_name(next_job.model)
@@ -537,12 +596,84 @@ class InferenceScheduler:
 
         return True
 
+    def _compute_wanted_models(self) -> set[str]:
+        """The set of models the worker is actively serving right now.
+
+        Derived from live scheduler state — every model currently resident on an inference
+        process, plus every model referenced by a pending or in-progress job. This mirrors the
+        affinity computation in :meth:`preload_models`; ``bridge_data.image_models_to_load`` is
+        deliberately not used because the harness/canned path never resolves that config field,
+        so live state is the only reliable source.
+        """
+        wanted: set[str] = {
+            p.loaded_horde_model_name
+            for p in self._process_map.values()
+            if p.process_type == HordeProcessType.INFERENCE and p.loaded_horde_model_name is not None
+        }
+        wanted.update(j.model for j in self._job_tracker.jobs_pending_inference if j.model is not None)
+        wanted.update(j.model for j in self._job_tracker.jobs_in_progress if j.model is not None)
+        return wanted
+
+    def _refresh_model_demand(self) -> None:
+        """Stamp the current time against every model with live demand (pending/in-progress job).
+
+        Feeds the residency grace period (:meth:`_is_recently_demanded`). Only genuine demand —
+        not mere residency — refreshes the stamp, so a loaded-but-idle model's grace still
+        expires. Entries well past the grace window are pruned to bound the dict.
+        """
+        now = time.time()
+        for job in (*self._job_tracker.jobs_pending_inference, *self._job_tracker.jobs_in_progress):
+            if job.model is not None:
+                self._model_last_in_demand[job.model] = now
+
+        cutoff = now - (_RESIDENCY_GRACE_SECONDS * 4)
+        for model_name in [m for m, last in self._model_last_in_demand.items() if last < cutoff]:
+            del self._model_last_in_demand[model_name]
+
+    def _is_recently_demanded(self, model_name: str) -> bool:
+        """Whether the model had a pending/in-progress job within the residency grace window."""
+        last = self._model_last_in_demand.get(model_name)
+        return last is not None and (time.time() - last) <= _RESIDENCY_GRACE_SECONDS
+
+    def _residency_protects_from_unload(
+        self,
+        model_name: str | None,
+        wanted_models: set[str],
+        *,
+        vram: bool,
+    ) -> bool:
+        """Whether residency policy should keep ``model_name`` loaded rather than evict it now.
+
+        Two regimes:
+
+        - **Working set fits the process count** (``affinity_active``): every actively-served
+          model can have its own home process, so keep them all resident in both RAM and VRAM.
+          This is the regime the soak measures and the dominant duty-cycle win — it stops a
+          process evicting the very model it just used (and is about to reuse) the instant its
+          next job has not yet been popped.
+        - **More models than processes**: residency cannot be guaranteed, so apply only a RAM
+          grace period — cheap to hold, and it avoids the expensive disk reload between a model's
+          consecutive jobs. VRAM, the scarce resource, is still reclaimed promptly.
+
+        Genuine memory-pressure-aware eviction (a worker-owned aggregate VRAM budget) is WS-1 and
+        not yet implemented; in the fits regime the model count is bounded by the process count,
+        so unconditional residency there does not over-commit VRAM for the sd15-class workloads.
+        """
+        if model_name is None:
+            return False
+
+        if affinity_active(len(wanted_models), self._max_inference_processes) and model_name in wanted_models:
+            return True
+
+        return not vram and self._is_recently_demanded(model_name)
+
     def unload_models_from_vram(
         self,
         process_with_model: HordeProcessInfo,
     ) -> None:
         """Unload models from VRAM from processes that are not running a job."""
         bridge_data = self._runtime_config.bridge_data
+        wanted_models = self._compute_wanted_models()
         next_n_models = list(self.get_next_n_models(self._max_inference_processes))
         logger.debug(f"Next n models: {next_n_models}")
         next_model = None
@@ -570,6 +701,13 @@ class InferenceScheduler:
                     continue
 
                 if process_info.loaded_horde_model_name == next_model:
+                    continue
+
+                if self._residency_protects_from_unload(
+                    process_info.loaded_horde_model_name,
+                    wanted_models,
+                    vram=True,
+                ):
                     continue
 
                 if process_info.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
@@ -683,6 +821,8 @@ class InferenceScheduler:
         if self._max_concurrent_inference_processes == 1 and len(bridge_data.image_models_to_load) == 1:
             return False
 
+        wanted_models = self._compute_wanted_models()
+
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
                 continue
@@ -707,6 +847,13 @@ class InferenceScheduler:
                 if process_info.loaded_horde_model_name in models_still_needed:
                     continue
 
+                if self._residency_protects_from_unload(
+                    process_info.loaded_horde_model_name,
+                    wanted_models,
+                    vram=False,
+                ):
+                    continue
+
                 self.unload_from_ram(process_info.process_id)
                 return True
 
@@ -719,6 +866,8 @@ class InferenceScheduler:
         """
         self._pending_line_skip = None
         bridge_data = self._runtime_config.bridge_data
+
+        self._refresh_model_demand()
 
         if not self.preload_models():
             next_job_and_process = await self.get_next_job_and_process(information_only=True)
@@ -772,5 +921,14 @@ class InferenceScheduler:
                     )
                     self._batch_wait_log_time = time.time()
             else:
-                if not await self.start_inference():
+                # Fill every free inference slot this cycle rather than one per ~0.5s control-loop
+                # tick: when several jobs complete close together, dispatching them one tick apart
+                # leaves the GPU underfed. start_inference() returns False once no more can start
+                # (its own concurrency gate — jobs_in_progress >= max_concurrent, no free process,
+                # or no eligible job — stops the loop), so this cannot over-subscribe.
+                started_any = False
+                while await self.start_inference():
+                    started_any = True
+
+                if not started_any:
                     self.unload_models()

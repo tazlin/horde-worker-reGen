@@ -179,6 +179,35 @@ def _apply_high_memory_constraints(
     return cycle_process_on_model_change
 
 
+def _warn_lease_without_residency(
+    *,
+    gpu_sampling_lease_enabled: bool,
+    high_memory_mode: bool,
+    unload_models_from_vram_often: bool,
+    log: bool = False,
+) -> bool:
+    """Detect (and optionally warn about) enabling the GPU sampling lease without residency.
+
+    The lease brackets the diffusion model's VRAM load together with the denoise loop, so without
+    residency each process's RAM->VRAM transfer is serialized behind sampling instead of
+    overlapping it — usually a throughput loss rather than a gain.
+
+    Returns:
+        True if the lease is enabled in a non-resident (counterproductive) configuration.
+    """
+    if not gpu_sampling_lease_enabled:
+        return False
+    non_resident = unload_models_from_vram_often or not high_memory_mode
+    if non_resident and log:
+        logger.warning(
+            "gpu_sampling_lease_enabled is set without VRAM residency (high_memory_mode=true + "
+            "unload_models_from_vram_often=false). The lease brackets the model's VRAM load as "
+            "well as the denoise loop, so without residency it serializes RAM->VRAM transfers "
+            "behind sampling and typically reduces throughput.",
+        )
+    return non_resident
+
+
 class reGenBridgeData(CombinedHordeBridgeData):
     """The config model for reGen. Extra fields added here are specific to this worker implementation.
 
@@ -255,6 +284,29 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     post_process_job_overlap: bool = Field(default=False)
     """High and moderate performance modes will skip post processing if this is set to true."""
+
+    gpu_sampling_lease_enabled: bool = Field(default=False)
+    """Coordinate the GPU denoising loop across inference processes with a shared lease.
+
+    When true, at most `gpu_sampling_lease_slots` inference processes run the denoising loop at
+    once; any extra processes stage their next pipeline (model load, prompt encode) concurrently,
+    so when a sampling process finishes the next starts immediately — keeping the GPU busy
+    between jobs instead of idling during per-job warm-up. Trades extra resident VRAM (each
+    process keeps its model loaded) for higher GPU utilization, and **requires** residency
+    (`high_memory_mode: true` + `unload_models_from_vram_often: false`) to help: the lease
+    brackets the diffusion model's VRAM load as well as the denoise loop, so without residency it
+    serializes the RAM->VRAM transfer behind sampling rather than overlapping it."""
+
+    gpu_sampling_lease_slots: int = Field(default=1, ge=1)
+    """How many inference processes may run the GPU denoising loop at once when
+    `gpu_sampling_lease_enabled` is true (clamped to the inference-process count at runtime).
+
+    1 (the default) serializes denoising — one process samples while the rest stage their next
+    pipeline — the cleanest way to keep a single GPU busy back-to-back. Values > 1 permit that
+    many concurrent denoise loops; on hardware without CUDA MPS (e.g. Windows WDDM) concurrent
+    loops time-slice the GPU rather than truly parallelizing, so this can raise the
+    coverage-based duty-cycle metric without improving throughput. No effect unless
+    `gpu_sampling_lease_enabled` is true."""
 
     capture_kudos_training_data: bool = Field(default=False)
 
@@ -374,6 +426,13 @@ class reGenBridgeData(CombinedHordeBridgeData):
             queue_size=self.queue_size,
             unload_models_from_vram_often=self.unload_models_from_vram_often,
             cycle_process_on_model_change=self.cycle_process_on_model_change,
+            log=True,
+        )
+
+        _warn_lease_without_residency(
+            gpu_sampling_lease_enabled=self.gpu_sampling_lease_enabled,
+            high_memory_mode=self.high_memory_mode,
+            unload_models_from_vram_often=self.unload_models_from_vram_often,
             log=True,
         )
 

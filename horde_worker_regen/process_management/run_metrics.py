@@ -71,6 +71,12 @@ class RunMetricsSnapshot(BaseModel):
     num_job_slowdowns: int
     time_spent_no_jobs_available: float
     process_crash_events: list[ProcessCrashRecord]
+    gpu_utilization_mean_percent: float | None = None
+    """Average GPU core utilization (the duty cycle) sampled over the run, when measured."""
+    gpu_utilization_busy_fraction: float | None = None
+    """Fraction of GPU samples at or above the busy threshold, when measured."""
+    gpu_utilization_samples: int = 0
+    """How many GPU-utilization samples backed the figures above."""
 
 
 class WorkerRunMetrics:

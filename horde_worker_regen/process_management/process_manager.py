@@ -105,6 +105,30 @@ class SystemResources:
         return cls(total_ram_bytes=total_ram, device_map=device_map)
 
 
+def _resolve_inference_concurrency(
+    *,
+    gpu_sampling_lease_enabled: bool,
+    configured_lease_slots: int,
+    max_concurrent_inference_processes: int,
+    max_inference_processes: int,
+) -> tuple[int, int]:
+    """Resolve ``(inference_semaphore_size, gpu_sampling_lease_slots)`` for the IPC primitives.
+
+    Without the lease the whole-job inference semaphore is the only GPU gate, so it stays at the
+    concurrent-sampling count. With the lease the *lease* becomes the denoise gate and the
+    inference semaphore opens up to every inference process, letting spare processes stage their
+    next pipeline (model load, prompt encode) ahead instead of blocking at job start.
+
+    The lease slot count is independent of ``max_threads``: it bounds concurrent denoise loops
+    only, clamped to ``[1, max_inference_processes]`` (at least one denoise may always run, and
+    more slots than processes can never be used).
+    """
+    lease_slots = min(max(1, configured_lease_slots), max(1, max_inference_processes))
+    if gpu_sampling_lease_enabled:
+        return max_inference_processes, lease_slots
+    return max_concurrent_inference_processes, lease_slots
+
+
 @dataclasses.dataclass
 class MultiprocessingPrimitives:
     """Multiprocessing primitives created for IPC."""
@@ -114,6 +138,10 @@ class MultiprocessingPrimitives:
     disk_lock: Lock_MultiProcessing
     aux_model_lock: Lock_MultiProcessing
     vae_decode_semaphore: Semaphore
+    gpu_sampling_lease: Semaphore
+    """Serializes the GPU denoising loop across inference processes so they pipeline (one
+    samples while others stage their next pipeline) rather than idling the GPU in lockstep.
+    Sized to the number of GPU sampling slots (1 for a single GPU)."""
 
     @classmethod
     def create(
@@ -121,6 +149,7 @@ class MultiprocessingPrimitives:
         ctx: BaseContext,
         max_concurrent_inference: int,
         vae_decode_semaphore_max: int,
+        gpu_sampling_lease_slots: int = 1,
     ) -> MultiprocessingPrimitives:
         """Create real multiprocessing primitives from a context."""
         return cls(
@@ -129,6 +158,7 @@ class MultiprocessingPrimitives:
             disk_lock=Lock_MultiProcessing(ctx=ctx),
             aux_model_lock=Lock_MultiProcessing(ctx=ctx),
             vae_decode_semaphore=Semaphore(vae_decode_semaphore_max, ctx=ctx),
+            gpu_sampling_lease=Semaphore(max(1, gpu_sampling_lease_slots), ctx=ctx),
         )
 
 
@@ -432,10 +462,23 @@ class HordeWorkerProcessManager:
             if self.bridge_data.high_memory_mode:
                 vae_decode_semaphore_max = self.max_inference_processes
 
+            # The lease is an independent denoise gate (see _resolve_inference_concurrency): with
+            # it enabled the whole-job inference semaphore opens to every process so spare
+            # processes can stage their next pipeline (model load, prompt encode) ahead while
+            # others sample; the lease itself bounds concurrent denoise loops. Without it the
+            # inference semaphore stays the sole sampling gate at the concurrent-sampling count.
+            inference_semaphore_size, gpu_sampling_lease_slots = _resolve_inference_concurrency(
+                gpu_sampling_lease_enabled=self.bridge_data.gpu_sampling_lease_enabled,
+                configured_lease_slots=self.bridge_data.gpu_sampling_lease_slots,
+                max_concurrent_inference_processes=self._max_concurrent_inference_processes,
+                max_inference_processes=self.max_inference_processes,
+            )
+
             mp_primitives = MultiprocessingPrimitives.create(
                 ctx=ctx,
-                max_concurrent_inference=self._max_concurrent_inference_processes,
+                max_concurrent_inference=inference_semaphore_size,
                 vae_decode_semaphore_max=vae_decode_semaphore_max,
+                gpu_sampling_lease_slots=gpu_sampling_lease_slots,
             )
 
         self._process_message_queue = mp_primitives.process_message_queue
@@ -443,6 +486,7 @@ class HordeWorkerProcessManager:
         self._disk_lock = mp_primitives.disk_lock
         self._aux_model_lock = mp_primitives.aux_model_lock
         self._vae_decode_semaphore = mp_primitives.vae_decode_semaphore
+        self._gpu_sampling_lease = mp_primitives.gpu_sampling_lease
 
         self._process_lifecycle = ProcessLifecycleManager(
             process_map=self._process_map,
@@ -453,6 +497,8 @@ class HordeWorkerProcessManager:
             disk_lock=self._disk_lock,
             aux_model_lock=self._aux_model_lock,
             vae_decode_semaphore=self._vae_decode_semaphore,
+            gpu_sampling_lease=self._gpu_sampling_lease,
+            gpu_sampling_lease_enabled=self.bridge_data.gpu_sampling_lease_enabled,
             runtime_config=self._runtime_config,
             max_inference_processes=self.max_inference_processes,
             max_safety_processes=self.max_safety_processes,

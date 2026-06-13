@@ -127,6 +127,7 @@ class JobPopper:
     _replaced_due_to_maintenance: bool
     _api_messages_received: dict[str, APIWorkerMessage]
     _api_call_loop_interval: float
+    _fast_pop_interval: float
 
     _canned_job_source: CannedJobSource | None
 
@@ -176,6 +177,7 @@ class JobPopper:
         self._replaced_due_to_maintenance = False
         self._api_messages_received = {}
         self._api_call_loop_interval = 1
+        self._fast_pop_interval = 0.05
 
     @property
     def api_messages_received(self) -> dict[str, APIWorkerMessage]:
@@ -228,6 +230,25 @@ class JobPopper:
         if bridge_data.max_threads > 1:
             max_jobs_in_queue += bridge_data.max_threads - 1
         return len(self._job_tracker.jobs_pending_inference) >= max_jobs_in_queue
+
+    def _is_hungry(self, bridge_data: reGenBridgeData) -> bool:
+        """Whether the worker should pop again immediately instead of waiting the poll interval.
+
+        True only when work is actively flowing (the last pop returned a job), the local queue
+        has room (`_is_queue_full` is False), an inference process is free to take a job, and we
+        are not in post-error backoff. In that state the fixed ~1s poll cadence would leave a
+        freed GPU slot starved while a job is readily available; popping back-to-back fills the
+        buffer so the slot refills without delay. When the queue is full, no process is free, the
+        source has no work, or we are backing off, this is False and the loop reverts to polite
+        interval polling — so this never increases pressure on the API beyond filling the buffer.
+        """
+        if self._state.last_pop_no_jobs_available:
+            return False
+        if self._pop_throttler.is_in_error_backoff:
+            return False
+        if self._is_queue_full(bridge_data):
+            return False
+        return self._process_map.get_first_available_inference_process() is not None
 
     def _process_api_messages(self, job_pop_response: object) -> None:
         """Extract and store any worker messages from the pop response."""
@@ -323,8 +344,16 @@ class JobPopper:
     # endregion
 
     @logger.catch(reraise=True)
-    async def api_job_pop(self) -> None:
-        """Pop a job from the API if the queue is not full and preconditions are met."""
+    async def api_job_pop(self, *, urgent: bool = False) -> None:
+        """Pop a job from the API if the queue is not full and preconditions are met.
+
+        Args:
+            urgent: When True, skip the inter-pop frequency gate so the local queue can be
+                refilled back-to-back while a GPU slot is starved. The caller is responsible for
+                only setting this when the worker is genuinely hungry (see :meth:`_is_hungry`);
+                all other preconditions (queue-full, free process, megapixelstep wait, error
+                backoff) are still enforced below.
+        """
         if self._state.shutting_down:
             self._state.last_pop_no_jobs_available = False
             return
@@ -357,7 +386,7 @@ class JobPopper:
         if self._pop_throttler.should_wait_for_megapixelsteps(bridge_data):
             return
 
-        if self._pop_throttler.is_pop_too_soon(self._state.last_job_pop_time):
+        if not urgent and self._pop_throttler.is_pop_too_soon(self._state.last_job_pop_time):
             return
 
         self._state.last_job_pop_time = time.time()
@@ -482,13 +511,21 @@ class JobPopper:
         await self._enqueue_popped_job(job_pop_response)
 
     async def run(self) -> None:
-        """Run the API call loop for popping jobs."""
+        """Run the API call loop for popping jobs.
+
+        The loop normally polls at ``_api_call_loop_interval`` (~1s). When the worker is hungry
+        (a GPU slot is free, the queue has room, and work is flowing — see :meth:`_is_hungry`),
+        it instead pops back-to-back at ``_fast_pop_interval`` to refill the local queue, so a
+        process that just finished a job does not sit idle waiting for the next poll tick. It
+        reverts to the slow cadence the moment the queue is full or no work is available.
+        """
         logger.debug("In JobPopper.run")
 
         while True:
+            urgent = self._is_hungry(self._runtime_config.bridge_data)
             with logger.catch():
                 try:
-                    await self.api_job_pop()
+                    await self.api_job_pop(urgent=urgent)
                 except CancelledError as e:
                     self._shutdown_manager.shutdown()
                     logger.debug(f"CancelledError: {e}")
@@ -497,4 +534,5 @@ class JobPopper:
             if self._shutdown_manager.is_time_for_shutdown() or self._state.shut_down:
                 break
 
-            await asyncio.sleep(self._api_call_loop_interval)
+            still_hungry = self._is_hungry(self._runtime_config.bridge_data)
+            await asyncio.sleep(self._fast_pop_interval if still_hungry else self._api_call_loop_interval)

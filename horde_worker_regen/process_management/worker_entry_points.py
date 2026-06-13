@@ -78,6 +78,7 @@ def start_inference_process(
     vram_heavy_models: bool = False,
     dry_run_skip_inference: bool = False,
     dry_run_inference_delay: float = 1.0,
+    gpu_sampling_lease: Semaphore | None = None,
 ) -> None:
     """Start an inference process.
 
@@ -104,16 +105,22 @@ def start_inference_process(
         dry_run_skip_safety (bool, optional): If true, skip real safety checks and return a dummy result.
             Defaults to False.
         dry_run_inference_delay (float, optional): Seconds to sleep when dry-run inference is active. Defaults to 1.0.
+        gpu_sampling_lease (Semaphore | None, optional): Shared lease for cross-process GPU sampling
+            coordination, registered with hordelib. None disables it. Defaults to None.
     """
     with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
         logger.remove()
         maybe_wait_for_process_debugger(process_id, "inference")
 
         try:
-            # Before the first hordelib import: its import-time logfire init must defer to ours.
-            from horde_worker_regen.telemetry import claim_logfire_ownership
+            # Before the first hordelib import: its import-time logfire init must defer to ours,
+            # and OpenTelemetry tracing must be forced off by default. hordelib spans every
+            # ComfyUI internal op (hundreds/job); with no collector the SDK still processes them
+            # on GIL-contending threads and starves the inference loop. See telemetry.py.
+            from horde_worker_regen.telemetry import claim_logfire_ownership, enforce_telemetry_default_off
 
             claim_logfire_ownership()
+            enforce_telemetry_default_off()
 
             from hordelib.api import HordeLog
 
@@ -210,6 +217,10 @@ def start_inference_process(
             process_launch_identifier=process_launch_identifier,
             dry_run_skip_inference=dry_run_skip_inference,
             dry_run_inference_delay=dry_run_inference_delay,
+            gpu_sampling_lease=gpu_sampling_lease,
+            # Propagate the operator's memory assertion so HordeLib keeps models resident
+            # (no per-job aggressive unload / RAM->VRAM reload) when there is VRAM headroom.
+            high_memory_mode=high_memory_mode or very_high_memory_mode,
         )
 
         worker_process.main_loop()
@@ -250,10 +261,14 @@ def start_safety_process(
         maybe_wait_for_process_debugger(process_id, "safety")
 
         try:
-            # Before the first hordelib import: its import-time logfire init must defer to ours.
-            from horde_worker_regen.telemetry import claim_logfire_ownership
+            # Before the first hordelib import: its import-time logfire init must defer to ours,
+            # and OpenTelemetry tracing must be forced off by default. hordelib spans every
+            # ComfyUI internal op (hundreds/job); with no collector the SDK still processes them
+            # on GIL-contending threads and starves the inference loop. See telemetry.py.
+            from horde_worker_regen.telemetry import claim_logfire_ownership, enforce_telemetry_default_off
 
             claim_logfire_ownership()
+            enforce_telemetry_default_off()
 
             from hordelib.api import HordeLog
 

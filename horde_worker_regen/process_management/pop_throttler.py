@@ -56,6 +56,15 @@ class PopThrottler:
         """Return the current pop frequency in seconds."""
         return self._current_pop_frequency
 
+    @property
+    def is_in_error_backoff(self) -> bool:
+        """Whether pops are currently slowed due to a recent error.
+
+        While True, fast/urgent pop-ahead must not bypass the frequency gate — the worker is
+        deliberately backing off the API after a failure.
+        """
+        return self._current_pop_frequency > self._default_pop_frequency
+
     def is_pop_too_soon(self, last_pop_time: float) -> bool:
         """Return True if not enough time has elapsed since the last pop."""
         return (time.time() - last_pop_time) < self._current_pop_frequency

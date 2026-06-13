@@ -20,6 +20,7 @@ from horde_worker_regen.process_management._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
     CannedJobSource,
+    SoakImageTemplate,
     TimedJobSource,
     make_alchemy_scenario,
     make_canned_job,
@@ -62,6 +63,10 @@ class ScenarioSpec(BaseModel):
     arrival_rate_per_minute: float = 0.0
     arrival_burst_size: int = 0
     arrival_burst_interval_seconds: float = 0.0
+    soak_seconds: float | None = None
+    """When set, this is a sustained-load soak: jobs/forms are *generated* continuously from
+    the specs (their `count` becomes a relative weight) for this many seconds rather than the
+    specs being expanded into a fixed list. See `to_soak_templates`."""
 
     @property
     def total_image_jobs(self) -> int:
@@ -127,6 +132,29 @@ class ScenarioSpec(BaseModel):
         alchemy_forms = self.expand_alchemy_forms()
         alchemy_source = CannedAlchemySource(alchemy_forms) if alchemy_forms else None
         return job_source, alchemy_source
+
+    def to_soak_templates(self) -> tuple[list[SoakImageTemplate], list[tuple[str, float]]]:
+        """Convert the specs into weighted soak templates (their `count` becomes the weight).
+
+        Returns the image templates and the ``(form_name, weight)`` alchemy pairs the harness's
+        generating sources mint fresh jobs/forms from during a soak.
+        """
+        image_templates = [
+            SoakImageTemplate(
+                model=spec.model,
+                width=spec.width,
+                height=spec.height,
+                steps=spec.steps,
+                n_iter=spec.n_iter,
+                control_type=spec.control_type,
+                post_processing=list(spec.post_processing),
+                hires_fix=spec.hires_fix,
+                weight=float(spec.count),
+            )
+            for spec in self.image_jobs
+        ]
+        alchemy_templates = [(spec.form, float(spec.count)) for spec in self.alchemy_forms]
+        return image_templates, alchemy_templates
 
     def models_referenced(self) -> list[str]:
         """Return the distinct image models this scenario uses."""

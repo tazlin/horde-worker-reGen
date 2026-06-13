@@ -34,7 +34,7 @@ class TestDefaultLadder:
             assert level.establishes_tier_baseline == (level.stage == "A")
 
     def test_flux_not_included_by_default(self) -> None:
-        """flux is opt-in (large download and VRAM footprint)."""
+        """Flux is opt-in (large download and VRAM footprint)."""
         assert not any(level.tier == "flux" for level in build_default_ladder())
 
     def test_flux_opt_in(self) -> None:
@@ -53,7 +53,7 @@ class TestDefaultLadder:
         assert download_levels[0].scenario.image_jobs[0].lora_names
 
     def test_controlnet_only_for_sd_tiers(self) -> None:
-        """flux gets no controlnet level."""
+        """Flux gets no controlnet level."""
         ladder = build_default_ladder(LadderOptions(tiers=["flux"]))
         assert not any(level.axis == "controlnet" for level in ladder)
 

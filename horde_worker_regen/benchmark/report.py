@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from horde_worker_regen.benchmark.criteria import LevelCriteria, LevelStats, LevelVerdict
+from horde_worker_regen.benchmark.criteria import LevelStats
 from horde_worker_regen.benchmark.ladder import BENCH_TIER_MODELS, RampLevel
 from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
 
@@ -107,6 +107,23 @@ class SuggestedBridgeData(BaseModel):
         ]
         return "\n".join(lines)
 
+    def to_bridge_overrides(self) -> dict[str, object]:
+        """The worker bridge-data fields this recommendation sets (for the validation run).
+
+        ``max_batch`` is intentionally excluded: batch size is a per-job payload value, not a
+        worker config field, so the soak applies it through its job templates instead.
+        """
+        return {
+            "max_threads": self.max_threads,
+            "queue_size": self.queue_size,
+            "allow_lora": self.allow_lora,
+            "allow_controlnet": self.allow_controlnet,
+            "allow_post_processing": self.allow_post_processing,
+            "models_to_load": list(self.models_to_load),
+            "alchemist": self.alchemist,
+            "alchemy_allow_concurrent": self.alchemy_allow_concurrent,
+        }
+
 
 class BenchmarkReport(BaseModel):
     """The full ramp outcome: per-level reports plus the synthesized recommendation."""
@@ -128,6 +145,136 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     ordered = sorted(values)
     index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
     return ordered[index]
+
+
+def _its_retention(jobs: list) -> float | None:  # type: ignore[type-arg]
+    """Median sampling rate of the second half of completed image jobs ÷ that of the first half.
+
+    Ordered by completion time, this catches throughput decay over a sustained run (thermal
+    throttling, a VRAM/RAM leak, queue backpressure). Returns None without enough samples.
+    """
+    timed: list[tuple[float, float]] = []
+    for job in jobs:
+        if job.is_alchemy or job.phase_metrics is None or job.phase_metrics.sampling is None:
+            continue
+        its = job.phase_metrics.sampling.iterations_per_second
+        finalized = job.stage_timestamps.get("FINALIZED")
+        if its > 0 and finalized is not None:
+            timed.append((finalized, its))
+
+    if len(timed) < 4:
+        return None
+
+    timed.sort(key=lambda entry: entry[0])
+    midpoint = len(timed) // 2
+    first_half = statistics.median([its for _, its in timed[:midpoint]])
+    second_half = statistics.median([its for _, its in timed[midpoint:]])
+    if first_half <= 0:
+        return None
+    return second_half / first_half
+
+
+_PHASE_ORDER = [
+    "queue_wait",
+    "disk_load",
+    "vram_load",
+    "sampling",
+    "vae",
+    "other_inference",
+    "safety",
+    "submit",
+]
+
+
+def _median(values: list[float]) -> float | None:
+    return statistics.median(values) if values else None
+
+
+def _phase_breakdown(jobs: list) -> dict[str, float]:  # type: ignore[type-arg]
+    """Median per-job seconds in each pipeline phase, to show where a typical job's time goes.
+
+    Built from worker stage timestamps (queue_wait/inference/safety/submit) and the child's
+    phase metrics (disk->RAM, RAM->VRAM, sampling, VAE); ``other_inference`` is the inference
+    time not otherwise accounted for (graph build, prompt encode, image encode, IPC).
+    """
+    samples: dict[str, list[float]] = {phase: [] for phase in _PHASE_ORDER}
+
+    for job in jobs:
+        if job.is_alchemy:
+            continue
+        stamps = job.stage_timestamps or {}
+        if job.queue_wait_seconds is not None:
+            samples["queue_wait"].append(job.queue_wait_seconds)
+
+        inference_start = stamps.get("INFERENCE_IN_PROGRESS")
+        inference_end = stamps.get("PENDING_SAFETY_CHECK")
+        submit_ready = stamps.get("PENDING_SUBMIT")
+        finalized = stamps.get("FINALIZED")
+
+        if submit_ready is not None and finalized is not None:
+            samples["submit"].append(max(0.0, finalized - submit_ready))
+        if inference_end is not None and submit_ready is not None:
+            samples["safety"].append(max(0.0, submit_ready - inference_end))
+
+        pm = job.phase_metrics
+        if pm is None or inference_start is None or inference_end is None:
+            continue
+        inference_total = max(0.0, inference_end - inference_start)
+
+        disk_load = sum(m.duration_seconds for m in pm.model_loads if m.phase == "disk_to_ram")
+        vram_load = sum(m.duration_seconds for m in pm.model_loads if m.phase == "ram_to_vram")
+        sampling = pm.sampling.duration_seconds if pm.sampling is not None else 0.0
+        vae = sum((pm.phase_seconds or {}).values())
+        other = max(0.0, inference_total - disk_load - vram_load - sampling - vae)
+
+        samples["disk_load"].append(disk_load)
+        samples["vram_load"].append(vram_load)
+        samples["sampling"].append(sampling)
+        samples["vae"].append(vae)
+        samples["other_inference"].append(other)
+
+    return {phase: median for phase in _PHASE_ORDER if (median := _median(samples[phase])) is not None}
+
+
+_GPU_BUSY_PHASES = ("vram_load", "sampling", "vae")
+
+
+def _span_derived_busy_ratio(breakdown: dict[str, float]) -> float | None:
+    """GPU-touching phases (vram_load + sampling + vae) ÷ the whole per-job wall, or None.
+
+    A phase-attributed duty-cycle proxy that needs no tracing backend: it says what share of a
+    typical job's lifecycle is actual GPU work versus idle hand-off (queue_wait, disk_load,
+    other_inference, safety, submit). The NVML mean is still the headline; this explains it.
+    """
+    total = sum(breakdown.values())
+    if total <= 0:
+        return None
+    busy = sum(breakdown.get(phase, 0.0) for phase in _GPU_BUSY_PHASES)
+    return busy / total
+
+
+def _post_warmup_vram_reloads(jobs: list) -> int | None:  # type: ignore[type-arg]
+    """RAM->VRAM reloads across image jobs after the first completed one (warm-up excluded).
+
+    Orders jobs by completion and drops the first (the unavoidable cold load), then counts every
+    subsequent ``ram_to_vram`` model load. Under expected residency this is 0; a positive count
+    means a resident model was evicted and reloaded (residency defeated / stickiness thrash).
+    Returns None when no job carried phase metrics.
+    """
+    timed: list[tuple[float, int]] = []
+    for job in jobs:
+        if job.is_alchemy or job.phase_metrics is None:
+            continue
+        finalized = job.stage_timestamps.get("FINALIZED")
+        if finalized is None:
+            continue
+        reloads = sum(1 for load in job.phase_metrics.model_loads if load.phase == "ram_to_vram")
+        timed.append((finalized, reloads))
+
+    if not timed:
+        return None
+    timed.sort(key=lambda entry: entry[0])
+    return sum(reloads for _, reloads in timed[1:])
 
 
 def compute_level_stats(result: LevelRunResult, *, total_vram_mb: int | None = None) -> LevelStats:
@@ -163,6 +310,14 @@ def compute_level_stats(result: LevelRunResult, *, total_vram_mb: int | None = N
         if metrics.vram_used_high_water_mb_per_process:
             vram_high_water = max(metrics.vram_used_high_water_mb_per_process.values())
 
+    disk_min_free = (
+        min(metrics.disk_min_free_bytes.values())
+        if metrics is not None and metrics.disk_min_free_bytes
+        else None
+    )
+
+    phase_breakdown = _phase_breakdown(metrics.jobs) if metrics is not None else {}
+
     return LevelStats(
         num_jobs_expected=harness.num_jobs_expected,
         num_jobs_completed=harness.num_jobs_completed,
@@ -173,14 +328,20 @@ def compute_level_stats(result: LevelRunResult, *, total_vram_mb: int | None = N
         timed_out=harness.timed_out,
         its_p50=statistics.median(its_values) if its_values else None,
         its_min=min(its_values) if its_values else None,
+        its_retention_fraction=_its_retention(metrics.jobs) if metrics is not None else None,
+        gpu_utilization_mean_percent=metrics.gpu_utilization_mean_percent if metrics is not None else None,
+        gpu_utilization_busy_fraction=metrics.gpu_utilization_busy_fraction if metrics is not None else None,
+        span_derived_busy_ratio=_span_derived_busy_ratio(phase_breakdown),
+        post_warmup_vram_reloads=(_post_warmup_vram_reloads(metrics.jobs) if metrics is not None else None),
         vram_used_high_water_mb=vram_high_water,
         total_vram_mb=total_vram_mb,
-        disk_min_free_bytes=(min(metrics.disk_min_free_bytes.values()) if metrics and metrics.disk_min_free_bytes else None),
+        disk_min_free_bytes=disk_min_free,
         download_mbps_min=min(download_rates) if download_rates else None,
         model_load_disk_seconds_median=statistics.median(disk_loads) if disk_loads else None,
         model_load_vram_seconds_median=statistics.median(vram_loads) if vram_loads else None,
         queue_wait_seconds_p95=_percentile(queue_waits, 0.95),
         e2e_seconds_p95=_percentile(e2es, 0.95),
+        phase_breakdown_seconds=phase_breakdown,
     )
 
 
@@ -237,14 +398,19 @@ def render_markdown(report: BenchmarkReport) -> str:
 
     lines.append("## Levels")
     lines.append("")
-    lines.append("| Level | Outcome | it/s p50 | VRAM HW (MB) | Notes |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| Level | Outcome | it/s p50 | GPU busy % | VRAM HW (MB) | Notes |")
+    lines.append("|---|---|---|---|---|---|")
     for level_report in report.levels:
         stats = level_report.stats
         its = f"{stats.its_p50:.2f}" if stats and stats.its_p50 is not None else "-"
+        gpu = (
+            f"{stats.gpu_utilization_mean_percent:.0f}"
+            if stats and stats.gpu_utilization_mean_percent is not None
+            else "-"
+        )
         vram = str(stats.vram_used_high_water_mb) if stats and stats.vram_used_high_water_mb is not None else "-"
         notes = "; ".join(level_report.reasons + level_report.advisories)
-        lines.append(f"| {level_report.level.id} | {level_report.outcome} | {its} | {vram} | {notes} |")
+        lines.append(f"| {level_report.level.id} | {level_report.outcome} | {its} | {gpu} | {vram} | {notes} |")
     lines.append("")
 
     lines.append("## Suggested bridgeData")
@@ -253,6 +419,72 @@ def render_markdown(report: BenchmarkReport) -> str:
     lines.append(report.suggested_bridge_data.as_yaml_block())
     lines.append("```")
     lines.append("")
+
+    validation_levels = [level for level in report.levels if level.level.stage == "V"]
+    if validation_levels:
+        lines.append("## Validation (sustained load)")
+        lines.append("")
+        lines.append(
+            "Soaks the recommended config above under continuous, mostly-max-config mixed "
+            "traffic, confirming throughput holds and nothing degrades over time.",
+        )
+        lines.append("")
+        lines.append(
+            "| Tier | Verdict | Duration (s) | Jobs done | GPU duty | it/s retained | Faults | Recoveries |",
+        )
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for level_report in validation_levels:
+            stats = level_report.stats
+            duration = level_report.level.scenario.soak_seconds
+            duration_str = f"{duration:.0f}" if duration is not None else "-"
+            if stats is not None:
+                jobs = str(stats.num_jobs_completed)
+                gpu_duty = (
+                    f"{stats.gpu_utilization_mean_percent:.0f}%"
+                    if stats.gpu_utilization_mean_percent is not None
+                    else "-"
+                )
+                retention = (
+                    f"{stats.its_retention_fraction:.0%}" if stats.its_retention_fraction is not None else "-"
+                )
+                faults = str(stats.num_jobs_faulted + stats.num_alchemy_forms_faulted)
+                recoveries = str(stats.num_process_recoveries)
+            else:
+                jobs = gpu_duty = retention = faults = recoveries = "-"
+            lines.append(
+                f"| {level_report.level.tier} | {level_report.outcome} | {duration_str} | {jobs} | "
+                f"{gpu_duty} | {retention} | {faults} | {recoveries} |",
+            )
+        lines.append("")
+
+    timed_levels = [
+        level for level in (validation_levels or report.levels) if level.stats and level.stats.phase_breakdown_seconds
+    ]
+    if timed_levels:
+        lines.append("## Where the time goes (per job, median seconds)")
+        lines.append("")
+        lines.append(
+            "Median time a typical image job spends in each phase. `other_inference` is the "
+            "inference time outside model load, sampling and VAE (graph build, prompt encode, "
+            "image encode, IPC) — the prime target for raising GPU duty.",
+        )
+        lines.append("")
+        for level_report in timed_levels:
+            breakdown = level_report.stats.phase_breakdown_seconds  # type: ignore[union-attr]
+            total = sum(breakdown.values())
+            busy_ratio = level_report.stats.span_derived_busy_ratio  # type: ignore[union-attr]
+            busy_note = f", GPU-busy phases ≈ {busy_ratio:.0%} of it" if busy_ratio is not None else ""
+            lines.append(f"**{level_report.level.id}** (total ≈ {total:.2f}s/job{busy_note})")
+            lines.append("")
+            lines.append("| Phase | Seconds | % of total |")
+            lines.append("|---|---|---|")
+            for phase in _PHASE_ORDER:
+                if phase not in breakdown:
+                    continue
+                seconds = breakdown[phase]
+                pct = (seconds / total * 100) if total > 0 else 0.0
+                lines.append(f"| {phase} | {seconds:.3f} | {pct:.0f}% |")
+            lines.append("")
 
     lines.append("## Remediation queue")
     lines.append("")

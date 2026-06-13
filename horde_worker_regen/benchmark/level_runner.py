@@ -15,6 +15,7 @@ Writes (into ``--out``):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import faulthandler
 import sys
@@ -30,10 +31,8 @@ _HEARTBEAT_INTERVAL_SECONDS = 5.0
 def _start_heartbeat_thread(heartbeat_path: Path) -> None:
     def _beat() -> None:
         while True:
-            try:
+            with contextlib.suppress(OSError):
                 heartbeat_path.write_text(str(time.time()))
-            except OSError:
-                pass
             time.sleep(_HEARTBEAT_INTERVAL_SECONDS)
 
     threading.Thread(target=_beat, daemon=True).start()
@@ -41,6 +40,13 @@ def _start_heartbeat_thread(heartbeat_path: Path) -> None:
 
 def run_level(level_json_path: Path, out_dir: Path, *, process_mode: str = "real") -> int:
     """Run one level and write its result; returns the process exit code."""
+    # Tracing is opt-in (AIWORKER_REGEN_ENABLE_TELEMETRY); force it off before importing the
+    # harness/hordelib so spawned worker children inherit the kill switch. hordelib's per-op
+    # ComfyUI spans otherwise starve the GPU loop and skew the very measurements this collects.
+    from horde_worker_regen.telemetry import enforce_telemetry_default_off
+
+    enforce_telemetry_default_off()
+
     from horde_worker_regen.benchmark.ladder import RampLevel
     from horde_worker_regen.benchmark.report import HarnessSummary, LevelRunResult
     from horde_worker_regen.harness import HarnessConfig, run_harness
@@ -67,9 +73,21 @@ def run_level(level_json_path: Path, out_dir: Path, *, process_mode: str = "real
     exit_code = 0
     try:
         scenario = level.scenario
-        arrival = scenario.arrival_schedule()
-        harness_result = run_harness(
-            HarnessConfig(
+        if scenario.soak_seconds is not None:
+            image_templates, alchemy_templates = scenario.to_soak_templates()
+            config = HarnessConfig(
+                soak_seconds=scenario.soak_seconds,
+                soak_image_templates=image_templates,
+                soak_alchemy_templates=alchemy_templates,
+                process_mode=process_mode,  # type: ignore[arg-type]
+                skip_api=True,
+                timeout_seconds=level.timeout_seconds,
+                bridge_data_overrides=dict(level.bridge_data_overrides),
+                audit=True,
+            )
+        else:
+            arrival = scenario.arrival_schedule()
+            config = HarnessConfig(
                 # An empty list is a real (alchemy-only) scenario; None would trigger
                 # the default image scenario.
                 scenario=scenario.expand_image_jobs(),
@@ -80,10 +98,12 @@ def run_level(level_json_path: Path, out_dir: Path, *, process_mode: str = "real
                 timeout_seconds=level.timeout_seconds,
                 bridge_data_overrides=dict(level.bridge_data_overrides),
                 audit=True,
-            ),
-        )
+            )
+        harness_result = run_harness(config)
         harness_dict = dataclasses.asdict(harness_result)
-        metrics = harness_dict.pop("metrics", None)
+        # Drop the nested metrics snapshot before filtering kwargs into HarnessSummary;
+        # the typed metrics object is passed through from harness_result directly below.
+        harness_dict.pop("metrics", None)
         result = LevelRunResult(
             level_id=level.id,
             harness=HarnessSummary(**{k: v for k, v in harness_dict.items() if k in HarnessSummary.model_fields}),

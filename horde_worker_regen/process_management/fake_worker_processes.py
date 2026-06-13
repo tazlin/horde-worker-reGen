@@ -494,6 +494,7 @@ def start_fake_inference_process(
     vram_heavy_models: bool = False,
     dry_run_skip_inference: bool = False,
     dry_run_inference_delay: float = 1.0,
+    gpu_sampling_lease: Semaphore | None = None,
     fail_every_n: int = 0,
 ) -> None:
     """Start a fake inference process.

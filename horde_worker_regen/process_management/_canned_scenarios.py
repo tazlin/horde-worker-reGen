@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import base64
 import functools
+import random
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopPayload,
@@ -351,6 +352,126 @@ def make_alchemy_scenario(
         )
         for i in range(num_forms)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Sustained-load (soak) generation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SoakImageTemplate:
+    """A weighted image-job template for sustained-load (soak) generation.
+
+    Unlike a fixed scenario list, a soak source mints a *fresh* job (new generation IDs)
+    from one of these templates on every pop, so it can feed the worker indefinitely
+    without the ID collisions that recycling a fixed list would cause.
+    """
+
+    model: str = "Deliberate"
+    width: int = 512
+    height: int = 512
+    steps: int = 30
+    n_iter: int = 1
+    control_type: str | None = None
+    post_processing: list[str] = field(default_factory=list)
+    hires_fix: bool = False
+    weight: float = 1.0
+    """Relative likelihood of this template being chosen on each pop."""
+
+
+class GeneratingJobSource(CannedJobSource):
+    """A never-exhausting job source that mints fresh jobs from weighted templates.
+
+    Used by the sustained-load validation phase: it keeps the worker saturated for the
+    whole soak period, picking a template by weight and generating a new job (with unique
+    generation IDs) on each pop. Deterministic for a given seed.
+    """
+
+    def __init__(self, templates: list[SoakImageTemplate], *, seed: int = 0) -> None:
+        """Initialise with the weighted templates to generate from."""
+        super().__init__([], cycle=False)
+        if not templates:
+            raise ValueError("GeneratingJobSource requires at least one template")
+        self._templates = list(templates)
+        self._weights = [max(template.weight, 0.0) for template in templates]
+        if sum(self._weights) <= 0:
+            self._weights = [1.0] * len(templates)
+        self._rng = random.Random(seed)
+        self._stopped = False
+
+    def stop(self) -> None:
+        """Stop generating new jobs so the worker can drain what it has already accepted."""
+        self._stopped = True
+
+    @property
+    def exhausted(self) -> bool:
+        """False while generating; True once stopped, so the popper drains and idles."""
+        return self._stopped
+
+    @property
+    def total_jobs(self) -> int | None:
+        """Unbounded; the soak watcher decides when to stop."""
+        return None
+
+    def next_pop_response(self) -> ImageGenerateJobPopResponse:
+        """Generate a fresh job from a weighted-random template (or no-job once stopped)."""
+        if self._stopped:
+            return make_empty_pop_response()
+        template = self._rng.choices(self._templates, weights=self._weights, k=1)[0]
+        return make_canned_job(
+            template.model,
+            width=template.width,
+            height=template.height,
+            ddim_steps=template.steps,
+            n_iter=template.n_iter,
+            control_type=template.control_type,
+            post_processing=template.post_processing or None,
+            hires_fix=template.hires_fix,
+        )
+
+
+class GeneratingAlchemySource(CannedAlchemySource):
+    """A never-exhausting alchemy source that mints fresh forms from weighted form names."""
+
+    def __init__(self, form_weights: list[tuple[str, float]], *, seed: int = 0) -> None:
+        """Initialise with ``(form_name, weight)`` pairs to generate from."""
+        super().__init__([])
+        if not form_weights:
+            raise ValueError("GeneratingAlchemySource requires at least one form")
+        self._form_names = [name for name, _ in form_weights]
+        self._form_weights = [max(weight, 0.0) for _, weight in form_weights]
+        if sum(self._form_weights) <= 0:
+            self._form_weights = [1.0] * len(self._form_names)
+        self._rng = random.Random(seed)
+        self._source_image = make_source_image_base64()
+        self._stopped = False
+
+    def stop(self) -> None:
+        """Stop generating new forms so in-flight alchemy can drain."""
+        self._stopped = True
+
+    @property
+    def exhausted(self) -> bool:
+        """False while generating; True once stopped."""
+        return self._stopped
+
+    @property
+    def total_forms(self) -> int:
+        """Unbounded; the soak watcher decides when to stop."""
+        return 0
+
+    def next_form(self) -> AlchemyFormSpec | None:
+        """Generate a fresh alchemy form from a weighted-random form name (or None once stopped)."""
+        if self._stopped:
+            return None
+        form = self._rng.choices(self._form_names, weights=self._form_weights, k=1)[0]
+        return AlchemyFormSpec(
+            form_id=str(uuid.uuid4()),
+            form=form,
+            source_image_base64=self._source_image,
+            r2_upload=DUMMY_R2_UPLOAD_URL,
+        )
 
 
 # ---------------------------------------------------------------------------

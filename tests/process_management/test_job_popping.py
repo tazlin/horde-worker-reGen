@@ -242,6 +242,85 @@ class TestApiJobPopGuardClauses:
         session.submit_request.assert_awaited_once()
 
 
+class TestPopAhead:
+    """Tests for hunger detection and the urgent (throttle-bypassing) pop path."""
+
+    def test_hungry_when_work_flowing_slot_free_and_room(self) -> None:
+        """Flowing work + a free inference process + queue room + no backoff => hungry."""
+        popper = _make_popper(process_map=_make_process_map_with_available_processes())
+        assert popper._is_hungry(popper._runtime_config.bridge_data) is True
+
+    def test_not_hungry_when_no_jobs_available(self) -> None:
+        """If the last pop reported no work, do not fast-pop (stay polite)."""
+        state = WorkerState(last_pop_no_jobs_available=True)
+        popper = _make_popper(state=state, process_map=_make_process_map_with_available_processes())
+        assert popper._is_hungry(popper._runtime_config.bridge_data) is False
+
+    async def test_not_hungry_when_queue_full(self) -> None:
+        """A full local queue means no need to fast-pop."""
+        job_tracker = JobTracker()
+        for _ in range(10):
+            await track_popped_job_async(job_tracker, make_mock_job())
+        popper = _make_popper(job_tracker=job_tracker, process_map=_make_process_map_with_available_processes())
+        assert popper._is_hungry(popper._runtime_config.bridge_data) is False
+
+    def test_not_hungry_when_no_free_inference_process(self) -> None:
+        """No process able to take a job means fast-popping would just over-fill."""
+        safety_proc = make_mock_process_info(
+            10,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.SAFETY,
+        )
+        busy_inf = make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.INFERENCE_STARTING)
+        popper = _make_popper(process_map=ProcessMap({10: safety_proc, 0: busy_inf}))
+        assert popper._is_hungry(popper._runtime_config.bridge_data) is False
+
+    def test_not_hungry_when_in_error_backoff(self) -> None:
+        """While backing off after a pop error, do not bypass the throttle."""
+        popper = _make_popper(process_map=_make_process_map_with_available_processes())
+        popper._pop_throttler.on_pop_error()
+        assert popper._is_hungry(popper._runtime_config.bridge_data) is False
+
+    async def test_urgent_bypasses_frequency_throttle(self) -> None:
+        """An urgent pop proceeds even within the inter-pop frequency window."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()
+
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="test error"))
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=time.time()),  # throttle window would normally block
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+
+        await popper.api_job_pop(urgent=True)
+
+        session.submit_request.assert_awaited_once()
+
+    async def test_non_urgent_respects_frequency_throttle(self) -> None:
+        """Without urgency, a pop inside the frequency window is skipped (no request sent)."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()
+
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="test error"))
+        popper = _make_popper(
+            state=WorkerState(last_job_pop_time=time.time()),
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+
+        await popper.api_job_pop(urgent=False)
+
+        session.submit_request.assert_not_awaited()
+
+
 class TestHandleConsecutiveFailures:
     """Tests for _handle_consecutive_failures directly."""
 

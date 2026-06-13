@@ -38,6 +38,8 @@ class ProcessLifecycleManager:
     _disk_lock: Lock_MultiProcessing
     _aux_model_lock: Lock_MultiProcessing
     _vae_decode_semaphore: Semaphore
+    _gpu_sampling_lease: Semaphore
+    _gpu_sampling_lease_enabled: bool
     _runtime_config: RuntimeConfig
     _max_inference_processes: int
     _max_safety_processes: int
@@ -66,6 +68,8 @@ class ProcessLifecycleManager:
         disk_lock: Lock_MultiProcessing,
         aux_model_lock: Lock_MultiProcessing,
         vae_decode_semaphore: Semaphore,
+        gpu_sampling_lease: Semaphore,
+        gpu_sampling_lease_enabled: bool = False,
         runtime_config: RuntimeConfig,
         max_inference_processes: int,
         max_safety_processes: int,
@@ -84,6 +88,8 @@ class ProcessLifecycleManager:
         self._disk_lock = disk_lock
         self._aux_model_lock = aux_model_lock
         self._vae_decode_semaphore = vae_decode_semaphore
+        self._gpu_sampling_lease = gpu_sampling_lease
+        self._gpu_sampling_lease_enabled = gpu_sampling_lease_enabled
         self._runtime_config = runtime_config
         self._max_inference_processes = max_inference_processes
         self._max_safety_processes = max_safety_processes
@@ -224,6 +230,7 @@ class ProcessLifecycleManager:
                 "vram_heavy_models": vram_heavy_models,
                 "dry_run_skip_inference": bridge_data.dry_run_skip_inference,
                 "dry_run_inference_delay": bridge_data.dry_run_inference_delay,
+                "gpu_sampling_lease": self._gpu_sampling_lease if self._gpu_sampling_lease_enabled else None,
             },
         )
         process.start()

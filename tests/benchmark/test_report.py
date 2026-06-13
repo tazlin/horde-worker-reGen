@@ -11,6 +11,8 @@ from horde_worker_regen.benchmark.report import (
     HarnessSummary,
     LevelReport,
     LevelRunResult,
+    _post_warmup_vram_reloads,
+    _span_derived_busy_ratio,
     compute_level_stats,
     render_markdown,
     synthesize_bridge_data,
@@ -93,6 +95,56 @@ class TestComputeLevelStats:
         stats = compute_level_stats(result)
         assert stats.its_p50 is None
         assert stats.vram_used_high_water_mb is None
+
+
+def _reload_job(job_id: str, finalized: float, ram_to_vram_loads: int) -> JobMetricsRecord:
+    """A finalized image job carrying a given number of RAM->VRAM reload events."""
+    return JobMetricsRecord(
+        job_id=job_id,
+        stage_timestamps={"FINALIZED": finalized},
+        phase_metrics=JobPhaseMetrics(
+            model_loads=[
+                ModelLoadEvent(model_name="m", phase="ram_to_vram", duration_seconds=1.0, timestamp=0.0)
+                for _ in range(ram_to_vram_loads)
+            ],
+        ),
+    )
+
+
+class TestDutyCycleDiagnostics:
+    """The span-derived busy ratio and post-warm-up reload detector (WS-D/WS-C instruments)."""
+
+    def test_span_busy_ratio_is_gpu_phases_over_total(self) -> None:
+        """The ratio is (vram_load + sampling + vae) ÷ the whole per-job wall."""
+        breakdown = {"queue_wait": 2.0, "vram_load": 1.0, "sampling": 6.0, "vae": 1.0, "submit": 0.0}
+        # busy = 1 + 6 + 1 = 8; total = 10 -> 0.8
+        assert _span_derived_busy_ratio(breakdown) == 0.8
+
+    def test_span_busy_ratio_none_when_empty(self) -> None:
+        """No phase data means no defined ratio."""
+        assert _span_derived_busy_ratio({}) is None
+
+    def test_post_warmup_reloads_excludes_first_job(self) -> None:
+        """The cold first job's reload is warm-up; only later reloads are counted."""
+        jobs = [
+            _reload_job("a", finalized=100.0, ram_to_vram_loads=1),  # warm-up, excluded
+            _reload_job("b", finalized=200.0, ram_to_vram_loads=1),
+            _reload_job("c", finalized=300.0, ram_to_vram_loads=2),
+        ]
+        assert _post_warmup_vram_reloads(jobs) == 3
+
+    def test_post_warmup_reloads_zero_when_resident(self) -> None:
+        """A resident model that never reloads after warm-up yields zero."""
+        jobs = [
+            _reload_job("a", finalized=100.0, ram_to_vram_loads=1),
+            _reload_job("b", finalized=200.0, ram_to_vram_loads=0),
+            _reload_job("c", finalized=300.0, ram_to_vram_loads=0),
+        ]
+        assert _post_warmup_vram_reloads(jobs) == 0
+
+    def test_post_warmup_reloads_none_without_phase_metrics(self) -> None:
+        """Without any phase metrics the detector reports None (cannot tell)."""
+        assert _post_warmup_vram_reloads([JobMetricsRecord(job_id="a")]) is None
 
 
 class TestSynthesizeBridgeData:

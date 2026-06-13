@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import time
 from unittest.mock import Mock
 
 import pytest
 
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.inference_scheduler import (
+    _RESIDENCY_GRACE_SECONDS,
+    InferenceScheduler,
+)
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.lru_cache import LRUCache
 from horde_worker_regen.process_management.messages import (
@@ -383,6 +387,64 @@ class TestUnloadModels:
         assert process_info.last_control_flag == old_control_flag
 
 
+class TestSpeculativeDispatchCap:
+    """Tests for _max_jobs_in_progress_allowed (lease-gated speculative pre-staging)."""
+
+    def _vram_process_map(self, free_mb: int) -> ProcessMap:
+        proc = make_mock_process_info(0)
+        proc.total_vram_mb = 16000
+        proc.vram_usage_mb = 16000 - free_mb
+        return ProcessMap({0: proc})
+
+    def test_base_cap_when_lease_disabled(self) -> None:
+        """Without the lease the cap is the concurrent-sampling count (no pre-staging)."""
+        scheduler = _make_inference_scheduler(
+            process_map=self._vram_process_map(12000),
+            max_concurrent=2,
+            max_inference=4,
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=False),
+        )
+        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+
+    def test_cap_raised_to_all_processes_when_lease_on_and_vram_ample(self) -> None:
+        """With the lease and free VRAM, spare processes may stage ahead up to the process count."""
+        scheduler = _make_inference_scheduler(
+            process_map=self._vram_process_map(12000),
+            max_concurrent=2,
+            max_inference=4,
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
+        )
+        assert scheduler._max_jobs_in_progress_allowed(0) == 4
+
+    def test_cap_falls_back_when_vram_low(self) -> None:
+        """Pre-staging is withheld when free VRAM is below the headroom threshold."""
+        scheduler = _make_inference_scheduler(
+            process_map=self._vram_process_map(1000),
+            max_concurrent=2,
+            max_inference=4,
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
+        )
+        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+
+    def test_cap_falls_back_when_vram_unknown(self) -> None:
+        """With no VRAM report yet (cold start), do not speculate."""
+        scheduler = _make_inference_scheduler(
+            max_concurrent=2,
+            max_inference=4,
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
+        )
+        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+
+    def test_post_processing_count_added(self) -> None:
+        """Post-processing overlap slots extend the cap additively."""
+        scheduler = _make_inference_scheduler(
+            max_concurrent=2,
+            max_inference=4,
+            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=False),
+        )
+        assert scheduler._max_jobs_in_progress_allowed(1) == 3
+
+
 class TestGetSingleJobEffectiveMegapixelsteps:
     """Tests for get_single_job_effective_megapixelsteps."""
 
@@ -394,3 +456,105 @@ class TestGetSingleJobEffectiveMegapixelsteps:
         result = inference_scheduler.get_single_job_effective_megapixelsteps(job)
         assert isinstance(result, int)
         assert result > 0
+
+
+class TestWorkingSetResidency:
+    """Tests for the working-set residency policy that prevents inter-job unload thrash."""
+
+    async def test_compute_wanted_models_unions_live_state(self) -> None:
+        """The wanted set is the union of resident models, pending-job models, and in-progress models."""
+        job_tracker = JobTracker()
+        pending = make_job_pop_response("model_pending")
+        in_progress = make_job_pop_response("model_in_progress")
+        await track_popped_job_async(job_tracker, pending)
+        await track_popped_job_async(job_tracker, in_progress)
+        await mark_job_in_progress_async(job_tracker, in_progress)
+
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name="model_resident"),
+                1: make_mock_process_info(1, model_name=None),
+            },
+        )
+
+        scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        assert scheduler._compute_wanted_models() == {"model_resident", "model_pending", "model_in_progress"}
+
+    async def test_refresh_and_recent_demand(self) -> None:
+        """Refreshing demand stamps pending/in-progress models; recency reflects the grace window."""
+        job_tracker = JobTracker()
+        job = make_job_pop_response("hot_model")
+        await track_popped_job_async(job_tracker, job)
+
+        scheduler = _make_inference_scheduler(job_tracker=job_tracker)
+        scheduler._refresh_model_demand()
+        assert scheduler._is_recently_demanded("hot_model") is True
+        assert scheduler._is_recently_demanded("never_seen") is False
+
+    def test_recent_demand_expires_after_grace(self) -> None:
+        """A model whose last demand predates the grace window is no longer recently demanded."""
+        scheduler = _make_inference_scheduler()
+        scheduler._model_last_in_demand["cold_model"] = time.time() - (_RESIDENCY_GRACE_SECONDS + 5)
+        assert scheduler._is_recently_demanded("cold_model") is False
+
+    def test_refresh_prunes_far_stale_entries(self) -> None:
+        """Entries far past the grace window are pruned so the demand map cannot grow unbounded."""
+        scheduler = _make_inference_scheduler()
+        scheduler._model_last_in_demand["ancient"] = time.time() - (_RESIDENCY_GRACE_SECONDS * 10)
+        scheduler._refresh_model_demand()
+        assert "ancient" not in scheduler._model_last_in_demand
+
+    def test_fits_regime_protects_ram_and_vram(self) -> None:
+        """When the wanted set fits the process count, a wanted model is protected from both unloads."""
+        scheduler = _make_inference_scheduler(max_inference=2)
+        wanted = {"model_a", "model_b"}
+        assert scheduler._residency_protects_from_unload("model_a", wanted, vram=False) is True
+        assert scheduler._residency_protects_from_unload("model_a", wanted, vram=True) is True
+
+    def test_overflow_regime_protects_only_ram_via_grace(self) -> None:
+        """When models exceed processes, only recently-demanded RAM residency is protected, not VRAM."""
+        scheduler = _make_inference_scheduler(max_inference=2)
+        wanted = {"model_a", "model_b", "model_c"}  # 3 > 2 processes => affinity inactive
+        scheduler._model_last_in_demand["model_a"] = time.time()
+        assert scheduler._residency_protects_from_unload("model_a", wanted, vram=False) is True
+        assert scheduler._residency_protects_from_unload("model_a", wanted, vram=True) is False
+
+    def test_overflow_regime_evicts_stale_model(self) -> None:
+        """An overflow model not recently demanded is not protected from RAM eviction."""
+        scheduler = _make_inference_scheduler(max_inference=2)
+        wanted = {"model_a", "model_b", "model_c"}
+        assert scheduler._residency_protects_from_unload("model_a", wanted, vram=False) is False
+
+    def test_none_model_never_protected(self) -> None:
+        """A process with no loaded model is never protected."""
+        scheduler = _make_inference_scheduler(max_inference=2)
+        assert scheduler._residency_protects_from_unload(None, {"model_a"}, vram=False) is False
+
+    async def test_unload_models_keeps_resident_working_set(self) -> None:
+        """unload_models must not evict a resident working-set model just because its queue is momentarily empty."""
+        job_tracker = JobTracker()
+        # A pending job for model_b keeps the unload path active; model_a has no pending job but is resident.
+        pending = make_job_pop_response("model_b")
+        await track_popped_job_async(job_tracker, pending)
+
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name="model_a"),
+                1: make_mock_process_info(1, model_name="model_b"),
+            },
+        )
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry("model_a", load_state=ModelLoadState.LOADED_IN_RAM, process_id=0)
+        horde_model_map.update_entry("model_b", load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+            max_concurrent=2,
+            max_inference=2,
+            bridge_data=make_mock_bridge_data(image_models_to_load=["model_a", "model_b"]),
+        )
+
+        assert scheduler.unload_models() is False
+        assert process_map[0].last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM
