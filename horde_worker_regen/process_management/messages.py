@@ -12,6 +12,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopResponse,
 )
 from horde_sdk.ai_horde_api.fields import GenerationID
+from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 
@@ -138,10 +139,10 @@ class HordeProcessMemoryMessage(HordeProcessMessage):
 
     ram_usage_bytes: int
     """The number of bytes of RAM used by the process."""
-    vram_usage_bytes: int | None = None
-    """The number of bytes of VRAM used by the GPU."""
-    vram_total_bytes: int | None = None
-    """The total number of bytes of VRAM available on the GPU."""
+    vram_usage_mb: int | None = None
+    """The MB of VRAM used on the GPU."""
+    vram_total_mb: int | None = None
+    """The total MB of VRAM available on the GPU."""
 
 
 class HordeHeartbeatType(enum.Enum):
@@ -162,6 +163,13 @@ class HordeProcessHeartbeatMessage(HordeProcessMessage):
 
     percent_complete: int | None = None
     """The percentage (int) of the current operation that is complete, if applicable."""
+
+    current_step: int | None = None
+    """The current sampling step of the running inference, if applicable."""
+    total_steps: int | None = None
+    """The total sampling steps of the running inference, if applicable."""
+    iterations_per_second: float | None = None
+    """The instantaneous sampling rate (-1.0 when not yet known), if applicable."""
 
 
 class HordeProcessStateChangeMessage(HordeProcessMessage):
@@ -239,6 +247,33 @@ class HordeInferenceResultMessage(HordeProcessMessage):
             if f.generation_faults is not None:
                 total += len(f.generation_faults)
         return total
+
+
+class HordeJobMetricsMessage(HordeProcessMessage):
+    """Per-job performance metrics, sent by a child right after a job (or alchemy form) finishes.
+
+    Carries the snapshot from hordelib's in-process metrics collector: model-load phase
+    timings (disk->RAM, RAM->VRAM), sampling stats (steps, iterations/second), and
+    memory high-water marks observed during the job.
+    """
+
+    job_id: str
+    """The generation ID of the image job, or the form ID of the alchemy form."""
+    is_alchemy: bool = False
+    """Whether these metrics belong to an alchemy form rather than an image job."""
+    phase_metrics: JobPhaseMetrics
+    """The per-job metrics snapshot from hordelib."""
+
+
+class HordeDownloadMetricsMessage(HordeProcessMessage):
+    """Completed ad-hoc download events (lora/ti), drained from hordelib's metrics collector.
+
+    Downloads run on background threads with no job affinity, so they are reported
+    separately from per-job metrics whenever the child finds drained events.
+    """
+
+    events: list[DownloadEvent]
+    """The download events observed since the last drain."""
 
 
 class HordeSafetyEvaluation(BaseModel):

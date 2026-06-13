@@ -35,6 +35,24 @@ queue_depth_counter = logfire.metric_up_down_counter(
     description="Current number of jobs in the queue",
 )
 
+job_queue_wait_histogram = logfire.metric_histogram(
+    "job.queue_wait_seconds",
+    unit="s",
+    description="Time from job pop to inference start",
+)
+
+job_e2e_histogram = logfire.metric_histogram(
+    "job.e2e_seconds",
+    unit="s",
+    description="Time from job pop to finalized submit",
+)
+
+job_safety_histogram = logfire.metric_histogram(
+    "job.safety_seconds",
+    unit="s",
+    description="Time from safety-check queue entry to submit-ready",
+)
+
 
 @contextlib.contextmanager
 def span_job_pop(*, models: str) -> Iterator[logfire.LogfireSpan]:

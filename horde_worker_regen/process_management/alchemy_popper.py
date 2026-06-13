@@ -41,6 +41,7 @@ from horde_sdk.generation_parameters.alchemy.consts import (
 from loguru import logger
 
 import horde_worker_regen
+from horde_worker_regen.process_management._canned_scenarios import CannedAlchemySource
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.horde_process import WorkerCapability
 from horde_worker_regen.process_management.job_models import PendingAlchemySubmitJob
@@ -218,14 +219,29 @@ class AlchemyCoordinator:
         shutdown_manager: ShutdownManager,
         runtime_config: RuntimeConfig,
         api_sessions: ApiSessions,
+        canned_alchemy_source: CannedAlchemySource | None = None,
     ) -> None:
-        """Initialize with the shared main-process collaborators."""
+        """Initialize with the shared main-process collaborators.
+
+        Args:
+            state: The shared worker state.
+            process_map: The shared process map.
+            job_tracker: The image job tracker (consulted for contention policy).
+            shutdown_manager: The shutdown manager.
+            runtime_config: Holds the current bridge configuration snapshot.
+            api_sessions: The API session holder.
+            canned_alchemy_source: When set, forms come from this source and submits are
+                recorded locally instead of touching the API (harness/benchmark mode).
+        """
         self._state = state
         self._process_map = process_map
         self._job_tracker = job_tracker
         self._shutdown_manager = shutdown_manager
         self._runtime_config = runtime_config
         self._api_sessions = api_sessions
+        self._canned_alchemy_source = canned_alchemy_source
+        self.num_canned_forms_completed = 0
+        self.num_canned_forms_faulted = 0
 
         self._pending_forms = deque()
         self._in_flight = {}
@@ -337,9 +353,30 @@ class AlchemyCoordinator:
             response.raise_for_status()
             return base64.b64encode(await response.read()).decode("utf-8")
 
+    def _canned_alchemy_pop(self) -> None:
+        """Take the next form from the canned source, honoring the same pop policy as the API path."""
+        assert self._canned_alchemy_source is not None
+        if not self._should_pop():
+            return
+
+        self._last_pop_time = time.time()
+        spec = self._canned_alchemy_source.next_form()
+        if spec is None:
+            return
+
+        self._form_time_popped[spec.form_id] = time.time()
+        self._pending_forms.append(spec)
+        logger.opt(ansi=True).info(
+            f"<fg #34c0eb>Popped canned alchemy form {spec.form_id} ({spec.form})</>",
+        )
+
     @logger.catch(reraise=True)
     async def api_alchemy_pop(self) -> None:
-        """Pop alchemy forms from the API when the backfill policy allows it."""
+        """Pop alchemy forms from the API (or the canned source) when the pop policy allows it."""
+        if self._canned_alchemy_source is not None:
+            self._canned_alchemy_pop()
+            return
+
         if not self._should_pop():
             return
 
@@ -555,10 +592,30 @@ class AlchemyCoordinator:
         self._state.kudos_events.append((time.time(), response.reward))
         submit.succeed(int(response.reward))
 
+    def _canned_submit_alchemy(self) -> None:
+        """Record a completed form locally instead of submitting to the API."""
+        submit = self._pending_submits.popleft()
+        if submit.result_message.state == GENERATION_STATE.ok:
+            self.num_canned_forms_completed += 1
+            submit.succeed(0)
+            time_taken = round(time.time() - submit.time_popped, 2)
+            logger.opt(ansi=True).success(
+                f"Completed canned alchemy form {submit.form_id[:8]} (<u>{submit.result_message.form}</u>) "
+                f"in {time_taken} seconds.",
+            )
+        else:
+            self.num_canned_forms_faulted += 1
+            submit.fault()
+            logger.error(f"Canned alchemy form {submit.form_id} faulted")
+
     @logger.catch(reraise=True)
     async def api_submit_alchemy(self) -> None:
-        """Submit any completed alchemy forms to the API."""
+        """Submit any completed alchemy forms to the API (or record them locally in canned mode)."""
         if not self._pending_submits:
+            return
+
+        if self._canned_alchemy_source is not None:
+            self._canned_submit_alchemy()
             return
 
         submit = self._pending_submits.popleft()

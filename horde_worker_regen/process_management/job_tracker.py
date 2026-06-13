@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import enum
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from enum import auto
 
 from horde_sdk.ai_horde_api.apimodels import (
@@ -111,6 +112,11 @@ class TrackedJob:
     """Monotonic sequence assigned at registration; preserves pop/queue order."""
     stage_sequence: int = 0
     """Monotonic sequence assigned on each stage change; preserves FIFO order within a stage."""
+    stage_timestamps: dict[str, float] = field(default_factory=dict)
+    """Epoch time of the first entry into each stage, keyed by ``JobStage.name``.
+
+    Together with ``time_popped`` this gives per-job latency breakdowns
+    (queue wait, inference, safety, submit)."""
 
 
 @dataclass(frozen=True)
@@ -155,6 +161,15 @@ class JobTracker:
         self._last_job_submitted_time = time.time()
 
         self._sequence_counter = 0
+        self._finalize_observer: Callable[[TrackedJob, HordeJobInfo], None] | None = None
+
+    def set_finalize_observer(self, observer: Callable[[TrackedJob, HordeJobInfo], None]) -> None:
+        """Register a callback invoked with each job's final tracked state at finalize time.
+
+        Used by the run-metrics aggregator to fold per-job stage latencies into the
+        worker-wide metrics snapshot without wrapping tracker methods.
+        """
+        self._finalize_observer = observer
 
     # region internal helpers
 
@@ -186,6 +201,7 @@ class JobTracker:
             return False
         tracked.stage = new_stage
         tracked.stage_sequence = self._next_sequence()
+        tracked.stage_timestamps.setdefault(new_stage.name, time.time())
         return True
 
     def _register(
@@ -215,6 +231,7 @@ class JobTracker:
             pop_order=self._next_sequence(),
             stage_sequence=self._next_sequence(),
         )
+        tracked.stage_timestamps[stage.name] = time.time()
         self._jobs[job_id] = tracked
         return tracked
 
@@ -603,6 +620,13 @@ class JobTracker:
             logger.warning(
                 f"Job {sdk_info.id_} was finalized from stage {tracked.stage.name} (expected PENDING_SUBMIT)",
             )
+
+        tracked.stage_timestamps.setdefault("FINALIZED", time.time())
+        if self._finalize_observer is not None:
+            try:
+                self._finalize_observer(tracked, completed_job_info)
+            except Exception as e:
+                logger.warning(f"Job finalize observer failed: {type(e).__name__} {e}")
 
         del self._jobs[tracked.job_id]
         self._last_job_submitted_time = time.time()

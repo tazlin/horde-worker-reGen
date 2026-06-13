@@ -101,6 +101,22 @@ class ProcessLifecycleManager:
         self._hung_processes_detected = False
         self._hung_processes_detected_time = 0.0
         self._any_replaced = False
+        self._on_process_recovery: Callable[[HordeProcessInfo, str], None] | None = None
+
+    def set_process_recovery_observer(self, observer: Callable[[HordeProcessInfo, str], None]) -> None:
+        """Register a callback invoked with the process info and a reason on each recovery.
+
+        Used by the run-metrics aggregator to record crash/hang events.
+        """
+        self._on_process_recovery = observer
+
+    def _notify_process_recovery(self, process_info: HordeProcessInfo, reason: str) -> None:
+        if self._on_process_recovery is None:
+            return
+        try:
+            self._on_process_recovery(process_info, reason)
+        except Exception as e:
+            logger.warning(f"Process recovery observer failed: {type(e).__name__} {e}")
 
     @property
     def recently_recovered(self) -> bool:
@@ -363,6 +379,8 @@ class ProcessLifecycleManager:
                 process_info=process_info,
                 process_timeout=bridge_data.process_timeout,
             )
+
+        self._notify_process_recovery(process_info, "inference process replaced (crashed or hung)")
 
         self._end_inference_process(process_info)
         self._start_inference_process(process_info.process_id)

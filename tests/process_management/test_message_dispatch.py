@@ -98,6 +98,9 @@ class TestReceiveAndHandleProcessMessages:
         msg.percent_complete = None
         msg.process_warning = None
         msg.info = "heartbeat"
+        msg.current_step = None
+        msg.total_steps = None
+        msg.iterations_per_second = None
 
         _enqueue(message_dispatcher, msg)
         await message_dispatcher.receive_and_handle_process_messages()
@@ -115,8 +118,8 @@ class TestReceiveAndHandleProcessMessages:
         msg.process_id = 0
         msg.process_launch_identifier = 0
         msg.ram_usage_bytes = 1024
-        msg.vram_usage_bytes = 2048
-        msg.vram_total_bytes = 4096
+        msg.vram_usage_mb = 2048
+        msg.vram_total_mb = 4096
         msg.info = "memory"
 
         _enqueue(message_dispatcher, msg)
@@ -125,8 +128,8 @@ class TestReceiveAndHandleProcessMessages:
         process_map.on_memory_report.assert_called_once_with(
             process_id=0,
             ram_usage_bytes=1024,
-            vram_usage_bytes=2048,
-            total_vram_bytes=4096,
+            vram_usage_mb=2048,
+            total_vram_mb=4096,
         )
 
     async def test_state_change_to_inference_starting_updates_model_map(self) -> None:

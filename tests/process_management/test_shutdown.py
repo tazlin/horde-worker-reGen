@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import Mock
+
+import pytest
 
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import HordeProcessState
@@ -147,7 +150,7 @@ class TestShutdown:
 class TestAbort:
     """Tests for abort."""
 
-    def test_abort_purges_jobs_and_shuts_down(self, tmp_path, monkeypatch) -> None:
+    def test_abort_purges_jobs_and_shuts_down(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Calling abort should set shutting_down to True, and trigger relevant cleanup actions."""
         # abort() writes a .abort file to the CWD; isolate it so the test cannot
         # signal-shutdown a real worker running from the repo root.

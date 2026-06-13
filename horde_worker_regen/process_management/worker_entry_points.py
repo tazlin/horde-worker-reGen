@@ -110,6 +110,11 @@ def start_inference_process(
         maybe_wait_for_process_debugger(process_id, "inference")
 
         try:
+            # Before the first hordelib import: its import-time logfire init must defer to ours.
+            from horde_worker_regen.telemetry import claim_logfire_ownership
+
+            claim_logfire_ownership()
+
             from hordelib.api import HordeLog
 
             HordeLog.initialise(
@@ -245,6 +250,11 @@ def start_safety_process(
         maybe_wait_for_process_debugger(process_id, "safety")
 
         try:
+            # Before the first hordelib import: its import-time logfire init must defer to ours.
+            from horde_worker_regen.telemetry import claim_logfire_ownership
+
+            claim_logfire_ownership()
+
             from hordelib.api import HordeLog
 
             HordeLog.initialise(

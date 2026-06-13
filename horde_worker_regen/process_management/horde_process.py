@@ -96,17 +96,14 @@ class HordeProcess(abc.ABC):
     _last_sent_process_state: HordeProcessState = HordeProcessState.PROCESS_STARTING
     """The last process state that was sent to the main process."""
 
-    _vram_total_bytes: int = 0
-    """The total number of bytes of VRAM available on the GPU."""
-
-    def get_vram_usage_bytes(self) -> int:
-        """Return the number of bytes of VRAM used by the GPU."""
+    def get_vram_usage_mb(self) -> int:
+        """Return the MB of VRAM used on the GPU."""
         from hordelib.api import get_torch_free_vram_mb, get_torch_total_vram_mb
 
         return get_torch_total_vram_mb() - get_torch_free_vram_mb()
 
-    def get_vram_total_bytes(self) -> int:
-        """Return the total number of bytes of VRAM available on the GPU."""
+    def get_vram_total_mb(self) -> int:
+        """Return the total MB of VRAM available on the GPU."""
         from hordelib.api import get_torch_total_vram_mb
 
         return get_torch_total_vram_mb()
@@ -175,6 +172,9 @@ class HordeProcess(abc.ABC):
         *,
         process_warning: str | None = None,
         percent_complete: int | None = None,
+        current_step: int | None = None,
+        total_steps: int | None = None,
+        iterations_per_second: float | None = None,
     ) -> None:
         """Send a heartbeat message to the main process, indicating that the process is still alive.
 
@@ -194,6 +194,9 @@ class HordeProcess(abc.ABC):
             heartbeat_type=heartbeat_type,
             process_warning=process_warning,
             percent_complete=percent_complete,
+            current_step=current_step,
+            total_steps=total_steps,
+            iterations_per_second=iterations_per_second,
         )
         self.process_message_queue.put(message)
 
@@ -223,8 +226,8 @@ class HordeProcess(abc.ABC):
 
         try:
             if include_vram:
-                message.vram_usage_bytes = self.get_vram_usage_bytes()
-                message.vram_total_bytes = self.get_vram_total_bytes()
+                message.vram_usage_mb = self.get_vram_usage_mb()
+                message.vram_total_mb = self.get_vram_total_mb()
         except Exception as e:
             logger.error(f"Failed to get VRAM usage: {e}")
             return False

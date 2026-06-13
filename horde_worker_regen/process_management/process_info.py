@@ -8,6 +8,7 @@ from typing import override
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
 
 from horde_worker_regen.process_management.horde_process import (
@@ -68,12 +69,28 @@ class HordeProcessInfo:
 
     ram_usage_bytes: int
     """The amount of RAM used by this process."""
-    vram_usage_bytes: int
-    """The amount of VRAM used by this process."""
-    total_vram_bytes: int
-    """The total amount of VRAM available to this process."""
+    vram_usage_mb: int
+    """The amount of VRAM (MB) used by this process."""
+    total_vram_mb: int
+    """The total amount of VRAM (MB) available to this process."""
     batch_amount: int
     """The total amount of batching being run by this process."""
+
+    last_iterations_per_second: float | None
+    """The most recent sampling rate reported by this process (-1.0 = not yet known)."""
+    last_current_step: int | None
+    """The most recent sampling step reported by this process."""
+    last_total_steps: int | None
+    """The total steps of the most recent sampling run reported by this process."""
+
+    last_job_metrics: JobPhaseMetrics | None
+    """The per-job metrics snapshot from the most recently finished job on this process."""
+    vram_used_high_water_mb: int
+    """The highest in-job VRAM usage (MB) ever reported by this process (0 = none yet)."""
+    ram_used_high_water_mb: int
+    """The highest in-job RAM usage (MB) ever reported by this process (0 = none yet)."""
+    cumulative_download_events: list[DownloadEvent]
+    """All ad-hoc download events reported by this process, in arrival order."""
 
     recently_unloaded_from_ram: bool
     """True if models were recently unloaded from RAM."""
@@ -126,9 +143,18 @@ class HordeProcessInfo:
         self.last_job_referenced = None
 
         self.ram_usage_bytes = 0
-        self.vram_usage_bytes = 0
-        self.total_vram_bytes = 0
+        self.vram_usage_mb = 0
+        self.total_vram_mb = 0
         self.batch_amount = 1
+
+        self.last_iterations_per_second = None
+        self.last_current_step = None
+        self.last_total_steps = None
+
+        self.last_job_metrics = None
+        self.vram_used_high_water_mb = 0
+        self.ram_used_high_water_mb = 0
+        self.cumulative_download_events = []
 
         self.recently_unloaded_from_ram = False
 

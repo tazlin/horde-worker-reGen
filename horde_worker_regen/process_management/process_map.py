@@ -8,6 +8,7 @@ from typing import override
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
 from pydantic import ConfigDict
 
@@ -92,6 +93,9 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         heartbeat_type: HordeHeartbeatType,
         *,
         percent_complete: int | None = None,
+        current_step: int | None = None,
+        total_steps: int | None = None,
+        iterations_per_second: float | None = None,
     ) -> None:
         """Update the heartbeat for the given process ID.
 
@@ -99,6 +103,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             process_id (int): The ID of the process to update.
             heartbeat_type (HordeHeartbeatType): The type of the heartbeat.
             percent_complete (int | None, optional): The percentage of the job that has been completed, \
+                if applicable. Defaults to None.
+            current_step (int | None, optional): The current sampling step, if applicable. Defaults to None.
+            total_steps (int | None, optional): The total sampling steps, if applicable. Defaults to None.
+            iterations_per_second (float | None, optional): The instantaneous sampling rate, \
                 if applicable. Defaults to None.
         """
         self[process_id].last_heartbeat_delta = time.time() - self[process_id].last_heartbeat_timestamp
@@ -111,6 +119,11 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             self[process_id].heartbeats_inference_steps = 0
 
         self[process_id].last_heartbeat_percent_complete = percent_complete
+
+        if heartbeat_type == HordeHeartbeatType.INFERENCE_STEP:
+            self[process_id].last_current_step = current_step
+            self[process_id].last_total_steps = total_steps
+            self[process_id].last_iterations_per_second = iterations_per_second
 
     def on_process_ending(self, process_id: int) -> None:
         """Update the process map when a process has ended.
@@ -132,27 +145,49 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self,
         process_id: int,
         ram_usage_bytes: int,
-        vram_usage_bytes: int | None = 0,
-        total_vram_bytes: int | None = 0,
+        vram_usage_mb: int | None = 0,
+        total_vram_mb: int | None = 0,
     ) -> None:
         """Update the memory usage for the given process ID.
 
         Args:
             process_id (int): The ID of the process to update.
             ram_usage_bytes (int): The amount of RAM used by this process.
-            vram_usage_bytes (int): The amount of VRAM used by this process.
-            total_vram_bytes (int): The total amount of VRAM available to this process.
+            vram_usage_mb (int): The amount of VRAM used by this process.
+            total_vram_mb (int): The total amount of VRAM available to this process.
         """
         self[process_id].ram_usage_bytes = ram_usage_bytes
-        self[process_id].vram_usage_bytes = vram_usage_bytes or 0
-        self[process_id].total_vram_bytes = total_vram_bytes or 0
+        self[process_id].vram_usage_mb = vram_usage_mb or 0
+        self[process_id].total_vram_mb = total_vram_mb or 0
 
         self[process_id].last_received_timestamp = time.time()
 
         logger.debug(
             f"Process {process_id} memory report: "
-            f"ram: {ram_usage_bytes} vram: {vram_usage_bytes} total vram: {total_vram_bytes}",
+            f"ram: {ram_usage_bytes} vram: {vram_usage_mb} total vram: {total_vram_mb}",
         )
+
+    def on_job_metrics(self, process_id: int, phase_metrics: JobPhaseMetrics) -> None:
+        """Record a finished job's metrics snapshot for the given process ID."""
+        process_info = self[process_id]
+        process_info.last_job_metrics = phase_metrics
+        process_info.last_received_timestamp = time.time()
+
+        if phase_metrics.vram_used_high_water_mb is not None:
+            process_info.vram_used_high_water_mb = max(
+                process_info.vram_used_high_water_mb,
+                phase_metrics.vram_used_high_water_mb,
+            )
+        if phase_metrics.ram_used_high_water_mb is not None:
+            process_info.ram_used_high_water_mb = max(
+                process_info.ram_used_high_water_mb,
+                phase_metrics.ram_used_high_water_mb,
+            )
+
+    def on_download_metrics(self, process_id: int, events: list[DownloadEvent]) -> None:
+        """Record ad-hoc download events reported by the given process ID."""
+        self[process_id].cumulative_download_events.extend(events)
+        self[process_id].last_received_timestamp = time.time()
 
     def on_process_state_change(self, process_id: int, new_state: HordeProcessState) -> None:
         """Update the process state for the given process ID.
@@ -327,17 +362,17 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     def get_free_vram_mb(self) -> float | None:
         """Return the most conservative free VRAM (MB) across inference processes, or None.
 
-        Child processes report ``vram_usage_bytes``/``total_vram_bytes`` (named in bytes but
-        carried in MB) computed as ``torch_total - torch_free`` and ``torch_total``, so
-        ``total - usage`` is the device-wide free VRAM at sample time. Workers are typically
+        Child processes report ``vram_usage_mb``/``total_vram_mb`` computed as
+        ``torch_total - torch_free`` and ``torch_total``, so ``total - usage`` is the
+        device-wide free VRAM at sample time. Workers are typically
         single-GPU; the minimum free figure across reporting processes is used as a
         conservative estimate. Returns None when no inference process has reported VRAM yet
         (cold start, or a CPU-only deployment).
         """
         free_values = [
-            p.total_vram_bytes - p.vram_usage_bytes
+            p.total_vram_mb - p.vram_usage_mb
             for p in self.values()
-            if p.process_type == HordeProcessType.INFERENCE and p.total_vram_bytes > 0
+            if p.process_type == HordeProcessType.INFERENCE and p.total_vram_mb > 0
         ]
         if not free_values:
             return None
@@ -606,7 +641,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                         f"<fg #7b7d7d>[last message: {time_passed_seconds} secs ago: {safe_last_control_flag} "
                         f"heartbeat delta: {last_heartbeat_delta_now}]</>"
                     ),
-                    # f"ram: {process_info.ram_usage_bytes} vram: {process_info.vram_usage_bytes} ",
+                    # f"ram: {process_info.ram_usage_bytes} vram: {process_info.vram_usage_mb} ",
                 )
 
             else:

@@ -6,10 +6,22 @@ Users opt in to cloud export by setting the ``LOGFIRE_TOKEN`` environment variab
 
 from __future__ import annotations
 
+import os
+
 import logfire
 from loguru import logger
 
 _telemetry_configured: bool = False
+
+
+def claim_logfire_ownership() -> None:
+    """Tell hordelib the worker owns logfire/loguru configuration in this process.
+
+    Must be called before hordelib is imported: hordelib's import-time
+    ``initialize_logfire()`` would otherwise re-configure logfire and replace our
+    loguru handlers.
+    """
+    os.environ["HORDELIB_EXTERNAL_LOGFIRE"] = "1"
 
 
 def configure_telemetry() -> None:
@@ -20,6 +32,8 @@ def configure_telemetry() -> None:
     global _telemetry_configured  # noqa: PLW0603
     if _telemetry_configured:
         return
+
+    claim_logfire_ownership()
 
     logfire.configure(
         send_to_logfire="if-token-present",
@@ -53,6 +67,8 @@ def configure_child_telemetry(process_id: int) -> None:
     Args:
         process_id: The logical process id assigned by the worker.
     """
+    claim_logfire_ownership()
+
     logfire.configure(
         send_to_logfire="if-token-present",
         service_name=f"horde-worker-regen-child-{process_id}",

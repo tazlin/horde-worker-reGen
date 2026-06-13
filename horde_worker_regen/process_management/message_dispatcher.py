@@ -15,7 +15,9 @@ from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import (
     HordeAlchemyResultMessage,
     HordeAuxModelStateChangeMessage,
+    HordeDownloadMetricsMessage,
     HordeInferenceResultMessage,
+    HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
     HordeProcessHeartbeatMessage,
     HordeProcessMemoryMessage,
@@ -52,6 +54,8 @@ class MessageDispatcher:
     _model_metadata: ModelMetadata
     _on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]]
     _on_alchemy_result: Callable[[HordeAlchemyResultMessage], None] | None = None
+    _on_job_metrics: Callable[[HordeJobMetricsMessage], None] | None = None
+    _on_download_metrics: Callable[[HordeDownloadMetricsMessage], None] | None = None
 
     _last_deadlock_detected_time: float = 0.0
     _in_deadlock: bool = False
@@ -100,6 +104,16 @@ class MessageDispatcher:
         """Register the callback invoked when a child process reports an alchemy form result."""
         self._on_alchemy_result = handler
 
+    def set_metrics_handlers(
+        self,
+        *,
+        on_job_metrics: Callable[[HordeJobMetricsMessage], None],
+        on_download_metrics: Callable[[HordeDownloadMetricsMessage], None],
+    ) -> None:
+        """Register the callbacks invoked when a child reports job or download metrics."""
+        self._on_job_metrics = on_job_metrics
+        self._on_download_metrics = on_download_metrics
+
     async def receive_and_handle_process_messages(self) -> None:
         """Receive and handle any messages from the child processes."""
         while not self._process_message_queue.empty():
@@ -145,6 +159,18 @@ class MessageDispatcher:
                 self._handle_memory_report(message)
                 continue
 
+            if isinstance(message, HordeJobMetricsMessage):
+                self._process_map.on_job_metrics(message.process_id, message.phase_metrics)
+                if self._on_job_metrics is not None:
+                    self._on_job_metrics(message)
+                continue
+
+            if isinstance(message, HordeDownloadMetricsMessage):
+                self._process_map.on_download_metrics(message.process_id, message.events)
+                if self._on_download_metrics is not None:
+                    self._on_download_metrics(message)
+                continue
+
             if isinstance(message, HordeProcessStateChangeMessage):
                 self._handle_process_state_change(message)
 
@@ -170,6 +196,9 @@ class MessageDispatcher:
             message.process_id,
             heartbeat_type=message.heartbeat_type,
             percent_complete=message.percent_complete,
+            current_step=message.current_step,
+            total_steps=message.total_steps,
+            iterations_per_second=message.iterations_per_second,
         )
 
         in_progress_job_info = self._process_map[message.process_id].last_job_referenced
@@ -194,8 +223,8 @@ class MessageDispatcher:
         self._process_map.on_memory_report(
             process_id=message.process_id,
             ram_usage_bytes=message.ram_usage_bytes,
-            vram_usage_bytes=message.vram_usage_bytes,
-            total_vram_bytes=message.vram_total_bytes,
+            vram_usage_mb=message.vram_usage_mb,
+            total_vram_mb=message.vram_total_mb,
         )
 
     def _handle_process_state_change(self, message: HordeProcessStateChangeMessage) -> None:

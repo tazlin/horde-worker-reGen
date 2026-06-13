@@ -36,10 +36,12 @@ from horde_worker_regen.process_management.messages import (
     HordeControlFlag,
     HordeControlMessage,
     HordeControlModelMessage,
+    HordeDownloadMetricsMessage,
     HordeHeartbeatType,
     HordeImageResult,
     HordeInferenceControlMessage,
     HordeInferenceResultMessage,
+    HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
     HordePreloadInferenceModelMessage,
     HordeProcessState,
@@ -195,18 +197,18 @@ class HordeInferenceProcess(HordeProcess):
         self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
 
     @override
-    def get_vram_usage_bytes(self) -> int:
+    def get_vram_usage_mb(self) -> int:
         """Return VRAM used, or 0 in dry-run mode where torch is unavailable."""
         if self._dry_run_skip_inference:
             return 0
-        return super().get_vram_usage_bytes()
+        return super().get_vram_usage_mb()
 
     @override
-    def get_vram_total_bytes(self) -> int:
+    def get_vram_total_mb(self) -> int:
         """Return total VRAM, or 0 in dry-run mode where torch is unavailable."""
         if self._dry_run_skip_inference:
             return 0
-        return super().get_vram_total_bytes()
+        return super().get_vram_total_mb()
 
     @override
     def send_memory_report_message(self, include_vram: bool = False) -> bool:
@@ -362,6 +364,8 @@ class HordeInferenceProcess(HordeProcess):
 
             lora_manager.save_reference_to_disk()
 
+            self._send_download_metrics_if_any()
+
             if performed_a_download:
                 logger.info(f"Downloaded auxiliary models in {time_elapsed} seconds")
                 return time_elapsed
@@ -516,13 +520,66 @@ class HordeInferenceProcess(HordeProcess):
                 f"{progress_report.comfyui_progress.rate:.2f} "
                 f"{progress_report.comfyui_progress.rate_unit.name.lower().replace('_', ' ')}"
             )
+
+            # Normalize the rate to iterations/second regardless of how it was reported
+            # (-1.0 means not yet known and is passed through).
+            rate = progress_report.comfyui_progress.rate
+            if progress_report.comfyui_progress.rate_unit == ComfyUIProgressUnit.SECONDS_PER_ITERATION:
+                rate = 1.0 / rate if rate > 0 else -1.0
+
             self.send_heartbeat_message(
                 heartbeat_type=HordeHeartbeatType.INFERENCE_STEP,
                 process_warning=warning,
                 percent_complete=progress_report.comfyui_progress.percent,
+                current_step=progress_report.comfyui_progress.current_step,
+                total_steps=progress_report.comfyui_progress.total_steps,
+                iterations_per_second=rate,
             )
         else:
             self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+
+    def _send_job_metrics_message(self, job_id: str, *, is_alchemy: bool = False) -> None:
+        """Snapshot hordelib's per-job metrics and forward them to the main process.
+
+        Sent even in dry-run mode (with an empty snapshot) so the message flow is
+        identical with and without real inference.
+        """
+        try:
+            from hordelib.api import get_metrics_collector
+
+            self.process_message_queue.put(
+                HordeJobMetricsMessage(
+                    process_id=self.process_id,
+                    process_launch_identifier=self.process_launch_identifier,
+                    info=f"Job metrics for {job_id}",
+                    job_id=job_id,
+                    is_alchemy=is_alchemy,
+                    phase_metrics=get_metrics_collector().snapshot_and_reset_job(),
+                ),
+            )
+        except Exception as e:
+            # Metrics must never take down a job that otherwise succeeded.
+            logger.warning(f"Failed to send job metrics: {type(e).__name__} {e}")
+
+    def _send_download_metrics_if_any(self) -> None:
+        """Forward any ad-hoc download events hordelib observed since the last drain."""
+        try:
+            from hordelib.api import get_metrics_collector
+
+            events = get_metrics_collector().drain_download_events()
+            if not events:
+                return
+
+            self.process_message_queue.put(
+                HordeDownloadMetricsMessage(
+                    process_id=self.process_id,
+                    process_launch_identifier=self.process_launch_identifier,
+                    info=f"{len(events)} download event(s)",
+                    events=events,
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send download metrics: {type(e).__name__} {e}")
 
     def start_inference(self, job_info: ImageGenerateJobPopResponse) -> list[ResultingImageReturn] | None:
         """Start an inference job in the HordeLib instance.
@@ -574,6 +631,9 @@ class HordeInferenceProcess(HordeProcess):
             self._in_post_processing = False
             self._current_job_inference_steps_complete = False
             self._vae_lock_was_acquired = False
+
+            self._send_job_metrics_message(str(job_info.id_))
+            self._send_download_metrics_if_any()
 
             with contextlib.suppress(Exception):
                 self._inference_semaphore.release()
@@ -655,6 +715,8 @@ class HordeInferenceProcess(HordeProcess):
                 image_base64=image_base64,
             ),
         )
+
+        self._send_job_metrics_message(form.form_id, is_alchemy=True)
 
         process_state = (
             HordeProcessState.ALCHEMY_COMPLETE if state == GENERATION_STATE.ok else HordeProcessState.ALCHEMY_FAILED

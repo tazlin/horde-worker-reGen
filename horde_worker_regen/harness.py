@@ -39,7 +39,10 @@ from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management._canned_scenarios import (
+    ArrivalSchedule,
+    CannedAlchemySource,
     CannedJobSource,
+    TimedJobSource,
     make_simple_scenario,
 )
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
@@ -47,10 +50,12 @@ from horde_worker_regen.process_management.fake_worker_processes import (
     start_fake_inference_process,
     start_fake_safety_process,
 )
+from horde_worker_regen.process_management.messages import AlchemyFormSpec
 from horde_worker_regen.process_management.process_manager import (
     HordeWorkerProcessManager,
     SystemResources,
 )
+from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 
 HarnessProcessMode = Literal["fake", "dry_run", "real"]
@@ -65,6 +70,12 @@ class HarnessConfig:
 
     num_jobs: int = 3
     """Number of jobs in the default scenario (ignored when `scenario` is provided)."""
+
+    alchemy_forms: list[AlchemyFormSpec] | None = None
+    """Alchemy forms to run alongside the image scenario (enables `alchemist` in the bridge data)."""
+
+    arrival: ArrivalSchedule | None = None
+    """When set, image jobs are released to the popper on this schedule instead of all at once."""
 
     process_mode: HarnessProcessMode = "fake"
     """Which child processes to launch: protocol-faithful fakes, real processes in
@@ -112,6 +123,11 @@ class HarnessResult:
     diagnostics: list[str] = field(default_factory=list)
     """Non-fatal warnings and diagnostic messages collected during the run (e.g. zero
     processes started, no pops). Empty list means no diagnostics."""
+    metrics: RunMetricsSnapshot | None = None
+    """The worker-wide run metrics snapshot taken at the end of the run."""
+    num_alchemy_forms_expected: int = 0
+    num_alchemy_forms_completed: int = 0
+    num_alchemy_forms_faulted: int = 0
 
     @property
     def all_jobs_accounted_for(self) -> bool:
@@ -120,9 +136,13 @@ class HarnessResult:
 
     @property
     def succeeded(self) -> bool:
-        """Whether the run finished in time with every job completed and none faulted."""
+        """Whether the run finished in time with everything completed and nothing faulted."""
         return (
-            not self.timed_out and self.num_jobs_faulted == 0 and (self.num_jobs_completed >= self.num_jobs_expected)
+            not self.timed_out
+            and self.num_jobs_faulted == 0
+            and (self.num_jobs_completed >= self.num_jobs_expected)
+            and self.num_alchemy_forms_faulted == 0
+            and (self.num_alchemy_forms_completed >= self.num_alchemy_forms_expected)
         )
 
     def failure_summary(self) -> str:
@@ -138,6 +158,10 @@ class HarnessResult:
             parts.append(f"jobs_completed={self.num_jobs_completed}/{self.num_jobs_expected}")
         if self.audit_failures:
             parts.append(f"audit_failures={len(self.audit_failures)}")
+        if self.num_alchemy_forms_faulted > 0:
+            parts.append(f"alchemy_faulted={self.num_alchemy_forms_faulted}")
+        if self.num_alchemy_forms_completed < self.num_alchemy_forms_expected:
+            parts.append(f"alchemy_completed={self.num_alchemy_forms_completed}/{self.num_alchemy_forms_expected}")
         if self.diagnostics:
             parts.append(f"diagnostics={self.diagnostics}")
         return "; ".join(parts) if parts else "no issues detected"
@@ -235,6 +259,8 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         "dry_run_skip_safety": config.process_mode != "real",
         "dry_run_inference_delay": config.job_delay_seconds,
     }
+    if config.alchemy_forms:
+        bridge_data_fields["alchemist"] = True
     bridge_data_fields.update(config.bridge_data_overrides)
     bridge_data = reGenBridgeData(**bridge_data_fields)  # type: ignore[arg-type]
     # Prevent the manager from watching/reloading a bridge data file from disk.
@@ -299,7 +325,16 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
             safety_entry_point=start_fake_safety_process,
         )
 
-    canned_job_source = CannedJobSource(scenario) if config.skip_api else None
+    canned_job_source: CannedJobSource | None = None
+    if config.skip_api:
+        if config.arrival is not None:
+            canned_job_source = TimedJobSource(scenario, config.arrival)
+        else:
+            canned_job_source = CannedJobSource(scenario)
+
+    canned_alchemy_source: CannedAlchemySource | None = None
+    if config.skip_api and config.alchemy_forms:
+        canned_alchemy_source = CannedAlchemySource(config.alchemy_forms)
 
     system_resources = _build_harness_system_resources() if config.process_mode != "real" else None
 
@@ -312,6 +347,7 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
         stable_diffusion_reference=build_harness_model_reference(scenario),
         process_entry_points=entry_points,
         canned_job_source=canned_job_source,
+        canned_alchemy_source=canned_alchemy_source,
     )
 
     return manager, len(scenario)
@@ -321,9 +357,10 @@ async def _watch_for_scenario_completion(
     manager: HordeWorkerProcessManager,
     *,
     num_jobs_expected: int,
+    num_forms_expected: int = 0,
     timeout_seconds: float,
 ) -> bool:
-    """Trigger shutdown once all jobs are accounted for, or abort on timeout.
+    """Trigger shutdown once all jobs and alchemy forms are accounted for, or abort on timeout.
 
     Returns:
         True if the run timed out, False otherwise.
@@ -334,15 +371,21 @@ async def _watch_for_scenario_completion(
         await asyncio.sleep(0.1)
 
         jobs_accounted_for = manager._job_tracker.total_num_completed_jobs + manager._job_tracker.num_jobs_faulted
-        if jobs_accounted_for >= num_jobs_expected:
-            logger.info(f"Harness scenario complete ({jobs_accounted_for}/{num_jobs_expected} jobs accounted for)")
+        coordinator = manager._alchemy_coordinator
+        forms_accounted_for = coordinator.num_canned_forms_completed + coordinator.num_canned_forms_faulted
+        if jobs_accounted_for >= num_jobs_expected and forms_accounted_for >= num_forms_expected:
+            logger.info(
+                f"Harness scenario complete ({jobs_accounted_for}/{num_jobs_expected} jobs, "
+                f"{forms_accounted_for}/{num_forms_expected} alchemy forms accounted for)",
+            )
             manager._shutdown()
             return False
 
         if time.time() - time_started > timeout_seconds:
             logger.error(
                 f"Harness timed out after {timeout_seconds}s with "
-                f"{jobs_accounted_for}/{num_jobs_expected} jobs accounted for",
+                f"{jobs_accounted_for}/{num_jobs_expected} jobs and "
+                f"{forms_accounted_for}/{num_forms_expected} alchemy forms accounted for",
             )
             manager._abort()
             return True
@@ -383,10 +426,13 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
 
     time_started = time.time()
 
+    num_forms_expected = len(config.alchemy_forms) if (config.alchemy_forms and config.skip_api) else 0
+
     watcher_task = asyncio.create_task(
         _watch_for_scenario_completion(
             manager,
             num_jobs_expected=num_jobs_expected,
+            num_forms_expected=num_forms_expected,
             timeout_seconds=config.timeout_seconds,
         ),
     )
@@ -406,6 +452,11 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         timed_out = await watcher_task
 
     # Determine the exit reason for diagnostic purposes.
+    # Drain any messages still in the IPC queue (e.g. metrics emitted by a child just
+    # before shutdown), so the final run-metrics snapshot is complete.
+    with contextlib.suppress(Exception):
+        await manager.receive_and_handle_process_messages()
+
     exit_reason = _determine_exit_reason(
         manager=manager,
         num_jobs_expected=num_jobs_expected,
@@ -442,6 +493,10 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         num_jobs_submitted_faulted=num_jobs_submitted_faulted,
         exit_reason=exit_reason,
         diagnostics=diagnostics,
+        metrics=manager.get_run_metrics_snapshot(),
+        num_alchemy_forms_expected=num_forms_expected,
+        num_alchemy_forms_completed=manager._alchemy_coordinator.num_canned_forms_completed,
+        num_alchemy_forms_faulted=manager._alchemy_coordinator.num_canned_forms_faulted,
     )
 
 

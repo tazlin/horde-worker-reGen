@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from multiprocessing.context import BaseContext
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
+from pathlib import Path
 
 import aiohttp
 import aiohttp.client_exceptions
@@ -42,7 +43,7 @@ from horde_worker_regen.consts import (
     VRAM_HEAVY_MODELS,
 )
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
-from horde_worker_regen.process_management._canned_scenarios import CannedJobSource
+from horde_worker_regen.process_management._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.alchemy_popper import AlchemyCoordinator
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
@@ -58,6 +59,7 @@ from horde_worker_regen.process_management.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot, WorkerRunMetrics
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.safety_orchestrator import SafetyOrchestrator
 from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
@@ -66,6 +68,7 @@ from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.reporting.status_reporter import StatusReporter
+from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
 
@@ -326,6 +329,7 @@ class HordeWorkerProcessManager:
         stable_diffusion_reference: dict[str, ImageGenerationModelRecord] | None = None,
         process_entry_points: ProcessEntryPoints | None = None,
         canned_job_source: CannedJobSource | None = None,
+        canned_alchemy_source: CannedAlchemySource | None = None,
     ) -> None:
         """Initialise the process manager.
 
@@ -348,6 +352,8 @@ class HordeWorkerProcessManager:
                 (hordelib-backed) entry points. Test harnesses can inject fakes here.
             canned_job_source: Source of predetermined jobs used when `dry_run_skip_api` is set. \
                 If None, an endlessly-cycling default scenario is used.
+            canned_alchemy_source: Source of predetermined alchemy forms; when set, the alchemy \
+                coordinator pops from it and records submits locally instead of touching the API.
         """
         self.session_start_time = time.time()
         self._state = WorkerState()
@@ -468,6 +474,17 @@ class HordeWorkerProcessManager:
             state=self._state,
         )
 
+        self._run_metrics = WorkerRunMetrics()
+        self._message_dispatcher.set_metrics_handlers(
+            on_job_metrics=self._run_metrics.on_job_metrics,
+            on_download_metrics=self._run_metrics.on_download_metrics,
+        )
+        self._job_tracker.set_finalize_observer(self._run_metrics.on_job_finalized)
+        self._process_lifecycle.set_process_recovery_observer(self._record_process_crash)
+
+        self._disk_monitor = DiskSpaceMonitor(self._disk_paths_to_monitor())
+        self._last_disk_sample_time = 0.0
+
         self._safety_orchestrator = SafetyOrchestrator(
             process_map=self._process_map,
             job_tracker=self._job_tracker,
@@ -527,6 +544,7 @@ class HordeWorkerProcessManager:
             shutdown_manager=self._shutdown_manager,
             runtime_config=self._runtime_config,
             api_sessions=self._api_sessions,
+            canned_alchemy_source=canned_alchemy_source,
         )
         self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
 
@@ -862,6 +880,7 @@ class HordeWorkerProcessManager:
                 return False
 
         self.print_status_method()
+        self._sample_disk_space()
 
         await self._sleep(self._loop_interval / 2)
         return True
@@ -910,6 +929,42 @@ class HordeWorkerProcessManager:
     def detect_deadlock(self) -> None:
         """Detect if there are jobs in the queue but no processes doing anything."""
         self._message_dispatcher.detect_deadlock()
+
+    _DISK_SAMPLE_INTERVAL_SECONDS = 30.0
+
+    @staticmethod
+    def _disk_paths_to_monitor() -> list[Path]:
+        """Return the disk paths whose free space matters to the worker."""
+        paths = [Path.cwd()]
+        cache_home = os.getenv("AIWORKER_CACHE_HOME")
+        if cache_home:
+            paths.append(Path(cache_home))
+        return paths
+
+    def _sample_disk_space(self) -> None:
+        """Sample disk free space at most every `_DISK_SAMPLE_INTERVAL_SECONDS`."""
+        if time.time() - self._last_disk_sample_time < self._DISK_SAMPLE_INTERVAL_SECONDS:
+            return
+        self._last_disk_sample_time = time.time()
+        self._disk_monitor.sample()
+
+    def _record_process_crash(self, process_info: HordeProcessInfo, reason: str) -> None:
+        """Forward a process recovery event to the run-metrics aggregator."""
+        self._run_metrics.record_process_crash(
+            process_id=process_info.process_id,
+            process_launch_identifier=process_info.process_launch_identifier,
+            last_state=process_info.last_process_state.name,
+            reason=reason,
+        )
+
+    def get_run_metrics_snapshot(self) -> RunMetricsSnapshot:
+        """Return the run-wide metrics snapshot (stage latencies, downloads, high-waters, crashes)."""
+        return self._run_metrics.snapshot(
+            num_process_recoveries=self._process_lifecycle._num_process_recoveries,
+            num_job_slowdowns=self._job_submitter.num_job_slowdowns,
+            time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
+            disk_min_free_bytes=self._disk_monitor.min_free_bytes,
+        )
 
     def print_status_method(self) -> None:
         """Print the status of the worker if it's time to do so."""

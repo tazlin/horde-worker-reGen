@@ -27,7 +27,7 @@ dependencies = [
     "horde_sdk~=0.20.1",
     "horde_safety~=0.3.0",
     "horde_engine~=2.20.12",
-    "horde_model_reference~=4.0.0",
+    "horde_model_reference~=4.0.4",
     "python-dotenv",
     "ruamel.yaml",
     "semver",
@@ -65,6 +65,7 @@ cpu = [
 run_worker = "horde_worker_regen.run_worker:start"
 download_models = "horde_worker_regen.download_models:main"
 horde-worker = "horde_worker_regen.tui.app:main"
+horde-benchmark = "horde_worker_regen.benchmark.cli:main"
 
 [dependency-groups]
 dev = [

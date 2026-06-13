@@ -26,6 +26,7 @@ from typing import override
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+from hordelib.metrics import JobPhaseMetrics, SamplingStats
 from loguru import logger
 
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
@@ -33,12 +34,16 @@ from horde_worker_regen.process_management._dummy_images import make_dummy_png_b
 from horde_worker_regen.process_management.debug_attach import maybe_wait_for_process_debugger
 from horde_worker_regen.process_management.horde_process import HordeProcess
 from horde_worker_regen.process_management.messages import (
+    AlchemyFormSpec,
+    HordeAlchemyControlMessage,
+    HordeAlchemyResultMessage,
     HordeControlFlag,
     HordeControlMessage,
     HordeHeartbeatType,
     HordeImageResult,
     HordeInferenceControlMessage,
     HordeInferenceResultMessage,
+    HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
     HordePreloadInferenceModelMessage,
     HordeProcessState,
@@ -105,12 +110,12 @@ class FakeInferenceProcess(HordeProcess):
         )
 
     @override
-    def get_vram_usage_bytes(self) -> int:
+    def get_vram_usage_mb(self) -> int:
         """Return a fixed fake VRAM usage value."""
         return 0
 
     @override
-    def get_vram_total_bytes(self) -> int:
+    def get_vram_total_mb(self) -> int:
         """Return a fixed fake VRAM total value."""
         return 0
 
@@ -196,6 +201,30 @@ class FakeInferenceProcess(HordeProcess):
             ),
         )
 
+        # The real process snapshots hordelib's metrics collector after each job; emit a
+        # synthetic equivalent so the pipe -> dispatcher -> run-metrics chain is exercised
+        # without any GPU.
+        steps = job_info.payload.ddim_steps if job_info.payload.ddim_steps else 30
+        elapsed = max(time.time() - time_start, 0.001)
+        self.process_message_queue.put(
+            HordeJobMetricsMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"Job metrics for {job_info.id_}",
+                job_id=str(job_info.id_),
+                phase_metrics=JobPhaseMetrics(
+                    sampling=SamplingStats(
+                        steps_completed=steps,
+                        total_steps=steps,
+                        duration_seconds=elapsed,
+                        iterations_per_second=steps / elapsed,
+                    ),
+                    vram_used_high_water_mb=1234,
+                    ram_used_high_water_mb=2345,
+                ),
+            ),
+        )
+
         if self._active_model_name is not None:
             self.on_horde_model_state_change(
                 process_state=(
@@ -210,12 +239,55 @@ class FakeInferenceProcess(HordeProcess):
             info="Waiting for job",
         )
 
+    def _run_fake_alchemy(self, form: AlchemyFormSpec) -> None:
+        """Pretend to run an alchemy form, emitting the same message sequence as the real process."""
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.ALCHEMY_STARTING,
+            info=f"Starting alchemy form {form.form} ({form.form_id})",
+        )
+        time_start = time.time()
+        if self._job_delay_seconds > 0:
+            time.sleep(self._job_delay_seconds)
+
+        self.process_message_queue.put(
+            HordeAlchemyResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"Alchemy form {form.form} ({form.form_id})",
+                time_elapsed=time.time() - time_start,
+                form_id=form.form_id,
+                form=form.form,
+                state=GENERATION_STATE.ok,
+                image_base64=make_dummy_png_base64(),
+            ),
+        )
+        self.process_message_queue.put(
+            HordeJobMetricsMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"Job metrics for {form.form_id}",
+                job_id=form.form_id,
+                is_alchemy=True,
+                phase_metrics=JobPhaseMetrics(vram_used_high_water_mb=600, ram_used_high_water_mb=1200),
+            ),
+        )
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.ALCHEMY_COMPLETE,
+            info=f"Finished alchemy form {form.form} ({form.form_id})",
+        )
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.WAITING_FOR_JOB,
+            info="Waiting for job",
+        )
+
     @override
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
         """Handle control messages with the same observable behavior as the real inference process."""
         logger.debug(f"Fake inference process received {type(message).__name__}: {message.control_flag}")
 
-        if isinstance(message, HordePreloadInferenceModelMessage):
+        if isinstance(message, HordeAlchemyControlMessage):
+            self._run_fake_alchemy(message.form)
+        elif isinstance(message, HordePreloadInferenceModelMessage):
             self.preload_model(message.horde_model_name)
         elif isinstance(message, HordeInferenceControlMessage) and (
             message.control_flag == HordeControlFlag.START_INFERENCE
@@ -301,18 +373,64 @@ class FakeSafetyProcess(HordeProcess):
         )
 
     @override
-    def get_vram_usage_bytes(self) -> int:
+    def get_vram_usage_mb(self) -> int:
         """Return a fixed fake VRAM usage value."""
         return 0
 
     @override
-    def get_vram_total_bytes(self) -> int:
+    def get_vram_total_mb(self) -> int:
         """Return a fixed fake VRAM total value."""
         return 0
+
+    def _run_fake_alchemy(self, form: AlchemyFormSpec) -> None:
+        """Pretend to run a CLIP-class alchemy form (caption/interrogation/nsfw)."""
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.ALCHEMY_STARTING,
+            info=f"Starting alchemy form {form.form} ({form.form_id})",
+        )
+        time_start = time.time()
+        if self._evaluation_delay_seconds > 0:
+            time.sleep(self._evaluation_delay_seconds)
+
+        result_payload: dict = {form.form: "a fake caption"} if form.form == "caption" else {form.form: False}
+        self.process_message_queue.put(
+            HordeAlchemyResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"Alchemy form {form.form} ({form.form_id})",
+                time_elapsed=time.time() - time_start,
+                form_id=form.form_id,
+                form=form.form,
+                state=GENERATION_STATE.ok,
+                result_payload=result_payload,
+            ),
+        )
+        self.process_message_queue.put(
+            HordeJobMetricsMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"Job metrics for {form.form_id}",
+                job_id=form.form_id,
+                is_alchemy=True,
+                phase_metrics=JobPhaseMetrics(ram_used_high_water_mb=800),
+            ),
+        )
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.ALCHEMY_COMPLETE,
+            info=f"Finished alchemy form {form.form} ({form.form_id})",
+        )
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.WAITING_FOR_JOB,
+            info="Waiting for job",
+        )
 
     @override
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
         """Evaluate any safety request as safe and report back immediately."""
+        if isinstance(message, HordeAlchemyControlMessage):
+            self._run_fake_alchemy(message.form)
+            return
+
         if not isinstance(message, HordeSafetyControlMessage):
             logger.critical(f"Fake safety process received unexpected message type: {type(message).__name__}")
             return

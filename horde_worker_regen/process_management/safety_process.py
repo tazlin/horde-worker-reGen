@@ -265,6 +265,26 @@ class HordeSafetyProcess(HordeProcess):
             ]
         return results
 
+    def _send_alchemy_job_metrics(self, form: AlchemyFormSpec) -> None:
+        """Snapshot hordelib's metrics collector for this form and forward it (best effort)."""
+        try:
+            from hordelib.api import get_metrics_collector
+
+            from horde_worker_regen.process_management.messages import HordeJobMetricsMessage
+
+            self.process_message_queue.put(
+                HordeJobMetricsMessage(
+                    process_id=self.process_id,
+                    process_launch_identifier=self.process_launch_identifier,
+                    info=f"Job metrics for {form.form_id}",
+                    job_id=form.form_id,
+                    is_alchemy=True,
+                    phase_metrics=get_metrics_collector().snapshot_and_reset_job(),
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send alchemy job metrics: {type(e).__name__} {e}")
+
     def start_alchemy(self, form: AlchemyFormSpec) -> None:
         """Run a CLIP-stack alchemy form (caption/interrogation/nsfw) and report the result."""
         self.send_process_state_change_message(
@@ -309,6 +329,7 @@ class HordeSafetyProcess(HordeProcess):
                 result_payload=result_payload,
             ),
         )
+        self._send_alchemy_job_metrics(form)
 
         process_state = (
             HordeProcessState.ALCHEMY_COMPLETE if state == GENERATION_STATE.ok else HordeProcessState.ALCHEMY_FAILED
