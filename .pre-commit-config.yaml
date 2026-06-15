@@ -10,7 +10,7 @@ repos:
     hooks:
     -   id: black
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.6
+    rev: v0.15.16
     hooks:
     -    id: ruff
 -   repo: https://github.com/pre-commit/mirrors-mypy
@@ -38,11 +38,20 @@ repos:
         - loguru
         - python-dotenv
         - aiohttp
-        - mediapipe==0.10.21
         - horde_safety==0.3.0
         - torch==2.9.1
         - ruamel.yaml
-        - horde_engine==2.20.12
-        - horde_sdk==0.17.1
-        - horde_model_reference~=4.0.0
+        - horde_engine>=3.0.0,<4.0.0
+        - horde_sdk~=0.20.6
+        - horde_model_reference>=5.1.1,<6.0.0
         - semver
+        - logfire>=4.6.0
+        - textual>=2.1.0
+        - textual-serve>=1.1.1
+        - certifi
+        - babel
+        - qrcode==7.4.2
+        - python-Levenshtein
+        - aiodns>=3.0.0
+        - typing_extensions
+        - requests
