@@ -1,6 +1,12 @@
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Keep uv's package cache next to the install instead of on the home drive (~/.cache). The cache is several
+# GB; defaulting it here keeps it on the same volume as .venv so uv can hardlink instead of full-copying, and
+# off the home drive. Respect an existing UV_CACHE_DIR so power users can still point at a shared global cache.
+: "${UV_CACHE_DIR:=$SCRIPT_DIR/bin/uv_cache}"
+export UV_CACHE_DIR
+
 echo "============================================"
 echo "  AI Horde Worker - Install / Update (ROCm)"
 echo "============================================"

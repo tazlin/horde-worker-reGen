@@ -6,6 +6,9 @@ SET PYTHONNOUSERSITE=1
 SET PYTHONPATH=
 SET CONDA_SHLVL=
 
+REM Match update-runtime.cmd: keep uv's cache on the install drive (next to .venv) rather than the home drive.
+if not defined UV_CACHE_DIR set "UV_CACHE_DIR=%~dp0bin\uv_cache"
+
 IF EXIST ".venv" GOTO APP
 
 :INSTALL

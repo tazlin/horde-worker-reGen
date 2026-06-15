@@ -12,6 +12,12 @@ SET PYTHONNOUSERSITE=1
 SET PYTHONPATH=
 SET CONDA_SHLVL=
 
+REM Keep uv's package cache next to the install instead of on the home drive (%LOCALAPPDATA%). The cache
+REM is several GB; defaulting it here means it lands on the drive the user chose for the worker, and stays on
+REM the same volume as .venv so uv can hardlink instead of falling back to slow full-copies. Respect an
+REM existing UV_CACHE_DIR so power users / dev checkouts can still point at a shared global cache.
+if not defined UV_CACHE_DIR set "UV_CACHE_DIR=%~dp0bin\uv_cache"
+
 REM Windows long-path support is a SYSTEM-WIDE setting (HKLM) and needs admin, so it is opt-in, never
 REM automatic: we do not change your system unless you ask. Set HORDE_WORKER_ENABLE_LONG_PATHS=1 to opt in
 REM (only needed if you hit "path too long" errors; keeping the install path short usually avoids them).
