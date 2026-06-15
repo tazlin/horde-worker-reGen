@@ -1,4 +1,5 @@
 import contextlib
+import os
 import sys
 from typing import Protocol
 
@@ -12,6 +13,29 @@ from loguru import logger
 
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.debug_attach import maybe_wait_for_process_debugger
+
+# Env var the parent process sets (from its own ``-v`` count) so spawned workers inherit the
+# operator's verbosity intent instead of a hardcoded value. Read by ``resolve_worker_log_verbosity``.
+WORKER_LOG_VERBOSITY_ENV = "AIWORKER_PROCESS_LOG_VERBOSITY"
+
+# Floor for worker processes. Maps to DEBUG, the level the bridge.log file sink uses; previously
+# every worker was hardcoded to 5 (TRACE), which forced trace.log's diagnose output on permanently.
+_DEFAULT_WORKER_LOG_VERBOSITY = 4
+
+
+def resolve_worker_log_verbosity() -> int:
+    """Resolve the ``verbosity_count`` a spawned worker process should initialise logging with.
+
+    Defaults to DEBUG. The parent may raise it (e.g. to TRACE) via ``WORKER_LOG_VERBOSITY_ENV``;
+    worker *file* logs are never dropped below DEBUG, matching the bridge.log sink level.
+    """
+    raw = os.environ.get(WORKER_LOG_VERBOSITY_ENV)
+    if raw is None:
+        return _DEFAULT_WORKER_LOG_VERBOSITY
+    try:
+        return max(int(raw), _DEFAULT_WORKER_LOG_VERBOSITY)
+    except ValueError:
+        return _DEFAULT_WORKER_LOG_VERBOSITY
 
 
 class InferenceProcessEntryPoint(Protocol):
@@ -152,7 +176,7 @@ def start_inference_process(
             HordeLog.initialise(
                 setup_logging=True,
                 process_id=process_id,
-                verbosity_count=5,  # FIXME
+                verbosity_count=resolve_worker_log_verbosity(),
             )
 
             from horde_worker_regen.telemetry import configure_child_telemetry
@@ -300,7 +324,7 @@ def start_safety_process(
             HordeLog.initialise(
                 setup_logging=True,
                 process_id=process_id,
-                verbosity_count=5,  # FIXME
+                verbosity_count=resolve_worker_log_verbosity(),
             )
 
             from horde_worker_regen.telemetry import configure_child_telemetry
@@ -394,7 +418,7 @@ def start_download_process(
             HordeLog.initialise(
                 setup_logging=True,
                 process_id=process_id,
-                verbosity_count=5,
+                verbosity_count=resolve_worker_log_verbosity(),
             )
 
             from horde_worker_regen.telemetry import configure_child_telemetry

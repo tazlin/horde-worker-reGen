@@ -244,6 +244,13 @@ def _prepare_runtime(options: WorkerLaunchOptions, *, supervised: bool = False) 
 
     os.environ["HORDE_SDK_DISABLE_CUSTOM_SINKS"] = "1"
 
+    # Spawned workers can't see the CLI -v count, so pass the operator's verbosity intent down
+    # via env (inherited across the spawn). Workers floor it at DEBUG; setdefault lets an
+    # explicitly-exported value win. See worker_entry_points.resolve_worker_log_verbosity.
+    from horde_worker_regen.process_management.worker_entry_points import WORKER_LOG_VERBOSITY_ENV
+
+    os.environ.setdefault(WORKER_LOG_VERBOSITY_ENV, str(options.verbosity))
+
     if options.worker_name:
         os.environ["AIWORKER_DREAMER_WORKER_NAME"] = options.worker_name
 
