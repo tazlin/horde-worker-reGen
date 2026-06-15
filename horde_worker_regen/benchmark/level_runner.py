@@ -94,6 +94,19 @@ def run_level(level_json_path: Path, out_dir: Path, *, process_mode: str = "real
 
     enforce_telemetry_default_off()
 
+    # Set AIWORKER_CACHE_HOME (and friends) from bridgeData.yaml before hordelib resolves its weights
+    # root in the spawned inference children. Normally inherited from the controller, but a directly
+    # invoked level (`--only-level` remediation, manual `python -m ...level_runner`) needs it too.
+    from horde_worker_regen.benchmark.worker_env import ensure_worker_env
+
+    ensure_worker_env(process_mode)
+
+    if process_mode == "real":
+        with contextlib.suppress(Exception):
+            from horde_model_reference import resolve_weights_root
+
+            logger.info(f"Benchmark model weights root: {resolve_weights_root(os.getenv('AIWORKER_CACHE_HOME'))}")
+
     from horde_worker_regen.benchmark.ladder import RampLevel
     from horde_worker_regen.benchmark.report import HarnessSummary, LevelRunResult
     from horde_worker_regen.harness import HarnessConfig, run_harness

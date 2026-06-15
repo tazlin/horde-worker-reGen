@@ -431,6 +431,36 @@ class BenchmarkController:
                 return candidate
         return Path.cwd()
 
+    @staticmethod
+    def _no_local_models_reason() -> str | None:
+        """Real-mode guard: fast-skip when the resolved weights root holds no checkpoints at all.
+
+        The non-warm benchmark path never downloads checkpoints on the fly, so an empty or
+        misconfigured weights root (the classic ``AIWORKER_CACHE_HOME``-unset case) makes every
+        inference child exit with "No models available" and the level would otherwise wedge until
+        its timeout. Skipped when extra model directories are configured, since the checkpoints may
+        legitimately live outside the primary root.
+        """
+        try:
+            from horde_model_reference import resolve_weights_root
+
+            from horde_worker_regen.model_download_plan import ENV_EXTRA_MODEL_DIRECTORIES
+
+            if os.environ.get(ENV_EXTRA_MODEL_DIRECTORIES):
+                return None
+            root = resolve_weights_root(os.getenv("AIWORKER_CACHE_HOME"))
+        except Exception as e:  # noqa: BLE001 - pre-flight must never block the ramp
+            logger.debug(f"Model-presence pre-flight unavailable: {e}")
+            return None
+
+        hint = "set `cache_home` in bridgeData.yaml or AIWORKER_CACHE_HOME"
+        if not root.exists():
+            return f"no model weights root at {root}; {hint}"
+        for pattern in ("*.safetensors", "*.ckpt", "*.gguf"):
+            if next(iter(root.rglob(pattern)), None) is not None:
+                return None
+        return f"no model files found under {root}; {hint} (real-mode benchmarking does not download checkpoints)"
+
     def _pre_flight_skip_reason(self, level: RampLevel, machine: MachineInfo) -> str | None:
         """Return why the level should be skipped without running, or None to proceed."""
         if self._skip_downloads and level.requires_network:
@@ -450,6 +480,10 @@ class BenchmarkController:
             free_disk = shutil.disk_usage(disk_check_path).free
             if free_disk < level.criteria.min_disk_free_gb * 1024**3:
                 return f"insufficient disk on {disk_check_path}: {free_disk / 1024**3:.1f} GB free"
+
+            no_models_reason = self._no_local_models_reason()
+            if no_models_reason is not None:
+                return no_models_reason
 
         if self._process_mode == "real" and machine.total_vram_mb:
             try:

@@ -64,6 +64,12 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
 def _run_ramp(args: argparse.Namespace) -> int:
     from horde_worker_regen.benchmark.controller import BenchmarkController
     from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
+    from horde_worker_regen.benchmark.worker_env import ensure_worker_env
+
+    # The harness never reads bridgeData.yaml, so set AIWORKER_CACHE_HOME (and friends) here, before
+    # spawning level subprocesses, so the real inference children resolve the worker's actual model
+    # directory instead of hordelib's empty ./models fallback. Children inherit this process's env.
+    ensure_worker_env(args.process_mode)
 
     out_dir: Path = args.out if args.out is not None else Path("benchmark_results") / time.strftime("%Y%m%d-%H%M%S")
 
