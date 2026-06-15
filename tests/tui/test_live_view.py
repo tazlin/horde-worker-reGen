@@ -1,0 +1,92 @@
+"""Tests for the live view: sampling-row gating and the staleness banner."""
+
+from __future__ import annotations
+
+from rich.console import Console
+
+from horde_worker_regen.process_management.supervisor_channel import (
+    ProcessSnapshot,
+    WorkerConfigSummary,
+    WorkerStateSnapshot,
+)
+from horde_worker_regen.tui.widgets.live_view import LiveView
+
+
+def _render(renderable: object) -> str:
+    """Render a Rich renderable to plain text."""
+    console = Console(width=100)
+    with console.capture() as capture:
+        console.print(renderable)
+    return capture.get()
+
+
+def _process(state: str) -> ProcessSnapshot:
+    """A process carrying populated sampling fields, in the given state."""
+    return ProcessSnapshot(
+        process_id=0,
+        process_type="INFERENCE",
+        last_process_state=state,
+        is_alive=True,
+        is_busy=state != "WAITING_FOR_JOB",
+        loaded_horde_model_name="Deliberate",
+        last_heartbeat_timestamp=0.0,
+        last_current_step=30,
+        last_total_steps=30,
+        last_iterations_per_second=9.1,
+        vram_usage_mb=8000,
+        total_vram_mb=24000,
+    )
+
+
+def test_idle_process_hides_stale_sampling_row() -> None:
+    """A WAITING_FOR_JOB process must not show a sampling/throughput row, even with step fields set."""
+    panel = LiveView()._render_process_panel(_process("WAITING_FOR_JOB"))
+    text = _render(panel)
+    assert "Sampling" not in text
+    assert "it/s" not in text
+
+
+def test_active_process_shows_sampling_row() -> None:
+    """An actively-sampling process shows the sampling row built from its step fields."""
+    panel = LiveView()._render_process_panel(_process("INFERENCE_STARTING"))
+    text = _render(panel)
+    assert "Sampling" in text
+    assert "30/30 steps" in text
+
+
+class _RecordingBody:
+    """Stands in for the live-body Static, capturing the renderable handed to update()."""
+
+    def __init__(self) -> None:
+        self.renderable: object | None = None
+
+    def update(self, renderable: object) -> None:
+        self.renderable = renderable
+
+
+def _snapshot(state: str = "WAITING_FOR_JOB") -> WorkerStateSnapshot:
+    config = WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0")
+    return WorkerStateSnapshot(config=config, processes=[_process(state)])
+
+
+def test_stale_snapshot_shows_banner() -> None:
+    """When the snapshot is old, the view prepends a clear staleness banner."""
+    view = LiveView()
+    body = _RecordingBody()
+    view.query_one = lambda *args, **kwargs: body  # type: ignore[method-assign,assignment]
+
+    view.update_snapshot(_snapshot(), snapshot_age=12.0)
+    text = _render(body.renderable)
+    assert "old" in text
+    assert "12s" in text
+
+
+def test_fresh_snapshot_has_no_banner() -> None:
+    """A fresh snapshot renders the panels without a staleness banner."""
+    view = LiveView()
+    body = _RecordingBody()
+    view.query_one = lambda *args, **kwargs: body  # type: ignore[method-assign,assignment]
+
+    view.update_snapshot(_snapshot(), snapshot_age=0.5)
+    text = _render(body.renderable)
+    assert "old" not in text

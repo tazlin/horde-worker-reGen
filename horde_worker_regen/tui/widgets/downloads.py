@@ -1,0 +1,314 @@
+"""The Downloads screen: what is on disk, what the config implies, and live download progress.
+
+Consumes the snapshot's ``download_plan`` (the config's disk implications, computed once and always
+available when the model reference is loaded) and ``downloads`` (the live download-process status,
+present only when background downloads are enabled). It answers, in plain language: which models are
+already on disk, how much disk the configuration needs, whether the disk can hold it, and when/where/
+why anything is downloading right now.
+"""
+
+from __future__ import annotations
+
+from rich.console import Group, RenderableType
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from textual.app import ComposeResult
+from textual.containers import Horizontal, VerticalScroll
+from textual.message import Message
+from textual.widgets import Button, Input, Static
+
+from horde_worker_regen.process_management.supervisor_channel import (
+    DownloadPhase,
+    DownloadPlanSummary,
+    DownloadStatusSnapshot,
+    WorkerStateSnapshot,
+)
+from horde_worker_regen.tui.formatters import human_bytes, human_duration, shorten
+
+_PHASE_STYLE: dict[DownloadPhase, str] = {
+    DownloadPhase.INITIALIZING: "yellow",
+    DownloadPhase.SCANNING: "yellow",
+    DownloadPhase.DOWNLOADING: "green",
+    DownloadPhase.IDLE: "grey62",
+    DownloadPhase.PAUSED: "yellow",
+    DownloadPhase.ERROR: "red",
+}
+
+_PHASE_DETAIL: dict[DownloadPhase, str] = {
+    DownloadPhase.INITIALIZING: "Fetching the model reference (a network call on first run)…",
+    DownloadPhase.SCANNING: "Verifying which configured models are already on disk…",
+    DownloadPhase.DOWNLOADING: "Downloading models in the background while the worker serves what it has.",
+    DownloadPhase.IDLE: "All requested models are present; nothing queued.",
+    DownloadPhase.PAUSED: "Downloads are paused; queued work is held until resumed.",
+    DownloadPhase.ERROR: "The download subsystem hit an error (see below).",
+}
+
+_BAR_WIDTH = 32
+
+
+class DownloadsView(VerticalScroll):
+    """A dashboard for model presence, the config's disk budget, and live download progress."""
+
+    DEFAULT_CSS = """
+    DownloadsView #downloads-controls {
+        height: 3;
+    }
+    DownloadsView #downloads-controls Button {
+        margin-right: 1;
+    }
+    DownloadsView #downloads-rate {
+        width: 28;
+        margin-right: 1;
+    }
+    """
+
+    class PauseToggleRequested(Message):
+        """Posted when the user toggles the download pause control."""
+
+        def __init__(self, *, currently_paused: bool) -> None:
+            """Carry whether downloads are currently paused, so the app picks pause vs resume."""
+            super().__init__()
+            self.currently_paused = currently_paused
+
+    class RateLimitRequested(Message):
+        """Posted when the user applies a download bandwidth cap (KB/s; 0 clears the cap)."""
+
+        def __init__(self, kbps: int) -> None:
+            """Carry the requested cap in KB/s."""
+            super().__init__()
+            self.kbps = kbps
+
+    def __init__(self) -> None:
+        """Track the last-seen paused state so the control row labels itself correctly."""
+        super().__init__()
+        self._paused = False
+
+    def compose(self) -> ComposeResult:
+        """Lay out the controls row, phase banner, disk-plan panel, current download, queue, failures."""
+        with Horizontal(id="downloads-controls"):
+            yield Button("Pause downloads", id="downloads-pause")
+            yield Input(placeholder="rate limit KB/s (0 = off)", id="downloads-rate", type="integer")
+            yield Button("Apply limit", id="downloads-rate-apply")
+        yield Static(id="downloads-banner")
+        yield Static(id="downloads-plan")
+        yield Static(id="downloads-current")
+        yield Static(id="downloads-queue")
+        yield Static(id="downloads-failures")
+
+    def update_view(self, snapshot: WorkerStateSnapshot | None) -> None:
+        """Refresh every panel from the latest snapshot (tolerant of missing download data)."""
+        downloads = snapshot.downloads if snapshot is not None else None
+        plan = snapshot.download_plan if snapshot is not None else None
+
+        self._paused = downloads.paused if downloads is not None else False
+        self.query_one("#downloads-pause", Button).label = "Resume downloads" if self._paused else "Pause downloads"
+        self.query_one("#downloads-banner", Static).update(self._render_banner(downloads, plan))
+        self.query_one("#downloads-plan", Static).update(self._render_plan(plan, downloads))
+        self.query_one("#downloads-current", Static).update(self._render_current(downloads))
+        self.query_one("#downloads-queue", Static).update(self._render_queue(downloads))
+        self.query_one("#downloads-failures", Static).update(self._render_failures(downloads))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Translate the control buttons into messages the app forwards to the supervisor."""
+        if event.button.id == "downloads-pause":
+            self.post_message(self.PauseToggleRequested(currently_paused=self._paused))
+        elif event.button.id == "downloads-rate-apply":
+            self._post_rate_limit()
+        event.stop()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Apply the rate limit when Enter is pressed in the rate field."""
+        if event.input.id == "downloads-rate":
+            self._post_rate_limit()
+            event.stop()
+
+    def _post_rate_limit(self) -> None:
+        """Parse the rate field and post a RateLimitRequested (ignoring invalid input)."""
+        raw = self.query_one("#downloads-rate", Input).value.strip()
+        try:
+            kbps = max(int(raw), 0) if raw else 0
+        except ValueError:
+            return
+        self.post_message(self.RateLimitRequested(kbps))
+
+    def _render_banner(
+        self,
+        downloads: DownloadStatusSnapshot | None,
+        plan: DownloadPlanSummary | None,
+    ) -> Panel:
+        """Render the headline phase banner, with the over-budget warning taking precedence."""
+        if plan is not None and not plan.fits:
+            title = Text("⚠  DISK OVER BUDGET", style="bold red")
+            detail = Text(
+                f"The configured models need {human_bytes(plan.to_download_bytes)} to download but only "
+                f"{human_bytes(plan.free_disk_bytes)} is free (short by {human_bytes(plan.shortfall_bytes)}). "
+                "Downloads will proceed until the disk fills, then stop with a disk-full error.",
+                style="red",
+            )
+            return Panel(detail, title=title, title_align="left", border_style="red", padding=(0, 1))
+
+        if downloads is None:
+            detail = Text(
+                "No download process is running. Models load at worker startup; this tab shows the "
+                "configuration's disk plan below once the model reference is loaded.",
+                style="grey70",
+            )
+            return Panel(detail, title="Downloads", title_align="left", border_style="grey37", padding=(0, 1))
+
+        phase = downloads.phase
+        colour = _PHASE_STYLE.get(phase, "grey62")
+        title = Text.assemble((phase.value.upper(), f"bold {colour}"))
+        lines: list[Text] = [Text(_PHASE_DETAIL.get(phase, ""), style="grey70")]
+        if downloads.error_message:
+            lines.append(Text(downloads.error_message, style="red"))
+        control = self._control_line(downloads)
+        if control is not None:
+            lines.append(control)
+        return Panel(Group(*lines), title=title, title_align="left", border_style=colour, padding=(0, 1))
+
+    @staticmethod
+    def _control_line(downloads: DownloadStatusSnapshot) -> Text | None:
+        """Summarize the active pause state and bandwidth cap, when either is set."""
+        parts: list[tuple[str, str]] = []
+        if downloads.paused:
+            parts.append(("paused", "yellow"))
+        if downloads.rate_limit_kbps:
+            parts.append((f"limit {downloads.rate_limit_kbps} KB/s", "grey70"))
+        if not parts:
+            return None
+        text = Text("controls: ", style="grey50")
+        for index, (label, style) in enumerate(parts):
+            if index:
+                text.append("  ·  ", style="grey50")
+            text.append(label, style=style)
+        return text
+
+    @staticmethod
+    def _readiness(plan: DownloadPlanSummary, downloads: DownloadStatusSnapshot | None) -> tuple[int, int] | None:
+        """Live ``(ready, total)`` model count, or None when there is no download process to track.
+
+        The denominator is the configured total from the plan; ``downloads.present_model_names`` cannot
+        be used because it lists *every* image model on disk, not just the configured ones. A model
+        counts as not-ready while it is queued, currently downloading, or failed (deduped by name so a
+        download that is still listed in the queue is not subtracted twice).
+        """
+        total = plan.num_present + plan.num_to_download
+        if total <= 0 or downloads is None:
+            return None
+        remaining = {item.model_name for item in downloads.pending}
+        if downloads.current is not None:
+            remaining.add(downloads.current.model_name)
+        failed = {failure.model_name for failure in downloads.failures} - remaining
+        ready = max(0, total - len(remaining) - len(failed))
+        return ready, total
+
+    def _render_plan(self, plan: DownloadPlanSummary | None, downloads: DownloadStatusSnapshot | None) -> Panel:
+        """Render the configuration's disk budget: present, to-download, total, free, and fit."""
+        if plan is None:
+            body: RenderableType = Text("Disk plan not available yet (model reference still loading).", style="grey50")
+            return Panel(body, title="Disk plan", title_align="left", border_style="grey37", padding=(0, 1))
+
+        table = Table.grid(padding=(0, 2))
+        table.add_column(justify="right", style="bold cyan", no_wrap=True)
+        table.add_column()
+        table.add_row("On disk", f"{plan.num_present} models · {human_bytes(plan.present_bytes)}")
+        table.add_row("To download", f"{plan.num_to_download} models · {human_bytes(plan.to_download_bytes)}")
+        readiness = self._readiness(plan, downloads)
+        if readiness is not None:
+            ready, total = readiness
+            table.add_row(
+                "Ready now",
+                Text(f"{ready} of {total} models", style="green" if ready >= total else "yellow"),
+            )
+        table.add_row("Total", human_bytes(plan.total_bytes))
+        table.add_row("Free disk", human_bytes(plan.free_disk_bytes))
+
+        fit_text = (
+            Text("fits on disk", style="green")
+            if plan.fits
+            else Text(f"OVER BUDGET by {human_bytes(plan.shortfall_bytes)}", style="bold red")
+        )
+        table.add_row("Status", fit_text)
+        if not plan.sizes_complete:
+            table.add_row(
+                "Note",
+                Text("some models lack size metadata; totals are a lower bound", style="yellow"),
+            )
+
+        return Panel(table, title="Disk plan", title_align="left", border_style="grey37", padding=(0, 1))
+
+    def _render_current(self, downloads: DownloadStatusSnapshot | None) -> Panel:
+        """Render the in-progress download with its feature, target, progress bar, speed, and ETA."""
+        if downloads is None or downloads.current is None:
+            body: RenderableType = Text("Nothing downloading right now.", style="grey50")
+            return Panel(body, title="Downloading now", title_align="left", border_style="grey37", padding=(0, 1))
+
+        current = downloads.current
+        header = Text.assemble(
+            (shorten(current.model_name, 40), "bold"),
+            ("   ", ""),
+            (current.feature, "cyan"),
+        )
+        where = Text.assemble(("→ ", "grey50"), (current.target_dir, "grey70"))
+
+        bar = self._progress_bar(current.percent)
+        sizes = f"{human_bytes(current.downloaded_bytes)} / {human_bytes(current.total_bytes)}"
+        speed = f"{human_bytes(current.speed_bps)}/s" if current.speed_bps else "-"
+        eta = human_duration(current.eta_seconds) if current.eta_seconds is not None else "-"
+        progress = Text.assemble(
+            (bar, "green"),
+            ("  ", ""),
+            (sizes, "grey70"),
+            ("   ", ""),
+            ("⇣ ", "grey50"),
+            (speed, "grey70"),
+            ("   ", ""),
+            ("ETA ", "grey50"),
+            (eta, "grey70"),
+        )
+        return Panel(
+            Group(header, where, progress),
+            title="Downloading now",
+            title_align="left",
+            border_style="green",
+            padding=(0, 1),
+        )
+
+    @staticmethod
+    def _progress_bar(percent: float | None) -> str:
+        """Render a fixed-width text progress bar; an indeterminate marker when the total is unknown."""
+        if percent is None:
+            return "[" + "?" * _BAR_WIDTH + "]"
+        filled = int(round(percent / 100.0 * _BAR_WIDTH))
+        return "[" + "█" * filled + "░" * (_BAR_WIDTH - filled) + f"] {percent:5.1f}%"
+
+    def _render_queue(self, downloads: DownloadStatusSnapshot | None) -> Panel:
+        """Render the queue of pending downloads, labelled with feature and size."""
+        pending = downloads.pending if downloads is not None else []
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="grey70")
+        table.add_column(style="cyan")
+        table.add_column(justify="right", style="grey62")
+        if not pending:
+            table.add_row(Text("queue empty", style="grey50"), "", "")
+        for item in pending:
+            table.add_row(shorten(item.model_name, 40), item.feature, human_bytes(item.size_bytes))
+        title = f"Queued ({len(pending)})"
+        return Panel(table, title=title, title_align="left", border_style="grey37", padding=(0, 1))
+
+    def _render_failures(self, downloads: DownloadStatusSnapshot | None) -> Panel:
+        """Render any failed downloads with their feature and reason."""
+        failures = downloads.failures if downloads is not None else []
+        if not failures:
+            body: RenderableType = Text("no failures", style="grey50")
+            return Panel(body, title="Failures", title_align="left", border_style="grey37", padding=(0, 1))
+
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="bold")
+        table.add_column(style="cyan")
+        table.add_column(style="red")
+        for failure in failures:
+            table.add_row(shorten(failure.model_name, 40), failure.feature, failure.reason)
+        title = f"Failures ({len(failures)})"
+        return Panel(table, title=title, title_align="left", border_style="red", padding=(0, 1))
