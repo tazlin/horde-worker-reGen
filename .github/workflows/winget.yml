@@ -1,0 +1,30 @@
+name: Publish to WinGet
+
+# Opt-in automated submission to the Windows Package Manager community repo, replacing the manual
+# per-release version bump + placeholder SHA256 in packaging/winget/. It stays INACTIVE until a
+# maintainer opts in (see packaging/winget/README.md):
+#   - set the repo variable WINGET_ENABLED to 'true'
+#   - add the secret WINGET_TOKEN: a classic PAT that can push to your fork of microsoft/winget-pkgs
+# The action (winget-releaser, Komac under the hood) reads the release's zip asset, computes its hash,
+# and opens the winget-pkgs PR for Haidra.HordeWorker.
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to submit (e.g. v12.0.1)
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: ${{ vars.WINGET_ENABLED == 'true' }}
+    steps:
+      - name: Submit to winget-pkgs
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: Haidra.HordeWorker
+          installers-regex: 'horde-worker-reGen\.zip$'
+          release-tag: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          token: ${{ secrets.WINGET_TOKEN }}

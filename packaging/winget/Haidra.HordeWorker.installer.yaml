@@ -1,0 +1,19 @@
+# winget installer manifest. The bundle is the same release zip the one-line installer uses; winget
+# extracts it and exposes `horde-worker` on PATH. First run of that command bootstraps the environment
+# (uv + PyTorch) via runtime.cmd, exactly like the script install.
+#
+# Per release, bump PackageVersion, point InstallerUrl at the tagged asset, and set InstallerSha256
+# (wingetcreate/komac automate this; or `sha256sum horde-worker-reGen.zip`).
+PackageIdentifier: Haidra.HordeWorker
+PackageVersion: 12.0.0
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: horde-worker.cmd
+    PortableCommandAlias: horde-worker
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/Haidra-Org/horde-worker-reGen/releases/download/v12.0.0/horde-worker-reGen.zip
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+ManifestType: installer
+ManifestVersion: 1.6.0

@@ -12,7 +12,13 @@ SET PYTHONNOUSERSITE=1
 SET PYTHONPATH=
 SET CONDA_SHLVL=
 
-Reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v "LongPathsEnabled" /t REG_DWORD /d "1" /f 2>nul
+REM Windows long-path support is a SYSTEM-WIDE setting (HKLM) and needs admin, so it is opt-in, never
+REM automatic: we do not change your system unless you ask. Set HORDE_WORKER_ENABLE_LONG_PATHS=1 to opt in
+REM (only needed if you hit "path too long" errors; keeping the install path short usually avoids them).
+if defined HORDE_WORKER_ENABLE_LONG_PATHS (
+    echo Enabling Windows long-path support system-wide ^(requires administrator^)...
+    Reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v "LongPathsEnabled" /t REG_DWORD /d "1" /f
+)
 
 REM Parse arguments for GPU backend selection
 SET GPU_EXTRA=cu128
@@ -29,7 +35,7 @@ if not exist "%~dp0bin\uv.exe" (
     if errorlevel 1 (
         echo.
         echo ERROR: Failed to download uv. Check your internet connection.
-        pause
+        if not defined HORDE_WORKER_NONINTERACTIVE pause
         exit /b 1
     )
     echo Done.
@@ -59,4 +65,4 @@ echo   1. Edit bridgeData.yaml with your API key and worker name
 echo   2. Run horde-bridge.cmd to start the worker
 echo      (or horde-worker.cmd for the interactive launcher)
 echo.
-pause
+if not defined HORDE_WORKER_NONINTERACTIVE pause

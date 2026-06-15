@@ -8,7 +8,7 @@
 - When submitting debug information **do not publish `.log` files in the server channels - send them to tazlin directly** as we cannot guarantee that your API key would not be in it (though, this warning should relax over time).
 - Workers especially interested in logs should note that there is a main log (`bridge.log`) and a log for each subprocess. `bridge_0.log` is the safety process, and all ones after that (`bridge_1.log`, `brige_2.log`, etc) are inference processes.
 - You could `Get-Content bridge_1.log -Wait` each log on windows , or `less +F bridge_1.log` on linux to monitor these logs.
-- **The worker does not download models on worker start** for the moment (this will change.) You can download all models configured in your bridge data by invoking `python download_models.py`.
+- **The worker downloads configured models on start** in the background, reporting progress on the dashboard's Downloads tab. You can also pre-download everything in your bridge data ahead of time by invoking `python download_models.py` (the `horde-bridge` scripts do this before starting the worker).
 
 
 ## Advanced users, AMD ROCm inside Windows WSL:
@@ -173,21 +173,14 @@ Pressing control-c will stop the worker but will first have the worker complete 
 
 ## Advanced users, running on directml
 
-### Caveats and Limitations:
-> DirectML is anywhere from 3x to 10x slower than other methods and will max out your VRAM at 100%. It is also not compatible with Flux.1. If you can use *ANY* other method, do that instead. Unless you have a lot of RAM, you might also run into memory issues. You should limit yourself to the smallest models and easiest jobs, even if you have a decent GPU in theory.
+DirectML is **temporarily unavailable**. The `torch-directml` build is pinned to an older torch (2.4 era)
+that is incompatible with the torch version this worker now requires, so the `update-runtime-directml.cmd`
+and `horde-bridge-directml.cmd` scripts have been removed rather than left to fail with a confusing error.
 
-### Prerequisites
-* Install [git](https://git-scm.com/) in your system.
-* Make sure your Windows OS and GPU drivers are up to date.
-
-### General Use:
-- The first steps are identical to the normal process: [install](README.md/#installing) and [configure](README.md/#configure) the worker. Remember to stick with the lowest end settings.
-
-- Now [update](README.md/#updating) the runtime, but make sure to use the `update-runtime-directml.cmd` script. Follow the linked instructions and run this script for future updates as well.
-
-- To run the worker again follow [starting/stopping](README.md/#startingstopping), making sure to use the `horde-bridge-directml.cmd` script.
-
-For more direct support, join the [discord discussion](https://discord.com/channels/781145214752129095/1076124012305993768) in the [official discord](https://discord.gg/3DxrhksKzn).
+If you have an AMD or Intel GPU on Windows and no CUDA option, run the worker on Linux with ROCm for now.
+This section will be restored when a compatible DirectML build is available. For help, join the
+[discord discussion](https://discord.com/channels/781145214752129095/1076124012305993768) in the
+[official discord](https://discord.gg/3DxrhksKzn).
 
 
 ## Advanced users, container install

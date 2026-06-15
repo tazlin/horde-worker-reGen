@@ -2,61 +2,74 @@
 
 Share your GPU with the world. Earn [kudos](https://github.com/Haidra-Org/haidra-assets/blob/main/docs/kudos.md). Generate AI images faster.
 
-The [AI Horde](https://aihorde.net/) is a free, open, decentralized platform where anyone can contribute GPU power to generate images. When your worker completes jobs, you earn **kudos** — the more you have, the faster your own image requests get processed.
+The [AI Horde](https://aihorde.net/) is a free, open, decentralized platform where anyone can contribute GPU power to generate images. When your worker completes jobs, you earn **kudos**; the more you have, the faster your own image requests get processed.
 
 ## Quick Start
 
-> **Prerequisites**: An NVIDIA GPU (8 GB+ VRAM recommended), [git](https://gitforwindows.org/) (Windows) or `git` (Linux), and an [AI Horde API key](https://aihorde.net/register).
+> **Prerequisites**: an NVIDIA GPU (8 GB+ VRAM recommended) and a free [AI Horde API key](https://aihorde.net/register). You do **not** need git or Python installed; the installer fetches everything it needs, including its own Python and PyTorch.
 
-### 1. Download the worker
+### Install
 
-**Windows** — open Command Prompt or PowerShell:
+**Windows** — use `winget` (most trusted), or paste the one-liner into PowerShell:
 
-```cmd
-git clone https://github.com/Haidra-Org/horde-worker-reGen.git
-cd horde-worker-reGen
+```powershell
+winget install Haidra.HordeWorker
 ```
 
-**Linux** — open a terminal:
+```powershell
+irm https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.ps1 | iex
+```
+
+**Linux** — paste into a terminal:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.sh | sh
+```
+
+The installer downloads the worker, builds its environment (the first run pulls Python and PyTorch and can take several minutes), then opens the **dashboard in your browser**. A short wizard walks you through:
+
+1. Entering your API key and choosing a worker name
+2. Picking which models to serve (a sensible default is chosen for your GPU)
+3. Optionally running a benchmark to auto-tune your settings
+4. Starting the worker
+
+After you click **Start**, your chosen models download in the background (shown on the **Downloads** tab). The first run can take 30-60 minutes depending on your selection and connection; the worker serves each model as it finishes, so keep the window open. That's it, you're contributing to the horde. Re-run the same install command any time to update.
+
+> **Windows SmartScreen**: the raw `irm … | iex` one-liner may show "Windows protected your PC". Click **More info → Run anyway** (the same step used to install tools like `uv`). `winget install` avoids the prompt entirely.
+
+> **Tip**: keep the install path free of spaces. The installer picks a safe default; override it with `$env:HORDE_WORKER_DIR` (Windows) or `HORDE_WORKER_DIR` (Linux).
+
+> **What the installer does (and doesn't)**: it installs into a per-user folder (no administrator rights needed), downloads Python, PyTorch, and your chosen models (several GB) into that folder and your per-user package cache, and adds per-user "AI Horde Worker" shortcuts. It does **not** change any system-wide settings. Opt out of the shortcuts with `HORDE_WORKER_NO_SHORTCUTS`, or skip the auto-launch with `HORDE_WORKER_NO_LAUNCH`.
+
+### Opening it again later
+
+The worker runs as long as the launcher window is open: closing that window (or pressing Ctrl+C in it) stops the worker. Closing just the dashboard window or browser tab leaves the worker running, so you can reopen it to reconnect. To start the worker again after it has been stopped:
+
+- **Windows**: click the **AI Horde Worker** shortcut the installer added to your Desktop and Start Menu (or, if you installed with winget, run `horde-worker` in a terminal). You can also run `horde-worker.cmd` in the install folder.
+- **Linux**: launch **AI Horde Worker** from your applications menu, or run `./horde-worker.sh` in the install folder.
+
+The first run does the slow one-time setup; reopening after that is quick. On a return visit the worker remembers your settings and skips the setup wizard.
+
+### Power-user and headless options
+
+- **In-terminal UI instead of the browser**: `horde-worker.cmd --terminal` (Windows) or `./horde-worker.sh --terminal` (Linux).
+- **Remote / LAN access to the dashboard**: `horde-worker.cmd --host 0.0.0.0`. This binds all interfaces and the dashboard is unauthenticated, so only do this on a trusted network.
+- **Fully unattended (no UI)**: edit `bridgeData.yaml`, then run `horde-bridge.cmd` (Windows) or `./horde-bridge.sh` (Linux).
+
+### Manual install (git or zip)
+
+<details>
+<summary>Prefer to clone or download a zip?</summary>
 
 ```bash
 git clone https://github.com/Haidra-Org/horde-worker-reGen.git
 cd horde-worker-reGen
 ```
 
-> **Tip**: Do not use spaces in the installation path (`C:\horde_worker` is fine, `C:\My Workers` is not).
+No git? Download the [latest zip](https://github.com/Haidra-Org/horde-worker-reGen/archive/refs/heads/main.zip) and extract it (use a path without spaces).
 
-<details>
-<summary>No git? Download the zip instead.</summary>
-
-Download the [latest zip](https://github.com/Haidra-Org/horde-worker-reGen/archive/refs/heads/main.zip), extract it, and open a terminal in the extracted folder.
+Then run `horde-worker.cmd` (Windows) or `./horde-worker.sh` (Linux): it installs dependencies on first run and opens the dashboard. Or use the non-interactive scripts: `update-runtime.cmd` to install, copy `bridgeData_template.yaml` to `bridgeData.yaml` and fill in your details, then `horde-bridge.cmd` to run.
 </details>
-
-### 2. Launch the interactive setup
-
-Double-click (or run) the launcher for your OS:
-
-| OS | Launcher |
-|----|----------|
-| Windows | `horde-worker.cmd` |
-| Linux | `./horde-worker.sh` |
-
-The launcher automatically installs dependencies on first run (no separate install step needed), then opens an **interactive terminal UI** that walks you through:
-
-1. Entering your API key and choosing a worker name
-2. Selecting your GPU type
-3. Downloading AI models
-4. Starting the worker
-
-That's it — you're contributing to the horde!
-
-### Alternative: command-line scripts
-
-If you prefer non-interactive scripts:
-
-1. **Install dependencies**: run `update-runtime.cmd` (Windows) or `./update-runtime.sh` (Linux).
-2. **Edit config**: copy `bridgeData_template.yaml` to `bridgeData.yaml` and fill in your API key and worker name.
-3. **Start the worker**: run `horde-bridge.cmd` (Windows) or `./horde-bridge.sh` (Linux).
 
 ## Contents
 
@@ -68,6 +81,7 @@ If you prefer non-interactive scripts:
 - [Custom Models](#custom-models)
 - [Docker](#docker)
 - [Support & Troubleshooting](#support--troubleshooting)
+- [Architecture & developer docs](#architecture--developer-docs)
 
 ## Configuration
 
@@ -133,9 +147,9 @@ Minimize other VRAM-consuming apps while the worker runs.
 <details>
 <summary><strong>Lower-end GPUs / Under-performing workers</strong></summary>
 
-- `extra_slow_worker: true` — gives more time per job, but requesters must opt-in. Only use if consistently under 0.3 MPS/s or 3000 kudos/hr with correct config.
-- `limit_max_steps: true` — caps total steps per job based on model type.
-- `preload_timeout: 120` — allows longer model load times.
+- `extra_slow_worker: true`: gives more time per job, but requesters must opt-in. Only use if consistently under 0.3 MPS/s or 3000 kudos/hr with correct config.
+- `limit_max_steps: true`: caps total steps per job based on model type.
+- `preload_timeout: 120`: allows longer model load times.
 </details>
 
 <details>
@@ -148,7 +162,7 @@ Minimize other VRAM-consuming apps while the worker runs.
 
 ### Hardware Tips
 
-- **Use an SSD.** HDDs are too slow for multiple models — limit to one model with <60 s load time.
+- **Use an SSD.** HDDs are too slow for multiple models; limit to one model with <60 s load time.
 - **Configure 8 GB+ swap** (16 GB+ preferred), even on Linux.
 - **Keep `max_threads` ≤ 2** unless you have a 48 GB+ VRAM data center GPU.
 - **Disable sleep/power-saving** while the worker runs.
@@ -160,7 +174,7 @@ Minimize other VRAM-consuming apps while the worker runs.
 
 No extra steps. The standard scripts and the interactive launcher default to CUDA.
 
-### AMD (ROCm) — Linux only
+### AMD (ROCm) (Linux only)
 
 AMD support is **experimental** and Linux-only.
 
@@ -168,12 +182,11 @@ AMD support is **experimental** and Linux-only.
 - [WSL support](README_advanced.md#advanced-users-amd-rocm-inside-windows-wsl) is highly experimental.
 - Join the [AMD discussion on Discord](https://discord.com/channels/781145214752129095/1076124012305993768) for help.
 
-### DirectML — Windows (experimental)
+### DirectML (Windows)
 
-DirectML is **several times slower** than CUDA or ROCm. Use only if you have no other option.
-
-- Use `update-runtime-directml.cmd` and `horde-bridge-directml.cmd`.
-- See [Running on DirectML](README_advanced.md#advanced-users-running-on-directml) for details.
+DirectML is **temporarily unavailable**: its PyTorch build is incompatible with the current torch version.
+Windows AMD/Intel users without CUDA should run on Linux (ROCm) for now. This note will be updated when a
+compatible DirectML build returns.
 
 ## Running the Worker
 
@@ -181,9 +194,13 @@ DirectML is **several times slower** than CUDA or ROCm. Use only if you have no 
 
 > The worker is resource-intensive. Avoid gaming or other heavy tasks while it runs.
 
-**Recommended**: use `horde-worker.cmd` / `./horde-worker.sh` for the interactive launcher.
+**Recommended**: run `horde-worker.cmd` (Windows) or `./horde-worker.sh` (Linux). By default this opens the **dashboard in your browser** (served locally via `textual serve`). On first run it launches the setup wizard; after that it shows a live overview, a per-process view, logs, a configuration editor, downloads, benchmarking, and recommendations.
 
-**Alternative**: use `horde-bridge.cmd` / `./horde-bridge.sh` (or the `-rocm` / `-directml` variants).
+Browser mode runs the worker in a persistent background host, so **closing the browser tab leaves the worker running**; closing the launcher window stops it. Reopen the dashboard any time to reconnect.
+
+Prefer a terminal? Add `--terminal` for the in-terminal UI. You can try the dashboard without a GPU using `horde-worker --process-mode fake`. See [Worker TUI](docs/worker_tui.md) for details.
+
+**Alternative (headless)**: `horde-bridge.cmd` / `./horde-bridge.sh` (or the `-rocm` variant) runs the worker with no UI. The headless `run_worker` path is unchanged.
 
 ### Stopping
 
@@ -217,18 +234,19 @@ Running multiple workers needs high RAM (32–64 GB+). `queue_size` and `max_thr
 
 Stay up to date via our [Discord](https://discord.gg/3DxrhksKzn). Script names below assume Windows + NVIDIA; for Linux use `.sh`, for AMD use `-rocm` variants.
 
-1. **Stop** the worker (`Ctrl+C`).
-2. **Pull updates**:
-   - Git users: `git pull`
-   - Zip users: download the [latest zip](https://github.com/db0/horde-worker-reGen/archive/refs/heads/main.zip), extract over the existing folder.
-3. **Update dependencies**: The interactive launcher handles this for you. You can also run `update-runtime.cmd` (or the relevant variant) to update manually.
-4. **Start** the worker again.
+1. **Stop** the worker (`Ctrl+C`, or Quit in the dashboard).
+2. **Update**, matching how you installed:
+   - One-line installer: re-run the same `irm … | iex` (Windows) or `curl … | sh` (Linux) command; it updates in place.
+   - winget: `winget upgrade Haidra.HordeWorker`.
+   - Git users: `git pull`, then `update-runtime.cmd` (or the relevant variant).
+   - Zip users: download the [latest zip](https://github.com/Haidra-Org/horde-worker-reGen/archive/refs/heads/main.zip), extract over the existing folder, then `update-runtime.cmd`.
+3. **Start** the worker again.
 
 > **Antivirus note**: Some antivirus (e.g. Avast) may interfere with downloads. If you see `CRYPT_E_NO_REVOCATION_CHECK` errors, temporarily disable it.
 
 ## Custom Models
 
-Serving custom models requires the `customizer` role — request it on [Discord](https://discord.gg/3DxrhksKzn).
+Serving custom models requires the `customizer` role; request it on [Discord](https://discord.gg/3DxrhksKzn).
 
 With the role:
 
@@ -263,12 +281,33 @@ See the [Docker guide](Dockerfiles/README.md) for setup instructions.
 | Problem | Fix |
 |---------|-----|
 | Download failures | Check disk space and internet connection. |
+| "Path too long" / file-not-found during install (Windows) | Use a short install path (the default already is). If it persists, opt in to system-wide long-path support: set `$env:HORDE_WORKER_ENABLE_LONG_PATHS=1` before installing (this changes an HKLM setting and needs administrator). |
 | Job timeouts | Remove large models (Flux, Cascade, SDXL), lower `max_power`, disable post-processing/controlnet/lora. |
 | Out of memory | Lower `max_threads`, `max_batch`, or `queue_size`. Close other programs. |
 | Less kudos than expected | New workers have 50% of job kudos and 100% of uptime kudos held in escrow for ~1 week until you become trusted. |
 | Worker in maintenance mode | Log into [artbot](https://tinybots.net/artbot/settings?panel=workers) with the worker running and click "unpause". Check [logs](logs/README.md) for ERROR entries to find the root cause. |
 
 For advanced setup options (manual `uv` usage, custom environments, etc.), see [README_advanced.md](README_advanced.md).
+
+## Architecture & developer docs
+
+Want to understand how the worker works under the hood, or contribute a change?
+
+- **[Documentation home](docs/index.md)**: start here.
+- **[Architecture overview](docs/architecture.md)**: what runs where, the process model, and IPC.
+- **[Codebase Map](docs/navigation.md)**: a file→responsibility quick reference and program entry points.
+- **[Job Lifecycle](docs/job_lifecycle.md)**: traces a job from pop to submit.
+- **[Contributing](CONTRIBUTING.md)**: development setup and guidelines.
+
+**Where things live (top level):**
+
+| Path | What it is |
+|------|------------|
+| `run_worker.py` | Worker entry point |
+| `horde_worker_regen/process_management/` | Main- and child-process orchestration (the core) |
+| `horde_worker_regen/bridge_data/` | Configuration loading and models |
+| `bridgeData.yaml` | Your worker configuration |
+| `docs/` | Full documentation: see the [Codebase Map](docs/navigation.md) |
 
 ## Model Usage & Licenses
 

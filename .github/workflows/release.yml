@@ -1,0 +1,76 @@
+name: Release worker bundle
+
+# On a version tag, build the clean zip the one-line installer and winget package both consume, and
+# publish it as a Release asset reachable at:
+#   https://github.com/<owner>/<repo>/releases/latest/download/horde-worker-reGen.zip
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard against a local path source in pyproject
+        # A released bundle must depend on published versions; a leftover local `path =` source under
+        # [tool.uv.sources] (used for in-repo dev against hordelib) would make `uv sync` fail on a user's
+        # machine. Fail loudly so a release is never cut from the dev-pinned state.
+        run: |
+          if grep -qE '^[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*=[[:space:]]*\{[^}]*path[[:space:]]*=' pyproject.toml; then
+            echo "::error file=pyproject.toml::A local 'path =' source remains under [tool.uv.sources]; flip it to a published version before releasing."
+            grep -nE 'path[[:space:]]*=' pyproject.toml || true
+            exit 1
+          fi
+
+      - name: Stage the runtime bundle
+        # The file list is the single source of truth in packaging/bundle-include.txt (kept honest by
+        # tests/test_bundle_manifest.py), so adding/removing a launcher does not silently drift from what
+        # ships. The horde_worker_regen/ package is copied separately.
+        run: |
+          set -eu
+          stage="stage"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          manifest="packaging/bundle-include.txt"
+          while IFS= read -r entry || [ -n "$entry" ]; do
+            entry="${entry%$'\r'}"
+            case "$entry" in ''|\#*) continue ;; esac
+            for f in $entry; do
+              if [ -e "$f" ]; then cp "$f" "$stage/"; fi
+            done
+          done < "$manifest"
+          cp -r horde_worker_regen "$stage/"
+          find "$stage" -type d -name "__pycache__" -prune -exec rm -rf {} +
+          find "$stage" -type d -name "*.egg-info" -prune -exec rm -rf {} +
+
+      - name: Create the zip
+        run: |
+          set -eu
+          (cd stage && zip -rq ../horde-worker-reGen.zip .)
+          ls -la horde-worker-reGen.zip
+
+      - name: Compute checksums
+        # Published so users can verify the download and so the winget automation has a machine-readable
+        # hash instead of the placeholder in the static manifest.
+        run: |
+          set -eu
+          sha256sum horde-worker-reGen.zip | tee SHA256SUMS
+
+      - name: Verify the bundle ships the lockfile
+        run: |
+          set -eu
+          if ! unzip -l horde-worker-reGen.zip | grep -q "uv.lock"; then
+            echo "::error::uv.lock is missing from the bundle; the installer's 'uv sync --locked' would fail."
+            exit 1
+          fi
+
+      - name: Publish the release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${GITHUB_REF_NAME}" horde-worker-reGen.zip SHA256SUMS --title "${GITHUB_REF_NAME}" --generate-notes

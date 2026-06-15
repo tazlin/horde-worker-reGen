@@ -1,4 +1,4 @@
 @echo off
 cd /d %~dp0
-call runtime python -s download_models.py
+call "%~dp0runtime.cmd" python -s download_models.py
 pause

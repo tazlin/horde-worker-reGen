@@ -1,0 +1,23 @@
+PackageIdentifier: Haidra.HordeWorker
+PackageVersion: 12.0.0
+PackageLocale: en-US
+Publisher: Haidra-Org
+PublisherUrl: https://github.com/Haidra-Org
+PublisherSupportUrl: https://github.com/Haidra-Org/horde-worker-reGen/issues
+PackageName: AI Horde Worker
+PackageUrl: https://github.com/Haidra-Org/horde-worker-reGen
+License: AGPL-3.0
+LicenseUrl: https://github.com/Haidra-Org/horde-worker-reGen/blob/main/LICENSE
+ShortDescription: Share your GPU with the AI Horde to generate images and earn kudos.
+Description: >-
+  A worker for the AI Horde, the free and open crowdsourced image-generation network. Run `horde-worker`
+  after installing to open the dashboard, which walks you through setup and starts contributing your GPU.
+Moniker: horde-worker
+Tags:
+  - ai
+  - stable-diffusion
+  - image-generation
+  - gpu
+  - ai-horde
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

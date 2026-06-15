@@ -19,10 +19,20 @@ if [ ! -f "$SCRIPT_DIR/bin/uv" ]; then
     echo ""
 fi
 
-echo "Installing dependencies for GPU backend: cu128"
+# Parse arguments for GPU backend selection (default cu128). ROCm has its own update-runtime-rocm.sh.
+GPU_EXTRA="cu128"
+for arg in "$@"; do
+    case "$arg" in
+        --cpu) GPU_EXTRA="cpu" ;;
+        --rocm) GPU_EXTRA="rocm" ;;
+        --directml) GPU_EXTRA="directml" ;;
+    esac
+done
+
+echo "Installing dependencies for GPU backend: $GPU_EXTRA"
 echo "(This may take a few minutes on first run...)"
 echo ""
-"$SCRIPT_DIR/bin/uv" sync --locked --extra cu128
+"$SCRIPT_DIR/bin/uv" sync --locked --extra "$GPU_EXTRA"
 if [ $? -ne 0 ]; then
     echo ""
     echo "ERROR: Installation failed."
