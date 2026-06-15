@@ -55,6 +55,14 @@ jobs:
           (cd stage && zip -rq ../horde-worker-reGen.zip .)
           ls -la horde-worker-reGen.zip
 
+      - name: Upload the staged bundle for the installer job
+        # The Windows installer job consumes this exact staging directory, so the graphical installer and
+        # the zip can never drift from each other.
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-bundle-stage
+          path: stage
+
       - name: Compute checksums
         # Published so users can verify the download and so the winget automation has a machine-readable
         # hash instead of the placeholder in the static manifest.
@@ -74,3 +82,55 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release create "${GITHUB_REF_NAME}" horde-worker-reGen.zip SHA256SUMS --title "${GITHUB_REF_NAME}" --generate-notes
+
+  windows-installer:
+    # Build the graphical double-click installer (HordeWorker-Setup.exe) and add it to the release the
+    # bundle job created. Runs after the release exists, so if Inno Setup or choco hiccups the release
+    # still ships the zip and the one-line / winget paths keep working.
+    needs: bundle
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the staged bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-bundle-stage
+          path: stage
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''
+          $stage = (Resolve-Path stage).Path
+          $out = Join-Path (Get-Location).Path 'dist'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          # Discover ISCC instead of hardcoding a version dir: choco's innosetup package tracks
+          # whatever Inno Setup is current (6 or 7), so a fixed "Inno Setup 6" path silently breaks
+          # on the next major bump. The same discovery lives in packaging/build-local.ps1.
+          $iscc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe","${env:ProgramFiles}\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue |
+                  Sort-Object { $_.Directory.Name } -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $iscc) { throw 'ISCC.exe not found after installing Inno Setup' }
+          & $iscc 'packaging\inno\HordeWorker.iss' "/DStageDir=$stage" "/DMyAppVersion=$version" "/O$out"
+          if (-not (Test-Path (Join-Path $out 'HordeWorker-Setup.exe'))) {
+            throw 'ISCC did not produce HordeWorker-Setup.exe'
+          }
+
+      - name: Publish the installer and extend SHA256SUMS
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${env:GITHUB_REF_NAME}"
+          $exe = 'dist\HordeWorker-Setup.exe'
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          # Extend the SHA256SUMS the bundle job already published (two-space separator matches sha256sum).
+          gh release download $tag --pattern SHA256SUMS --output SHA256SUMS --clobber
+          Add-Content -Path SHA256SUMS -Value "$hash  HordeWorker-Setup.exe"
+          gh release upload $tag $exe SHA256SUMS --clobber

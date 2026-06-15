@@ -19,6 +19,11 @@ RUN apt-get update && \
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
+# The uv cache below is a BuildKit cache mount on a different filesystem than the image layers, so uv
+# cannot hardlink from it into .venv. Copy mode avoids the per-build warning and the fallback churn.
+# (Inherited by the builder and final stages, covering both build-time and entrypoint uv operations.)
+ENV UV_LINK_MODE=copy
+
 # Stage 2: Install dependencies (cached layer)
 FROM base AS builder
 
@@ -36,11 +41,11 @@ RUN git clone "https://github.com/${GIT_OWNER}/horde-worker-reGen.git" . && \
 
 # Install dependencies first (better layer caching)
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-install-project --extra cu128
+    uv sync --locked --no-install-project --extra cu126
 
 # Install the project itself
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --extra cu128
+    uv sync --locked --extra cu126
 
 # Stage 3: Final stage
 FROM builder AS final

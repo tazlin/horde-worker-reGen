@@ -7,8 +7,8 @@
 # seeds the config, and starts the dashboard. Re-running it updates in place.
 #
 # Options (environment variables, so they work with the curl | sh form):
-#   HORDE_WORKER_DIR        install location (default: ~/.local/share/horde-worker)
-#   HORDE_WORKER_BACKEND    cu128 | rocm | cpu (default: detected from the GPU)
+#   HORDE_WORKER_DIR        install location (default: ./horde-worker in the current directory)
+#   HORDE_WORKER_BACKEND    cu126 | cu130 | cu132 | rocm | cpu (default: detected from the GPU/driver)
 #   HORDE_WORKER_NO_LAUNCH  set to skip auto-launching the dashboard after install
 set -eu
 
@@ -17,7 +17,11 @@ REPO="horde-worker-reGen"
 ASSET="horde-worker-reGen.zip"
 RELEASE_URL="https://github.com/$OWNER/$REPO/releases/latest/download/$ASSET"
 
-INSTALL_DIR="${HORDE_WORKER_DIR:-$HOME/.local/share/horde-worker}"
+# Default into a named subfolder of the current directory, not the home drive: the worker plus its model
+# downloads run to many GB, so installing onto whatever drive the user cd'd to (and chose to run this from)
+# is far less surprising than quietly filling up $HOME. A subfolder (rather than the bare CWD) keeps the
+# loose-file bundle self-contained and avoids overwriting unrelated files already sitting there.
+INSTALL_DIR="${HORDE_WORKER_DIR:-$PWD/horde-worker}"
 if [ "${1:-}" != "" ]; then INSTALL_DIR="$1"; fi
 case "$INSTALL_DIR" in
     *" "*) echo "ERROR: the install path must not contain spaces: $INSTALL_DIR" >&2; exit 1 ;;
@@ -78,6 +82,18 @@ has_amd_hardware() {
     lspci 2>/dev/null | grep -iqE 'amd/ati|advanced micro devices|radeon' && return 0
     return 1
 }
+nvidia_cuda_build() {
+    # Choose the CUDA build from the driver's max supported CUDA version (nvidia-smi's "CUDA Version"
+    # header). torch 2.12.0 (the locked line) has no cu128 wheel, so a CUDA 12.x driver gets cu126 -- a
+    # 12.6 build runs on any CUDA 12.6+ driver (and, via NVIDIA driver back-compat, on CUDA 13), and is
+    # the safe default when the version can't be read. cu130 is used on a CUDA 13+ driver (also covers
+    # 13.2). cu132 is never auto-selected; it stays a manual HORDE_WORKER_BACKEND=cu132 override.
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        major="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version:[[:space:]]*\([0-9]\{1,\}\)\..*/\1/p' | head -n1)"
+        if [ -n "$major" ] && [ "$major" -ge 13 ] 2>/dev/null; then echo "cu130"; return; fi
+    fi
+    echo "cu126"
+}
 
 # GPU backend: explicit override wins; otherwise detect. Never silently fall back to CPU when a GPU
 # is present, because the CPU build is ~100x slower and just looks like the worker is "broken".
@@ -85,10 +101,10 @@ BACKEND="${HORDE_WORKER_BACKEND:-}"
 if [ -n "$BACKEND" ]; then
     echo "GPU backend: $BACKEND (from HORDE_WORKER_BACKEND)"
 elif has_nvidia_gpu; then
-    BACKEND="cu128"
+    BACKEND="$(nvidia_cuda_build)"
     command -v nvidia-smi >/dev/null 2>&1 || \
-        echo "Note: an NVIDIA GPU was detected but 'nvidia-smi' is not on PATH; using the CUDA build anyway."
-    echo "GPU backend: cu128 (NVIDIA GPU detected)"
+        echo "Note: an NVIDIA GPU was detected but 'nvidia-smi' is not on PATH; using the $BACKEND build anyway."
+    echo "GPU backend: $BACKEND (NVIDIA GPU detected)"
 elif has_amd_runtime; then
     BACKEND="rocm"
     echo "GPU backend: rocm (AMD ROCm runtime detected)"
@@ -102,7 +118,7 @@ elif has_amd_hardware; then
 else
     echo "WARNING: no NVIDIA or AMD GPU detected; using the CPU build." >&2
     echo "CPU is roughly 100x slower than a GPU and is mainly useful for testing." >&2
-    echo "If you have an NVIDIA GPU, install its drivers and re-run, or set HORDE_WORKER_BACKEND=cu128." >&2
+    echo "If you have an NVIDIA GPU, install its drivers and re-run, or set HORDE_WORKER_BACKEND=cu126." >&2
     BACKEND="cpu"
 fi
 
@@ -120,9 +136,12 @@ export UV_CACHE_DIR
 
 echo "Setting up the environment. The first run downloads Python and PyTorch and can take several minutes..."
 export HORDE_WORKER_NONINTERACTIVE=1
+# Hand the resolved build to update-runtime via the env var it already honours, so any CUDA build
+# (cu126/cu128/cu130) flows through rather than being downgraded to the update-runtime default. ROCm
+# keeps its dedicated script.
+export HORDE_WORKER_BACKEND="$BACKEND"
 case "$BACKEND" in
     rocm) ./update-runtime-rocm.sh ;;
-    cpu) ./update-runtime.sh --cpu ;;
     *) ./update-runtime.sh ;;
 esac
 

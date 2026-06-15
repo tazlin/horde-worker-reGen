@@ -39,3 +39,19 @@ def test_all_root_launchers_are_bundled() -> None:
     launchers = {path.name for path in REPO_ROOT.glob("*.cmd")} | {path.name for path in REPO_ROOT.glob("*.sh")}
     missing = launchers - entries - NOT_BUNDLED
     assert not missing, f"these root launchers are missing from packaging/bundle-include.txt: {sorted(missing)}"
+
+
+def test_detect_backend_script_is_bundled() -> None:
+    """detect-backend.ps1 must ship in the bundle: install.ps1 reads it after extraction, and the
+    graphical installer sources it from the same staging, so the GPU check stays in one place."""
+    assert "packaging/detect-backend.ps1" in _manifest_entries()
+
+
+def test_inno_installer_sources_the_staging() -> None:
+    """The graphical installer must build from the same staged bundle as the zip (single source of truth),
+    so it can never drift from what the manifest ships."""
+    iss = REPO_ROOT / "packaging" / "inno" / "HordeWorker.iss"
+    assert iss.exists(), "packaging/inno/HordeWorker.iss is missing"
+    text = iss.read_text(encoding="utf-8")
+    assert "{#StageDir}" in text, "HordeWorker.iss should source files from the {#StageDir} staging directory"
+    assert "detect-backend.ps1" in text, "HordeWorker.iss should ship/extract detect-backend.ps1"

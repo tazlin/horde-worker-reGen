@@ -25,3 +25,6 @@ horde-worker.cmd
 horde-worker.sh
 preload-models.cmd
 preload-models.sh
+# Shared GPU detector used by install.ps1 (after extraction) and the graphical installer; staging
+# flattens it to the bundle root, so install.ps1 reads it from the install dir, not packaging/.
+packaging/detect-backend.ps1

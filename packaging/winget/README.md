@@ -12,6 +12,56 @@ The package is the same release zip the one-line installer uses (`horde-worker-r
 it and exposes `horde-worker` on PATH; the first run bootstraps the environment (uv + PyTorch) via
 `runtime.cmd`, exactly like the script install.
 
+## Choosing where it installs (and how much disk you need)
+
+winget installs portable packages under your profile by default
+(`%LOCALAPPDATA%\Microsoft\WinGet\Packages\`, i.e. the C: drive), with the `horde-worker` alias on PATH
+under `%LOCALAPPDATA%\Microsoft\WinGet\Links`. To put it on another drive:
+
+- **Per install:**
+
+  ```powershell
+  winget install Haidra.HordeWorker --location "D:\HordeWorker"
+  ```
+
+- **As a persistent default** for every portable package (`winget settings`):
+
+  ```jsonc
+  "installBehavior": {
+      "portablePackageUserRoot":    "D:/WinGet/Packages",          // used with --scope user (default)
+      "portablePackageMachineRoot": "D:/WinGet/Packages/Machine"   // used with --scope machine
+  }
+  ```
+
+  Both must be absolute paths and apply only to `portable`-type packages. Choose which one is used with
+  `--scope user` (the default) or `--scope machine`.
+
+> **`--location` does not move the models.** It controls where the bundle extracts, and therefore where
+> `.venv` and the uv package cache (`bin\uv_cache`) are created. The model files are separate and far
+> larger, and winget does **not** place them: they default to a `models\` folder next to wherever you
+> launch `horde-worker` from, or to `AIWORKER_CACHE_HOME`. To keep everything off C:, also point the
+> models at the same drive before the first run, either by setting `cache_home:` in `bridgeData.yaml`
+> or with an environment variable:
+>
+> ```powershell
+> setx AIWORKER_CACHE_HOME "D:\HordeWorker\models"   # persists; reopen the terminal for it to apply
+> ```
+
+### Disk space
+
+Plan generously; this is a heavyweight install, and most of it is unavoidable:
+
+- **Environment floor, before any models:** roughly **10-15 GB** for the CUDA build (the `.venv` alone is
+  ~7-10 GB). PyTorch and the NVIDIA CUDA libraries it pulls in are the bulk, and that cost cannot be
+  avoided on a GPU install. The CPU-only build is smaller, around 3-5 GB. This figure covers the
+  extracted bundle, the `.venv`, and uv's wheel cache together (the `.venv` hardlinks from the cache, so
+  on the same drive they largely share storage rather than doubling it).
+- **Models, on top of that:** each model is roughly **2-8 GB**, and a useful multi-model selection runs
+  to **tens or hundreds of GB**. These land wherever `cache_home` / `AIWORKER_CACHE_HOME` points.
+
+After a successful install you can reclaim a few GB of cached wheel archives with `uv cache prune` (run
+from the install folder); the tradeoff is re-downloading them on the next update.
+
 ## Releasing a new version (automated)
 
 Submission is automated by `.github/workflows/winget.yml` (the `winget-releaser` action, Komac under the

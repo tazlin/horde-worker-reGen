@@ -26,7 +26,11 @@ dependencies = [
     "certifi",
     "horde_sdk~=0.20.6",
     "horde_safety~=0.3.0",
-    "horde_engine>=3.0.0,<4.0.0",
+    # Requires horde-engine (hordelib) 3.1.0+: it declares torchvision/torchaudio as ranges so the
+    # worker's cuXXX build extras resolve the latest torch (2.12.0 today) for the chosen wheel index.
+    # Regenerate uv.lock with `uv lock` once horde-engine 3.1.0 is published (the lock was verified
+    # against a local editable build during development).
+    "horde_engine>=3.1.0,<4.0.0",
     "horde_model_reference>=5.1.1,<6.0.0",
     "python-dotenv",
     "ruamel.yaml",
@@ -44,19 +48,24 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cu128 = [
-    "torch==2.9.1",
-]
-rocm = [
-    "torch==2.9.1",
-    "pytorch-triton-rocm>=3.5.1 ; sys_platform == 'linux'",
-]
-# NOTE: the directml extra (torch-directml==0.2.5.dev240914) was removed with the hordelib v3
-# catch-up: torch-directml is pinned to the torch 2.4 era and cannot satisfy horde-engine's
-# torch/torchvision 2.9/0.24 requirements. Restore it when torch-directml catches up.
-cpu = [
-    "torch==2.9.1",
-]
+# One thin extra per NVIDIA/CPU build. torch is left UNPINNED and floats to the latest version the
+# horde-engine torchvision/torchaudio ranges allow (today 2.12.0 -> torchvision 0.27.0 / torchaudio
+# 2.11.0); the extra only routes torch to the matching wheel index (see [tool.uv.sources]). GPU
+# detection (packaging/detect-backend.ps1 / install.sh) picks the build; update-runtime.* install it
+# with `uv sync --locked --extra <build>`:
+#   cu130   NVIDIA, CUDA 13.x driver (a 13.0 build also covers a 13.2 driver)
+#   cu132   NVIDIA, exact CUDA 13.2 build (manual; cu130 also runs on 13.2)
+#   cu126   NVIDIA, CUDA 12.6+ driver (the only CUDA-12 build of torch 2.12.0; also runs on CUDA 13)
+#   cpu     no GPU (~100x slower; testing only)
+# Only these builds are locked. ROCm and other builds/versions are installed AD-HOC (not from the lock):
+# e.g. ROCm: `uv pip install torch==2.9.1 torchvision torchaudio pytorch-triton-rocm --extra-index-url
+# https://download.pytorch.org/whl/rocm6.4`; or let uv auto-detect: `UV_TORCH_BACKEND=auto uv pip
+# install torch torchvision torchaudio`. (torch 2.12.0 has no cu128 wheel, so CUDA 12.x uses cu126.)
+# directml was removed in the hordelib v3 catch-up.
+cu126 = ["torch"]
+cu130 = ["torch"]
+cu132 = ["torch"]
+cpu = ["torch"]
 
 [project.urls]
 "Homepage" = "https://github.com/Haidra-Org/horde-worker-reGen"
@@ -105,30 +114,34 @@ dev = [
 python-preference = "managed"
 conflicts = [
     [
-        {extra = "cu128"},
-        {extra = "rocm"},
+        {extra = "cu126"},
+        {extra = "cu130"},
+        {extra = "cu132"},
         {extra = "cpu"},
     ],
 ]
 
 [tool.uv.sources]
 torch = [
-    {index = "pytorch-cu128", extra = "cu128"},
-    {index = "pytorch-rocm", extra = "rocm"},
+    {index = "pytorch-cu126", extra = "cu126"},
+    {index = "pytorch-cu130", extra = "cu130"},
+    {index = "pytorch-cu132", extra = "cu132"},
     {index = "pytorch-cpu", extra = "cpu"},
-]
-pytorch-triton-rocm = [
-    {index = "pytorch-rocm", extra = "rocm"},
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/rocm6.4"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [[tool.uv.index]]

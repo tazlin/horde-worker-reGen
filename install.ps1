@@ -6,8 +6,8 @@
 # seeds the config, and opens the dashboard in your browser. Re-running it updates in place.
 #
 # Options come from environment variables (so they work with the irm | iex form):
-#   $env:HORDE_WORKER_DIR       install location (default: %LOCALAPPDATA%\HordeWorker)
-#   $env:HORDE_WORKER_BACKEND   cu128 | cpu (default: cu128 if an NVIDIA GPU is detected, else cpu)
+#   $env:HORDE_WORKER_DIR       install location (default: .\HordeWorker in the current directory)
+#   $env:HORDE_WORKER_BACKEND   cu126 | cu130 | cu132 | cpu (default: detected from the GPU driver)
 #   $env:HORDE_WORKER_NO_LAUNCH set to skip auto-launching the dashboard after install
 
 #Requires -Version 5.1
@@ -36,30 +36,11 @@ function New-Shortcut([string]$LinkPath, [string]$TargetPath, [string]$WorkingDi
     $shortcut.Save()
 }
 
-function Test-NvidiaGpu {
-    # nvidia-smi on PATH is the happy path, but a freshly installed driver often does not add it to
-    # PATH. Fall back to its default location and to the video-controller list so we do not mistake a
-    # real NVIDIA card for a CPU-only machine and quietly install the (~100x slower) CPU build.
-    if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { return $true }
-    if (Test-Path (Join-Path $env:SystemRoot "System32\nvidia-smi.exe")) { return $true }
-    try {
-        foreach ($c in Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop) {
-            if ($c.Name -match "NVIDIA") { return $true }
-        }
-    } catch { }
-    return $false
-}
-
-function Test-AmdGpu {
-    try {
-        foreach ($c in Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop) {
-            if ($c.Name -match "AMD|Radeon") { return $true }
-        }
-    } catch { }
-    return $false
-}
-
-$InstallDir = Get-Option "HORDE_WORKER_DIR" (Join-Path $env:LOCALAPPDATA "HordeWorker")
+# Default into a named subfolder of the current directory, not the home drive: the worker plus its model
+# downloads run to many GB, so installing onto whatever drive the user cd'd to (and chose to run this from)
+# is far less surprising than quietly filling up %LOCALAPPDATA%. A subfolder (rather than the bare CWD)
+# keeps the loose-file bundle self-contained and avoids overwriting unrelated files already sitting there.
+$InstallDir = Get-Option "HORDE_WORKER_DIR" (Join-Path (Get-Location).Path "HordeWorker")
 if ($args.Count -ge 1 -and $args[0]) { $InstallDir = [string]$args[0] }
 if ($InstallDir -match "\s") {
     Write-Error "The install path must not contain spaces (PyTorch and uv dislike them): $InstallDir"
@@ -82,17 +63,28 @@ Remove-Item $tmpZip -Force
 # GPU backend: explicit override wins; otherwise detect the hardware. We never silently fall back to
 # the CPU build when a GPU is present, because that is ~100x slower and just looks like the worker is
 # "broken" to someone who does not know to check. (ROCm is Linux-only; DirectML is temporarily removed.)
+# The hardware check is shared with the graphical installer via detect-backend.ps1 (shipped in the
+# bundle we just extracted), so both installers protect users with the exact same logic. We run it in a
+# child PowerShell with -ExecutionPolicy Bypass so a locked-down machine policy cannot block it.
 $Backend = Get-Option "HORDE_WORKER_BACKEND" ""
 if ($Backend) {
     Write-Host "GPU backend: $Backend (from HORDE_WORKER_BACKEND)"
-} elseif (Test-NvidiaGpu) {
-    $Backend = "cu128"
-    if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
-        Write-Host "Note: an NVIDIA GPU was detected but 'nvidia-smi' is not on PATH; using the CUDA build anyway." -ForegroundColor Yellow
+} else {
+    $detectScript = Join-Path $InstallDir "detect-backend.ps1"
+    $detected = (& powershell -NoProfile -ExecutionPolicy Bypass -File $detectScript).Trim()
+    if (-not $detected) {
+        # Fail loud rather than silently choosing the CPU build, which would be the wrong call on a GPU box.
+        Write-Error "GPU detection failed (detect-backend.ps1 produced no result). Set `$env:HORDE_WORKER_BACKEND to a CUDA build (cu126/cu130/cu132) or 'cpu' and re-run."
+        exit 1
     }
-    Write-Host "GPU backend: cu128 (NVIDIA GPU detected)"
-} elseif (Test-AmdGpu) {
-    Write-Error @'
+    if ($detected -match '^cu\d+$') {
+        # detect-backend.ps1 picks the CUDA build from the driver's max CUDA version (cu130 on a
+        # CUDA 13+ driver, otherwise cu126). Accept the whole cu* family so a new build flows through
+        # without editing this installer.
+        $Backend = $detected
+        Write-Host "GPU backend: $detected (NVIDIA GPU detected)"
+    } elseif ($detected -eq "amd-unsupported") {
+        Write-Error @'
 An AMD GPU was detected, but Windows GPU acceleration is currently unavailable
 (DirectML is temporarily removed and ROCm is Linux-only). Installing now would use the
 CPU build, which is roughly 100x slower.
@@ -101,12 +93,16 @@ If you understand that and still want to run on CPU, re-run with:
     $env:HORDE_WORKER_BACKEND = 'cpu'
 On Linux, an AMD card can use the ROCm build instead.
 '@
-    exit 1
-} else {
-    Write-Host "No NVIDIA or AMD GPU detected; using the CPU build." -ForegroundColor Yellow
-    Write-Host "CPU is roughly 100x slower than a GPU and is mainly useful for testing." -ForegroundColor Yellow
-    Write-Host "If you do have an NVIDIA GPU, install its drivers and re-run, or set `$env:HORDE_WORKER_BACKEND='cu128'." -ForegroundColor Yellow
-    $Backend = "cpu"
+        exit 1
+    } elseif ($detected -eq "cpu") {
+        Write-Host "No NVIDIA or AMD GPU detected; using the CPU build." -ForegroundColor Yellow
+        Write-Host "CPU is roughly 100x slower than a GPU and is mainly useful for testing." -ForegroundColor Yellow
+        Write-Host "If you do have an NVIDIA GPU, install its drivers and re-run, or set `$env:HORDE_WORKER_BACKEND='cu126'." -ForegroundColor Yellow
+        $Backend = "cpu"
+    } else {
+        Write-Error "GPU detection returned an unrecognized token '$detected'. Set `$env:HORDE_WORKER_BACKEND to a CUDA build (cu126/cu130/cu132) or 'cpu' and re-run."
+        exit 1
+    }
 }
 
 # Seed the config from the template on a fresh install (never clobbers an existing bridgeData.yaml).
@@ -125,12 +121,12 @@ if (-not $env:UV_CACHE_DIR) {
 
 Write-Host "Setting up the environment. The first run downloads Python and PyTorch and can take several minutes..."
 $env:HORDE_WORKER_NONINTERACTIVE = "1"
+# Hand the resolved build to update-runtime via the env var it already honours. This carries any
+# CUDA build (cu126/cu128/cu130), not just cpu, so a detected cu130 is not silently downgraded to the
+# update-runtime default.
+$env:HORDE_WORKER_BACKEND = $Backend
 $updateRuntime = Join-Path $InstallDir "update-runtime.cmd"
-if ($Backend -eq "cpu") {
-    & $updateRuntime "--cpu"
-} else {
-    & $updateRuntime
-}
+& $updateRuntime
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Environment setup failed. See the output above; deleting the .venv folder and re-running often helps."
     exit 1
