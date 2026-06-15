@@ -112,9 +112,6 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-# Local-path dev against the hordelib v3 branch; the coordinated-release PR flips this back
-# to a published horde_engine version pin (see docs/plans in the hordelib repo).
-horde_engine = {path = "../../horde/jug/hordelib", editable = true}
 torch = [
     {index = "pytorch-cu128", extra = "cu128"},
     {index = "pytorch-rocm", extra = "rocm"},
