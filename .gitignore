@@ -8,6 +8,11 @@ dummy
 
 kudos_training_data*
 
+benchmark_results/runs
+benchmark_results/*-*/*
+
+.horde_worker_regen/*
+
 packages.svg
 classes.svg
 
@@ -29,6 +34,12 @@ bin/uvx
 bin/uvx.exe
 info/
 library/
+
+# Local release-build outputs (packaging/build-local.ps1; these mirror the CI artifacts).
+# dist/ (the installer output) is already ignored by the "Distribution / packaging" block below.
+/stage/
+/horde-worker-reGen.zip
+/SHA256SUMS
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
