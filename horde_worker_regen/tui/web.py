@@ -103,8 +103,21 @@ def _resolve_host_port(arg_host_port: int | None) -> int:
 
 
 def _build_served_command(args: argparse.Namespace, host_port: int) -> str:
-    """Compose the per-session dashboard command, which attaches to the worker host."""
-    parts = ["horde-worker", f"--attach 127.0.0.1:{host_port}", f"--process-mode {args.process_mode}"]
+    """Compose the per-session dashboard command, which attaches to the worker host.
+
+    The TUI is invoked via ``python -m`` rather than the ``horde-worker`` console script because
+    textual-serve launches this through the shell (``cmd.exe /c`` on Windows), and cmd.exe resolves
+    bare names against the current directory before PATH. The web server runs from the repo root, whose
+    ``horde-worker.cmd`` launcher would otherwise shadow the console script and re-invoke the *web*
+    server. Module invocation cannot be shadowed and mirrors how the worker host is spawned.
+    """
+    parts = [
+        f'"{sys.executable}"',
+        "-m",
+        "horde_worker_regen.tui.app",
+        f"--attach 127.0.0.1:{host_port}",
+        f"--process-mode {args.process_mode}",
+    ]
     if args.config:
         parts.append(f'--config "{args.config}"')
     return " ".join(parts)
