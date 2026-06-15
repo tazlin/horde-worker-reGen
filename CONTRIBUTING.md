@@ -2,10 +2,10 @@
 
 ## Code Quality Tools
 
-* [tox](https://tox.wiki/)
-    * Creates virtual environments for CI or local pytest runs.
-        * Note that the CI does not current execute calls to the production API by default.
-    * Run `tox list` or see `tox.ini` for more info
+* [uv](https://docs.astral.sh/uv/)
+    * A modern Python package manager and virtual environment tool
+    * Run `uv sync --extra <extra>` to install dependencies and `uv run <command>` to run commands in the virtual environment.
+        * See `pyproject.toml` for the dependencies and extras used in this project - you need to specify your GPU specific torch.
 * [pre-commit](https://pre-commit.com/)
     * Creates virtual environments for formatting and linting tools
     * Run `pre-commit run --all-files` or see `.pre-commit-config.yaml` for more info.

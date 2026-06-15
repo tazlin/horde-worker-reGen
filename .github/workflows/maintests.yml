@@ -51,4 +51,4 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Run unit tests
-        run: uv run tox -e tests-no-api-calls
+        run: uv run pytest

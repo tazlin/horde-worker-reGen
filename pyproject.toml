@@ -26,7 +26,7 @@ dependencies = [
     "certifi",
     "horde_sdk~=0.20.6",
     "horde_safety~=0.3.0",
-    "horde_engine~=2.20.12",
+    "horde_engine>=3.0.0,<4.0.0",
     "horde_model_reference>=5.1.1,<6.0.0",
     "python-dotenv",
     "ruamel.yaml",
