@@ -111,6 +111,13 @@ if [ ! -f bridgeData.yaml ] && [ -f bridgeData_template.yaml ]; then
     cp bridgeData_template.yaml bridgeData.yaml
 fi
 
+# Co-locate uv's package cache with the install so it lands on the chosen drive (not the home drive) and
+# stays on the same volume as .venv for hardlinking. update-runtime*.sh apply the same default; setting it
+# here too makes the decision visible at the entry point. Respect a user-set UV_CACHE_DIR. ($PWD is the
+# install dir: we cd'd into it above.)
+: "${UV_CACHE_DIR:=$PWD/bin/uv_cache}"
+export UV_CACHE_DIR
+
 echo "Setting up the environment. The first run downloads Python and PyTorch and can take several minutes..."
 export HORDE_WORKER_NONINTERACTIVE=1
 case "$BACKEND" in
