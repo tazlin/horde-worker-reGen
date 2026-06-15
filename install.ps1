@@ -16,7 +16,7 @@ $ErrorActionPreference = "Stop"
 # Windows PowerShell 5.1 defaults to TLS 1.0/1.1; GitHub requires 1.2+, so opt in before downloading.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$Owner = "Haidra-Org"
+$Owner = "tazlin"
 $Repo = "horde-worker-reGen"
 $Asset = "horde-worker-reGen.zip"
 $ReleaseUrl = "https://github.com/$Owner/$Repo/releases/latest/download/$Asset"

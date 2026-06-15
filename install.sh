@@ -12,7 +12,7 @@
 #   HORDE_WORKER_NO_LAUNCH  set to skip auto-launching the dashboard after install
 set -eu
 
-OWNER="Haidra-Org"
+OWNER="tazlin"
 REPO="horde-worker-reGen"
 ASSET="horde-worker-reGen.zip"
 RELEASE_URL="https://github.com/$OWNER/$REPO/releases/latest/download/$ASSET"
