@@ -296,6 +296,11 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].last_heartbeat_timestamp = time.time()
         self[process_id].heartbeats_inference_steps = 0
         self[process_id].last_heartbeat_percent_complete = None
+        # Sampling progress is job-scoped: clear it on reset so a finished job's final step/it-s do not
+        # linger and get rendered over an idle process (these are only ever set by INFERENCE_STEP beats).
+        self[process_id].last_current_step = None
+        self[process_id].last_total_steps = None
+        self[process_id].last_iterations_per_second = None
 
     def delete_safety_processes(self) -> None:
         """Clear all safety processes."""

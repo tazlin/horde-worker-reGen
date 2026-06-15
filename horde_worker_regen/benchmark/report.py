@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import statistics
+import time
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -10,6 +11,17 @@ from pydantic import BaseModel, Field
 from horde_worker_regen.benchmark.criteria import LevelStats
 from horde_worker_regen.benchmark.ladder import BENCH_TIER_MODELS, RampLevel
 from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
+
+BENCHMARK_REPORT_SCHEMA_VERSION = 1
+"""Bumped when the report schema changes incompatibly; stamped into every report for later reads."""
+
+
+def _current_worker_version() -> str:
+    """Return the running worker version (local import keeps this module import-light)."""
+    from horde_worker_regen import __version__
+
+    return __version__
+
 
 FindingKind = Literal[
     "oom",
@@ -126,7 +138,17 @@ class SuggestedBridgeData(BaseModel):
 
 
 class BenchmarkReport(BaseModel):
-    """The full ramp outcome: per-level reports plus the synthesized recommendation."""
+    """The full ramp outcome: per-level reports plus the synthesized recommendation.
+
+    Self-describing: ``worker_version``, ``created_at`` and ``run_id`` stamp every report so a later
+    run (or a version bump) can tell whether the stored recommendation still applies. The defaults
+    make reports written before these fields were added still parse.
+    """
+
+    report_schema_version: int = BENCHMARK_REPORT_SCHEMA_VERSION
+    worker_version: str = Field(default_factory=_current_worker_version)
+    created_at: float = Field(default_factory=time.time)
+    run_id: str = ""
 
     machine: MachineInfo = Field(default_factory=MachineInfo)
     levels: list[LevelReport] = Field(default_factory=list)
@@ -311,9 +333,7 @@ def compute_level_stats(result: LevelRunResult, *, total_vram_mb: int | None = N
             vram_high_water = max(metrics.vram_used_high_water_mb_per_process.values())
 
     disk_min_free = (
-        min(metrics.disk_min_free_bytes.values())
-        if metrics is not None and metrics.disk_min_free_bytes
-        else None
+        min(metrics.disk_min_free_bytes.values()) if metrics is not None and metrics.disk_min_free_bytes else None
     )
 
     phase_breakdown = _phase_breakdown(metrics.jobs) if metrics is not None else {}
@@ -444,9 +464,7 @@ def render_markdown(report: BenchmarkReport) -> str:
                     if stats.gpu_utilization_mean_percent is not None
                     else "-"
                 )
-                retention = (
-                    f"{stats.its_retention_fraction:.0%}" if stats.its_retention_fraction is not None else "-"
-                )
+                retention = f"{stats.its_retention_fraction:.0%}" if stats.its_retention_fraction is not None else "-"
                 faults = str(stats.num_jobs_faulted + stats.num_alchemy_forms_faulted)
                 recoveries = str(stats.num_process_recoveries)
             else:

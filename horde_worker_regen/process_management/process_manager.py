@@ -10,6 +10,7 @@ import sys
 import time
 from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Mapping
+from multiprocessing.connection import Connection
 from multiprocessing.context import BaseContext
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
@@ -29,6 +30,7 @@ from horde_sdk.ai_horde_api.ai_horde_clients import (
 )
 from horde_sdk.ai_horde_api.apimodels import (
     FindUserRequest,
+    ImageGenerateJobPopResponse,
     ModifyWorkerRequest,
     SingleWorkerDetailsResponse,
     UserDetailsResponse,
@@ -36,6 +38,7 @@ from horde_sdk.ai_horde_api.apimodels import (
 from loguru import logger
 from pydantic import ValidationError
 
+from horde_worker_regen.app_state import WorkerRunRecord
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.bridge_data.load_config import BridgeDataLoader
 from horde_worker_regen.consts import (
@@ -55,6 +58,8 @@ from horde_worker_regen.process_management.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.lru_cache import LRUCache
 from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
+from horde_worker_regen.process_management.messages import AlchemyFormSpec, HordeDownloadAvailabilityMessage
+from horde_worker_regen.process_management.model_availability import ModelAvailability
 from horde_worker_regen.process_management.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
@@ -63,6 +68,17 @@ from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.safety_orchestrator import SafetyOrchestrator
 from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
+from horde_worker_regen.process_management.supervisor_channel import (
+    RECENT_JOBS_IN_SNAPSHOT,
+    DownloadPlanSummary,
+    ProcessSnapshot,
+    RecentJobRecord,
+    SupervisorChannel,
+    SupervisorCommand,
+    SupervisorControlMessage,
+    WorkerConfigSummary,
+    WorkerStateSnapshot,
+)
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
@@ -198,13 +214,13 @@ class HordeWorkerProcessManager:
     can run at once. Use `max_concurrent_inference_processes` to control that behavior."""
 
     _max_concurrent_inference_processes: int
-    """The maximum number of inference processes that can run jobs concurrently. \
-        This is set at initialization to prevent changing the value at runtime."""
+    """The provisioned concurrency *ceiling* (the size the inference semaphore was created for). \
+        The live effective cap is exposed by the ``max_concurrent_inference_processes`` property."""
 
     @property
     def max_concurrent_inference_processes(self) -> int:
-        """The maximum number of inference processes that can run jobs concurrently."""
-        return self._max_concurrent_inference_processes
+        """The live concurrent-inference cap (effective ``max_threads``), adjustable at runtime."""
+        return self._runtime_config.effective_max_threads
 
     max_safety_processes: int
     """The maximum number of safety processes that can run at once."""
@@ -353,6 +369,7 @@ class HordeWorkerProcessManager:
         max_safety_processes: int = 1,
         amd_gpu: bool = False,
         directml: int | None = None,
+        supervisor_connection: Connection | None = None,
         system_resources: SystemResources | None = None,
         mp_primitives: MultiprocessingPrimitives | None = None,
         skip_api_init: bool = False,
@@ -360,6 +377,8 @@ class HordeWorkerProcessManager:
         process_entry_points: ProcessEntryPoints | None = None,
         canned_job_source: CannedJobSource | None = None,
         canned_alchemy_source: CannedAlchemySource | None = None,
+        enable_background_downloads: bool = False,
+        max_threads_ceiling: int | None = None,
     ) -> None:
         """Initialise the process manager.
 
@@ -374,6 +393,9 @@ class HordeWorkerProcessManager:
             max_safety_processes: The maximum number of safety processes that can run at once.
             amd_gpu: Whether or not the GPU is an AMD GPU.
             directml: ID of the potential directml device.
+            supervisor_connection: When launched by a supervising frontend (the TUI), the worker's \
+                end of the duplex pipe. State snapshots are pushed and control commands drained over \
+                it. None for the standard headless run.
             system_resources: Pre-detected system resources. If None, auto-detects via torch/psutil.
             mp_primitives: Pre-created multiprocessing primitives. If None, creates real ones from ctx.
             skip_api_init: If True, skip the remove_maintenance API call during init.
@@ -384,14 +406,29 @@ class HordeWorkerProcessManager:
                 If None, an endlessly-cycling default scenario is used.
             canned_alchemy_source: Source of predetermined alchemy forms; when set, the alchemy \
                 coordinator pops from it and records submits locally instead of touching the API.
+            enable_background_downloads: If True, start a background download process that reports \
+                on-disk model availability and fetches missing models, gating pops and inference \
+                startup on disk presence. Off by default (tests/harness pre-load everything).
+            max_threads_ceiling: The largest concurrent-inference count this session may scale to. \
+                The IPC semaphores are provisioned for this many slots, and runtime thread changes \
+                (config reload, supervisor command) are clamped to it. Defaults to ``max_threads`` \
+                (no runtime growth beyond the configured value); the benchmark raises it.
         """
         self.session_start_time = time.time()
         self._state = WorkerState()
         self._sleep = asyncio.sleep
 
-        self._runtime_config = RuntimeConfig(initial=bridge_data)
+        ceiling = max(bridge_data.max_threads, max_threads_ceiling if max_threads_ceiling is not None else 0)
+        self._runtime_config = RuntimeConfig(initial=bridge_data, max_threads_ceiling=ceiling)
         self._api_sessions = ApiSessions()
         self._model_metadata = ModelMetadata()
+        self._model_availability = ModelAvailability()
+        self._enable_background_downloads = enable_background_downloads
+        self._inference_processes_started = False
+        self._initial_download_requested = False
+        self._download_wait_started = 0.0
+        self._download_plan_summary: DownloadPlanSummary | None = None
+        self._download_plan_computed = False
         logger.debug(f"Models to load: {bridge_data.image_models_to_load}")
         logger.debug(f"Custom Models to load: {bridge_data.custom_models}")
 
@@ -402,9 +439,11 @@ class HordeWorkerProcessManager:
 
         self.max_safety_processes = max_safety_processes
 
-        self._max_concurrent_inference_processes = bridge_data.max_threads
+        # This attribute is the provisioned concurrency *ceiling* (semaphore size). The live
+        # effective cap is read via the max_concurrent_inference_processes property below.
+        self._max_concurrent_inference_processes = ceiling
 
-        self.max_inference_processes = self.bridge_data.queue_size + self.bridge_data.max_threads
+        self.max_inference_processes = self.bridge_data.queue_size + ceiling
 
         self._lru = LRUCache(self.max_inference_processes)
 
@@ -525,11 +564,16 @@ class HordeWorkerProcessManager:
             on_job_metrics=self._run_metrics.on_job_metrics,
             on_download_metrics=self._run_metrics.on_download_metrics,
         )
+        self._message_dispatcher.set_download_availability_handler(self._on_download_availability)
         self._job_tracker.set_finalize_observer(self._run_metrics.on_job_finalized)
         self._process_lifecycle.set_process_recovery_observer(self._record_process_crash)
 
         self._disk_monitor = DiskSpaceMonitor(self._disk_paths_to_monitor())
         self._last_disk_sample_time = 0.0
+
+        self._supervisor = SupervisorChannel(supervisor_connection) if supervisor_connection is not None else None
+        self._last_supervisor_publish_time = 0.0
+        self._last_supervisor_signature: tuple[object, ...] | None = None
 
         self._safety_orchestrator = SafetyOrchestrator(
             process_map=self._process_map,
@@ -581,6 +625,7 @@ class HordeWorkerProcessManager:
             max_concurrent_inference_processes=self._max_concurrent_inference_processes,
             dry_run_skip_api=bridge_data.dry_run_skip_api,
             canned_job_source=canned_job_source,
+            model_availability=self._model_availability,
         )
 
         self._alchemy_coordinator = AlchemyCoordinator(
@@ -890,6 +935,7 @@ class HordeWorkerProcessManager:
             await self._sleep(self._loop_interval)
 
             await self.receive_and_handle_process_messages()
+            self._maybe_start_inference_processes()
             self.detect_deadlock()
 
             if len(self._job_tracker.jobs_pending_safety_check) > 0:
@@ -914,6 +960,7 @@ class HordeWorkerProcessManager:
 
             await self._sleep(self._loop_interval)
             await self.receive_and_handle_process_messages()
+            self._handle_supervisor_commands()
             if self._process_lifecycle.replace_hung_processes():
                 await self._sleep(self._loop_interval / 2)
                 await self._sleep(self._loop_interval / 2)
@@ -927,13 +974,98 @@ class HordeWorkerProcessManager:
 
         self.print_status_method()
         self._sample_disk_space()
+        self._publish_supervisor_snapshot()
 
         await self._sleep(self._loop_interval / 2)
         return True
 
+    _DOWNLOAD_STARTUP_GRACE_SECONDS = 90.0
+    """How long to wait for the download process's first availability report before starting
+    inference anyway, so a missing/failed download process can never wedge startup forever."""
+
+    def _on_download_availability(self, message: HordeDownloadAvailabilityMessage) -> None:
+        """Record an on-disk availability snapshot from the download process.
+
+        On the first authoritative (post-scan) report, request background downloads of any
+        configured-but-missing models, then (re)check whether inference processes can be started now
+        that disk presence is known. Early initializing/scanning reports update the live status only;
+        acting on them would request downloads against an as-yet-incomplete present set.
+        """
+        self._model_availability.update(
+            present=set(message.available_model_names),
+            currently_downloading=message.currently_downloading,
+            pending=tuple(message.pending_downloads),
+            failed=tuple(message.failed_downloads),
+            status=message.status,
+            scan_complete=message.scan_complete,
+        )
+
+        if message.scan_complete and not self._initial_download_requested:
+            self._initial_download_requested = True
+            plan = self._get_download_plan_summary()
+            if plan is not None:
+                StatusReporter.log_startup_download_plan(plan)
+            present = self._model_availability.present or set()
+            configured = set(self.bridge_data.image_models_to_load)
+            missing = sorted(configured - present)
+            # Only run the (heavier) auxiliary pass on a genuinely incomplete install; a worker that
+            # already has all its image models almost certainly has its aux models too.
+            download_aux = len(missing) > 0
+            if missing or download_aux:
+                logger.info(
+                    f"Worker has {len(present)} of {len(configured)} configured models on disk; "
+                    f"background-downloading {len(missing)} missing: {missing}",
+                )
+                self._process_lifecycle.request_downloads(missing, download_aux=download_aux)
+
+        self._maybe_start_inference_processes()
+
+    def _maybe_start_inference_processes(self) -> None:
+        """Start inference processes once at least one model is present (background-download mode).
+
+        In the default (non-background-download) mode inference processes are started up front, so
+        this is a no-op. With background downloads enabled, starting before any model is on disk
+        would crash the inference children ("no models available"); this defers them until disk
+        presence is known, with a grace-period fallback so a silent download process cannot hang us.
+        """
+        if self._inference_processes_started or not self._enable_background_downloads:
+            return
+
+        availability = self._model_availability
+        if availability.scan_complete and len(availability.present or set()) > 0:
+            logger.info("At least one model is present on disk; starting inference processes")
+            self._process_lifecycle.start_inference_processes()
+            self._inference_processes_started = True
+            return
+
+        # While the download process is still initializing/scanning, or reporting an empty disk, we
+        # keep waiting: starting inference with no models would only crash and churn the children. The
+        # grace fallback exists solely for a download process that never reports at all (crashed/hung
+        # import); an actively-initializing or -scanning process counts as alive and resets the clock.
+        if availability.is_known and not availability.scan_complete:
+            self._download_wait_started = time.time()
+            return
+
+        if not availability.is_known and (time.time() - self._download_wait_started) > (
+            self._DOWNLOAD_STARTUP_GRACE_SECONDS
+        ):
+            logger.warning(
+                "No model availability report after "
+                f"{self._DOWNLOAD_STARTUP_GRACE_SECONDS:.0f}s; starting inference processes anyway",
+            )
+            self._process_lifecycle.start_inference_processes()
+            self._inference_processes_started = True
+
     async def _process_control_loop(self) -> None:
         self._process_lifecycle.start_safety_processes()
-        self._process_lifecycle.start_inference_processes()
+        self._download_wait_started = time.time()
+        if self._enable_background_downloads:
+            self._process_lifecycle.start_download_process()
+            # Inference processes are started lazily once a model is on disk; see
+            # _maybe_start_inference_processes (called from the availability handler and each tick).
+        else:
+            self._process_lifecycle.start_inference_processes()
+            self._inference_processes_started = True
 
         while True:
             try:
@@ -951,6 +1083,15 @@ class HordeWorkerProcessManager:
             except CancelledError as e:
                 self._shutdown()
                 logger.debug(f"CancelledError: {e}")
+            except Exception as e:
+                # A failure in a control tick must not abandon in-flight work by killing the loop:
+                # log, initiate a graceful shutdown, and fall through to the orderly teardown below
+                # (the timed-shutdown backstop bounds it).
+                logger.error(f"Unexpected error in control loop; shutting down gracefully: {e}")
+                logger.exception(e)
+                self._shutdown()
+                self._start_timed_shutdown()
+                break
 
         while len(self._job_tracker.jobs_pending_inference) > 0:
             await asyncio.sleep(0.2)
@@ -961,6 +1102,7 @@ class HordeWorkerProcessManager:
 
         self._process_lifecycle.end_inference_processes(force=True)
         self._process_lifecycle.end_safety_processes()
+        self._process_lifecycle.end_download_process()
 
         logger.info("Shutting down process manager")
         self._state.shut_down = True
@@ -1055,10 +1197,314 @@ class HordeWorkerProcessManager:
             jobs_being_safety_checked=len(self._job_tracker.jobs_being_safety_checked),
             jobs_in_progress=len(self._job_tracker.jobs_in_progress),
             total_ram_gigabytes=self.total_ram_gigabytes,
+            download_status=self._model_availability.status,
+            download_plan=self._get_download_plan_summary(),
         )
 
         self._last_status_message_time = reporter.last_status_message_time
         self._status_message_frequency = updated_frequency
+
+    _supervisor_publish_min_interval = 0.0
+    """A hard floor between snapshots regardless of change (0 = publish every tick when state changed)."""
+    _supervisor_publish_floor_interval = 2.0
+    """Maximum seconds between snapshots when nothing changes — a heartbeat so the TUI knows we're alive."""
+
+    def _handle_supervisor_commands(self) -> None:
+        """Drain and apply any control commands from a supervising frontend (no-op if unsupervised)."""
+        if self._supervisor is None:
+            return
+        for command in self._supervisor.drain_commands():
+            try:
+                self._apply_supervisor_command(command)
+            except Exception as e:
+                logger.warning(f"Failed to apply supervisor command {command.command.name}: {e}")
+        if self._supervisor.closed:
+            self._supervisor = None
+
+    def _apply_supervisor_command(self, command: SupervisorControlMessage) -> None:
+        """Dispatch one supervisor command onto the worker's existing control mechanisms."""
+        match command.command:
+            case SupervisorCommand.PAUSE | SupervisorCommand.DRAIN:
+                self._state.supervisor_paused = True
+                logger.info("Supervisor requested pause: no new jobs will be popped (in-flight jobs finish).")
+            case SupervisorCommand.RESUME:
+                self._state.supervisor_paused = False
+                logger.info("Supervisor requested resume: job popping re-enabled.")
+            case SupervisorCommand.RESTART_PROCESS:
+                if command.process_id is None:
+                    logger.warning("RESTART_PROCESS supervisor command missing process_id; ignoring.")
+                    return
+                process_info = self._process_map.get(command.process_id)
+                if process_info is None or process_info.process_type != HordeProcessType.INFERENCE:
+                    logger.warning(f"RESTART_PROCESS: no inference process with id {command.process_id}.")
+                    return
+                logger.warning(f"Supervisor requested restart of inference process {command.process_id}.")
+                self._process_lifecycle._replace_inference_process(process_info)
+            case SupervisorCommand.RELOAD_CONFIG:
+                logger.info("Supervisor requested config reload from disk.")
+                self.get_bridge_data_from_disk()
+            case SupervisorCommand.SET_CONCURRENCY:
+                self._apply_set_concurrency(command.target_threads, command.target_processes)
+            case SupervisorCommand.PAUSE_DOWNLOADS:
+                logger.info("Supervisor requested download pause.")
+                self._process_lifecycle.set_download_controls(paused=True)
+            case SupervisorCommand.RESUME_DOWNLOADS:
+                logger.info("Supervisor requested download resume.")
+                self._process_lifecycle.set_download_controls(paused=False)
+            case SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT:
+                rate = command.download_rate_limit_kbps or 0
+                limit_label = "unlimited" if rate == 0 else f"{rate} KB/s"
+                logger.info(f"Supervisor set download rate limit to {limit_label}.")
+                self._process_lifecycle.set_download_controls(rate_limit_kbps=rate)
+            case SupervisorCommand.SHUTDOWN:
+                logger.warning("Supervisor requested shutdown.")
+                # Graceful first: drain in-flight work via the normal shutdown path; the
+                # (drain-aware, idempotent) timed-shutdown is only the force-kill backstop.
+                self._shutdown()
+                self._start_timed_shutdown()
+
+    def _apply_set_concurrency(self, target_threads: int | None, target_processes: int | None) -> None:
+        """Adjust the live concurrent-inference cap and/or running inference-process count.
+
+        Both knobs are independent: ``target_threads`` changes how many inferences may run at once
+        (clamped to the provisioned ceiling), while ``target_processes`` changes how many inference
+        processes are staged. The benchmark drives both per level; an operator can use either as a
+        memory/VRAM-pressure lever.
+        """
+        if target_threads is not None:
+            applied = self._runtime_config.set_effective_max_threads(target_threads)
+            logger.info(f"Supervisor set concurrent-inference cap to {applied} (requested {target_threads}).")
+        if target_processes is not None:
+            result = self._process_lifecycle.scale_inference_processes(target_processes)
+            self._inference_processes_started = True
+            logger.info(f"Supervisor scaled inference processes to {result} (requested {target_processes}).")
+
+    def install_benchmark_scenario(
+        self,
+        *,
+        jobs: list[ImageGenerateJobPopResponse] | None,
+        alchemy_forms: list[AlchemyFormSpec] | None = None,
+    ) -> None:
+        """Swap in a fresh canned scenario and reset per-level metrics (warm benchmark worker).
+
+        The worker keeps running between levels; this replaces the job/alchemy sources it pops from
+        and clears the aggregated run metrics so the next level's numbers start clean. Completion is
+        tracked by the caller via job-tracker count deltas (the tracker itself is not reset).
+        """
+        # Always install concrete (possibly empty) sources: a None job source under skip_api would
+        # make the popper fall back to the default cycling scenario, polluting the level.
+        self._job_popper.set_canned_job_source(CannedJobSource(jobs or []))
+        self._alchemy_coordinator.set_canned_alchemy_source(CannedAlchemySource(alchemy_forms or []))
+        self._run_metrics.reset()
+
+    def _supervisor_state_signature(self) -> tuple[object, ...]:
+        """A cheap fingerprint of the display-relevant worker state.
+
+        Publishing is gated on this changing (plus a periodic floor): it captures the per-process states,
+        sampling progress, and headline counters that the dashboards render — but deliberately omits
+        constantly-jittering memory/kudos figures, which ride the floor refresh instead. Computing it each
+        tick avoids the cost of a full snapshot build (notably ``run_metrics.snapshot``) when idle.
+        """
+        per_process = tuple(
+            (
+                info.process_id,
+                info.last_process_state,
+                info.last_current_step,
+                info.last_total_steps,
+                info.loaded_horde_model_name,
+            )
+            for info in self._process_map.values()
+        )
+        return (
+            per_process,
+            self.num_jobs_total,
+            self._job_tracker.total_num_completed_jobs,
+            self._job_tracker.num_jobs_faulted,
+            len(self._job_tracker.jobs_in_progress),
+            len(self._job_tracker.jobs_pending_inference),
+            len(self._job_tracker.jobs_pending_safety_check),
+            len(self._job_tracker.jobs_being_safety_checked),
+            self._state.last_pop_maintenance_mode or self._state.supervisor_paused,
+            self._state.shutting_down,
+            self._user_info_failed,
+        )
+
+    def _publish_supervisor_snapshot(self) -> None:
+        """Push a worker-state snapshot when display state changed, or at the periodic heartbeat floor.
+
+        Snapshots go out whenever the cheap state signature changes (so transitions and sampling progress
+        surface within one control-loop tick, ~2 Hz) and at least every ``_supervisor_publish_floor_interval``
+        seconds otherwise. A hard ``_supervisor_publish_min_interval`` floor can rate-limit bursts. The send
+        itself is non-blocking (the channel's daemon thread owns the pipe), so this never stalls the loop.
+        """
+        if self._supervisor is None:
+            return
+        now = time.time()
+        since_last = now - self._last_supervisor_publish_time
+        if since_last < self._supervisor_publish_min_interval:
+            return
+
+        signature = self._supervisor_state_signature()
+        changed = signature != self._last_supervisor_signature
+        if not changed and since_last < self._supervisor_publish_floor_interval:
+            return
+
+        self._last_supervisor_publish_time = now
+        self._last_supervisor_signature = signature
+        try:
+            snapshot = self._build_worker_state_snapshot()
+        except Exception as e:
+            logger.debug(f"Failed to build supervisor snapshot: {e}")
+            return
+        if not self._supervisor.send_snapshot(snapshot):
+            self._supervisor = None
+
+    def _get_download_plan_summary(self) -> DownloadPlanSummary | None:
+        """Compute the config's disk-implications summary once, then return the cached value.
+
+        Existence-only and torch-free (see :mod:`model_download_plan`); the live download process stays
+        authoritative about integrity. Returns None until the model reference is available, so the
+        snapshot simply omits the plan rather than blocking on a not-yet-loaded reference.
+        """
+        if self._download_plan_computed:
+            return self._download_plan_summary
+
+        reference = self.stable_diffusion_reference
+        if reference is None:
+            return None
+
+        from horde_worker_regen import model_download_plan
+
+        plan = model_download_plan.compute_download_plan(
+            list(self.bridge_data.image_models_to_load),
+            reference,
+            extra_model_directories=self.bridge_data.extra_model_directories,
+        )
+        self._download_plan_summary = DownloadPlanSummary(
+            present_bytes=plan.present_bytes,
+            to_download_bytes=plan.to_download_bytes,
+            total_bytes=plan.total_bytes,
+            free_disk_bytes=plan.free_disk_bytes,
+            fits=plan.fits,
+            shortfall_bytes=plan.shortfall_bytes,
+            num_present=plan.num_present,
+            num_to_download=plan.num_to_download,
+            sizes_complete=plan.sizes_complete,
+        )
+        self._download_plan_computed = True
+        return self._download_plan_summary
+
+    def _build_worker_state_snapshot(self) -> WorkerStateSnapshot:
+        """Assemble current worker state for the supervisor pipe (mirrors what StatusReporter prints)."""
+        import horde_worker_regen
+
+        bridge_data = self.bridge_data
+        processes = [ProcessSnapshot.from_process_info(info) for info in self._process_map.values()]
+        active_models = sorted(
+            {info.loaded_horde_model_name for info in self._process_map.values() if info.loaded_horde_model_name},
+        )
+
+        run_metrics = self._run_metrics.snapshot(
+            num_process_recoveries=self._process_lifecycle._num_process_recoveries,
+            num_job_slowdowns=self._job_submitter.num_job_slowdowns,
+            time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
+            disk_min_free_bytes=self._disk_monitor.min_free_bytes,
+        )
+
+        session_hours = max((time.time() - self.session_start_time) / 3600.0, 1e-6)
+        kudos_session = self._state.kudos_generated_this_session
+        kudos_per_hour = kudos_session / session_hours if kudos_session else None
+
+        last_pop_time = self._state.last_job_pop_time
+        seconds_since_last_pop = (time.time() - last_pop_time) if last_pop_time else None
+        api_messages: list[str] = []
+        for api_message in self._job_popper.api_messages_received.values():
+            if api_message.message_text:
+                api_messages.append(api_message.message_text)
+
+        config = WorkerConfigSummary(
+            dreamer_name=bridge_data.dreamer_worker_name,
+            worker_version=horde_worker_regen.__version__,
+            horde_username=self.user_info.username if self.user_info is not None else None,
+            num_models=len(bridge_data.image_models_to_load),
+            custom_models=bool(bridge_data.custom_models),
+            max_power=bridge_data.max_power,
+            max_threads=self.max_concurrent_inference_processes,
+            queue_size=bridge_data.queue_size,
+            max_batch=bridge_data.max_batch,
+            safety_on_gpu=bridge_data.safety_on_gpu,
+            allow_img2img=bridge_data.allow_img2img,
+            allow_lora=bridge_data.allow_lora,
+            allow_controlnet=bridge_data.allow_controlnet,
+            allow_sdxl_controlnet=bridge_data.allow_sdxl_controlnet,
+            allow_post_processing=bridge_data.allow_post_processing,
+            high_performance_mode=bridge_data.high_performance_mode,
+            moderate_performance_mode=bridge_data.moderate_performance_mode,
+            high_memory_mode=bridge_data.high_memory_mode,
+            very_high_memory_mode=bridge_data.very_high_memory_mode,
+            extra_slow_worker=bridge_data.extra_slow_worker,
+        )
+
+        return WorkerStateSnapshot(
+            session_start_time=self.session_start_time,
+            shutting_down=self._state.shutting_down,
+            maintenance_mode=self._state.last_pop_maintenance_mode or self._state.supervisor_paused,
+            too_many_consecutive_failed_jobs=self._state.too_many_consecutive_failed_jobs,
+            worker_registered=self.user_info is not None,
+            user_info_failed=self._user_info_failed,
+            user_info_failed_reason=self._user_info_failed_reason,
+            in_error_backoff=self._job_popper._pop_throttler.is_in_error_backoff,
+            consecutive_failed_jobs=self._state.consecutive_failed_jobs,
+            seconds_since_last_pop=seconds_since_last_pop,
+            api_messages=api_messages,
+            config=config,
+            processes=processes,
+            num_jobs_popped=self.num_jobs_total,
+            num_jobs_submitted=self._job_tracker.total_num_completed_jobs,
+            num_jobs_faulted=self._job_tracker.num_jobs_faulted,
+            num_job_slowdowns=self._job_submitter.num_job_slowdowns,
+            num_process_recoveries=self._process_lifecycle._num_process_recoveries,
+            pending_megapixelsteps=self._job_tracker.get_pending_megapixelsteps(),
+            jobs_pending_inference=len(self._job_tracker.jobs_pending_inference),
+            jobs_in_progress=len(self._job_tracker.jobs_in_progress),
+            jobs_pending_safety_check=len(self._job_tracker.jobs_pending_safety_check),
+            jobs_being_safety_checked=len(self._job_tracker.jobs_being_safety_checked),
+            time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
+            kudos_per_hour=kudos_per_hour,
+            kudos_this_session=kudos_session,
+            active_models=active_models,
+            gpu_utilization_mean_percent=run_metrics.gpu_utilization_mean_percent,
+            gpu_utilization_busy_fraction=run_metrics.gpu_utilization_busy_fraction,
+            vram_high_water_mb_per_process=run_metrics.vram_used_high_water_mb_per_process,
+            ram_high_water_mb_per_process=run_metrics.ram_used_high_water_mb_per_process,
+            disk_free_bytes=dict(self._disk_monitor.current_free_bytes),
+            recent_jobs=[
+                RecentJobRecord.from_metrics_record(job) for job in run_metrics.jobs[-RECENT_JOBS_IN_SNAPSHOT:]
+            ],
+            downloads=self._model_availability.status,
+            download_plan=self._get_download_plan_summary(),
+        )
+
+    def build_run_record(self) -> WorkerRunRecord:
+        """Return a durable summary of this worker session for app-state persistence.
+
+        Read after the main loop ends (the counters remain valid on the manager). ``clean_exit`` is
+        False when the session tripped the consecutive-failure circuit breaker, which both flags a
+        bad run and disqualifies the active config from being recorded as known-good.
+        """
+        import horde_worker_regen
+
+        ended_at = time.time()
+        return WorkerRunRecord(
+            started_at=self.session_start_time,
+            ended_at=ended_at,
+            duration_seconds=max(0.0, ended_at - self.session_start_time),
+            worker_version=horde_worker_regen.__version__,
+            jobs_submitted=self._job_tracker.total_num_completed_jobs,
+            jobs_faulted=self._job_tracker.num_jobs_faulted,
+            kudos_this_session=self._state.kudos_generated_this_session,
+            clean_exit=not self._state.too_many_consecutive_failed_jobs,
+        )
 
     _bridge_data_loop_interval = 1.0
     """The interval between bridge data loop iterations."""
@@ -1078,16 +1524,33 @@ class HordeWorkerProcessManager:
             return
 
         try:
+            previous_effective = self._runtime_config.effective_max_threads
+            # The setter calls RuntimeConfig.update, which re-derives the effective concurrency cap
+            # (clamped to the session ceiling) from the reloaded max_threads.
             self.bridge_data = BridgeDataLoader.load(
                 file_path=BRIDGE_CONFIG_FILENAME,
                 horde_model_reference_manager=self.horde_model_reference_manager,
             )
-            if self.bridge_data.max_threads != self._max_concurrent_inference_processes:
+            new_effective = self._runtime_config.effective_max_threads
+            if new_effective != previous_effective:
+                logger.info(
+                    f"Concurrent-inference cap changed {previous_effective} -> {new_effective} "
+                    f"from {BRIDGE_CONFIG_FILENAME}.",
+                )
+            if self.bridge_data.max_threads > self._max_concurrent_inference_processes:
                 logger.warning(
-                    f"max_threads in {BRIDGE_CONFIG_FILENAME} cannot be changed while the worker is running.",
+                    f"max_threads={self.bridge_data.max_threads} exceeds this session's ceiling of "
+                    f"{self._max_concurrent_inference_processes} (capped to {new_effective}); "
+                    "restart the worker to raise the ceiling.",
                 )
             logger.debug(f"Models to load: {self.bridge_data.image_models_to_load}")
             logger.debug(f"Custom models: {self.bridge_data.custom_models}")
+            # Re-assert the config's download controls (config is authoritative on reload, overriding any
+            # prior live TUI override); a None rate-limit means unlimited, sent as 0 to clear any cap.
+            self._process_lifecycle.set_download_controls(
+                paused=self.bridge_data.downloads_paused,
+                rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
+            )
         except Exception as e:
             logger.debug(e)
 
@@ -1121,20 +1584,43 @@ class HordeWorkerProcessManager:
             except CancelledError as e:
                 self._shutdown()
                 logger.debug(f"CancelledError: {e}")
+            except Exception as e:
+                # Best-effort config watcher: a transient read/parse error (e.g. the file briefly
+                # missing mid-rewrite) must never take the worker down. Log and retry next interval.
+                logger.warning(f"Error while watching {BRIDGE_CONFIG_FILENAME} for changes: {e}")
+                await asyncio.sleep(self._bridge_data_loop_interval)
 
     def _handle_exception(self, task: asyncio.Task[None]) -> None:
-        """Logs exceptions from asyncio tasks.
+        """Supervise a finished main-loop task; shut down gracefully if one ends unexpectedly.
 
-        :param task: asyncio task to monitor
-        :return: None
+        Each main-loop coroutine is meant to run for the worker's whole life. If one finishes while
+        the worker is not already shutting down — whether by raising or by returning early — the
+        worker would otherwise limp on with a dead loop (e.g. jobs popped but never submitted, which
+        orphans them). Instead, initiate a graceful shutdown so in-flight work drains and any
+        supervising frontend relaunches us.
+
+        This runs on the event-loop thread, so it must not block or ``sys.exit``: setting the
+        shutdown flag lets the existing drain-and-exit path run, bounded by the timed-shutdown
+        backstop.
         """
+        if task.cancelled():
+            return
+
         ex = task.exception()
+
+        if self._state.shutting_down or self._state.shut_down:
+            if ex is not None:
+                logger.debug(f"main loop task ended during shutdown: {ex}")
+            return
+
         if ex is not None:
-            if self._state.shutting_down:
-                logger.debug(f"exception thrown by a main loop task: {ex}")
-            else:
-                logger.error(f"exception thrown by a main loop task: {ex}")
-                logger.exception(ex)
+            logger.error(f"main loop task ended unexpectedly: {ex}")
+            logger.exception(ex)
+        else:
+            logger.error("A main loop task returned unexpectedly while the worker was running; shutting down.")
+
+        self._shutdown()
+        self._start_timed_shutdown()
 
     async def _main_loop(self) -> None:
         aiohttp_session = ClientSession(requote_redirect_url=False)
@@ -1166,7 +1652,16 @@ class HordeWorkerProcessManager:
             for task in tasks:
                 task.add_done_callback(self._handle_exception)
 
-            await asyncio.gather(*tasks)
+            # return_exceptions=True so one failing loop does not cancel its siblings mid-flight:
+            # _handle_exception has already initiated a graceful shutdown, and we want the other
+            # loops (notably the submitter) to keep draining in-flight work until done.
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            if not self._state.shut_down:
+                self._shutdown()
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(result, CancelledError):
+                    logger.error(f"main loop task raised during shutdown: {result}")
 
     def start(self) -> None:
         """Start the process manager."""

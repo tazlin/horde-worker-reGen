@@ -1,0 +1,429 @@
+"""The supervisor channel: structured state + control between a TUI/supervisor and the worker.
+
+A supervising frontend (``horde_worker_regen.tui``) launches the worker as a child process and holds
+one end of a duplex pipe. The worker pushes :class:`WorkerStateSnapshot` objects at a steady cadence
+and drains :class:`SupervisorControlMessage` commands each loop tick. This mirrors the worker's own
+internal IPC (see ``messages.py``) and is the structured upgrade of the ``.abort``-sentinel external
+supervision hook already present in the control loop.
+
+Models here are deliberately pure-data and JSON-round-trippable: the default transport is a
+``multiprocessing`` pipe (pickle), but the same models serialize cleanly for the localhost-socket
+fallback the launcher can swap to without touching any screen code.
+"""
+
+from __future__ import annotations
+
+import enum
+import threading
+import time
+from typing import TYPE_CHECKING
+
+from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from multiprocessing.connection import Connection
+
+    from horde_worker_regen.process_management.process_info import HordeProcessInfo
+    from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
+
+SUPERVISOR_PROTOCOL_VERSION = 1
+"""Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect."""
+
+RECENT_JOBS_IN_SNAPSHOT = 25
+"""How many of the most recent finished-job records to carry in a snapshot (bounds payload size)."""
+
+
+class WorkerConfigSummary(BaseModel):
+    """The operationally-relevant bridge-data fields the overview/worker panels display.
+
+    This is a compact projection of ``reGenBridgeData``; the config *editor* reads the full
+    ``bridgeData.yaml`` directly, so the snapshot only carries what the dashboards render.
+    """
+
+    dreamer_name: str
+    worker_version: str
+    horde_username: str | None = None
+    num_models: int = 0
+    custom_models: bool = False
+    max_power: int = 8
+    max_threads: int = 1
+    queue_size: int = 1
+    max_batch: int = 1
+    safety_on_gpu: bool = False
+    allow_img2img: bool = True
+    allow_lora: bool = False
+    allow_controlnet: bool = False
+    allow_sdxl_controlnet: bool = False
+    allow_post_processing: bool = True
+    high_performance_mode: bool = False
+    moderate_performance_mode: bool = False
+    high_memory_mode: bool = False
+    very_high_memory_mode: bool = False
+    extra_slow_worker: bool = False
+
+
+class ProcessSnapshot(BaseModel):
+    """A serializable projection of one child process's live state (from ``HordeProcessInfo``)."""
+
+    process_id: int
+    process_type: str
+    """The ``HordeProcessType`` name (e.g. ``INFERENCE`` / ``SAFETY``)."""
+    last_process_state: str
+    """The ``HordeProcessState`` name (e.g. ``WAITING_FOR_JOB`` / ``INFERENCE_STARTING``)."""
+    is_alive: bool
+    is_busy: bool
+
+    loaded_horde_model_name: str | None = None
+    loaded_horde_model_baseline: str | None = None
+    current_job_id: str | None = None
+
+    last_heartbeat_timestamp: float = 0.0
+    last_heartbeat_delta: float = 0.0
+    last_heartbeat_type: str = "OTHER"
+    heartbeats_inference_steps: int = 0
+    last_heartbeat_percent_complete: int | None = None
+
+    ram_usage_bytes: int = 0
+    vram_usage_mb: int = 0
+    total_vram_mb: int = 0
+    batch_amount: int = 1
+
+    last_iterations_per_second: float | None = None
+    last_current_step: int | None = None
+    last_total_steps: int | None = None
+
+    vram_used_high_water_mb: int = 0
+    ram_used_high_water_mb: int = 0
+
+    @classmethod
+    def from_process_info(cls, info: HordeProcessInfo) -> ProcessSnapshot:
+        """Build a snapshot from a live ``HordeProcessInfo`` (read-only; no import coupling)."""
+        job = info.last_job_referenced
+        current_job_id = str(job.id_.root) if job is not None and job.id_ is not None else None
+        baseline = info.loaded_horde_model_baseline
+        return cls(
+            process_id=info.process_id,
+            process_type=info.process_type.name,
+            last_process_state=info.last_process_state.name,
+            is_alive=info.is_process_alive(),
+            is_busy=info.is_process_busy(),
+            loaded_horde_model_name=info.loaded_horde_model_name,
+            loaded_horde_model_baseline=str(baseline) if baseline is not None else None,
+            current_job_id=current_job_id,
+            last_heartbeat_timestamp=info.last_heartbeat_timestamp,
+            last_heartbeat_delta=info.last_heartbeat_delta,
+            last_heartbeat_type=info.last_heartbeat_type.name,
+            heartbeats_inference_steps=info.heartbeats_inference_steps,
+            last_heartbeat_percent_complete=info.last_heartbeat_percent_complete,
+            ram_usage_bytes=info.ram_usage_bytes,
+            vram_usage_mb=info.vram_usage_mb,
+            total_vram_mb=info.total_vram_mb,
+            batch_amount=info.batch_amount,
+            last_iterations_per_second=info.last_iterations_per_second,
+            last_current_step=info.last_current_step,
+            last_total_steps=info.last_total_steps,
+            vram_used_high_water_mb=info.vram_used_high_water_mb,
+            ram_used_high_water_mb=info.ram_used_high_water_mb,
+        )
+
+
+class RecentJobRecord(BaseModel):
+    """A lean projection of one finished job, for the insights/recent-activity views.
+
+    Deliberately a local model (not ``run_metrics.JobMetricsRecord``) so this module, imported by
+    the TUI and the fake worker, stays free of the heavy ``horde_sdk``/logfire import chain.
+    """
+
+    job_id: str
+    is_alchemy: bool = False
+    faulted: bool = False
+    queue_wait_seconds: float | None = None
+    e2e_seconds: float | None = None
+    safety_seconds: float | None = None
+
+    @classmethod
+    def from_metrics_record(cls, record: JobMetricsRecord) -> RecentJobRecord:
+        """Project a worker-side ``JobMetricsRecord`` into the lean wire form."""
+        return cls(
+            job_id=record.job_id,
+            is_alchemy=record.is_alchemy,
+            faulted=record.faulted,
+            queue_wait_seconds=record.queue_wait_seconds,
+            e2e_seconds=record.e2e_seconds,
+            safety_seconds=record.safety_seconds,
+        )
+
+
+class DownloadPhase(enum.StrEnum):
+    """What the background download process is doing right now."""
+
+    INITIALIZING = "initializing"
+    """Loading model managers / fetching the model reference (a network call on first run)."""
+    SCANNING = "scanning"
+    """Verifying which configured models are already on disk (may hash large files on first run)."""
+    DOWNLOADING = "downloading"
+    """Actively downloading one or more models."""
+    IDLE = "idle"
+    """Nothing queued; all requested models are present (or were skipped)."""
+    PAUSED = "paused"
+    """Downloads are paused by the operator; queued work is held."""
+    ERROR = "error"
+    """The download subsystem hit an unrecoverable error (see ``error_message``)."""
+
+
+class DownloadItem(BaseModel):
+    """A queued (not yet started) download, labelled with the feature that needs it."""
+
+    model_name: str
+    feature: str
+    """Human label for why this downloads (e.g. 'image model', 'LoRa', 'ControlNet annotators')."""
+    target_dir: str | None = None
+    """Where the file(s) will be written on disk."""
+    size_bytes: int | None = None
+
+
+class CurrentDownloadStatus(BaseModel):
+    """The download in progress right now, with live progress."""
+
+    model_name: str
+    feature: str
+    target_dir: str
+    downloaded_bytes: int = 0
+    total_bytes: int = 0
+    speed_bps: float | None = None
+    eta_seconds: float | None = None
+
+    @property
+    def percent(self) -> float | None:
+        """Completion as a 0-100 percentage, or None when the total size is unknown."""
+        if self.total_bytes <= 0:
+            return None
+        return min(100.0, self.downloaded_bytes / self.total_bytes * 100.0)
+
+
+class DownloadFailure(BaseModel):
+    """A download that was attempted and failed, with a human-readable reason."""
+
+    model_name: str
+    feature: str
+    reason: str
+
+
+class DownloadStatusSnapshot(BaseModel):
+    """The full state of the download subsystem, for the TUI/console downloads view."""
+
+    phase: DownloadPhase = DownloadPhase.IDLE
+    current: CurrentDownloadStatus | None = None
+    pending: list[DownloadItem] = Field(default_factory=list)
+    failures: list[DownloadFailure] = Field(default_factory=list)
+    present_model_names: list[str] = Field(default_factory=list)
+    paused: bool = False
+    rate_limit_kbps: int | None = None
+    error_message: str | None = None
+
+
+class DownloadPlanSummary(BaseModel):
+    """The disk implications of the current model config (computed once via model_download_plan)."""
+
+    present_bytes: int = 0
+    to_download_bytes: int = 0
+    total_bytes: int = 0
+    free_disk_bytes: int | None = None
+    fits: bool = True
+    shortfall_bytes: int = 0
+    num_present: int = 0
+    num_to_download: int = 0
+    sizes_complete: bool = True
+    """False when some configured models lack size metadata, so the byte totals are a lower bound."""
+
+
+class WorkerStateSnapshot(BaseModel):
+    """One frame of worker state pushed from the worker to its supervisor over the pipe.
+
+    Carries the same headline information the console ``StatusReporter`` assembles, plus the
+    per-process detail the live view renders. Payload size is bounded: ``recent_jobs`` is capped
+    at :data:`RECENT_JOBS_IN_SNAPSHOT`.
+    """
+
+    protocol_version: int = SUPERVISOR_PROTOCOL_VERSION
+    timestamp: float = Field(default_factory=time.time)
+    session_start_time: float = 0.0
+
+    shutting_down: bool = False
+    maintenance_mode: bool = False
+    too_many_consecutive_failed_jobs: bool = False
+
+    # Connectivity / health signals the worker already tracks (surfaced for the status monitor).
+    worker_registered: bool = False
+    """Whether the AI Horde API has returned this worker's details at least once (it is known)."""
+    user_info_failed: bool = False
+    """The most recent user-details API call failed; the clearest API/network-reachability signal."""
+    user_info_failed_reason: str | None = None
+    """A short description of the last user-info failure, when one occurred."""
+    in_error_backoff: bool = False
+    """The job-pop throttler is backing off after repeated pop failures (server/network trouble)."""
+    consecutive_failed_jobs: int = 0
+    """How many jobs have failed back-to-back (resets on a success)."""
+    seconds_since_last_pop: float | None = None
+    """Seconds since the worker last successfully popped a job (None if it never has)."""
+    api_messages: list[str] = Field(default_factory=list)
+    """Operator/maintenance messages delivered by the horde in pop responses."""
+
+    config: WorkerConfigSummary
+    processes: list[ProcessSnapshot] = Field(default_factory=list)
+
+    # Headline job counters (from the job tracker / submitter / popper).
+    num_jobs_popped: int = 0
+    num_jobs_submitted: int = 0
+    num_jobs_faulted: int = 0
+    num_job_slowdowns: int = 0
+    num_process_recoveries: int = 0
+    pending_megapixelsteps: int = 0
+    jobs_pending_inference: int = 0
+    jobs_in_progress: int = 0
+    jobs_pending_safety_check: int = 0
+    jobs_being_safety_checked: int = 0
+    time_spent_no_jobs_available: float = 0.0
+
+    kudos_per_hour: float | None = None
+    kudos_this_session: float | None = None
+
+    active_models: list[str] = Field(default_factory=list)
+
+    gpu_utilization_mean_percent: float | None = None
+    gpu_utilization_busy_fraction: float | None = None
+
+    vram_high_water_mb_per_process: dict[int, int] = Field(default_factory=dict)
+    ram_high_water_mb_per_process: dict[int, int] = Field(default_factory=dict)
+    disk_free_bytes: dict[str, int] = Field(default_factory=dict)
+
+    downloads: DownloadStatusSnapshot | None = None
+    """Live download-subsystem state (None when background downloads are disabled)."""
+    download_plan: DownloadPlanSummary | None = None
+    """The one-time disk implications of the configured models (None when not computed)."""
+
+    recent_jobs: list[RecentJobRecord] = Field(default_factory=list)
+    """The most recent finished-job records, newest last (capped)."""
+
+
+class SupervisorCommand(enum.Enum):
+    """A control action the supervisor asks the worker to take, drained each loop tick."""
+
+    PAUSE = enum.auto()
+    """Enter maintenance mode: stop popping new jobs (in-flight jobs finish)."""
+    RESUME = enum.auto()
+    """Leave maintenance mode and resume popping jobs."""
+    DRAIN = enum.auto()
+    """Stop popping and let in-flight jobs finish without exiting (alias of PAUSE for now)."""
+    RESTART_PROCESS = enum.auto()
+    """Replace one inference process by ``process_id`` (e.g. a stuck slot)."""
+    RELOAD_CONFIG = enum.auto()
+    """Re-read ``bridgeData.yaml`` from disk and hot-swap the runtime config."""
+    SET_CONCURRENCY = enum.auto()
+    """Adjust the live inference concurrency: thread cap and/or running process count."""
+    PAUSE_DOWNLOADS = enum.auto()
+    """Hold background model downloads (the current chunk loop blocks) until resumed."""
+    RESUME_DOWNLOADS = enum.auto()
+    """Resume held background model downloads."""
+    SET_DOWNLOAD_RATE_LIMIT = enum.auto()
+    """Set the background-download bandwidth cap in KB/s (0 or None clears the cap)."""
+    SHUTDOWN = enum.auto()
+    """Begin a graceful, timed shutdown of the worker."""
+
+
+class SupervisorControlMessage(BaseModel):
+    """A command sent from the supervisor to the worker over the pipe."""
+
+    command: SupervisorCommand
+    process_id: int | None = None
+    """The target process slot, required for :attr:`SupervisorCommand.RESTART_PROCESS`."""
+    target_threads: int | None = None
+    """The new concurrent-inference cap, for :attr:`SupervisorCommand.SET_CONCURRENCY` (clamped to \
+    the session ceiling)."""
+    target_processes: int | None = None
+    """The new running inference-process count, for :attr:`SupervisorCommand.SET_CONCURRENCY`."""
+    download_rate_limit_kbps: int | None = None
+    """The new download bandwidth cap in KB/s, for :attr:`SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT`."""
+
+
+class SupervisorChannel:
+    """The worker's end of the supervisor pipe, designed so the consumer can never stall the worker.
+
+    Snapshots are sent on a daemon thread from a single latest-only slot: :meth:`send_snapshot` only
+    updates the slot and returns immediately, so the worker's control loop never blocks on a slow or
+    hung supervisor (it just sends the freshest state once the consumer catches up). :meth:`drain_commands`
+    is non-blocking and skips a tick rather than wait if the sender thread is mid-send. A dead pipe is
+    caught and marks the channel closed.
+
+    Send and receive on the one duplex connection are serialized by a lock, so the sender thread and
+    the control loop never touch the connection concurrently.
+    """
+
+    def __init__(self, connection: Connection) -> None:
+        """Wrap the worker-side pipe connection and start the snapshot sender thread."""
+        self._connection = connection
+        self._lock = threading.Lock()
+        self._closed = False
+        self._latest: WorkerStateSnapshot | None = None
+        self._pending = threading.Event()
+        self._stop = threading.Event()
+        self._sender = threading.Thread(
+            target=self._send_loop,
+            name="supervisor-snapshot-sender",
+            daemon=True,
+        )
+        self._sender.start()
+
+    def send_snapshot(self, snapshot: WorkerStateSnapshot) -> bool:
+        """Hand the latest snapshot to the sender thread. Never blocks; returns False once closed."""
+        if self._closed:
+            return False
+        self._latest = snapshot
+        self._pending.set()
+        return True
+
+    def _send_loop(self) -> None:
+        """Send the freshest snapshot whenever one is pending (may block on a slow consumer; that's fine)."""
+        while not self._stop.is_set():
+            if not self._pending.wait(timeout=0.5):
+                continue
+            self._pending.clear()
+            snapshot = self._latest
+            if snapshot is None:
+                continue
+            with self._lock:
+                if self._closed:
+                    return
+                try:
+                    self._connection.send(snapshot)
+                except Exception:
+                    self._closed = True
+                    return
+
+    def drain_commands(self) -> list[SupervisorControlMessage]:
+        """Return all control messages currently waiting, without blocking (skips if a send is in progress)."""
+        if self._closed:
+            return []
+        commands: list[SupervisorControlMessage] = []
+        if not self._lock.acquire(blocking=False):
+            return commands
+        try:
+            while self._connection.poll():
+                message = self._connection.recv()
+                if isinstance(message, SupervisorControlMessage):
+                    commands.append(message)
+        except (EOFError, OSError):
+            self._closed = True
+        finally:
+            self._lock.release()
+        return commands
+
+    def close(self) -> None:
+        """Stop the sender thread (the connection itself is owned by the caller)."""
+        self._stop.set()
+        self._pending.set()
+
+    @property
+    def closed(self) -> bool:
+        """Whether the channel has encountered an unrecoverable pipe error."""
+        return self._closed

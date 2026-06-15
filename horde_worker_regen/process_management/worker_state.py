@@ -24,6 +24,9 @@ class WorkerState:
     last_pop_no_jobs_available: bool = False
     last_pop_maintenance_mode: bool = False
 
+    supervisor_paused: bool = False
+    """Local pause requested by a supervising frontend (TUI). Stops new job/alchemy pops; in-flight work finishes."""
+
     consecutive_failed_jobs: int = 0
     too_many_consecutive_failed_jobs: bool = False
     too_many_consecutive_failed_jobs_time: float = 0.0

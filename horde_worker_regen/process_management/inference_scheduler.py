@@ -59,7 +59,7 @@ class InferenceScheduler:
     _process_lifecycle: ProcessLifecycleManager
     _runtime_config: RuntimeConfig
     _model_metadata: ModelMetadata
-    _max_concurrent_inference_processes: int
+    _max_threads_ceiling: int
     _max_inference_processes: int
     _lru: LRUCache
 
@@ -111,7 +111,10 @@ class InferenceScheduler:
         self._process_lifecycle = process_lifecycle
         self._runtime_config = runtime_config
         self._model_metadata = model_metadata
-        self._max_concurrent_inference_processes = max_concurrent_inference_processes
+        # The constructor value is the provisioned ceiling; the *live* concurrent cap is read from
+        # the runtime config (see the _max_concurrent_inference_processes property) so it can change
+        # at runtime without resizing the inference semaphore.
+        self._max_threads_ceiling = max_concurrent_inference_processes
         self._max_inference_processes = max_inference_processes
         self._lru = lru
 
@@ -121,6 +124,11 @@ class InferenceScheduler:
         self._batch_wait_log_time = 0.0
         self._pending_line_skip = None
         self._model_last_in_demand = {}
+
+    @property
+    def _max_concurrent_inference_processes(self) -> int:
+        """The live concurrent-inference cap (effective ``max_threads``), bounded by the ceiling."""
+        return self._runtime_config.effective_max_threads
 
     @property
     def post_process_job_overlap_allowed(self) -> bool:

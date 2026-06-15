@@ -1,4 +1,5 @@
 # import yaml
+import asyncio
 import pathlib
 
 import pytest
@@ -93,8 +94,12 @@ def test_bridge_data_yaml() -> None:
     assert len(parsed_bridge_data.meta_load_instructions) == 1
 
 
-async def test_bridge_data_loader_yaml_template() -> None:
-    """Test that the bridge data template file can be loaded and parsed by a BridgeDataLoader."""
+def test_bridge_data_loader_yaml_template() -> None:
+    """Test that the bridge data template file can be loaded and parsed by a BridgeDataLoader.
+
+    Synchronous on purpose: ``BridgeDataLoader.load`` initializes the model reference manager via
+    ``asyncio.run`` internally, which cannot run inside a pytest-asyncio event loop.
+    """
     bridge_data_loader = BridgeDataLoader()
 
     if not ModelReferenceManager.has_instance():
@@ -130,7 +135,9 @@ async def test_bridge_data_loader_yaml_local_if_present() -> None:
     if not pathlib.Path("bridgeData.yaml").is_file():
         pytest.skip("bridgeData.yaml not found")
 
-    bridge_data = bridge_data_loader.load(
+    # `load` initializes the model reference manager via `asyncio.run`; run it off this event loop.
+    bridge_data = await asyncio.to_thread(
+        bridge_data_loader.load,
         file_path="bridgeData.yaml",
         file_format=ConfigFormat.yaml,
         horde_model_reference_manager=horde_model_reference_manager,
@@ -158,7 +165,9 @@ async def test_bridge_data_load_from_env_vars() -> None:
     else:
         horde_model_reference_manager = ModelReferenceManager.get_instance()
 
-    bridge_data = BridgeDataLoader.load_from_env_vars(
+    # `load_from_env_vars` initializes the model reference manager via `asyncio.run`; run it off-loop.
+    bridge_data = await asyncio.to_thread(
+        BridgeDataLoader.load_from_env_vars,
         horde_model_reference_manager=horde_model_reference_manager,
     )
     assert bridge_data is not None

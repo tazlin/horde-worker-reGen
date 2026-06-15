@@ -9,11 +9,15 @@ dependent levels; a failure on an axis stops higher rungs of that axis).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import dataclasses
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -27,6 +31,16 @@ from horde_worker_regen.benchmark.ladder import (
     RampLevel,
 )
 from horde_worker_regen.benchmark.memory_preflight import plan_soak_topology
+from horde_worker_regen.benchmark.progress_channel import (
+    LevelFinished,
+    LevelLiveSnapshot,
+    LevelProgress,
+    LevelStarted,
+    NullProgressSink,
+    ProgressSink,
+    RampFinished,
+    RampStarted,
+)
 from horde_worker_regen.benchmark.report import (
     BenchmarkReport,
     Finding,
@@ -43,8 +57,87 @@ from horde_worker_regen.benchmark.soak import build_validation_level
 
 _SUBPROCESS_GRACE_SECONDS = 120.0
 _LOG_TAIL_LINES = 100
+_LEVEL_POLL_INTERVAL_SECONDS = 1.0
+"""How often the controller waits on the level subprocess (and republishes its live metrics)."""
+_SUBPROCESS_KILL_WAIT_SECONDS = 10.0
+"""How long to wait for a killed (hung) level subprocess to actually exit."""
+
+
+def _expected_jobs(level: RampLevel) -> int | None:
+    """Return the number of image jobs a level expects, or None for an open-ended soak."""
+    if level.scenario.soak_seconds is not None:
+        return None
+    expected = sum(getattr(job, "count", 1) for job in level.scenario.image_jobs)
+    return expected or None
+
 
 _OOM_PATTERN = re.compile(r"CUDA out of memory|torch\.OutOfMemoryError|cudaErrorMemoryAllocation", re.IGNORECASE)
+_WARM_LEVEL_TIMEOUT_MARGIN_SECONDS = 90.0
+"""Extra wall-clock budget over a level's own timeout before the warm driver gives up on it."""
+
+
+def _build_level_run_result(level_id: str, harness_result: object) -> object:
+    """Build the on-disk ``LevelRunResult`` from a warm-session ``HarnessResult`` (mirrors level_runner)."""
+    harness_dict = dataclasses.asdict(harness_result)  # type: ignore[call-overload]
+    metrics = harness_dict.pop("metrics", None)
+    return LevelRunResult(
+        level_id=level_id,
+        harness=HarnessSummary(**{k: v for k, v in harness_dict.items() if k in HarnessSummary.model_fields}),
+        metrics=getattr(harness_result, "metrics", None) or metrics,
+    )
+
+
+class _WarmSessionDriver:
+    """Runs a :class:`WarmHarnessSession` on a private event loop so the sync controller can drive it.
+
+    The session's manager main loop runs as a task on a background thread's event loop; the controller
+    submits per-level coroutines to it and blocks on the result. All manager state is therefore mutated
+    only on the loop thread, avoiding cross-thread races.
+    """
+
+    def __init__(self, *, process_mode: str, model_names: list[str], max_threads_ceiling: int) -> None:
+        """Create the driver for the given process mode, model union, and concurrency ceiling."""
+        from horde_worker_regen.harness import WarmHarnessSession
+
+        self._session = WarmHarnessSession(
+            process_mode=process_mode,  # type: ignore[arg-type]
+            model_names=model_names,
+            max_threads_ceiling=max_threads_ceiling,
+        )
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, name="warm-benchmark-loop", daemon=True)
+
+    def start(self, timeout_seconds: float = 180.0) -> None:
+        """Start the loop thread and bring the worker up (processes warm)."""
+        self._thread.start()
+        asyncio.run_coroutine_threadsafe(self._session.__aenter__(), self._loop).result(timeout=timeout_seconds)
+
+    def run_level(
+        self,
+        *,
+        jobs: list,  # type: ignore[type-arg]
+        alchemy_forms: list | None,  # type: ignore[type-arg]
+        threads: int,
+        timeout_seconds: float,
+    ) -> object:
+        """Run one level on the warm worker and return its ``HarnessResult``."""
+        future = asyncio.run_coroutine_threadsafe(
+            self._session.run_level(
+                jobs=jobs,
+                alchemy_forms=alchemy_forms,
+                threads=threads,
+                timeout_seconds=timeout_seconds,
+            ),
+            self._loop,
+        )
+        return future.result(timeout=timeout_seconds + _WARM_LEVEL_TIMEOUT_MARGIN_SECONDS)
+
+    def close(self) -> None:
+        """Shut the worker down and stop the loop thread."""
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(self._session.aclose(), self._loop).result(timeout=90.0)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=10.0)
 
 
 def detect_machine_info() -> MachineInfo:
@@ -82,6 +175,8 @@ class BenchmarkController:
         skip_downloads: bool = False,
         validate: bool = False,
         soak_seconds: float = 300.0,
+        progress_sink: ProgressSink | None = None,
+        warm: bool = False,
     ) -> None:
         """Initialize the controller.
 
@@ -94,6 +189,10 @@ class BenchmarkController:
             skip_downloads: Skip levels that require network access.
             validate: After the ramp, soak the synthesized config under sustained load.
             soak_seconds: How long each per-tier validation soak runs.
+            progress_sink: Where to emit structured progress events; defaults to discarding them.
+            warm: Run fixed-scenario levels against a single warm worker reused across the ramp
+                (one child-process startup instead of one per level). Soak/validation levels still
+                use their own isolated subprocess.
         """
         self._ladder = ladder
         self._out_dir = out_dir
@@ -103,6 +202,9 @@ class BenchmarkController:
         self._skip_downloads = skip_downloads
         self._validate = validate
         self._soak_seconds = soak_seconds
+        self._sink = progress_sink if progress_sink is not None else NullProgressSink()
+        self._warm = warm
+        self._warm_driver: _WarmSessionDriver | None = None
 
         self._tier_baselines: dict[str, TierBaseline] = {}
         self._failed_tier_baselines: set[str] = set()
@@ -112,39 +214,22 @@ class BenchmarkController:
         """Run the ramp and return (and persist) the full report."""
         self._out_dir.mkdir(parents=True, exist_ok=True)
         machine = detect_machine_info()
+        self._emit_ramp_started(machine)
         reports: list[LevelReport] = []
 
-        for level in self._ladder:
-            if self._only_level is not None and level.id != self._only_level:
-                continue
-
-            report: LevelReport | None = None
-            if self._resume:
-                prior_result = self._load_result(self._out_dir / f"level_{level.id}.json")
-                if prior_result is not None:
-                    logger.info(f"Resuming level {level.id} from its existing result")
-                    report = self._evaluate_result(level, prior_result, machine, log_tail=[])
-
-            if report is None:
-                skip_reason = self._pre_flight_skip_reason(level, machine)
-                if skip_reason is not None:
-                    logger.warning(f"Skipping level {level.id}: {skip_reason}")
-                    reports.append(LevelReport(level=level, outcome="skipped", reasons=[skip_reason]))
+        self._maybe_start_warm_driver()
+        try:
+            for level_index, level in enumerate(self._ladder):
+                if self._only_level is not None and level.id != self._only_level:
                     continue
 
-                logger.info(f"Running level {level.id}: {level.description}")
-                report = self._run_level(level, machine)
-
-            reports.append(report)
-
-            if report.outcome == "passed":
-                if level.establishes_tier_baseline and report.stats is not None and report.stats.its_p50 is not None:
-                    self._tier_baselines[level.tier] = TierBaseline(tier=level.tier, its_p50=report.stats.its_p50)
-            else:
-                if level.establishes_tier_baseline:
-                    self._failed_tier_baselines.add(level.tier)
-                self._failed_axes.add((level.tier, level.axis))
-                logger.warning(f"Level {level.id} did not pass: {'; '.join(report.reasons) or report.outcome}")
+                self._emit_level_started(level, level_index=level_index, num_levels=len(self._ladder))
+                report = self._resolve_level_report(level, machine)
+                reports.append(report)
+                self._emit_level_finished(report)
+                self._record_baseline_bookkeeping(level, report)
+        finally:
+            self._stop_warm_driver()
 
         suggested = synthesize_bridge_data(reports)
 
@@ -152,6 +237,7 @@ class BenchmarkController:
             reports.extend(self._run_validation(suggested, machine))
 
         benchmark_report = BenchmarkReport(
+            run_id=self._out_dir.name,
             machine=machine,
             levels=reports,
             suggested_bridge_data=suggested,
@@ -160,7 +246,98 @@ class BenchmarkController:
 
         (self._out_dir / "report.json").write_text(benchmark_report.model_dump_json(indent=2), encoding="utf-8")
         (self._out_dir / "report.md").write_text(render_markdown(benchmark_report), encoding="utf-8")
+        self._emit_ramp_finished(benchmark_report)
         return benchmark_report
+
+    def _resolve_level_report(self, level: RampLevel, machine: MachineInfo) -> LevelReport:
+        """Produce a level's report by reusing a prior result, pre-flight skipping, or running it."""
+        if self._resume:
+            prior_result = self._load_result(self._out_dir / f"level_{level.id}.json")
+            if prior_result is not None:
+                logger.info(f"Resuming level {level.id} from its existing result")
+                return self._evaluate_result(level, prior_result, machine, log_tail=[])
+
+        skip_reason = self._pre_flight_skip_reason(level, machine)
+        if skip_reason is not None:
+            logger.warning(f"Skipping level {level.id}: {skip_reason}")
+            return LevelReport(level=level, outcome="skipped", reasons=[skip_reason])
+
+        logger.info(f"Running level {level.id}: {level.description}")
+        return self._run_level(level, machine)
+
+    def _record_baseline_bookkeeping(self, level: RampLevel, report: LevelReport) -> None:
+        """Update the tier-baseline and failed-axis tracking that drives later skip decisions."""
+        if report.outcome == "passed":
+            if level.establishes_tier_baseline and report.stats is not None and report.stats.its_p50 is not None:
+                self._tier_baselines[level.tier] = TierBaseline(tier=level.tier, its_p50=report.stats.its_p50)
+            return
+        if level.establishes_tier_baseline:
+            self._failed_tier_baselines.add(level.tier)
+        self._failed_axes.add((level.tier, level.axis))
+        logger.warning(f"Level {level.id} did not pass: {'; '.join(report.reasons) or report.outcome}")
+
+    # region progress events
+
+    def _emit_ramp_started(self, machine: MachineInfo) -> None:
+        """Announce the ramp: run identity, level count, tiers, and machine summary."""
+        self._sink.emit(
+            RampStarted(
+                run_id=self._out_dir.name,
+                num_levels=len(self._ladder),
+                tiers=sorted({level.tier for level in self._ladder}),
+                process_mode=self._process_mode,
+                gpu_name=machine.gpu_name,
+                total_vram_mb=machine.total_vram_mb,
+            ),
+        )
+
+    def _emit_level_started(self, level: RampLevel, *, level_index: int, num_levels: int) -> None:
+        """Announce that a level is beginning (or about to be skipped)."""
+        self._sink.emit(
+            LevelStarted(
+                level_id=level.id,
+                description=level.description,
+                stage=level.stage,
+                tier=level.tier,
+                axis=level.axis,
+                level_index=level_index,
+                num_levels=num_levels,
+                jobs_expected=_expected_jobs(level),
+                timeout_seconds=level.timeout_seconds,
+            ),
+        )
+
+    def _emit_level_finished(self, report: LevelReport) -> None:
+        """Announce a level's outcome and headline statistics."""
+        stats = report.stats
+        self._sink.emit(
+            LevelFinished(
+                level_id=report.level.id,
+                outcome=report.outcome,
+                reasons=report.reasons,
+                advisories=report.advisories,
+                its_p50=stats.its_p50 if stats is not None else None,
+                gpu_busy_percent=stats.gpu_utilization_mean_percent if stats is not None else None,
+                vram_used_high_water_mb=stats.vram_used_high_water_mb if stats is not None else None,
+                num_findings=len(report.findings),
+            ),
+        )
+
+    def _emit_ramp_finished(self, report: BenchmarkReport) -> None:
+        """Announce the ramp totals and the synthesized recommendation."""
+        levels_passed = sum(1 for level in report.levels if level.outcome == "passed")
+        self._sink.emit(
+            RampFinished(
+                run_id=report.run_id,
+                levels_passed=levels_passed,
+                levels_total=len(report.levels),
+                num_findings=len(report.findings),
+                report_path=str(self._out_dir / "report.json"),
+                suggested_bridge_data_yaml=report.suggested_bridge_data.as_yaml_block(),
+            ),
+        )
+
+    # endregion
 
     def _run_validation(self, suggested: SuggestedBridgeData, machine: MachineInfo) -> list[LevelReport]:
         """Soak the synthesized config under sustained load, one stage-V level per passing tier."""
@@ -170,28 +347,16 @@ class BenchmarkController:
             if pool_skip_reason is not None:
                 logger.warning(f"Skipping validation V-{tier}-soak: {pool_skip_reason}")
                 placeholder = build_validation_level(suggested, tier, soak_seconds=self._soak_seconds)
-                validation_reports.append(
-                    LevelReport(level=placeholder, outcome="skipped", reasons=[pool_skip_reason]),
-                )
+                self._emit_level_started(placeholder, level_index=0, num_levels=0)
+                skipped_report = LevelReport(level=placeholder, outcome="skipped", reasons=[pool_skip_reason])
+                self._emit_level_finished(skipped_report)
+                validation_reports.append(skipped_report)
                 continue
+
             level = build_validation_level(suggested, tier, soak_seconds=self._soak_seconds, model_pool=model_pool)
-
-            report: LevelReport | None = None
-            if self._resume:
-                prior_result = self._load_result(self._out_dir / f"level_{level.id}.json")
-                if prior_result is not None:
-                    logger.info(f"Resuming validation {level.id} from its existing result")
-                    report = self._evaluate_result(level, prior_result, machine, log_tail=[])
-
-            if report is None:
-                skip_reason = self._pre_flight_skip_reason(level, machine)
-                if skip_reason is not None:
-                    logger.warning(f"Skipping validation {level.id}: {skip_reason}")
-                    report = LevelReport(level=level, outcome="skipped", reasons=[skip_reason])
-                else:
-                    logger.info(f"Running validation {level.id}: {level.description}")
-                    report = self._run_level(level, machine)
-
+            self._emit_level_started(level, level_index=0, num_levels=0)
+            report = self._resolve_level_report(level, machine)
+            self._emit_level_finished(report)
             if report.outcome != "passed":
                 logger.warning(
                     f"Validation {level.id} did not pass: {'; '.join(report.reasons) or report.outcome}",
@@ -306,8 +471,89 @@ class BenchmarkController:
 
         return None
 
+    def _warm_session_params(self) -> tuple[list[str], int]:
+        """Return the union of fixed-scenario level models and the max thread count to provision."""
+        models: set[str] = set()
+        ceiling = 1
+        for level in self._ladder:
+            if level.scenario.soak_seconds is not None:
+                continue
+            for job in level.scenario.expand_image_jobs():
+                if job.model is not None:
+                    models.add(job.model)
+            ceiling = max(ceiling, int(level.bridge_data_overrides.get("max_threads", 1) or 1))
+        return sorted(models), ceiling
+
+    def _maybe_start_warm_driver(self) -> None:
+        """Bring up the shared warm worker, if warm mode is enabled and any level needs it."""
+        if not self._warm or self._resume:
+            return
+        has_fixed_level = any(level.scenario.soak_seconds is None for level in self._ladder)
+        if not has_fixed_level:
+            return
+        model_names, ceiling = self._warm_session_params()
+        logger.info(f"Starting warm benchmark worker (models: {model_names}, thread ceiling: {ceiling})")
+        driver = _WarmSessionDriver(
+            process_mode=self._process_mode,
+            model_names=model_names,
+            max_threads_ceiling=ceiling,
+        )
+        try:
+            driver.start()
+        except Exception as e:  # noqa: BLE001 - fall back to per-level subprocesses if warmup fails
+            logger.error(f"Warm worker failed to start ({type(e).__name__}: {e}); using per-level subprocesses")
+            with contextlib.suppress(Exception):
+                driver.close()
+            return
+        self._warm_driver = driver
+
+    def _stop_warm_driver(self) -> None:
+        """Tear down the shared warm worker, if one is running."""
+        if self._warm_driver is None:
+            return
+        logger.info("Shutting down warm benchmark worker")
+        self._warm_driver.close()
+        self._warm_driver = None
+
+    def _run_level_warm(self, level: RampLevel, machine: MachineInfo) -> LevelReport:
+        """Run one fixed-scenario level on the shared warm worker and evaluate its outcome."""
+        assert self._warm_driver is not None
+        threads = int(level.bridge_data_overrides.get("max_threads", 1) or 1)
+        logger.info(f"Running level {level.id} on warm worker (threads={threads})")
+
+        try:
+            harness_result = self._warm_driver.run_level(
+                jobs=level.scenario.expand_image_jobs(),
+                alchemy_forms=level.scenario.expand_alchemy_forms() or None,
+                threads=threads,
+                timeout_seconds=level.timeout_seconds,
+            )
+        except Exception as e:  # noqa: BLE001 - a wedged warm level is a finding, not a ramp abort
+            logger.error(f"Warm level {level.id} failed: {type(e).__name__}: {e}")
+            return LevelReport(
+                level=level,
+                outcome="crashed",
+                reasons=[f"warm worker raised running level: {type(e).__name__}: {e}"],
+                findings=self._classify_findings(level, None, [], crashed=True),
+            )
+
+        result = _build_level_run_result(level.id, harness_result)
+        with contextlib.suppress(OSError):
+            (self._out_dir / f"level_{level.id}.json").write_text(
+                result.model_dump_json(indent=2),  # type: ignore[attr-defined]
+                encoding="utf-8",
+            )
+        return self._evaluate_result(level, result, machine, log_tail=[])  # type: ignore[arg-type]
+
     def _run_level(self, level: RampLevel, machine: MachineInfo) -> LevelReport:
-        """Run one level in a subprocess and evaluate its outcome."""
+        """Run one level and evaluate its outcome.
+
+        Fixed-scenario levels run on the warm worker when one is active; soak levels (and every
+        level without a warm driver) run in their own isolated subprocess.
+        """
+        if self._warm_driver is not None and level.scenario.soak_seconds is None:
+            return self._run_level_warm(level, machine)
+
         level_json_path = self._out_dir / f"level_{level.id}.def.json"
         level_json_path.write_text(level.model_dump_json(indent=2), encoding="utf-8")
         result_path = self._out_dir / f"level_{level.id}.json"
@@ -326,19 +572,7 @@ class BenchmarkController:
             self._process_mode,
         ]
 
-        hung = False
-        try:
-            completed = subprocess.run(
-                command,
-                timeout=level.timeout_seconds + _SUBPROCESS_GRACE_SECONDS,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            exit_code = completed.returncode
-        except subprocess.TimeoutExpired:
-            hung = True
-            exit_code = -1
+        exit_code, hung = self._run_level_subprocess(level, command)
 
         log_tail = self._read_log_tail(log_path)
         result = self._load_result(result_path)
@@ -372,6 +606,67 @@ class BenchmarkController:
             )
 
         return self._evaluate_result(level, result, machine, log_tail=log_tail)
+
+    def _run_level_subprocess(self, level: RampLevel, command: list[str]) -> tuple[int, bool]:
+        """Run the level subprocess to completion, streaming live progress and enforcing the timeout.
+
+        Replaces a single blocking ``subprocess.run`` with a poll loop so a level's live metrics (written
+        by the runner to ``level_<id>.live.json``) can be republished as progress events while it runs.
+        Returns ``(exit_code, hung)``; on a timeout the subprocess is killed and ``hung`` is True.
+        """
+        live_path = self._out_dir / f"level_{level.id}.live.json"
+        deadline = time.time() + level.timeout_seconds + _SUBPROCESS_GRACE_SECONDS
+        last_live_signature: str | None = None
+
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            while True:
+                try:
+                    exit_code = process.wait(timeout=_LEVEL_POLL_INTERVAL_SECONDS)
+                    return exit_code, False
+                except subprocess.TimeoutExpired:
+                    last_live_signature = self._emit_live_progress(level, live_path, last_live_signature)
+                    if time.time() >= deadline:
+                        process.kill()
+                        with contextlib.suppress(Exception):
+                            process.wait(timeout=_SUBPROCESS_KILL_WAIT_SECONDS)
+                        return -1, True
+        finally:
+            if process.poll() is None:
+                with contextlib.suppress(Exception):
+                    process.kill()
+
+    def _emit_live_progress(self, level: RampLevel, live_path: Path, last_signature: str | None) -> str | None:
+        """Emit a :class:`LevelProgress` event when the level's live snapshot has changed; return its signature."""
+        live = self._read_live_snapshot(live_path)
+        if live is None:
+            return last_signature
+        signature = live.model_dump_json()
+        if signature == last_signature:
+            return last_signature
+        self._sink.emit(
+            LevelProgress(
+                level_id=level.id,
+                jobs_completed=live.jobs_completed,
+                jobs_faulted=live.jobs_faulted,
+                jobs_expected=_expected_jobs(level),
+                iterations_per_second=live.iterations_per_second,
+                vram_used_mb=live.vram_used_mb,
+                gpu_busy_percent=live.gpu_busy_percent,
+                elapsed_seconds=live.elapsed_seconds,
+            ),
+        )
+        return signature
+
+    @staticmethod
+    def _read_live_snapshot(live_path: Path) -> LevelLiveSnapshot | None:
+        """Read the level's latest live snapshot, tolerating an absent or mid-write file."""
+        if not live_path.exists():
+            return None
+        try:
+            return LevelLiveSnapshot.model_validate_json(live_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
 
     def _evaluate_result(
         self,

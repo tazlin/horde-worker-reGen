@@ -10,11 +10,13 @@ from horde_sdk.ai_horde_api.apimodels import GenMetadataEntry
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from loguru import logger
 
+from horde_worker_regen.process_management.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import (
     HordeAlchemyResultMessage,
     HordeAuxModelStateChangeMessage,
+    HordeDownloadAvailabilityMessage,
     HordeDownloadMetricsMessage,
     HordeInferenceResultMessage,
     HordeJobMetricsMessage,
@@ -56,6 +58,7 @@ class MessageDispatcher:
     _on_alchemy_result: Callable[[HordeAlchemyResultMessage], None] | None = None
     _on_job_metrics: Callable[[HordeJobMetricsMessage], None] | None = None
     _on_download_metrics: Callable[[HordeDownloadMetricsMessage], None] | None = None
+    _on_download_availability: Callable[[HordeDownloadAvailabilityMessage], None] | None = None
 
     _last_deadlock_detected_time: float = 0.0
     _in_deadlock: bool = False
@@ -114,6 +117,13 @@ class MessageDispatcher:
         self._on_job_metrics = on_job_metrics
         self._on_download_metrics = on_download_metrics
 
+    def set_download_availability_handler(
+        self,
+        handler: Callable[[HordeDownloadAvailabilityMessage], None],
+    ) -> None:
+        """Register the callback invoked when the download process reports on-disk availability."""
+        self._on_download_availability = handler
+
     async def receive_and_handle_process_messages(self) -> None:
         """Receive and handle any messages from the child processes."""
         while not self._process_message_queue.empty():
@@ -125,6 +135,16 @@ class MessageDispatcher:
 
             self._in_deadlock = False
             self._in_queue_deadlock = False
+
+            # The download process lives outside the process map, so its messages must be handled
+            # (or ignored) before any of the process-map lookups below, which would otherwise raise.
+            if message.process_id == DOWNLOAD_PROCESS_ID:
+                if (
+                    isinstance(message, HordeDownloadAvailabilityMessage)
+                    and self._on_download_availability is not None
+                ):
+                    self._on_download_availability(message)
+                continue
 
             if isinstance(message, HordeProcessHeartbeatMessage):
                 self._handle_heartbeat(message)

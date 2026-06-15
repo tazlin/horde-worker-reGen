@@ -10,7 +10,12 @@ import pytest
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import HordeProcessState
 from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
+from horde_worker_regen.process_management.shutdown_manager import (
+    _SHUTDOWN_GRACE_BASE_SECONDS,
+    _SHUTDOWN_GRACE_PER_JOB_SECONDS,
+    MAX_SHUTDOWN_GRACE_SECONDS,
+    ShutdownManager,
+)
 from horde_worker_regen.process_management.worker_state import WorkerState
 
 from .conftest import (
@@ -184,3 +189,84 @@ class TestSignalHandler:
         shutdown_manager.signal_handler(2, None)
 
         assert shutdown_manager._caught_sigints == 2
+
+
+class TestComputeShutdownGrace:
+    """The force-kill grace scales with outstanding work (all stages) and is hard-capped."""
+
+    def test_empty_tracker_uses_base_grace(self) -> None:
+        """With no jobs in flight, the grace is just the base."""
+        shutdown_manager = _make_shutdown_manager()
+        assert shutdown_manager._compute_shutdown_grace() == _SHUTDOWN_GRACE_BASE_SECONDS
+
+    async def test_grace_scales_with_outstanding_jobs(self) -> None:
+        """Each in-flight job (here, two pending inference) extends the grace."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, Mock())
+        await track_popped_job_async(job_tracker, Mock())
+
+        shutdown_manager = _make_shutdown_manager(job_tracker=job_tracker)
+        expected = _SHUTDOWN_GRACE_BASE_SECONDS + (2 * _SHUTDOWN_GRACE_PER_JOB_SECONDS)
+        assert shutdown_manager._compute_shutdown_grace() == pytest.approx(expected)
+
+    async def test_grace_is_capped(self) -> None:
+        """A very large backlog cannot push the grace past the hard ceiling."""
+        job_tracker = JobTracker()
+        for _ in range(100):
+            await track_popped_job_async(job_tracker, Mock())
+
+        shutdown_manager = _make_shutdown_manager(job_tracker=job_tracker)
+        assert shutdown_manager._compute_shutdown_grace() == MAX_SHUTDOWN_GRACE_SECONDS
+
+
+class TestFaultReportOutstandingJobs:
+    """The last-resort fault-report moves un-submitted in-flight jobs to PENDING_SUBMIT (faulted)."""
+
+    async def test_in_flight_jobs_are_faulted_for_resubmission(self) -> None:
+        """Pending-inference jobs are moved to PENDING_SUBMIT (faulted) so the submitter can report them."""
+        # shut_down=True so the report's drain poll exits immediately (no submitter runs in this test).
+        state = WorkerState(shutting_down=True, shut_down=True)
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, Mock())
+        await track_popped_job_async(job_tracker, Mock())
+        assert len(job_tracker.jobs_pending_inference) == 2
+
+        shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
+        shutdown_manager._fault_report_outstanding_jobs()
+
+        assert len(job_tracker.jobs_pending_inference) == 0
+        assert len(job_tracker.jobs_pending_submit) == 2
+
+    def test_no_outstanding_jobs_is_a_noop(self) -> None:
+        """With nothing in flight, the fault-report does nothing and never raises."""
+        state = WorkerState(shutting_down=True, shut_down=True)
+        shutdown_manager = _make_shutdown_manager(state=state)
+        shutdown_manager._fault_report_outstanding_jobs()
+        assert len(shutdown_manager._job_tracker.jobs_pending_submit) == 0
+
+
+class TestStartTimedShutdownIdempotent:
+    """The force-kill backstop thread is started at most once, however many callers request it."""
+
+    def test_only_one_backstop_thread_is_started(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Repeated requests to start the backstop create exactly one thread."""
+        shutdown_manager = _make_shutdown_manager()
+        created: list[object] = []
+
+        class _FakeThread:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                created.append(self)
+
+            def start(self) -> None:
+                pass
+
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.shutdown_manager.threading.Thread",
+            _FakeThread,
+        )
+
+        shutdown_manager.start_timed_shutdown()
+        shutdown_manager.start_timed_shutdown()
+
+        assert len(created) == 1
+        assert shutdown_manager._timed_shutdown_started is True

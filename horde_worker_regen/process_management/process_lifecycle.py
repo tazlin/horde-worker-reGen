@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import multiprocessing
 import time
 from collections.abc import Callable
@@ -12,12 +13,14 @@ from loguru import logger
 
 from horde_worker_regen.consts import VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.horde_process import HordeProcessType
+from horde_worker_regen.process_management.horde_process import HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import (
     HordeControlFlag,
     HordeControlMessage,
+    HordeDownloadControlMessage,
     HordeProcessState,
 )
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
@@ -48,6 +51,7 @@ class ProcessLifecycleManager:
     _abort_callback: Callable[[], None]
     _state: WorkerState
     _entry_points: ProcessEntryPoints
+    _download_process_info: HordeProcessInfo | None
 
     num_processes_launched: int
     _num_process_recoveries: int
@@ -108,6 +112,7 @@ class ProcessLifecycleManager:
         self._hung_processes_detected_time = 0.0
         self._any_replaced = False
         self._on_process_recovery: Callable[[HordeProcessInfo, str], None] | None = None
+        self._download_process_info = None
 
     def set_process_recovery_observer(self, observer: Callable[[HordeProcessInfo, str], None]) -> None:
         """Register a callback invoked with the process info and a reason on each recovery.
@@ -128,6 +133,11 @@ class ProcessLifecycleManager:
     def recently_recovered(self) -> bool:
         """Whether a process was recently recovered (read-only for manager)."""
         return self._recently_recovered
+
+    @property
+    def download_process_info(self) -> HordeProcessInfo | None:
+        """The background download process, or None if one is not running."""
+        return self._download_process_info
 
     def start_safety_processes(self) -> None:
         """Start all the safety processes configured to be used."""
@@ -178,6 +188,99 @@ class ProcessLifecycleManager:
 
             logger.info(f"Started safety process (id: {pid})")
             self.num_processes_launched += 1
+
+    def start_download_process(self) -> None:
+        """Start the singleton background download process, if not already running.
+
+        The download process lives outside the process map (it serves no jobs and must not be
+        swept up by the hung-process logic); its messages are routed by its reserved process id.
+        """
+        if self._download_process_info is not None:
+            return
+
+        bridge_data = self._runtime_config.bridge_data
+        pipe_connection, child_pipe_connection = multiprocessing.Pipe(duplex=True)
+
+        process = multiprocessing.Process(
+            target=self._entry_points.download_entry_point,
+            args=(
+                DOWNLOAD_PROCESS_ID,
+                self._process_message_queue,
+                child_pipe_connection,
+                self._disk_lock,
+                self.num_processes_launched,
+            ),
+            kwargs={
+                "nsfw": bridge_data.nsfw,
+                "allow_lora": bridge_data.allow_lora,
+                "allow_controlnet": bridge_data.allow_controlnet,
+                "allow_sdxl_controlnet": bridge_data.allow_sdxl_controlnet,
+                "allow_post_processing": bridge_data.allow_post_processing,
+                "purge_loras": bridge_data.purge_loras_on_download,
+                "amd_gpu": self._amd_gpu,
+                "directml": self._directml,
+                "rate_limit_kbps": bridge_data.download_rate_limit_kbps,
+                "paused": bridge_data.downloads_paused,
+            },
+        )
+        process.start()
+
+        self._download_process_info = HordeProcessInfo(
+            mp_process=process,
+            pipe_connection=pipe_connection,
+            process_id=DOWNLOAD_PROCESS_ID,
+            process_type=HordeProcessType.DOWNLOAD,
+            last_process_state=HordeProcessState.PROCESS_STARTING,
+            process_launch_identifier=self.num_processes_launched,
+            capabilities=WorkerCapability(0),
+        )
+        self.num_processes_launched += 1
+        logger.info("Started background download process")
+
+    def request_downloads(self, model_names: list[str], *, download_aux: bool = False) -> None:
+        """Ask the download process to ensure the given image models are present on disk."""
+        if self._download_process_info is None:
+            logger.warning("Cannot request downloads: no download process is running")
+            return
+        if not model_names and not download_aux:
+            return
+        self._download_process_info.safe_send_message(
+            HordeDownloadControlMessage(model_names=list(model_names), download_aux=download_aux),
+        )
+
+    def set_download_controls(self, *, paused: bool | None = None, rate_limit_kbps: int | None = None) -> None:
+        """Forward live pause/bandwidth controls to the download process (no-op if none is running).
+
+        Used by both the config-reload path and the supervisor pause/resume/rate commands. A ``None``
+        argument leaves that control unchanged; ``rate_limit_kbps`` of 0 (or negative) clears the cap.
+        """
+        if self._download_process_info is None:
+            return
+        if paused is None and rate_limit_kbps is None:
+            return
+        self._download_process_info.safe_send_message(
+            HordeDownloadControlMessage(
+                model_names=[],
+                download_aux=False,
+                set_paused=paused,
+                set_rate_limit_kbps=rate_limit_kbps,
+            ),
+        )
+
+    def end_download_process(self) -> None:
+        """Stop the background download process, if running."""
+        if self._download_process_info is None:
+            return
+        with contextlib.suppress(BrokenPipeError):
+            self._download_process_info.safe_send_message(
+                HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS),
+            )
+        try:
+            self._download_process_info.mp_process.join(timeout=1)
+            self._download_process_info.mp_process.kill()
+        except Exception as e:
+            logger.debug(f"Failed to stop download process: {e}")
+        self._download_process_info = None
 
     def start_inference_processes(self) -> None:
         """Start all the inference processes configured to be used."""
@@ -245,6 +348,52 @@ class ProcessLifecycleManager:
         self._process_map[pid] = process_info
         self.num_processes_launched += 1
         return process_info
+
+    def _allocate_inference_pid(self) -> int:
+        """Return the lowest process id not currently in use.
+
+        Slot ids are reused once freed, so this stays stable across scale-down/scale-up cycles
+        (a ``len(map)``-based scheme would collide after removing a non-last slot). The download
+        process lives outside the map at its own reserved id, so it never participates here.
+        """
+        used = set(self._process_map.keys())
+        pid = 0
+        while pid in used:
+            pid += 1
+        return pid
+
+    def scale_inference_processes(self, target_count: int) -> int:
+        """Grow or shrink the running inference processes toward ``target_count``.
+
+        Growth spawns fresh processes (bounded by the launched-process ceiling). Shrink ends idle
+        processes, preferring ones not holding a model needed by queued work, and removes them from
+        the process map; busy processes are never killed, so the effective count may not reach the
+        target in one call. Used by the benchmark to stage processes on demand and as a memory/VRAM
+        pressure lever.
+
+        Returns:
+            The number of inference processes after scaling.
+        """
+        target = max(0, min(target_count, self._max_inference_processes))
+        current = self._process_map.num_loaded_inference_processes()
+
+        if target > current:
+            for _ in range(target - current):
+                pid = self._allocate_inference_pid()
+                self._start_inference_process(pid)
+                logger.info(f"Scaled up: started inference process {pid}")
+        elif target < current:
+            disallowed = self.get_processes_with_model_for_queued_job()
+            for _ in range(current - target):
+                victim = self._process_map._get_first_inference_process_to_kill(disallowed_processes=disallowed)
+                if victim is None:
+                    logger.debug("Scale down: no idle inference process available to stop right now")
+                    break
+                self._end_inference_process(victim)
+                self._process_map.pop(victim.process_id, None)
+                logger.info(f"Scaled down: stopped inference process {victim.process_id}")
+
+        return self._process_map.num_loaded_inference_processes()
 
     def end_inference_processes(
         self,

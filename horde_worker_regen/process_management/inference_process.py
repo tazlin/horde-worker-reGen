@@ -191,12 +191,22 @@ class HordeInferenceProcess(HordeProcess):
                 sys.exit(1)
 
             if len(SharedModelManager.manager.compvis.available_models) == 0:
-                logger.critical("No models available in SharedModelManager")
-                self.send_process_state_change_message(
-                    process_state=HordeProcessState.PROCESS_ENDED,
-                    info="No models available in SharedModelManager",
-                )
-                sys.exit(1)
+                # A model may have only just landed via the background download process; re-scan the
+                # on-disk database a few times before giving up, so we do not hard-crash on a race
+                # with a just-completed download. The main process only starts inference once at least
+                # one model is present, so reaching this branch at all is already unusual.
+                for _ in range(5):
+                    time.sleep(2)
+                    SharedModelManager.manager.compvis.load_model_database()
+                    if len(SharedModelManager.manager.compvis.available_models) > 0:
+                        break
+                else:
+                    logger.critical("No models available in SharedModelManager")
+                    self.send_process_state_change_message(
+                        process_state=HordeProcessState.PROCESS_ENDED,
+                        info="No models available in SharedModelManager",
+                    )
+                    sys.exit(1)
 
         logger.info("HordeInferenceProcess initialised")
 

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
-from .conftest import make_test_runtime_config, track_popped_job_async
+from .conftest import make_mock_process_info, make_test_runtime_config, track_popped_job_async
 
 
 def _make_plm(
@@ -21,6 +23,7 @@ def _make_plm(
     """Helper to build a PLM with mostly-mocked dependencies."""
     bridge_data = Mock()
     bridge_data.image_models_to_load = ["stable_diffusion"]
+    bridge_data.max_threads = 1
     bridge_data.safety_on_gpu = False
     bridge_data.high_memory_mode = False
     bridge_data.very_high_memory_mode = False
@@ -125,3 +128,76 @@ def test_safety_processes_should_be_replaced_property() -> None:
 
     plm.safety_processes_should_be_replaced = True
     assert plm.safety_processes_should_be_replaced is True
+
+
+def _patch_spawn_with_stub(plm: ProcessLifecycleManager) -> None:
+    """Replace real process spawning with a stub that adds an idle mock process to the map."""
+
+    def _fake_start(pid: int) -> HordeProcessInfo:
+        info = make_mock_process_info(pid, model_name=None, process_type=HordeProcessType.INFERENCE)
+        plm._process_map[pid] = info
+        plm.num_processes_launched += 1
+        return info
+
+    plm._start_inference_process = _fake_start  # type: ignore[method-assign]
+
+
+def test_allocate_inference_pid_picks_lowest_free() -> None:
+    """The pid allocator returns the lowest unused slot id, reusing freed ones."""
+    process_map = ProcessMap(
+        {
+            0: make_mock_process_info(0, process_type=HordeProcessType.SAFETY),
+            1: make_mock_process_info(1, model_name=None),
+        },
+    )
+    plm = _make_plm(process_map=process_map)
+    assert plm._allocate_inference_pid() == 2
+
+    process_map.pop(1)
+    assert plm._allocate_inference_pid() == 1
+
+
+def test_scale_up_starts_processes_up_to_ceiling() -> None:
+    """Scaling up spawns processes, bounded by max_inference_processes."""
+    plm = _make_plm()  # max_inference_processes=2
+    _patch_spawn_with_stub(plm)
+
+    assert plm.scale_inference_processes(2) == 2
+    assert plm._process_map.num_inference_processes() == 2
+    assert sorted(plm._process_map.keys()) == [0, 1]
+
+    # Requests beyond the launched ceiling are capped.
+    assert plm.scale_inference_processes(5) == 2
+
+
+def test_scale_down_stops_idle_processes() -> None:
+    """Scaling down ends idle inference processes and removes them from the map."""
+    plm = _make_plm()
+    _patch_spawn_with_stub(plm)
+    plm.scale_inference_processes(2)
+
+    assert plm.scale_inference_processes(1) == 1
+    assert plm._process_map.num_inference_processes() == 1
+
+
+def test_scale_down_never_kills_busy_processes() -> None:
+    """A busy (mid-inference) process is retained even when scaling toward zero."""
+    busy = make_mock_process_info(0, model_name="m", state=HordeProcessState.INFERENCE_STARTING)
+    idle = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+    plm = _make_plm(process_map=ProcessMap({0: busy, 1: idle}))
+
+    plm.scale_inference_processes(0)
+
+    remaining = list(plm._process_map.keys())
+    assert remaining == [0]  # the busy process survives
+
+
+def test_pid_reused_after_scale_down_then_up() -> None:
+    """A slot freed by scaling down is reused on the next scale up (no collision)."""
+    plm = _make_plm()
+    _patch_spawn_with_stub(plm)
+    plm.scale_inference_processes(2)  # pids 0, 1
+    plm.scale_inference_processes(1)  # removes the first idle slot (pid 0)
+    plm.scale_inference_processes(2)  # should re-allocate pid 0
+
+    assert sorted(plm._process_map.keys()) == [0, 1]

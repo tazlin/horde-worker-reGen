@@ -9,10 +9,11 @@ if sys.platform == "win32":
 
 import argparse
 import contextlib
+import dataclasses
 import io
 import multiprocessing
 import os
-import time
+from multiprocessing.connection import Connection
 from multiprocessing.context import BaseContext
 from typing import override
 
@@ -26,44 +27,17 @@ def main(
     *,
     amd_gpu: bool = False,
     directml: int | None = None,
+    supervisor_connection: Connection | None = None,
 ) -> None:
     """Check for a valid config and start the driver ('main') process for the reGen worker."""
-    import asyncio
-
-    from horde_model_reference.model_reference_manager import (
-        DeferredPrefetchHandle,
-        ModelReferenceManager,
-        PrefetchStrategy,
-    )
     from pydantic import ValidationError
 
     from horde_worker_regen.bridge_data.load_config import BridgeDataLoader, reGenBridgeData
     from horde_worker_regen.consts import BRIDGE_CONFIG_FILENAME
     from horde_worker_regen.process_management.main_entry_point import start_working
+    from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
 
-    def ensure_model_db_downloaded() -> ModelReferenceManager:
-        horde_model_reference_manager = ModelReferenceManager(prefetch_strategy=PrefetchStrategy.DEFERRED)
-
-        while True:
-            try:
-                with logger.catch(reraise=True):
-                    handle = horde_model_reference_manager.deferred_prefetch_handle
-                    if handle is None:
-                        raise ValueError("Failed to get deferred prefetch handle for model reference manager")
-
-                    async def _download_model_references(handle: DeferredPrefetchHandle) -> None:
-                        await handle
-
-                    asyncio.run(_download_model_references(handle))
-
-                return horde_model_reference_manager
-
-            except Exception as e:
-                logger.error(f"Failed to download and convert legacy DBs: ({type(e).__name__}) {e}")
-                logger.error("Retrying in 5 seconds...")
-                time.sleep(5)
-
-    horde_model_reference_manager = ensure_model_db_downloaded()
+    horde_model_reference_manager = ensure_model_reference_manager_initialized()
 
     bridge_data: reGenBridgeData | None = None
     try:
@@ -115,6 +89,7 @@ def main(
         horde_model_reference_manager=horde_model_reference_manager,
         amd_gpu=amd_gpu,
         directml=directml,
+        supervisor_connection=supervisor_connection,
     )
 
     logger.info("Worker has finished working.")
@@ -173,10 +148,92 @@ class LogConsoleRewriter(io.StringIO):
         self.original_iostream.flush()
 
 
-def init() -> None:
-    """Initialise the worker, including logging, environment variables, and other housekeeping."""
+@dataclasses.dataclass
+class WorkerLaunchOptions:
+    """Explicit worker launch options, decoupled from argparse so a supervisor can pass them directly."""
+
+    verbosity: int = 0
+    no_logging: bool = False
+    load_config_from_env_vars: bool = False
+    amd: bool = False
+    worker_name: str | None = None
+    directml: int | None = None
+
+
+def _redirect_streams_to_file(path: str) -> None:
+    """Point this process's stdout/stderr (Python and OS-fd level) at a file.
+
+    The supervised worker is a spawned child that inherits the TUI's terminal, so any console
+    output would corrupt the Textual UI. The TUI surfaces worker output by tailing logs/bridge*.log
+    instead, so here we send the raw streams to a file. ``os.dup2`` also captures C-level writes
+    and loguru's ``sys.__stdout__`` console sink; if it is unavailable we fall back to the
+    Python-level reassignment alone.
+    """
+    from pathlib import Path
+
+    Path("logs").mkdir(exist_ok=True)
+    # Intentionally kept open for the process lifetime: it backs fds 1/2 via dup2 below.
+    stream = open(path, "a", buffering=1, encoding="utf-8")  # noqa: SIM115
+    with contextlib.suppress(Exception):
+        os.dup2(stream.fileno(), 1)
+        os.dup2(stream.fileno(), 2)
+    sys.stdout = stream
+    sys.stderr = stream
+
+
+def _record_worker_start_in_app_state() -> None:
+    """Record that a worker session is starting on this version, best-effort.
+
+    Stamps ``worker_version_last_ran`` in the durable app state so a later version bump can mark a
+    stale benchmark for re-running. Any failure is swallowed (logged at debug): app-state bookkeeping
+    must never block worker startup.
+    """
+    try:
+        from horde_worker_regen import __version__
+        from horde_worker_regen.app_state import AppStateStore
+
+        AppStateStore().record_worker_started(worker_version=__version__)
+    except Exception as app_state_error:  # noqa: BLE001 - app-state must never block worker startup
+        logger.debug(f"Could not record worker start in app state: {app_state_error}")
+
+
+def _log_benchmark_hint() -> None:
+    """Log a one-time, non-blocking hint when no current benchmark exists for this worker version.
+
+    The interactive onboarding lives in the TUI; for a headless/container/service worker this keeps startup
+    unattended while still pointing the operator at the benchmark. Any failure is swallowed (logged at debug).
+    """
+    try:
+        from horde_worker_regen import __version__
+        from horde_worker_regen.app_state import AppStateStore, BenchmarkAvailability, benchmark_status_summary
+
+        availability = benchmark_status_summary(AppStateStore().load(), current_version=__version__)
+        if availability is BenchmarkAvailability.CURRENT:
+            return
+        preface = "No benchmark on record" if availability is BenchmarkAvailability.NONE else "Benchmark is stale"
+        logger.info(
+            f"{preface} for worker v{__version__}. Run 'horde-benchmark ramp' (or launch the TUI with "
+            "'horde-worker') to benchmark and auto-tune this worker.",
+        )
+    except Exception as hint_error:  # noqa: BLE001 - the hint must never block worker startup
+        logger.debug(f"Could not emit benchmark hint: {hint_error}")
+
+
+def _prepare_runtime(options: WorkerLaunchOptions, *, supervised: bool = False) -> None:
+    """Shared worker pre-flight: spawn method, env vars, version check, telemetry, and logging.
+
+    Args:
+        options: The launch options.
+        supervised: When True, the worker was launched by the TUI over a pipe. Console output is
+            redirected to a file (so it cannot corrupt the TUI) and console verbosity is minimised;
+            the loguru file sinks (logs/bridge*.log) are unaffected and remain the TUI's log source.
+    """
     with contextlib.suppress(Exception):
         multiprocessing.set_start_method("spawn", force=True)
+
+    if supervised:
+        # Redirect before anything prints, so not even the start-method banner leaks to the TUI.
+        _redirect_streams_to_file("logs/bridge_main_console.log")
 
     if os.path.exists(".abort"):
         with logger.catch(reraise=True):
@@ -185,6 +242,77 @@ def init() -> None:
 
     print(f"Multiprocessing start method: {multiprocessing.get_start_method()}")
 
+    os.environ["HORDE_SDK_DISABLE_CUSTOM_SINKS"] = "1"
+
+    if options.worker_name:
+        os.environ["AIWORKER_DREAMER_WORKER_NAME"] = options.worker_name
+
+    from horde_worker_regen.load_env_vars import load_env_vars_from_config
+
+    if not options.load_config_from_env_vars:
+        # Note: 'load_env_vars_from_config' means to translate the config file to environment variables
+        # if 'load_config_from_env_vars' is True, then we are ignoring the config file
+        load_env_vars_from_config()
+
+    from horde_worker_regen.version_meta import do_version_check
+
+    do_version_check()
+
+    _record_worker_start_in_app_state()
+
+    if not supervised:
+        rewriter_stdout = LogConsoleRewriter(sys.stdout)  # type: ignore
+        sys.stdout = rewriter_stdout
+
+        rewriter_stderr = LogConsoleRewriter(sys.stderr)  # type: ignore
+        sys.stderr = rewriter_stderr
+
+    # OpenTelemetry tracing is opt-in only (AIWORKER_REGEN_ENABLE_TELEMETRY). Force it off here —
+    # before any hordelib import and before worker processes are spawned — so the kill switch is
+    # inherited by every child. Left on, hordelib's per-ComfyUI-op spans starve the inference loop
+    # and depress GPU duty cycle even with no collector running. See telemetry.py.
+    from horde_worker_regen.telemetry import claim_logfire_ownership, enforce_telemetry_default_off
+
+    claim_logfire_ownership()
+    enforce_telemetry_default_off()
+    # configure_telemetry()  # opt-in: only call when AIWORKER_REGEN_ENABLE_TELEMETRY is set
+
+    AIWORKER_LIMITED_CONSOLE_MESSAGES = os.getenv("AIWORKER_LIMITED_CONSOLE_MESSAGES")
+
+    logger.remove()
+    from hordelib.api import HordeLog
+
+    target_verbosity = options.verbosity
+
+    if supervised:
+        target_verbosity = 0  # Console is redirected to a file; keep it terse (file sinks unaffected).
+    elif AIWORKER_LIMITED_CONSOLE_MESSAGES:
+        if target_verbosity > 2:
+            print(
+                "Warning: AIWORKER_LIMITED_CONSOLE_MESSAGES is set"
+                " but verbosity is set to 3 or higher. Setting verbosity to 2.",
+            )
+
+        target_verbosity = 2
+    elif options.no_logging:
+        target_verbosity = 0  # Disable logging to the console
+    elif options.verbosity == 0:
+        target_verbosity = 3  # Default to INFO or higher (Warning, Error, Critical)
+
+    # Initialise logging with loguru
+    HordeLog.initialise(
+        setup_logging=True,
+        process_id=None,
+        verbosity_count=target_verbosity,
+    )
+
+    if not supervised:
+        # The TUI shows an interactive onboarding modal instead; a headless worker just gets a hint.
+        _log_benchmark_hint()
+
+
+def init() -> None:
+    """Initialise the worker from CLI args and run it (the headless entry point)."""
     # Create args for -v, allowing -vvv
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", action="count", default=0, help="Increase verbosity of output")
@@ -219,72 +347,40 @@ def init() -> None:
 
     args = parser.parse_args()
 
-    os.environ["HORDE_SDK_DISABLE_CUSTOM_SINKS"] = "1"
-
-    if args.worker_name:
-        os.environ["AIWORKER_DREAMER_WORKER_NAME"] = args.worker_name
-
-    from horde_worker_regen.load_env_vars import load_env_vars_from_config
-
-    if not args.load_config_from_env_vars:
-        # Note: 'load_env_vars_from_config' means to translate the config file to environment variables
-        # if 'load_config_from_env_vars' is True, then we are ignoring the config file
-        load_env_vars_from_config()
-
-    from horde_worker_regen.version_meta import do_version_check
-
-    do_version_check()
-
-    rewriter_stdout = LogConsoleRewriter(sys.stdout)  # type: ignore
-    sys.stdout = rewriter_stdout
-
-    rewriter_stderr = LogConsoleRewriter(sys.stderr)  # type: ignore
-    sys.stderr = rewriter_stderr
-
-    # OpenTelemetry tracing is opt-in only (AIWORKER_REGEN_ENABLE_TELEMETRY). Force it off here —
-    # before any hordelib import and before worker processes are spawned — so the kill switch is
-    # inherited by every child. Left on, hordelib's per-ComfyUI-op spans starve the inference loop
-    # and depress GPU duty cycle even with no collector running. See telemetry.py.
-    from horde_worker_regen.telemetry import claim_logfire_ownership, enforce_telemetry_default_off
-
-    claim_logfire_ownership()
-    enforce_telemetry_default_off()
-    # configure_telemetry()  # opt-in: only call when AIWORKER_REGEN_ENABLE_TELEMETRY is set
-
-    AIWORKER_LIMITED_CONSOLE_MESSAGES = os.getenv("AIWORKER_LIMITED_CONSOLE_MESSAGES")
-
-    logger.remove()
-    from hordelib.api import HordeLog
-
-    target_verbosity = args.v
-
-    if AIWORKER_LIMITED_CONSOLE_MESSAGES:
-        if target_verbosity > 2:
-            print(
-                "Warning: AIWORKER_LIMITED_CONSOLE_MESSAGES is set"
-                " but verbosity is set to 3 or higher. Setting verbosity to 2.",
-            )
-
-        target_verbosity = 2
-    elif args.no_logging:
-        target_verbosity = 0  # Disable logging to the console
-    elif args.v == 0:
-        target_verbosity = 3  # Default to INFO or higher (Warning, Error, Critical)
-
-    # Initialise logging with loguru
-    HordeLog.initialise(
-        setup_logging=True,
-        process_id=None,
-        verbosity_count=target_verbosity,
+    options = WorkerLaunchOptions(
+        verbosity=args.v,
+        no_logging=args.no_logging,
+        load_config_from_env_vars=args.load_config_from_env_vars,
+        amd=args.amd,
+        worker_name=args.worker_name,
+        directml=args.directml,
     )
 
-    # We only need to download the legacy DBs once, so we do it here instead of in the worker processes
+    _prepare_runtime(options)
 
+    # We only need to download the legacy DBs once, so we do it here instead of in the worker processes
     main(
         multiprocessing.get_context("spawn"),
-        args.load_config_from_env_vars,
-        amd_gpu=args.amd,
-        directml=args.directml,
+        options.load_config_from_env_vars,
+        amd_gpu=options.amd,
+        directml=options.directml,
+    )
+
+
+def run_supervised(supervisor_connection: Connection, options: WorkerLaunchOptions) -> None:
+    """Worker entry point used by the TUI supervisor (a spawned child of the TUI process).
+
+    Identical to :func:`init` but driven by an explicit options object instead of argv, with the
+    console redirected to a file and a supervisor pipe wired in for state snapshots and control.
+    This must be a top-level function so it is picklable as a ``multiprocessing`` spawn target.
+    """
+    _prepare_runtime(options, supervised=True)
+    main(
+        multiprocessing.get_context("spawn"),
+        options.load_config_from_env_vars,
+        amd_gpu=options.amd,
+        directml=options.directml,
+        supervisor_connection=supervisor_connection,
     )
 
 

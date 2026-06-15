@@ -1,0 +1,151 @@
+"""Startup fail-fast checks for the worker's configured names.
+
+Worker names are unique horde-wide and are tied to the API key that first registers them. The
+config template ships with reserved placeholder names, and each worker *type* (the image "dreamer"
+and the alchemy "alchemist") registers as a separate, uniquely-named worker. Getting this wrong
+otherwise surfaces only as a late, cryptic "Wrong credentials to submit as this worker" at pop time.
+
+This module verifies the configuration *before* any processes spawn:
+
+1. A local check (no network): names must not be the reserved defaults, and the alchemist name must
+   differ from the dreamer name when alchemy is enabled.
+2. A network check: each enabled name must be either unregistered (a brand-new worker, the normal
+   first-run case) or already owned by the configured API key. Per the project's chosen policy this
+    hard-fails on *any* failure, including the API being unreachable (after a small bounded retry),
+   so the worker never silently runs under a name the horde will reject.
+"""
+
+from __future__ import annotations
+
+import time
+
+from horde_sdk.ai_horde_api.ai_horde_clients import AIHordeAPIClientSession, AIHordeAPISimpleClient
+from horde_sdk.ai_horde_api.apimodels import (
+    FindUserRequest,
+    UserDetailsResponse,
+    WorkerDetailItem,
+)
+from horde_sdk.generic_api.apimodels import RequestErrorResponse
+from loguru import logger
+
+from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+
+_OWNERSHIP_CHECK_ATTEMPTS = 3
+"""How many times the network ownership check is attempted before hard-failing on a transient error."""
+
+_OWNERSHIP_CHECK_RETRY_DELAY_SECONDS = 2.0
+"""Delay between ownership-check attempts after a transient (e.g. network) failure."""
+
+
+class WorkerNameConfigError(Exception):
+    """Raised when a worker name is a reserved default, duplicated, or owned by another account."""
+
+
+def verify_worker_identity(bridge_data: reGenBridgeData) -> None:
+    """Fail fast on a worker-name misconfiguration before any work begins.
+
+    Raises:
+        WorkerNameConfigError: If a name is a reserved default, the dreamer/alchemist names collide,
+            a name is owned by a different account, or ownership cannot be verified.
+    """
+    _validate_worker_names_local(bridge_data)
+
+    if bridge_data.dry_run_skip_api:
+        logger.warning("dry_run_skip_api is set; skipping the worker-name ownership check.")
+        return
+
+    _verify_worker_names_owned(bridge_data)
+
+
+def _validate_worker_names_local(bridge_data: reGenBridgeData) -> None:
+    """Reject reserved-default or colliding worker names without touching the network."""
+    fields = type(bridge_data).model_fields
+    dreamer_default = fields["dreamer_worker_name"].default
+    alchemist_default = fields["alchemist_name"].default
+
+    if bridge_data.dreamer_worker_name == dreamer_default:
+        raise WorkerNameConfigError(
+            f"Your worker name is still the default ({dreamer_default!r}). Set a unique `dreamer_name` "
+            "in bridgeData.yaml; the default is reserved and the horde will reject it.",
+        )
+
+    if bridge_data.alchemist:
+        if bridge_data.alchemist_name == alchemist_default:
+            raise WorkerNameConfigError(
+                f"Alchemy is enabled but `alchemist_name` is still the default ({alchemist_default!r}). "
+                "Set a unique `alchemist_name` in bridgeData.yaml; the default is reserved.",
+            )
+        if bridge_data.alchemist_name == bridge_data.dreamer_worker_name:
+            raise WorkerNameConfigError(
+                "`alchemist_name` must differ from `dreamer_name`: each worker type registers as a "
+                "separate, uniquely-named worker on the horde.",
+            )
+
+
+def _verify_worker_names_owned(bridge_data: reGenBridgeData) -> None:
+    """Verify each enabled worker name is unregistered or owned by this API key (network, hard-fail)."""
+    names = [bridge_data.dreamer_worker_name]
+    if bridge_data.alchemist:
+        names.append(bridge_data.alchemist_name)
+
+    last_error: Exception | None = None
+    for attempt in range(_OWNERSHIP_CHECK_ATTEMPTS):
+        try:
+            owned_worker_ids = _fetch_owned_worker_ids(bridge_data.api_key)
+            simple_client = AIHordeAPISimpleClient()
+            for name in names:
+                worker = _lookup_worker(simple_client, name, bridge_data.api_key)
+                if worker is None:
+                    logger.info(f"Worker name {name!r} is not yet registered; it will be created on first pop.")
+                    continue
+                if str(worker.id_) not in owned_worker_ids:
+                    raise WorkerNameConfigError(
+                        f"Worker name {name!r} is already registered to another account "
+                        f"(owner: {worker.owner or 'unknown'}). Worker names are unique horde-wide; "
+                        "choose a different name in bridgeData.yaml.",
+                    )
+                logger.debug(f"Worker name {name!r} is owned by this API key ({worker.id_}).")
+            return
+        except WorkerNameConfigError:
+            raise  # A definitive verdict, not a transient error; do not retry.
+        except Exception as network_error:  # noqa: BLE001 - any other failure is retried then hard-fails
+            last_error = network_error
+            logger.warning(
+                f"Worker-name ownership check attempt {attempt + 1}/{_OWNERSHIP_CHECK_ATTEMPTS} failed: "
+                f"{network_error}",
+            )
+            if attempt < _OWNERSHIP_CHECK_ATTEMPTS - 1:
+                time.sleep(_OWNERSHIP_CHECK_RETRY_DELAY_SECONDS)
+
+    raise WorkerNameConfigError(
+        f"Could not verify worker-name ownership with the AI Horde API after {_OWNERSHIP_CHECK_ATTEMPTS} "
+        f"attempts: {last_error}. The worker will not start until the API is reachable and the "
+        "configuration is valid.",
+    )
+
+
+def _fetch_owned_worker_ids(api_key: str) -> set[str]:
+    """Return the set of worker IDs owned by the account behind ``api_key``."""
+    with AIHordeAPIClientSession() as session:
+        response = session.submit_request(FindUserRequest(apikey=api_key), UserDetailsResponse)
+    if isinstance(response, RequestErrorResponse):
+        raise RuntimeError(f"find_user returned an error: {response.message}")
+    return {str(worker_id) for worker_id in (response.worker_ids or [])}
+
+
+def _lookup_worker(
+    simple_client: AIHordeAPISimpleClient,
+    name: str,
+    api_key: str,
+) -> WorkerDetailItem | None:
+    """Return the worker registered under ``name`` (case-insensitive), or None if none exists.
+
+    Uses the list endpoint with a name filter so a missing worker is an empty result rather than an
+    exception, and re-checks the name client-side so the result is correct regardless of how the
+    server interprets the filter.
+    """
+    response = simple_client.workers_all_details(worker_name=name, api_key=api_key)
+    for worker in response:
+        if worker.name is not None and worker.name.lower() == name.lower():
+            return worker
+    return None

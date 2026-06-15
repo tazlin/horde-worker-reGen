@@ -276,8 +276,9 @@ class TestAlchemyHeadroomEstimator:
 
 
 class _StubState:
-    def __init__(self, *, shutting_down: bool = False) -> None:
+    def __init__(self, *, shutting_down: bool = False, supervisor_paused: bool = False) -> None:
         self.shutting_down = shutting_down
+        self.supervisor_paused = supervisor_paused
 
 
 class _StubRuntimeConfig:

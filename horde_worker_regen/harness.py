@@ -26,6 +26,7 @@ import multiprocessing
 import os
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -123,6 +124,14 @@ class HarnessConfig:
 
     soak_drain_timeout_seconds: float = 60.0
     """After the soak period, how long to wait for in-flight work to drain before shutting down."""
+
+    on_progress: Callable[[RunMetricsSnapshot, float], None] | None = None
+    """Optional best-effort progress hook, invoked roughly every ``progress_interval_seconds`` with the
+    live run-metrics snapshot and elapsed seconds. The benchmark uses it to stream intra-level metrics;
+    it is None for ordinary harness runs, leaving their behaviour unchanged."""
+
+    progress_interval_seconds: float = 2.0
+    """How often :attr:`on_progress` is sampled and invoked during a run."""
 
 
 @dataclass
@@ -469,11 +478,7 @@ async def _watch_for_soak_period(
     # Phase 1 — sustained load: the generating sources keep the worker saturated.
     while time.time() - time_started < soak_seconds:
         await asyncio.sleep(0.2)
-        if (
-            not gpu_sampling_started
-            and gpu_sampler is not None
-            and manager._job_tracker.total_num_completed_jobs >= 1
-        ):
+        if not gpu_sampling_started and gpu_sampler is not None and manager._job_tracker.total_num_completed_jobs >= 1:
             gpu_sampler.start()
             gpu_sampling_started = True
         if manager._state.shutting_down:
@@ -515,6 +520,27 @@ def _cleanup_stale_abort_file() -> None:
     if os.path.exists(abort_path):
         logger.warning(f"Removing stale .abort file from {abort_path}")
         os.remove(abort_path)
+
+
+async def _emit_progress_periodically(
+    manager: HordeWorkerProcessManager,
+    *,
+    on_progress: Callable[[RunMetricsSnapshot, float], None],
+    interval_seconds: float,
+    time_started: float,
+) -> None:
+    """Sample the manager's live run metrics on a timer and hand them to the progress hook.
+
+    Best-effort and side-effect-only: any error building or delivering a sample is logged at debug and
+    the loop continues, so a flaky consumer can never disturb the run it is observing.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            snapshot = manager.get_run_metrics_snapshot()
+            on_progress(snapshot, time.time() - time_started)
+        except Exception as progress_error:  # noqa: BLE001 - progress sampling must never break the run
+            logger.debug(f"Progress sampling failed: {progress_error}")
 
 
 async def run_harness_async(config: HarnessConfig) -> HarnessResult:
@@ -567,6 +593,17 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
             ),
         )
 
+    progress_task: asyncio.Task[None] | None = None
+    if config.on_progress is not None:
+        progress_task = asyncio.create_task(
+            _emit_progress_periodically(
+                manager,
+                on_progress=config.on_progress,
+                interval_seconds=config.progress_interval_seconds,
+                time_started=time_started,
+            ),
+        )
+
     exception_raised: BaseException | None = None
     try:
         await manager._main_loop()
@@ -578,6 +615,8 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
             gpu_sampler.stop()
         if not watcher_task.done():
             watcher_task.cancel()
+        if progress_task is not None and not progress_task.done():
+            progress_task.cancel()
 
     timed_out = False
     with contextlib.suppress(asyncio.CancelledError):
@@ -710,3 +749,205 @@ def _collect_run_diagnostics(
 def run_harness(config: HarnessConfig) -> HarnessResult:
     """Synchronous wrapper around `run_harness_async`."""
     return asyncio.run(run_harness_async(config))
+
+
+def _warm_model_reference(model_names: list[str]) -> dict[str, ImageGenerationModelRecord]:
+    """Build a minimal model reference covering every model the warm session may run."""
+    return {
+        name: ImageGenerationModelRecord(
+            name=name,
+            baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+            nsfw=False,
+            description="warm benchmark session model record",
+        )
+        for name in model_names
+    }
+
+
+def _build_warm_bridge_data(
+    *,
+    model_names: list[str],
+    process_mode: HarnessProcessMode,
+    max_threads_ceiling: int,
+) -> reGenBridgeData:
+    """Construct bridge data for a warm session covering every level's models."""
+    fields: dict[str, object] = {
+        "api_key": "0000000000",
+        "dreamer_name": "warm-benchmark-worker",
+        "models_to_load": sorted(set(model_names)),
+        "max_threads": 1,
+        "queue_size": 1,
+        "alchemist": True,
+        "safety_on_gpu": False,
+        "cycle_process_on_model_change": False,
+        "remove_maintenance_on_init": False,
+        "exit_on_unhandled_faults": False,
+        "suppress_speed_warnings": True,
+        # Keep the inference semaphore the sole concurrency gate so the live effective cap governs
+        # how many inferences run at once per level (no lease pre-staging to muddy the measurement).
+        "gpu_sampling_lease_enabled": False,
+        "dry_run_skip_api": True,
+        "dry_run_skip_inference": process_mode != "real",
+        "dry_run_skip_safety": process_mode != "real",
+    }
+    bridge_data = reGenBridgeData(**fields)  # type: ignore[arg-type]
+    bridge_data._loaded_from_env_vars = True
+    return bridge_data
+
+
+class WarmHarnessSession:
+    """A long-lived worker reused across benchmark levels, to eliminate per-level warm-up.
+
+    Builds one :class:`HordeWorkerProcessManager` with real OS child processes, keeps it running, and
+    runs each level by swapping the canned scenario, setting the concurrent-inference cap, and
+    resetting per-level metrics, then waiting for the level's jobs to drain. The heavy child-process
+    startup (hordelib/comfyui init) happens once for the whole ramp instead of once per level.
+
+    The inference processes are launched once to the ceiling and never torn down between levels (that
+    is the warmth); only the *effective* concurrency cap changes per level, so a level's ``max_threads``
+    is honoured without respawning. Use as an async context manager.
+    """
+
+    def __init__(
+        self,
+        *,
+        process_mode: HarnessProcessMode,
+        model_names: list[str],
+        max_threads_ceiling: int,
+        horde_model_reference_manager: ModelReferenceManager | None = None,
+    ) -> None:
+        """Initialise the session description (the worker is built on ``__aenter__``)."""
+        self._process_mode = process_mode
+        self._model_names = sorted(set(model_names))
+        self._max_threads_ceiling = max(1, max_threads_ceiling)
+        self._horde_model_reference_manager = horde_model_reference_manager
+        self._manager: HordeWorkerProcessManager | None = None
+        self._loop_task: asyncio.Task[None] | None = None
+
+    @property
+    def manager(self) -> HordeWorkerProcessManager:
+        """The underlying process manager (only valid inside the session)."""
+        if self._manager is None:
+            raise RuntimeError("WarmHarnessSession is not started")
+        return self._manager
+
+    def _build_manager(self) -> HordeWorkerProcessManager:
+        entry_points: ProcessEntryPoints | None = None
+        if self._process_mode == "fake":
+            entry_points = ProcessEntryPoints(
+                inference_entry_point=start_fake_inference_process,
+                safety_entry_point=start_fake_safety_process,
+            )
+        system_resources = _build_harness_system_resources() if self._process_mode != "real" else None
+        # Inject a minimal reference covering every level's models in all modes (mirrors
+        # build_harness_process_manager); the real model load on disk uses hordelib's own reference.
+        reference = _warm_model_reference(self._model_names)
+        return HordeWorkerProcessManager(
+            ctx=multiprocessing.get_context("spawn"),
+            bridge_data=_build_warm_bridge_data(
+                model_names=self._model_names,
+                process_mode=self._process_mode,
+                max_threads_ceiling=self._max_threads_ceiling,
+            ),
+            horde_model_reference_manager=self._horde_model_reference_manager,
+            system_resources=system_resources,
+            skip_api_init=True,
+            stable_diffusion_reference=reference,
+            process_entry_points=entry_points,
+            # Start idle with empty sources; each level installs its own via install_benchmark_scenario.
+            canned_job_source=CannedJobSource([]),
+            canned_alchemy_source=CannedAlchemySource([]),
+            max_threads_ceiling=self._max_threads_ceiling,
+            enable_background_downloads=self._process_mode == "real",
+        )
+
+    async def __aenter__(self) -> WarmHarnessSession:
+        """Build the worker and start its main loop; wait briefly for processes to come up."""
+        from horde_worker_regen.telemetry import configure_telemetry
+
+        configure_telemetry()
+        _cleanup_stale_abort_file()
+
+        self._manager = self._build_manager()
+        self._loop_task = asyncio.create_task(self._manager._main_loop())
+        await self._wait_for_inference_ready()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Shut the worker down."""
+        await self.aclose()
+
+    async def _wait_for_inference_ready(self, timeout_seconds: float = 120.0) -> None:
+        """Wait until at least one inference process exists (best-effort warmup gate)."""
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            if self._manager is not None and self._manager._process_map.num_inference_processes() >= 1:
+                return
+            await asyncio.sleep(0.1)
+
+    async def aclose(self) -> None:
+        """Gracefully shut the worker down and await its main loop."""
+        if self._manager is not None and not self._manager._state.shutting_down:
+            self._manager._shutdown()
+        if self._loop_task is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._loop_task, timeout=60.0)
+
+    async def run_level(
+        self,
+        *,
+        jobs: list[ImageGenerateJobPopResponse] | None,
+        alchemy_forms: list[AlchemyFormSpec] | None = None,
+        threads: int = 1,
+        timeout_seconds: float = 120.0,
+    ) -> HarnessResult:
+        """Run one fixed-scenario level on the warm worker and report its outcome.
+
+        Completion is tracked by the delta in the job tracker's cumulative counters (the tracker is
+        not reset between levels), so this returns once the level's own jobs and alchemy forms are
+        accounted for, or when ``timeout_seconds`` elapses.
+        """
+        manager = self.manager
+        scenario_jobs = jobs or []
+        num_jobs_expected = len(scenario_jobs)
+        num_forms_expected = len(alchemy_forms or [])
+
+        base_completed = manager._job_tracker.total_num_completed_jobs
+        base_faulted = manager._job_tracker.num_jobs_faulted
+
+        manager._apply_set_concurrency(target_threads=threads, target_processes=None)
+        manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=alchemy_forms)
+
+        time_started = time.time()
+        timed_out = False
+        while True:
+            await asyncio.sleep(0.1)
+            completed = manager._job_tracker.total_num_completed_jobs - base_completed
+            faulted = manager._job_tracker.num_jobs_faulted - base_faulted
+            forms_done = (
+                manager._alchemy_coordinator.num_canned_forms_completed
+                + manager._alchemy_coordinator.num_canned_forms_faulted
+            )
+            if (completed + faulted) >= num_jobs_expected and forms_done >= num_forms_expected:
+                break
+            if time.time() - time_started > timeout_seconds:
+                timed_out = True
+                break
+
+        with contextlib.suppress(Exception):
+            await manager.receive_and_handle_process_messages()
+
+        completed = manager._job_tracker.total_num_completed_jobs - base_completed
+        faulted = manager._job_tracker.num_jobs_faulted - base_faulted
+        return HarnessResult(
+            num_jobs_expected=num_jobs_expected,
+            num_jobs_completed=completed,
+            num_jobs_faulted=faulted,
+            elapsed_seconds=time.time() - time_started,
+            timed_out=timed_out,
+            exit_reason="timed_out" if timed_out else "completed",
+            metrics=manager.get_run_metrics_snapshot(),
+            num_alchemy_forms_expected=num_forms_expected,
+            num_alchemy_forms_completed=manager._alchemy_coordinator.num_canned_forms_completed,
+            num_alchemy_forms_faulted=manager._alchemy_coordinator.num_canned_forms_faulted,
+        )

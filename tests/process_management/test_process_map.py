@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from loguru import logger
 
 from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.messages import HordeHeartbeatType, HordeProcessState
 from horde_worker_regen.process_management.process_map import ProcessMap
 
 from .conftest import make_mock_process_info
@@ -129,3 +129,49 @@ class TestProcessStateTransitions:
             process_map.on_process_state_change(0, HordeProcessState.PROCESS_ENDED)
 
         assert warnings == []
+
+
+class TestSamplingProgressReset:
+    """Sampling progress (step/it-s) is job-scoped and must not linger past the job that set it.
+
+    These fields are only ever set by INFERENCE_STEP heartbeats; if they are not cleared on reset, an
+    idle process reports a stale mid-sampling step and it/s, which a consumer (e.g. the TUI live view)
+    renders as a nonsensical "WAITING_FOR_JOB but mid-step" state.
+    """
+
+    def _drive_sampling(self, process_map: ProcessMap, process_id: int = 0) -> None:
+        """Populate the sampling fields the way a real inference heartbeat would."""
+        process_map.on_heartbeat(
+            process_id,
+            HordeHeartbeatType.INFERENCE_STEP,
+            percent_complete=50,
+            current_step=15,
+            total_steps=30,
+            iterations_per_second=8.4,
+        )
+
+    def test_reset_heartbeat_state_clears_sampling_progress(self) -> None:
+        """reset_heartbeat_state must null the step/it-s fields, not just the percent/step count."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        process_map = ProcessMap({0: proc})
+        self._drive_sampling(process_map)
+        assert proc.last_current_step == 15
+
+        process_map.reset_heartbeat_state(0)
+
+        assert proc.last_current_step is None
+        assert proc.last_total_steps is None
+        assert proc.last_iterations_per_second is None
+
+    def test_waiting_for_job_transition_clears_sampling_progress(self) -> None:
+        """Returning to WAITING_FOR_JOB (which resets heartbeat state) clears the sampling fields."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        process_map = ProcessMap({0: proc})
+        self._drive_sampling(process_map)
+
+        process_map.on_process_state_change(0, HordeProcessState.INFERENCE_COMPLETE)
+        process_map.on_process_state_change(0, HordeProcessState.WAITING_FOR_JOB)
+
+        assert proc.last_current_step is None
+        assert proc.last_total_steps is None
+        assert proc.last_iterations_per_second is None

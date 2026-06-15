@@ -18,6 +18,36 @@ if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
     from horde_worker_regen.process_management.device_info import TorchDeviceMap
     from horde_worker_regen.process_management.job_models import APIWorkerMessage
+    from horde_worker_regen.process_management.supervisor_channel import (
+        DownloadPlanSummary,
+        DownloadStatusSnapshot,
+    )
+
+
+def _human_bytes(num_bytes: float | None) -> str:
+    """Render a byte count as a human-readable string (e.g. ``12.3 GB``)."""
+    if num_bytes is None:
+        return "-"
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(value) < 1024.0 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024.0
+    return f"{value:.1f} TB"
+
+
+def _human_duration(seconds: float | None) -> str:
+    """Render a duration in seconds as ``1h02m`` / ``2m03s`` / ``45s``, or a dash when unknown."""
+    if seconds is None:
+        return "-"
+    total = int(max(seconds, 0))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 
 class StatusReporter:
@@ -78,6 +108,8 @@ class StatusReporter:
         jobs_being_safety_checked: int,
         jobs_in_progress: int,
         total_ram_gigabytes: int,
+        download_status: DownloadStatusSnapshot | None = None,
+        download_plan: DownloadPlanSummary | None = None,
     ) -> float:
         """Print the status of the worker.
 
@@ -106,6 +138,8 @@ class StatusReporter:
             jobs_being_safety_checked: Number of jobs being safety checked.
             jobs_in_progress: Number of jobs in progress.
             total_ram_gigabytes: Total RAM in gigabytes.
+            download_status: Live background-download status, or None when no download process runs.
+            download_plan: The config's disk-budget summary, or None when the reference is not loaded.
 
         Returns:
             The updated status message frequency.
@@ -145,6 +179,10 @@ class StatusReporter:
         )
 
         logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
+
+        # Print downloads info (only when there is something to show)
+        if self._print_downloads(logging_function, download_status, download_plan):
+            logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
 
         # Print worker info
         self._print_worker_info(
@@ -248,6 +286,101 @@ class StatusReporter:
         logging_function(
             f"<fg #7dcea0>{job_info_message}</>",
         )
+
+    @staticmethod
+    def _plan_summary_line(download_plan: DownloadPlanSummary) -> str:
+        """A one-line disk-budget summary (present/to-download/total/free/fit)."""
+        fit = "fits" if download_plan.fits else f"OVER BUDGET by {_human_bytes(download_plan.shortfall_bytes)}"
+        caveat = "" if download_plan.sizes_complete else " (lower bound; some sizes unknown)"
+        return (
+            f"on disk {download_plan.num_present} ({_human_bytes(download_plan.present_bytes)}) | "
+            f"to download {download_plan.num_to_download} ({_human_bytes(download_plan.to_download_bytes)}) | "
+            f"total {_human_bytes(download_plan.total_bytes)} | "
+            f"free {_human_bytes(download_plan.free_disk_bytes)} | {fit}{caveat}"
+        )
+
+    @staticmethod
+    def log_startup_download_plan(download_plan: DownloadPlanSummary) -> None:
+        """Log a one-time, plain-language summary of what the worker will download in the background."""
+        if download_plan.num_to_download <= 0:
+            logger.info(
+                f"All {download_plan.num_present} configured models are already on disk "
+                f"({_human_bytes(download_plan.present_bytes)}).",
+            )
+            return
+        logger.info(
+            f"Background model download plan: {StatusReporter._plan_summary_line(download_plan)}. "
+            "The worker will serve the models it already has while the rest download.",
+        )
+        if not download_plan.fits:
+            logger.warning(
+                "The configured models will not fit on the model disk "
+                f"(short by {_human_bytes(download_plan.shortfall_bytes)}). Downloads will proceed until the "
+                "disk fills, then stop with a disk-full error. Free space or reduce models_to_load.",
+            )
+
+    def _print_downloads(
+        self,
+        logging_function: Callable[..., None],
+        download_status: DownloadStatusSnapshot | None,
+        download_plan: DownloadPlanSummary | None,
+    ) -> bool:
+        """Print the downloads section. Returns True when anything was printed."""
+        if download_status is None and download_plan is None:
+            return False
+
+        logging_function("<b>Downloads:</b>")
+
+        if download_plan is not None:
+            line = self._plan_summary_line(download_plan)
+            colour = "#7dcea0" if download_plan.fits else "#ff5555"
+            logging_function(f"  Disk plan: <fg {colour}>{line}</>")
+
+        if download_status is not None:
+            self._print_download_status(logging_function, download_status)
+
+        return True
+
+    @staticmethod
+    def _print_download_status(
+        logging_function: Callable[..., None],
+        download_status: DownloadStatusSnapshot,
+    ) -> None:
+        """Print the live phase, current download, queue summary, and any failures."""
+        phase_bits = [f"phase: {download_status.phase.value}"]
+        if download_status.paused:
+            phase_bits.append("PAUSED")
+        if download_status.rate_limit_kbps:
+            phase_bits.append(f"limit {download_status.rate_limit_kbps} KB/s")
+        logging_function("  " + " | ".join(phase_bits))
+        if download_status.error_message:
+            logging_function(f"  <fg #ff5555>error: {download_status.error_message}</>")
+
+        current = download_status.current
+        if current is not None:
+            percent = current.percent
+            percent_text = f"{percent:.1f}%" if percent is not None else "?"
+            speed = f"{_human_bytes(current.speed_bps)}/s" if current.speed_bps else "-"
+            logging_function(
+                f"  Now: {current.model_name} [{current.feature}] -> {current.target_dir}",
+            )
+            logging_function(
+                f"       {_human_bytes(current.downloaded_bytes)}/{_human_bytes(current.total_bytes)} "
+                f"({percent_text}) | {speed} | ETA {_human_duration(current.eta_seconds)}",
+            )
+
+        if download_status.pending:
+            preview = ", ".join(
+                f"{item.model_name} [{item.feature}] {_human_bytes(item.size_bytes)}"
+                for item in download_status.pending[:3]
+            )
+            more = f" (+{len(download_status.pending) - 3} more)" if len(download_status.pending) > 3 else ""
+            logging_function(f"  Queued ({len(download_status.pending)}): {preview}{more}")
+
+        for failure in download_status.failures:
+            logging_function(
+                f"  <fg #ff5555>Failed: {failure.model_name} [{failure.feature}]: {failure.reason}</>",
+            )
 
     def _print_worker_info(
         self,

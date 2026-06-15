@@ -32,13 +32,15 @@ from loguru import logger
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management._dummy_images import make_dummy_png_base64
 from horde_worker_regen.process_management.debug_attach import maybe_wait_for_process_debugger
-from horde_worker_regen.process_management.horde_process import HordeProcess
+from horde_worker_regen.process_management.horde_process import HordeProcess, HordeProcessType
 from horde_worker_regen.process_management.messages import (
     AlchemyFormSpec,
     HordeAlchemyControlMessage,
     HordeAlchemyResultMessage,
     HordeControlFlag,
     HordeControlMessage,
+    HordeDownloadAvailabilityMessage,
+    HordeDownloadControlMessage,
     HordeHeartbeatType,
     HordeImageResult,
     HordeInferenceControlMessage,
@@ -51,6 +53,13 @@ from horde_worker_regen.process_management.messages import (
     HordeSafetyEvaluation,
     HordeSafetyResultMessage,
     ModelLoadState,
+)
+from horde_worker_regen.process_management.supervisor_channel import (
+    CurrentDownloadStatus,
+    DownloadFailure,
+    DownloadItem,
+    DownloadPhase,
+    DownloadStatusSnapshot,
 )
 
 
@@ -548,5 +557,165 @@ def start_fake_safety_process(
         pipe_connection=pipe_connection,
         disk_lock=disk_lock,
         process_launch_identifier=process_launch_identifier,
+    )
+    worker_process.main_loop()
+
+
+class FakeDownloadProcess(HordeProcess):
+    """A lightweight stand-in for ``HordeDownloadProcess`` that imports no ML dependencies.
+
+    Starts from a scripted on-disk set and "downloads" any requested model (after an optional
+    per-model delay) by adding it to that set, unless it is in ``fail_models``. Emits the same
+    ``HordeDownloadAvailabilityMessage`` snapshots the real process does.
+    """
+
+    def __init__(
+        self,
+        process_id: int,
+        process_message_queue: ProcessQueue,
+        pipe_connection: Connection,
+        disk_lock: Lock,
+        process_launch_identifier: int,
+        *,
+        scripted_present: list[str] | None = None,
+        download_delay_seconds: float = 0.0,
+        fail_models: list[str] | None = None,
+        rate_limit_kbps: int | None = None,
+        paused: bool = False,
+    ) -> None:
+        """Initialise with a scripted present-set and download behaviour."""
+        super().__init__(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+        )
+        self.process_type = HordeProcessType.DOWNLOAD
+        self._present: set[str] = set(scripted_present or [])
+        self._download_delay_seconds = download_delay_seconds
+        self._fail_models = set(fail_models or [])
+        self._pending: list[str] = []
+        self._failed: list[str] = []
+        self._currently_downloading: str | None = None
+        self._paused = paused
+        self._rate_limit_kbps = rate_limit_kbps if (rate_limit_kbps or 0) > 0 else None
+        self._send_availability()
+
+    def _status_snapshot(self) -> DownloadStatusSnapshot:
+        """Project the fake's state into the same rich snapshot the real process emits."""
+        if self._currently_downloading is not None:
+            phase = DownloadPhase.PAUSED if self._paused else DownloadPhase.DOWNLOADING
+            current = CurrentDownloadStatus(
+                model_name=self._currently_downloading,
+                feature="image model",
+                target_dir="models/compvis",
+            )
+        else:
+            phase = DownloadPhase.PAUSED if self._paused and self._pending else DownloadPhase.IDLE
+            current = None
+        return DownloadStatusSnapshot(
+            phase=phase,
+            current=current,
+            pending=[DownloadItem(model_name=name, feature="image model") for name in self._pending],
+            failures=[
+                DownloadFailure(model_name=name, feature="image model", reason="failed") for name in self._failed
+            ],
+            present_model_names=sorted(self._present),
+            paused=self._paused,
+            rate_limit_kbps=self._rate_limit_kbps,
+        )
+
+    def _send_availability(self, info: str = "download availability") -> None:
+        self.process_message_queue.put(
+            HordeDownloadAvailabilityMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=info,
+                available_model_names=sorted(self._present),
+                currently_downloading=self._currently_downloading,
+                pending_downloads=list(self._pending),
+                failed_downloads=list(self._failed),
+                status=self._status_snapshot(),
+            ),
+        )
+
+    @override
+    def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
+        if not isinstance(message, HordeDownloadControlMessage):
+            logger.warning(f"Fake download process received unexpected message: {type(message).__name__}")
+            return
+        if message.set_paused is not None:
+            self._paused = message.set_paused
+        if message.set_rate_limit_kbps is not None:
+            self._rate_limit_kbps = message.set_rate_limit_kbps if message.set_rate_limit_kbps > 0 else None
+        for model_name in message.model_names:
+            if model_name in self._present or model_name in self._pending:
+                continue
+            self._pending.append(model_name)
+        self._send_availability("download request received")
+
+    @override
+    def worker_cycle(self) -> None:
+        if self._paused or not self._pending:
+            return
+        model_name = self._pending.pop(0)
+        self._currently_downloading = model_name
+        self._send_availability(f"downloading {model_name}")
+        if self._download_delay_seconds > 0:
+            time.sleep(self._download_delay_seconds)
+        self._currently_downloading = None
+        if model_name in self._fail_models:
+            self._failed.append(model_name)
+        else:
+            self._present.add(model_name)
+        self._send_availability(f"finished {model_name}")
+
+    @override
+    def cleanup_for_exit(self) -> None:
+        return
+
+
+def start_fake_download_process(
+    process_id: int,
+    process_message_queue: ProcessQueue,
+    pipe_connection: Connection,
+    disk_lock: Lock,
+    process_launch_identifier: int,
+    *,
+    nsfw: bool = True,
+    allow_lora: bool = False,
+    allow_controlnet: bool = False,
+    allow_sdxl_controlnet: bool = False,
+    allow_post_processing: bool = True,
+    purge_loras: bool = False,
+    amd_gpu: bool = False,
+    directml: int | None = None,
+    rate_limit_kbps: int | None = None,
+    paused: bool = False,
+    scripted_present: list[str] | None = None,
+    download_delay_seconds: float = 0.0,
+    fail_models: list[str] | None = None,
+) -> None:
+    """Start a fake download process.
+
+    Signature-compatible with ``worker_entry_points.start_download_process``; the worker-config
+    arguments are accepted and ignored, except ``rate_limit_kbps``/``paused`` which the fake honors so
+    the pause/throttle controls can be exercised. Inject the scripting arguments with
+    ``functools.partial`` (partials of module-level functions stay picklable under spawn).
+    """
+    logger.remove()
+    maybe_wait_for_process_debugger(process_id, "fake download")
+    worker_process = FakeDownloadProcess(
+        process_id=process_id,
+        process_message_queue=process_message_queue,
+        pipe_connection=pipe_connection,
+        disk_lock=disk_lock,
+        process_launch_identifier=process_launch_identifier,
+        scripted_present=scripted_present,
+        download_delay_seconds=download_delay_seconds,
+        fail_models=fail_models,
+        rate_limit_kbps=rate_limit_kbps,
+        paused=paused,
     )
     worker_process.main_loop()

@@ -96,6 +96,15 @@ class WorkerRunMetrics:
         self._ram_high_water_per_process: dict[int, int] = {}
         self._crash_events: list[ProcessCrashRecord] = []
 
+    def reset(self) -> None:
+        """Clear all aggregated metrics, e.g. at a benchmark level boundary on a warm worker."""
+        self._jobs.clear()
+        self._downloads.clear()
+        self._phase_metrics_by_job.clear()
+        self._vram_high_water_per_process.clear()
+        self._ram_high_water_per_process.clear()
+        self._crash_events.clear()
+
     def on_job_metrics(self, message: HordeJobMetricsMessage) -> None:
         """Handle a per-job metrics message from a child process."""
         metrics = message.phase_metrics

@@ -21,6 +21,7 @@ from horde_worker_regen.process_management._canned_scenarios import CannedJobSou
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.job_tracker import JobTracker
+from horde_worker_regen.process_management.model_availability import ModelAvailability
 from horde_worker_regen.process_management.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
     PopThrottler,
@@ -45,6 +46,7 @@ def _select_models_for_pop(
     max_inference_processes: int,
     *,
     last_pop_had_no_jobs: bool,
+    model_availability: ModelAvailability | None = None,
 ) -> set[str] | None:
     """Choose which models to include in a pop request.
 
@@ -53,6 +55,12 @@ def _select_models_for_pop(
         (caller should skip the pop).
     """
     models = set(bridge_data.image_models_to_load)
+
+    # Never advertise a model that is not on disk: a job for it would be popped only to fault when the
+    # inference process cannot find the checkpoint. While availability is unknown (no download process)
+    # this is a no-op, preserving the behaviour of workers that pre-download everything.
+    if model_availability is not None:
+        models = model_availability.filter_present(models)
 
     loaded_models = {
         process.loaded_horde_model_name
@@ -105,7 +113,18 @@ def _select_models_for_pop(
         models.update(custom_model_names)
 
     if len(models) == 0:
-        logger.debug("Not eligible to pop a job yet")
+        if (
+            model_availability is not None
+            and model_availability.is_known
+            and (model_availability.currently_downloading or model_availability.pending)
+        ):
+            logger.info(
+                "No configured models are on disk yet; waiting for downloads "
+                f"(downloading: {model_availability.currently_downloading}, "
+                f"pending: {len(model_availability.pending)})",
+            )
+        else:
+            logger.debug("Not eligible to pop a job yet")
         return None
 
     return models
@@ -130,9 +149,10 @@ class JobPopper:
     _fast_pop_interval: float
 
     _canned_job_source: CannedJobSource | None
+    _model_availability: ModelAvailability | None
 
     _max_inference_processes: int
-    _max_concurrent_inference_processes: int
+    _max_threads_ceiling: int
 
     def __init__(
         self,
@@ -147,11 +167,15 @@ class JobPopper:
         max_concurrent_inference_processes: int,
         dry_run_skip_api: bool = False,
         canned_job_source: CannedJobSource | None = None,
+        model_availability: ModelAvailability | None = None,
     ) -> None:
         """Initialize with all required dependencies for job popping.
 
         When `dry_run_skip_api` is set, jobs come from `canned_job_source` instead of
         the live API; if no source is given, an endlessly-cycling default is used.
+
+        When `model_availability` is provided, only models present on disk are advertised in
+        pop requests (a missing model would otherwise be popped and then fault).
         """
         self._state = state
         self._process_map = process_map
@@ -161,12 +185,16 @@ class JobPopper:
         self._api_sessions = api_sessions
 
         self._max_inference_processes = max_inference_processes
-        self._max_concurrent_inference_processes = max_concurrent_inference_processes
+        # The constructor value is the provisioned ceiling; the threads advertised in pop requests
+        # track the live effective cap (see the _max_concurrent_inference_processes property).
+        self._max_threads_ceiling = max_concurrent_inference_processes
         self._dry_run_skip_api = dry_run_skip_api
 
         self._canned_job_source = canned_job_source
         if dry_run_skip_api and self._canned_job_source is None:
             self._canned_job_source = make_default_dry_run_source()
+
+        self._model_availability = model_availability
 
         self._pop_throttler = PopThrottler(job_tracker=job_tracker)
         self._source_image_downloader = SourceImageDownloader(
@@ -178,6 +206,15 @@ class JobPopper:
         self._api_messages_received = {}
         self._api_call_loop_interval = 1
         self._fast_pop_interval = 0.05
+
+    @property
+    def _max_concurrent_inference_processes(self) -> int:
+        """The live concurrent-inference cap (effective ``max_threads``) advertised to the API."""
+        return self._runtime_config.effective_max_threads
+
+    def set_canned_job_source(self, source: CannedJobSource | None) -> None:
+        """Swap the canned job source at runtime (a warm benchmark worker's level boundary)."""
+        self._canned_job_source = source
 
     @property
     def api_messages_received(self) -> dict[str, APIWorkerMessage]:
@@ -358,6 +395,10 @@ class JobPopper:
             self._state.last_pop_no_jobs_available = False
             return
 
+        if self._state.supervisor_paused:
+            self._state.last_pop_no_jobs_available = False
+            return
+
         cur_time = time.time()
         bridge_data = self._runtime_config.bridge_data
 
@@ -397,6 +438,7 @@ class JobPopper:
             self._job_tracker,
             self._max_inference_processes,
             last_pop_had_no_jobs=self._state.last_pop_no_jobs_available,
+            model_availability=self._model_availability,
         )
         if models is None:
             return

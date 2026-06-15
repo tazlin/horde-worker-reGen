@@ -157,6 +157,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd = Mock()
     bd.image_models_to_load = ["stable_diffusion"]
     bd.custom_models = []  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
+    bd.extra_model_directories = []
     bd.max_threads = 1
     bd.queue_size = 1
     bd.high_memory_mode = False

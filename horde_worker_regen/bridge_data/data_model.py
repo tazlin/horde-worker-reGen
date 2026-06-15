@@ -251,6 +251,26 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     download_timeout: int = Field(default=TOTAL_LORA_DOWNLOAD_TIMEOUT + 1)
     """The maximum amount of time to allow an aux model to download before it is killed"""
+
+    download_rate_limit_kbps: int | None = Field(default=None, ge=0)
+    """Cap background model downloads to this many KB/s (None or 0 means unlimited).
+
+    Applied by the background download process and honored on config reload. Approximate: enforced at
+    16MB-chunk granularity, so very low limits are coarse."""
+    downloads_paused: bool = Field(default=False)
+    """If true, background model downloads are held (the current chunk loop blocks) until resumed.
+
+    Honored on config reload and overridable live from the TUI; the worker keeps serving models that
+    are already on disk while downloads are paused."""
+
+    extra_model_directories: list[str] = Field(default_factory=list)
+    """Additional model weights-root directories to search for already-downloaded files.
+
+    Each entry is a directory laid out like the primary model folder (containing ``compvis``, ``lora``,
+    etc.); presence checks search the primary root and then these, so model files can be spread across
+    disks. New downloads always target the primary root. Also settable via the
+    ``AIWORKER_EXTRA_MODEL_DIRECTORIES`` environment variable (``os.pathsep``-separated)."""
+
     preload_timeout: int = Field(default=80, ge=15)
     """The maximum amount of time to allow a model to load before it is killed"""
     inference_step_timeout: int = Field(default=15, ge=15, le=30)
@@ -499,6 +519,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
         # See load_env_vars.py's `def load_env_vars(self) -> None:`
         if self.models_folder_parent and os.getenv("AIWORKER_CACHE_HOME") is None:
             os.environ["AIWORKER_CACHE_HOME"] = self.models_folder_parent
+        if self.extra_model_directories and os.getenv("AIWORKER_EXTRA_MODEL_DIRECTORIES") is None:
+            os.environ["AIWORKER_EXTRA_MODEL_DIRECTORIES"] = os.pathsep.join(self.extra_model_directories)
         if self.horde_url:
             if os.environ.get("AI_HORDE_URL"):
                 logger.warning(

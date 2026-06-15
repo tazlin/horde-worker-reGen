@@ -60,6 +60,31 @@ class SafetyProcessEntryPoint(Protocol):
         """Run a safety process until told to end."""
 
 
+class DownloadProcessEntryPoint(Protocol):
+    """The signature a callable must have to serve as the background download process target."""
+
+    def __call__(
+        self,
+        process_id: int,
+        process_message_queue: ProcessQueue,
+        pipe_connection: Connection,
+        disk_lock: Lock,
+        process_launch_identifier: int,
+        *,
+        nsfw: bool = True,
+        allow_lora: bool = False,
+        allow_controlnet: bool = False,
+        allow_sdxl_controlnet: bool = False,
+        allow_post_processing: bool = True,
+        purge_loras: bool = False,
+        amd_gpu: bool = False,
+        directml: int | None = None,
+        rate_limit_kbps: int | None = None,
+        paused: bool = False,
+    ) -> None:
+        """Run the download process until told to end."""
+
+
 def start_inference_process(
     process_id: int,
     process_message_queue: ProcessQueue,
@@ -317,6 +342,91 @@ def start_safety_process(
         worker_process.main_loop()
 
 
+def start_download_process(
+    process_id: int,
+    process_message_queue: ProcessQueue,
+    pipe_connection: Connection,
+    disk_lock: Lock,
+    process_launch_identifier: int,
+    *,
+    nsfw: bool = True,
+    allow_lora: bool = False,
+    allow_controlnet: bool = False,
+    allow_sdxl_controlnet: bool = False,
+    allow_post_processing: bool = True,
+    purge_loras: bool = False,
+    amd_gpu: bool = False,
+    directml: int | None = None,
+    rate_limit_kbps: int | None = None,
+    paused: bool = False,
+) -> None:
+    """Start the background model-download process.
+
+    Args:
+        process_id (int): The reserved id for this process (see ``download_process.DOWNLOAD_PROCESS_ID``).
+        process_message_queue (ProcessQueue): The queue to send messages to the main process.
+        pipe_connection (Connection): Receives ``HordeControlMessage``s from the main process.
+        disk_lock (Lock): Coordinates disk access with the inference/safety processes.
+        process_launch_identifier (int): The unique identifier for this launch.
+        nsfw (bool): Whether NSFW default LoRas may be fetched. Defaults to True.
+        allow_lora (bool): Whether to fetch the default LoRas during an aux pass. Defaults to False.
+        allow_controlnet (bool): Whether to fetch ControlNet models/annotators. Defaults to False.
+        allow_sdxl_controlnet (bool): Whether to fetch SDXL ControlNet/miscellaneous models. Defaults to False.
+        allow_post_processing (bool): Whether to fetch post-processing models. Defaults to True.
+        purge_loras (bool): Whether to purge unused LoRas during an aux pass. Defaults to False.
+        amd_gpu (bool): Whether this is an AMD GPU. Defaults to False.
+        directml (int | None): The DirectML device index, if any. Defaults to None.
+        rate_limit_kbps (int | None): Initial bandwidth cap in KB/s (None/0 = unlimited). Defaults to None.
+        paused (bool): Whether downloads start paused. Defaults to False.
+    """
+    with contextlib.nullcontext():
+        logger.remove()
+        maybe_wait_for_process_debugger(process_id, "download")
+
+        try:
+            from horde_worker_regen.telemetry import claim_logfire_ownership, enforce_telemetry_default_off
+
+            claim_logfire_ownership()
+            enforce_telemetry_default_off()
+
+            from hordelib.api import HordeLog
+
+            HordeLog.initialise(
+                setup_logging=True,
+                process_id=process_id,
+                verbosity_count=5,
+            )
+
+            from horde_worker_regen.telemetry import configure_child_telemetry
+
+            configure_child_telemetry(process_id)
+        except Exception as e:
+            logger.critical(f"Failed to initialise download process: {type(e).__name__} {e}")
+            sys.exit(1)
+
+        from horde_worker_regen.process_management.download_process import HordeDownloadProcess
+
+        worker_process = HordeDownloadProcess(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+            nsfw=nsfw,
+            allow_lora=allow_lora,
+            allow_controlnet=allow_controlnet,
+            allow_sdxl_controlnet=allow_sdxl_controlnet,
+            allow_post_processing=allow_post_processing,
+            purge_loras=purge_loras,
+            amd_gpu=amd_gpu,
+            directml=directml,
+            rate_limit_kbps=rate_limit_kbps,
+            paused=paused,
+        )
+
+        worker_process.main_loop()
+
+
 class ProcessEntryPoints:
     """The multiprocessing targets used when launching child worker processes.
 
@@ -330,12 +440,14 @@ class ProcessEntryPoints:
 
     inference_entry_point: InferenceProcessEntryPoint
     safety_entry_point: SafetyProcessEntryPoint
+    download_entry_point: DownloadProcessEntryPoint
 
     def __init__(
         self,
         *,
         inference_entry_point: InferenceProcessEntryPoint | None = None,
         safety_entry_point: SafetyProcessEntryPoint | None = None,
+        download_entry_point: DownloadProcessEntryPoint | None = None,
     ) -> None:
         """Initialise with the given entry points, defaulting to the real ones.
 
@@ -344,8 +456,13 @@ class ProcessEntryPoints:
                 inference processes. Defaults to `start_inference_process`.
             safety_entry_point (SafetyProcessEntryPoint | None, optional): The target for \
                 safety processes. Defaults to `start_safety_process`.
+            download_entry_point (DownloadProcessEntryPoint | None, optional): The target for \
+                the background download process. Defaults to `start_download_process`.
         """
         self.inference_entry_point = (
             inference_entry_point if inference_entry_point is not None else start_inference_process
         )
         self.safety_entry_point = safety_entry_point if safety_entry_point is not None else start_safety_process
+        self.download_entry_point = (
+            download_entry_point if download_entry_point is not None else start_download_process
+        )

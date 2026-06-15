@@ -16,6 +16,8 @@ from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 
+from horde_worker_regen.process_management.supervisor_channel import DownloadStatusSnapshot
+
 
 class ModelLoadState(enum.Enum):
     """The state of a model.
@@ -219,6 +221,29 @@ class HordeDownloadCompleteMessage(HordeModelStateChangeMessage):
     """Download complete messages that are sent from the child processes to the main process."""
 
 
+class HordeDownloadAvailabilityMessage(HordeProcessMessage):
+    """A full snapshot of on-disk image-model availability, sent by the dedicated download process.
+
+    Unlike the per-process model-state messages, this is not tied to an entry in the process map:
+    the download process lives outside it. The snapshot is sent once after the process loads its
+    model managers and again after each model finishes (or fails) downloading, so the main process
+    can keep its advertised-models set in sync without per-event bookkeeping.
+    """
+
+    available_model_names: list[str]
+    """Every configured image model currently present on disk."""
+    currently_downloading: str | None = None
+    """The model being downloaded right now, if any."""
+    pending_downloads: list[str] = Field(default_factory=list)
+    """Models still queued to download (excludes the one in progress)."""
+    failed_downloads: list[str] = Field(default_factory=list)
+    """Models whose download was attempted and failed (will not be retried automatically)."""
+    scan_complete: bool = True
+    """False for early initializing/scanning reports whose on-disk set is not yet authoritative."""
+    status: DownloadStatusSnapshot | None = None
+    """Rich, display-oriented status (phase, current download, queue, failures) for the TUI/console."""
+
+
 class HordeImageResult(BaseModel):
     """Contains information about a single image that has been generated in a job."""
 
@@ -315,6 +340,8 @@ class HordeControlFlag(enum.Enum):
     """Signal the child process to unload models from VRAM."""
     UNLOAD_MODELS_FROM_RAM = auto()
     """Signal the child process to unload models from RAM."""
+    DOWNLOAD_MODELS = auto()
+    """Signal the dedicated download process to ensure a set of models are present on disk."""
     END_PROCESS = auto()
     """Signal the child process to end."""
 
@@ -331,6 +358,25 @@ class HordeControlModelMessage(HordeControlMessage):
 
     horde_model_name: str
     """The name of the model as defined in the horde model reference."""
+
+
+class HordeDownloadControlMessage(HordeControlMessage):
+    """Ask the dedicated download process to ensure a set of image models are present on disk.
+
+    The process downloads any not already present, sequentially in the background, reporting
+    a fresh :class:`HordeDownloadAvailabilityMessage` snapshot as each completes.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.DOWNLOAD_MODELS
+    model_names: list[str] = Field(default_factory=list)
+    """The horde image-model names to ensure are downloaded."""
+    download_aux: bool = False
+    """If True, also run the one-time auxiliary/default downloads (LoRa defaults, controlnet,
+    post-processing, safety helpers) permitted by the worker config."""
+    set_paused: bool | None = None
+    """If not None, pause (True) or resume (False) downloads; applied live, mid-download."""
+    set_rate_limit_kbps: int | None = None
+    """If not None, set the bandwidth cap in kB/s; 0 or negative clears the limit."""
 
 
 class HordePreloadInferenceModelMessage(HordeControlModelMessage):

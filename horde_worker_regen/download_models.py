@@ -1,7 +1,5 @@
 """Contains the code to download all models specified in the config file. Executable as a standalone script."""
 
-import asyncio
-
 
 def download_all_models(
     *,
@@ -15,28 +13,13 @@ def download_all_models(
     if not load_config_from_env_vars:
         load_env_vars_from_config()
 
-    from horde_model_reference.model_reference_manager import ModelReferenceManager, PrefetchStrategy
     from loguru import logger
 
     from horde_worker_regen.bridge_data.load_config import BridgeDataLoader, reGenBridgeData
     from horde_worker_regen.consts import BRIDGE_CONFIG_FILENAME
+    from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
 
-    async def download_model_references() -> ModelReferenceManager:
-        horde_model_reference_manager = ModelReferenceManager(
-            prefetch_strategy=PrefetchStrategy.ASYNC,
-        )
-
-        prefetch_handle = horde_model_reference_manager.deferred_prefetch_handle
-
-        if prefetch_handle is None:
-            logger.error("Failed to get prefetch handle for model reference manager")
-            exit(1)
-
-        await prefetch_handle
-
-        return horde_model_reference_manager
-
-    horde_model_reference_manager = asyncio.run(download_model_references())
+    horde_model_reference_manager = ensure_model_reference_manager_initialized()
 
     bridge_data: reGenBridgeData | None = None
     try:
@@ -190,3 +173,60 @@ def download_all_models(
         exit(1)
     else:
         logger.success("Downloaded all compvis (Stable Diffusion) models.")
+
+
+def migrate_model_layout(*, apply: bool = False, load_config_from_env_vars: bool = False) -> int:
+    """Migrate the on-disk model layout to the canonical horde_model_reference layout.
+
+    A thin pass-through to horde_model_reference's ``migrate-model-layout``: it first loads the worker's
+    environment (so ``AIWORKER_CACHE_HOME`` and any extra model directories are honored), then plans and,
+    when *apply* is true, performs the symlink-safe relocation. Dry-run by default.
+    """
+    from horde_worker_regen.load_env_vars import load_env_vars_from_config
+
+    if not load_config_from_env_vars:
+        load_env_vars_from_config()
+
+    from horde_model_reference.cli.migrate_layout import main as migrate_layout_main
+
+    return migrate_layout_main(["--apply"] if apply else [])
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Console-script entry point: download all configured models, or migrate the on-disk layout."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="download_models",
+        description="Download all models named in the worker config, or migrate the on-disk model layout.",
+    )
+    parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help="Migrate the on-disk model layout instead of downloading (dry-run unless --apply is given).",
+    )
+    parser.add_argument("--apply", action="store_true", help="With --migrate, perform the moves (default: dry-run).")
+    parser.add_argument(
+        "--env",
+        dest="load_config_from_env_vars",
+        action="store_true",
+        help="Load configuration from environment variables instead of the config file.",
+    )
+    parser.add_argument("--purge-unused-loras", action="store_true", help="Delete LoRAs not in the configured set.")
+    parser.add_argument("--directml", type=int, default=None, help="DirectML device index (for Windows AMD GPUs).")
+    args = parser.parse_args(argv)
+
+    if args.migrate:
+        raise SystemExit(
+            migrate_model_layout(apply=args.apply, load_config_from_env_vars=args.load_config_from_env_vars),
+        )
+
+    download_all_models(
+        load_config_from_env_vars=args.load_config_from_env_vars,
+        purge_unused_loras=args.purge_unused_loras,
+        directml=args.directml,
+    )
+
+
+if __name__ == "__main__":
+    main()

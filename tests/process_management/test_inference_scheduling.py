@@ -55,6 +55,9 @@ def _make_inference_scheduler(
         job_tracker = JobTracker()
     if bridge_data is None:
         bridge_data = make_mock_bridge_data()
+    # The effective concurrency cap is now read live from the runtime config's max_threads; tie it to
+    # the fixture's max_concurrent so these tests exercise the intended concurrent-inference cap.
+    bridge_data.max_threads = max_concurrent
 
     return InferenceScheduler(
         state=state,

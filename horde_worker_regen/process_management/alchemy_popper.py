@@ -257,6 +257,12 @@ class AlchemyCoordinator:
         self._error_pop_frequency = 15.0
         self._loop_interval = 1.0
 
+    def set_canned_alchemy_source(self, source: CannedAlchemySource | None) -> None:
+        """Swap the canned alchemy source at runtime and reset its per-level counters."""
+        self._canned_alchemy_source = source
+        self.num_canned_forms_completed = 0
+        self.num_canned_forms_faulted = 0
+
     @property
     def bridge_data(self) -> reGenBridgeData:
         """Return the current bridge configuration."""
@@ -275,6 +281,8 @@ class AlchemyCoordinator:
         if not bridge_data.alchemist:
             return False
         if self._state.shutting_down:
+            return False
+        if self._state.supervisor_paused:
             return False
         if len(self._pending_forms) + len(self._in_flight) >= max(bridge_data.queue_size, 1):
             return False
@@ -370,6 +378,21 @@ class AlchemyCoordinator:
             f"<fg #34c0eb>Popped canned alchemy form {spec.form_id} ({spec.form})</>",
         )
 
+    def _handle_pop_error_response(self, response: RequestErrorResponse) -> None:
+        """Log an alchemy pop error, with actionable guidance for common, recoverable causes."""
+        message_lower = response.message.lower()
+        if "maintenance mode" in message_lower:
+            logger.warning(f"Failed to pop alchemy job (Maintenance Mode): {response}")
+        elif "wrong credentials" in message_lower:
+            logger.warning(f"Failed to pop alchemy job (Wrong Credentials): {response}")
+            logger.error("Did you set a unique `alchemist_name` in bridgeData.yaml?")
+            logger.error(
+                "Alchemist worker names must be unique horde-wide and cannot reuse your `dreamer_name`. "
+                "If you haven't used this name before, try changing it.",
+            )
+        else:
+            logger.error(f"Failed to pop alchemy job (API Error): {response}")
+
     @logger.catch(reraise=True)
     async def api_alchemy_pop(self) -> None:
         """Pop alchemy forms from the API (or the canned source) when the pop policy allows it."""
@@ -405,7 +428,7 @@ class AlchemyCoordinator:
             return
 
         if isinstance(pop_response, RequestErrorResponse):
-            logger.error(f"Failed to pop alchemy job (API Error): {pop_response}")
+            self._handle_pop_error_response(pop_response)
             self._last_pop_time = time.time() + (self._error_pop_frequency - self._pop_frequency)
             return
 

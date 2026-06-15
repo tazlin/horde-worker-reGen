@@ -40,6 +40,8 @@ class HordeProcessType(enum.Enum):
 
     INFERENCE = auto()
     SAFETY = auto()
+    DOWNLOAD = auto()
+    """A background model-downloading process; serves no jobs and lives outside the process map."""
 
 
 class WorkerCapability(enum.Flag):
@@ -62,6 +64,7 @@ class WorkerCapability(enum.Flag):
 DEFAULT_CAPABILITIES: dict[HordeProcessType, WorkerCapability] = {
     HordeProcessType.INFERENCE: WorkerCapability.IMAGE_GEN | WorkerCapability.ALCHEMY_GRAPH,
     HordeProcessType.SAFETY: WorkerCapability.SAFETY_EVAL | WorkerCapability.ALCHEMY_CLIP,
+    HordeProcessType.DOWNLOAD: WorkerCapability(0),
 }
 """The capabilities each process type declares by default."""
 

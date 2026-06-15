@@ -47,6 +47,34 @@ def test_fake_mode_ramp_end_to_end(tmp_path: Path) -> None:
 
 
 @pytest.mark.e2e
+def test_warm_mode_runs_fixed_levels_without_subprocesses(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A warm-mode ramp runs its fixed-scenario levels on one reused worker, spawning no subprocess."""
+    ladder = build_default_ladder(
+        LadderOptions(
+            tiers=["sd15"],
+            jobs_per_level=2,
+            include_concurrency=True,
+            include_features=False,
+            include_alchemy=False,
+        ),
+    )
+    fixed_levels = [level for level in ladder if level.scenario.soak_seconds is None]
+    assert len(fixed_levels) >= 2, "need multiple fixed levels to exercise warm reuse"
+
+    def _fail_if_called(*args: object, **kwargs: object) -> subprocess.Popen:
+        raise AssertionError("warm mode must not spawn per-level subprocesses")
+
+    monkeypatch.setattr(subprocess, "Popen", _fail_if_called)
+
+    controller = BenchmarkController(ladder, tmp_path, process_mode="fake", warm=True, validate=False)
+    report = controller.run()
+
+    passed = [level for level in report.levels if level.outcome == "passed"]
+    assert len(passed) >= 2, [(level.level.id, level.outcome, level.reasons) for level in report.levels]
+    assert (tmp_path / "report.json").exists()
+
+
+@pytest.mark.e2e
 def test_validation_soak_runs_after_ramp(tmp_path: Path) -> None:
     """After the ramp, a stage-V soak runs the synthesized config under sustained generated load."""
     ladder = _mini_ladder()
@@ -116,10 +144,10 @@ def test_failed_axis_skips_higher_rungs(tmp_path: Path) -> None:
 def test_crashed_subprocess_recorded_and_ramp_survives(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A level subprocess that dies without a result is a 'crashed' finding, not a ramp abort."""
 
-    def _fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
-        return subprocess.CompletedProcess(args=args, returncode=139, stdout="", stderr="segfault")
+    def _fake_subprocess(self: BenchmarkController, level: object, command: object) -> tuple[int, bool]:
+        return 139, False
 
-    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(BenchmarkController, "_run_level_subprocess", _fake_subprocess)
 
     ladder = _mini_ladder()
     controller = BenchmarkController(ladder, tmp_path, process_mode="fake")
@@ -133,10 +161,10 @@ def test_crashed_subprocess_recorded_and_ramp_survives(tmp_path: Path, monkeypat
 def test_hung_subprocess_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A level subprocess that exceeds its timeout is killed and recorded as a hang."""
 
-    def _fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
-        raise subprocess.TimeoutExpired(cmd="level_runner", timeout=1.0)
+    def _fake_subprocess(self: BenchmarkController, level: object, command: object) -> tuple[int, bool]:
+        return -1, True
 
-    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(BenchmarkController, "_run_level_subprocess", _fake_subprocess)
 
     ladder = _mini_ladder()
     controller = BenchmarkController(ladder, tmp_path, process_mode="fake")
@@ -153,10 +181,10 @@ def test_resume_reuses_existing_results(tmp_path: Path, monkeypatch: pytest.Monk
     first_report = BenchmarkController(ladder, tmp_path, process_mode="fake").run()
     assert first_report.levels[0].outcome == "passed"
 
-    def _fail_if_called(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+    def _fail_if_called(*args: object, **kwargs: object) -> subprocess.Popen:
         raise AssertionError("resume must not re-run level subprocesses")
 
-    monkeypatch.setattr(subprocess, "run", _fail_if_called)
+    monkeypatch.setattr(subprocess, "Popen", _fail_if_called)
 
     resumed_report = BenchmarkController(ladder, tmp_path, process_mode="fake", resume=True).run()
     assert resumed_report.levels[0].outcome == "passed"
@@ -166,10 +194,10 @@ def test_resume_reuses_existing_results(tmp_path: Path, monkeypatch: pytest.Monk
 def test_skip_downloads_skips_networked_levels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """--skip-downloads pre-flight-skips network levels without running anything."""
 
-    def _fail_if_called(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+    def _fail_if_called(*args: object, **kwargs: object) -> subprocess.Popen:
         raise AssertionError("skipped levels must not spawn subprocesses")
 
-    monkeypatch.setattr(subprocess, "run", _fail_if_called)
+    monkeypatch.setattr(subprocess, "Popen", _fail_if_called)
 
     ladder = build_default_ladder(
         LadderOptions(
