@@ -642,6 +642,9 @@ class FakeDownloadProcess(HordeProcess):
 
     @override
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
+        if message.control_flag == HordeControlFlag.RELOAD_MODEL_DATABASE:
+            # The fake holds no real model managers; a reference reload is a no-op here.
+            return
         if not isinstance(message, HordeDownloadControlMessage):
             logger.warning(f"Fake download process received unexpected message: {type(message).__name__}")
             return

@@ -242,6 +242,10 @@ class HordeDownloadAvailabilityMessage(HordeProcessMessage):
     """False for early initializing/scanning reports whose on-disk set is not yet authoritative."""
     status: DownloadStatusSnapshot | None = None
     """Rich, display-oriented status (phase, current download, queue, failures) for the TUI/console."""
+    reference_changed: bool = False
+    """True on the snapshot following a completed download that altered on-disk references (a new image
+    model, or the LoRa/TI/aux pass). The main process broadcasts a reload so inference subprocesses
+    re-read the updated reference (notably lora.json/ti.json) without a restart."""
 
 
 class HordeImageResult(BaseModel):
@@ -342,6 +346,11 @@ class HordeControlFlag(enum.Enum):
     """Signal the child process to unload models from RAM."""
     DOWNLOAD_MODELS = auto()
     """Signal the dedicated download process to ensure a set of models are present on disk."""
+    RELOAD_MODEL_DATABASE = auto()
+    """Signal a child process to reload its model managers' references from disk (no download).
+
+    Sent after the parent refreshes the on-disk reference, or after the download process reports new
+    LoRa/TI availability, so subprocesses pick up the changes without restarting."""
     END_PROCESS = auto()
     """Signal the child process to end."""
 

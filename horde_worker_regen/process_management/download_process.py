@@ -8,8 +8,9 @@ honours live pause and bandwidth-limit controls.
 
 Behavioural notes grounded in a hordelib source trace:
 
-- ``SharedModelManager.load_model_managers()`` makes a synchronous network fetch of the model reference
-  on first run; it is reported as the ``INITIALIZING`` phase and retried with backoff on failure.
+- ``SharedModelManager.load_model_managers()`` reads the model reference from disk (offline): the
+  parent process owns reference downloading. It is reported as the ``INITIALIZING`` phase and retried
+  with backoff on failure.
 - The first on-disk scan (``available_models``) can SHA256-hash large files; it is reported as the
   ``SCANNING`` phase so it never looks hung.
 - ``download_file`` exposes a per-chunk ``callback(downloaded, total)`` but no pause/rate-limit. We
@@ -131,6 +132,10 @@ class HordeDownloadProcess(HordeProcess):
 
         self._aux_requested = False
         self._aux_done = False
+        self._reload_requested = False
+        # Set after a completed download that changed on-disk references; emitted once on the next
+        # status snapshot so the parent can broadcast a reload to the inference subprocesses.
+        self._reference_changed_pending = False
 
         # Per-download context the progress callback reads (set before each download).
         self._cb_feature = FEATURE_IMAGE_MODEL
@@ -170,6 +175,9 @@ class HordeDownloadProcess(HordeProcess):
         self._last_status_emit = now
         self._phase = phase
         status = self._build_status(phase)
+        with self._lock:
+            reference_changed = self._reference_changed_pending
+            self._reference_changed_pending = False
         message = HordeDownloadAvailabilityMessage(
             process_id=self.process_id,
             process_launch_identifier=self.process_launch_identifier,
@@ -180,6 +188,7 @@ class HordeDownloadProcess(HordeProcess):
             failed_downloads=[failure.model_name for failure in status.failures],
             scan_complete=scan_complete,
             status=status,
+            reference_changed=reference_changed,
         )
         self.process_message_queue.put(message)
 
@@ -200,6 +209,11 @@ class HordeDownloadProcess(HordeProcess):
     def _handle_control_message(self, message: object) -> None:
         if isinstance(message, HordeControlMessage) and message.control_flag == HordeControlFlag.END_PROCESS:
             self._end_process = True
+            return
+        if isinstance(message, HordeControlMessage) and message.control_flag == HordeControlFlag.RELOAD_MODEL_DATABASE:
+            # Defer the reload to the main loop so it never races the download thread's manager reads.
+            with self._lock:
+                self._reload_requested = True
             return
         if not isinstance(message, HordeDownloadControlMessage):
             logger.warning(f"Download process received unexpected control message: {type(message).__name__}")
@@ -259,13 +273,21 @@ class HordeDownloadProcess(HordeProcess):
             time.sleep(0.2)
 
     def _load_managers_with_retry(self) -> bool:
-        """Load hordelib's model managers, retrying the (networked) reference fetch with backoff."""
+        """Load hordelib's model managers, retrying with backoff.
+
+        References are read from disk (offline): the parent process owns reference downloading. This
+        process still downloads model *weights*; it just learns *what* to download from the on-disk
+        reference the parent wrote.
+        """
         from hordelib.api import SharedModelManager
+
+        from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
         for attempt in range(len(_LOAD_RETRY_BACKOFF_SECONDS) + 1):
             if self._end_process:
                 return False
             try:
+                ensure_offline_reference_manager()
                 SharedModelManager(do_not_load_model_mangers=True)
                 SharedModelManager.load_model_managers(multiprocessing_lock=self.disk_lock)
                 if SharedModelManager.manager.compvis is None:
@@ -288,23 +310,46 @@ class HordeDownloadProcess(HordeProcess):
         with self._lock:
             self._present = sorted(compvis.available_models) if compvis is not None else []
 
+    def _reload_model_database(self) -> None:
+        """Reload model manager references from disk (offline) after a parent reference refresh."""
+        from hordelib.api import SharedModelManager
+
+        try:
+            SharedModelManager.manager.reload_database()
+            logger.info("Download process reloaded model database from disk")
+        except Exception as e:  # noqa: BLE001 - a reload failure must not crash the download process
+            logger.error(f"Download process failed to reload model database: {type(e).__name__}: {e}")
+
     def _tick(self) -> bool:
         """Do one unit of work; return True if it did something, False when idle."""
         with self._lock:
             paused = self._paused
             next_model = self._pending[0] if (self._pending and not paused) else None
             aux_ready = self._aux_requested and not self._aux_done and not paused
+            reload_requested = self._reload_requested
+            if reload_requested:
+                self._reload_requested = False
+
+        if reload_requested:
+            self._reload_model_database()
+            self._refresh_present()
+            self._send_status(DownloadPhase.IDLE, force=True)
+            return True
 
         if paused:
             self._send_status(DownloadPhase.PAUSED)
             return False
         if next_model is not None:
             self._download_image_model(next_model)
+            with self._lock:
+                self._reference_changed_pending = True
             return True
         if aux_ready:
             self._run_aux_downloads()
             self._aux_done = True
             self._refresh_present()
+            with self._lock:
+                self._reference_changed_pending = True
             self._send_status(DownloadPhase.IDLE, force=True)
             return True
         self._send_status(DownloadPhase.IDLE)

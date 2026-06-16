@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "horde_worker_regen"
-version = "12.2.0"
+version = "12.4.0"
 description = "Allows you to connect to the AI Horde and generate images for users."
 authors = [
     {name = "tazlin", email = "tazlin.on.github@gmail.com"},
@@ -31,7 +31,7 @@ dependencies = [
     # Regenerate uv.lock with `uv lock` once horde-engine 3.1.0 is published (the lock was verified
     # against a local editable build during development).
     "horde_engine>=3.1.0,<4.0.0",
-    "horde_model_reference>=5.1.1,<6.0.0",
+    "horde_model_reference>=5.2.0,<6.0.0",
     "python-dotenv",
     "ruamel.yaml",
     "semver",

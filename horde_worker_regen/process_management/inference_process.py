@@ -175,6 +175,13 @@ class HordeInferenceProcess(HordeProcess):
                 set_gpu_sampling_lease(gpu_sampling_lease)
                 logger.info("Registered GPU sampling lease for cross-process pipelining")
 
+            # Subprocesses never download model references: the parent process owns downloading and
+            # has already written the converted files to disk. Pre-build an offline reference manager
+            # so hordelib reuses it (instead of forcing a per-subprocess network fetch/convert).
+            from horde_worker_regen.reference_helper import ensure_offline_reference_manager
+
+            ensure_offline_reference_manager()
+
             SharedModelManager.load_model_managers(
                 multiprocessing_lock=self.disk_lock,
                 # Reference saves are coordinated by this process under disk_lock; the lora
@@ -845,6 +852,22 @@ class HordeInferenceProcess(HordeProcess):
         logger.info("Unloaded all models from RAM")
         self._active_model_name = None
 
+    def reload_model_database(self) -> None:
+        """Reload the model managers' references from disk (no download).
+
+        Triggered by the parent after it refreshes the on-disk reference, or after the download
+        process reports new LoRa/TI availability. Reloading the adhoc (LoRa/TI) managers picks up
+        records other processes wrote, which is how newly downloaded auxiliary models become visible
+        here without a restart.
+        """
+        if self._dry_run_skip_inference or self._shared_model_manager is None:
+            return
+        try:
+            self._shared_model_manager.manager.reload_database()
+            logger.info("Reloaded model database from disk")
+        except Exception as e:  # noqa: BLE001 - a reload failure must not crash the inference process
+            logger.error(f"Failed to reload model database: {type(e).__name__}: {e}")
+
     @logger.catch(reraise=True)
     @override
     def cleanup_for_exit(self) -> None:
@@ -1062,3 +1085,5 @@ class HordeInferenceProcess(HordeProcess):
                 self.unload_models_from_vram()
             elif message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
                 self.unload_models_from_ram()
+            elif message.control_flag == HordeControlFlag.RELOAD_MODEL_DATABASE:
+                self.reload_model_database()

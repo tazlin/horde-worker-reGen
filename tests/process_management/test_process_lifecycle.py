@@ -56,6 +56,29 @@ def _make_plm(
     )
 
 
+def test_broadcast_reload_model_database_targets_inference_and_download() -> None:
+    """The reload broadcast reaches every inference process and the download process."""
+    from horde_worker_regen.process_management.messages import HordeControlFlag, HordeControlMessage
+
+    process_map = ProcessMap({})
+    inf0 = make_mock_process_info(0)
+    inf1 = make_mock_process_info(1)
+    process_map[0] = inf0
+    process_map[1] = inf1
+
+    plm = _make_plm(process_map=process_map)
+    download_info = make_mock_process_info(9000, process_type=HordeProcessType.DOWNLOAD, model_name=None)
+    plm._download_process_info = download_info
+
+    plm.broadcast_reload_model_database()
+
+    for proc in (inf0, inf1, download_info):
+        proc.pipe_connection.send.assert_called_once()
+        sent = proc.pipe_connection.send.call_args.args[0]
+        assert isinstance(sent, HordeControlMessage)
+        assert sent.control_flag == HordeControlFlag.RELOAD_MODEL_DATABASE
+
+
 def test_init_stores_references() -> None:
     """Test that the constructor properly stores references to its dependencies."""
     plm = _make_plm()

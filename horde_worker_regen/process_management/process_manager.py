@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import ssl
 import sys
+import threading
 import time
 from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Mapping
@@ -433,6 +434,13 @@ class HordeWorkerProcessManager:
         self._download_wait_started = 0.0
         self._download_plan_summary: DownloadPlanSummary | None = None
         self._download_plan_computed = False
+        # Periodic, parent-owned reference refresh: subprocesses never download references, so the
+        # parent re-downloads on this cadence and tells every subprocess to reload from disk. The same
+        # reload also re-reads lora.json/ti.json, which is how cross-process LoRa/TI downloads become
+        # visible without a restart.
+        self._last_reference_refresh = time.time()
+        self._reference_refresh_in_progress = False
+        self._pending_reference_reload_broadcast = False
         logger.debug(f"Models to load: {bridge_data.image_models_to_load}")
         logger.debug(f"Custom Models to load: {bridge_data.custom_models}")
 
@@ -1011,6 +1019,7 @@ class HordeWorkerProcessManager:
             if self.is_time_for_shutdown():
                 return False
 
+        self._maybe_refresh_references()
         self.print_status_method()
         self._sample_disk_space()
         self._publish_supervisor_snapshot()
@@ -1021,6 +1030,44 @@ class HordeWorkerProcessManager:
     _DOWNLOAD_STARTUP_GRACE_SECONDS = 90.0
     """How long to wait for the download process's first availability report before starting
     inference anyway, so a missing/failed download process can never wedge startup forever."""
+
+    _REFERENCE_REFRESH_INTERVAL_SECONDS = 1800.0
+    """How often the parent re-downloads the model reference and tells subprocesses to reload from
+    disk. References change rarely, so this is intentionally infrequent; it also refreshes
+    cross-process LoRa/TI visibility (subprocesses re-read lora.json/ti.json on the same reload)."""
+
+    def _maybe_refresh_references(self) -> None:
+        """Periodically re-download references in the parent and broadcast a reload to subprocesses.
+
+        Subprocesses never download references themselves: the parent owns it. The network
+        re-download runs off the event loop in a daemon thread (writing fresh JSON to disk); once it
+        finishes, the next tick broadcasts a reload so every subprocess re-reads the files.
+        """
+        if self._pending_reference_reload_broadcast:
+            self._pending_reference_reload_broadcast = False
+            self._process_lifecycle.broadcast_reload_model_database()
+
+        if self._reference_refresh_in_progress:
+            return
+        if (time.time() - self._last_reference_refresh) < self._REFERENCE_REFRESH_INTERVAL_SECONDS:
+            return
+        if self.horde_model_reference_manager is None:
+            return
+
+        self._last_reference_refresh = time.time()
+        self._reference_refresh_in_progress = True
+
+        def _refresh() -> None:
+            try:
+                self.horde_model_reference_manager.get_all_model_references_or_none(overwrite_existing=True)
+                logger.info("Refreshed model reference from source; broadcasting reload to subprocesses")
+                self._pending_reference_reload_broadcast = True
+            except Exception as e:  # noqa: BLE001 - a refresh failure must not crash the worker
+                logger.warning(f"Periodic model reference refresh failed: {type(e).__name__}: {e}")
+            finally:
+                self._reference_refresh_in_progress = False
+
+        threading.Thread(target=_refresh, name="reference-refresh", daemon=True).start()
 
     def _on_download_availability(self, message: HordeDownloadAvailabilityMessage) -> None:
         """Record an on-disk availability snapshot from the download process.
@@ -1038,6 +1085,12 @@ class HordeWorkerProcessManager:
             status=message.status,
             scan_complete=message.scan_complete,
         )
+
+        # A completed download changed the on-disk reference (a new image model, or the LoRa/TI/aux
+        # pass). Tell the inference subprocesses to reload from disk so newly downloaded auxiliary
+        # models become visible cross-process without a restart. Subprocesses never download.
+        if message.reference_changed:
+            self._process_lifecycle.broadcast_reload_model_database()
 
         if message.scan_complete and not self._initial_download_requested:
             self._initial_download_requested = True

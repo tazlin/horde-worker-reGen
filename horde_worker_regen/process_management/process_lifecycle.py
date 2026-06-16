@@ -267,6 +267,19 @@ class ProcessLifecycleManager:
             ),
         )
 
+    def broadcast_reload_model_database(self) -> None:
+        """Tell every subprocess to reload its model managers' references from disk (no download).
+
+        Sent after the parent refreshes the on-disk reference, or after the download process reports
+        new LoRa/TI availability, so inference and download subprocesses pick up the changes live
+        without a restart. Subprocesses never download references; they only re-read the parent's files.
+        """
+        message = HordeControlMessage(control_flag=HordeControlFlag.RELOAD_MODEL_DATABASE)
+        for process_info in self._process_map.get_inference_processes():
+            process_info.safe_send_message(message)
+        if self._download_process_info is not None:
+            self._download_process_info.safe_send_message(message)
+
     def end_download_process(self) -> None:
         """Stop the background download process, if running."""
         if self._download_process_info is None:
