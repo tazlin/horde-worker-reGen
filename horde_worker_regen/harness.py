@@ -55,6 +55,7 @@ from horde_worker_regen.process_management.fake_worker_processes import (
     start_fake_inference_process,
     start_fake_safety_process,
 )
+from horde_worker_regen.process_management.fault_injection import FaultProfile
 from horde_worker_regen.process_management.messages import AlchemyFormSpec
 from horde_worker_regen.process_management.process_manager import (
     HordeWorkerProcessManager,
@@ -115,6 +116,13 @@ class HarnessConfig:
 
     fail_every_n: int = 0
     """If > 0, every nth fake inference job reports a faulted result (fake process mode only)."""
+
+    inference_fault_profile: FaultProfile | None = None
+    """If set (fake process mode only), scripts the inference fakes' misbehaviour (hang, crash,
+    drop heartbeats, slow, OOM, corrupt message) so the chaos tests can probe the recovery paths."""
+
+    safety_fault_profile: FaultProfile | None = None
+    """If set (fake process mode only), scripts the safety fakes' misbehaviour on the eval path."""
 
     audit: bool = True
     """If True, attach a JobLifecycleAuditor and report invariant violations in the result."""
@@ -377,16 +385,28 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
 
     entry_points: ProcessEntryPoints | None = None
     if config.process_mode == "fake":
-        inference_entry_point = start_fake_inference_process
+        # functools.partial of a module-level function stays picklable under spawn, so we can bind the
+        # fault scripting (and the legacy fail_every_n) without losing the spawn-compatible target.
+        inference_kwargs: dict[str, object] = {}
         if config.fail_every_n > 0:
-            # functools.partial of a module-level function stays picklable under spawn
-            inference_entry_point = functools.partial(
-                start_fake_inference_process,
-                fail_every_n=config.fail_every_n,
-            )
+            inference_kwargs["fail_every_n"] = config.fail_every_n
+        if config.inference_fault_profile is not None:
+            inference_kwargs["fault_profile"] = config.inference_fault_profile
+        inference_entry_point = (
+            functools.partial(start_fake_inference_process, **inference_kwargs)
+            if inference_kwargs
+            else start_fake_inference_process
+        )
+
+        safety_entry_point = (
+            functools.partial(start_fake_safety_process, fault_profile=config.safety_fault_profile)
+            if config.safety_fault_profile is not None
+            else start_fake_safety_process
+        )
+
         entry_points = ProcessEntryPoints(
             inference_entry_point=inference_entry_point,
-            safety_entry_point=start_fake_safety_process,
+            safety_entry_point=safety_entry_point,
         )
 
     canned_job_source: CannedJobSource | None = None
