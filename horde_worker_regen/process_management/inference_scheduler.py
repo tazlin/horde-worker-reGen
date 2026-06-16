@@ -27,6 +27,7 @@ from horde_worker_regen.process_management.messages import (
 )
 from horde_worker_regen.process_management.model_affinity import affinity_active, compute_protected_processes
 from horde_worker_regen.process_management.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.performance_model import PerformanceModel, signature_from_job
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
@@ -63,6 +64,7 @@ class InferenceScheduler:
     _max_threads_ceiling: int
     _max_inference_processes: int
     _lru: LRUCache
+    _performance_model: PerformanceModel | None
 
     _preload_delay_notified: bool
     _model_recently_missing: bool
@@ -84,6 +86,7 @@ class InferenceScheduler:
         max_concurrent_inference_processes: int,
         max_inference_processes: int,
         lru: LRUCache,
+        performance_model: PerformanceModel | None = None,
     ) -> None:
         """Initialize the scheduler with references to the components it needs to manage.
 
@@ -104,6 +107,8 @@ class InferenceScheduler:
             max_inference_processes (int): The maximum number of inference processes to have launched at once,
                 including those that are preloading or downloading models.
             lru (LRUCache): The worker's LRU cache, used to track recently used models for unloading decisions.
+            performance_model (PerformanceModel | None): Supplies an expected sampling time per dispatched
+                job for the audit ledger (and, in a later phase, slow-job remediation). May be ``None``.
         """
         self._state = state
         self._process_map = process_map
@@ -118,6 +123,7 @@ class InferenceScheduler:
         self._max_threads_ceiling = max_concurrent_inference_processes
         self._max_inference_processes = max_inference_processes
         self._lru = lru
+        self._performance_model = performance_model
 
         self._preload_delay_notified = False
         self._model_recently_missing = False
@@ -140,6 +146,23 @@ class InferenceScheduler:
     def get_single_job_effective_megapixelsteps(self, job: ImageGenerateJobPopResponse) -> int:
         """Return the number of effective megapixelsteps for a single job."""
         return _get_single_job_effective_megapixelsteps(job)
+
+    def _expected_sampling_seconds(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+    ) -> float | None:
+        """The performance model's expected sampling seconds for a job, or ``None`` when unavailable.
+
+        Returns ``None`` when no model is wired, the baseline is unknown, or the job's signature has no
+        seeded or calibrated rate yet (cold start), so the absence of an expectation is never an error.
+        """
+        if self._performance_model is None:
+            return None
+        signature = signature_from_job(job, str(baseline) if baseline is not None else None)
+        if signature is None:
+            return None
+        return self._performance_model.expected_sampling_seconds(signature)
 
     def _max_jobs_in_progress_allowed(self, processes_post_processing: int) -> int:
         """The cap on concurrently in-progress jobs for this scheduling decision.
@@ -592,19 +615,28 @@ class InferenceScheduler:
             ),
         ):
             await self._job_tracker.mark_inference_started(next_job)
+            horde_model_baseline = self._model_metadata.get_baseline(next_job.model)
+
+            dispatch_detail: dict[str, str | int | float | bool | None] = {
+                "model": next_job.model,
+                "steps": next_job.payload.ddim_steps,
+            }
+            expected_seconds = self._expected_sampling_seconds(next_job, horde_model_baseline)
+            if expected_seconds is not None:
+                dispatch_detail["expected_sampling_seconds"] = round(expected_seconds, 2)
+
             self._process_lifecycle.action_ledger.record(
                 LedgerEventType.INFERENCE_DISPATCHED,
                 process_id=process_with_model.process_id,
                 os_pid=process_with_model.os_pid,
                 launch_identifier=process_with_model.process_launch_identifier,
                 job_id=str(next_job.id_) if next_job.id_ is not None else None,
-                detail={"model": next_job.model, "steps": next_job.payload.ddim_steps},
+                detail=dispatch_detail,
             )
 
             process_with_model.last_control_flag = HordeControlFlag.START_INFERENCE
             process_with_model.last_job_referenced = next_job
             process_with_model.loaded_horde_model_name = next_job.model
-            horde_model_baseline = self._model_metadata.get_baseline(next_job.model)
             process_with_model.loaded_horde_model_baseline = horde_model_baseline
 
         else:

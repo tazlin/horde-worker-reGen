@@ -17,6 +17,7 @@ from multiprocessing.synchronize import BoundedSemaphore as BoundedSemaphore_Mul
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import aiohttp
 import aiohttp.client_exceptions
@@ -40,7 +41,7 @@ from horde_sdk.ai_horde_api.apimodels import (
 from loguru import logger
 from pydantic import ValidationError
 
-from horde_worker_regen.app_state import WorkerRunRecord, default_app_state_dir
+from horde_worker_regen.app_state import AppStateStore, WorkerRunRecord, default_app_state_dir
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.bridge_data.load_config import BridgeDataLoader
 from horde_worker_regen.consts import (
@@ -69,6 +70,11 @@ from horde_worker_regen.process_management.messages import (
 from horde_worker_regen.process_management.model_availability import ModelAvailability
 from horde_worker_regen.process_management.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.owned_process_registry import OwnedProcessRegistry
+from horde_worker_regen.process_management.performance_model import (
+    PERF_MODEL_FILENAME,
+    PerformanceModel,
+    load_seed_its_by_signature,
+)
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
@@ -95,6 +101,11 @@ from horde_worker_regen.reporting.status_reporter import StatusReporter
 from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
+
+if TYPE_CHECKING:
+    from horde_worker_regen.process_management.job_models import HordeJobInfo
+    from horde_worker_regen.process_management.job_tracker import TrackedJob
+    from horde_worker_regen.process_management.messages import HordeJobMetricsMessage
 
 
 @dataclasses.dataclass(frozen=True)
@@ -606,12 +617,19 @@ class HordeWorkerProcessManager:
         )
 
         self._run_metrics = WorkerRunMetrics()
+
+        # Expected-time-to-complete model: seeds from the last benchmark's per-tier reference it/s and
+        # self-calibrates from this worker's own jobs, so a "slow" job becomes measurable rather than
+        # guessed. Disabled-to-memory under test (no app-state read, no benchmark import, no perf file);
+        # the model is unit-tested directly. Phase 4 consumes its expected_sampling_seconds.
+        self._performance_model = self._build_performance_model()
+
         self._message_dispatcher.set_metrics_handlers(
-            on_job_metrics=self._run_metrics.on_job_metrics,
+            on_job_metrics=self._on_job_metrics,
             on_download_metrics=self._run_metrics.on_download_metrics,
         )
         self._message_dispatcher.set_download_availability_handler(self._on_download_availability)
-        self._job_tracker.set_finalize_observer(self._run_metrics.on_job_finalized)
+        self._job_tracker.set_finalize_observer(self._on_job_finalized)
         self._process_lifecycle.set_process_recovery_observer(self._record_process_crash)
 
         self._disk_monitor = DiskSpaceMonitor(self._disk_paths_to_monitor())
@@ -648,6 +666,7 @@ class HordeWorkerProcessManager:
             max_concurrent_inference_processes=self._max_concurrent_inference_processes,
             max_inference_processes=self.max_inference_processes,
             lru=self._lru,
+            performance_model=self._performance_model,
         )
 
         self._job_submitter = JobSubmitter(
@@ -1262,6 +1281,45 @@ class HordeWorkerProcessManager:
         self._last_disk_sample_time = time.time()
         self._disk_monitor.sample()
 
+    def _build_performance_model(self) -> PerformanceModel:
+        """Construct the performance model, seeding from the last benchmark report when one exists.
+
+        Under test the model is purely in-memory: no app-state read, no benchmark import chain, and no
+        perf file, so CI never touches the working directory or a prior benchmark. The model is unit
+        tested directly. A missing or unreadable benchmark report yields an empty seed (the model then
+        relies on self-calibration alone), never an error.
+        """
+
+        def resolve_baseline(model_name: str) -> str | None:
+            baseline = self._model_metadata.get_baseline(model_name)
+            return str(baseline) if baseline is not None else None
+
+        if os.environ.get("AI_HORDE_TESTING"):
+            return PerformanceModel(baseline_resolver=resolve_baseline)
+
+        seed: dict[str, float] = {}
+        last_benchmark = AppStateStore().load().last_benchmark
+        if last_benchmark is not None:
+            seed = load_seed_its_by_signature(last_benchmark.results_dir)
+            if seed:
+                logger.info(f"Seeded performance model with {len(seed)} tier baseline(s) from the last benchmark.")
+
+        return PerformanceModel(
+            seed_its_by_signature=seed,
+            path=default_app_state_dir() / PERF_MODEL_FILENAME,
+            baseline_resolver=resolve_baseline,
+        )
+
+    def _on_job_metrics(self, message: HordeJobMetricsMessage) -> None:
+        """Fan a child's per-job metrics message out to the run metrics and the performance model."""
+        self._run_metrics.on_job_metrics(message)
+        self._performance_model.on_job_metrics(message)
+
+    def _on_job_finalized(self, tracked: TrackedJob, completed_job_info: HordeJobInfo) -> None:
+        """Fan a finalized job out to the run metrics (stage latencies) and the performance model (calibration)."""
+        self._run_metrics.on_job_finalized(tracked, completed_job_info)
+        self._performance_model.on_job_finalized(tracked, completed_job_info)
+
     def _record_process_crash(self, process_info: HordeProcessInfo, reason: str) -> None:
         """Forward a process recovery event to the run-metrics aggregator."""
         self._run_metrics.record_process_crash(
@@ -1863,6 +1921,8 @@ class HordeWorkerProcessManager:
         self._shutdown_manager.start_timed_shutdown()
 
     def _shutdown(self) -> None:
+        # Flush the latest self-calibration before exit so the next run starts warm.
+        self._performance_model.save()
         self._shutdown_manager.shutdown()
 
     def _abort(self) -> None:
