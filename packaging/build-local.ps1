@@ -123,6 +123,7 @@ function Invoke-SmokeTest {
     $expected = @(
         'horde-worker.cmd', 'runtime.cmd', 'update-runtime.cmd',
         'bridgeData.yaml', 'detect-backend.ps1',
+        'bootstrap.py', 'worker_bootstrap\cli.py',
         'horde_worker_regen', 'unins000.exe', 'bin\backend'
     )
     foreach ($item in $expected) {
@@ -187,6 +188,10 @@ try {
         foreach ($file in $matched) { Copy-Item -Path $file.FullName -Destination $stageDir }
     }
     Copy-Item -Recurse -Path $pkgDir -Destination (Join-Path $stageDir 'horde_worker_regen')
+    # The stdlib-only bootstrap brain that bootstrap.py imports (copied as a package, like the worker).
+    $bootstrapPkg = Join-Path $RepoRoot 'worker_bootstrap'
+    if (-not (Test-Path $bootstrapPkg)) { throw "Bootstrap package not found: $bootstrapPkg" }
+    Copy-Item -Recurse -Path $bootstrapPkg -Destination (Join-Path $stageDir 'worker_bootstrap')
 
     # Drop build noise that CI also prunes so the zip matches the published one.
     Get-ChildItem -Path $stageDir -Recurse -Directory -ErrorAction SilentlyContinue |

@@ -1,48 +1,25 @@
 #!/bin/bash
-# Get the directory of the current script
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# List of directories to check for jemalloc
-dirs=(
-    "/usr/lib"
-    "/usr/local/lib"
-    "/lib"
-    "/lib64"
-    "/usr/lib/x86_64-linux-gnu"
-)
-
-# Check each directory
-for dir in "${dirs[@]}"; do
+# jemalloc noticeably reduces the worker's memory fragmentation; preload it when present (Linux-specific,
+# so it stays in this shell shim rather than the cross-platform Python brain).
+for dir in /usr/lib /usr/local/lib /lib /lib64 /usr/lib/x86_64-linux-gnu; do
     if [ -f "$dir/libjemalloc.so.2" ]; then
         export LD_PRELOAD="$dir/libjemalloc.so.2"
-        printf "Using jemalloc from $dir\n"
+        printf "Using jemalloc from %s\n" "$dir"
         break
     fi
 done
-
-# If jemalloc was not found, print a warning
-if [ -z "$LD_PRELOAD" ]; then
-    printf "WARNING: jemalloc not found. You may run into memory issues! We recommend running 'sudo apt install libjemalloc2'\n"
-    # Press q to quit or any other key to continue
+if [ -z "${LD_PRELOAD:-}" ]; then
+    printf "WARNING: jemalloc not found. You may run into memory issues! We recommend 'sudo apt install libjemalloc2'\n"
     read -n 1 -s -r -p "Press q to quit or any other key to continue: " key
-    if [ "$key" = "q" ]; then
-        printf "\n"
-        exit 1
-    fi
+    if [ "$key" = "q" ]; then printf "\n"; exit 1; fi
+    printf "\n"
 fi
 
 echo "============================================"
 echo "  AI Horde Worker"
 echo "============================================"
 echo ""
-if "$SCRIPT_DIR/runtime.sh" python -s "$SCRIPT_DIR/download_models.py"; then
-    echo ""
-    echo "Models ready. Starting worker..."
-    echo "(Press Ctrl+C to stop the worker gracefully)"
-    echo ""
-    "$SCRIPT_DIR/runtime.sh" python -s "$SCRIPT_DIR/run_worker.py" $*
-else
-    echo ""
-    echo "ERROR: Model download failed. Check the output above and try again."
-    echo "       Common fix: check your internet connection and disk space."
-fi
+# The bridge path: ensure the environment, download/verify models, then run the headless worker.
+exec "$SCRIPT_DIR/runtime.sh" launch bridge "$@"

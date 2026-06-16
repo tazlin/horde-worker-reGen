@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# One-line installer for the AI Horde Worker (Linux).
+# One-line installer for the AI Horde Worker (Linux / macOS).
 #
 #   curl -LsSf https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.sh | sh
 #
-# Downloads the latest release, builds the environment with uv (no pre-installed Python or git needed),
-# seeds the config, and starts the dashboard. Re-running it updates in place.
+# Downloads the latest release, then hands off to the bundled runtime.sh, which installs uv and runs the
+# Python bootstrap (GPU detection, dependency sync, config seeding, launch). No pre-installed Python or git
+# needed. Re-running it updates in place.
 #
 # Options (environment variables, so they work with the curl | sh form):
 #   HORDE_WORKER_DIR        install location (default: ./horde-worker in the current directory)
@@ -18,9 +19,7 @@ ASSET="horde-worker-reGen.zip"
 RELEASE_URL="https://github.com/$OWNER/$REPO/releases/latest/download/$ASSET"
 
 # Default into a named subfolder of the current directory, not the home drive: the worker plus its model
-# downloads run to many GB, so installing onto whatever drive the user cd'd to (and chose to run this from)
-# is far less surprising than quietly filling up $HOME. A subfolder (rather than the bare CWD) keeps the
-# loose-file bundle self-contained and avoids overwriting unrelated files already sitting there.
+# downloads run to many GB. A subfolder keeps the loose-file bundle self-contained.
 INSTALL_DIR="${HORDE_WORKER_DIR:-$PWD/horde-worker}"
 if [ "${1:-}" != "" ]; then INSTALL_DIR="$1"; fi
 case "$INSTALL_DIR" in
@@ -61,89 +60,22 @@ if ! chmod +x ./*.sh 2>/dev/null; then
     echo "      run:  chmod +x \"$INSTALL_DIR\"/*.sh" >&2
 fi
 
-# GPU detection helpers. NVIDIA detection is broadened aggressively (a working CUDA card frequently
-# has no nvidia-smi on PATH), but AMD is kept conservative: the ROCm build only works if the ROCm
-# runtime is actually present, so a bare Radeon in lspci with no runtime is treated as "needs a
-# decision" rather than silently installing a doomed build or the (~100x slower) CPU build.
-has_nvidia_gpu() {
-    command -v nvidia-smi >/dev/null 2>&1 && return 0
-    [ -e /proc/driver/nvidia/version ] && return 0
-    [ -e /dev/nvidia0 ] && return 0
-    command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -iq 'nvidia' && return 0
-    return 1
-}
-has_amd_runtime() {
-    command -v rocminfo >/dev/null 2>&1 && return 0
-    [ -e /dev/kfd ] && return 0
-    return 1
-}
-has_amd_hardware() {
-    command -v lspci >/dev/null 2>&1 || return 1
-    lspci 2>/dev/null | grep -iqE 'amd/ati|advanced micro devices|radeon' && return 0
-    return 1
-}
-nvidia_cuda_build() {
-    # Choose the CUDA build from the driver's max supported CUDA version (nvidia-smi's "CUDA Version"
-    # header). torch 2.12.0 (the locked line) has no cu128 wheel, so a CUDA 12.x driver gets cu126 -- a
-    # 12.6 build runs on any CUDA 12.6+ driver (and, via NVIDIA driver back-compat, on CUDA 13), and is
-    # the safe default when the version can't be read. cu130 is used on a CUDA 13+ driver (also covers
-    # 13.2). cu132 is never auto-selected; it stays a manual HORDE_WORKER_BACKEND=cu132 override.
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        major="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version:[[:space:]]*\([0-9]\{1,\}\)\..*/\1/p' | head -n1)"
-        if [ -n "$major" ] && [ "$major" -ge 13 ] 2>/dev/null; then echo "cu130"; return; fi
-    fi
-    echo "cu126"
-}
-
-# GPU backend: explicit override wins; otherwise detect. Never silently fall back to CPU when a GPU
-# is present, because the CPU build is ~100x slower and just looks like the worker is "broken".
-BACKEND="${HORDE_WORKER_BACKEND:-}"
-if [ -n "$BACKEND" ]; then
-    echo "GPU backend: $BACKEND (from HORDE_WORKER_BACKEND)"
-elif has_nvidia_gpu; then
-    BACKEND="$(nvidia_cuda_build)"
-    command -v nvidia-smi >/dev/null 2>&1 || \
-        echo "Note: an NVIDIA GPU was detected but 'nvidia-smi' is not on PATH; using the $BACKEND build anyway."
-    echo "GPU backend: $BACKEND (NVIDIA GPU detected)"
-elif has_amd_runtime; then
-    BACKEND="rocm"
-    echo "GPU backend: rocm (AMD ROCm runtime detected)"
-elif has_amd_hardware; then
-    echo "ERROR: an AMD GPU was detected, but the ROCm runtime was not found (no rocminfo, no /dev/kfd)." >&2
-    echo "Installing now would use the CPU build, which is roughly 100x slower." >&2
-    echo "Install ROCm (https://rocm.docs.amd.com) and re-run, or force a choice with one of:" >&2
-    echo "    HORDE_WORKER_BACKEND=rocm   # try the ROCm build" >&2
-    echo "    HORDE_WORKER_BACKEND=cpu    # run on CPU (slow)" >&2
-    exit 1
-else
-    echo "WARNING: no NVIDIA or AMD GPU detected; using the CPU build." >&2
-    echo "CPU is roughly 100x slower than a GPU and is mainly useful for testing." >&2
-    echo "If you have an NVIDIA GPU, install its drivers and re-run, or set HORDE_WORKER_BACKEND=cu126." >&2
-    BACKEND="cpu"
-fi
-
-# Seed the config from the template on a fresh install (never clobbers an existing bridgeData.yaml).
-if [ ! -f bridgeData.yaml ] && [ -f bridgeData_template.yaml ]; then
-    cp bridgeData_template.yaml bridgeData.yaml
-fi
-
-# Co-locate uv's package cache with the install so it lands on the chosen drive (not the home drive) and
-# stays on the same volume as .venv for hardlinking. update-runtime*.sh apply the same default; setting it
-# here too makes the decision visible at the entry point. Respect a user-set UV_CACHE_DIR. ($PWD is the
-# install dir: we cd'd into it above.)
-: "${UV_CACHE_DIR:=$PWD/bin/uv_cache}"
-export UV_CACHE_DIR
-
+# Everything else (install uv, detect the GPU, seed bridgeData.yaml, sync dependencies) is the bootstrap's
+# job now, so the one-liner, the regular launchers and every platform run identical logic. runtime.sh
+# installs uv and runs bootstrap.py. --no-launch: we start the dashboard ourselves below. A pre-set
+# HORDE_WORKER_BACKEND still overrides detection (e.g. 'cpu', or 'rocm' for AMD on Linux).
 echo "Setting up the environment. The first run downloads Python and PyTorch and can take several minutes..."
 export HORDE_WORKER_NONINTERACTIVE=1
-# Hand the resolved build to update-runtime via the env var it already honours, so any CUDA build
-# (cu126/cu128/cu130) flows through rather than being downgraded to the update-runtime default. ROCm
-# keeps its dedicated script.
-export HORDE_WORKER_BACKEND="$BACKEND"
-case "$BACKEND" in
-    rocm) ./update-runtime-rocm.sh ;;
-    *) ./update-runtime.sh ;;
-esac
+if ! ./runtime.sh install --no-launch; then
+    echo "" >&2
+    echo "ERROR: environment setup failed (see the output above). Deleting .venv and re-running often helps." >&2
+    exit 1
+fi
+# Trust the artifact, not just the exit code: a real install must have produced a virtual environment.
+if [ ! -d .venv ]; then
+    echo "ERROR: environment setup did not produce a .venv. See the output above; delete .venv and re-run." >&2
+    exit 1
+fi
 
 echo ""
 echo "Installation complete (installed at $INSTALL_DIR)."

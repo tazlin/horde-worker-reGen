@@ -157,8 +157,37 @@ HSA Agents
 - `git clone https://github.com/Haidra-Org/horde-worker-reGen.git`
 - `cd .\horde-worker-reGen\`
 - Install the requirements:
-  - CUDA: `pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128`
-  - RoCM: `pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/rocm6.2`
+  - CUDA: `pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130`
+    - Match the wheel index to your driver's CUDA version: `cu132` for a CUDA 13.2+ driver, `cu130` for
+      CUDA 13.0/13.1, and `cu126` for a CUDA 12.6+ driver (the only CUDA-12 build of torch 2.12.0). The
+      `update-runtime`/`install` scripts pick the build automatically from your driver's CUDA version;
+      only this manual `pip` path needs you to choose the URL yourself.
+  - RoCM: `pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/rocm6.4`
+
+### Selecting a PyTorch build (advanced)
+
+The worker locks the latest torch (2.12.0) as one thin uv extra per build (`cu126`/`cu130`/`cu132`/`cpu`).
+You normally never set this by hand -- the build is detected from your GPU driver and the
+`update-runtime`/`install` scripts run `uv sync --locked --extra <build>` for you. To force one:
+
+```bash
+HORDE_WORKER_BACKEND=cu132 ./update-runtime.sh   # CUDA 13.2+ build of torch 2.12.0 (auto-selected on 13.2+)
+HORDE_WORKER_BACKEND=cu130 ./update-runtime.sh   # CUDA 13.0/13.1 build of torch 2.12.0
+HORDE_WORKER_BACKEND=cu126 ./update-runtime.sh   # CUDA 12.6+ build of torch 2.12.0
+HORDE_WORKER_BACKEND=cpu   ./update-runtime.sh   # no GPU
+```
+
+Only these builds are locked. **ROCm** and **older torch versions** are installed ad-hoc (not from the
+lock) -- easy to mix in, but not pinned:
+
+```bash
+./update-runtime-rocm.sh                          # torch 2.9.1 on ROCm 6.4 (override: HORDE_WORKER_ROCM_TORCH)
+UV_TORCH_BACKEND=auto uv pip install torch torchvision torchaudio    # let uv auto-detect your GPU
+uv pip install torch==2.11.0 --extra-index-url https://download.pytorch.org/whl/cu128   # an older line
+```
+
+torch 2.12.0 has no `cu128` wheel, so a CUDA 12.x driver uses `cu126` (a legacy `cu128` request is
+remapped to `cu126` automatically). The full list of build extras is in `pyproject.toml`.
 
 ### Run worker
 - Set your config now, copying `bridgeData_template.yaml` to `bridgeData.yaml`, being sure to set an API key and worker name at a minimum
@@ -168,7 +197,7 @@ HSA Agents
 Pressing control-c will stop the worker but will first have the worker complete any jobs in progress before ending. Please try and avoid hard killing it unless you are seeing many major errors. You can force kill by repeatedly pressing control+c or doing a SIGKILL.
 
 ### Important note if manually manage your venvs
-- You should be running `python -m pip install -r requirements.txt -U https://download.pytorch.org/whl/cu128` every time you `git pull`. (Use `/whl/rocm6.2` instead if applicable)
+- You should be running `python -m pip install -r requirements.txt -U --extra-index-url https://download.pytorch.org/whl/cu130` every time you `git pull`. (That is the torch 2.12.0 build for a CUDA 13.0/13.1 driver; use `/whl/cu132` for a CUDA 13.2+ driver, `/whl/cu126` for a CUDA 12.6+ driver, or `/whl/rocm6.4` for AMD, as applicable.)
 
 
 ## Advanced users, running on directml

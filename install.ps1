@@ -2,13 +2,14 @@
 #
 #   irm https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.ps1 | iex
 #
-# Downloads the latest release, builds the environment with uv (no pre-installed Python or git needed),
-# seeds the config, and opens the dashboard in your browser. Re-running it updates in place.
+# Downloads the latest release, then hands off to the bundled runtime.cmd, which installs uv and runs the
+# Python bootstrap (GPU detection, dependency sync, config seeding, launch). No pre-installed Python or git
+# needed. Re-running it updates in place.
 #
 # Options come from environment variables (so they work with the irm | iex form):
-#   $env:HORDE_WORKER_DIR       install location (default: .\HordeWorker in the current directory)
-#   $env:HORDE_WORKER_BACKEND   cu126 | cu130 | cu132 | cpu (default: detected from the GPU driver)
-#   $env:HORDE_WORKER_NO_LAUNCH set to skip auto-launching the dashboard after install
+#   $env:HORDE_WORKER_DIR        install location (default: .\HordeWorker in the current directory)
+#   $env:HORDE_WORKER_BACKEND    cu126 | cu130 | cu132 | cpu (default: detected from the GPU driver)
+#   $env:HORDE_WORKER_NO_LAUNCH  set to skip auto-launching the dashboard after install
 
 #Requires -Version 5.1
 $ErrorActionPreference = "Stop"
@@ -36,10 +37,21 @@ function New-Shortcut([string]$LinkPath, [string]$TargetPath, [string]$WorkingDi
     $shortcut.Save()
 }
 
+function Expand-ReleaseZip([string]$ZipPath, [string]$Destination) {
+    # Prefer in-box curl.exe + tar.exe (Windows 10 1803+): tar unpacks a .zip on Windows and, unlike
+    # Expand-Archive, needs no PowerShell module to autoload (which can fail under a pwsh-polluted
+    # PSModulePath). Fall back to Expand-Archive on older Windows that lacks tar.
+    $tar = Join-Path $env:SystemRoot "System32\tar.exe"
+    if (Test-Path $tar) {
+        & $tar -xf $ZipPath -C $Destination
+        if ($LASTEXITCODE -eq 0) { return }
+    }
+    Expand-Archive -Path $ZipPath -DestinationPath $Destination -Force
+}
+
 # Default into a named subfolder of the current directory, not the home drive: the worker plus its model
-# downloads run to many GB, so installing onto whatever drive the user cd'd to (and chose to run this from)
-# is far less surprising than quietly filling up %LOCALAPPDATA%. A subfolder (rather than the bare CWD)
-# keeps the loose-file bundle self-contained and avoids overwriting unrelated files already sitting there.
+# downloads run to many GB, so installing onto whatever drive the user cd'd to is far less surprising than
+# quietly filling up %LOCALAPPDATA%. A subfolder keeps the bundle self-contained.
 $InstallDir = Get-Option "HORDE_WORKER_DIR" (Join-Path (Get-Location).Path "HordeWorker")
 if ($args.Count -ge 1 -and $args[0]) { $InstallDir = [string]$args[0] }
 if ($InstallDir -match "\s") {
@@ -54,81 +66,33 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
 $tmpZip = Join-Path ([System.IO.Path]::GetTempPath()) ("horde-worker-" + [System.Guid]::NewGuid().ToString() + ".zip")
 Write-Host "Downloading the latest release..."
-Invoke-WebRequest -Uri $ReleaseUrl -OutFile $tmpZip -UseBasicParsing
+$curl = Join-Path $env:SystemRoot "System32\curl.exe"
+if (Test-Path $curl) {
+    & $curl -fL --retry 3 -o $tmpZip $ReleaseUrl
+    if ($LASTEXITCODE -ne 0) { Write-Error "Download failed (curl exit $LASTEXITCODE) from $ReleaseUrl"; exit 1 }
+} else {
+    Invoke-WebRequest -Uri $ReleaseUrl -OutFile $tmpZip -UseBasicParsing
+}
 
 Write-Host "Extracting..."
-Expand-Archive -Path $tmpZip -DestinationPath $InstallDir -Force
+Expand-ReleaseZip -ZipPath $tmpZip -Destination $InstallDir
 Remove-Item $tmpZip -Force
 
-# GPU backend: explicit override wins; otherwise detect the hardware. We never silently fall back to
-# the CPU build when a GPU is present, because that is ~100x slower and just looks like the worker is
-# "broken" to someone who does not know to check. (ROCm is Linux-only; DirectML is temporarily removed.)
-# The hardware check is shared with the graphical installer via detect-backend.ps1 (shipped in the
-# bundle we just extracted), so both installers protect users with the exact same logic. We run it in a
-# child PowerShell with -ExecutionPolicy Bypass so a locked-down machine policy cannot block it.
-$Backend = Get-Option "HORDE_WORKER_BACKEND" ""
-if ($Backend) {
-    Write-Host "GPU backend: $Backend (from HORDE_WORKER_BACKEND)"
-} else {
-    $detectScript = Join-Path $InstallDir "detect-backend.ps1"
-    $detected = (& powershell -NoProfile -ExecutionPolicy Bypass -File $detectScript).Trim()
-    if (-not $detected) {
-        # Fail loud rather than silently choosing the CPU build, which would be the wrong call on a GPU box.
-        Write-Error "GPU detection failed (detect-backend.ps1 produced no result). Set `$env:HORDE_WORKER_BACKEND to a CUDA build (cu126/cu130/cu132) or 'cpu' and re-run."
-        exit 1
-    }
-    if ($detected -match '^cu\d+$') {
-        # detect-backend.ps1 picks the CUDA build from the driver's max CUDA version (cu130 on a
-        # CUDA 13+ driver, otherwise cu126). Accept the whole cu* family so a new build flows through
-        # without editing this installer.
-        $Backend = $detected
-        Write-Host "GPU backend: $detected (NVIDIA GPU detected)"
-    } elseif ($detected -eq "amd-unsupported") {
-        Write-Error @'
-An AMD GPU was detected, but Windows GPU acceleration is currently unavailable
-(DirectML is temporarily removed and ROCm is Linux-only). Installing now would use the
-CPU build, which is roughly 100x slower.
-
-If you understand that and still want to run on CPU, re-run with:
-    $env:HORDE_WORKER_BACKEND = 'cpu'
-On Linux, an AMD card can use the ROCm build instead.
-'@
-        exit 1
-    } elseif ($detected -eq "cpu") {
-        Write-Host "No NVIDIA or AMD GPU detected; using the CPU build." -ForegroundColor Yellow
-        Write-Host "CPU is roughly 100x slower than a GPU and is mainly useful for testing." -ForegroundColor Yellow
-        Write-Host "If you do have an NVIDIA GPU, install its drivers and re-run, or set `$env:HORDE_WORKER_BACKEND='cu126'." -ForegroundColor Yellow
-        $Backend = "cpu"
-    } else {
-        Write-Error "GPU detection returned an unrecognized token '$detected'. Set `$env:HORDE_WORKER_BACKEND to a CUDA build (cu126/cu130/cu132) or 'cpu' and re-run."
-        exit 1
-    }
-}
-
-# Seed the config from the template on a fresh install (never clobbers an existing bridgeData.yaml).
-$bridge = Join-Path $InstallDir "bridgeData.yaml"
-$template = Join-Path $InstallDir "bridgeData_template.yaml"
-if ((-not (Test-Path $bridge)) -and (Test-Path $template)) {
-    Copy-Item $template $bridge
-}
-
-# Co-locate uv's package cache with the install so it lands on the chosen drive (not the home drive) and
-# stays on the same volume as .venv for hardlinking. update-runtime.cmd applies the same default; setting it
-# here too makes the decision visible at the entry point. Respect a user-set UV_CACHE_DIR.
-if (-not $env:UV_CACHE_DIR) {
-    $env:UV_CACHE_DIR = Join-Path (Resolve-Path $InstallDir).Path "bin\uv_cache"
-}
-
+# Everything else (install uv, detect the GPU, seed bridgeData.yaml, sync dependencies) is the bootstrap's
+# job now, so the exact same logic runs for the one-liner, the graphical installer and winget. runtime.cmd
+# installs uv via in-box curl/tar (no fragile nested PowerShell) and then runs bootstrap.py. We pass
+# --no-launch and start the dashboard ourselves below, after creating shortcuts. A pre-set
+# $env:HORDE_WORKER_BACKEND still overrides detection (e.g. 'cpu' to opt into a CPU-only AMD install).
 Write-Host "Setting up the environment. The first run downloads Python and PyTorch and can take several minutes..."
 $env:HORDE_WORKER_NONINTERACTIVE = "1"
-# Hand the resolved build to update-runtime via the env var it already honours. This carries any
-# CUDA build (cu126/cu128/cu130), not just cpu, so a detected cu130 is not silently downgraded to the
-# update-runtime default.
-$env:HORDE_WORKER_BACKEND = $Backend
-$updateRuntime = Join-Path $InstallDir "update-runtime.cmd"
-& $updateRuntime
+& (Join-Path $InstallDir "runtime.cmd") install --no-launch
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "Environment setup failed. See the output above; deleting the .venv folder and re-running often helps."
+    Write-Error "Environment setup failed (see the output above). Deleting the .venv folder and re-running often helps."
+    exit 1
+}
+# Trust the artifact, not just the exit code: a real install must have produced a virtual environment.
+if (-not (Test-Path (Join-Path $InstallDir ".venv"))) {
+    Write-Error "Environment setup did not produce a .venv. See the output above; delete .venv and re-run."
     exit 1
 }
 
@@ -136,8 +100,8 @@ Write-Host ""
 Write-Host "Installation complete." -ForegroundColor Green
 Write-Host "Installed at: $InstallDir"
 
-# Create shortcuts so reopening the dashboard later is one click. These are per-user (Start Menu /
-# Desktop) only, never system-wide, and opt-out via HORDE_WORKER_NO_SHORTCUTS; best-effort either way.
+# Create shortcuts so reopening the dashboard later is one click. Per-user only, opt-out via
+# HORDE_WORKER_NO_SHORTCUTS; best-effort.
 $launcher = Join-Path $InstallDir "horde-worker.cmd"
 $madeShortcut = $false
 if (Get-Option "HORDE_WORKER_NO_SHORTCUTS" "") {

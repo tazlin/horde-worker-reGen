@@ -53,8 +53,8 @@ dependencies = [
 # 2.11.0); the extra only routes torch to the matching wheel index (see [tool.uv.sources]). GPU
 # detection (packaging/detect-backend.ps1 / install.sh) picks the build; update-runtime.* install it
 # with `uv sync --locked --extra <build>`:
-#   cu130   NVIDIA, CUDA 13.x driver (a 13.0 build also covers a 13.2 driver)
-#   cu132   NVIDIA, exact CUDA 13.2 build (manual; cu130 also runs on 13.2)
+#   cu132   NVIDIA, CUDA 13.2+ driver (exact 13.2 build; auto-selected when the driver is 13.2 or newer)
+#   cu130   NVIDIA, CUDA 13.0/13.1 driver (auto-selected for those; a 13.2+ driver gets cu132 instead)
 #   cu126   NVIDIA, CUDA 12.6+ driver (the only CUDA-12 build of torch 2.12.0; also runs on CUDA 13)
 #   cpu     no GPU (~100x slower; testing only)
 # Only these builds are locked. ROCm and other builds/versions are installed AD-HOC (not from the lock):

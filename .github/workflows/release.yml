@@ -46,6 +46,8 @@ jobs:
             done
           done < "$manifest"
           cp -r horde_worker_regen "$stage/"
+          # The stdlib-only bootstrap brain bootstrap.py imports (copied as a package, like the worker).
+          cp -r worker_bootstrap "$stage/"
           find "$stage" -type d -name "__pycache__" -prune -exec rm -rf {} +
           find "$stage" -type d -name "*.egg-info" -prune -exec rm -rf {} +
 
@@ -77,6 +79,16 @@ jobs:
             echo "::error::uv.lock is missing from the bundle; the installer's 'uv sync --locked' would fail."
             exit 1
           fi
+
+      - name: Verify the bundle ships the bootstrap brain
+        run: |
+          set -eu
+          for needed in bootstrap.py worker_bootstrap/cli.py; do
+            if ! unzip -l horde-worker-reGen.zip | grep -q "$needed"; then
+              echo "::error::$needed is missing from the bundle; the launchers' Python bootstrap would fail."
+              exit 1
+            fi
+          done
 
       - name: Publish the release asset
         env:

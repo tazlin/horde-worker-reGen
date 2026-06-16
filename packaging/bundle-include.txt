@@ -1,6 +1,6 @@
 # Files bundled into the release zip, read by .github/workflows/release.yml.
 # One path or glob per line; blank lines and lines starting with '#' are ignored.
-# The horde_worker_regen/ package is copied separately by the workflow.
+# The horde_worker_regen/ and worker_bootstrap/ packages are copied (recursively) separately by the workflow.
 # A test (tests/test_bundle_manifest.py) asserts every root .cmd/.sh launcher is listed here, so a new
 # launcher fails CI until added, and that no listed path is stale (e.g. a removed script).
 pyproject.toml
@@ -9,6 +9,9 @@ LICENSE
 README.md
 README_advanced.md
 bridgeData_template.yaml
+# The stdlib-only bootstrap entry point the launchers run via `uv run --script` (its logic lives in the
+# worker_bootstrap/ package, copied separately by the workflow alongside horde_worker_regen/).
+bootstrap.py
 download_models.py
 run_worker.py
 convert_config_to_env.py
@@ -25,6 +28,8 @@ horde-worker.cmd
 horde-worker.sh
 preload-models.cmd
 preload-models.sh
-# Shared GPU detector used by install.ps1 (after extraction) and the graphical installer; staging
-# flattens it to the bundle root, so install.ps1 reads it from the install dir, not packaging/.
+# GPU detector for the graphical (Inno) installer's pre-install wizard, which must warn AMD/CPU users
+# before uv exists (so it cannot use bootstrap.py's detector yet). Runtime/one-liner detection now lives
+# in worker_bootstrap/detect.py; this stays as the wizard's pre-uv equivalent. Staging flattens it to the
+# bundle root so the installer sources it from the same staging as the zip.
 packaging/detect-backend.ps1

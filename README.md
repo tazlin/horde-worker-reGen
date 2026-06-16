@@ -10,7 +10,15 @@ The [AI Horde](https://aihorde.net/) is a free, open, decentralized platform whe
 
 ### Install
 
-**Windows** — use `winget` (most trusted), or paste the one-liner into PowerShell:
+#### Windows: download and double-click (easiest)
+
+No command line needed. Download **[HordeWorker-Setup.exe](https://github.com/Haidra-Org/horde-worker-reGen/releases/latest/download/HordeWorker-Setup.exe)**, double-click it, and click through the installer (**Next → Next → Finish**). It installs per-user (no administrator rights), adds an **AI Horde Worker** shortcut to your Desktop and Start Menu, and opens the dashboard when it finishes.
+
+> **Windows SmartScreen**: the installer isn't code-signed yet, so Windows may show "Windows protected your PC". Click **More info**, then **Run anyway**.
+
+#### Windows: scripted install (advanced)
+
+Prefer the command line, or want an unattended install? Use `winget`, or paste the one-liner into PowerShell:
 
 ```powershell
 winget install Haidra.HordeWorker
@@ -20,13 +28,15 @@ winget install Haidra.HordeWorker
 irm https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.ps1 | iex
 ```
 
-**Linux** — paste into a terminal:
+#### Linux
+
+Paste into a terminal:
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.sh | sh
 ```
 
-The installer downloads the worker, builds its environment (the first run pulls Python and PyTorch and can take several minutes), then opens the **dashboard in your browser**. A short wizard walks you through:
+However you installed, the first run builds the environment (it pulls Python and PyTorch and can take several minutes) and then opens the **dashboard in your browser**. A short wizard walks you through:
 
 1. Entering your API key and choosing a worker name
 2. Picking which models to serve (a sensible default is chosen for your GPU)
@@ -37,9 +47,13 @@ After you click **Start**, your chosen models download in the background (shown 
 
 > **Windows SmartScreen**: the raw `irm … | iex` one-liner may show "Windows protected your PC". Click **More info → Run anyway** (the same step used to install tools like `uv`). `winget install` avoids the prompt entirely.
 
-> **Tip**: keep the install path free of spaces. The installer picks a safe default; override it with `$env:HORDE_WORKER_DIR` (Windows) or `HORDE_WORKER_DIR` (Linux).
+> **Tip**: keep the install path free of spaces. The one-liner installs into a `HordeWorker` (Windows) / `horde-worker` (Linux) folder in your **current directory**, so `cd` to the drive you want before running it; override the location with `$env:HORDE_WORKER_DIR` (Windows) or `HORDE_WORKER_DIR` (Linux). Installing with `winget` instead? See [choosing the install drive](packaging/winget/README.md#choosing-where-it-installs-and-how-much-disk-you-need).
 
-> **What the installer does (and doesn't)**: it installs into a per-user folder (no administrator rights needed), downloads Python, PyTorch, and your chosen models (several GB) into that folder and your per-user package cache, and adds per-user "AI Horde Worker" shortcuts. It does **not** change any system-wide settings. Opt out of the shortcuts with `HORDE_WORKER_NO_SHORTCUTS`, or skip the auto-launch with `HORDE_WORKER_NO_LAUNCH`.
+#### What the scripted install does (and doesn't) do
+
+It installs into a folder in your current directory, downloads Python, PyTorch, and your chosen models into that folder (its uv python package cache lives inside it too), and adds per-user "AI Horde Worker" shortcuts. It does **not** change any system-wide settings. Opt out of the shortcuts with `HORDE_WORKER_NO_SHORTCUTS`, or skip the auto-launch with `HORDE_WORKER_NO_LAUNCH`.
+
+> **Disk space**: this is a large install. Even before any models, the GPU (CUDA) environment needs roughly **10-15 GB** (the `.venv` alone is ~7-10 GB; PyTorch and its bundled NVIDIA CUDA libraries are the bulk, and that floor is unavoidable on a GPU install). The CPU-only build is ~3-5 GB. **Models are separate and much larger**: each is ~2-8 GB and a useful selection runs to **tens or hundreds of GB**. The one-liner keeps everything on the drive you run it from; with `winget`, see [the winget notes](packaging/winget/README.md#choosing-where-it-installs-and-how-much-disk-you-need) for installing to another drive and redirecting the model cache.
 
 ### Opening it again later
 

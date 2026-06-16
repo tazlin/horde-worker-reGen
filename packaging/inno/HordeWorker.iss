@@ -151,8 +151,10 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    // Persist the detected backend so the deferred first-launch bootstrap (runtime.cmd -> update-runtime.cmd)
-    // installs the right PyTorch build instead of defaulting to CUDA on a CPU-only machine.
+    // Persist the detected backend so the deferred first-launch bootstrap (horde-worker.cmd -> runtime.cmd
+    // -> bootstrap.py, which reads bin/backend) installs the right PyTorch build instead of defaulting to
+    // CUDA on a CPU-only machine. The wizard still detects here because uv (and thus bootstrap.py) does not
+    // exist until first launch.
     if DetectedBackend = '' then
       DetectedBackend := 'cu126';
     ForceDirectories(ExpandConstant('{app}\bin'));

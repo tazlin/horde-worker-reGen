@@ -41,15 +41,38 @@ def test_all_root_launchers_are_bundled() -> None:
     assert not missing, f"these root launchers are missing from packaging/bundle-include.txt: {sorted(missing)}"
 
 
+def test_bootstrap_entry_point_is_bundled() -> None:
+    """bootstrap.py (the entry the launchers run via `uv run --script`) must ship in the bundle."""
+    assert "bootstrap.py" in _manifest_entries()
+
+
+def test_bootstrap_package_is_staged_by_workflows() -> None:
+    """Both staging scripts must copy the separately-bundled worker_bootstrap/ package.
+
+    It is copied like horde_worker_regen/ (not via the manifest), so if a staging script drops it the
+    bundle would omit the bootstrap brain and every launcher would fail.
+    """
+    assert (REPO_ROOT / "worker_bootstrap" / "cli.py").exists(), "worker_bootstrap/cli.py is missing"
+    release = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    build_local = (REPO_ROOT / "packaging" / "build-local.ps1").read_text(encoding="utf-8")
+    assert "worker_bootstrap" in release, "release.yml must stage the worker_bootstrap package"
+    assert "worker_bootstrap" in build_local, "build-local.ps1 must stage the worker_bootstrap package"
+
+
 def test_detect_backend_script_is_bundled() -> None:
-    """detect-backend.ps1 must ship in the bundle: install.ps1 reads it after extraction, and the
-    graphical installer sources it from the same staging, so the GPU check stays in one place."""
+    """detect-backend.ps1 must ship in the bundle for the graphical installer's pre-install wizard.
+
+    The wizard detects the GPU before uv (and thus bootstrap.py) exists, sourcing the script from the same
+    staging as the zip, so it can never drift from what ships.
+    """
     assert "packaging/detect-backend.ps1" in _manifest_entries()
 
 
 def test_inno_installer_sources_the_staging() -> None:
-    """The graphical installer must build from the same staged bundle as the zip (single source of truth),
-    so it can never drift from what the manifest ships."""
+    """The graphical installer must build from the same staged bundle as the zip (single source of truth).
+
+    Sourcing from the shared staging means it can never drift from what the manifest ships.
+    """
     iss = REPO_ROOT / "packaging" / "inno" / "HordeWorker.iss"
     assert iss.exists(), "packaging/inno/HordeWorker.iss is missing"
     text = iss.read_text(encoding="utf-8")
