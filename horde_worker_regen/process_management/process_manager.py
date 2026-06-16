@@ -675,6 +675,7 @@ class HordeWorkerProcessManager:
         # in-place soft reset (rebuild pools, limp-by) to giving up cleanly on jobs it cannot serve, so
         # the worker keeps running rather than wedging. See RecoverySupervisor for the escalation policy.
         self._recovery_supervisor = RecoverySupervisor()
+        self._limp_by_active = False
 
         self._job_submitter = JobSubmitter(
             state=self._state,
@@ -1272,18 +1273,23 @@ class HordeWorkerProcessManager:
         action = self._recovery_supervisor.evaluate(is_wedged=self._assess_wedge())
         if action is RecoveryAction.SOFT_RESET:
             self._perform_soft_reset()
+            self._limp_by_active = True
         elif action is RecoveryAction.GIVE_UP:
             self._give_up_on_wedged_jobs()
-        elif not self._recovery_supervisor.is_in_episode:
-            # The episode closed after a sustained clean streak: restore full concurrency (undo limp-by).
-            self._runtime_config.set_effective_max_threads(self._max_concurrent_inference_processes)
+        elif self._limp_by_active and not self._recovery_supervisor.is_in_episode:
+            # The episode recovered after a sustained clean streak: undo limp-by exactly once, restoring
+            # the *configured* concurrency (not the ceiling, which would override a user max_threads or a
+            # live TUI override). RuntimeConfig clamps to the ceiling.
+            self._limp_by_active = False
+            self._runtime_config.set_effective_max_threads(self.bridge_data.max_threads)
+            logger.info("Save-our-ship: pools recovered; restored configured concurrency (limp-by cleared).")
 
     def _perform_soft_reset(self) -> None:
         """Rebuild the worker's process pools in place and drop one limp-by notch (reduced concurrency)."""
         level = self._recovery_supervisor.limp_by_level
-        applied = self._runtime_config.set_effective_max_threads(
-            max(1, self._max_concurrent_inference_processes - level),
-        )
+        # Limp by one notch *down from the current* effective concurrency (clamped to >= 1 by
+        # RuntimeConfig), never up from a lower configured value.
+        applied = self._runtime_config.set_effective_max_threads(self._runtime_config.effective_max_threads - 1)
         logger.error(
             f"Save-our-ship soft reset #{level}: rebuilding process pools and limping by "
             f"(effective max_threads -> {applied}).",
