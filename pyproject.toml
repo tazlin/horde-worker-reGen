@@ -26,10 +26,11 @@ dependencies = [
     "certifi",
     "horde_sdk~=0.20.6",
     "horde_safety~=0.3.0",
-    # Requires horde-engine (hordelib) 3.1.0+: it declares torchvision/torchaudio as ranges so the
-    # worker's cuXXX build extras resolve the latest torch (2.12.0 today) for the chosen wheel index.
-    # Regenerate uv.lock with `uv lock` once horde-engine 3.1.0 is published (the lock was verified
-    # against a local editable build during development).
+    # Requires horde-engine (hordelib) 3.1.0+: it declares torchvision as a range so the worker's cuXXX
+    # build extras resolve the latest torch (2.12.0 today) for the chosen wheel index.
+    # NOTE: torchaudio is still pulled transitively from the *published* horde-engine 3.1.1 (a hard dep
+    # there). horde-engine makes torchaudio optional from the next release; once it is published, bump
+    # this floor and re-run `uv lock` to drop torchaudio from the worker lock entirely.
     "horde_engine>=3.1.0,<4.0.0",
     "horde_model_reference>=5.3.0,<6.0.0",
     "python-dotenv",
@@ -48,24 +49,27 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# One thin extra per NVIDIA/CPU build. torch is left UNPINNED and floats to the latest version the
-# horde-engine torchvision/torchaudio ranges allow (today 2.12.0 -> torchvision 0.27.0 / torchaudio
-# 2.11.0); the extra only routes torch to the matching wheel index (see [tool.uv.sources]). GPU
-# detection (packaging/detect-backend.ps1 / install.sh) picks the build; update-runtime.* install it
+# One thin extra per NVIDIA/CPU build. torch and torchvision are left UNPINNED and float to the latest
+# version the horde-engine torchvision range allows (today 2.12.0 -> torchvision 0.27.0); the extra
+# routes BOTH to the matching wheel index (see [tool.uv.sources]) so their CUDA builds never disagree.
+# GPU detection (packaging/detect-backend.ps1 / install.sh) picks the build; update-runtime.* install it
 # with `uv sync --locked --extra <build>`:
 #   cu132   NVIDIA, CUDA 13.2+ driver (exact 13.2 build; auto-selected when the driver is 13.2 or newer)
 #   cu130   NVIDIA, CUDA 13.0/13.1 driver (auto-selected for those; a 13.2+ driver gets cu132 instead)
 #   cu126   NVIDIA, CUDA 12.6+ driver (the only CUDA-12 build of torch 2.12.0; also runs on CUDA 13)
 #   cpu     no GPU (~100x slower; testing only)
-# Only these builds are locked. ROCm and other builds/versions are installed AD-HOC (not from the lock):
-# e.g. ROCm: `uv pip install torch==2.9.1 torchvision torchaudio pytorch-triton-rocm --extra-index-url
-# https://download.pytorch.org/whl/rocm6.4`; or let uv auto-detect: `UV_TORCH_BACKEND=auto uv pip
-# install torch torchvision torchaudio`. (torch 2.12.0 has no cu128 wheel, so CUDA 12.x uses cu126.)
-# directml was removed in the hordelib v3 catch-up.
-cu126 = ["torch"]
-cu130 = ["torch"]
-cu132 = ["torch"]
-cpu = ["torch"]
+# torchaudio is NOT routed here: it has no +cu132 wheel and audio is unsupported, so it must never be
+# mixed in (a cu132 torch + a PyPI torchaudio is exactly the CUDA-version-mismatch crash this avoids).
+# horde-engine omits it by default and stubs it at runtime; install ad-hoc if you ever need audio
+# (cu126/cu130/cpu only). Only these builds are locked. ROCm and other builds/versions are installed
+# AD-HOC (not from the lock): e.g. ROCm: `uv pip install torch==2.9.1 torchvision pytorch-triton-rocm
+# --extra-index-url https://download.pytorch.org/whl/rocm6.4`; or let uv auto-detect:
+# `UV_TORCH_BACKEND=auto uv pip install torch torchvision`. (torch 2.12.0 has no cu128 wheel, so CUDA
+# 12.x uses cu126.) directml was removed in the hordelib v3 catch-up.
+cu126 = ["torch", "torchvision"]
+cu130 = ["torch", "torchvision"]
+cu132 = ["torch", "torchvision"]
+cpu = ["torch", "torchvision"]
 
 [project.urls]
 "Homepage" = "https://github.com/Haidra-Org/horde-worker-reGen"
@@ -123,6 +127,14 @@ conflicts = [
 
 [tool.uv.sources]
 torch = [
+    {index = "pytorch-cu126", extra = "cu126"},
+    {index = "pytorch-cu130", extra = "cu130"},
+    {index = "pytorch-cu132", extra = "cu132"},
+    {index = "pytorch-cpu", extra = "cpu"},
+]
+# torchvision is routed alongside torch so the pair always shares one CUDA build; a torchvision left to
+# resolve from generic PyPI pulls a different CUDA build and breaks the install.
+torchvision = [
     {index = "pytorch-cu126", extra = "cu126"},
     {index = "pytorch-cu130", extra = "cu130"},
     {index = "pytorch-cu132", extra = "cu132"},
