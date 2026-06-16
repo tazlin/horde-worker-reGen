@@ -38,6 +38,14 @@ class HordeProcessInfo:
     """The connection through which messages can be sent to this process."""
     process_id: int
     """The ID of this process. This is not an OS process ID."""
+    os_pid: int | None
+    """The OS process id (``mp_process.pid``), captured right after the process starts.
+
+    Distinct from ``process_id`` (a stable logical slot 0,1,2...). Used to take ownership of the
+    real process: it is logged in crash/timeout diagnostics and recorded in the owned-PID registry so
+    a parent that dies hard can have its orphaned children reaped on the next startup. None until the
+    process has been started.
+    """
     process_type: HordeProcessType
     """The type of this process."""
     capabilities: WorkerCapability
@@ -133,6 +141,7 @@ class HordeProcessInfo:
         self.mp_process = mp_process
         self.pipe_connection = pipe_connection
         self.process_id = process_id
+        self.os_pid = mp_process.pid
         self.process_type = process_type
         self.capabilities = capabilities if capabilities is not None else DEFAULT_CAPABILITIES[process_type]
         self.last_process_state = last_process_state

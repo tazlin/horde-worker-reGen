@@ -672,7 +672,14 @@ class JobTracker:
             logger.warning(f"Job {faulted_job.id_} already in completed_jobs")
             return
 
-        self._set_stage(tracked, JobStage.PENDING_SUBMIT)
+        if self._set_stage(tracked, JobStage.PENDING_SUBMIT):
+            # A crash/timeout-faulted job never produces an inference RESULT message, so the
+            # dispatcher's per-result completion increment never fires for it. Count it here so the
+            # job is not silently dropped from the worker's terminal-job accounting. Without this a
+            # caller waiting for every job to reach a terminal state (the e2e harness, and the
+            # worker's own queue-drain logic) waits forever on a job that has, in fact, finished
+            # (as a fault). The faulted-kudos counter is still incremented once at submit time.
+            self._total_num_completed_jobs += 1
 
     async def purge_jobs(self) -> None:
         """Clear all jobs from the tracker."""

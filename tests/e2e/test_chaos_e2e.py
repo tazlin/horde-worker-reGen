@@ -3,9 +3,8 @@
 Each test spawns real fake child processes (via the harness ``fake`` mode) scripted with a
 :class:`FaultProfile`, then asserts the *intended* resilient outcome: every job is accounted for
 (completed or faulted, never lost), no audit invariant is violated, and the worker does not wedge.
-Probes targeting a known gap are marked ``xfail`` with the roadmap phase that closes it; the xfail
-flipping to a pass is that phase's acceptance signal. Watchdog timeouts are shrunk via
-``bridge_data_overrides`` so a genuinely-wedged run resolves quickly instead of burning the wall clock.
+Probes targeting a known gap are marked ``xfail``. Watchdog timeouts are shrunk via ``bridge_data_overrides``
+so a genuinely-wedged run resolves quickly instead of burning the wall clock.
 """
 
 from __future__ import annotations
@@ -20,6 +19,11 @@ from horde_worker_regen.process_management.fault_injection import FaultProfile
 # cannot lean on tiny watchdog timeouts. Instead it bounds the whole run with a short timeout_seconds:
 # crash detection is immediate (is_alive), and an undetected wedge simply runs out the clock.
 _WEDGE_TIMEOUT_SECONDS = 15.0
+
+# Detecting a *hang* (as opposed to a crash, which is caught immediately via is_alive) requires
+# waiting out a full inference_step_timeout of silence. That floor is 15s (the bridge-data minimum),
+# so a hang probe must allow detection + recovery + the remaining jobs to finish well past it.
+_HANG_DETECT_TIMEOUT_SECONDS = 45.0
 
 
 @pytest.mark.e2e
@@ -43,13 +47,6 @@ async def test_oom_fault_is_reported_and_pipeline_continues() -> None:
 
 
 @pytest.mark.e2e
-@pytest.mark.xfail(
-    reason="Phase 2: a child that hard-crashes just after acquiring the inference semaphore (before the "
-    "parent records INFERENCE_STARTING) orphans it; the slot is reaped and replaced once, but with "
-    "max_threads=1 the replacement can never acquire the semaphore and the worker wedges. Needs "
-    "state-independent, idempotent semaphore release on replacement.",
-    strict=False,
-)
 async def test_midjob_crash_recovers_and_keeps_serving() -> None:
     """A child that crashes mid-inference must be reaped and replaced, faulting only its in-flight job."""
     scenario = make_simple_scenario(4)
@@ -108,8 +105,9 @@ async def test_stale_launch_duplicate_result_is_ignored() -> None:
 
 @pytest.mark.e2e
 @pytest.mark.xfail(
-    reason="Phase 2/5: an inference process that fails on every start is respawned forever with no "
-    "circuit breaker, starving the worker until the run times out.",
+    reason="A crash-loop breaker now quarantines the perpetually-crashing slot, but "
+    "with no inference capacity left the worker has nothing to recover to and the run still times out. "
+    "Closing this needs the save-our-ship / limp-by fallback (give up the unservable jobs cleanly).",
     strict=False,
 )
 async def test_inference_crash_on_start_is_circuit_broken() -> None:
@@ -130,8 +128,9 @@ async def test_inference_crash_on_start_is_circuit_broken() -> None:
 
 @pytest.mark.e2e
 @pytest.mark.xfail(
-    reason="Phase 2/5: a safety process that fails on every start wedges all image jobs in safety with "
-    "no circuit breaker or save-our-ship fallback.",
+    reason="A safety process that fails on every start wedges all image jobs in safety. The "
+    "crash-loop breaker covers inference slots, not the safety pool; recovering this needs the "
+    "save-our-ship / limp-by fallback.",
     strict=False,
 )
 async def test_safety_crash_on_start_does_not_wedge_image_jobs() -> None:
@@ -151,11 +150,6 @@ async def test_safety_crash_on_start_does_not_wedge_image_jobs() -> None:
 
 
 @pytest.mark.e2e
-@pytest.mark.xfail(
-    reason="Phase 2: a process wedged at 0% (no step heartbeat) is not caught by is_stuck_on_inference, "
-    "and a live safety peer prevents the coarse all-processes-timeout fallback from firing.",
-    strict=False,
-)
 async def test_hang_at_zero_percent_is_recovered() -> None:
     """A child that accepts a job then wedges before its first step must be detected and replaced."""
     scenario = make_simple_scenario(3)
@@ -164,7 +158,7 @@ async def test_hang_at_zero_percent_is_recovered() -> None:
             scenario=scenario,
             process_mode="fake",
             skip_api=True,
-            timeout_seconds=_WEDGE_TIMEOUT_SECONDS,
+            timeout_seconds=_HANG_DETECT_TIMEOUT_SECONDS,
             inference_fault_profile=FaultProfile(hang_after_n_jobs=1),
         ),
     )

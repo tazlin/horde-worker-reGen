@@ -13,6 +13,7 @@ from loguru import logger
 
 from horde_worker_regen.consts import VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType, WorkerCapability
@@ -23,11 +24,24 @@ from horde_worker_regen.process_management.messages import (
     HordeDownloadControlMessage,
     HordeProcessState,
 )
+from horde_worker_regen.process_management.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.worker_state import WorkerState
+
+CRASH_LOOP_WINDOW_SECONDS: float = 300.0
+"""Sliding window over which an inference slot's replacements are counted for crash-loop detection."""
+
+CRASH_LOOP_MAX_REPLACEMENTS: int = 3
+"""Replacements of a single slot within ``CRASH_LOOP_WINDOW_SECONDS`` before it is quarantined.
+
+A slot that dies (or hangs) faster than it can do useful work is not worth respawning indefinitely:
+each restart costs a model (re)load and starves the worker. Past this count the slot is quarantined
+(left out of the pool) and the lost capacity is surfaced as a severity signal for the higher-level
+recovery supervisor rather than papered over by an unbounded respawn loop.
+"""
 
 
 class ProcessLifecycleManager:
@@ -52,6 +66,8 @@ class ProcessLifecycleManager:
     _state: WorkerState
     _entry_points: ProcessEntryPoints
     _download_process_info: HordeProcessInfo | None
+    _owned_registry: OwnedProcessRegistry | None
+    _action_ledger: ActionLedger
 
     num_processes_launched: int
     _num_process_recoveries: int
@@ -60,6 +76,9 @@ class ProcessLifecycleManager:
     _recently_recovered: bool
     _hung_processes_detected: bool
     _hung_processes_detected_time: float
+    _slot_recovery_history: dict[int, list[float]]
+    _quarantined_inference_slots: set[int]
+    _num_slots_quarantined: int
 
     def __init__(
         self,
@@ -82,6 +101,8 @@ class ProcessLifecycleManager:
         abort_callback: Callable[[], None],
         state: WorkerState,
         entry_points: ProcessEntryPoints | None = None,
+        owned_registry: OwnedProcessRegistry | None = None,
+        action_ledger: ActionLedger | None = None,
     ) -> None:
         """Initialize with shared references and callbacks from the parent manager."""
         self._process_map = process_map
@@ -102,6 +123,10 @@ class ProcessLifecycleManager:
         self._abort_callback = abort_callback
         self._state = state
         self._entry_points = entry_points if entry_points is not None else ProcessEntryPoints()
+        self._owned_registry = owned_registry
+        # The ledger is always present (an in-memory ring by default) so diagnostics work under test;
+        # the parent manager injects a file-backed one in a real run.
+        self._action_ledger = action_ledger if action_ledger is not None else ActionLedger()
 
         self.num_processes_launched = 0
         self._num_process_recoveries = 0
@@ -113,6 +138,9 @@ class ProcessLifecycleManager:
         self._any_replaced = False
         self._on_process_recovery: Callable[[HordeProcessInfo, str], None] | None = None
         self._download_process_info = None
+        self._slot_recovery_history = {}
+        self._quarantined_inference_slots = set()
+        self._num_slots_quarantined = 0
 
     def set_process_recovery_observer(self, observer: Callable[[HordeProcessInfo, str], None]) -> None:
         """Register a callback invoked with the process info and a reason on each recovery.
@@ -135,9 +163,83 @@ class ProcessLifecycleManager:
         return self._recently_recovered
 
     @property
+    def num_slots_quarantined(self) -> int:
+        """How many inference slots the crash-loop circuit breaker has taken out of the pool."""
+        return self._num_slots_quarantined
+
+    @property
+    def quarantined_inference_slots(self) -> frozenset[int]:
+        """The process ids of inference slots currently quarantined (read-only)."""
+        return frozenset(self._quarantined_inference_slots)
+
+    @property
     def download_process_info(self) -> HordeProcessInfo | None:
         """The background download process, or None if one is not running."""
         return self._download_process_info
+
+    @property
+    def action_ledger(self) -> ActionLedger:
+        """The self-audited record of lifecycle actions taken on child processes (read-only)."""
+        return self._action_ledger
+
+    def _register_owned(self, process_info: HordeProcessInfo) -> None:
+        """Record a just-started child in the action ledger and the owned-PID registry."""
+        self._action_ledger.record(
+            LedgerEventType.PROCESS_SPAWNED,
+            process_id=process_info.process_id,
+            os_pid=process_info.os_pid,
+            launch_identifier=process_info.process_launch_identifier,
+            detail={"process_type": process_info.process_type.name},
+        )
+        if self._owned_registry is not None:
+            self._owned_registry.record(
+                os_pid=process_info.os_pid,
+                launch_identifier=process_info.process_launch_identifier,
+                process_type=process_info.process_type.name,
+            )
+
+    def _log_recovery_diagnostics(self, process_info: HordeProcessInfo, reason: str) -> None:
+        """Emit a structured snapshot of why a process is being recovered, so a future hang explains itself.
+
+        Pulls together the OS identity, the last state and heartbeat the parent saw, the child's exit
+        code (if it died), and the slot's recent ledger history into one log line. Called at the moment
+        of replacement, while ``process_info`` still reflects the faulted state.
+        """
+        now = time.time()
+        exitcode: int | None = None
+        with contextlib.suppress(Exception):
+            exitcode = process_info.mp_process.exitcode
+
+        recent = self._action_ledger.recent(process_id=process_info.process_id, limit=10)
+        recent_summary = "; ".join(
+            f"{event.event_type.name}@-{now - event.timestamp:.1f}s" + (f"({event.reason})" if event.reason else "")
+            for event in recent
+        )
+        last_job = process_info.last_job_referenced
+        logger.error(
+            f"Recovery diagnostics for process {process_info.process_id} (os_pid={process_info.os_pid}, "
+            f"launch={process_info.process_launch_identifier}): reason='{reason}'; "
+            f"last_state={process_info.last_process_state.name}; exitcode={exitcode}; "
+            f"last_heartbeat_type={process_info.last_heartbeat_type.name}; "
+            f"since_last_heartbeat={now - process_info.last_heartbeat_timestamp:.1f}s; "
+            f"since_last_message={now - process_info.last_received_timestamp:.1f}s; "
+            f"last_job={last_job.id_ if last_job is not None else None}; recent_actions=[{recent_summary}]",
+        )
+
+    def _forget_owned(self, process_info: HordeProcessInfo) -> None:
+        """Drop a cleanly-ended child from the owned-PID registry (no-op if reaping is disabled)."""
+        if self._owned_registry is not None:
+            self._owned_registry.forget(process_info.os_pid)
+
+    def kill_owned_children(self) -> list[int]:
+        """Best-effort kill of every still-owned child by OS pid; for atexit / signal cleanup.
+
+        Identity is re-verified per pid inside the registry, so a reused pid is never killed. Returns
+        the pids actually killed. No-op (empty list) when orphan reaping is disabled.
+        """
+        if self._owned_registry is None:
+            return []
+        return self._owned_registry.kill_all_owned()
 
     def start_safety_processes(self) -> None:
         """Start all the safety processes configured to be used."""
@@ -185,6 +287,7 @@ class ProcessLifecycleManager:
                 last_process_state=HordeProcessState.PROCESS_STARTING,
                 process_launch_identifier=self.num_processes_launched,
             )
+            self._register_owned(self._process_map[pid])
 
             logger.info(f"Started safety process (id: {pid})")
             self.num_processes_launched += 1
@@ -234,6 +337,7 @@ class ProcessLifecycleManager:
             process_launch_identifier=self.num_processes_launched,
             capabilities=WorkerCapability(0),
         )
+        self._register_owned(self._download_process_info)
         self.num_processes_launched += 1
         logger.info("Started background download process")
 
@@ -293,6 +397,7 @@ class ProcessLifecycleManager:
             self._download_process_info.mp_process.kill()
         except Exception as e:
             logger.debug(f"Failed to stop download process: {e}")
+        self._forget_owned(self._download_process_info)
         self._download_process_info = None
 
     def start_inference_processes(self) -> None:
@@ -359,6 +464,7 @@ class ProcessLifecycleManager:
             process_launch_identifier=self.num_processes_launched,
         )
         self._process_map[pid] = process_info
+        self._register_owned(process_info)
         self.num_processes_launched += 1
         return process_info
 
@@ -458,6 +564,14 @@ class ProcessLifecycleManager:
         except Exception as e:
             logger.error(f"Failed to kill process {process_info.process_id}: {e}")
 
+        self._forget_owned(process_info)
+        self._action_ledger.record(
+            LedgerEventType.PROCESS_ENDED,
+            process_id=process_info.process_id,
+            os_pid=process_info.os_pid,
+            launch_identifier=process_info.process_launch_identifier,
+        )
+
         if not self._state.shutting_down:
             logger.info(f"Ended inference process {process_info.process_id}")
 
@@ -474,6 +588,7 @@ class ProcessLifecycleManager:
 
         process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
         self._process_map.on_process_ending(process_id=process_info.process_id)
+        self._forget_owned(process_info)
 
         logger.info(f"Ended safety process {process_info.process_id}")
 
@@ -539,8 +654,90 @@ class ProcessLifecycleManager:
             self._safety_processes_should_be_replaced = False
             self._num_process_recoveries += 1
 
+    def _release_held_primitives(self, process_info: HordeProcessInfo) -> None:
+        """Release every shared primitive a replaced inference child might still be holding.
+
+        A child acquires the inference/VAE/sampling semaphores and the disk/aux locks inside its own
+        process, so a child that dies or hangs leaves them held; the parent must release on its behalf
+        or that concurrency is lost for the lifetime of the worker (one orphaned inference permit at
+        ``max_threads=1`` wedges everything). We deliberately do not infer which primitives are held
+        from the last state the parent recorded: a child can crash after acquiring but before the
+        parent processes the matching state-change message, and that exact race is what wedged the
+        worker before. Releasing unconditionally is safe because every one of these is bounded (the
+        semaphores are BoundedSemaphores, a Lock is bound to one), so releasing one the child did not
+        hold raises ValueError, which we swallow as a harmless no-op rather than inflating a limit.
+        """
+        candidates: list[tuple[str, Semaphore | Lock_MultiProcessing]] = [
+            ("inference_semaphore", self._inference_semaphore),
+            ("disk_lock", self._disk_lock),
+            ("aux_model_lock", self._aux_model_lock),
+            ("vae_decode_semaphore", self._vae_decode_semaphore),
+        ]
+        if self._gpu_sampling_lease_enabled:
+            candidates.append(("gpu_sampling_lease", self._gpu_sampling_lease))
+
+        released: list[str] = []
+        for name, primitive in candidates:
+            try:
+                primitive.release()
+                released.append(name)
+            except ValueError:
+                # Not held by the dead child; the bounded primitive rejected the spurious release.
+                pass
+
+        if released:
+            self._action_ledger.record(
+                LedgerEventType.SEMAPHORE_RELEASED,
+                process_id=process_info.process_id,
+                os_pid=process_info.os_pid,
+                detail={"released": ", ".join(released)},
+            )
+            logger.debug(
+                f"Released primitives possibly held by replaced process {process_info.process_id}: "
+                f"{', '.join(released)}",
+            )
+
+    def _record_slot_recovery(self, process_id: int) -> int:
+        """Record a replacement of the given slot and return how many happened within the window."""
+        now = time.time()
+        recent = [t for t in self._slot_recovery_history.get(process_id, []) if now - t <= CRASH_LOOP_WINDOW_SECONDS]
+        recent.append(now)
+        self._slot_recovery_history[process_id] = recent
+        return len(recent)
+
+    def _quarantine_inference_slot(self, process_info: HordeProcessInfo, replacements_in_window: int) -> None:
+        """Take a crash-looping inference slot out of the pool instead of respawning it again.
+
+        The slot has died or hung ``replacements_in_window`` times inside the crash-loop window, so
+        respawning it would just repeat the loop and keep starving the worker. Its OS process was
+        already ended by the caller, and the caller already recorded the recovery event; here we only
+        drop it from the process map and remember it so it is not silently refilled. The lost capacity
+        is surfaced via ``num_slots_quarantined`` so the higher-level recovery supervisor (Phase 5)
+        can escalate when too much capacity is lost.
+        """
+        self._quarantined_inference_slots.add(process_info.process_id)
+        self._num_slots_quarantined += 1
+        self._process_map.pop(process_info.process_id, None)
+        self._action_ledger.record(
+            LedgerEventType.PROCESS_QUARANTINED,
+            process_id=process_info.process_id,
+            os_pid=process_info.os_pid,
+            launch_identifier=process_info.process_launch_identifier,
+            reason=f"crash loop: {replacements_in_window} replacements in {CRASH_LOOP_WINDOW_SECONDS:.0f}s",
+        )
+        logger.critical(
+            f"Inference slot {process_info.process_id} quarantined after {replacements_in_window} replacements "
+            f"within {CRASH_LOOP_WINDOW_SECONDS:.0f}s (crash loop); not respawning it.",
+        )
+
     def _replace_inference_process(self, process_info: HordeProcessInfo) -> None:
-        """Replaces an inference process (for whatever reason; probably because it crashed)."""
+        """Replace an inference process (because it crashed, hung, or timed out).
+
+        Frees any shared GPU/disk primitives the dead child may still hold (state-independently; see
+        ``_release_held_primitives``), faults its in-flight job, then either respawns the slot or, if
+        the slot has been replaced too many times in a short window, quarantines it (crash-loop
+        circuit breaker) so a permanently-broken slot cannot spin in an unbounded respawn loop.
+        """
         bridge_data = self._runtime_config.bridge_data
         logger.debug(f"Replacing {process_info}")
         job_to_remove = None
@@ -552,31 +749,18 @@ class ProcessLifecycleManager:
                 job_to_remove = process.last_job_referenced
                 break
 
-        if process_info.last_process_state == HordeProcessState.INFERENCE_STARTING:
-            try:
-                self._inference_semaphore.release()
-            except ValueError:
-                logger.debug("Inference semaphore already released")
-            try:
-                self._disk_lock.release()
-            except ValueError:
-                logger.debug("Disk lock already released")
+        self._release_held_primitives(process_info)
 
-        elif process_info.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL:
-            try:
-                self._aux_model_lock.release()
-            except ValueError:
-                logger.debug("Aux model lock already released")
-
-            if (
-                process_info.last_job_referenced is not None
-                and process_info.last_job_referenced in self._job_tracker.jobs_lookup
-            ):
-                job_to_remove = process_info.last_job_referenced
-                logger.error(
-                    f"Job {job_to_remove.id_ or job_to_remove.ids} was in aux model preload on process "
-                    f"{process_info.process_id} but it failed. Removing.",
-                )
+        if (
+            process_info.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL
+            and process_info.last_job_referenced is not None
+            and process_info.last_job_referenced in self._job_tracker.jobs_lookup
+        ):
+            job_to_remove = process_info.last_job_referenced
+            logger.error(
+                f"Job {job_to_remove.id_ or job_to_remove.ids} was in aux model preload on process "
+                f"{process_info.process_id} but it failed. Removing.",
+            )
 
         if process_info.loaded_horde_model_name is not None:
             self._horde_model_map.expire_entry(process_info.loaded_horde_model_name)
@@ -588,12 +772,37 @@ class ProcessLifecycleManager:
                 process_timeout=bridge_data.process_timeout,
             )
 
-        self._notify_process_recovery(process_info, "inference process replaced (crashed or hung)")
+        replacements_in_window = self._record_slot_recovery(process_info.process_id)
+        will_quarantine = replacements_in_window > CRASH_LOOP_MAX_REPLACEMENTS
+        recovery_reason = (
+            f"inference slot quarantined (crash loop: {replacements_in_window} replacements)"
+            if will_quarantine
+            else "inference process replaced (crashed or hung)"
+        )
+        # Record the recovery while the process info still reflects the faulted state: ending the
+        # process first overwrites last_process_state with PROCESS_ENDING and loses that diagnostic.
+        self._log_recovery_diagnostics(process_info, recovery_reason)
+        raw_exitcode = getattr(process_info.mp_process, "exitcode", None)
+        exitcode = raw_exitcode if isinstance(raw_exitcode, int) else None
+        self._action_ledger.record(
+            LedgerEventType.PROCESS_REPLACED,
+            process_id=process_info.process_id,
+            os_pid=process_info.os_pid,
+            launch_identifier=process_info.process_launch_identifier,
+            job_id=str(job_to_remove.id_) if job_to_remove is not None else None,
+            reason=recovery_reason,
+            detail={"last_state": process_info.last_process_state.name, "exitcode": exitcode},
+        )
+        self._notify_process_recovery(process_info, recovery_reason)
 
         self._end_inference_process(process_info)
-        self._start_inference_process(process_info.process_id)
-
         self._num_process_recoveries += 1
+
+        if will_quarantine:
+            self._quarantine_inference_slot(process_info, replacements_in_window)
+            return
+
+        self._start_inference_process(process_info.process_id)
 
     def get_processes_with_model_for_queued_job(self) -> list[int]:
         """Get the processes that have the model for any queued job."""
@@ -638,6 +847,8 @@ class ProcessLifecycleManager:
 
         self._process_map.clear()
         self._horde_model_map.root.clear()
+        if self._owned_registry is not None:
+            self._owned_registry.clear()
 
     def _check_and_replace_process(
         self,
@@ -657,7 +868,16 @@ class ProcessLifecycleManager:
 
         if time_elapsed > timeout and process_info.last_process_state == state:
             logger.error(f"{process_info} {error_message}, replacing it")
+            self._action_ledger.record(
+                LedgerEventType.TIMEOUT_DETECTED,
+                process_id=process_info.process_id,
+                os_pid=process_info.os_pid,
+                launch_identifier=process_info.process_launch_identifier,
+                reason=error_message,
+                detail={"state": state.name, "elapsed_s": round(time_elapsed, 1), "timeout_s": timeout},
+            )
             if process_info.process_type == HordeProcessType.SAFETY:
+                self._log_recovery_diagnostics(process_info, error_message)
                 # Arm the replacement before driving it: `_replace_all_safety_process` no-ops unless the
                 # flag is set, so omitting this (the historical bug) made the safety branch a silent no-op.
                 self._initiate_safety_replacement()
@@ -669,9 +889,6 @@ class ProcessLifecycleManager:
 
     def replace_hung_processes(self) -> bool:
         """Replaces processes that haven't checked in since `process_timeout` seconds in bridgeData."""
-        if self._recently_recovered:
-            return False
-
         import threading
 
         bridge_data = self._runtime_config.bridge_data
@@ -683,17 +900,39 @@ class ProcessLifecycleManager:
         now = time.time()
 
         any_replaced = False
+
+        # Definitive crashes (the OS process has exited) are reaped immediately, even right after
+        # another recovery. A dead child sends no further messages, so deferring its reap behind the
+        # recent-recovery debounce would wedge the worker for the debounce window on every burst of
+        # crashes (e.g. a replacement that also dies). Unbounded respawns are prevented by the
+        # crash-loop circuit breaker in `_replace_inference_process`, not by this debounce.
         # Snapshot the values: recovering a process can mutate the map (safety end/delete/restart).
         for process_info in list(self._process_map.values()):
             if self._reap_if_crashed(process_info):
                 any_replaced = True
-                self._recently_recovered = True
-                continue
+
+        if any_replaced:
+            self._recently_recovered = True
+            threading.Thread(target=timed_unset_recently_recovered).start()
+
+        # The hang/timeout heuristics below are debounced: a just-replaced process is still spinning
+        # up and would otherwise trip the startup / all-processes-timed-out checks before it reports in.
+        if self._recently_recovered:
+            return any_replaced
+
+        for process_info in list(self._process_map.values()):
             if self._process_map.is_stuck_on_inference(
                 process_info.process_id,
                 bridge_data.inference_step_timeout,
             ):
                 logger.error(f"{process_info} seems to be stuck mid inference, replacing it")
+                self._action_ledger.record(
+                    LedgerEventType.TIMEOUT_DETECTED,
+                    process_id=process_info.process_id,
+                    os_pid=process_info.os_pid,
+                    launch_identifier=process_info.process_launch_identifier,
+                    reason="stuck mid inference (no step progress within inference_step_timeout)",
+                )
                 self._replace_inference_process(process_info)
                 any_replaced = True
                 self._recently_recovered = True
@@ -719,6 +958,11 @@ class ProcessLifecycleManager:
                         bridge_data.post_process_timeout + (3 * bridge_data.max_batch),
                         HordeProcessState.INFERENCE_POST_PROCESSING,
                         "seems to be stuck post processing",
+                    ),
+                    (
+                        bridge_data.process_timeout,
+                        HordeProcessState.WAITING_FOR_JOB,
+                        "seems to be stuck idle (silent) while there is work to do",
                     ),
                 ]
                 if self._state.last_pop_no_jobs_available:

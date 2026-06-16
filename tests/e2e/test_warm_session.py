@@ -1,4 +1,4 @@
-"""Warm-session end-to-end tests: one worker reused across levels, no per-level respawn (Phase 3)."""
+"""Warm-session end-to-end tests: one worker reused across levels, no per-level respawn."""
 
 from __future__ import annotations
 

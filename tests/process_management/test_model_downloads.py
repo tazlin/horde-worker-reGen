@@ -1,4 +1,4 @@
-"""Tests for background model downloads and on-disk availability gating (Phase 1)."""
+"""Tests for background model downloads and on-disk availability gating."""
 
 from __future__ import annotations
 

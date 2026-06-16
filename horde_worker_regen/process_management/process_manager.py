@@ -13,6 +13,7 @@ from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Mapping
 from multiprocessing.connection import Connection
 from multiprocessing.context import BaseContext
+from multiprocessing.synchronize import BoundedSemaphore as BoundedSemaphore_MultiProcessing
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
 from pathlib import Path
@@ -39,7 +40,7 @@ from horde_sdk.ai_horde_api.apimodels import (
 from loguru import logger
 from pydantic import ValidationError
 
-from horde_worker_regen.app_state import WorkerRunRecord
+from horde_worker_regen.app_state import WorkerRunRecord, default_app_state_dir
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.bridge_data.load_config import BridgeDataLoader
 from horde_worker_regen.consts import (
@@ -48,6 +49,7 @@ from horde_worker_regen.consts import (
 )
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management._canned_scenarios import CannedAlchemySource, CannedJobSource
+from horde_worker_regen.process_management.action_ledger import ActionLedger
 from horde_worker_regen.process_management.alchemy_popper import AlchemyCoordinator
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
@@ -66,6 +68,7 @@ from horde_worker_regen.process_management.messages import (
 )
 from horde_worker_regen.process_management.model_availability import ModelAvailability
 from horde_worker_regen.process_management.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
@@ -172,14 +175,26 @@ class MultiprocessingPrimitives:
         vae_decode_semaphore_max: int,
         gpu_sampling_lease_slots: int = 1,
     ) -> MultiprocessingPrimitives:
-        """Create real multiprocessing primitives from a context."""
+        """Create real multiprocessing primitives from a context.
+
+        The GPU-concurrency gates are BoundedSemaphores, not plain Semaphores, for a reason that is
+        load-bearing for crash recovery: a child acquires these inside its own process, so when it
+        dies or hangs the parent must release on its behalf or the slot's concurrency is lost forever
+        (a single orphaned inference permit at ``max_threads=1`` wedges the whole worker). The parent
+        cannot always know whether the dead child actually held a permit, so it releases
+        unconditionally. With a plain Semaphore an over-release would silently raise the ceiling and
+        admit more concurrent sampling than configured (an eventual VRAM OOM); a BoundedSemaphore
+        instead rejects the over-release with ``ValueError``, making the blind release a safe no-op
+        when the child held nothing. The child's own acquire/release stay paired and idempotent, so
+        the bound is never hit in normal operation.
+        """
         return cls(
             process_message_queue=multiprocessing.Queue(),
-            inference_semaphore=Semaphore(max_concurrent_inference, ctx=ctx),
+            inference_semaphore=BoundedSemaphore_MultiProcessing(max_concurrent_inference, ctx=ctx),
             disk_lock=Lock_MultiProcessing(ctx=ctx),
             aux_model_lock=Lock_MultiProcessing(ctx=ctx),
-            vae_decode_semaphore=Semaphore(vae_decode_semaphore_max, ctx=ctx),
-            gpu_sampling_lease=Semaphore(max(1, gpu_sampling_lease_slots), ctx=ctx),
+            vae_decode_semaphore=BoundedSemaphore_MultiProcessing(vae_decode_semaphore_max, ctx=ctx),
+            gpu_sampling_lease=BoundedSemaphore_MultiProcessing(max(1, gpu_sampling_lease_slots), ctx=ctx),
         )
 
 
@@ -539,6 +554,23 @@ class HordeWorkerProcessManager:
         self._vae_decode_semaphore = mp_primitives.vae_decode_semaphore
         self._gpu_sampling_lease = mp_primitives.gpu_sampling_lease
 
+        # Take ownership of child OS pids so a parent that died hard can have its orphaned children
+        # reaped on the next startup. Disabled under test: it touches real OS processes and a shared
+        # on-disk registry, neither of which belongs in CI. The registry itself is unit-tested directly.
+        self._owned_registry: OwnedProcessRegistry | None = None
+        if not os.environ.get("AI_HORDE_TESTING"):
+            self._owned_registry = OwnedProcessRegistry()
+            reaped = self._owned_registry.reap_orphans_from_previous_run()
+            if reaped:
+                logger.warning(
+                    f"Reaped {len(reaped)} orphaned child process(es) left by a previous run: {reaped}",
+                )
+
+        # Self-audited record of lifecycle actions, for post-mortems of a hang/crash. Always kept in
+        # memory (so the timeout diagnostics dump works); mirrored to a JSONL file only outside tests.
+        ledger_path = None if os.environ.get("AI_HORDE_TESTING") else (default_app_state_dir() / "action_ledger.jsonl")
+        self._action_ledger = ActionLedger(path=ledger_path)
+
         self._process_lifecycle = ProcessLifecycleManager(
             process_map=self._process_map,
             horde_model_map=self._horde_model_map,
@@ -558,6 +590,8 @@ class HordeWorkerProcessManager:
             abort_callback=self._abort,
             state=self._state,
             entry_points=process_entry_points,
+            owned_registry=self._owned_registry,
+            action_ledger=self._action_ledger,
         )
 
         self._message_dispatcher = MessageDispatcher(
@@ -1743,8 +1777,14 @@ class HordeWorkerProcessManager:
             return
 
         if ex is not None:
-            logger.error(f"main loop task ended unexpectedly: {ex}")
-            logger.exception(ex)
+            # Format the traceback from the exception object directly. This is a done-callback, not an
+            # ``except`` block, so there is no active exception for ``logger.exception()`` to pick up;
+            # calling it here logged only the (often empty) message and silently dropped the traceback,
+            # which made a crashing main-loop task nearly impossible to diagnose.
+            import traceback
+
+            tb_text = "".join(traceback.format_exception(type(ex), ex, ex.__traceback__))
+            logger.error(f"main loop task ended unexpectedly: {ex!r}\n{tb_text}")
         else:
             logger.error("A main loop task returned unexpectedly while the worker was running; shutting down.")
 
@@ -1794,11 +1834,23 @@ class HordeWorkerProcessManager:
 
     def start(self) -> None:
         """Start the process manager."""
+        import atexit
         import signal
+
+        # Backstop the clean-shutdown path: if the interpreter exits without ending children (a crash
+        # that still unwinds to atexit, or a stray exit), kill any child we still own by OS pid so it
+        # cannot linger holding the GPU. Identity is re-verified per pid, so a reused pid is never hit.
+        atexit.register(self._kill_owned_children_on_exit)
 
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
         asyncio.run(self._main_loop())
+
+    def _kill_owned_children_on_exit(self) -> None:
+        """Best-effort kill of any child still owned at interpreter exit (the atexit backstop)."""
+        killed = self._process_lifecycle.kill_owned_children()
+        if killed:
+            logger.warning(f"atexit: killed {len(killed)} still-running owned child process(es): {killed}")
 
     def signal_handler(self, sig: int, frame: object) -> None:
         """Handle SIGINT and SIGTERM."""

@@ -359,6 +359,10 @@ def make_mock_process_info(
     """
     mp_process = Mock()
     mp_process.is_alive.return_value = True
+    # A started process has a real integer OS pid (and no exitcode yet); mirror that so HordeProcessInfo
+    # captures an int os_pid rather than a Mock (the action ledger validates os_pid as int | None).
+    mp_process.pid = 100000 + process_id
+    mp_process.exitcode = None
     pipe_connection = Mock()
     if not safe_send_returns:
         pipe_connection.send.side_effect = Exception("mock send failure")

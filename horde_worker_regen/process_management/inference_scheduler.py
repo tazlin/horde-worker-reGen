@@ -10,6 +10,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
 from horde_worker_regen.consts import KNOWN_SLOW_WORKFLOWS, VRAM_HEAVY_MODELS
+from horde_worker_regen.process_management.action_ledger import LedgerEventType
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.job_models import LineSkip, NextJobAndProcess
@@ -302,6 +303,14 @@ class InferenceScheduler:
 
             if preload_sent:
                 available_process.last_control_flag = HordeControlFlag.PRELOAD_MODEL
+                self._process_lifecycle.action_ledger.record(
+                    LedgerEventType.PRELOAD_REQUESTED,
+                    process_id=available_process.process_id,
+                    os_pid=available_process.os_pid,
+                    launch_identifier=available_process.process_launch_identifier,
+                    job_id=str(job.id_) if job.id_ is not None else None,
+                    detail={"model": job.model},
+                )
 
                 self._horde_model_map.update_entry(
                     horde_model_name=job.model,
@@ -583,6 +592,14 @@ class InferenceScheduler:
             ),
         ):
             await self._job_tracker.mark_inference_started(next_job)
+            self._process_lifecycle.action_ledger.record(
+                LedgerEventType.INFERENCE_DISPATCHED,
+                process_id=process_with_model.process_id,
+                os_pid=process_with_model.os_pid,
+                launch_identifier=process_with_model.process_launch_identifier,
+                job_id=str(next_job.id_) if next_job.id_ is not None else None,
+                detail={"model": next_job.model, "steps": next_job.payload.ddim_steps},
+            )
 
             process_with_model.last_control_flag = HordeControlFlag.START_INFERENCE
             process_with_model.last_job_referenced = next_job

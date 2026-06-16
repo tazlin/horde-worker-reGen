@@ -1,4 +1,4 @@
-"""Tests for runtime concurrency scaling: effective thread cap and SET_CONCURRENCY (Phase 2)."""
+"""Tests for runtime concurrency scaling: effective thread cap and SET_CONCURRENCY."""
 
 from __future__ import annotations
 

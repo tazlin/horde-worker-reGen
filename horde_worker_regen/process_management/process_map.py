@@ -318,18 +318,22 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         process_id: int,
         inference_step_timeout: int,
     ) -> bool:
-        """Return true if the process is actively doing inference but we haven't received a heartbeat in a while."""
-        if self[process_id].last_process_state != HordeProcessState.INFERENCE_STARTING:
+        """Return true if a process is in inference but has shown no progress within the timeout.
+
+        ``last_heartbeat_timestamp`` is reset the moment a job is dispatched to the slot (see
+        ``on_last_job_reference_change``) and again on every INFERENCE_STEP, so the wall-clock gap
+        since it is the time spent in inference with no sampling progress. Measuring that gap live
+        (rather than the previously-used ``last_heartbeat_delta``, which freezes at its last computed
+        value the instant heartbeats stop arriving) catches a true hang where the child simply goes
+        silent. It also catches a slot wedged *before* its first step (hung at 0%, having never
+        emitted an INFERENCE_STEP): the old heartbeat-type and ``percent_complete < 1`` gates gave
+        that case a free pass, which is exactly the 0%-hang gap this overhaul closes.
+        """
+        process_info = self[process_id]
+        if process_info.last_process_state != HordeProcessState.INFERENCE_STARTING:
             return False
 
-        last_heartbeat_percent_complete = self[process_id].last_heartbeat_percent_complete
-        if last_heartbeat_percent_complete is not None and last_heartbeat_percent_complete < 1:
-            return False
-
-        return bool(
-            self[process_id].last_heartbeat_type == HordeHeartbeatType.INFERENCE_STEP
-            and self[process_id].last_heartbeat_delta > inference_step_timeout,
-        )
+        return (time.time() - process_info.last_heartbeat_timestamp) > inference_step_timeout
 
     def get_capable_processes(self, capability: WorkerCapability) -> list[HordeProcessInfo]:
         """Return all processes declaring the given capability.
