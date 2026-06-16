@@ -20,6 +20,15 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, list[tup
     monkeypatch.delenv("HORDE_WORKER_BACKEND", raising=False)
     monkeypatch.setattr(cli.detect, "detect_backend", lambda: "cu126")
 
+    # Keep the install path hermetic: don't really prompt for consent or shell out to git.
+    monkeypatch.setattr(cli.consent, "ensure_consent", lambda **kw: True)
+    monkeypatch.setattr(cli.gitbin, "find_system_git", lambda: "git")
+    monkeypatch.setattr(
+        cli.gitbin,
+        "ensure_git",
+        lambda root=None, **kw: cli.gitbin.GitResolution("git", "system", "ok"),
+    )
+
     calls: list[tuple[str, object]] = []
     monkeypatch.setattr(cli.runner, "uv_sync", lambda uv, extra, **kw: calls.append(("sync", extra)) or 0)
     monkeypatch.setattr(cli.runner, "uv_run", lambda uv, command, **kw: calls.append(("run", command)) or 0)
@@ -104,6 +113,26 @@ def test_install_writes_backend_syncs_no_launch(env: tuple[Path, list]) -> None:
     assert cli.main(["install", "--no-launch"]) == 0
     assert backend.read_backend_file(root / "bin" / "backend") == "cu126"
     assert calls == [("sync", "cu126")]
+
+
+def test_install_aborts_when_consent_declined(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Declining the consent gate aborts before any dependency sync."""
+    _, calls = env
+    monkeypatch.setattr(cli.consent, "ensure_consent", lambda **kw: False)
+    assert cli.main(["install", "--no-launch"]) == 1
+    assert calls == []
+
+
+def test_sync_aborts_when_git_unavailable(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unresolvable git (e.g. POSIX with no git) aborts the sync with a non-zero code."""
+    _, calls = env
+    monkeypatch.setattr(
+        cli.gitbin,
+        "ensure_git",
+        lambda root=None, **kw: cli.gitbin.GitResolution(None, "missing", "install git"),
+    )
+    assert cli.main(["sync"]) == 1
+    assert calls == []
 
 
 def test_run_passthrough(env: tuple[Path, list]) -> None:

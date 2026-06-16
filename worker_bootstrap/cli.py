@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from worker_bootstrap import backend as backend_mod
-from worker_bootstrap import config_seed, detect, paths, runner, uvbin
+from worker_bootstrap import config_seed, consent, detect, gitbin, paths, runner, uvbin
 
 _BACKEND_ENV = "HORDE_WORKER_BACKEND"
 
@@ -41,7 +41,7 @@ def _print_cpu_notice() -> None:
 
 
 def _sync(uv: str, root: Path, *, cli_flag: str | None) -> int:
-    """Resolve the backend, seed config, then run the locked sync (or the ad-hoc ROCm path)."""
+    """Disclose, gain consent, ensure git, seed config, then run the locked sync (or ad-hoc ROCm path)."""
     token = backend_mod.resolve_backend(
         cli_flag=cli_flag,
         env_value=os.environ.get(_BACKEND_ENV),
@@ -50,6 +50,23 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None) -> int:
     if token == detect.AMD_UNSUPPORTED:
         _print_amd_unsupported()
         return 2
+
+    # Disclose what is about to be installed (and from where) and gain consent before any heavy download.
+    # The git line tells the user up front whether their existing git is used or a portable one is fetched.
+    system_git = gitbin.find_system_git()
+    if not consent.ensure_consent(
+        notice_path=paths.install_notice(root),
+        marker_path=paths.consent_marker(root),
+        detail_lines=[f"  - GPU backend to install: {token}", gitbin.notice_line(system_git)],
+    ):
+        return 1
+
+    # Resolve git now (during the long install), not mid-job: hordelib clones ComfyUI with a bare `git`.
+    git_resolution = gitbin.ensure_git(root)
+    if not git_resolution.ok:
+        print(git_resolution.message, file=sys.stderr)
+        return 1
+
     config_seed.seed_config(template=paths.template_config(root), target=paths.bridge_config(root))
     if token == detect.ROCM:
         from worker_bootstrap import rocm

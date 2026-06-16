@@ -40,6 +40,11 @@ OutputDir=dist
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+; Disclosure pages, sourced from the same staged bundle the one-liner and winget show so they can never
+; drift: the plain-language "what/where/from" notice as the Info-before page, and the aggregated
+; third-party license notices as the standard accept page.
+InfoBeforeFile={#StageDir}\INSTALL_NOTICE.txt
+LicenseFile={#StageDir}\THIRD-PARTY-NOTICES.md
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName=AI Horde Worker
@@ -49,7 +54,9 @@ UninstallDisplayName=AI Horde Worker
 ; SignTool=hordesign $f
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"
+; Shortcuts are opt-in (unchecked by default), matching the one-line installers' conservative default.
+Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Shortcuts (optional):"; Flags: unchecked
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts (optional):"; Flags: unchecked
 
 [Files]
 ; Everything in the staged bundle, minus detect-backend.ps1 which is handled explicitly below.
@@ -63,7 +70,7 @@ Source: "{#StageDir}\detect-backend.ps1"; Flags: dontcopy
 Source: "{#StageDir}\bridgeData_template.yaml"; DestDir: "{app}"; DestName: "bridgeData.yaml"; Flags: onlyifdoesntexist uninsneveruninstall
 
 [Icons]
-Name: "{autoprograms}\AI Horde Worker"; Filename: "{app}\horde-worker.cmd"; WorkingDir: "{app}"; Comment: "AI Horde Worker dashboard"
+Name: "{autoprograms}\AI Horde Worker"; Filename: "{app}\horde-worker.cmd"; WorkingDir: "{app}"; Comment: "AI Horde Worker dashboard"; Tasks: startmenuicon
 Name: "{autodesktop}\AI Horde Worker"; Filename: "{app}\horde-worker.cmd"; WorkingDir: "{app}"; Comment: "AI Horde Worker dashboard"; Tasks: desktopicon
 
 [Run]
@@ -159,5 +166,8 @@ begin
       DetectedBackend := 'cu126';
     ForceDirectories(ExpandConstant('{app}\bin'));
     SaveStringToFile(ExpandConstant('{app}\bin\backend'), DetectedBackend, False);
+    // Record that consent was captured by the license page so the deferred first-launch sync
+    // (horde-worker.cmd -> runtime.cmd -> bootstrap.py) does not prompt the user a second time.
+    SaveStringToFile(ExpandConstant('{app}\bin\install-consent'), 'consent recorded (graphical installer)' + #13#10, False);
   end;
 end;

@@ -1,0 +1,33 @@
+AI Horde Worker - what this installer does
+==========================================
+
+The AI Horde Worker shares your GPU with the AI Horde (https://aihorde.net) to generate images. It is
+free and open source, licensed under the GNU AGPL-3.0 (see the LICENSE file).
+
+Installing and first run will download the following from the internet into the install folder
+(nothing is installed system-wide, and your existing system settings are not changed):
+
+  - uv, the package manager that does the work
+        from github.com/astral-sh/uv            (Apache-2.0 OR MIT)
+  - A private Python runtime (managed CPython, not your system Python)
+        from Astral's python-build-standalone   (PSF)
+  - PyTorch and torchvision (the deep-learning runtime; this is the bulk, ~3-10 GB)
+        from download.pytorch.org / PyPI         (BSD-3-Clause)
+  - ComfyUI, the image-generation engine, cloned on the first job
+        from github.com/comfyanonymous/ComfyUI   (GPL-3.0)
+  - The comfyui_controlnet_aux and ComfyQR ComfyUI custom nodes, cloned on the first job
+        from github.com (their respective licenses)
+  - git itself, ONLY if you do not already have it: an existing git on your PATH is always preferred
+    and used as-is. If none is found, on Windows a portable MinGit is downloaded
+        from github.com/git-for-windows/git      (GPLv2); on Linux/macOS you are asked to install git.
+  - The AI models you choose, later, from the dashboard
+        from CivitAI / Hugging Face              (each model has its own license; many use the
+                                                  CreativeML OpenRAIL license, review before use)
+
+Disk space: the environment alone is roughly 10-15 GB on a GPU install (3-5 GB CPU-only). The AI models
+you pick are separate and much larger (tens to hundreds of GB). Everything stays on the drive you install
+to.
+
+Source code, full third-party license texts, and documentation:
+  https://github.com/Haidra-Org/horde-worker-reGen
+  THIRD-PARTY-NOTICES.md (bundled alongside this file)

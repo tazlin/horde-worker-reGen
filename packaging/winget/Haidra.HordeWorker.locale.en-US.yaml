@@ -8,6 +8,7 @@ PackageName: AI Horde Worker
 PackageUrl: https://github.com/Haidra-Org/horde-worker-reGen
 License: AGPL-3.0
 LicenseUrl: https://github.com/Haidra-Org/horde-worker-reGen/blob/main/LICENSE
+Copyright: Copyright (c) Haidra-Org contributors
 ShortDescription: Share your GPU with the AI Horde to generate images and earn kudos.
 Description: >-
   A worker for the AI Horde, the free and open crowdsourced image-generation network. Run `horde-worker`
@@ -19,5 +20,15 @@ Tags:
   - image-generation
   - gpu
   - ai-horde
+Agreements:
+  - AgreementLabel: Components downloaded on first run
+    Agreement: >-
+      On first run this worker downloads, into its install folder, a private Python runtime and uv
+      (Astral), PyTorch and torchvision (download.pytorch.org / PyPI, BSD-3-Clause), and ComfyUI plus a
+      couple of custom nodes (cloned from GitHub; ComfyUI is GPL-3.0). It uses an existing git if present
+      and otherwise fetches a portable MinGit (git-for-windows, GPLv2). AI models you choose are
+      downloaded later from CivitAI / Hugging Face under their own licenses. See INSTALL_NOTICE.txt and
+      THIRD-PARTY-NOTICES.md in the install folder.
+    AgreementUrl: https://github.com/Haidra-Org/horde-worker-reGen/blob/main/THIRD-PARTY-NOTICES.md
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0

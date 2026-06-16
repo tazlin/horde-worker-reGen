@@ -6,6 +6,10 @@
 pyproject.toml
 uv.lock
 LICENSE
+# Install-time disclosure shown by every front-end: the plain-language notice (also the .exe's Info page)
+# and the aggregated third-party license notices (also the .exe's License page).
+INSTALL_NOTICE.txt
+THIRD-PARTY-NOTICES.md
 README.md
 README_advanced.md
 bridgeData_template.yaml

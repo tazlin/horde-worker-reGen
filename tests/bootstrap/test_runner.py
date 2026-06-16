@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,17 @@ def test_build_child_env_respects_preset(monkeypatch: pytest.MonkeyPatch, tmp_pa
     """A caller-set UV_CACHE_DIR is preserved (power users can redirect the cache)."""
     monkeypatch.setenv("UV_CACHE_DIR", "C:/shared/uvcache")
     assert runner.build_child_env(tmp_path)["UV_CACHE_DIR"] == "C:/shared/uvcache"
+
+
+def test_build_child_env_prepends_bundled_git(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A provisioned bundled git is put first on PATH so hordelib's child `git` clone resolves to it."""
+    monkeypatch.setenv("PATH", "/existing/path")
+    assert str(paths.git_cmd_dir(tmp_path)) not in runner.build_child_env(tmp_path)["PATH"]
+
+    paths.git_cmd_dir(tmp_path).mkdir(parents=True)
+    path = runner.build_child_env(tmp_path)["PATH"]
+    assert path.split(os.pathsep)[0] == str(paths.git_cmd_dir(tmp_path))
+    assert "/existing/path" in path
 
 
 class _FakeCompleted:

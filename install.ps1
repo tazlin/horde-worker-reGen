@@ -2,14 +2,19 @@
 #
 #   irm https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.ps1 | iex
 #
-# Downloads the latest release, then hands off to the bundled runtime.cmd, which installs uv and runs the
-# Python bootstrap (GPU detection, dependency sync, config seeding, launch). No pre-installed Python or git
-# needed. Re-running it updates in place.
+# Downloads the latest release, shows a notice of what will be installed and from where, asks for
+# confirmation, then hands off to the bundled runtime.cmd, which installs uv and runs the Python bootstrap
+# (GPU detection, dependency sync, config seeding, launch). It provides its own private Python; for git it
+# uses an existing git if you have one, and otherwise fetches a portable git on Windows. Re-running it
+# updates in place.
 #
 # Options come from environment variables (so they work with the irm | iex form):
-#   $env:HORDE_WORKER_DIR        install location (default: .\HordeWorker in the current directory)
-#   $env:HORDE_WORKER_BACKEND    cu126 | cu130 | cu132 | cpu (default: detected from the GPU driver)
-#   $env:HORDE_WORKER_NO_LAUNCH  set to skip auto-launching the dashboard after install
+#   $env:HORDE_WORKER_DIR         install location (default: .\HordeWorker in the current directory)
+#   $env:HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | cpu (default: detected from the GPU driver)
+#   $env:HORDE_WORKER_ASSUME_YES  accept the install notice without prompting (required when non-interactive)
+#   $env:HORDE_WORKER_SHORTCUTS   create Desktop/Start Menu shortcuts without prompting
+#   $env:HORDE_WORKER_NO_SHORTCUTS skip shortcut creation entirely
+#   $env:HORDE_WORKER_NO_LAUNCH   set to skip auto-launching the dashboard after install
 
 #Requires -Version 5.1
 $ErrorActionPreference = "Stop"
@@ -26,6 +31,13 @@ function Get-Option([string]$Name, [string]$Default) {
     $value = [Environment]::GetEnvironmentVariable($Name)
     if ($value) { return $value }
     return $Default
+}
+
+function Read-YesNo([string]$Prompt, [bool]$DefaultYes = $false) {
+    $suffix = if ($DefaultYes) { "[Y/n]" } else { "[y/N]" }
+    $answer = (Read-Host "$Prompt $suffix").Trim().ToLower()
+    if (-not $answer) { return $DefaultYes }
+    return ($answer -eq "y" -or $answer -eq "yes")
 }
 
 function New-Shortcut([string]$LinkPath, [string]$TargetPath, [string]$WorkingDir) {
@@ -78,13 +90,34 @@ Write-Host "Extracting..."
 Expand-ReleaseZip -ZipPath $tmpZip -Destination $InstallDir
 Remove-Item $tmpZip -Force
 
+# Show what is about to be installed (and from where) and get consent before any heavy download. We do it
+# here, where the user is at a console, then pass HORDE_WORKER_ASSUME_YES so the bootstrap does not prompt
+# again. Honour a pre-set HORDE_WORKER_ASSUME_YES for unattended installs.
+$noticePath = Join-Path $InstallDir "INSTALL_NOTICE.txt"
+if (Test-Path $noticePath) {
+    Write-Host ""
+    Get-Content $noticePath | ForEach-Object { Write-Host $_ }
+    Write-Host ""
+}
+if (-not (Get-Option "HORDE_WORKER_ASSUME_YES" "")) {
+    if ([Environment]::UserInteractive) {
+        if (-not (Read-YesNo "Proceed with installation?")) {
+            Write-Host "Installation cancelled. The downloaded files are in $InstallDir; delete that folder to remove them."
+            exit 1
+        }
+        $env:HORDE_WORKER_ASSUME_YES = "1"
+    } else {
+        Write-Error "This is a non-interactive session, so it cannot ask you to accept the notice above. Re-run with `$env:HORDE_WORKER_ASSUME_YES='1' to accept it, or use the graphical installer (HordeWorker-Setup.exe)."
+        exit 1
+    }
+}
+
 # Everything else (install uv, detect the GPU, seed bridgeData.yaml, sync dependencies) is the bootstrap's
 # job now, so the exact same logic runs for the one-liner, the graphical installer and winget. runtime.cmd
 # installs uv via in-box curl/tar (no fragile nested PowerShell) and then runs bootstrap.py. We pass
 # --no-launch and start the dashboard ourselves below, after creating shortcuts. A pre-set
 # $env:HORDE_WORKER_BACKEND still overrides detection (e.g. 'cpu' to opt into a CPU-only AMD install).
 Write-Host "Setting up the environment. The first run downloads Python and PyTorch and can take several minutes..."
-$env:HORDE_WORKER_NONINTERACTIVE = "1"
 & (Join-Path $InstallDir "runtime.cmd") install --no-launch
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Environment setup failed (see the output above). Deleting the .venv folder and re-running often helps."
@@ -100,14 +133,21 @@ Write-Host ""
 Write-Host "Installation complete." -ForegroundColor Green
 Write-Host "Installed at: $InstallDir"
 
-# Create shortcuts so reopening the dashboard later is one click. Per-user only, opt-out via
-# HORDE_WORKER_NO_SHORTCUTS; best-effort.
+# Shortcuts are opt-in (conservative default): we ask, defaulting to No. HORDE_WORKER_SHORTCUTS creates
+# them without asking (for unattended installs); HORDE_WORKER_NO_SHORTCUTS skips entirely. Per-user only,
+# best-effort.
 $launcher = Join-Path $InstallDir "horde-worker.cmd"
 $madeShortcut = $false
+$wantShortcuts = $false
 if (Get-Option "HORDE_WORKER_NO_SHORTCUTS" "") {
     Write-Host "Skipping shortcut creation (HORDE_WORKER_NO_SHORTCUTS is set)."
-} else {
-    Write-Host "Creating 'AI Horde Worker' shortcuts (Desktop + Start Menu; set HORDE_WORKER_NO_SHORTCUTS to skip)..."
+} elseif (Get-Option "HORDE_WORKER_SHORTCUTS" "") {
+    $wantShortcuts = $true
+} elseif ([Environment]::UserInteractive) {
+    $wantShortcuts = Read-YesNo "Create 'AI Horde Worker' shortcuts on your Desktop and Start Menu?"
+}
+if ($wantShortcuts) {
+    Write-Host "Creating 'AI Horde Worker' shortcuts (Desktop + Start Menu)..."
     foreach ($shortcutDir in @([Environment]::GetFolderPath("Programs"), [Environment]::GetFolderPath("Desktop"))) {
         if (-not $shortcutDir) { continue }
         try {

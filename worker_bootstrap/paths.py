@@ -34,6 +34,30 @@ def backend_file(root: Path | None = None) -> Path:
     return bin_dir(root) / "backend"
 
 
+def consent_marker(root: Path | None = None) -> Path:
+    """Return the marker that records install consent was captured (``bin/install-consent``).
+
+    Lives under ``bin/`` so the uninstaller removes it (a reinstall then re-asks), and so the .exe's
+    deferred first-launch sync and later dependency updates do not re-prompt once consent is recorded.
+    """
+    return bin_dir(root) / "install-consent"
+
+
+def git_dir(root: Path | None = None) -> Path:
+    """Return where a bundled portable git (MinGit, Windows fallback) is unpacked (``bin/git``)."""
+    return bin_dir(root) / "git"
+
+
+def git_cmd_dir(root: Path | None = None) -> Path:
+    """Return the bundled git's ``cmd/`` directory (holds ``git.exe``), to prepend to a child PATH."""
+    return git_dir(root) / "cmd"
+
+
+def install_notice(root: Path | None = None) -> Path:
+    """Return the bundled plain-language install notice (``INSTALL_NOTICE.txt``)."""
+    return (root or install_root()) / "INSTALL_NOTICE.txt"
+
+
 def venv_dir(root: Path | None = None) -> Path:
     """Return the project virtual environment directory (``.venv``)."""
     return (root or install_root()) / ".venv"

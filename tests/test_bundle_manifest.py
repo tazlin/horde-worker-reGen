@@ -78,3 +78,17 @@ def test_inno_installer_sources_the_staging() -> None:
     text = iss.read_text(encoding="utf-8")
     assert "{#StageDir}" in text, "HordeWorker.iss should source files from the {#StageDir} staging directory"
     assert "detect-backend.ps1" in text, "HordeWorker.iss should ship/extract detect-backend.ps1"
+
+
+def test_disclosure_notices_are_bundled() -> None:
+    """Both disclosure files must ship so every front-end can show the same notice and licenses."""
+    entries = _manifest_entries()
+    assert "INSTALL_NOTICE.txt" in entries, "INSTALL_NOTICE.txt must be bundled"
+    assert "THIRD-PARTY-NOTICES.md" in entries, "THIRD-PARTY-NOTICES.md must be bundled"
+
+
+def test_inno_installer_shows_disclosure_pages() -> None:
+    """The graphical installer must surface the notice (Info page) and licenses (License page)."""
+    text = (REPO_ROOT / "packaging" / "inno" / "HordeWorker.iss").read_text(encoding="utf-8")
+    assert "InfoBeforeFile" in text and "INSTALL_NOTICE.txt" in text, "the .exe must show INSTALL_NOTICE.txt"
+    assert "LicenseFile" in text and "THIRD-PARTY-NOTICES.md" in text, "the .exe must show the license notices"

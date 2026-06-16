@@ -41,8 +41,8 @@
 
 .PARAMETER SmokeTest
   After building, install the .exe silently into a temp folder, verify it, then uninstall.
-  Briefly creates a Start Menu shortcut (removed on uninstall). Cannot be combined with
-  -SkipInstaller.
+  Shortcuts are opt-in (unchecked tasks), so a silent install creates none. Cannot be combined
+  with -SkipInstaller.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File packaging\build-local.ps1
@@ -123,8 +123,9 @@ function Invoke-SmokeTest {
     $expected = @(
         'horde-worker.cmd', 'runtime.cmd', 'update-runtime.cmd',
         'bridgeData.yaml', 'detect-backend.ps1',
+        'INSTALL_NOTICE.txt', 'THIRD-PARTY-NOTICES.md',
         'bootstrap.py', 'worker_bootstrap\cli.py',
-        'horde_worker_regen', 'unins000.exe', 'bin\backend'
+        'horde_worker_regen', 'unins000.exe', 'bin\backend', 'bin\install-consent'
     )
     foreach ($item in $expected) {
         if (-not (Test-Path (Join-Path $target $item))) { throw "Expected installed item missing: $item" }

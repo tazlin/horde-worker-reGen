@@ -3,14 +3,18 @@
 #
 #   curl -LsSf https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.sh | sh
 #
-# Downloads the latest release, then hands off to the bundled runtime.sh, which installs uv and runs the
-# Python bootstrap (GPU detection, dependency sync, config seeding, launch). No pre-installed Python or git
-# needed. Re-running it updates in place.
+# Downloads the latest release, shows a notice of what will be installed and from where, asks for
+# confirmation, then hands off to the bundled runtime.sh, which installs uv and runs the Python bootstrap
+# (GPU detection, dependency sync, config seeding, launch). It provides its own private Python; git must
+# already be installed (on Linux/macOS it is a one-line package install). Re-running it updates in place.
 #
 # Options (environment variables, so they work with the curl | sh form):
-#   HORDE_WORKER_DIR        install location (default: ./horde-worker in the current directory)
-#   HORDE_WORKER_BACKEND    cu126 | cu130 | cu132 | rocm | cpu (default: detected from the GPU/driver)
-#   HORDE_WORKER_NO_LAUNCH  set to skip auto-launching the dashboard after install
+#   HORDE_WORKER_DIR         install location (default: ./horde-worker in the current directory)
+#   HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | rocm | cpu (default: detected from the GPU/driver)
+#   HORDE_WORKER_ASSUME_YES  accept the install notice without prompting (required when piped, no terminal)
+#   HORDE_WORKER_SHORTCUTS   create the applications-menu entry without prompting
+#   HORDE_WORKER_NO_SHORTCUTS skip the applications-menu entry entirely
+#   HORDE_WORKER_NO_LAUNCH   set to skip auto-launching the dashboard after install
 set -eu
 
 OWNER="tazlin"
@@ -60,12 +64,37 @@ if ! chmod +x ./*.sh 2>/dev/null; then
     echo "      run:  chmod +x \"$INSTALL_DIR\"/*.sh" >&2
 fi
 
+# Show what is about to be installed (and from where) and get consent before any heavy download. Under
+# `curl | sh` our stdin is the piped script, so we read the answer from the controlling terminal
+# (/dev/tty); when there is none (true headless), require HORDE_WORKER_ASSUME_YES instead of guessing.
+if [ -f "$INSTALL_DIR/INSTALL_NOTICE.txt" ]; then
+    echo ""
+    cat "$INSTALL_DIR/INSTALL_NOTICE.txt"
+    echo ""
+fi
+if [ -z "${HORDE_WORKER_ASSUME_YES:-}" ]; then
+    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+        printf 'Proceed with installation? [y/N] ' > /dev/tty
+        reply=""
+        read -r reply < /dev/tty || reply=""
+        case "$reply" in
+            [Yy]|[Yy][Ee][Ss]) ;;
+            *) echo "Installation cancelled. The downloaded files are in $INSTALL_DIR; delete that folder to remove them."; exit 1 ;;
+        esac
+        export HORDE_WORKER_ASSUME_YES=1
+    else
+        echo "ERROR: no interactive terminal to accept the notice above (stdin is the piped script)." >&2
+        echo "       Re-run accepting it explicitly, e.g.:" >&2
+        echo "         curl -LsSf https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.sh | HORDE_WORKER_ASSUME_YES=1 sh" >&2
+        exit 1
+    fi
+fi
+
 # Everything else (install uv, detect the GPU, seed bridgeData.yaml, sync dependencies) is the bootstrap's
 # job now, so the one-liner, the regular launchers and every platform run identical logic. runtime.sh
 # installs uv and runs bootstrap.py. --no-launch: we start the dashboard ourselves below. A pre-set
 # HORDE_WORKER_BACKEND still overrides detection (e.g. 'cpu', or 'rocm' for AMD on Linux).
 echo "Setting up the environment. The first run downloads Python and PyTorch and can take several minutes..."
-export HORDE_WORKER_NONINTERACTIVE=1
 if ! ./runtime.sh install --no-launch; then
     echo "" >&2
     echo "ERROR: environment setup failed (see the output above). Deleting .venv and re-running often helps." >&2
@@ -80,11 +109,21 @@ fi
 echo ""
 echo "Installation complete (installed at $INSTALL_DIR)."
 
-# Per-user application-menu entry so the dashboard is easy to reopen later. Never system-wide; opt out
-# with HORDE_WORKER_NO_SHORTCUTS. Best-effort either way.
+# Per-user application-menu entry so the dashboard is easy to reopen later. Opt-in (conservative default):
+# we ask, defaulting to No. HORDE_WORKER_SHORTCUTS adds it without asking; HORDE_WORKER_NO_SHORTCUTS skips
+# it. Never system-wide; best-effort.
+make_shortcut=""
 if [ -n "${HORDE_WORKER_NO_SHORTCUTS:-}" ]; then
     echo "Skipping the app-menu entry (HORDE_WORKER_NO_SHORTCUTS is set)."
-else
+elif [ -n "${HORDE_WORKER_SHORTCUTS:-}" ]; then
+    make_shortcut=1
+elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf "Add an 'AI Horde Worker' entry to your applications menu? [y/N] " > /dev/tty
+    reply=""
+    read -r reply < /dev/tty || reply=""
+    case "$reply" in [Yy]|[Yy][Ee][Ss]) make_shortcut=1 ;; esac
+fi
+if [ -n "$make_shortcut" ]; then
     apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     desktop_file="$apps_dir/ai-horde-worker.desktop"
     if mkdir -p "$apps_dir" 2>/dev/null && printf '%s\n' \
