@@ -517,6 +517,13 @@ class InferenceScheduler:
         process_with_model = next_job_and_process.process_with_model
         next_job = next_job_and_process.next_job
 
+        degraded_dispatch = self._job_tracker.is_degraded_dispatch_pending(next_job)
+        if degraded_dispatch and len(self._job_tracker.jobs_in_progress) > 0:
+            # A degraded retry (after a resource/OOM failure) runs in isolation to minimise VRAM
+            # pressure: defer it until no other job is sampling. It keeps its head-of-queue position, so
+            # it dispatches as soon as the in-flight jobs drain rather than being starved.
+            return False
+
         if next_job_and_process.line_skip is not None:
             logger.info(
                 f"Job {next_job_and_process.next_job.id_} skipped the line and will be run on process "
@@ -538,6 +545,11 @@ class InferenceScheduler:
             )
 
         if bridge_data.unload_models_from_vram_often:
+            self.unload_models_from_vram(process_with_model)
+
+        if degraded_dispatch:
+            # Reclaim VRAM from idle slots before the degraded retry so the job has the best chance to
+            # fit, independent of the unload_models_from_vram_often setting.
             self.unload_models_from_vram(process_with_model)
 
         color_format_string = "<fg #f0beff>{message}</>"
@@ -624,6 +636,20 @@ class InferenceScheduler:
             expected_seconds = self._expected_sampling_seconds(next_job, horde_model_baseline)
             if expected_seconds is not None:
                 dispatch_detail["expected_sampling_seconds"] = round(expected_seconds, 2)
+
+            # Stamp the in-flight timing onto the slot so the graded-slowdown monitor can measure this
+            # job against its expected sampling time; the level resets so notices escalate per dispatch.
+            process_with_model.current_inference_started_at = time.time()
+            process_with_model.current_job_expected_sampling_seconds = expected_seconds
+            process_with_model.current_job_slowdown_level = 0
+
+            if degraded_dispatch:
+                self._job_tracker.clear_degraded_dispatch(next_job)
+                dispatch_detail["degraded_retry"] = True
+                logger.warning(
+                    f"  Degraded, isolated retry dispatched for job {str(next_job.id_)[:8]} "
+                    "after a prior resource failure.",
+                )
 
             self._process_lifecycle.action_ledger.record(
                 LedgerEventType.INFERENCE_DISPATCHED,

@@ -75,6 +75,22 @@ class HordeProcessInfo:
 
     last_job_referenced: ImageGenerateJobPopResponse | None
 
+    current_inference_started_at: float | None
+    """Epoch time inference was dispatched to this slot for its current job, or None when not inferring.
+
+    Set by the scheduler at dispatch and cleared when a result (or fault) arrives, so the graded-slowdown
+    monitor can measure how long the slot has actually been sampling against the expected sampling time."""
+    current_job_expected_sampling_seconds: float | None
+    """The performance model's expected sampling seconds for the slot's current job, or None when unknown.
+
+    Travels with the slot from dispatch so the watchdog can grade "slower than expected" without itself
+    needing the performance model. None on a cold start (no seed/calibration yet) suppresses grading."""
+    current_job_slowdown_level: int
+    """Highest slowdown rung already logged for the current job (0 none, 1 notice, 2 warn).
+
+    Reset to 0 at each dispatch so the graded-slowdown monitor escalates a job's notices at most once
+    per rung instead of every watchdog tick."""
+
     ram_usage_bytes: int
     """The amount of RAM used by this process."""
     vram_usage_mb: int
@@ -157,6 +173,9 @@ class HordeProcessInfo:
         self.last_heartbeat_percent_complete = None
 
         self.last_job_referenced = None
+        self.current_inference_started_at = None
+        self.current_job_expected_sampling_seconds = None
+        self.current_job_slowdown_level = 0
 
         self.ram_usage_bytes = 0
         self.vram_usage_mb = 0

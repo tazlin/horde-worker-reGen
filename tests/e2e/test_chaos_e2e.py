@@ -25,10 +25,20 @@ _WEDGE_TIMEOUT_SECONDS = 15.0
 # so a hang probe must allow detection + recovery + the remaining jobs to finish well past it.
 _HANG_DETECT_TIMEOUT_SECONDS = 45.0
 
+# A deterministic crash-on-start is only recoverable by the save-our-ship escalation: the crash-loop
+# breaker must quarantine the pool (several process re-spawns), the supervisor attempts a soft reset,
+# then gives up and abandons ship. Each step is bounded by real process-spawn cost (notably slow on
+# Windows), so this allows generous headroom over the observed ~20-30s rather than a tight wedge bound.
+_SAVE_OUR_SHIP_TIMEOUT_SECONDS = 60.0
+
 
 @pytest.mark.e2e
-async def test_oom_fault_is_reported_and_pipeline_continues() -> None:
-    """A job that reports an out-of-memory fault must be submitted as faulted, not lost, and the rest flow."""
+async def test_oom_fault_is_retried_and_pipeline_continues() -> None:
+    """A one-off out-of-memory fault must be given a degraded retry (not lost) and the pipeline must flow.
+
+    With bounded retry enabled (the default), a transient OOM is requeued for a degraded, isolated retry
+    rather than reported faulted on the first failure; the job recovers and every job is accounted for.
+    """
     scenario = make_simple_scenario(4)
     result = await run_harness_async(
         HarnessConfig(
@@ -43,12 +53,37 @@ async def test_oom_fault_is_reported_and_pipeline_continues() -> None:
     assert not result.timed_out, result.failure_summary()
     assert result.all_jobs_accounted_for
     assert result.audit_failures == []
+
+
+@pytest.mark.e2e
+async def test_oom_fault_is_reported_faulted_when_retry_disabled() -> None:
+    """With retry disabled, an out-of-memory fault is reported faulted (not lost) on the first failure."""
+    scenario = make_simple_scenario(4)
+    result = await run_harness_async(
+        HarnessConfig(
+            scenario=scenario,
+            process_mode="fake",
+            skip_api=True,
+            timeout_seconds=60.0,
+            inference_fault_profile=FaultProfile(oom_on_job_n=2),
+            bridge_data_overrides={"max_inference_attempts": 1},
+        ),
+    )
+
+    assert not result.timed_out, result.failure_summary()
+    assert result.all_jobs_accounted_for
+    assert result.audit_failures == []
     assert result.num_jobs_submitted_faulted >= 1
 
 
 @pytest.mark.e2e
 async def test_midjob_crash_recovers_and_keeps_serving() -> None:
-    """A child that crashes mid-inference must be reaped and replaced, faulting only its in-flight job."""
+    """A child that crashes mid-inference must be reaped and replaced, faulting only its in-flight job.
+
+    Retry is disabled here to isolate what this probe asserts: the *watchdog's* crash detection and slot
+    replacement. The crash-then-retry-to-completion path is covered by
+    ``test_midjob_crash_is_retried_to_completion``.
+    """
     scenario = make_simple_scenario(4)
     result = await run_harness_async(
         HarnessConfig(
@@ -58,12 +93,39 @@ async def test_midjob_crash_recovers_and_keeps_serving() -> None:
             timeout_seconds=_WEDGE_TIMEOUT_SECONDS,
             job_delay_seconds=0.05,
             inference_fault_profile=FaultProfile(crash_on_job_n=2),
+            bridge_data_overrides={"max_inference_attempts": 1},
         ),
     )
 
     assert not result.timed_out, result.failure_summary()
     assert result.all_jobs_accounted_for
     assert result.audit_failures == []
+
+
+@pytest.mark.e2e
+async def test_midjob_crash_is_retried_to_completion() -> None:
+    """With bounded retry, a job whose slot crashed mid-inference is requeued and completes, not faulted.
+
+    Each fresh slot the fake scripts crashes on its own second job, so recovering all four jobs takes a
+    few replace-and-retry cycles; the generous budget allows for those process re-spawns and model
+    re-preloads. The point is that nothing is lost or faulted: the crashed work is retried to success.
+    """
+    scenario = make_simple_scenario(4)
+    result = await run_harness_async(
+        HarnessConfig(
+            scenario=scenario,
+            process_mode="fake",
+            skip_api=True,
+            timeout_seconds=50.0,
+            job_delay_seconds=0.05,
+            inference_fault_profile=FaultProfile(crash_on_job_n=2),
+        ),
+    )
+
+    assert not result.timed_out, result.failure_summary()
+    assert result.all_jobs_accounted_for
+    assert result.audit_failures == []
+    assert result.num_jobs_submitted_faulted == 0
 
 
 @pytest.mark.e2e
@@ -104,21 +166,20 @@ async def test_stale_launch_duplicate_result_is_ignored() -> None:
 
 
 @pytest.mark.e2e
-@pytest.mark.xfail(
-    reason="A crash-loop breaker now quarantines the perpetually-crashing slot, but "
-    "with no inference capacity left the worker has nothing to recover to and the run still times out. "
-    "Closing this needs the save-our-ship / limp-by fallback (give up the unservable jobs cleanly).",
-    strict=False,
-)
 async def test_inference_crash_on_start_is_circuit_broken() -> None:
-    """A permanently-failing inference start must be quarantined so the worker does not wedge."""
+    """A permanently-failing inference start must be circuit-broken and abandoned, not left to wedge.
+
+    The crash-loop breaker quarantines the slot, the recovery supervisor attempts a soft reset, and when
+    that cannot restore a working pool it abandons ship cleanly (the last resort) so the worker stops
+    instead of spinning forever.
+    """
     scenario = make_simple_scenario(2)
     result = await run_harness_async(
         HarnessConfig(
             scenario=scenario,
             process_mode="fake",
             skip_api=True,
-            timeout_seconds=_WEDGE_TIMEOUT_SECONDS,
+            timeout_seconds=_SAVE_OUR_SHIP_TIMEOUT_SECONDS,
             inference_fault_profile=FaultProfile(crash_on_start=True),
         ),
     )
@@ -127,21 +188,20 @@ async def test_inference_crash_on_start_is_circuit_broken() -> None:
 
 
 @pytest.mark.e2e
-@pytest.mark.xfail(
-    reason="A safety process that fails on every start wedges all image jobs in safety. The "
-    "crash-loop breaker covers inference slots, not the safety pool; recovering this needs the "
-    "save-our-ship / limp-by fallback.",
-    strict=False,
-)
 async def test_safety_crash_on_start_does_not_wedge_image_jobs() -> None:
-    """Image jobs must not be wedged forever by a safety process that crashes on every start."""
+    """A safety process that crashes on every start must not wedge the worker forever.
+
+    The safety pool is rebuilt on each crash (including a crash during startup, before it ever loads);
+    once it has crash-looped past its threshold the recovery supervisor recognizes the pool as failing
+    and abandons ship cleanly rather than holding jobs in safety indefinitely.
+    """
     scenario = make_simple_scenario(2)
     result = await run_harness_async(
         HarnessConfig(
             scenario=scenario,
             process_mode="fake",
             skip_api=True,
-            timeout_seconds=_WEDGE_TIMEOUT_SECONDS,
+            timeout_seconds=_SAVE_OUR_SHIP_TIMEOUT_SECONDS,
             safety_fault_profile=FaultProfile(crash_on_start=True),
         ),
     )
@@ -151,7 +211,12 @@ async def test_safety_crash_on_start_does_not_wedge_image_jobs() -> None:
 
 @pytest.mark.e2e
 async def test_hang_at_zero_percent_is_recovered() -> None:
-    """A child that accepts a job then wedges before its first step must be detected and replaced."""
+    """A child that accepts a job then wedges before its first step must be detected and replaced.
+
+    Retry is disabled so this probe isolates hang *detection and recovery*: re-feeding a job to a slot
+    that wedges on every second job would just incur another full ``inference_step_timeout`` of silence
+    per attempt, which is the retry policy's concern, not the watchdog's.
+    """
     scenario = make_simple_scenario(3)
     result = await run_harness_async(
         HarnessConfig(
@@ -160,6 +225,7 @@ async def test_hang_at_zero_percent_is_recovered() -> None:
             skip_api=True,
             timeout_seconds=_HANG_DETECT_TIMEOUT_SECONDS,
             inference_fault_profile=FaultProfile(hang_after_n_jobs=1),
+            bridge_data_overrides={"max_inference_attempts": 1},
         ),
     )
 

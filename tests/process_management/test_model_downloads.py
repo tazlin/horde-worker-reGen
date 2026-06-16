@@ -7,6 +7,7 @@ import queue
 import time
 from unittest.mock import Mock
 
+from horde_worker_regen.process_management.action_ledger import ActionLedger
 from horde_worker_regen.process_management.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.process_management.fake_worker_processes import FakeDownloadProcess
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
@@ -274,6 +275,7 @@ class TestDispatcherRoutesDownloadMessages:
             process_message_queue=message_queue,  # type: ignore[arg-type]
             runtime_config=make_test_runtime_config(),
             model_metadata=make_test_model_metadata(),
+            action_ledger=ActionLedger(),
             on_unload_vram=_noop_unload,  # type: ignore[arg-type]
             state=WorkerState(),
         )

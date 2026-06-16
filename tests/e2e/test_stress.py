@@ -40,7 +40,12 @@ async def test_mixed_models_force_model_swaps() -> None:
 
 @pytest.mark.e2e
 async def test_fault_injection_keeps_pipeline_flowing() -> None:
-    """Periodic inference faults must be reported and must not lose or wedge other jobs."""
+    """Periodic inference faults must be reported and must not lose or wedge other jobs.
+
+    Retry is disabled so this asserts the report-as-fault path directly (a fault that cannot be
+    recovered is still submitted, not lost). The recover-via-retry path is covered separately by
+    ``test_chaos_e2e``'s OOM and crash retry probes.
+    """
     scenario = make_simple_scenario(6)
     result = await run_harness_async(
         HarnessConfig(
@@ -49,6 +54,7 @@ async def test_fault_injection_keeps_pipeline_flowing() -> None:
             skip_api=True,
             timeout_seconds=90.0,
             fail_every_n=3,
+            bridge_data_overrides={"max_inference_attempts": 1},
         ),
     )
 

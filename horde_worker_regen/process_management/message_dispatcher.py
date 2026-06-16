@@ -10,9 +10,12 @@ from horde_sdk.ai_horde_api.apimodels import GenMetadataEntry
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from loguru import logger
 
+from horde_worker_regen.process_management.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.download_process import DOWNLOAD_PROCESS_ID
+from horde_worker_regen.process_management.failure_classification import is_resource_failure
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.job_tracker import JobTracker
+from horde_worker_regen.process_management.job_models import HordeJobInfo
+from horde_worker_regen.process_management.job_tracker import InferenceFailureResolution, JobTracker
 from horde_worker_regen.process_management.messages import (
     HordeAlchemyResultMessage,
     HordeAuxModelStateChangeMessage,
@@ -54,6 +57,7 @@ class MessageDispatcher:
 
     _runtime_config: RuntimeConfig
     _model_metadata: ModelMetadata
+    _action_ledger: ActionLedger
     _on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]]
     _on_alchemy_result: Callable[[HordeAlchemyResultMessage], None] | None = None
     _on_job_metrics: Callable[[HordeJobMetricsMessage], None] | None = None
@@ -76,6 +80,7 @@ class MessageDispatcher:
         process_message_queue: Queue,  # type: ignore[type-arg]
         runtime_config: RuntimeConfig,
         model_metadata: ModelMetadata,
+        action_ledger: ActionLedger,
         on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]],
         state: WorkerState,
     ) -> None:
@@ -88,6 +93,8 @@ class MessageDispatcher:
             process_message_queue (Queue): The queue from which to receive messages from child processes.
             runtime_config (RuntimeConfig): Holds the current bridge configuration snapshot.
             model_metadata (ModelMetadata): Provides lookups against the stable-diffusion model reference.
+            action_ledger (ActionLedger): The shared lifecycle audit ledger; inference retries and terminal
+                faults are recorded here so a job's failure history is self-explaining in a post-mortem.
             on_unload_vram (Callable[[HordeProcessInfo], None]): A callback to invoke when a process reports that it
                 has unloaded a model from VRAM. This is used to trigger the unloading of the model from any other
                 processes that have it loaded, if the current bridge configuration requires aggressive VRAM management.
@@ -100,6 +107,7 @@ class MessageDispatcher:
         self._process_message_queue = process_message_queue
         self._runtime_config = runtime_config
         self._model_metadata = model_metadata
+        self._action_ledger = action_ledger
         self._on_unload_vram = on_unload_vram
         self._state = state
 
@@ -403,6 +411,18 @@ class MessageDispatcher:
                 await self._job_tracker.drop_pending_inference(message.sdk_api_job_info)
             return
 
+        # A result (success or fault) means the slot is no longer sampling this job, so retire its
+        # in-flight timestamps before the graded-slowdown monitor can read them against a finished job.
+        if message.process_id in self._process_map:
+            self._process_map[message.process_id].current_inference_started_at = None
+            self._process_map[message.process_id].current_job_expected_sampling_seconds = None
+
+        # Faults are resolved before the success bookkeeping: a retryable failure is requeued (and must
+        # not be counted as completed), and the retry brain owns the stage move for both outcomes.
+        if message.state == GENERATION_STATE.faulted:
+            await self._handle_faulted_inference_result(message, job_info)
+            return
+
         if not await self._job_tracker.release_in_progress(message.sdk_api_job_info):
             logger.error(
                 f"Job {message.sdk_api_job_info.id_} not found in jobs_in_progress. "
@@ -435,24 +455,71 @@ class MessageDispatcher:
         else:
             logger.info(f"Inference finished for job {message.sdk_api_job_info.id_}")
             logger.debug(f"Job didn't include time_elapsed: {message.sdk_api_job_info}")
-        if message.state != GENERATION_STATE.faulted:
-            job_info.state = message.state
-            job_info.time_to_generate = message.time_elapsed
-            job_info.job_image_results = message.job_image_results
 
-            jobs_completed_counter.add(1)
-            await self._job_tracker.queue_for_safety(job_info)
-        else:
-            jobs_faulted_counter.add(1)
-            logger.error(
-                f"Job {message.sdk_api_job_info.id_} faulted on process {message.process_id}: {message.info}",
+        job_info.state = message.state
+        job_info.time_to_generate = message.time_elapsed
+        job_info.job_image_results = message.job_image_results
+
+        jobs_completed_counter.add(1)
+        await self._job_tracker.queue_for_safety(job_info)
+
+    async def _handle_faulted_inference_result(
+        self,
+        message: HordeInferenceResultMessage,
+        job_info: HordeJobInfo,
+    ) -> None:
+        """Resolve a faulted inference result: requeue it for another attempt, or fault it terminally.
+
+        Routes through the job tracker's bounded/degraded retry policy. A resource (out-of-memory) failure,
+        recognized from the result's diagnostic ``info``, earns one degraded, isolated retry. On exhaustion
+        the tracker has already moved the job to ``PENDING_SUBMIT`` and counted it; here we only emit the
+        telemetry, audit, and VRAM cleanup the success path would otherwise have done.
+        """
+        resource_failure = is_resource_failure(message.info)
+        job_id = str(message.sdk_api_job_info.id_) if message.sdk_api_job_info.id_ is not None else None
+
+        resolution = await self._job_tracker.handle_job_fault(
+            message.sdk_api_job_info,
+            process_timeout=message.time_elapsed if message.time_elapsed is not None else 0.0,
+            is_resource_failure=resource_failure,
+            retryable=True,
+        )
+
+        if resolution is not InferenceFailureResolution.FAULTED:
+            degraded = resolution is InferenceFailureResolution.RETRY_DEGRADED
+            self._action_ledger.record(
+                LedgerEventType.INFERENCE_RETRIED,
+                process_id=message.process_id,
+                job_id=job_id,
+                reason=message.info or "inference failed",
+                detail={"degraded": degraded, "resource_failure": resource_failure},
             )
-
-            logger.debug(
-                f"Job data: {message.sdk_api_job_info.model_dump(exclude=_excludes_for_job_dump)}",  # type: ignore
+            logger.warning(
+                f"Job {job_id} faulted on process {message.process_id} ({message.info}); requeued for "
+                f"{'a degraded, isolated' if degraded else 'another'} attempt.",
             )
+            return
 
-            await self._job_tracker.queue_for_submit(job_info)
+        # Terminal fault: the tracker has moved the job to PENDING_SUBMIT and counted it as terminal.
+        jobs_faulted_counter.add(1)
+        queue_depth_counter.add(-1)
+        bridge_data = self._runtime_config.bridge_data
+        if bridge_data.unload_models_from_vram_often and message.process_id in self._process_map:
+            await self._on_unload_vram(self._process_map[message.process_id])
+
+        self._action_ledger.record(
+            LedgerEventType.INFERENCE_FAULTED,
+            process_id=message.process_id,
+            job_id=job_id,
+            reason=message.info or "inference failed",
+            detail={"resource_failure": resource_failure},
+        )
+        logger.error(
+            f"Job {message.sdk_api_job_info.id_} faulted on process {message.process_id}: {message.info}",
+        )
+        logger.debug(
+            f"Job data: {message.sdk_api_job_info.model_dump(exclude=_excludes_for_job_dump)}",  # type: ignore
+        )
 
     async def _handle_safety_result(self, message: HordeSafetyResultMessage) -> None:
         """Handle a safety check result message."""

@@ -487,6 +487,11 @@ class HordeInferenceProcess(HordeProcess):
     _inference_slot_released: bool = False
 
     _last_job_inference_rate: str | None = None
+    _last_inference_error: str | None = None
+    """Summary of the exception that failed the current job's inference, or None if it succeeded.
+
+    Surfaced as the faulted result's ``info`` so the main process can both log a real reason (previously
+    a faulted result carried only the empty rate string) and classify a resource/OOM failure for retry."""
 
     def _release_inference_slot(self) -> None:
         """Release this job's sampling-concurrency slot, at most once per job.
@@ -647,6 +652,7 @@ class HordeInferenceProcess(HordeProcess):
         self._inference_slot_released = False
         self._vae_lock_was_acquired = False
         self._last_job_inference_rate = None
+        self._last_inference_error = None
 
         try:
             self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
@@ -675,7 +681,11 @@ class HordeInferenceProcess(HordeProcess):
                     ):
                         results = self._horde.basic_inference(job_info, progress_callback=self.progress_callback)
         except Exception as e:
-            logger.critical(f"Inference failed: {type(e).__name__} {e}")
+            # Keep a reason for the faulted result: the main process logs it and classifies a
+            # resource/OOM failure (which earns a degraded retry) from this text. The full message is
+            # preserved so torch's "CUDA out of memory" wording reaches the failure classifier intact.
+            self._last_inference_error = f"{type(e).__name__}: {e}"
+            logger.critical(f"Inference failed: {self._last_inference_error}")
             return None
         finally:
             self._is_busy = False
@@ -935,11 +945,19 @@ class HordeInferenceProcess(HordeProcess):
                     ),
                 )
 
+        is_faulted = results is None or len(results) == 0
+        # A faulted result's info doubles as the diagnostic + the resource-failure classification signal,
+        # so prefer the captured exception summary over the (empty, for a fault) inference-rate string.
+        if is_faulted and self._last_inference_error is not None:
+            info = self._last_inference_error
+        else:
+            info = self._last_job_inference_rate if self._last_job_inference_rate is not None else ""
+
         message = HordeInferenceResultMessage(
             process_id=self.process_id,
             process_launch_identifier=self.process_launch_identifier,
-            info=self._last_job_inference_rate if self._last_job_inference_rate is not None else "",
-            state=GENERATION_STATE.ok if results is not None and len(results) > 0 else GENERATION_STATE.faulted,
+            info=info,
+            state=GENERATION_STATE.faulted if is_faulted else GENERATION_STATE.ok,
             time_elapsed=time_elapsed,
             job_image_results=all_image_results,
             sdk_api_job_info=job_info,

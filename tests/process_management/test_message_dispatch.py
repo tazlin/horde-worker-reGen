@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.action_ledger import ActionLedger
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
@@ -64,6 +65,7 @@ def _make_dispatcher(
         process_message_queue=process_message_queue,
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         model_metadata=make_test_model_metadata(),
+        action_ledger=ActionLedger(),
         on_unload_vram=Mock(),
         state=state,
     )

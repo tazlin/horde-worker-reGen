@@ -213,6 +213,12 @@ class JobSubmitter:
                         ref=str(new_submit.gen_iter),
                     ),
                 )
+        elif new_submit.completed_job_info.state == GENERATION_STATE.faulted:
+            # A faulted job carries no image to hang per-image faults on, so the only record of *why* it
+            # faulted (and how many attempts it took) is the diagnostic the tracker recorded against it.
+            fault_id = new_submit.completed_job_info.sdk_api_job_info.id_
+            if fault_id is not None:
+                metadata = await self._job_tracker.get_faults_for_job(fault_id)
         seed = 0
         if new_submit.completed_job_info.sdk_api_job_info.payload.seed is not None:
             seed = int(new_submit.completed_job_info.sdk_api_job_info.payload.seed)

@@ -377,9 +377,16 @@ class PerformanceModel:
         Logs the prediction-vs-actual it/s at debug (the model's prior expectation, computed before this
         sample is folded in) so a slow job is visible in the logs even before we act on it.
         """
+        from horde_sdk.ai_horde_api import GENERATION_STATE
+
         job_id = str(tracked.job_id)
         observed_its = self._its_by_job_id.pop(job_id, None)
         if observed_its is None:
+            return
+
+        # A faulted job's sampling rate is from a failed or partial run (e.g. an OOM mid-sample); folding
+        # it into calibration would teach the model a wrong, usually too-slow, expectation. Drop it.
+        if completed_job_info.state == GENERATION_STATE.faulted:
             return
 
         job = tracked.sdk_api_job_info

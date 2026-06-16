@@ -89,10 +89,13 @@ class SafetyOrchestrator:
             critical_fault = True
 
         if critical_fault:
+            # A post-inference safety setup failure (missing images/id/model/prompt) cannot be fixed by
+            # re-running inference, so it is faulted terminally rather than requeued.
             await self._job_tracker.handle_job_fault(
                 faulted_job=completed_job_info.sdk_api_job_info,
                 process_info=safety_process,
                 process_timeout=bridge_data.process_timeout,
+                retryable=False,
             )
             logger.error(f"Failed to start safety evaluation for job {completed_job_info.sdk_api_job_info.id_}")
             await self._job_tracker.abandon_pending_safety(completed_job_info)

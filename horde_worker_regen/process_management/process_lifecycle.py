@@ -43,6 +43,23 @@ each restart costs a model (re)load and starves the worker. Past this count the 
 recovery supervisor rather than papered over by an unbounded respawn loop.
 """
 
+SAFETY_CRASH_LOOP_MAX: int = 3
+"""Safety-pool replacements within ``CRASH_LOOP_WINDOW_SECONDS`` before the pool is reported as failing.
+
+The crash-loop circuit breaker quarantines individual *inference* slots, but the safety pool has no such
+per-slot breaker. This count is the equivalent signal for safety: a pool that has been rebuilt more than
+this many times in the window is failing (e.g. a safety process that crashes on every start), which the
+recovery supervisor escalates rather than rebuilding the pool forever."""
+
+SLOWDOWN_NOTICE_RATIO: float = 2.0
+"""Sampling time past this multiple of the job's expected time logs a soft notice (rung 1 of the ladder)."""
+
+SLOWDOWN_WARN_RATIO: float = 4.0
+"""Sampling time past this multiple warns, audits, and counts toward the recovery-supervisor severity.
+
+The hard kill remains the ``inference_step_timeout`` in :meth:`replace_hung_processes`; these softer,
+evidence-based rungs sit below it so a measurable slowdown is logged before the slot is replaced."""
+
 
 class ProcessLifecycleManager:
     """Owns process start/stop/replace logic and related state."""
@@ -79,6 +96,7 @@ class ProcessLifecycleManager:
     _slot_recovery_history: dict[int, list[float]]
     _quarantined_inference_slots: set[int]
     _num_slots_quarantined: int
+    _safety_recovery_history: list[float]
 
     def __init__(
         self,
@@ -130,6 +148,7 @@ class ProcessLifecycleManager:
 
         self.num_processes_launched = 0
         self._num_process_recoveries = 0
+        self._num_slowdown_events = 0
         self._safety_processes_should_be_replaced = False
         self._safety_processes_ending = False
         self._recently_recovered = False
@@ -141,6 +160,7 @@ class ProcessLifecycleManager:
         self._slot_recovery_history = {}
         self._quarantined_inference_slots = set()
         self._num_slots_quarantined = 0
+        self._safety_recovery_history = []
 
     def set_process_recovery_observer(self, observer: Callable[[HordeProcessInfo, str], None]) -> None:
         """Register a callback invoked with the process info and a reason on each recovery.
@@ -636,9 +656,15 @@ class ProcessLifecycleManager:
         if not self._safety_processes_should_be_replaced:
             return
 
-        if not self._safety_processes_ending and self._process_map.num_loaded_safety_processes() > 0:
+        if not self._safety_processes_ending:
+            # Enter the ending phase on the first call regardless of whether a process is currently
+            # loaded. A safety process that died while still PROCESS_STARTING is never "loaded", so the
+            # old ``num_loaded > 0`` guard left ``_safety_processes_ending`` unset; the restart branch
+            # below (gated on that flag) then never fired, leaving the worker without safety forever.
+            # Setting the flag here covers both the normal end->delete->start flow and a startup crash.
             self._safety_processes_ending = True
-            self.end_safety_processes()
+            if self._process_map.num_loaded_safety_processes() > 0:
+                self.end_safety_processes()
             return
 
         if self._process_map.num_loaded_safety_processes() == 0 and self._process_map.num_safety_processes() > 0:
@@ -653,6 +679,27 @@ class ProcessLifecycleManager:
             self._safety_processes_ending = False
             self._safety_processes_should_be_replaced = False
             self._num_process_recoveries += 1
+            self._record_safety_recovery()
+
+    def _record_safety_recovery(self) -> None:
+        """Record that the safety pool was just rebuilt, pruning the history to the crash-loop window."""
+        now = time.time()
+        self._safety_recovery_history = [
+            t for t in self._safety_recovery_history if now - t <= CRASH_LOOP_WINDOW_SECONDS
+        ]
+        self._safety_recovery_history.append(now)
+
+    @property
+    def safety_pool_failing(self) -> bool:
+        """Whether the safety pool has been rebuilt too many times recently (its crash-loop signal).
+
+        The equivalent of inference-slot quarantine for the safety pool: True when a safety process has
+        had to be rebuilt more than ``SAFETY_CRASH_LOOP_MAX`` times within the crash-loop window (e.g. it
+        crashes on every start), which the recovery supervisor escalates instead of rebuilding forever.
+        """
+        now = time.time()
+        recent = [t for t in self._safety_recovery_history if now - t <= CRASH_LOOP_WINDOW_SECONDS]
+        return len(recent) > SAFETY_CRASH_LOOP_MAX
 
     def _release_held_primitives(self, process_info: HordeProcessInfo) -> None:
         """Release every shared primitive a replaced inference child might still be holding.
@@ -730,6 +777,41 @@ class ProcessLifecycleManager:
             f"within {CRASH_LOOP_WINDOW_SECONDS:.0f}s (crash loop); not respawning it.",
         )
 
+    def rebuild_inference_pool(self, *, reason: str) -> None:
+        """Rebuild the inference pool in place: replace live slots and revive quarantined ones.
+
+        The recovery supervisor's soft reset uses this to give a wedged worker (e.g. every slot
+        quarantined by the crash-loop breaker) a clean start without restarting the parent process or
+        detaching the TUI. The crash-loop history is cleared first: this is a deliberate, supervised
+        rebuild, not the unbounded respawn loop the breaker guards against, so prior replacements must
+        not immediately re-quarantine the fresh slots.
+        """
+        logger.error(f"Soft reset: rebuilding inference pool ({reason}).")
+        self._slot_recovery_history.clear()
+
+        revived = sorted(self._quarantined_inference_slots)
+        self._quarantined_inference_slots.clear()
+
+        live = [p for p in self._process_map.values() if p.process_type == HordeProcessType.INFERENCE]
+        for process_info in live:
+            self._replace_inference_process(process_info)
+
+        for slot_id in revived:
+            if slot_id not in self._process_map:
+                self._start_inference_process(slot_id)
+
+        self._action_ledger.record(
+            LedgerEventType.PROCESS_REPLACED,
+            reason=f"soft reset: {reason}",
+            detail={"rebuilt_live": len(live), "revived_quarantined": len(revived)},
+        )
+
+    def rebuild_safety_pool(self, *, reason: str) -> None:
+        """Force the safety pool to be rebuilt (arm + replace), used by the recovery supervisor's soft reset."""
+        logger.error(f"Soft reset: rebuilding safety pool ({reason}).")
+        self._initiate_safety_replacement()
+        self._replace_all_safety_process()
+
     def _replace_inference_process(self, process_info: HordeProcessInfo) -> None:
         """Replace an inference process (because it crashed, hung, or timed out).
 
@@ -766,10 +848,14 @@ class ProcessLifecycleManager:
             self._horde_model_map.expire_entry(process_info.loaded_horde_model_name)
 
         if job_to_remove is not None:
+            # A slot crash/hang mid-job is retryable: the job is requeued to a fresh slot (bounded by
+            # max_inference_attempts) rather than faulted outright. The crash gives no resource signal,
+            # so it takes the ordinary retry, not the degraded path.
             self._job_tracker.handle_job_fault_now(
                 faulted_job=job_to_remove,
                 process_info=process_info,
                 process_timeout=bridge_data.process_timeout,
+                retryable=True,
             )
 
         replacements_in_window = self._record_slot_recovery(process_info.process_id)
@@ -887,6 +973,57 @@ class ProcessLifecycleManager:
             return True
         return False
 
+    def _grade_running_inference(self) -> None:
+        """Grade in-flight inference against its expected sampling time, escalating notices for slow jobs.
+
+        The hard kill remains the ``inference_step_timeout`` in :meth:`replace_hung_processes`; this adds
+        the softer, evidence-based rungs below it (a job measurably slower than its signature's expected
+        time) so a slowdown is logged, audited, and counted toward the recovery-supervisor severity
+        before the watchdog resorts to replacing the slot. A job with no expected time (cold start) is
+        skipped, so this never fires on an uncalibrated worker.
+        """
+        now = time.time()
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.last_process_state != HordeProcessState.INFERENCE_STARTING:
+                continue
+            started = process_info.current_inference_started_at
+            expected = process_info.current_job_expected_sampling_seconds
+            if started is None or expected is None or expected <= 0:
+                continue
+
+            elapsed = now - started
+            ratio = elapsed / expected
+            level = 2 if ratio >= SLOWDOWN_WARN_RATIO else 1 if ratio >= SLOWDOWN_NOTICE_RATIO else 0
+            if level <= process_info.current_job_slowdown_level:
+                continue
+            process_info.current_job_slowdown_level = level
+
+            job_id = (
+                str(process_info.last_job_referenced.id_) if process_info.last_job_referenced is not None else None
+            )
+            if level >= 2:
+                self._num_slowdown_events += 1
+                logger.warning(
+                    f"Inference on process {process_info.process_id} is {ratio:.1f}x its expected sampling time "
+                    f"({elapsed:.0f}s vs ~{expected:.0f}s); watching for a hang.",
+                )
+                self._action_ledger.record(
+                    LedgerEventType.SLOWDOWN_DETECTED,
+                    process_id=process_info.process_id,
+                    os_pid=process_info.os_pid,
+                    launch_identifier=process_info.process_launch_identifier,
+                    job_id=job_id,
+                    reason=f"{ratio:.1f}x expected sampling time",
+                    detail={"elapsed_s": round(elapsed, 1), "expected_s": round(expected, 1)},
+                )
+            else:
+                logger.info(
+                    f"Inference on process {process_info.process_id} is running slower than expected "
+                    f"({ratio:.1f}x ~{expected:.0f}s); not yet a concern.",
+                )
+
     def replace_hung_processes(self) -> bool:
         """Replaces processes that haven't checked in since `process_timeout` seconds in bridgeData."""
         import threading
@@ -898,6 +1035,10 @@ class ProcessLifecycleManager:
             self._recently_recovered = False
 
         now = time.time()
+
+        # Soft, evidence-based slowdown grading runs every tick (cheap, no side effects beyond logging
+        # and audit) regardless of the recovery debounce below, which only gates hard replacement.
+        self._grade_running_inference()
 
         any_replaced = False
 

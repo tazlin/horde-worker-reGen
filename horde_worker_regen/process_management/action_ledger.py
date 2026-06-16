@@ -32,9 +32,14 @@ class LedgerEventType(enum.StrEnum):
     PROCESS_QUARANTINED = "process_quarantined"
     PROCESS_ENDED = "process_ended"
     INFERENCE_DISPATCHED = "inference_dispatched"
+    INFERENCE_RETRIED = "inference_retried"
+    INFERENCE_FAULTED = "inference_faulted"
     PRELOAD_REQUESTED = "preload_requested"
     SEMAPHORE_RELEASED = "semaphore_released"
     TIMEOUT_DETECTED = "timeout_detected"
+    SLOWDOWN_DETECTED = "slowdown_detected"
+    SOFT_RESET = "soft_reset"
+    RECOVERY_ABANDONED = "recovery_abandoned"
     ORPHAN_REAPED = "orphan_reaped"
 
 

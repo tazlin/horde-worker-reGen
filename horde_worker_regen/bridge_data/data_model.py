@@ -276,6 +276,14 @@ class reGenBridgeData(CombinedHordeBridgeData):
     inference_step_timeout: int = Field(default=15, ge=15, le=30)
     """The maximum amount of time to allow a single inference step to run before the process is killed"""
 
+    max_inference_attempts: int = Field(default=2, ge=1, le=5)
+    """How many times a single job may be dispatched to inference before it is reported faulted.
+
+    1 disables retry (one shot, then fault: the pre-resiliency behaviour). The default of 2 grants one
+    bounded retry, so a job whose slot crashed, hung, or failed to receive its dispatch is requeued for a
+    fresh attempt rather than faulted outright. A resource (out-of-memory) failure spends its retry in a
+    degraded, isolated dispatch. Once attempts are exhausted the job is reported faulted with diagnostics."""
+
     minutes_allowed_without_jobs: int = Field(default=30, ge=0, lt=60 * 60)
 
     horde_model_stickiness: float = Field(default=0.0, le=1.0, ge=0.0, alias="model_stickiness")

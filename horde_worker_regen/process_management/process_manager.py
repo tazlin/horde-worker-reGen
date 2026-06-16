@@ -50,7 +50,7 @@ from horde_worker_regen.consts import (
 )
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management._canned_scenarios import CannedAlchemySource, CannedJobSource
-from horde_worker_regen.process_management.action_ledger import ActionLedger
+from horde_worker_regen.process_management.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.alchemy_popper import AlchemyCoordinator
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
@@ -78,6 +78,7 @@ from horde_worker_regen.process_management.performance_model import (
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.recovery_supervisor import RecoveryAction, RecoverySupervisor
 from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot, WorkerRunMetrics
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.safety_orchestrator import SafetyOrchestrator
@@ -612,6 +613,7 @@ class HordeWorkerProcessManager:
             process_message_queue=self._process_message_queue,
             runtime_config=self._runtime_config,
             model_metadata=self._model_metadata,
+            action_ledger=self._action_ledger,
             on_unload_vram=self.unload_models_from_vram,
             state=self._state,
         )
@@ -668,6 +670,11 @@ class HordeWorkerProcessManager:
             lru=self._lru,
             performance_model=self._performance_model,
         )
+
+        # Save-our-ship: escalates a worker that has stopped making progress on accepted work from an
+        # in-place soft reset (rebuild pools, limp-by) to giving up cleanly on jobs it cannot serve, so
+        # the worker keeps running rather than wedging. See RecoverySupervisor for the escalation policy.
+        self._recovery_supervisor = RecoverySupervisor()
 
         self._job_submitter = JobSubmitter(
             state=self._state,
@@ -762,6 +769,10 @@ class HordeWorkerProcessManager:
 
     def enable_performance_mode(self) -> None:
         """Enable performance mode."""
+        # Re-applied here (init + every config reload) so a live change to max_inference_attempts takes
+        # effect without a restart, alongside the other performance-related thresholds.
+        self._job_tracker.set_retry_policy(self.bridge_data.max_inference_attempts)
+
         if self.bridge_data.high_performance_mode:
             self._job_tracker.set_performance_mode_thresholds(80)
             logger.info("High performance mode enabled")
@@ -1066,6 +1077,10 @@ class HordeWorkerProcessManager:
                 await self._sleep(self._loop_interval / 2)
             self._process_lifecycle._replace_all_safety_process()
 
+            # Save-our-ship: above the per-slot recovery, escalate a worker that is wedged as a whole
+            # (no live process for pending work) to a soft reset and finally to giving up cleanly.
+            self._run_recovery_supervisor()
+
             if self._state.shutting_down and not self._state.last_pop_recently():
                 self._process_lifecycle.end_inference_processes()
 
@@ -1200,6 +1215,130 @@ class HordeWorkerProcessManager:
             )
             self._process_lifecycle.start_inference_processes()
             self._inference_processes_started = True
+
+    def _is_inference_capacity_available(self) -> bool:
+        """Whether any inference process is alive to serve pending inference work."""
+        return any(
+            process_info.process_type == HordeProcessType.INFERENCE and process_info.is_process_alive()
+            for process_info in self._process_map.values()
+        )
+
+    def _is_safety_capacity_available(self) -> bool:
+        """Whether any safety process is alive to serve pending safety checks."""
+        return any(
+            process_info.process_type == HordeProcessType.SAFETY and process_info.is_process_alive()
+            for process_info in self._process_map.values()
+        )
+
+    def _is_safety_pool_ready(self) -> bool:
+        """Whether at least one safety process is alive and able to accept a check (genuine recovery)."""
+        return any(
+            process_info.process_type == HordeProcessType.SAFETY and process_info.can_accept_job()
+            for process_info in self._process_map.values()
+        )
+
+    def _is_inference_pool_unrecoverable(self) -> bool:
+        """Whether the crash-loop breaker has quarantined every inference slot (definitive: cannot serve).
+
+        Quarantine requires repeated rapid failures per slot, so this never fires during a normal slot
+        replacement or a slow model load (neither of which quarantines), only when every slot has
+        crash-looped out of the pool.
+        """
+        return len(self._process_lifecycle.quarantined_inference_slots) >= self.max_inference_processes
+
+    def _is_safety_pool_unrecoverable(self) -> bool:
+        """Whether the safety pool is crash-looping (rebuilt too often) and not currently ready to serve.
+
+        The readiness gate keeps a pool that has recovered (a healthy safety process is up) from being
+        treated as wedged while its recent rebuild count ages out of the window.
+        """
+        return self._process_lifecycle.safety_pool_failing and not self._is_safety_pool_ready()
+
+    def _assess_wedge(self) -> bool:
+        """Whether the worker structurally cannot make progress (the save-our-ship trigger).
+
+        Keyed on the two crash-loop signals, not on transient capacity gaps: every inference slot has
+        been quarantined, or the safety pool is crash-looping with no healthy process. A merely slow,
+        busy, replacing, or model-loading worker trips neither, so a healthy worker is never wedged.
+        """
+        if self._state.shutting_down:
+            return False
+        return self._is_inference_pool_unrecoverable() or self._is_safety_pool_unrecoverable()
+
+    def _run_recovery_supervisor(self) -> None:
+        """Drive the save-our-ship escalation one tick and perform any action it returns."""
+        if self._state.shutting_down:
+            return
+        action = self._recovery_supervisor.evaluate(is_wedged=self._assess_wedge())
+        if action is RecoveryAction.SOFT_RESET:
+            self._perform_soft_reset()
+        elif action is RecoveryAction.GIVE_UP:
+            self._give_up_on_wedged_jobs()
+        elif not self._recovery_supervisor.is_in_episode:
+            # The episode closed after a sustained clean streak: restore full concurrency (undo limp-by).
+            self._runtime_config.set_effective_max_threads(self._max_concurrent_inference_processes)
+
+    def _perform_soft_reset(self) -> None:
+        """Rebuild the worker's process pools in place and drop one limp-by notch (reduced concurrency)."""
+        level = self._recovery_supervisor.limp_by_level
+        applied = self._runtime_config.set_effective_max_threads(
+            max(1, self._max_concurrent_inference_processes - level),
+        )
+        logger.error(
+            f"Save-our-ship soft reset #{level}: rebuilding process pools and limping by "
+            f"(effective max_threads -> {applied}).",
+        )
+        self._action_ledger.record(
+            LedgerEventType.SOFT_RESET,
+            reason=f"save-our-ship soft reset #{level}",
+            detail={"limp_by_level": level, "effective_max_threads": applied},
+        )
+        self._process_lifecycle.rebuild_inference_pool(reason=f"soft reset #{level}")
+        self._process_lifecycle.rebuild_safety_pool(reason=f"soft reset #{level}")
+
+    def _give_up_on_wedged_jobs(self) -> None:
+        """Last resort: fault unservable jobs, and if no pool can recover, shut down cleanly.
+
+        Soft resets did not restore a working pool. Any jobs that cannot be served are reported faulted
+        so the horde reissues them rather than holding them forever. If the worker structurally cannot
+        serve at all (inference pool unrecoverable, or safety pool failing), it shuts down cleanly: the
+        sanctioned last resort, so a permanently-broken worker stops rather than spinning, instead of
+        hanging. A worker whose pools later recover never reaches here (the episode closes first).
+        """
+        faulted = 0
+        if not self._is_inference_capacity_available():
+            for job in list(self._job_tracker.jobs_pending_inference):
+                if job not in self._job_tracker.jobs_in_progress:
+                    self._job_tracker.handle_job_fault_now(job, retryable=False)
+                    faulted += 1
+        if not self._is_safety_capacity_available():
+            stuck_safety = list(self._job_tracker.jobs_pending_safety_check) + list(
+                self._job_tracker.jobs_being_safety_checked,
+            )
+            for info in stuck_safety:
+                self._job_tracker.handle_job_fault_now(info.sdk_api_job_info, retryable=False)
+                faulted += 1
+        if faulted > 0:
+            logger.critical(
+                f"Save-our-ship: gave up on {faulted} unservable job(s) and reported them faulted so the "
+                "horde reissues them.",
+            )
+
+        structurally_broken = self._is_inference_pool_unrecoverable() or self._is_safety_pool_unrecoverable()
+        self._action_ledger.record(
+            LedgerEventType.RECOVERY_ABANDONED,
+            reason="save-our-ship: soft resets could not restore a working pool",
+            detail={"jobs_faulted": faulted, "structurally_broken": structurally_broken},
+        )
+        if structurally_broken and not self._state.shutting_down:
+            logger.critical(
+                "Save-our-ship: the worker cannot restore a working process pool after repeated soft "
+                "resets; abandoning ship (the last resort) rather than spinning indefinitely.",
+            )
+            # Abort rather than graceful shutdown: a graceful drain is gated by `recently_recovered`
+            # (which the soft resets just set) and would stall for the watchdog window, and there is
+            # nothing to drain gracefully when the pools are dead. The .abort sentinel stops promptly.
+            self._abort()
 
     async def _process_control_loop(self) -> None:
         self._process_lifecycle.start_safety_processes()

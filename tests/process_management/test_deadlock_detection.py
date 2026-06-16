@@ -6,6 +6,7 @@ import queue
 import time
 from unittest.mock import Mock
 
+from horde_worker_regen.process_management.action_ledger import ActionLedger
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
@@ -50,6 +51,7 @@ def _make_message_dispatcher(
         process_message_queue=Mock(spec=queue.Queue),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         model_metadata=make_test_model_metadata(),
+        action_ledger=ActionLedger(),
         on_unload_vram=Mock(),
         state=state,
     )

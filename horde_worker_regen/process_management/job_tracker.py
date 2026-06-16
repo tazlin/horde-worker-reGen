@@ -33,6 +33,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
     ImageGenerateJobPopResponse,
 )
+from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 
@@ -62,6 +63,23 @@ class JobStage(enum.Enum):
     """Sent to the safety process; awaiting its verdict."""
     PENDING_SUBMIT = auto()
     """Ready to be submitted to the API (success or fault)."""
+
+
+class InferenceFailureResolution(enum.Enum):
+    """What the tracker decided to do with a job whose inference attempt failed.
+
+    The two ``RETRY*`` outcomes leave the job in :attr:`JobStage.PENDING_INFERENCE` for another
+    dispatch; ``FAULTED`` is terminal (the job has been moved to :attr:`JobStage.PENDING_SUBMIT` as a
+    fault and counted once). Callers branch on this to log, audit, and (for ``RETRY_DEGRADED``) drive a
+    more conservative re-dispatch.
+    """
+
+    RETRY = auto()
+    """Requeued to ``PENDING_INFERENCE`` for a fresh, normal attempt (a crash/hang/transient failure)."""
+    RETRY_DEGRADED = auto()
+    """Requeued for one degraded, isolated attempt after a resource (out-of-memory) failure."""
+    FAULTED = auto()
+    """Attempts exhausted or the failure is non-retryable; moved to ``PENDING_SUBMIT`` as a terminal fault."""
 
 
 _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
@@ -117,6 +135,12 @@ class TrackedJob:
 
     Together with ``time_popped`` this gives per-job latency breakdowns
     (queue wait, inference, safety, submit)."""
+    inference_attempts: int = 0
+    """How many inference attempts have failed for this job; bounds retry against ``max_inference_attempts``."""
+    degraded_retry_used: bool = False
+    """Whether this job has already spent its one degraded (isolated) retry for a resource failure."""
+    needs_degraded_dispatch: bool = False
+    """Set when this job's next dispatch should run degraded/isolated (consumed by the scheduler)."""
 
 
 @dataclass(frozen=True)
@@ -162,6 +186,14 @@ class JobTracker:
 
         self._sequence_counter = 0
         self._finalize_observer: Callable[[TrackedJob, HordeJobInfo], None] | None = None
+
+        # Defaults to one attempt (no retry: the pre-resiliency behaviour) so a directly-constructed
+        # tracker faults terminally; the worker opts into bounded retry via set_retry_policy().
+        self._max_inference_attempts = 1
+
+    def set_retry_policy(self, max_inference_attempts: int) -> None:
+        """Set how many inference attempts a job may have before it is reported faulted (clamped to >= 1)."""
+        self._max_inference_attempts = max(1, max_inference_attempts)
 
     def set_finalize_observer(self, observer: Callable[[TrackedJob, HordeJobInfo], None]) -> None:
         """Register a callback invoked with each job's final tracked state at finalize time.
@@ -629,48 +661,110 @@ class JobTracker:
                 logger.warning(f"Job finalize observer failed: {type(e).__name__} {e}")
 
         del self._jobs[tracked.job_id]
+        # Faults are kept independent of job lifetime, but a finalized job will never be read again,
+        # so drop its fault list here to keep the fault map from growing for the worker's whole run.
+        self._job_faults.pop(tracked.job_id, None)
         self._last_job_submitted_time = time.time()
+
+    def is_degraded_dispatch_pending(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether this job's next dispatch should run degraded/isolated (a peek; does not consume)."""
+        tracked = self._tracked_for(job)
+        return tracked is not None and tracked.needs_degraded_dispatch
+
+    def clear_degraded_dispatch(self, job: ImageGenerateJobPopResponse) -> None:
+        """Consume the degraded-dispatch flag once the scheduler has dispatched the job degraded."""
+        tracked = self._tracked_for(job)
+        if tracked is not None:
+            tracked.needs_degraded_dispatch = False
 
     async def handle_job_fault(
         self,
         faulted_job: ImageGenerateJobPopResponse,
         process_info: HordeProcessInfo | None = None,
         process_timeout: float = 0.0,
-    ) -> None:
-        """Handle a job that has faulted, moving it to the pending submit stage."""
-        self._handle_job_fault_impl(faulted_job, process_info=process_info, process_timeout=process_timeout)
+        *,
+        is_resource_failure: bool = False,
+        retryable: bool = True,
+    ) -> InferenceFailureResolution:
+        """Resolve a faulted job: requeue it for another (possibly degraded) attempt, or fault it.
+
+        Returns the resolution so the caller can log/audit and, for a degraded retry, drive a more
+        conservative re-dispatch. ``retryable=False`` forces a terminal fault (e.g. a post-inference
+        safety failure or a shutdown drain, where re-running inference cannot help).
+        """
+        return self._resolve_inference_failure_impl(
+            faulted_job,
+            process_info=process_info,
+            process_timeout=process_timeout,
+            is_resource_failure=is_resource_failure,
+            retryable=retryable,
+        )
 
     def handle_job_fault_now(
         self,
         faulted_job: ImageGenerateJobPopResponse,
         process_info: HordeProcessInfo | None = None,
         process_timeout: float = 0.0,
-    ) -> None:
-        """Synchronous fault path for sync callers (e.g. process crash handling)."""
-        self._handle_job_fault_impl(faulted_job, process_info=process_info, process_timeout=process_timeout)
+        *,
+        is_resource_failure: bool = False,
+        retryable: bool = True,
+    ) -> InferenceFailureResolution:
+        """Synchronous fault path for sync callers (e.g. process crash handling). See :meth:`handle_job_fault`."""
+        return self._resolve_inference_failure_impl(
+            faulted_job,
+            process_info=process_info,
+            process_timeout=process_timeout,
+            is_resource_failure=is_resource_failure,
+            retryable=retryable,
+        )
 
-    def _handle_job_fault_impl(
+    def _resolve_inference_failure_impl(
         self,
         faulted_job: ImageGenerateJobPopResponse,
         *,
         process_info: HordeProcessInfo | None,
         process_timeout: float,
-    ) -> None:
+        is_resource_failure: bool,
+        retryable: bool,
+    ) -> InferenceFailureResolution:
         tracked = self._tracked_for(faulted_job)
 
         if tracked is None or tracked.job_info is None:
             logger.error(f"Job {faulted_job.id_} not found in jobs_lookup")
-            return
+            return InferenceFailureResolution.FAULTED
 
-        tracked.job_info.fault_job()
-        tracked.job_info.time_to_generate = process_timeout
+        if tracked.stage == JobStage.PENDING_SUBMIT:
+            logger.warning(f"Job {faulted_job.id_} already in completed_jobs")
+            return InferenceFailureResolution.FAULTED
+
+        tracked.inference_attempts += 1
 
         if process_info is not None:
             logger.error(f"Job {faulted_job.id_} faulted due to process {process_info.process_id} crashing")
 
-        if tracked.stage == JobStage.PENDING_SUBMIT:
-            logger.warning(f"Job {faulted_job.id_} already in completed_jobs")
-            return
+        # A job with no pop timestamp was never formally queued (registered late, e.g. mid-flight), so it
+        # has no pending-inference position to return to; such a job is always faulted terminally.
+        can_retry = (
+            retryable and tracked.time_popped is not None and tracked.inference_attempts < self._max_inference_attempts
+        )
+
+        if can_retry and self._set_stage(tracked, JobStage.PENDING_INFERENCE):
+            degraded = is_resource_failure and not tracked.degraded_retry_used
+            if degraded:
+                tracked.degraded_retry_used = True
+                tracked.needs_degraded_dispatch = True
+            logger.warning(
+                f"Job {faulted_job.id_} inference attempt "
+                f"{tracked.inference_attempts}/{self._max_inference_attempts} failed"
+                f"{' (resource/OOM)' if is_resource_failure else ''}; requeuing for "
+                f"{'a degraded, isolated' if degraded else 'another'} attempt.",
+            )
+            return InferenceFailureResolution.RETRY_DEGRADED if degraded else InferenceFailureResolution.RETRY
+
+        # Terminal fault: out of attempts, not retryable, or the requeue transition was refused.
+        tracked.job_info.fault_job()
+        tracked.job_info.time_to_generate = process_timeout
+        self._record_fault_diagnostics(tracked, is_resource_failure=is_resource_failure)
 
         if self._set_stage(tracked, JobStage.PENDING_SUBMIT):
             # A crash/timeout-faulted job never produces an inference RESULT message, so the
@@ -680,6 +774,22 @@ class JobTracker:
             # worker's own queue-drain logic) waits forever on a job that has, in fact, finished
             # (as a fault). The faulted-kudos counter is still incremented once at submit time.
             self._total_num_completed_jobs += 1
+        return InferenceFailureResolution.FAULTED
+
+    def _record_fault_diagnostics(self, tracked: TrackedJob, *, is_resource_failure: bool) -> None:
+        """Attach a fault diagnostic to the job so it rides along on the faulted submit's gen_metadata.
+
+        A faulted job carries no image to hang per-image faults on, so this is the only record of *why*
+        it faulted that reaches the horde. The reason and attempt count also aid local post-mortems.
+        """
+        reason = "resource/OOM" if is_resource_failure else "inference failure"
+        self._job_faults.setdefault(tracked.job_id, []).append(
+            GenMetadataEntry(
+                type=METADATA_TYPE.information,
+                value=METADATA_VALUE.see_ref,
+                ref=f"faulted after {tracked.inference_attempts} attempt(s): {reason}"[:255],
+            ),
+        )
 
     async def purge_jobs(self) -> None:
         """Clear all jobs from the tracker."""
