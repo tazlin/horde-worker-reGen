@@ -109,7 +109,7 @@ def test_process_snapshot_from_process_info() -> None:
 def test_channel_sends_snapshot_without_blocking_and_receives_commands() -> None:
     """The threaded channel delivers snapshots and drains commands over a real in-process pipe."""
     parent, child = multiprocessing.Pipe(duplex=True)
-    channel = SupervisorChannel(child)
+    channel = SupervisorChannel(child)  # pyrefly: ignore
     try:
         assert channel.send_snapshot(_make_snapshot()) is True
 

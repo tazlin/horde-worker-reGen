@@ -115,7 +115,7 @@ def test_crash_in_postprocessing_releases_inference_semaphore() -> None:
 
     plm._replace_inference_process(dead)
 
-    plm._inference_semaphore.release.assert_called()
+    plm._inference_semaphore.release.assert_called()  # pyrefly: ignore
 
 
 def test_crash_looping_slot_is_eventually_quarantined() -> None:
@@ -127,12 +127,12 @@ def test_crash_looping_slot_is_eventually_quarantined() -> None:
         spawn_count += 1
         replacement = make_mock_process_info(pid, model_name=None, state=HordeProcessState.PROCESS_STARTING)
         replacement.mp_process.is_alive.return_value = False  # the replacement is dead too
-        replacement.mp_process.exitcode = 1
+        replacement.mp_process.exitcode = 1  # pyrefly: ignore
         plm._process_map[pid] = replacement
 
     dead = make_mock_process_info(0, model_name=None, state=HordeProcessState.PROCESS_STARTING)
     dead.mp_process.is_alive.return_value = False
-    dead.mp_process.exitcode = 1
+    dead.mp_process.exitcode = 1  # pyrefly: ignore
     plm = _make_plm(process_map=ProcessMap({0: dead}))
     plm._end_inference_process = Mock()  # type: ignore[method-assign]
     plm._start_inference_process = _respawn_dead  # type: ignore[method-assign]
@@ -169,12 +169,12 @@ def test_quarantine_is_recorded_in_action_ledger() -> None:
         spawn_count += 1
         replacement = make_mock_process_info(pid, model_name=None, state=HordeProcessState.PROCESS_STARTING)
         replacement.mp_process.is_alive.return_value = False
-        replacement.mp_process.exitcode = 1
+        replacement.mp_process.exitcode = 1  # pyrefly: ignore
         plm._process_map[pid] = replacement
 
     dead = make_mock_process_info(0, model_name=None, state=HordeProcessState.PROCESS_STARTING)
     dead.mp_process.is_alive.return_value = False
-    dead.mp_process.exitcode = 1
+    dead.mp_process.exitcode = 1  # pyrefly: ignore
     plm = _make_plm(process_map=ProcessMap({0: dead}))
     plm._end_inference_process = Mock()  # type: ignore[method-assign]
     plm._start_inference_process = _respawn_dead  # type: ignore[method-assign]

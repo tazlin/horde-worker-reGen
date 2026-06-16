@@ -205,6 +205,7 @@ class TestJobStages:
     async def test_normal_lifecycle_stages(self, job_tracker: JobTracker) -> None:
         """A job should move through the stages of the happy path one at a time."""
         job = await track_popped_job_async(job_tracker, make_mock_job())
+        assert job.id_ is not None
         assert job_tracker.get_stage(job.id_) is JobStage.PENDING_INFERENCE
 
         await job_tracker.mark_inference_started(job)
@@ -262,6 +263,7 @@ class TestJobStages:
     async def test_illegal_transition_is_refused(self, job_tracker: JobTracker) -> None:
         """A terminal-stage job cannot move back to an earlier stage."""
         job = await track_popped_job_async(job_tracker, make_mock_job())
+        assert job.id_ is not None
         job_info = await job_tracker.get_job_info(job)
         assert job_info is not None
 
@@ -300,8 +302,8 @@ class TestJobStages:
         await job_tracker.begin_safety_check(job_info)
 
         await job_tracker.handle_job_fault(faulted_job=job)
-        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT  # pyrefly: ignore
 
         # The (late) safety result must not be able to re-queue the job for submit
-        assert await job_tracker.take_being_safety_checked(job.id_) is None
+        assert await job_tracker.take_being_safety_checked(job.id_) is None  # pyrefly: ignore
         assert len(job_tracker.jobs_pending_submit) == 1

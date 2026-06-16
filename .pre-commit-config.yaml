@@ -9,45 +9,10 @@ repos:
     rev: v0.15.16
     hooks:
     -    id: ruff
--   repo: https://github.com/pre-commit/mirrors-mypy
-    rev: 'v1.14.1'
+-   repo: https://github.com/facebook/pyrefly-pre-commit
+    rev: 1.1.0.dev2  # Version of the pre-commit hook itself; language: system means the venv's pyrefly is used
     hooks:
-    -   id: mypy
-        args: []
-        additional_dependencies:
-        - pydantic>=2.9.2
-        - types-requests
-        - types-pytz
-        - types-setuptools
-        - types-urllib3
-        - StrEnum
-        - types-pillow
-        - types-pyyaml
-        - types-pygments
-        - types-colorama
-        - types-psutil
-        - types-pywin32
-        - types-tabulate
-        - types-tqdm
-        - types-regex
-        - pytest
-        - loguru
-        - python-dotenv
-        - aiohttp
-        - horde_safety~=0.3.0
-        - torch
-        - ruamel.yaml
-        - horde_engine>=3.1.0,<4.0.0
-        - horde_sdk~=0.20.6
-        - horde_model_reference>=5.3.0,<6.0.0
-        - semver
-        - logfire>=4.6.0
-        - textual>=2.1.0
-        - textual-serve>=1.1.1
-        - certifi
-        - babel
-        - qrcode==7.4.2
-        - python-Levenshtein
-        - aiodns>=3.0.0,<4.0.0
-        - typing_extensions
-        - requests
+      - id: pyrefly-check
+        name: Pyrefly (type checking)
+        pass_filenames: false
+        language: system  # Use the pyrefly from the active venv, keeping it in sync with pyproject.toml

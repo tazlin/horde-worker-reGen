@@ -57,6 +57,7 @@ class TestJobLifecycleAuditor:
 
         job = await track_popped_job_async(manager._job_tracker, make_mock_job())
         job_info = await manager._job_tracker.get_job_info(job)
+        assert job_info is not None
         await manager._job_tracker.queue_for_submit(job_info)
         await manager._job_tracker.finalize_submitted(job_info)
         await manager._job_tracker.finalize_submitted(job_info)
@@ -72,9 +73,9 @@ class TestJobLifecycleAuditor:
 
         job = await track_popped_job_async(manager._job_tracker, make_mock_job())
         job_info = await manager._job_tracker.get_job_info(job)
-        job_info.state = GENERATION_STATE.faulted
-        await manager._job_tracker.queue_for_submit(job_info)
-        await manager._job_tracker.finalize_submitted(job_info)
+        job_info.state = GENERATION_STATE.faulted  # pyrefly: ignore
+        await manager._job_tracker.queue_for_submit(job_info)  # pyrefly: ignore
+        await manager._job_tracker.finalize_submitted(job_info)  # pyrefly: ignore
 
         assert auditor.num_jobs_submitted_faulted == 1
         assert auditor.verify() == []

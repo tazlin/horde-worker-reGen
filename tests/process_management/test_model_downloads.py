@@ -193,7 +193,7 @@ class TestManagerDownloadHandling:
     """The manager's reaction to download-process availability reports."""
 
     def _manager_in_download_mode(self, **bridge_overrides: object) -> Mock:
-        manager = make_testable_process_manager(**bridge_overrides)
+        manager = make_testable_process_manager(**bridge_overrides)  # type: ignore
         manager._enable_background_downloads = True
         manager._download_wait_started = time.time()
         manager._process_lifecycle = Mock()

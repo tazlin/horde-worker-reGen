@@ -190,6 +190,7 @@ def test_metrics_then_finalize_calibrates() -> None:
     from horde_worker_regen.process_management.messages import HordeJobMetricsMessage
 
     job = make_canned_job(width=512, height=512, ddim_steps=30, n_iter=1)
+    assert job.id_ is not None
     model = PerformanceModel(baseline_resolver=lambda _name: _SD15_BASELINE, min_samples=1)
 
     sampling = SamplingStats(steps_completed=30, total_steps=30, duration_seconds=5.0, iterations_per_second=6.0)

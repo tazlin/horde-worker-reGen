@@ -37,7 +37,7 @@ def _make_stub() -> _StubProcess:
         disk_lock=Mock(),
         process_launch_identifier=0,
     )
-    proc.process_message_queue.reset_mock()
+    proc.process_message_queue.reset_mock()  # pyrefly: ignore
     return proc
 
 
@@ -49,8 +49,8 @@ def test_idle_heartbeat_emitted_when_waiting() -> None:
 
     proc._maybe_send_idle_heartbeat()
 
-    assert proc.process_message_queue.put.call_count == 1
-    sent = proc.process_message_queue.put.call_args[0][0]
+    assert proc.process_message_queue.put.call_count == 1  # pyrefly: ignore
+    sent = proc.process_message_queue.put.call_args[0][0]  # pyrefly: ignore
     assert isinstance(sent, HordeProcessHeartbeatMessage)
     assert sent.heartbeat_type is HordeHeartbeatType.OTHER
 
@@ -63,7 +63,7 @@ def test_idle_heartbeat_skipped_while_busy() -> None:
 
     proc._maybe_send_idle_heartbeat()
 
-    proc.process_message_queue.put.assert_not_called()
+    proc.process_message_queue.put.assert_not_called()  # pyrefly: ignore
 
 
 def test_idle_heartbeat_is_throttled() -> None:
@@ -74,4 +74,4 @@ def test_idle_heartbeat_is_throttled() -> None:
 
     proc._maybe_send_idle_heartbeat()
 
-    proc.process_message_queue.put.assert_not_called()
+    proc.process_message_queue.put.assert_not_called()  # pyrefly: ignore

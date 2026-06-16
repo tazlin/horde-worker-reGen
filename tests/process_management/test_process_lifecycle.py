@@ -73,8 +73,8 @@ def test_broadcast_reload_model_database_targets_inference_and_download() -> Non
     plm.broadcast_reload_model_database()
 
     for proc in (inf0, inf1, download_info):
-        proc.pipe_connection.send.assert_called_once()
-        sent = proc.pipe_connection.send.call_args.args[0]
+        proc.pipe_connection.send.assert_called_once()  # type: ignore
+        sent = proc.pipe_connection.send.call_args.args[0]  # pyrefly: ignore
         assert isinstance(sent, HordeControlMessage)
         assert sent.control_flag == HordeControlFlag.RELOAD_MODEL_DATABASE
 
@@ -253,7 +253,7 @@ def test_reap_if_crashed_recovers_dead_inference() -> None:
     """A dead inference child (no longer alive) is recovered without waiting on a state timer."""
     dead = make_mock_process_info(1, model_name=None, state=HordeProcessState.PROCESS_STARTING)
     dead.mp_process.is_alive.return_value = False
-    dead.mp_process.exitcode = 1
+    dead.mp_process.exitcode = 1  # pyrefly: ignore
     plm = _make_plm(process_map=ProcessMap({1: dead}))
     plm._replace_inference_process = Mock()  # type: ignore[method-assign]
 
@@ -267,7 +267,7 @@ def test_reap_if_crashed_recovers_dead_safety() -> None:
         0, model_name=None, state=HordeProcessState.PROCESS_STARTING, process_type=HordeProcessType.SAFETY
     )
     dead.mp_process.is_alive.return_value = False
-    dead.mp_process.exitcode = -9
+    dead.mp_process.exitcode = -9  # pyrefly: ignore
     plm = _make_plm(process_map=ProcessMap({0: dead}))
 
     assert plm._reap_if_crashed(dead) is True

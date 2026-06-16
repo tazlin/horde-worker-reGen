@@ -27,7 +27,7 @@ def _clean_stats(**overrides: object) -> LevelStats:
         "total_vram_mb": 24000,
         "disk_min_free_bytes": 100 * 1024**3,
     }
-    base.update(overrides)
+    base.update(overrides)  # pyrefly: ignore
     return LevelStats(**base)  # type: ignore[arg-type]
 
 

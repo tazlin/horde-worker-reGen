@@ -36,7 +36,7 @@ class TestComputeProtectedProcesses:
     def test_surplus_copy_is_displaceable(self) -> None:
         """A model with two copies keeps only one pinned; the surplus stays displaceable."""
         process_models = {0: "A", 5: "A", 1: "B", 2: "C", 3: "D"}
-        protected = compute_protected_processes(process_models, {"A", "B", "C", "D"})
+        protected = compute_protected_processes(process_models, {"A", "B", "C", "D"})  # pyrefly: ignore
         # Exactly one of A's two processes is protected (the lowest id), the other is free.
         assert 0 in protected
         assert 5 not in protected
@@ -45,7 +45,7 @@ class TestComputeProtectedProcesses:
     def test_unwanted_model_not_protected(self) -> None:
         """A process holding a model no longer in models_to_load is displaceable."""
         process_models = {0: "A", 1: "OLD"}
-        assert compute_protected_processes(process_models, {"A"}) == {0}
+        assert compute_protected_processes(process_models, {"A"}) == {0}  # pyrefly: ignore
 
     def test_empty_processes_not_protected(self) -> None:
         """Processes with no model loaded are never protected."""

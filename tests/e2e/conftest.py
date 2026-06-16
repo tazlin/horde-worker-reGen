@@ -6,6 +6,7 @@ import asyncio
 import multiprocessing
 import sys
 import time
+from collections.abc import Generator
 from unittest.mock import Mock
 
 import pytest
@@ -38,7 +39,7 @@ def event_loop_policy() -> asyncio.AbstractEventLoopPolicy:
 
 
 @pytest.fixture(autouse=True)
-def _reap_multiprocessing_children() -> None:
+def _reap_multiprocessing_children() -> Generator[None, None, None]:
     """Reap lingering multiprocessing children after each e2e test.
 
     The e2e tests spawn real OS child processes via ``multiprocessing.Process`` (spawn

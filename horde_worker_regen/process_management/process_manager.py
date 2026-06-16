@@ -1120,7 +1120,8 @@ class HordeWorkerProcessManager:
             return
         if (time.time() - self._last_reference_refresh) < self._REFERENCE_REFRESH_INTERVAL_SECONDS:
             return
-        if self.horde_model_reference_manager is None:
+        manager = self.horde_model_reference_manager
+        if manager is None:
             return
 
         self._last_reference_refresh = time.time()
@@ -1128,7 +1129,7 @@ class HordeWorkerProcessManager:
 
         def _refresh() -> None:
             try:
-                self.horde_model_reference_manager.get_all_model_references_or_none(overwrite_existing=True)
+                manager.get_all_model_references_or_none(overwrite_existing=True)
                 logger.info("Refreshed model reference from source; broadcasting reload to subprocesses")
                 self._pending_reference_reload_broadcast = True
             except Exception as e:  # noqa: BLE001 - a refresh failure must not crash the worker

@@ -175,9 +175,10 @@ def run_level(level_json_path: Path, out_dir: Path, *, process_mode: str = "real
         # Drop the nested metrics snapshot before filtering kwargs into HarnessSummary;
         # the typed metrics object is passed through from harness_result directly below.
         harness_dict.pop("metrics", None)
+        harness_kwargs = {k: v for k, v in harness_dict.items() if k in HarnessSummary.model_fields and v is not None}
         result = LevelRunResult(
             level_id=level.id,
-            harness=HarnessSummary(**{k: v for k, v in harness_dict.items() if k in HarnessSummary.model_fields}),
+            harness=HarnessSummary(**harness_kwargs),
             metrics=harness_result.metrics,
         )
         if not harness_result.succeeded:

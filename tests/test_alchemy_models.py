@@ -59,7 +59,7 @@ class TestExpandOfferedForms:
     """Bridge-data forms expand to the individual form names the API expects."""
 
     def _bridge_data(self, **kwargs: object) -> reGenBridgeData:
-        return reGenBridgeData(api_key="0000000000", **kwargs)
+        return reGenBridgeData(api_key="0000000000", **kwargs)  # pyrefly: ignore
 
     def test_default_forms_without_caption_opt_in(self) -> None:
         """The default forms offer everything except caption (BLIP opt-in)."""

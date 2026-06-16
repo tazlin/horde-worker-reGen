@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from typing import Any
 
 import requests
 from loguru import logger
@@ -148,7 +149,7 @@ class TelemetryQuery:
             {"query": promql, "start": start_epoch, "end": end_epoch, "step": step_seconds},
         )
 
-    def _prometheus_request(self, path: str, params: dict[str, object]) -> list[dict] | None:
+    def _prometheus_request(self, path: str, params: dict[str, Any]) -> list[dict] | None:
         url = f"{self._endpoints.prometheus_url}{path}"
         try:
             response = self._session.get(url, params=params, timeout=self._endpoints.timeout_seconds)
@@ -235,7 +236,7 @@ class TelemetryQuery:
             )
         return spans
 
-    def _jaeger_request(self, path: str, params: dict[str, object]) -> dict | None:
+    def _jaeger_request(self, path: str, params: dict[str, Any]) -> dict | None:
         url = f"{self._endpoints.jaeger_url}{path}"
         try:
             response = self._session.get(url, params=params, timeout=self._endpoints.timeout_seconds)
