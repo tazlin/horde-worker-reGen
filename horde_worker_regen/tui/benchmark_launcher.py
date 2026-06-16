@@ -79,6 +79,7 @@ class BenchmarkOptions:
     include_concurrency: bool = True
     include_features: bool = True
     include_alchemy: bool = True
+    verbose: bool = False
 
     def build_command(self, out_dir: Path) -> list[str]:
         """Return the ``horde-benchmark ramp`` argv that runs this configuration into ``out_dir``."""
@@ -106,6 +107,8 @@ class BenchmarkOptions:
             command.append("--no-features")
         if not self.include_alchemy:
             command.append("--no-alchemy")
+        if self.verbose:
+            command.append("--verbose")
         return command
 
 
@@ -125,6 +128,8 @@ class LevelState:
     vram_used_mb: int | None = None
     gpu_busy_percent: float | None = None
     elapsed_seconds: float = 0.0
+    phase: str = ""
+    num_process_recoveries: int = 0
     outcome: str | None = None
     reasons: list[str] = dataclasses.field(default_factory=list)
     advisories: list[str] = dataclasses.field(default_factory=list)
@@ -179,6 +184,8 @@ class BenchmarkRunState:
             level.vram_used_mb = event.vram_used_mb
             level.gpu_busy_percent = event.gpu_busy_percent
             level.elapsed_seconds = event.elapsed_seconds
+            level.phase = event.phase
+            level.num_process_recoveries = event.num_process_recoveries
         elif isinstance(event, LevelFinished):
             level = self._level(event.level_id)
             level.outcome = event.outcome

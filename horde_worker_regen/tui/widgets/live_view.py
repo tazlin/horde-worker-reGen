@@ -121,6 +121,10 @@ class LiveView(VerticalScroll):
             f"{human_mb(process.ram_usage_bytes / 1024 / 1024)}   (peak {human_mb(process.ram_used_high_water_mb)})",
         )
         body.add_row("Heartbeat", self._heartbeat_text(heartbeat_age, process.is_alive))
+        # A running tally so a healthy-but-quiet process (the safety process especially, whose checks
+        # are each over in milliseconds) visibly does work rather than looking parked.
+        work_label = "Checked" if process.process_type == "SAFETY" else "Completed"
+        body.add_row(work_label, f"{process.num_jobs_completed:,} jobs")
 
         title = Text.assemble(
             (f" Process {process.process_id} ", "bold"),

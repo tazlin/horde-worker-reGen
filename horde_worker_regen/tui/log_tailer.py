@@ -7,6 +7,8 @@ truncation. The worker already writes these files, so the TUI adds no new disk w
 
 from __future__ import annotations
 
+import dataclasses
+import re
 from pathlib import Path
 
 _TAIL_BYTES = 64 * 1024
@@ -28,6 +30,85 @@ def discover_bridge_logs(log_dir: Path = LOG_DIR) -> list[Path]:
         result.append(main)
     result.extend(sorted(log_dir.glob("bridge_*.log"), key=lambda path: path.name))
     return result
+
+
+_DATE_TOKEN = re.compile(
+    r"[._](?P<date>\d{4}-\d{2}-\d{2}(?:[ _T]\d{2}[-:]\d{2}[-:]\d{2})?(?:[_.]\d+)?)$",
+)
+"""A trailing loguru rotation timestamp on a log stem (dot- or underscore-separated)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class BridgeLog:
+    """One discovered bridge log file, classified by which process wrote it and whether it is current."""
+
+    path: Path
+    process_key: str
+    """A stable key identifying the writing process ("main", "console", "1", "safety", ...)."""
+    process_label: str
+    """A friendly label for the process selector ("bridge (main)", "console output", ...)."""
+    is_current: bool
+    """True for the live (un-rotated) file; False for a rotated, dated historical file."""
+    history_label: str
+    """``"current"`` for the live file, otherwise the rotation date token (for the history selector)."""
+
+
+def _process_identity(stem: str) -> tuple[str, str]:
+    """Map a date-stripped bridge stem to a (stable key, friendly label) for its writing process."""
+    if stem == "bridge":
+        return "main", "bridge (main)"
+    rest = stem[len("bridge_") :] if stem.startswith("bridge_") else stem
+    if rest in ("main_console", "console"):
+        return "console", "console output"
+    if rest.isdigit():
+        return rest, f"subprocess {rest}"
+    return rest, rest.replace("_", " ")
+
+
+def _classify_bridge_log(path: Path) -> BridgeLog:
+    """Classify one ``bridge*.log`` path by process and current-vs-rotated, stripping any date token."""
+    stem = path.name[: -len(".log")] if path.name.endswith(".log") else path.name
+    date_match = _DATE_TOKEN.search(stem)
+    if date_match is not None:
+        history_label = date_match.group("date")
+        stem = stem[: date_match.start()]
+    else:
+        history_label = "current"
+    key, label = _process_identity(stem)
+    return BridgeLog(path, key, label, date_match is None, history_label)
+
+
+def _process_sort_key(process_key: str) -> tuple[int, int, str]:
+    """Order process keys for the selector: main, console, numbered subprocesses, then the rest."""
+    if process_key == "main":
+        return (0, 0, "")
+    if process_key == "console":
+        return (1, 0, "")
+    if process_key.isdigit():
+        return (2, int(process_key), "")
+    return (3, 0, process_key)
+
+
+def discover_bridge_logs_grouped(log_dir: Path = LOG_DIR) -> dict[str, list[BridgeLog]]:
+    """Group all ``bridge*.log`` files by writing process.
+
+    Returns an ordered mapping (main, console, numbered subprocesses, then others) of process key to
+    that process's files: the live file first, then rotated historical files newest-first. This lets
+    the logs view present one entry per process and tuck the dated rotations behind a history selector
+    instead of listing every rotated file as a confusing top-level peer.
+    """
+    if not log_dir.exists():
+        return {}
+    grouped: dict[str, list[BridgeLog]] = {}
+    for path in log_dir.glob("bridge*.log"):
+        entry = _classify_bridge_log(path)
+        grouped.setdefault(entry.process_key, []).append(entry)
+
+    for entries in grouped.values():
+        entries.sort(key=lambda entry: entry.history_label, reverse=True)  # newest date first
+        entries.sort(key=lambda entry: not entry.is_current)  # stable: the live file leads
+
+    return {key: grouped[key] for key in sorted(grouped, key=_process_sort_key)}
 
 
 class LogFollower:

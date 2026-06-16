@@ -50,6 +50,14 @@ _BLIP_PERIOD = 55
 _BLIP_LENGTH = 6
 _WARMUP_GRACE = 14
 
+# Simulated "no jobs available" stretch (with skip reasons) and a horde-set maintenance window, so the
+# condition-surfacing UI is demonstrable under --process-mode fake.
+_NO_WORK_PERIOD = 30
+_NO_WORK_LENGTH = 8
+_MOCK_SKIP_REASONS = {"models": 3, "max_pixels": 1, "nsfw": 2}
+_MAINTENANCE_PERIOD = 80
+_MAINTENANCE_LENGTH = 10
+
 
 class _MockProcess:
     """A single synthetic inference process: one warm-up, then a repeating job cycle."""
@@ -67,6 +75,7 @@ class _MockProcess:
         self.vram_high_water_mb = 1800
         self.ram_bytes = 6 * 1024**3
         self.last_inference_started = 0.0
+        self.num_jobs_completed = 0
 
     @property
     def state(self) -> str:
@@ -116,6 +125,7 @@ class _MockProcess:
         self._phase_started = now
         if completed:
             self.model = random.choice(_MOCK_MODELS)
+            self.num_jobs_completed += 1
         return completed
 
     @property
@@ -150,6 +160,47 @@ class _MockProcess:
             last_total_steps=self.total_steps if sampling else None,
             vram_used_high_water_mb=self.vram_high_water_mb,
             ram_used_high_water_mb=self.ram_bytes // 1024**2,
+            num_jobs_completed=self.num_jobs_completed,
+        )
+
+
+class _MockSafetyProcess:
+    """A synthetic safety process: idle between checks, but with a fresh heartbeat and a climbing tally.
+
+    Exercises the two safety-specific fixes at once: the idle heartbeat (so it never looks dead) and the
+    per-process "Checked" counter (so its otherwise-invisible work is visible).
+    """
+
+    def __init__(self, process_id: int) -> None:
+        self.process_id = process_id
+        self.num_jobs_completed = 0
+        self._busy_until = 0.0
+
+    def on_job_checked(self) -> None:
+        """Record a completed safety check and briefly flash the evaluating state."""
+        self.num_jobs_completed += 1
+        self._busy_until = time.monotonic() + 0.2
+
+    @property
+    def state(self) -> str:
+        """``EVALUATING_SAFETY`` during the brief check flash, otherwise ``WAITING_FOR_JOB``."""
+        return "EVALUATING_SAFETY" if time.monotonic() < self._busy_until else "WAITING_FOR_JOB"
+
+    def to_snapshot(self) -> ProcessSnapshot:
+        """Project the safety process into a wire snapshot (always alive, heartbeat fresh)."""
+        return ProcessSnapshot(
+            process_id=self.process_id,
+            process_type="SAFETY",
+            last_process_state=self.state,
+            is_alive=True,
+            is_busy=self.state != "WAITING_FOR_JOB",
+            last_heartbeat_timestamp=time.time(),
+            last_heartbeat_type="OTHER",
+            ram_usage_bytes=2 * 1024**3,
+            vram_usage_mb=0,
+            total_vram_mb=24000,
+            ram_used_high_water_mb=2 * 1024,
+            num_jobs_completed=self.num_jobs_completed,
         )
 
 
@@ -236,7 +287,8 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
     import horde_worker_regen
 
     channel = SupervisorChannel(connection)  # type: ignore[arg-type]
-    processes = [_MockProcess(0), _MockProcess(1)]
+    safety = _MockSafetyProcess(0)
+    processes = [_MockProcess(1), _MockProcess(2)]
     downloads = _MockDownloads()
 
     paused = False
@@ -278,19 +330,23 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
                 jobs_submitted += 1
                 jobs_popped += 1
                 kudos_session += random.uniform(8.0, 28.0)
+                safety.on_job_checked()
                 if random.random() < 0.04:
                     jobs_faulted += 1
 
         elapsed = time.time() - session_start
         blip = elapsed > _WARMUP_GRACE and (int(elapsed) % _BLIP_PERIOD) < _BLIP_LENGTH
+        no_work = not paused and elapsed > _WARMUP_GRACE and (int(elapsed) % _NO_WORK_PERIOD) < _NO_WORK_LENGTH
+        horde_maintenance = elapsed > _WARMUP_GRACE and (int(elapsed) % _MAINTENANCE_PERIOD) < _MAINTENANCE_LENGTH
         last_pop = max((p.last_inference_started for p in processes), default=0.0)
         session_hours = max(elapsed / 3600.0, 1e-6)
 
         snapshot = WorkerStateSnapshot(
             session_start_time=session_start,
             maintenance_mode=paused,
+            worker_details_maintenance=horde_maintenance,
             config=config,
-            processes=[process.to_snapshot() for process in processes],
+            processes=[safety.to_snapshot(), *(process.to_snapshot() for process in processes)],
             num_jobs_popped=jobs_popped,
             num_jobs_submitted=jobs_submitted,
             num_jobs_faulted=jobs_faulted,
@@ -299,6 +355,8 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
             user_info_failed_reason="HTTP error ((ConnectionError) simulated outage)" if blip else None,
             in_error_backoff=blip,
             seconds_since_last_pop=(time.time() - last_pop) if last_pop else None,
+            last_pop_no_jobs_available=no_work,
+            last_pop_skipped_reasons=dict(_MOCK_SKIP_REASONS) if no_work else {},
             api_messages=["Simulated network issue; the worker is retrying."] if blip else [],
             pending_megapixelsteps=random.randint(0, 12),
             jobs_pending_inference=sum(1 for p in processes if p.state == "PRELOADING_MODEL"),

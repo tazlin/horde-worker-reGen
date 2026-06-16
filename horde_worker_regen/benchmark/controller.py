@@ -54,6 +54,7 @@ from horde_worker_regen.benchmark.report import (
     synthesize_bridge_data,
 )
 from horde_worker_regen.benchmark.soak import build_validation_level
+from horde_worker_regen.process_management.worker_entry_points import WORKER_LOG_VERBOSITY_ENV
 
 _SUBPROCESS_GRACE_SECONDS = 120.0
 _LOG_TAIL_LINES = 100
@@ -177,6 +178,7 @@ class BenchmarkController:
         soak_seconds: float = 300.0,
         progress_sink: ProgressSink | None = None,
         warm: bool = False,
+        verbose: bool = False,
     ) -> None:
         """Initialize the controller.
 
@@ -193,6 +195,8 @@ class BenchmarkController:
             warm: Run fixed-scenario levels against a single warm worker reused across the ramp
                 (one child-process startup instead of one per level). Soak/validation levels still
                 use their own isolated subprocess.
+            verbose: Raise the spawned worker children's log verbosity to TRACE so their per-process
+                logs capture the full cold-start detail (for diagnosing slow/wedged startups).
         """
         self._ladder = ladder
         self._out_dir = out_dir
@@ -204,7 +208,12 @@ class BenchmarkController:
         self._soak_seconds = soak_seconds
         self._sink = progress_sink if progress_sink is not None else NullProgressSink()
         self._warm = warm
+        self._verbose = verbose
         self._warm_driver: _WarmSessionDriver | None = None
+
+        if verbose:
+            # Spawned worker children inherit this; resolve_worker_log_verbosity() maps 5 to TRACE.
+            os.environ[WORKER_LOG_VERBOSITY_ENV] = "5"
 
         self._tier_baselines: dict[str, TierBaseline] = {}
         self._failed_tier_baselines: set[str] = set()
@@ -649,10 +658,17 @@ class BenchmarkController:
         Returns ``(exit_code, hung)``; on a timeout the subprocess is killed and ``hung`` is True.
         """
         live_path = self._out_dir / f"level_{level.id}.live.json"
+        subprocess_log_path = self._out_dir / f"level_{level.id}.subprocess.log"
         deadline = time.time() + level.timeout_seconds + _SUBPROCESS_GRACE_SECONDS
         last_live_signature: str | None = None
 
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Capture the level subprocess's stdout/stderr (and, by inheritance under spawn, its worker
+        # children's) to a per-level file. This was previously discarded to DEVNULL, which is the main
+        # reason a crashed or wedged child left "no useful logs": its traceback, OOM message, and
+        # ComfyUI console output had nowhere to land. The structured `level_<id>.log` only carries the
+        # manager's own loguru output, never the children's.
+        subprocess_log = subprocess_log_path.open("w", encoding="utf-8", errors="replace")
+        process = subprocess.Popen(command, stdout=subprocess_log, stderr=subprocess.STDOUT)
         try:
             while True:
                 try:
@@ -669,6 +685,7 @@ class BenchmarkController:
             if process.poll() is None:
                 with contextlib.suppress(Exception):
                     process.kill()
+            subprocess_log.close()
 
     def _emit_live_progress(self, level: RampLevel, live_path: Path, last_signature: str | None) -> str | None:
         """Emit a :class:`LevelProgress` event when the level's live snapshot has changed; return its signature."""
@@ -688,6 +705,9 @@ class BenchmarkController:
                 vram_used_mb=live.vram_used_mb,
                 gpu_busy_percent=live.gpu_busy_percent,
                 elapsed_seconds=live.elapsed_seconds,
+                phase=live.phase,
+                process_summary=live.process_summary,
+                num_process_recoveries=live.num_process_recoveries,
             ),
         )
         return signature

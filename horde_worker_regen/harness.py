@@ -66,6 +66,17 @@ from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
 
 HarnessProcessMode = Literal["fake", "dry_run", "real"]
 
+_REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS = 600
+"""Startup budget (preload/process timeout) handed to a real-mode worker under benchmarking.
+
+Benchmarking deliberately cold-starts the worker, and on heavier tiers loads large models, so a
+cold ``hordelib.initialise`` plus first model load can take well over a minute. The production
+stuck-start/all-unresponsive timers are tuned for fast API failover and would kill that legitimate
+startup, triggering a kill/respawn storm that only deepens the contention. The level subprocess
+timeout (and the lifecycle's dead-child detection) are the real backstops in a benchmark, so real
+mode runs with this generous budget instead. Fake/dry-run start instantly and keep the defaults, so
+the recovery machinery stays exercised by the tests."""
+
 
 @dataclass
 class HarnessConfig:
@@ -292,6 +303,10 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
     }
     if config.alchemy_forms or config.soak_alchemy_templates:
         bridge_data_fields["alchemist"] = True
+    if config.process_mode == "real":
+        startup_budget = max(_REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS, int(config.timeout_seconds))
+        bridge_data_fields["preload_timeout"] = startup_budget
+        bridge_data_fields["process_timeout"] = startup_budget
     bridge_data_fields.update(config.bridge_data_overrides)
     bridge_data = reGenBridgeData(**bridge_data_fields)  # type: ignore[arg-type]
     # Prevent the manager from watching/reloading a bridge data file from disk.
@@ -790,6 +805,11 @@ def _build_warm_bridge_data(
         "dry_run_skip_inference": process_mode != "real",
         "dry_run_skip_safety": process_mode != "real",
     }
+    if process_mode == "real":
+        # See _REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS: the warm worker cold-starts once, and must not
+        # be torn down by the production startup timers before it finishes coming up.
+        fields["preload_timeout"] = _REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS
+        fields["process_timeout"] = _REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS
     bridge_data = reGenBridgeData(**fields)  # type: ignore[arg-type]
     bridge_data._loaded_from_env_vars = True
     return bridge_data
@@ -877,13 +897,27 @@ class WarmHarnessSession:
         """Shut the worker down."""
         await self.aclose()
 
-    async def _wait_for_inference_ready(self, timeout_seconds: float = 120.0) -> None:
-        """Wait until at least one inference process exists (best-effort warmup gate)."""
+    async def _wait_for_inference_ready(self, timeout_seconds: float = 600.0) -> None:
+        """Wait until an inference process is actually ready to take a job (warm gate).
+
+        Waiting for a process to merely *exist* (the historical behaviour) let the first level start
+        while the worker was still doing its minute-plus cold start, so the level "ran" against a
+        not-yet-ready worker. Gate on real readiness instead: a process the scheduler would hand a job
+        to (WAITING_FOR_JOB / PRELOADED). Best-effort: on timeout we log and proceed, leaving the
+        per-level timeout as the backstop.
+        """
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
-            if self._manager is not None and self._manager._process_map.num_inference_processes() >= 1:
+            if (
+                self._manager is not None
+                and self._manager._process_map.get_first_available_inference_process() is not None
+            ):
                 return
             await asyncio.sleep(0.1)
+        logger.warning(
+            f"Warm worker: no inference process became ready within {timeout_seconds:.0f}s; "
+            "starting levels anyway (the per-level timeout will catch a wedged worker)",
+        )
 
     async def aclose(self) -> None:
         """Gracefully shut the worker down and await its main loop."""

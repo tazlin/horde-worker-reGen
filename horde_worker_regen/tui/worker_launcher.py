@@ -155,8 +155,15 @@ class WorkerSupervisor:
         self._restart_attempts = 0
         self._spawn()
 
-    def _spawn(self) -> None:
-        """Create a fresh pipe and worker process (the pipe transport seam)."""
+    def _spawn(self, *, status: SupervisorStatus = SupervisorStatus.STARTING) -> None:
+        """Create a fresh pipe and worker process (the pipe transport seam).
+
+        Drops any retained snapshot up front: the new worker has not reported yet, so keeping the old
+        worker's last frame would let it age past the staleness threshold and read as UNRESPONSIVE
+        during a relaunch. ``status`` lets a restart present a single ``RESTARTING`` phase instead of
+        flickering through ``STARTING``.
+        """
+        self.latest_snapshot = None
         parent_connection, child_connection = self._ctx.Pipe(duplex=True)
         target = _target_for_mode(self._mode)
         process = self._ctx.Process(  # type: ignore[attr-defined]
@@ -172,7 +179,7 @@ class WorkerSupervisor:
         self._process = process
         self._connection = parent_connection
         self._last_spawn_time = time.time()
-        self._set_status(SupervisorStatus.STARTING)
+        self._set_status(status)
         logger.info(f"Launched worker (mode={self._mode.value}, pid={process.pid}).")
 
     def _set_status(self, status: SupervisorStatus) -> None:
@@ -353,12 +360,29 @@ class WorkerSupervisor:
         self._graceful_stop_deadline = time.time() + timeout
 
     def restart(self) -> None:
-        """Stop the worker and start it again (blocking; for owners that drive lifecycle synchronously)."""
-        self.stop()
-        self.start()
+        """Stop the worker and start it again (blocking; for owners that drive lifecycle synchronously).
 
-    def stop(self, *, timeout: float = GRACEFUL_STOP_TIMEOUT_SECONDS) -> None:
-        """Gracefully shut the worker down (blocking), terminating it if it overruns the timeout."""
+        Presented as a single ``RESTARTING`` phase from the instant it begins: the stale snapshot is
+        dropped and the status is pinned to ``RESTARTING`` across the stop and relaunch (the stop is
+        told not to fall back to ``STOPPED``), so the dashboard shows a calm "relaunching" rather than
+        ageing the dead worker's last frame into the alarming ``UNRESPONSIVE``. The next fresh snapshot
+        flips the status to ``RUNNING`` (see :meth:`drain_snapshots`).
+        """
+        self.latest_snapshot = None
+        self._set_status(SupervisorStatus.RESTARTING)
+        self.stop(set_stopped_status=False)
+        # Mirror start()'s lifecycle reset, but keep the RESTARTING phase instead of STARTING.
+        self._intentional_stop = False
+        self._graceful_stop_deadline = 0.0
+        self._restart_attempts = 0
+        self._spawn(status=SupervisorStatus.RESTARTING)
+
+    def stop(self, *, timeout: float = GRACEFUL_STOP_TIMEOUT_SECONDS, set_stopped_status: bool = True) -> None:
+        """Gracefully shut the worker down (blocking), terminating it if it overruns the timeout.
+
+        ``set_stopped_status=False`` lets :meth:`restart` keep the ``RESTARTING`` phase across the stop
+        instead of briefly flashing ``STOPPED`` between the teardown and the relaunch.
+        """
         self._intentional_stop = True
         process = self._process
         if process is not None and process.is_alive():
@@ -370,7 +394,8 @@ class WorkerSupervisor:
                 process.join(5.0)
         self._cleanup_process()
         self._graceful_stop_deadline = 0.0
-        self._set_status(SupervisorStatus.STOPPED)
+        if set_stopped_status:
+            self._set_status(SupervisorStatus.STOPPED)
 
     def close(self) -> None:
         """Release the worker when the frontend exits.
@@ -382,9 +407,11 @@ class WorkerSupervisor:
         self.stop()
 
     def _cleanup_process(self) -> None:
-        """Close the connection and drop the process handle."""
+        """Close the connection and drop the process handle (and the now-dead worker's last snapshot)."""
         if self._connection is not None:
             with contextlib.suppress(Exception):
                 self._connection.close()
             self._connection = None
         self._process = None
+        # The worker that produced it is gone; keeping it would age into a false UNRESPONSIVE.
+        self.latest_snapshot = None

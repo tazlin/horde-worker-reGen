@@ -273,6 +273,8 @@ class AttachedWorkerSupervisor:
         """Reflect a lost/absent host connection as a stopped, not-running worker."""
         self._status = SupervisorStatus.STOPPED
         self._worker_running = False
+        # Drop the last frame so a dropped connection does not age into a false UNRESPONSIVE.
+        self.latest_snapshot = None
 
     def _apply(self, message: dict[str, object]) -> None:
         """Update local state from a host frame (snapshot or status; hello is ignored)."""
@@ -288,6 +290,10 @@ class AttachedWorkerSupervisor:
         if isinstance(status_value, str):
             with contextlib.suppress(ValueError):
                 self._status = SupervisorStatus(status_value)
+                # The host streams no snapshots while stopped/restarting; drop the last frame so it
+                # cannot age into a false UNRESPONSIVE on this attached session.
+                if self._status in (SupervisorStatus.STOPPED, SupervisorStatus.RESTARTING):
+                    self.latest_snapshot = None
         restart_attempts = message.get("restart_attempts", 0)
         self._restart_attempts = restart_attempts if isinstance(restart_attempts, int) else 0
         self._worker_running = bool(message.get("worker_running", False))

@@ -120,7 +120,7 @@ def derive(
             WorkerPhase.RESTARTING,
             HealthStatus.WARN,
             "Restarting worker…",
-            "Relaunching after an unexpected exit.",
+            "Relaunching the worker. This is expected after a manual restart or an automatic recovery.",
             [],
             True,
         )
@@ -173,12 +173,12 @@ def derive(
             checks,
             False,
         )
-    if snapshot.maintenance_mode:
+    if snapshot.maintenance_mode or snapshot.worker_details_maintenance or snapshot.worker_details_paused:
         return HealthReport(
             WorkerPhase.PAUSED,
             HealthStatus.WARN,
             "Paused",
-            "Not popping new jobs. In-flight jobs will finish.",
+            _maintenance_detail(snapshot),
             checks,
             False,
         )
@@ -210,6 +210,20 @@ def derive(
             False,
         )
 
+    if snapshot.last_pop_no_jobs_available:
+        detail = "No jobs were available on the last check (low demand or your config matched none)."
+        why = summarize_skips(snapshot.last_pop_skipped_reasons)
+        if why:
+            detail += f" Recently skipped: {why}."
+        return HealthReport(
+            WorkerPhase.READY,
+            HealthStatus.OK,
+            "Ready; no jobs available right now",
+            detail,
+            checks,
+            False,
+        )
+
     return HealthReport(
         WorkerPhase.READY,
         HealthStatus.OK,
@@ -218,6 +232,20 @@ def derive(
         checks,
         False,
     )
+
+
+def summarize_skips(skipped_reasons: dict[str, int], *, limit: int = 4) -> str:
+    """Render the last pop's skip reasons as a compact, count-ordered phrase ("3 models · 1 nsfw")."""
+    ranked = sorted(((reason, count) for reason, count in skipped_reasons.items() if count), key=lambda r: -r[1])
+    return " · ".join(f"{count} {reason}" for reason, count in ranked[:limit])
+
+
+def _maintenance_detail(snapshot: WorkerStateSnapshot) -> str:
+    """Explain a paused/maintenance worker, naming the horde as the source when it is."""
+    if snapshot.worker_details_maintenance or snapshot.worker_details_paused:
+        what = "maintenance" if snapshot.worker_details_maintenance else "paused"
+        return f"The horde has this worker set to {what}; it will not be given new jobs. In-flight jobs finish."
+    return "Not popping new jobs (maintenance mode). In-flight jobs will finish."
 
 
 def _is_warming_up(snapshot: WorkerStateSnapshot) -> bool:
@@ -290,6 +318,10 @@ def _build_checks(snapshot: WorkerStateSnapshot, snapshot_age: float | None) -> 
         )
     else:
         checks.append(HealthCheck("Job health", HealthStatus.OK, "No recent failures or recoveries"))
+
+    skips = summarize_skips(snapshot.last_pop_skipped_reasons)
+    if skips:
+        checks.append(HealthCheck("Work", HealthStatus.INFO, f"Last pop skipped: {skips}"))
 
     if snapshot_age is not None:
         responsive = snapshot_age <= STALE_SNAPSHOT_SECONDS

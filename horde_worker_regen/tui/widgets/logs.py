@@ -9,7 +9,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, RichLog, Select
 
-from horde_worker_regen.tui.log_tailer import LogFollower, discover_bridge_logs
+from horde_worker_regen.tui.log_tailer import BridgeLog, LogFollower, discover_bridge_logs_grouped
 
 _LEVEL_RANK: dict[str, int] = {
     "TRACE": 5,
@@ -42,8 +42,16 @@ class LogsView(Vertical):
         height: 3;
         padding: 0 1;
     }
-    LogsView #log-controls Select {
-        width: 32;
+    LogsView #log-process {
+        width: 26;
+        margin-right: 1;
+    }
+    LogsView #log-history {
+        width: 22;
+        margin-right: 1;
+    }
+    LogsView #log-level {
+        width: 14;
         margin-right: 1;
     }
     LogsView #log-search {
@@ -59,14 +67,21 @@ class LogsView(Vertical):
         super().__init__()
         self._follower: LogFollower | None = None
         self._current_path: Path | None = None
-        self._known_files: list[Path] = []
+        self._grouped: dict[str, list[BridgeLog]] = {}
+        self._process_keys: list[str] = []
+        self._history_labels: list[str] = []
+        self._process_key: str | None = None
+        self._history_label = "current"
+        self._updating = False
+        """Set while mutating the selects programmatically so their Changed events are ignored."""
         self._min_rank = 0
         self._search = ""
 
     def compose(self) -> ComposeResult:
-        """Lay out the file/level/search controls and the log output."""
+        """Lay out the process/history/level/search controls and the log output."""
         with Horizontal(id="log-controls"):
-            yield Select((), prompt="No logs yet", id="log-file", allow_blank=True)
+            yield Select((), prompt="waiting for logs…", id="log-process", allow_blank=True)
+            yield Select((("current", "current"),), value="current", id="log-history", allow_blank=True)
             yield Select(
                 ((level, level) for level in _LEVEL_CHOICES),
                 value="ALL",
@@ -78,27 +93,86 @@ class LogsView(Vertical):
 
     def on_mount(self) -> None:
         """Discover log files and begin polling."""
-        self._refresh_file_options(select_first=True)
+        self._refresh(select_first=True)
         self.set_interval(0.5, self._poll)
 
-    def _refresh_file_options(self, *, select_first: bool) -> None:
-        """Re-scan the logs directory and update the file selector if the set changed."""
-        files = discover_bridge_logs()
-        if files == self._known_files:
-            return
-        self._known_files = files
-        select = self.query_one("#log-file", Select)
-        select.set_options((self._label_for(path), str(path)) for path in files)
-        if select_first and files and self._current_path is None:
-            select.value = str(files[0])
-            self._switch_file(files[0])
+    def _refresh(self, *, select_first: bool) -> None:
+        """Re-scan the logs directory, refreshing the process/history selectors only when they change."""
+        self._grouped = discover_bridge_logs_grouped()
+        keys = list(self._grouped.keys())
+        if keys != self._process_keys:
+            self._process_keys = keys
+            self._rebuild_process_options()
 
-    @staticmethod
-    def _label_for(path: Path) -> str:
-        """A friendly selector label for a bridge log path."""
-        if path.name == "bridge.log":
-            return "bridge (main)"
-        return path.stem.replace("bridge_", "subprocess ")
+        if self._process_key is None and select_first and keys:
+            self._select_process(keys[0], programmatic=True)
+        elif self._process_key is not None and self._process_key in self._grouped:
+            labels = [entry.history_label for entry in self._grouped[self._process_key]]
+            if labels != self._history_labels:
+                self._rebuild_history_options(reset=False)
+            # The live file is followed across rotations by LogFollower, but pick it up if it only
+            # appeared after the process was first selected.
+            if self._history_label == "current":
+                self._follow(self._process_key, "current")
+
+    def _rebuild_process_options(self) -> None:
+        """Repopulate the process selector from the current process keys (one entry per process)."""
+        select = self.query_one("#log-process", Select)
+        options = [(self._grouped[key][0].process_label, key) for key in self._process_keys]
+        self._updating = True
+        try:
+            select.set_options(options)
+            if self._process_key in self._grouped:
+                select.value = self._process_key
+        finally:
+            self._updating = False
+
+    def _rebuild_history_options(self, *, reset: bool) -> None:
+        """Repopulate the history selector for the selected process (live file first, then dates)."""
+        if self._process_key is None:
+            return
+        entries = self._grouped.get(self._process_key, [])
+        labels = [entry.history_label for entry in entries]
+        self._history_labels = labels
+        target = "current" if reset else self._history_label
+        if target not in labels:
+            target = labels[0] if labels else "current"
+        self._history_label = target
+        select = self.query_one("#log-history", Select)
+        self._updating = True
+        try:
+            select.set_options([(label, label) for label in labels])
+            if labels:
+                select.value = target
+        finally:
+            self._updating = False
+
+    def _select_process(self, key: str, *, programmatic: bool) -> None:
+        """Switch the active process: reset history to its live file and begin following it."""
+        if programmatic:
+            select = self.query_one("#log-process", Select)
+            self._updating = True
+            try:
+                select.value = key
+            finally:
+                self._updating = False
+        self._process_key = key
+        self._rebuild_history_options(reset=True)
+        self._follow(key, self._history_label)
+
+    def _entry_for(self, key: str, history_label: str) -> BridgeLog | None:
+        """Resolve a (process, history) pair to a log file, falling back to the newest available."""
+        entries = self._grouped.get(key, [])
+        for entry in entries:
+            if entry.history_label == history_label:
+                return entry
+        return entries[0] if entries else None
+
+    def _follow(self, key: str, history_label: str) -> None:
+        """Begin following the file for a (process, history) pair if it is not already current."""
+        entry = self._entry_for(key, history_label)
+        if entry is not None and entry.path != self._current_path:
+            self._switch_file(entry.path)
 
     def _switch_file(self, path: Path) -> None:
         """Begin following a new file, clearing the view and re-priming the tail."""
@@ -109,13 +183,17 @@ class LogsView(Vertical):
         log.write(Text(f"── following {path} ──", style="italic grey62"))
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        """Handle file/level selection changes."""
-        if event.select.id == "log-file":
-            if event.value is Select.BLANK:
-                return
-            path = Path(str(event.value))
-            if path != self._current_path:
-                self._switch_file(path)
+        """Handle process/history/level selection changes (ignoring programmatic updates)."""
+        if self._updating:
+            return
+        if event.select.id == "log-process":
+            if event.value is not Select.BLANK and str(event.value) != self._process_key:
+                self._select_process(str(event.value), programmatic=False)
+        elif event.select.id == "log-history":
+            if event.value is not Select.BLANK and str(event.value) != self._history_label:
+                self._history_label = str(event.value)
+                if self._process_key is not None:
+                    self._follow(self._process_key, self._history_label)
         elif event.select.id == "log-level":
             self._min_rank = _LEVEL_RANK.get(str(event.value), 0) if event.value != "ALL" else 0
             self._reprime()
@@ -133,7 +211,7 @@ class LogsView(Vertical):
 
     def _poll(self) -> None:
         """Append any new (filtered) lines and keep the file list current."""
-        self._refresh_file_options(select_first=True)
+        self._refresh(select_first=True)
         if self._follower is None:
             return
         new_lines = self._follower.poll()

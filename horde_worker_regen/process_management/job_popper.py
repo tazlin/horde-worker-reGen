@@ -512,6 +512,7 @@ class JobPopper:
 
         if job_pop_response.id_ is None:
             self._state.last_pop_no_jobs_available = True
+            self._state.last_pop_skipped_reasons = skipped_reasons
             logger.info(info_string)
             self._pop_throttler.on_no_jobs_available(
                 cur_time,
@@ -524,6 +525,7 @@ class JobPopper:
             return
 
         self._state.last_pop_no_jobs_available = False
+        self._state.last_pop_skipped_reasons = {}
         self._pop_throttler.on_job_popped()
 
         has_loras = job_pop_response.payload.loras is not None and len(job_pop_response.payload.loras) > 0

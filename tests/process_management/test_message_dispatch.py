@@ -132,6 +132,22 @@ class TestReceiveAndHandleProcessMessages:
             total_vram_mb=4096,
         )
 
+    def test_record_completed_job_increments_producing_process(self) -> None:
+        """A result message bumps the per-process completed-work counter on the producing slot."""
+        process_info = make_mock_process_info(0)
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: process_info}))
+        assert process_info.num_jobs_completed == 0
+
+        message_dispatcher._record_completed_job(0)
+        message_dispatcher._record_completed_job(0)
+
+        assert process_info.num_jobs_completed == 2
+
+    def test_record_completed_job_unknown_process_is_noop(self) -> None:
+        """A result from a process not in the map is ignored rather than raising."""
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({}))
+        message_dispatcher._record_completed_job(99)  # must not raise
+
     async def test_state_change_to_inference_starting_updates_model_map(self) -> None:
         """When a process state changes to INFERENCE_STARTING, the model map should be updated."""
         process_info = make_mock_process_info(0, model_name="test_model")

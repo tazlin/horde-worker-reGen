@@ -169,6 +169,16 @@ class HordeProcess(abc.ABC):
     _last_heartbeat_time: float = 0.0
     _last_heartbeat_type: HordeHeartbeatType = HordeHeartbeatType.OTHER
 
+    _IDLE_HEARTBEAT_STATES: frozenset[HordeProcessState] = frozenset(
+        {
+            HordeProcessState.WAITING_FOR_JOB,
+            HordeProcessState.INFERENCE_COMPLETE,
+            HordeProcessState.ALCHEMY_COMPLETE,
+            HordeProcessState.PRELOADED_MODEL,
+        },
+    )
+    """States in which it is safe to emit a liveness heartbeat: alive and looping, but not mid-job."""
+
     def send_heartbeat_message(
         self,
         heartbeat_type: HordeHeartbeatType,
@@ -205,6 +215,21 @@ class HordeProcess(abc.ABC):
 
         self._last_heartbeat_type = heartbeat_type
         self._last_heartbeat_time = time.time()
+
+    def _maybe_send_idle_heartbeat(self) -> None:
+        """Emit a throttled liveness heartbeat while idle so the dashboard's heartbeat stays fresh.
+
+        Without this an idle process never refreshes its heartbeat timestamp and reads as unresponsive
+        in the live view; the safety process is the worst case, sitting in ``WAITING_FOR_JOB`` between
+        checks that are each over in milliseconds. Restricted to idle states and gated by an explicit
+        interval check (the heartbeat throttle only gates *type changes*) so it never interleaves with
+        the ``INFERENCE_STEP`` stream that hung-process detection relies on.
+        """
+        if self._last_sent_process_state not in self._IDLE_HEARTBEAT_STATES:
+            return
+        if time.time() - self._last_heartbeat_time < self._heartbeat_limit_interval_seconds:
+            return
+        self.send_heartbeat_message(HordeHeartbeatType.OTHER)
 
     @abstractmethod
     def cleanup_for_exit(self) -> None:
@@ -283,6 +308,7 @@ class HordeProcess(abc.ABC):
             time.sleep(self._loop_interval)
             self.receive_and_handle_control_messages()
             self.worker_cycle()
+            self._maybe_send_idle_heartbeat()
 
         # We escaped the loop, so the process is ending
         self.send_process_state_change_message(

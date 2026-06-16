@@ -180,6 +180,26 @@ def test_format_renders_each_event() -> None:
         assert line is not None and line.strip()
 
 
+def test_progress_line_shows_phase_and_restarts() -> None:
+    """A still-starting level (no jobs yet) renders its phase and surfaces any process restarts."""
+    event = LevelProgress(
+        level_id="A-sd15",
+        jobs_completed=0,
+        jobs_expected=4,
+        elapsed_seconds=42.0,
+        phase="initializing inference process",
+        process_summary="inf#1=PROCESS_STARTING safety#0=PROCESS_STARTING",
+        num_process_recoveries=3,
+    )
+    line = format_progress_event(event)
+    assert line is not None
+    assert "initializing inference process" in line
+    assert "3 process restart" in line
+    # The per-process detail is opt-in (verbose) only.
+    assert "inf#1=PROCESS_STARTING" not in line
+    assert "inf#1=PROCESS_STARTING" in (format_progress_event(event, verbose=True) or "")
+
+
 @pytest.mark.e2e
 def test_fake_ramp_emits_lifecycle_events(tmp_path: Path) -> None:
     """A fake-mode ramp writes the ramp/level lifecycle events to progress.jsonl."""

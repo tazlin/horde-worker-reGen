@@ -464,6 +464,45 @@ class ProcessLifecycleManager:
 
         logger.info(f"Ended safety process {process_info.process_id}")
 
+    def _initiate_safety_replacement(self) -> None:
+        """Flag the safety pool for replacement so the control loop's state machine restarts it.
+
+        Setting this flag is the trigger; `_replace_all_safety_process` (run each control-loop tick)
+        then ends, deletes, and restarts the safety process across the next few ticks. The only other
+        place this flag is set requires a *running* safety process and an in-flight job, so without
+        this a safety process that wedges or dies during startup would never be recovered: it would
+        sit pinned at PROCESS_STARTING while the stuck-detection logged a misleading "replacing it"
+        forever without doing anything.
+        """
+        self._safety_processes_should_be_replaced = True
+
+    def _reap_if_crashed(self, process_info: HordeProcessInfo) -> bool:
+        """Recover a child that has already exited (crash, sys.exit, segfault) instead of waiting on a timer.
+
+        A dead child sends no further messages, so the state-timeout checks in `replace_hung_processes`
+        would otherwise leave it pinned at its last reported state forever. Detecting the exit directly
+        lets us restart it promptly and log the exit code so the cause is visible.
+
+        Returns:
+            True if the process was found dead and a replacement was initiated.
+        """
+        if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
+            return False
+        if process_info.mp_process.is_alive():
+            return False
+
+        exit_code = process_info.mp_process.exitcode
+        logger.error(
+            f"{process_info} exited unexpectedly (exitcode={exit_code}) while "
+            f"{process_info.last_process_state.name}; recovering",
+        )
+        if process_info.process_type == HordeProcessType.SAFETY:
+            self._initiate_safety_replacement()
+            self._replace_all_safety_process()
+        elif process_info.process_type == HordeProcessType.INFERENCE:
+            self._replace_inference_process(process_info)
+        return True
+
     def _replace_all_safety_process(self) -> None:
         """Replace all of the safety processes."""
         if not self._safety_processes_should_be_replaced:
@@ -606,6 +645,9 @@ class ProcessLifecycleManager:
         if time_elapsed > timeout and process_info.last_process_state == state:
             logger.error(f"{process_info} {error_message}, replacing it")
             if process_info.process_type == HordeProcessType.SAFETY:
+                # Arm the replacement before driving it: `_replace_all_safety_process` no-ops unless the
+                # flag is set, so omitting this (the historical bug) made the safety branch a silent no-op.
+                self._initiate_safety_replacement()
                 self._replace_all_safety_process()
             if process_info.process_type == HordeProcessType.INFERENCE:
                 self._replace_inference_process(process_info)
@@ -628,7 +670,12 @@ class ProcessLifecycleManager:
         now = time.time()
 
         any_replaced = False
-        for process_info in self._process_map.values():
+        # Snapshot the values: recovering a process can mutate the map (safety end/delete/restart).
+        for process_info in list(self._process_map.values()):
+            if self._reap_if_crashed(process_info):
+                any_replaced = True
+                self._recently_recovered = True
+                continue
             if self._process_map.is_stuck_on_inference(
                 process_info.process_id,
                 bridge_data.inference_step_timeout,

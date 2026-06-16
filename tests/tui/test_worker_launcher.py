@@ -6,12 +6,18 @@ import time
 
 import pytest
 
+from horde_worker_regen.process_management.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.worker_launcher import (
     SupervisorStatus,
     WorkerProcessMode,
     WorkerSupervisor,
 )
+
+
+def _stub_snapshot() -> WorkerStateSnapshot:
+    """A minimal snapshot to stand in for a now-dead worker's last frame."""
+    return WorkerStateSnapshot(config=WorkerConfigSummary(dreamer_name="Test", worker_version="12.0.0"))
 
 
 class _FakeConn:
@@ -198,6 +204,37 @@ def test_graceful_stop_terminates_worker_that_overruns_deadline() -> None:
 
     supervisor.tick()
     assert not supervisor.is_alive()
+    assert supervisor.status is SupervisorStatus.STOPPED
+
+
+def test_restart_clears_stale_snapshot_and_shows_restarting() -> None:
+    """A user restart drops the dead worker's last frame and presents a single RESTARTING phase.
+
+    Guards against the false UNRESPONSIVE: with the stale snapshot cleared, the dashboard derives a
+    calm INITIALIZING/RESTARTING rather than ageing the old frame into the red staleness state.
+    """
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    supervisor.latest_snapshot = _stub_snapshot()
+
+    supervisor.restart()
+
+    assert supervisor.latest_snapshot is None
+    assert supervisor.status is SupervisorStatus.RESTARTING
+    assert ctx.process_count == 2  # the worker was relaunched
+
+
+def test_stop_clears_snapshot() -> None:
+    """An explicit stop drops the last frame so a stopped worker shows no stale live data."""
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    supervisor.latest_snapshot = _stub_snapshot()
+
+    supervisor.stop()
+
+    assert supervisor.latest_snapshot is None
     assert supervisor.status is SupervisorStatus.STOPPED
 
 

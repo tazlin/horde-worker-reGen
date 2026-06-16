@@ -26,8 +26,13 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.process_info import HordeProcessInfo
     from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
 
-SUPERVISOR_PROTOCOL_VERSION = 1
-"""Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect."""
+SUPERVISOR_PROTOCOL_VERSION = 2
+"""Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
+
+v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
+last-pop no-jobs/skip-reason fields. All are defaulted, so the change is wire-compatible, but the
+bump keeps host/attach diagnostics honest.
+"""
 
 RECENT_JOBS_IN_SNAPSHOT = 25
 """How many of the most recent finished-job records to carry in a snapshot (bounds payload size)."""
@@ -95,6 +100,9 @@ class ProcessSnapshot(BaseModel):
     vram_used_high_water_mb: int = 0
     ram_used_high_water_mb: int = 0
 
+    num_jobs_completed: int = 0
+    """Jobs/forms this slot has finished (inference, safety check, or alchemy form); resets on replace."""
+
     @classmethod
     def from_process_info(cls, info: HordeProcessInfo) -> ProcessSnapshot:
         """Build a snapshot from a live ``HordeProcessInfo`` (read-only; no import coupling)."""
@@ -124,6 +132,7 @@ class ProcessSnapshot(BaseModel):
             last_total_steps=info.last_total_steps,
             vram_used_high_water_mb=info.vram_used_high_water_mb,
             ram_used_high_water_mb=info.ram_used_high_water_mb,
+            num_jobs_completed=info.num_jobs_completed,
         )
 
 
@@ -251,6 +260,11 @@ class WorkerStateSnapshot(BaseModel):
 
     shutting_down: bool = False
     maintenance_mode: bool = False
+    """Maintenance: the local pop loop hit maintenance, or the operator paused the worker locally."""
+    worker_details_maintenance: bool = False
+    """The horde's worker-details API reports this worker in maintenance (polled, advisory)."""
+    worker_details_paused: bool = False
+    """The horde's worker-details API reports this worker paused (polled, advisory)."""
     too_many_consecutive_failed_jobs: bool = False
 
     # Connectivity / health signals the worker already tracks (surfaced for the status monitor).
@@ -266,6 +280,10 @@ class WorkerStateSnapshot(BaseModel):
     """How many jobs have failed back-to-back (resets on a success)."""
     seconds_since_last_pop: float | None = None
     """Seconds since the worker last successfully popped a job (None if it never has)."""
+    last_pop_no_jobs_available: bool = False
+    """The most recent successful pop returned no job (a short-term 'no work right now' signal)."""
+    last_pop_skipped_reasons: dict[str, int] = Field(default_factory=dict)
+    """Why the last 'no job available' pop skipped work, per reason (models/nsfw/max_pixels/...)."""
     api_messages: list[str] = Field(default_factory=list)
     """Operator/maintenance messages delivered by the horde in pop responses."""
 

@@ -60,6 +60,9 @@ def _build_live_snapshot(metrics: RunMetricsSnapshot, elapsed_seconds: float) ->
         vram_used_mb=vram_used_mb,
         gpu_busy_percent=metrics.gpu_utilization_mean_percent,
         elapsed_seconds=elapsed_seconds,
+        phase=metrics.phase,
+        process_summary=metrics.process_state_summary,
+        num_process_recoveries=metrics.num_process_recoveries,
     )
 
 

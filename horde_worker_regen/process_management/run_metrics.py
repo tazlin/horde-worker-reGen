@@ -77,6 +77,12 @@ class RunMetricsSnapshot(BaseModel):
     """Fraction of GPU samples at or above the busy threshold, when measured."""
     gpu_utilization_samples: int = 0
     """How many GPU-utilization samples backed the figures above."""
+    phase: str = ""
+    """Human-readable description of what the worker was doing at snapshot time (e.g. "initializing
+    inference process", "waiting for first job", "running inference"). Drives benchmark live progress
+    so a slow cold start reads as motion rather than a hang. Empty when not populated."""
+    process_state_summary: str = ""
+    """Compact per-process state line (e.g. ``inf#1=PROCESS_STARTING safety#0=WAITING_FOR_JOB``)."""
 
 
 class WorkerRunMetrics:
@@ -204,11 +210,13 @@ class WorkerRunMetrics:
         num_job_slowdowns: int = 0,
         time_spent_no_jobs_available: float = 0.0,
         disk_min_free_bytes: dict[str, int] | None = None,
+        phase: str = "",
+        process_state_summary: str = "",
     ) -> RunMetricsSnapshot:
         """Return an immutable snapshot of everything observed so far.
 
-        The headline counters live on the process manager and its collaborators, so the
-        caller passes them in rather than this class duplicating their bookkeeping.
+        The headline counters and the live phase/process-state strings live on the process manager and
+        its collaborators, so the caller passes them in rather than this class duplicating them.
         """
         return RunMetricsSnapshot(
             jobs=list(self._jobs),
@@ -220,4 +228,6 @@ class WorkerRunMetrics:
             num_job_slowdowns=num_job_slowdowns,
             time_spent_no_jobs_available=time_spent_no_jobs_available,
             process_crash_events=list(self._crash_events),
+            phase=phase,
+            process_state_summary=process_state_summary,
         )

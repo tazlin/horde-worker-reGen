@@ -106,6 +106,8 @@ class BenchmarkView(VerticalScroll):
             yield Switch(value=True, id="benchmark-validate")
             yield Label("Downloads")
             yield Switch(value=False, id="benchmark-downloads")
+            yield Label("Verbose")
+            yield Switch(value=False, id="benchmark-verbose")
         yield Static(self._app_state_summary, id="benchmark-status", classes="benchmark-body")
         yield Static(id="benchmark-body", classes="benchmark-body")
 
@@ -150,6 +152,7 @@ class BenchmarkView(VerticalScroll):
             validate=self.query_one("#benchmark-validate", Switch).value,
             soak_minutes=soak_minutes,
             include_downloads=self.query_one("#benchmark-downloads", Switch).value,
+            verbose=self.query_one("#benchmark-verbose", Switch).value,
         )
 
     def _update_buttons(self, status: BenchmarkSupervisorStatus, run_state: BenchmarkRunState) -> None:
@@ -261,11 +264,15 @@ class BenchmarkView(VerticalScroll):
             else str(level.jobs_completed)
         )
         table.add_row("Level", f"{level.level_id} ({level.stage}/{level.tier}/{level.axis})")
+        if level.phase:
+            table.add_row("Status", Text(level.phase, style="yellow"))
         table.add_row("Jobs", jobs + (f"  ({level.jobs_faulted} faulted)" if level.jobs_faulted else ""))
         table.add_row("it/s", "-" if level.iterations_per_second is None else f"{level.iterations_per_second:.2f}")
         table.add_row("VRAM", "-" if level.vram_used_mb is None else f"{level.vram_used_mb} MB")
         table.add_row("GPU busy", "-" if level.gpu_busy_percent is None else f"{level.gpu_busy_percent:.0f}%")
         table.add_row("Elapsed", f"{level.elapsed_seconds:.0f}s")
+        if level.num_process_recoveries:
+            table.add_row("Restarts", Text(f"{level.num_process_recoveries} (!)", style="bold red"))
         return Panel(table, title="Current level", title_align="left", border_style="cyan")
 
     def _render_level_table(self, run_state: BenchmarkRunState) -> Panel:

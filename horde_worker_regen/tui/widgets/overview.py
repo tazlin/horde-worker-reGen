@@ -20,7 +20,7 @@ from horde_worker_regen.tui.formatters import (
     human_mb,
     shorten,
 )
-from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase
+from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, summarize_skips
 from horde_worker_regen.tui.widgets.common import StatCard
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -94,6 +94,9 @@ class OverviewView(VerticalScroll):
 
         if snapshot is not None:
             body.append(self._activity_line(snapshot))
+            why_no_work = summarize_skips(snapshot.last_pop_skipped_reasons)
+            if why_no_work:
+                body.append(Text.assemble(("∅ why no work: ", "yellow"), (why_no_work, "italic yellow")))
             for message in snapshot.api_messages[:3]:
                 body.append(Text.assemble(("✉ ", "cyan"), (message, "italic cyan")))
 
@@ -219,9 +222,10 @@ class OverviewView(VerticalScroll):
         table.add_column("Step", justify="right")
         table.add_column("it/s", justify="right")
         table.add_column("VRAM", justify="right")
+        table.add_column("Done", justify="right")
 
         if not snapshot.processes:
-            table.add_row("-", "-", "waiting for first snapshot", "-", "-", "-", "-")
+            table.add_row("-", "-", "waiting for first snapshot", "-", "-", "-", "-", "-")
             return table
 
         for process in snapshot.processes:
@@ -243,6 +247,7 @@ class OverviewView(VerticalScroll):
                 step,
                 format_its(process.last_iterations_per_second),
                 vram,
+                f"{process.num_jobs_completed:,}",
             )
         return table
 

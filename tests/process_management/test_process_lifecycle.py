@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from unittest.mock import Mock
 
 from horde_worker_regen.process_management.horde_process import HordeProcessType
@@ -201,3 +202,61 @@ def test_pid_reused_after_scale_down_then_up() -> None:
     plm.scale_inference_processes(2)  # should re-allocate pid 0
 
     assert sorted(plm._process_map.keys()) == [0, 1]
+
+
+def test_stuck_starting_safety_arms_replacement() -> None:
+    """A safety process stuck in PROCESS_STARTING must actually arm its replacement.
+
+    Regression: the stuck-detection used to call `_replace_all_safety_process()` without first
+    setting the flag it gates on, so the safety branch was a silent no-op that logged "replacing it"
+    forever while leaving the wedged process in place.
+    """
+    safety = make_mock_process_info(
+        0, model_name=None, state=HordeProcessState.PROCESS_STARTING, process_type=HordeProcessType.SAFETY
+    )
+    # Age the process's last-seen timestamps so the elapsed-time check trips against timeout=0.
+    safety.last_received_timestamp = time.time() - 1000
+    safety.last_heartbeat_timestamp = time.time() - 1000
+    plm = _make_plm(process_map=ProcessMap({0: safety}))
+
+    assert plm.safety_processes_should_be_replaced is False
+    replaced = plm._check_and_replace_process(safety, 0.0, HordeProcessState.PROCESS_STARTING, "stuck")
+
+    assert replaced is True
+    assert plm.safety_processes_should_be_replaced is True
+
+
+def test_reap_if_crashed_recovers_dead_inference() -> None:
+    """A dead inference child (no longer alive) is recovered without waiting on a state timer."""
+    dead = make_mock_process_info(1, model_name=None, state=HordeProcessState.PROCESS_STARTING)
+    dead.mp_process.is_alive.return_value = False
+    dead.mp_process.exitcode = 1
+    plm = _make_plm(process_map=ProcessMap({1: dead}))
+    plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+
+    assert plm._reap_if_crashed(dead) is True
+    plm._replace_inference_process.assert_called_once_with(dead)
+
+
+def test_reap_if_crashed_recovers_dead_safety() -> None:
+    """A dead safety child arms the safety-replacement state machine."""
+    dead = make_mock_process_info(
+        0, model_name=None, state=HordeProcessState.PROCESS_STARTING, process_type=HordeProcessType.SAFETY
+    )
+    dead.mp_process.is_alive.return_value = False
+    dead.mp_process.exitcode = -9
+    plm = _make_plm(process_map=ProcessMap({0: dead}))
+
+    assert plm._reap_if_crashed(dead) is True
+    assert plm.safety_processes_should_be_replaced is True
+
+
+def test_reap_if_crashed_ignores_live_and_ending_processes() -> None:
+    """A live process, or one we are intentionally ending, is never reaped as a crash."""
+    live = make_mock_process_info(1, model_name=None, state=HordeProcessState.PROCESS_STARTING)
+    plm = _make_plm(process_map=ProcessMap({1: live}))
+    assert plm._reap_if_crashed(live) is False
+
+    ending = make_mock_process_info(2, model_name=None, state=HordeProcessState.PROCESS_ENDING)
+    ending.mp_process.is_alive.return_value = False
+    assert plm._reap_if_crashed(ending) is False

@@ -86,6 +86,14 @@ class LevelProgress(BenchmarkProgressEvent):
     vram_used_mb: int | None = None
     gpu_busy_percent: float | None = None
     elapsed_seconds: float = 0.0
+    phase: str = ""
+    """What the worker is doing right now (e.g. "initializing inference process", "running inference"),
+    so a long cold start before the first job reads as motion rather than a hang."""
+    process_summary: str = ""
+    """Compact per-process state line, surfaced under extra verbosity."""
+    num_process_recoveries: int = 0
+    """Cumulative child-process restarts so far; a non-zero value during startup is the visible tell of
+    a respawn storm (rather than a merely slow level)."""
 
 
 class LevelFinished(BenchmarkProgressEvent):
@@ -142,6 +150,12 @@ class LevelLiveSnapshot(BaseModel):
     vram_used_mb: int | None = None
     gpu_busy_percent: float | None = None
     elapsed_seconds: float = 0.0
+    phase: str = ""
+    """What the worker is doing right now; see :class:`LevelProgress.phase`."""
+    process_summary: str = ""
+    """Compact per-process state line; see :class:`LevelProgress.process_summary`."""
+    num_process_recoveries: int = 0
+    """Cumulative child-process restarts; see :class:`LevelProgress.num_process_recoveries`."""
 
 
 def parse_progress_event(raw_line: str) -> BenchmarkProgressEvent | None:

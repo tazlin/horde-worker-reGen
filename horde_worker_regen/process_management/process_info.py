@@ -89,6 +89,13 @@ class HordeProcessInfo:
     """The highest in-job VRAM usage (MB) ever reported by this process (0 = none yet)."""
     ram_used_high_water_mb: int
     """The highest in-job RAM usage (MB) ever reported by this process (0 = none yet)."""
+    num_jobs_completed: int
+    """Count of jobs/forms this slot has finished (inference result, safety check, or alchemy form).
+
+    Resets to 0 when the slot is replaced (a fresh ``HordeProcessInfo`` is built), so it reads as the
+    work done by the *current* process. Surfaced per-process in the live view as running feedback,
+    most usefully for the safety process whose checks are otherwise too fast to see.
+    """
     cumulative_download_events: list[DownloadEvent]
     """All ad-hoc download events reported by this process, in arrival order."""
 
@@ -154,6 +161,7 @@ class HordeProcessInfo:
         self.last_job_metrics = None
         self.vram_used_high_water_mb = 0
         self.ram_used_high_water_mb = 0
+        self.num_jobs_completed = 0
         self.cumulative_download_events = []
 
         self.recently_unloaded_from_ram = False

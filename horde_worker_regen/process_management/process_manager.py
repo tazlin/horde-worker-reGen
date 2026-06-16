@@ -58,7 +58,11 @@ from horde_worker_regen.process_management.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.lru_cache import LRUCache
 from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
-from horde_worker_regen.process_management.messages import AlchemyFormSpec, HordeDownloadAvailabilityMessage
+from horde_worker_regen.process_management.messages import (
+    AlchemyFormSpec,
+    HordeDownloadAvailabilityMessage,
+    HordeProcessState,
+)
 from horde_worker_regen.process_management.model_availability import ModelAvailability
 from horde_worker_regen.process_management.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
@@ -772,6 +776,11 @@ class HordeWorkerProcessManager:
     _user_info_failed_reason: str | None = None
     """The reason the API request to fetch user info failed."""
 
+    _worker_details_maintenance: bool = False
+    """Whether the horde reports this worker in maintenance (from the worker-details API, polled)."""
+    _worker_details_paused: bool = False
+    """Whether the horde reports this worker paused (from the worker-details API, polled)."""
+
     def calculate_kudos_info(self) -> None:
         """Calculate and log information about the kudos generated in the current session."""
         # Use KudosCalculator to compute all metrics
@@ -894,6 +903,35 @@ class HordeWorkerProcessManager:
                 logger.error("The server failed to respond. Is the horde or your internet down?")
             await logger.complete()
 
+    def _fetch_worker_details(self, worker_name: str) -> SingleWorkerDetailsResponse | None:
+        """Synchronous worker-details lookup (run in a thread); mirrors :meth:`remove_maintenance`."""
+        simple_client = AIHordeAPISimpleClient()
+        return simple_client.worker_details_by_name(worker_name=worker_name)
+
+    async def api_get_worker_details(self) -> None:
+        """Best-effort refresh of this worker's maintenance/paused flags from the worker-details API.
+
+        These flags can be toggled remotely (web UI or another tool), so polling them lets the
+        dashboard show a worker the horde has placed in maintenance even when the local pop loop is not
+        the cause. Deliberately not gated on ``last_pop_maintenance_mode`` (unlike user-info) so the
+        worker keeps observing when maintenance is lifted. Any failure is swallowed: this is advisory
+        context, never load-bearing.
+        """
+        if self._state.shutting_down or self.bridge_data.dry_run_skip_api:
+            return
+        worker_name = self.bridge_data.dreamer_worker_name
+        if not worker_name:
+            return
+        try:
+            worker_details = await asyncio.to_thread(self._fetch_worker_details, worker_name)
+        except Exception as e:  # noqa: BLE001 - advisory poll must never disturb the worker
+            logger.trace(f"Worker-details refresh failed: {type(e).__name__} {e}")
+            return
+        if worker_details is None:
+            return
+        self._worker_details_maintenance = bool(worker_details.maintenance_mode)
+        self._worker_details_paused = bool(worker_details.paused)
+
     async def _api_get_user_info_loop(self) -> None:
         """Run the API get user info loop."""
         logger.debug("In _api_get_user_info_loop")
@@ -903,6 +941,7 @@ class HordeWorkerProcessManager:
                     if time.time() - self._last_get_user_info_time >= self._api_get_user_info_interval:
                         self._last_get_user_info_time = time.time()
                         await self.api_get_user_info()
+                        await self.api_get_worker_details()
                 except CancelledError as e:
                     self._shutdown()
                     logger.debug(f"CancelledError: {e}")
@@ -1147,12 +1186,45 @@ class HordeWorkerProcessManager:
 
     def get_run_metrics_snapshot(self) -> RunMetricsSnapshot:
         """Return the run-wide metrics snapshot (stage latencies, downloads, high-waters, crashes)."""
+        phase, process_state_summary = self.describe_run_phase()
         return self._run_metrics.snapshot(
             num_process_recoveries=self._process_lifecycle._num_process_recoveries,
             num_job_slowdowns=self._job_submitter.num_job_slowdowns,
             time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
             disk_min_free_bytes=self._disk_monitor.min_free_bytes,
+            phase=phase,
+            process_state_summary=process_state_summary,
         )
+
+    def describe_run_phase(self) -> tuple[str, str]:
+        """Describe what the worker is doing right now as ``(phase, per-process summary)``.
+
+        Gives benchmark live progress a human-readable sense of motion through the long, otherwise
+        silent cold start (process spawn, hordelib/GPU init, model load, first job), so a slow level
+        reads as "still working" rather than "hung". Cheap and side-effect-free; safe to call often.
+        """
+        inference = [p for p in self._process_map.values() if p.process_type == HordeProcessType.INFERENCE]
+        safety = [p for p in self._process_map.values() if p.process_type == HordeProcessType.SAFETY]
+
+        summary_parts = [f"inf#{p.process_id}={p.last_process_state.name}" for p in inference]
+        summary_parts += [f"safety#{p.process_id}={p.last_process_state.name}" for p in safety]
+        process_summary = " ".join(summary_parts)
+
+        if self._state.shutting_down:
+            return "draining in-flight work", process_summary
+
+        jobs_in_progress = len(self._job_tracker.jobs_in_progress)
+        if jobs_in_progress > 0:
+            return f"running inference ({jobs_in_progress} in progress)", process_summary
+        if self._job_tracker.total_num_completed_jobs > 0:
+            return "waiting for next job", process_summary
+        if any(p.can_accept_job() for p in inference):
+            return "ready; waiting for first job", process_summary
+        if any(p.last_process_state == HordeProcessState.PROCESS_STARTING for p in inference):
+            return "initializing inference process (loading GPU/model stack; first start is slow)", process_summary
+        if self._enable_background_downloads and not self._inference_processes_started:
+            return "waiting for model download / disk scan", process_summary
+        return "starting worker processes", process_summary
 
     def print_status_method(self) -> None:
         """Print the status of the worker if it's time to do so."""
@@ -1449,6 +1521,8 @@ class HordeWorkerProcessManager:
             session_start_time=self.session_start_time,
             shutting_down=self._state.shutting_down,
             maintenance_mode=self._state.last_pop_maintenance_mode or self._state.supervisor_paused,
+            worker_details_maintenance=self._worker_details_maintenance,
+            worker_details_paused=self._worker_details_paused,
             too_many_consecutive_failed_jobs=self._state.too_many_consecutive_failed_jobs,
             worker_registered=self.user_info is not None,
             user_info_failed=self._user_info_failed,
@@ -1456,6 +1530,8 @@ class HordeWorkerProcessManager:
             in_error_backoff=self._job_popper._pop_throttler.is_in_error_backoff,
             consecutive_failed_jobs=self._state.consecutive_failed_jobs,
             seconds_since_last_pop=seconds_since_last_pop,
+            last_pop_no_jobs_available=self._state.last_pop_no_jobs_available,
+            last_pop_skipped_reasons=dict(self._state.last_pop_skipped_reasons),
             api_messages=api_messages,
             config=config,
             processes=processes,

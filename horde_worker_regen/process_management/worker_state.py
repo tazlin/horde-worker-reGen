@@ -23,6 +23,12 @@ class WorkerState:
     last_job_pop_time: float = 0.0
     last_pop_no_jobs_available: bool = False
     last_pop_maintenance_mode: bool = False
+    last_pop_skipped_reasons: dict[str, int] = dataclasses.field(default_factory=dict)
+    """Why the last 'no job available' pop skipped work, per reason (models/nsfw/max_pixels/...).
+
+    Surfaced to the TUI as a "why no work" breakdown so an operator can see a quiet worker is
+    configured out of the available jobs (wrong models, too-low max_power, etc.) rather than idle.
+    """
 
     supervisor_paused: bool = False
     """Local pause requested by a supervising frontend (TUI). Stops new job/alchemy pops; in-flight work finishes."""

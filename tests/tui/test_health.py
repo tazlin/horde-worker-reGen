@@ -7,7 +7,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
-from horde_worker_regen.tui.health import HealthStatus, WorkerPhase, derive
+from horde_worker_regen.tui.health import HealthStatus, WorkerPhase, derive, summarize_skips
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
 
@@ -127,6 +127,41 @@ def test_ready_and_idle() -> None:
         0.5,
     )
     assert idle.phase is WorkerPhase.IDLE
+
+
+def test_worker_details_maintenance_is_paused_and_names_the_horde() -> None:
+    """A worker the horde has placed in maintenance surfaces as PAUSED, attributed to the horde."""
+    report = derive(
+        _snapshot(processes=[_process("WAITING_FOR_JOB")], worker_details_maintenance=True),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    assert report.phase is WorkerPhase.PAUSED
+    assert "horde" in report.detail.lower()
+
+
+def test_short_term_no_jobs_is_ready_with_skip_reasons() -> None:
+    """A pop that returned no job stays READY but explains why, including the skip-reason breakdown."""
+    report = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            last_pop_no_jobs_available=True,
+            last_pop_skipped_reasons={"models": 3, "nsfw": 1},
+        ),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    assert report.phase is WorkerPhase.READY
+    assert "no jobs available" in report.headline.lower()
+    assert "3 models" in report.detail
+    work = next(check for check in report.checks if check.name == "Work")
+    assert "models" in work.detail
+
+
+def test_summarize_skips_orders_by_count_and_drops_zeros() -> None:
+    """The skip summary is count-ordered and omits zero-count reasons."""
+    assert summarize_skips({"nsfw": 1, "models": 3, "untouched": 0}) == "3 models · 1 nsfw"
+    assert summarize_skips({}) == ""
 
 
 def test_checks_cover_core_dimensions() -> None:

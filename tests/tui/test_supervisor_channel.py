@@ -93,6 +93,7 @@ def _fake_process_info() -> SimpleNamespace:
         last_total_steps=None,
         vram_used_high_water_mb=2200,
         ram_used_high_water_mb=512,
+        num_jobs_completed=7,
     )
 
 

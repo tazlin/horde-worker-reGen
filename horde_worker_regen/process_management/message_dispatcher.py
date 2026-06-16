@@ -201,14 +201,27 @@ class MessageDispatcher:
                 self._handle_model_state_change(message)
 
             if isinstance(message, HordeInferenceResultMessage):
+                self._record_completed_job(message.process_id)
                 await self._handle_inference_result(message)
             elif isinstance(message, HordeSafetyResultMessage):
+                self._record_completed_job(message.process_id)
                 await self._handle_safety_result(message)
             elif isinstance(message, HordeAlchemyResultMessage):
+                self._record_completed_job(message.process_id)
                 if self._on_alchemy_result is not None:
                     self._on_alchemy_result(message)
                 else:
                     logger.error(f"Received alchemy result with no handler registered: {message.form_id}")
+
+    def _record_completed_job(self, process_id: int) -> None:
+        """Bump the producing process's completed-work counter (inference, safety check, or alchemy form).
+
+        Surfaced per-process in the live view as running feedback; the safety process is the main
+        beneficiary, since its checks are otherwise too fast for any state change to be visible.
+        """
+        process_info = self._process_map.get(process_id)
+        if process_info is not None:
+            process_info.num_jobs_completed += 1
 
     def _handle_heartbeat(self, message: HordeProcessHeartbeatMessage) -> None:
         """Handle a heartbeat message from a child process."""

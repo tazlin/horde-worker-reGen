@@ -59,6 +59,12 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Reuse one warm worker across fixed-scenario levels (skips per-level startup cost).",
     )
+    ramp.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show per-process state in the live view and raise spawned worker logging to TRACE.",
+    )
 
 
 def _run_ramp(args: argparse.Namespace) -> int:
@@ -89,7 +95,9 @@ def _run_ramp(args: argparse.Namespace) -> int:
     from horde_worker_regen.benchmark.progress_console import ConsoleProgressSink
 
     # Tee progress to a durable JSONL log (for the TUI / `monitor` to tail) and a live console view.
-    progress_sink = MultiProgressSink([JsonlProgressSink(out_dir / PROGRESS_FILENAME), ConsoleProgressSink()])
+    progress_sink = MultiProgressSink(
+        [JsonlProgressSink(out_dir / PROGRESS_FILENAME), ConsoleProgressSink(verbose=args.verbose)],
+    )
 
     controller = BenchmarkController(
         ladder,
@@ -102,6 +110,7 @@ def _run_ramp(args: argparse.Namespace) -> int:
         soak_seconds=args.soak_minutes * 60.0,
         progress_sink=progress_sink,
         warm=args.warm,
+        verbose=args.verbose,
     )
     try:
         report = controller.run()
@@ -165,7 +174,7 @@ def _run_monitor(args: argparse.Namespace) -> int:
             continue
         idle_polls = 0
         for event in events:
-            line = format_progress_event(event)
+            line = format_progress_event(event, verbose=args.verbose)
             if line is not None:
                 print(line)  # noqa: T201
             if isinstance(event, RampFinished):
@@ -199,6 +208,12 @@ def main(argv: list[str] | None = None) -> int:
 
     monitor = subparsers.add_parser("monitor", help="Tail a run's progress.jsonl live (attach or replay).")
     monitor.add_argument("out_dir", type=Path)
+    monitor.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show the per-process state summary on each progress line.",
+    )
 
     subparsers.add_parser("live", help="Open-loop load generation against a live API (not yet implemented).")
 
