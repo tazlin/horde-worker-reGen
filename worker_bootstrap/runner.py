@@ -44,10 +44,21 @@ def build_child_env(root: Path | None = None) -> dict[str, str]:
 
 
 def run_uv(uv: str, args: list[str], *, root: Path | None = None) -> int:
-    """Run uv with ``args`` in the install dir and the hardened env; return its exit code."""
+    """Run uv with ``args`` in the install dir and the hardened env; return its exit code.
+
+    Ctrl+C is delivered by the OS to the whole foreground process group, so the child (uv and,
+    underneath it, the worker) receives the same SIGINT we do and runs its own graceful shutdown.
+    We therefore swallow ``KeyboardInterrupt`` and keep waiting for the child to exit rather than
+    letting ``subprocess.run`` SIGKILL it and unwind with a traceback, which would orphan the worker
+    mid-drain. Repeated Ctrl+C simply loops here while the worker's handler escalates its own exit.
+    """
     root = root or paths.install_root()
-    completed = subprocess.run([uv, *args], cwd=str(root), env=build_child_env(root), check=False)
-    return completed.returncode
+    process = subprocess.Popen([uv, *args], cwd=str(root), env=build_child_env(root))
+    while True:
+        try:
+            return process.wait()
+        except KeyboardInterrupt:
+            continue
 
 
 def uv_sync(
