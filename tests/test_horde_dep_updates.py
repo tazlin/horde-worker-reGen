@@ -51,6 +51,20 @@ def _local_build_tag(version: str) -> str | None:
     return version.split("+", 1)[1] if "+" in version else None
 
 
+def _normalize(name: str) -> str:
+    """Normalize a distribution name for comparison (``horde_engine`` and ``horde-engine`` are one)."""
+    return name.replace("_", "-").lower()
+
+
+def _requested_extras(spec: str) -> set[str]:
+    """Return the extras requested in a dependency spec (the names inside ``[...]``)."""
+    before_marker = spec.split(";", 1)[0]
+    if "[" not in before_marker:
+        return set()
+    inside = before_marker.split("[", 1)[1].split("]", 1)[0]
+    return {part.strip() for part in inside.split(",") if part.strip()}
+
+
 def test_uv_lock_exists() -> None:
     """Check that uv.lock exists and is not empty."""
     assert UV_LOCK_FILE_PATH.exists(), "uv.lock not found — run 'uv lock' to generate it"
@@ -125,3 +139,52 @@ def test_pytorch_indexes_defined() -> None:
     index_names = {idx["name"] for idx in _load_pyproject()["tool"]["uv"].get("index", [])}
     for index in set(BUILD_INDEX.values()):
         assert index in index_names, f"no [[tool.uv.index]] named '{index}'"
+
+
+def test_horde_engine_requested_with_layerdiffuse_extra() -> None:
+    """horde-engine must carry the [layerdiffuse] extra in the BASE deps, not an opt-in extra.
+
+    The default Stable Diffusion pipeline wires in the layer_diffuse_apply / LayeredDiffusionApply node
+    unconditionally, so that ComfyUI node must import for ANY job to run. horde-engine 3.2.4 demoted the
+    node's sole requirement (diffusers) from a core dependency to the optional 'layerdiffuse' extra, so a
+    plain horde_engine request silently stops installing diffusers and every inference faults with a
+    KeyError on LayeredDiffusionApply. This guards against the extra being dropped on a future bump.
+    """
+    base_deps = _load_pyproject()["project"]["dependencies"]
+    horde_engine_specs = [d for d in base_deps if _normalize(_dep_name(d)) == "horde-engine"]
+    assert horde_engine_specs, "horde-engine is not declared in [project.dependencies]"
+    extras = set().union(*(_requested_extras(d) for d in horde_engine_specs))
+    assert "layerdiffuse" in extras, (
+        "horde-engine must be requested as horde_engine[layerdiffuse] in [project.dependencies]; "
+        "without it diffusers is not installed and the base pipeline's LayeredDiffusionApply node fails "
+        "to import, faulting every job"
+    )
+
+
+def test_post_processing_extra_includes_facerestore_dep() -> None:
+    """The post-processing extra must carry lpips, the bundled face-fix node's sole eager import gap.
+
+    horde-engine's vendored facerestore_cf node does a top-level `import lpips` (via basicsr.losses) when
+    ComfyUI loads it, but horde-engine declares lpips nowhere. Face restoration is a post-processing
+    feature, so the worker pulls lpips through this opt-in extra; dropping it makes the node fail to import
+    and faults face-fix jobs. (lmdb/wandb in that node are lazy, training-only imports and are not needed.)
+    """
+    extras = _load_pyproject()["project"]["optional-dependencies"]
+    assert "post-processing" in extras, "missing 'post-processing' extra"
+    names = {_normalize(_dep_name(d)) for d in extras["post-processing"]}
+    assert "lpips" in names, (
+        "the post-processing extra must list 'lpips' so horde-engine's facerestore_cf node can import; "
+        "without it face-fix jobs fault on a missing lpips import"
+    )
+
+
+def test_lock_resolves_diffusers() -> None:
+    """Require diffusers in uv.lock so `uv sync --locked` (embedded runtime) installs it.
+
+    The pyproject request alone is not enough: update-runtime builds the runtime from the lock, so a lock
+    regenerated without the layerdiffuse extra would still leave the layerdiffuse node un-importable.
+    """
+    locked_names = {p["name"] for p in _load_lock()["package"]}
+    assert "diffusers" in locked_names, (
+        "diffusers missing from uv.lock — run 'uv lock' after adding the horde_engine[layerdiffuse] extra"
+    )
