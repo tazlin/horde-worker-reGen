@@ -32,6 +32,8 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, list[tup
     calls: list[tuple[str, object]] = []
     monkeypatch.setattr(cli.runner, "uv_sync", lambda uv, extra, **kw: calls.append(("sync", extra)) or 0)
     monkeypatch.setattr(cli.runner, "uv_run", lambda uv, command, **kw: calls.append(("run", command)) or 0)
+    # Pruning runs after every successful sync; fake it so tests never shell out and `calls` stays clean.
+    monkeypatch.setattr(cli.runner, "uv_cache_prune", lambda uv, **kw: (0, 0))
     return tmp_path, calls
 
 
@@ -162,3 +164,76 @@ def test_env_override_beats_detection(env: tuple[Path, list], monkeypatch: pytes
     monkeypatch.setenv("HORDE_WORKER_BACKEND", "cpu")
     assert cli.main(["detect", "--write"]) == 0
     assert backend.read_backend_file(root / "bin" / "backend") == "cpu"
+
+
+# --- preview / hold / prune path (existing .venv, so the dry-run preview runs) ---------------------
+
+_TORCH_BUMP_DRY_RUN = (
+    " - torch==2.11.0+cu126\n + torch==2.12.1+cu126\n - torchvision==0.26.0\n + torchvision==0.27.1\n"
+)
+
+
+def _fake_preview(monkeypatch: pytest.MonkeyPatch, calls: list, *, dry_run_output: str, hold_feasible_rc: int) -> None:
+    """Wire the dry-run preview: the normal dry-run returns *dry_run_output*; the held probe returns a rc."""
+    monkeypatch.setattr(cli.runner, "uv_sync_dry_run", lambda uv, extra, **kw: (0, dry_run_output))
+
+    def fake_held(uv: str, extra: str, *, dry_run: bool = False, **kw: object) -> int:
+        if dry_run:
+            return hold_feasible_rc
+        calls.append(("held", extra))
+        return 0
+
+    monkeypatch.setattr(cli.runner, "uv_sync_held", fake_held)
+
+
+def test_sync_preview_proceeds_full_when_no_torch_change(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a venv but no large upgrade in the dry-run, sync proceeds normally (locked)."""
+    root, calls = env
+    _make_venv(root)
+    monkeypatch.setattr(cli.runner, "uv_sync_dry_run", lambda uv, extra, **kw: (0, " + somepkg==1.0.0\n"))
+    assert cli.main(["sync"]) == 0
+    assert calls == [("sync", "cu126")]
+
+
+def test_sync_hold_takes_held_path_for_optional_upgrade(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--hold-torch on a resolvable (optional) torch bump runs the held sync, not the locked one."""
+    root, calls = env
+    _make_venv(root)
+    _fake_preview(monkeypatch, calls, dry_run_output=_TORCH_BUMP_DRY_RUN, hold_feasible_rc=0)
+    assert cli.main(["sync", "--hold-torch"]) == 0
+    assert calls == [("held", "cu126")]
+
+
+def test_sync_hold_refused_when_upgrade_mandatory(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the held dry-run cannot resolve, the upgrade is mandatory: the normal locked sync runs."""
+    root, calls = env
+    _make_venv(root)
+    _fake_preview(monkeypatch, calls, dry_run_output=_TORCH_BUMP_DRY_RUN, hold_feasible_rc=1)
+    assert cli.main(["sync", "--hold-torch"]) == 0
+    assert calls == [("sync", "cu126")]  # forced full upgrade, never the held path
+
+
+def test_sync_prunes_only_when_cache_owned(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Auto-prune fires for the owned isolated cache but never in shared mode."""
+    root, _ = env
+    pruned: list[bool] = []
+    monkeypatch.setattr(cli.runner, "uv_cache_prune", lambda uv, **kw: pruned.append(True) or (0, 0))
+
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.delenv("HORDE_WORKER_UV_CACHE_MODE", raising=False)
+    assert cli.main(["sync"]) == 0
+    assert pruned == [True]  # owned (isolated default) => pruned
+
+    pruned.clear()
+    monkeypatch.setenv("HORDE_WORKER_UV_CACHE_MODE", "shared")
+    assert cli.main(["sync"]) == 0
+    assert pruned == []  # shared cache is never auto-pruned
+
+    pruned.clear()
+    monkeypatch.delenv("HORDE_WORKER_UV_CACHE_MODE", raising=False)
+    assert cli.main(["sync", "--no-prune"]) == 0
+    assert pruned == []  # explicitly disabled

@@ -16,7 +16,13 @@ unset CONDA_SHLVL
 HORDE_WORKER_DATA_DIR="${HORDE_WORKER_DATA_DIR:-${SCRIPT_DIR}-data}"
 export HORDE_WORKER_DATA_DIR
 mkdir -p "$HORDE_WORKER_DATA_DIR"
-: "${UV_CACHE_DIR:=$HORDE_WORKER_DATA_DIR/uv_cache}"; export UV_CACHE_DIR
+# Cache mode: "shared" leaves UV_CACHE_DIR unset so uv uses its own default (system) cache a power user
+# already populates for other projects (no 7-10 GB duplicate); the worker then never auto-prunes it.
+# "isolated" (default) keeps a private cache in the data dir that we can prune safely. Must match
+# worker_bootstrap/paths.py:uv_cache_mode. A caller-set UV_CACHE_DIR is respected in either mode.
+if [ "$HORDE_WORKER_UV_CACHE_MODE" != "shared" ]; then
+    : "${UV_CACHE_DIR:=$HORDE_WORKER_DATA_DIR/uv_cache}"; export UV_CACHE_DIR
+fi
 : "${UV_PYTHON_INSTALL_DIR:=$HORDE_WORKER_DATA_DIR/python}"; export UV_PYTHON_INSTALL_DIR
 : "${UV_PYTHON_PREFERENCE:=only-managed}"; export UV_PYTHON_PREFERENCE
 # Deliberately NOT setting AIWORKER_CACHE_HOME here. It would outrank `cache_home` in bridgeData.yaml (the

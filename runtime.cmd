@@ -16,7 +16,11 @@ REM the location. This must match worker_bootstrap\paths.py:data_root. Respect c
 for %%I in ("%~dp0.") do set "WORKER_ROOT=%%~fI"
 if not defined HORDE_WORKER_DATA_DIR set "HORDE_WORKER_DATA_DIR=%WORKER_ROOT%-data"
 if not exist "%HORDE_WORKER_DATA_DIR%" md "%HORDE_WORKER_DATA_DIR%"
-if not defined UV_CACHE_DIR set "UV_CACHE_DIR=%HORDE_WORKER_DATA_DIR%\uv_cache"
+REM Cache mode: "shared" leaves UV_CACHE_DIR unset so uv uses its own default (system) cache a power user
+REM already populates for other projects (no 7-10 GB duplicate); the worker then never auto-prunes it.
+REM "isolated" (default) keeps a private cache in the data dir that we can prune safely. Must match
+REM worker_bootstrap\paths.py:uv_cache_mode. Respect a caller-set UV_CACHE_DIR in either mode.
+if /I not "%HORDE_WORKER_UV_CACHE_MODE%"=="shared" if not defined UV_CACHE_DIR set "UV_CACHE_DIR=%HORDE_WORKER_DATA_DIR%\uv_cache"
 if not defined UV_PYTHON_INSTALL_DIR set "UV_PYTHON_INSTALL_DIR=%HORDE_WORKER_DATA_DIR%\python"
 REM AIWORKER_CACHE_HOME intentionally unset here: setting it would outrank `cache_home` in bridgeData.yaml.
 REM The worker applies the peered <data>\models default at lowest precedence from HORDE_WORKER_DATA_DIR, so

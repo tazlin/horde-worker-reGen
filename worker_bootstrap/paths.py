@@ -47,6 +47,28 @@ def python_install_dir(root: Path | None = None) -> Path:
     return data_root(root) / "python"
 
 
+def uv_cache_mode() -> str:
+    """Return the uv cache mode: ``"shared"`` or ``"isolated"`` (default).
+
+    ``isolated`` (the default) keeps a private uv cache under the peered data dir so a managed install
+    can prune it safely and never duplicates wheels with another tool's cache by accident. ``shared``
+    leaves ``UV_CACHE_DIR`` unset so uv uses its own default (system) cache, which a power user already
+    populates for other projects: this avoids duplicating 7-10 GB, at the cost of us never auto-pruning a
+    cache we do not own. Set via ``HORDE_WORKER_UV_CACHE_MODE``; any value other than ``shared`` (case
+    insensitive) is treated as ``isolated``. This resolution must match the shell shims.
+    """
+    return "shared" if os.environ.get("HORDE_WORKER_UV_CACHE_MODE", "").strip().lower() == "shared" else "isolated"
+
+
+def sync_overrides_file(root: Path | None = None) -> Path:
+    """Return the path of the generated uv override file used to hold packages during an opt-out sync.
+
+    Written to the writable peered data dir (not the worker folder, which a release update overwrites)
+    so "limp along" holds survive a reinstall and never collide with bundled files.
+    """
+    return data_root(root) / "sync-overrides.txt"
+
+
 def models_dir(root: Path | None = None) -> Path:
     """Return the model-weights directory (``AIWORKER_CACHE_HOME``), in the peered, preserved data dir."""
     return data_root(root) / "models"

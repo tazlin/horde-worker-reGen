@@ -6,7 +6,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HORDE_WORKER_DATA_DIR="${HORDE_WORKER_DATA_DIR:-${SCRIPT_DIR}-data}"
 export HORDE_WORKER_DATA_DIR
 mkdir -p "$HORDE_WORKER_DATA_DIR"
-: "${UV_CACHE_DIR:=$HORDE_WORKER_DATA_DIR/uv_cache}"; export UV_CACHE_DIR
+# Cache mode: "shared" leaves UV_CACHE_DIR unset (uv uses its own default cache, never auto-pruned);
+# "isolated" (default) keeps a private, prunable cache here. Must match worker_bootstrap/paths.py.
+if [ "$HORDE_WORKER_UV_CACHE_MODE" != "shared" ]; then
+    : "${UV_CACHE_DIR:=$HORDE_WORKER_DATA_DIR/uv_cache}"; export UV_CACHE_DIR
+fi
 : "${UV_PYTHON_INSTALL_DIR:=$HORDE_WORKER_DATA_DIR/python}"; export UV_PYTHON_INSTALL_DIR
 : "${UV_PYTHON_PREFERENCE:=only-managed}"; export UV_PYTHON_PREFERENCE
 # AIWORKER_CACHE_HOME intentionally unset here so it cannot outrank bridgeData.yaml `cache_home`; the worker

@@ -29,7 +29,11 @@ named "<install folder>-data", which is kept if you ever delete or reinstall the
 Disk space: the environment alone is roughly 10-15 GB on a GPU install (3-5 GB CPU-only). The AI models
 you pick are separate and much larger (tens to hundreds of GB). Everything stays on the drive you install
 to (the models and cache in the peered "-data" folder); set HORDE_WORKER_DATA_DIR to place that folder on
-another drive.
+another drive. The package cache is kept private to this install and is pruned of superseded files after
+each update so it does not grow without bound. If you already use the "uv" tool for other work and do not
+want a second cache, set HORDE_WORKER_UV_CACHE_MODE=shared to use uv's normal cache instead (it is then
+left for you to manage). Updates also preview what they would download and let you keep your current
+PyTorch when nothing requires a newer one; see docs/how-to/update-the-worker.md.
 
 Source code, full third-party license texts, and documentation:
   https://github.com/Haidra-Org/horde-worker-reGen

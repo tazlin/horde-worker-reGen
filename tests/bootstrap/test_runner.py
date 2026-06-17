@@ -116,6 +116,93 @@ def test_uv_sync_appends_feature_extras(monkeypatch: pytest.MonkeyPatch, tmp_pat
     ]
 
 
+def test_build_child_env_shared_cache_mode_omits_uv_cache_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Shared cache mode leaves UV_CACHE_DIR unset so uv uses its own (system) default cache."""
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.setenv("HORDE_WORKER_UV_CACHE_MODE", "shared")
+    env = runner.build_child_env(tmp_path)
+    assert "UV_CACHE_DIR" not in env
+    # The data dir and managed Python still live in the peered location regardless of cache mode.
+    assert env["UV_PYTHON_INSTALL_DIR"] == str(paths.python_install_dir(tmp_path))
+
+
+class _FakeCompleted:
+    """Stand-in for ``subprocess.run`` result with canned returncode/stdout/stderr."""
+
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_uv_sync_dry_run_argv_and_capture(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """uv_sync_dry_run adds --dry-run, keeps --locked, and returns the captured output."""
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kw: object) -> _FakeCompleted:
+        captured["cmd"] = cmd
+        captured["capture_output"] = kw.get("capture_output")
+        return _FakeCompleted(0, stdout="+ torch==2.12.1+cu132\n")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    rc, out = runner.uv_sync_dry_run("UV", "cu132", extras=("controlnet",), root=tmp_path)
+
+    assert rc == 0
+    assert "torch==2.12.1+cu132" in out
+    assert captured["capture_output"] is True
+    assert captured["cmd"] == ["UV", "sync", "--dry-run", "--locked", "--extra", "cu132", "--extra", "controlnet"]
+
+
+def test_uv_sync_held_drops_locked_and_adds_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The opt-out path drops --locked (only here) and passes --override to hold packages."""
+    captured: dict[str, object] = {}
+
+    def fake_popen(cmd: list[str], cwd: str, env: dict[str, str]) -> _FakePopen:
+        captured["cmd"] = cmd
+        return _FakePopen(0)
+
+    monkeypatch.setattr(runner.subprocess, "Popen", fake_popen)
+    overrides = tmp_path / "sync-overrides.txt"
+    rc = runner.uv_sync_held("UV", "cu132", overrides_path=overrides, extras=("post-processing",), root=tmp_path)
+
+    assert rc == 0
+    cmd = captured["cmd"]
+    assert "--locked" not in cmd  # the load-bearing difference from the normal path
+    assert cmd == ["UV", "sync", "--extra", "cu132", "--extra", "post-processing", "--override", str(overrides)]
+
+
+def test_uv_sync_held_dry_run_returns_code(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The held dry-run (feasibility probe) captures output and returns uv's exit code."""
+
+    def fake_run(cmd: list[str], **kw: object) -> _FakeCompleted:
+        assert "--dry-run" in cmd
+        assert "--locked" not in cmd
+        return _FakeCompleted(1)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    rc = runner.uv_sync_held("UV", "cu132", overrides_path=tmp_path / "o.txt", root=tmp_path, dry_run=True)
+    assert rc == 1  # non-zero => the hold is infeasible => the upgrade is mandatory
+
+
+def test_uv_cache_prune_parses_reclaimed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """uv_cache_prune runs `cache prune` (never clean) and parses the reclaimed size."""
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kw: object) -> _FakeCompleted:
+        captured["cmd"] = cmd
+        return _FakeCompleted(0, stdout="Pruning cache at ...\nRemoved 1248 files (3.4 GiB)\n")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    rc, reclaimed = runner.uv_cache_prune("UV", root=tmp_path)
+
+    assert rc == 0
+    assert captured["cmd"] == ["UV", "cache", "prune"]
+    assert reclaimed == int(3.4 * 1024**3)
+
+
 def test_uv_run_no_sync_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """uv_run builds `run --no-sync <command...>` with passthrough args intact."""
     captured: dict[str, object] = {}

@@ -9,6 +9,7 @@ trap that printed "Installation complete" after uv had failed).
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -30,7 +31,10 @@ def build_child_env(root: Path | None = None) -> dict[str, str]:
     # Keep uv's cache, managed CPython, and downloaded models in the peered data dir (a sibling of the
     # worker folder, preserved when the worker folder is deleted or reinstalled) rather than the home
     # drive. Respect caller-set values so power users can redirect them (the runtime shims set them first).
-    env.setdefault("UV_CACHE_DIR", str(paths.uv_cache_dir(root)))
+    # In shared cache mode we deliberately leave UV_CACHE_DIR unset so uv uses its own (system) default
+    # cache the user already populates for other projects; we then never auto-prune a cache we do not own.
+    if paths.uv_cache_mode() != "shared":
+        env.setdefault("UV_CACHE_DIR", str(paths.uv_cache_dir(root)))
     env.setdefault("UV_PYTHON_INSTALL_DIR", str(paths.python_install_dir(root)))
     # Propagate only the data-dir LOCATION, not AIWORKER_CACHE_HOME itself: forcing the models env var here
     # would outrank `cache_home` in bridgeData.yaml. The worker derives the <data>/models default from this
@@ -86,6 +90,117 @@ def uv_sync(
     for feature_extra in extras:
         args += ["--extra", feature_extra]
     return run_uv(uv, args, root=root)
+
+
+def uv_sync_dry_run(
+    uv: str,
+    extra: str,
+    *,
+    extras: Sequence[str] = (),
+    root: Path | None = None,
+    locked: bool = True,
+) -> tuple[int, str]:
+    """Run ``uv sync ... --dry-run`` and return ``(exit_code, combined_output)`` without touching the env.
+
+    Builds the same argv as :func:`uv_sync` plus ``--dry-run`` so the preview reflects exactly what the
+    real sync would do. Output is captured (stdout+stderr) for the plan parser rather than streamed, so
+    this uses a plain :func:`subprocess.run` instead of the foreground ``Popen`` wrapper.
+    """
+    root = root or paths.install_root()
+    args = ["sync", "--dry-run"]
+    if locked:
+        args.append("--locked")
+    args += ["--extra", extra]
+    for feature_extra in extras:
+        args += ["--extra", feature_extra]
+    result = subprocess.run(
+        [uv, *args],
+        cwd=str(root),
+        env=build_child_env(root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+def uv_sync_held(
+    uv: str,
+    extra: str,
+    *,
+    overrides_path: Path,
+    extras: Sequence[str] = (),
+    root: Path | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Run an opt-out sync that holds packages at the versions named in ``overrides_path``.
+
+    This is the "limp along" path: it drops ``--locked`` (the lock would force the held packages to
+    advance) and passes ``--override`` so uv keeps torch/torchvision at the currently-installed version
+    while still installing the rest of the new lock. ``--locked`` is intentionally absent here and ONLY
+    here; the normal :func:`uv_sync` path always keeps it.
+
+    With ``dry_run=True`` this only resolves (no install) and returns uv's exit code, which is the
+    authoritative REQUIRED-vs-OPTIONAL test: a non-zero code means a real dependency floor forbids the
+    hold, so the upgrade is mandatory. The dry-run output is captured (not streamed) to stay quiet.
+    """
+    args = ["sync", "--extra", extra]
+    for feature_extra in extras:
+        args += ["--extra", feature_extra]
+    args += ["--override", str(overrides_path)]
+    if dry_run:
+        args.append("--dry-run")
+        result = subprocess.run(
+            [uv, *args],
+            cwd=str(root or paths.install_root()),
+            env=build_child_env(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode
+    return run_uv(uv, args, root=root)
+
+
+_PRUNE_REMOVED_RE = re.compile(r"\(([\d.]+)\s*([KMGT]?i?B)\)")
+_UNIT_BYTES = {
+    "B": 1,
+    "KiB": 1024,
+    "MiB": 1024**2,
+    "GiB": 1024**3,
+    "TiB": 1024**4,
+    "KB": 1000,
+    "MB": 1000**2,
+    "GB": 1000**3,
+    "TB": 1000**4,
+}
+
+
+def uv_cache_prune(uv: str, *, root: Path | None = None) -> tuple[int, int]:
+    """Run ``uv cache prune`` (never ``clean``) and return ``(exit_code, reclaimed_bytes)``.
+
+    ``uv cache prune`` removes only unused cache entries and is hardlink-safe (it can never break an
+    existing venv), so it is safe to run after a successful sync to reclaim superseded wheels. The
+    reclaimed size is parsed best-effort from uv's "Removed N files (X MiB)" summary; 0 when not found.
+    """
+    root = root or paths.install_root()
+    result = subprocess.run(
+        [uv, "cache", "prune"],
+        cwd=str(root),
+        env=build_child_env(root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    reclaimed = 0
+    match = _PRUNE_REMOVED_RE.search((result.stdout or "") + (result.stderr or ""))
+    if match:
+        amount, unit = match.group(1), match.group(2)
+        try:
+            reclaimed = int(float(amount) * _UNIT_BYTES.get(unit, 1))
+        except ValueError:
+            reclaimed = 0
+    return result.returncode, reclaimed
 
 
 def uv_run(uv: str, command: list[str], *, root: Path | None = None, no_sync: bool = True) -> int:

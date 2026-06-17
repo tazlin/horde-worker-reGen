@@ -15,7 +15,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from worker_bootstrap import backend, paths, runner
+from worker_bootstrap import backend, paths, runner, sync_plan
 
 _DEFAULT_TORCH = "2.9.1"
 _DEFAULT_INDEX = "https://download.pytorch.org/whl/rocm6.4"
@@ -42,8 +42,21 @@ def _patch_wsl_libhsa(root: Path) -> None:
             shutil.copyfile(_SYSTEM_LIBHSA, found)
 
 
-def sync_rocm(uv: str, *, root: Path | None = None) -> int:
-    """Install the base environment then the ad-hoc ROCm torch stack; return the final exit code."""
+def _rocm_torch_already_satisfies(root: Path, target: str) -> bool:
+    """Return whether the installed ROCm torch already meets *target* (so a reinstall is optional)."""
+    installed = sync_plan.installed_versions(paths.venv_dir(root)).get("torch")
+    if installed is None:
+        return False
+    return sync_plan.version_at_least(installed, target)
+
+
+def sync_rocm(uv: str, *, root: Path | None = None, hold: bool = False) -> int:
+    """Install the base environment then the ad-hoc ROCm torch stack; return the final exit code.
+
+    With ``hold=True`` (the user opted to limp along), the ad-hoc torch reinstall is skipped when the
+    installed torch already satisfies the target version: the ROCm stack is not in the lock, so "holding"
+    simply means not re-pulling the ~GB torch wheel when nothing requires it.
+    """
     root = root or paths.install_root()
     # ROCm is a lean "others" backend: the cpu extra provides only the universal deps. Feature extras
     # (rembg/onnxruntime) are off by default and opt-in via HORDE_WORKER_FEATURES (their CPU wheels do
@@ -57,6 +70,9 @@ def sync_rocm(uv: str, *, root: Path | None = None) -> int:
 
     torch_version = os.environ.get("HORDE_WORKER_ROCM_TORCH", _DEFAULT_TORCH)
     index = os.environ.get("HORDE_WORKER_ROCM_INDEX", _DEFAULT_INDEX)
+    if hold and _rocm_torch_already_satisfies(root, torch_version):
+        print(f"Limping along: keeping the installed ROCm torch (target {torch_version} already satisfied).")
+        return 0
     print(f"Installing the ROCm PyTorch stack ad-hoc (torch {torch_version} from {index})...")
     torch_rc = runner.run_uv(
         uv,
