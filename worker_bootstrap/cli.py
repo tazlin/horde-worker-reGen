@@ -128,14 +128,33 @@ def _effective_cache_dir(root: Path) -> str:
 
 
 def _maybe_prune(uv: str, root: Path, options: _SyncOptions) -> None:
-    """Auto-prune the owned uv cache after a successful sync (never a shared/redirected cache)."""
+    """Auto-prune the owned uv cache after a successful sync (never a shared/redirected cache).
+
+    The install is already complete and on disk by the time this runs, so every non-success outcome
+    below is reported as a skipped cleanup, never a failed install. The progress line is printed (and
+    flushed) before the blocking call so a slow prune cannot look like a hang.
+    """
     if not options.prune or not _cache_is_owned(root):
         return
+    print("Tidying the worker's uv cache (removing superseded wheels; this can take a moment)...", flush=True)
     rc, reclaimed = runner.uv_cache_prune(uv, root=root)
-    if rc == 0 and reclaimed:
+    if rc == 0:
+        if reclaimed:
+            reclaimed_human = sync_plan.human_bytes(reclaimed)
+            print(f"Reclaimed {reclaimed_human} from the worker's uv cache ({_effective_cache_dir(root)}).")
+        else:
+            print("uv cache already tidy; nothing to reclaim.")
+        return
+    if rc == runner.PRUNE_TIMED_OUT:
         print(
-            f"Reclaimed {sync_plan.human_bytes(reclaimed)} from the worker's uv cache ({_effective_cache_dir(root)})."
+            "Cache cleanup timed out and was skipped; the install is complete. "
+            "Raise HORDE_WORKER_PRUNE_TIMEOUT or pass --no-prune to silence this.",
+            file=sys.stderr,
         )
+    elif rc == runner.PRUNE_INTERRUPTED:
+        print("Cache cleanup was interrupted and skipped; the install is complete.", file=sys.stderr)
+    else:
+        print("Cache cleanup did not complete (non-fatal); the install is complete.", file=sys.stderr)
 
 
 def _is_headless() -> bool:

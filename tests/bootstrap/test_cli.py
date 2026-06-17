@@ -237,3 +237,17 @@ def test_sync_prunes_only_when_cache_owned(env: tuple[Path, list], monkeypatch: 
     monkeypatch.delenv("HORDE_WORKER_UV_CACHE_MODE", raising=False)
     assert cli.main(["sync", "--no-prune"]) == 0
     assert pruned == []  # explicitly disabled
+
+
+def test_sync_prune_timeout_is_non_fatal(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A stalled/timed-out prune still leaves the install reported as success, with an honest skip note."""
+    root, _ = env
+    monkeypatch.setattr(cli.runner, "uv_cache_prune", lambda uv, **kw: (cli.runner.PRUNE_TIMED_OUT, 0))
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.delenv("HORDE_WORKER_UV_CACHE_MODE", raising=False)
+
+    assert cli.main(["sync"]) == 0  # install succeeded; cleanup failure must not change that
+    err = capsys.readouterr().err
+    assert "Cache cleanup timed out" in err

@@ -193,6 +193,7 @@ def test_uv_cache_prune_parses_reclaimed(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
     def fake_run(cmd: list[str], **kw: object) -> _FakeCompleted:
         captured["cmd"] = cmd
+        captured["timeout"] = kw.get("timeout")
         return _FakeCompleted(0, stdout="Pruning cache at ...\nRemoved 1248 files (3.4 GiB)\n")
 
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
@@ -201,6 +202,43 @@ def test_uv_cache_prune_parses_reclaimed(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert rc == 0
     assert captured["cmd"] == ["UV", "cache", "prune"]
     assert reclaimed == int(3.4 * 1024**3)
+    assert captured["timeout"] == runner._PRUNE_TIMEOUT_SECONDS  # bounded by default so it cannot hang forever
+
+
+def test_uv_cache_prune_times_out_non_fatally(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A stalled prune is bounded by the timeout and reported as a skip, never a crash."""
+
+    def fake_run(cmd: list[str], **kw: object) -> _FakeCompleted:
+        raise runner.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    rc, reclaimed = runner.uv_cache_prune("UV", root=tmp_path)
+
+    assert rc == runner.PRUNE_TIMED_OUT
+    assert reclaimed == 0
+
+
+def test_uv_cache_prune_swallows_ctrl_c(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Ctrl+C during the final cleanup skips the prune instead of unwinding with a traceback."""
+
+    def fake_run(cmd: list[str], **kw: object) -> _FakeCompleted:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    rc, reclaimed = runner.uv_cache_prune("UV", root=tmp_path)
+
+    assert rc == runner.PRUNE_INTERRUPTED
+    assert reclaimed == 0
+
+
+def test_prune_timeout_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HORDE_WORKER_PRUNE_TIMEOUT overrides the bound; 0/garbage fall back safely."""
+    monkeypatch.setenv("HORDE_WORKER_PRUNE_TIMEOUT", "45")
+    assert runner._prune_timeout_seconds() == 45.0
+    monkeypatch.setenv("HORDE_WORKER_PRUNE_TIMEOUT", "0")
+    assert runner._prune_timeout_seconds() == 0.0  # disables the bound
+    monkeypatch.setenv("HORDE_WORKER_PRUNE_TIMEOUT", "nonsense")
+    assert runner._prune_timeout_seconds() == runner._PRUNE_TIMEOUT_SECONDS
 
 
 def test_uv_run_no_sync_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

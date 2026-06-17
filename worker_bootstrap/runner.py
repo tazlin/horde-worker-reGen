@@ -162,6 +162,27 @@ def uv_sync_held(
     return run_uv(uv, args, root=root)
 
 
+# `uv cache prune` is a best-effort cleanup that runs AFTER a successful sync. It walks (and stat/hardlink-
+# checks) the whole cache tree, which can be slow on a large or networked cache and has, in the field,
+# appeared to hang with no output. These outcomes are returned to the caller as distinct exit codes so it
+# can give an honest message and still report the (already-successful) install as a success.
+PRUNE_TIMED_OUT = 124  # conventional "timed out" exit code
+PRUNE_INTERRUPTED = 130  # conventional "terminated by Ctrl+C" exit code
+_PRUNE_TIMEOUT_SECONDS = 300.0
+
+
+def _prune_timeout_seconds() -> float:
+    """Return the prune timeout, allowing an env override for unusually large/slow caches (0 disables)."""
+    raw = os.environ.get("HORDE_WORKER_PRUNE_TIMEOUT")
+    if raw is None:
+        return _PRUNE_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _PRUNE_TIMEOUT_SECONDS
+    return value if value > 0 else 0.0
+
+
 _PRUNE_REMOVED_RE = re.compile(r"\(([\d.]+)\s*([KMGT]?i?B)\)")
 _UNIT_BYTES = {
     "B": 1,
@@ -176,22 +197,37 @@ _UNIT_BYTES = {
 }
 
 
-def uv_cache_prune(uv: str, *, root: Path | None = None) -> tuple[int, int]:
+def uv_cache_prune(uv: str, *, root: Path | None = None, timeout: float | None = None) -> tuple[int, int]:
     """Run ``uv cache prune`` (never ``clean``) and return ``(exit_code, reclaimed_bytes)``.
 
     ``uv cache prune`` removes only unused cache entries and is hardlink-safe (it can never break an
     existing venv), so it is safe to run after a successful sync to reclaim superseded wheels. The
     reclaimed size is parsed best-effort from uv's "Removed N files (X MiB)" summary; 0 when not found.
+
+    Because this is post-success cleanup that has been observed to stall on large caches, the call is
+    bounded by ``timeout`` (defaulting to :func:`_prune_timeout_seconds`; 0 disables the bound). On a
+    timeout the child is killed and :data:`PRUNE_TIMED_OUT` is returned; a ``Ctrl+C`` during the prune
+    kills the child and returns :data:`PRUNE_INTERRUPTED` instead of unwinding with a traceback. In both
+    cases the caller can treat the prune as skipped while still reporting the completed install as success.
     """
     root = root or paths.install_root()
-    result = subprocess.run(
-        [uv, "cache", "prune"],
-        cwd=str(root),
-        env=build_child_env(root),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    effective_timeout = _prune_timeout_seconds() if timeout is None else timeout
+    try:
+        result = subprocess.run(
+            [uv, "cache", "prune"],
+            cwd=str(root),
+            env=build_child_env(root),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=effective_timeout or None,
+        )
+    except subprocess.TimeoutExpired:
+        return PRUNE_TIMED_OUT, 0
+    except KeyboardInterrupt:
+        # subprocess.run already killed the child on the way out; swallow the interrupt so a single
+        # Ctrl+C during this final cleanup skips it rather than discarding the successful install.
+        return PRUNE_INTERRUPTED, 0
     reclaimed = 0
     match = _PRUNE_REMOVED_RE.search((result.stdout or "") + (result.stderr or ""))
     if match:
