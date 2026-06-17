@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "horde_worker_regen"
-version = "12.5.7"
+version = "12.5.8"
 description = "Allows you to connect to the AI Horde and generate images for users."
 authors = [
     {name = "tazlin", email = "tazlin.on.github@gmail.com"},
@@ -31,7 +31,7 @@ dependencies = [
     # torchaudio as a hard dep, and exposes the optional-feature extras + capability registry
     # (hordelib.api.available_features) that the worker's `post-processing`/`controlnet` extras and the
     # config coercion in horde_worker_regen/capabilities.py depend on.
-    "horde_engine[layerdiffuse]>=3.2.5,<4.0.0",
+    "horde_engine[layerdiffuse,upscale-extra]>=3.2.5,<4.0.0",
     "horde_model_reference>=5.3.0,<6.0.0",
     "python-dotenv",
     "ruamel.yaml",
@@ -78,6 +78,7 @@ cpu = ["torch", "torchvision"]
 # (onnxruntime/mediapipe via controlnet; rembg via post-processing) that have no wheels for some
 # accelerators (Intel XPU / Apple MPS / Ascend), so they are NOT in the base install: a base worker
 # runs on every backend ComfyUI supports and screens images (the safety classifier is pure torch).
+#
 # Install profiles re-add these by default on NVIDIA/CPU; non-NVIDIA opts in only where wheels exist.
 # When a feature's deps are absent, horde_worker_regen/capabilities.py warns and coerces it off so the
 # worker never advertises what it cannot run. post-processing is one atomic bucket (strip_background

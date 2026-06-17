@@ -34,13 +34,33 @@ if TYPE_CHECKING:
 
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
-# The worker extra (see pyproject ``[project.optional-dependencies]``) that re-exports the
-# horde-engine extra enabling each gated feature. Keyed by ``FEATURE_KIND`` value (a plain string) so
-# this map needs no hordelib import to define.
-_WORKER_EXTRA_FOR_FEATURE: dict[str, str] = {
-    "strip_background": "post-processing",
+# The one worker-local fact about feature extras: how a horde-engine feature extra is re-exported under
+# the worker's own ``[project.optional-dependencies]`` name. horde-engine's ``rembg`` extra is surfaced
+# to operators as ``post-processing``; ``controlnet`` keeps its name. Everything else about gated features
+# (which FEATURE_KINDs are gated, the packages each needs, the labels) is owned by hordelib's
+# ``feature_requirements`` registry and read from it below, so there is a single source of truth.
+_HORDE_ENGINE_EXTRA_TO_WORKER_EXTRA: dict[str, str] = {
+    "rembg": "post-processing",
     "controlnet": "controlnet",
 }
+
+
+@functools.lru_cache(maxsize=1)
+def _worker_extra_for_feature() -> dict[str, str]:
+    """Map each gated ``FEATURE_KIND`` value to the worker extra that installs it.
+
+    Derived from hordelib's typed requirement registry (the source of truth for which features are
+    backend-gated and the horde-engine extra each needs) via the worker-local re-export aliases in
+    :data:`_HORDE_ENGINE_EXTRA_TO_WORKER_EXTRA`. A horde-engine extra with no worker alias falls back to
+    its own name, so a newly gated feature is still named usefully in install hints before an alias is
+    added. Cached because hordelib's registry does not change during a run.
+    """
+    from hordelib.api import get_feature_requirement_registry
+
+    return {
+        requirement.feature.value: _HORDE_ENGINE_EXTRA_TO_WORKER_EXTRA.get(requirement.extra, requirement.extra)
+        for requirement in get_feature_requirement_registry().values()
+    }
 
 
 @functools.lru_cache(maxsize=1)
@@ -78,7 +98,7 @@ def _install_hint(feature: FEATURE_KIND) -> str:
     from hordelib.api import missing_packages
 
     missing = missing_packages(feature)
-    extra = _WORKER_EXTRA_FOR_FEATURE.get(feature.value, feature.value)
+    extra = _worker_extra_for_feature().get(feature.value, feature.value)
     packages = ", ".join(missing) if missing else "the required packages"
     return (
         f"{packages} not installed; install `horde-worker-reGen[{extra}]` (or use an install profile "

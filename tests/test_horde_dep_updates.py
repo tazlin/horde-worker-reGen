@@ -161,6 +161,37 @@ def test_horde_engine_requested_with_layerdiffuse_extra() -> None:
     )
 
 
+def test_horde_engine_requested_with_upscale_extra() -> None:
+    """horde-engine must carry the [upscale-extra] extra in the BASE deps, not an opt-in extra.
+
+    upscale-extra pulls spandrel-extra-arches, a pure-Python universal wheel (no accelerator-specific
+    native blocker) that broadens the upscaler architectures spandrel can load. It gates no feature
+    on/off, so it rides in base on every backend rather than behind a per-backend feature extra. This
+    guards against it being dropped on a future bump (which would silently narrow upscaler support).
+    """
+    base_deps = _load_pyproject()["project"]["dependencies"]
+    horde_engine_specs = [d for d in base_deps if _normalize(_dep_name(d)) == "horde-engine"]
+    assert horde_engine_specs, "horde-engine is not declared in [project.dependencies]"
+    extras = set().union(*(_requested_extras(d) for d in horde_engine_specs))
+    assert "upscale-extra" in extras, (
+        "horde-engine must be requested as horde_engine[...,upscale-extra] in [project.dependencies]; "
+        "without it spandrel-extra-arches is not installed and the extra upscaler architectures are "
+        "unavailable on every backend"
+    )
+
+
+def test_lock_resolves_spandrel_extra_arches() -> None:
+    """Require spandrel-extra-arches in uv.lock so `uv sync --locked` installs the extra upscaler arches.
+
+    The pyproject request alone is not enough: update-runtime builds the runtime from the lock, so a lock
+    regenerated without the upscale-extra extra would still leave spandrel-extra-arches uninstalled.
+    """
+    locked_names = {_normalize(p["name"]) for p in _load_lock()["package"]}
+    assert "spandrel-extra-arches" in locked_names, (
+        "spandrel-extra-arches missing from uv.lock — run 'uv lock' after adding the horde_engine[upscale-extra] extra"
+    )
+
+
 def test_post_processing_extra_includes_facerestore_dep() -> None:
     """The post-processing extra must carry lpips, the bundled face-fix node's sole eager import gap.
 
