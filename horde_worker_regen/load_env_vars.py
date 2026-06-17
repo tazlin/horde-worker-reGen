@@ -59,6 +59,16 @@ def load_env_vars_from_config() -> None:  # FIXME: there is a dynamic way to do 
                 "This will override the value for `cache_home` in the config file.",
             )
 
+    # Peered-data fallback, applied at the LOWEST precedence: the scripted installers run the worker from a
+    # runtime shim that exports HORDE_WORKER_DATA_DIR (the sibling <worker>-data folder preserved across
+    # reinstalls) but deliberately do NOT pre-set AIWORKER_CACHE_HOME, so a user-set env var and a config
+    # `cache_home` both win over this. Only when neither supplied a model location do we default models into
+    # <data>/models so a fresh install reuses previously downloaded weights instead of re-downloading them.
+    if os.getenv("AIWORKER_CACHE_HOME") is None:
+        data_dir = os.getenv("HORDE_WORKER_DATA_DIR")
+        if data_dir:
+            os.environ["AIWORKER_CACHE_HOME"] = os.path.join(data_dir, "models")
+
     if "max_lora_cache_size" in config:
         if os.getenv("AIWORKER_LORA_CACHE_SIZE") is None:
             try:

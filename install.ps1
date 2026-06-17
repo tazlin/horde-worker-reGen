@@ -134,6 +134,9 @@ if (-not (Test-Path (Join-Path $InstallDir ".venv"))) {
 Write-Host ""
 Write-Host "Installation complete." -ForegroundColor Green
 Write-Host "Installed at: $InstallDir"
+Write-Host "Models, the uv cache, and Python live in $InstallDir-data (a sibling folder)."
+Write-Host "That data folder is preserved if you delete or reinstall the worker folder, so your models are"
+Write-Host "not lost. Set `$env:HORDE_WORKER_DATA_DIR before installing to put it elsewhere (e.g. another drive)."
 
 # Shortcuts are opt-in (conservative default): we ask, defaulting to No. HORDE_WORKER_SHORTCUTS creates
 # them without asking (for unattended installs); HORDE_WORKER_NO_SHORTCUTS skips entirely. Per-user only,
@@ -167,7 +170,8 @@ if ($madeShortcut) {
     Write-Host "  - click the 'AI Horde Worker' shortcut on your Desktop or in the Start Menu, or"
 }
 Write-Host "  - run horde-worker.cmd in $InstallDir."
-Write-Host "To update later: re-run the same install command (or 'winget upgrade Haidra.HordeWorker')."
+Write-Host "To update later: run update.cmd in $InstallDir, re-run the same install command, or"
+Write-Host "  'winget upgrade Haidra.HordeWorker'. Any of these keep your $InstallDir-data folder intact."
 Write-Host ""
 
 if (Get-Option "HORDE_WORKER_NO_LAUNCH" "") {

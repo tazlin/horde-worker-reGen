@@ -9,11 +9,18 @@ SET PYTHONNOUSERSITE=1
 SET PYTHONPATH=
 SET CONDA_SHLVL=
 
-REM Keep uv's cache and the managed Python it downloads on the install drive (next to .venv, under bin\
-REM which the uninstaller removes), not the home drive. Respect caller-set values so power users / dev
-REM checkouts can point at a shared location.
-if not defined UV_CACHE_DIR set "UV_CACHE_DIR=%~dp0bin\uv_cache"
-if not defined UV_PYTHON_INSTALL_DIR set "UV_PYTHON_INSTALL_DIR=%~dp0bin\python"
+REM Keep uv's cache, the managed Python, and downloaded models in a peered data dir: a sibling of the
+REM worker folder (same name with a -data suffix) that survives deleting or reinstalling the worker folder,
+REM so a user starting fresh cannot lose their cached deps or model weights. HORDE_WORKER_DATA_DIR overrides
+REM the location. This must match worker_bootstrap\paths.py:data_root. Respect caller-set values for each.
+for %%I in ("%~dp0.") do set "WORKER_ROOT=%%~fI"
+if not defined HORDE_WORKER_DATA_DIR set "HORDE_WORKER_DATA_DIR=%WORKER_ROOT%-data"
+if not exist "%HORDE_WORKER_DATA_DIR%" md "%HORDE_WORKER_DATA_DIR%"
+if not defined UV_CACHE_DIR set "UV_CACHE_DIR=%HORDE_WORKER_DATA_DIR%\uv_cache"
+if not defined UV_PYTHON_INSTALL_DIR set "UV_PYTHON_INSTALL_DIR=%HORDE_WORKER_DATA_DIR%\python"
+REM AIWORKER_CACHE_HOME intentionally unset here: setting it would outrank `cache_home` in bridgeData.yaml.
+REM The worker applies the peered <data>\models default at lowest precedence from HORDE_WORKER_DATA_DIR, so
+REM the ladder stays env var > cache_home > peered default. See worker_bootstrap/load_env_vars.py.
 REM Self-contained install: use a uv-managed CPython, not a system one that a user could later uninstall.
 if not defined UV_PYTHON_PREFERENCE set "UV_PYTHON_PREFERENCE=only-managed"
 

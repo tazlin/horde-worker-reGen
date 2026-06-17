@@ -17,6 +17,8 @@ def test_build_child_env_isolation(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     monkeypatch.setenv("VIRTUAL_ENV", "C:/some/script-env")
     monkeypatch.delenv("UV_CACHE_DIR", raising=False)
     monkeypatch.delenv("UV_PYTHON_INSTALL_DIR", raising=False)
+    monkeypatch.delenv("AIWORKER_CACHE_HOME", raising=False)
+    monkeypatch.delenv("HORDE_WORKER_DATA_DIR", raising=False)
 
     env = runner.build_child_env(tmp_path)
 
@@ -26,13 +28,23 @@ def test_build_child_env_isolation(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert "VIRTUAL_ENV" not in env  # inherited from the outer `uv run --script`; must not leak to inner uv
     assert env["UV_CACHE_DIR"] == str(paths.uv_cache_dir(tmp_path))
     assert env["UV_PYTHON_INSTALL_DIR"] == str(paths.python_install_dir(tmp_path))
+    # Only the data-dir LOCATION is propagated; AIWORKER_CACHE_HOME is left for the worker to derive at the
+    # lowest precedence so it never outranks bridgeData.yaml `cache_home`.
+    assert env["HORDE_WORKER_DATA_DIR"] == str(paths.data_root(tmp_path))
+    assert "AIWORKER_CACHE_HOME" not in env
     assert env["UV_PYTHON_PREFERENCE"] == "only-managed"
 
 
 def test_build_child_env_respects_preset(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """A caller-set UV_CACHE_DIR is preserved (power users can redirect the cache)."""
+    """Caller-set cache/model/data locations are preserved (power users can redirect them)."""
     monkeypatch.setenv("UV_CACHE_DIR", "C:/shared/uvcache")
-    assert runner.build_child_env(tmp_path)["UV_CACHE_DIR"] == "C:/shared/uvcache"
+    monkeypatch.setenv("AIWORKER_CACHE_HOME", "C:/shared/models")
+    monkeypatch.setenv("HORDE_WORKER_DATA_DIR", "C:/shared/horde-data")
+    env = runner.build_child_env(tmp_path)
+    assert env["UV_CACHE_DIR"] == "C:/shared/uvcache"
+    # A user/system-set AIWORKER_CACHE_HOME is never dropped or overridden by the launcher.
+    assert env["AIWORKER_CACHE_HOME"] == "C:/shared/models"
+    assert env["HORDE_WORKER_DATA_DIR"] == "C:/shared/horde-data"
 
 
 def test_build_child_env_prepends_bundled_git(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

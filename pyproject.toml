@@ -241,9 +241,10 @@ addopts = "-p pytest_asyncio"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 # Scope collection to our own tests. A bare `pytest` from the repo root would
-# otherwise recurse into bin/uv_cache/ (UV_CACHE_DIR set by runtime.sh) and try
-# to import the bundled test suites of third-party wheels, failing on their
-# dev-only deps. norecursedirs is belt-and-suspenders for explicit path args.
+# otherwise recurse into vendored dirs (e.g. the uv cache, now in the peered
+# <worker>-data sibling, or .venv) and try to import the bundled test suites of
+# third-party wheels, failing on their dev-only deps. norecursedirs is
+# belt-and-suspenders for explicit path args.
 testpaths = ["tests"]
 norecursedirs = ["bin", ".venv", "build", "dist", "*.egg-info"]
 markers = [

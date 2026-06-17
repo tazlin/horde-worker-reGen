@@ -110,6 +110,9 @@ fi
 
 echo ""
 echo "Installation complete (installed at $INSTALL_DIR)."
+echo "Models, the uv cache, and Python live in $INSTALL_DIR-data (a sibling folder), which is preserved if"
+echo "you delete or reinstall the worker folder, so your models are not lost. Set HORDE_WORKER_DATA_DIR"
+echo "before installing to put it elsewhere (e.g. another drive)."
 
 # Per-user application-menu entry so the dashboard is easy to reopen later. Opt-in (conservative default):
 # we ask, defaulting to No. HORDE_WORKER_SHORTCUTS adds it without asking; HORDE_WORKER_NO_SHORTCUTS skips
@@ -148,7 +151,7 @@ echo ""
 echo "To open the dashboard again later:"
 echo "  - run $INSTALL_DIR/horde-worker.sh  (add --terminal for the in-terminal UI), or"
 echo "  - launch 'AI Horde Worker' from your applications menu."
-echo "To update later: re-run the same install command."
+echo "To update later: run $INSTALL_DIR/update.sh or re-run the same install command (both keep $INSTALL_DIR-data intact)."
 echo ""
 
 if [ -n "${HORDE_WORKER_NO_LAUNCH:-}" ]; then

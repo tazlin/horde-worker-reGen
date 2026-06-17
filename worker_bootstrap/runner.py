@@ -27,10 +27,15 @@ def build_child_env(root: Path | None = None) -> dict[str, str]:
     # environment. Drop it so the uv we spawn here targets the project's .venv cleanly (and picks the
     # managed Python) instead of warning that VIRTUAL_ENV does not match and falling back to a system one.
     env.pop("VIRTUAL_ENV", None)
-    # Keep uv's cache and managed CPython on the install drive (and under bin/, which uninstall removes)
-    # rather than the home drive. Respect caller-set values so power users can redirect them.
+    # Keep uv's cache, managed CPython, and downloaded models in the peered data dir (a sibling of the
+    # worker folder, preserved when the worker folder is deleted or reinstalled) rather than the home
+    # drive. Respect caller-set values so power users can redirect them (the runtime shims set them first).
     env.setdefault("UV_CACHE_DIR", str(paths.uv_cache_dir(root)))
     env.setdefault("UV_PYTHON_INSTALL_DIR", str(paths.python_install_dir(root)))
+    # Propagate only the data-dir LOCATION, not AIWORKER_CACHE_HOME itself: forcing the models env var here
+    # would outrank `cache_home` in bridgeData.yaml. The worker derives the <data>/models default from this
+    # at the lowest precedence (load_env_vars.py), keeping env var > cache_home > peered default.
+    env.setdefault("HORDE_WORKER_DATA_DIR", str(paths.data_root(root)))
     # Use a uv-managed CPython, never a system one: a packaged install must be self-contained, so a user
     # uninstalling their own Python can't break .venv. (pyproject's "managed" only *prefers* managed.)
     env.setdefault("UV_PYTHON_PREFERENCE", "only-managed")

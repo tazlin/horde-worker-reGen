@@ -8,11 +8,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONNOUSERSITE=1
 unset PYTHONPATH
 unset CONDA_SHLVL
-# Keep uv's cache and the managed Python it downloads on the install drive (next to .venv), not the home
-# drive. Use a uv-managed CPython (only-managed) so the install is self-contained. Respect caller-set values.
-: "${UV_CACHE_DIR:=$SCRIPT_DIR/bin/uv_cache}"; export UV_CACHE_DIR
-: "${UV_PYTHON_INSTALL_DIR:=$SCRIPT_DIR/bin/python}"; export UV_PYTHON_INSTALL_DIR
+# Keep uv's cache, the managed Python, and downloaded models in a peered data dir: a sibling of the worker
+# folder (same name with a -data suffix) that is preserved when the worker folder is deleted or reinstalled,
+# so a user starting fresh cannot lose their cached deps or model weights. HORDE_WORKER_DATA_DIR overrides
+# the location (e.g. another drive). This must match worker_bootstrap/paths.py:data_root. Use a uv-managed
+# CPython (only-managed) so the install is self-contained. Respect caller-set values for each.
+HORDE_WORKER_DATA_DIR="${HORDE_WORKER_DATA_DIR:-${SCRIPT_DIR}-data}"
+export HORDE_WORKER_DATA_DIR
+mkdir -p "$HORDE_WORKER_DATA_DIR"
+: "${UV_CACHE_DIR:=$HORDE_WORKER_DATA_DIR/uv_cache}"; export UV_CACHE_DIR
+: "${UV_PYTHON_INSTALL_DIR:=$HORDE_WORKER_DATA_DIR/python}"; export UV_PYTHON_INSTALL_DIR
 : "${UV_PYTHON_PREFERENCE:=only-managed}"; export UV_PYTHON_PREFERENCE
+# Deliberately NOT setting AIWORKER_CACHE_HOME here. It would outrank `cache_home` in bridgeData.yaml (the
+# worker treats a pre-set env var as higher precedence than config). The peered <data>/models default is
+# applied at the LOWEST precedence inside the worker (load_env_vars.py, from HORDE_WORKER_DATA_DIR) so the
+# ladder stays env var > cache_home > peered default.
 
 ensure_uv() {
     [ -x "$SCRIPT_DIR/bin/uv" ] && return 0

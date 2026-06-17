@@ -6,6 +6,7 @@ relative to this file without needing the caller to pass the root in.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -14,19 +15,41 @@ def install_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def data_root(root: Path | None = None) -> Path:
+    """Return the sibling data directory that holds the reusable, expensive-to-rebuild artifacts.
+
+    The uv cache, the managed CPython, and downloaded models live here, peered alongside the worker
+    folder rather than nested inside it, so deleting or reinstalling the worker folder cannot take the
+    user's models and cached dependencies with it. The default is ``<worker_root>-data`` (same name with
+    a ``-data`` suffix); ``HORDE_WORKER_DATA_DIR`` overrides the location outright (e.g. another drive).
+    This resolution must stay identical to the shell shims (runtime.sh / runtime.cmd) that set the same
+    env before Python runs.
+    """
+    override = os.environ.get("HORDE_WORKER_DATA_DIR")
+    if override:
+        return Path(override)
+    r = root or install_root()
+    return r.parent / (r.name + "-data")
+
+
 def bin_dir(root: Path | None = None) -> Path:
     """Return the ``bin/`` directory that holds uv, the managed Python, and ``bin/backend``."""
     return (root or install_root()) / "bin"
 
 
 def uv_cache_dir(root: Path | None = None) -> Path:
-    """Return uv's package cache directory, co-located with the install (not on the home drive)."""
-    return bin_dir(root) / "uv_cache"
+    """Return uv's package cache directory, in the peered data dir (preserved across worker reinstalls)."""
+    return data_root(root) / "uv_cache"
 
 
 def python_install_dir(root: Path | None = None) -> Path:
-    """Return where uv should provision managed CPython, kept on the install drive under ``bin/``."""
-    return bin_dir(root) / "python"
+    """Return where uv provisions managed CPython, in the peered data dir (preserved across reinstalls)."""
+    return data_root(root) / "python"
+
+
+def models_dir(root: Path | None = None) -> Path:
+    """Return the model-weights directory (``AIWORKER_CACHE_HOME``), in the peered, preserved data dir."""
+    return data_root(root) / "models"
 
 
 def backend_file(root: Path | None = None) -> Path:
