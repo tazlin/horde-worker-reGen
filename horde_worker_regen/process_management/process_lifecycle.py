@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import contextlib
-import multiprocessing
+import os
+import sys
 import time
 from collections.abc import Callable
+from multiprocessing.context import BaseContext
+from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
 
@@ -115,6 +118,7 @@ class ProcessLifecycleManager:
     def __init__(
         self,
         *,
+        ctx: BaseContext,
         process_map: ProcessMap,
         horde_model_map: HordeModelMap,
         job_tracker: JobTracker,
@@ -137,6 +141,18 @@ class ProcessLifecycleManager:
         action_ledger: ActionLedger | None = None,
     ) -> None:
         """Initialize with shared references and callbacks from the parent manager."""
+        # All child processes are created from this context (ctx.Process/ctx.Pipe), not the bare
+        # multiprocessing.* helpers. Those resolve against the process-global default start method,
+        # which on POSIX is 'fork'; a forked child of a parent that has initialized CUDA dies with
+        # "Cannot re-initialize CUDA in forked subprocess". Pinning the spawn context here makes the
+        # worker correct regardless of how it was launched, instead of depending on an earlier
+        # set_start_method('spawn') side effect having run in this interpreter.
+        self._ctx = ctx
+        # typeshed declares Process only on the concrete context subclasses, not on BaseContext;
+        # the spawn context we are handed has it at runtime. Bind it once as a typed factory so the
+        # call sites stay statically checked (returning BaseProcess) without scattered ignores.
+        self._new_process: Callable[..., BaseProcess] = ctx.Process  # pyrefly: ignore[missing-attribute]
+        self._validate_spawn_start_method()
         self._process_map = process_map
         self._horde_model_map = horde_model_map
         self._job_tracker = job_tracker
@@ -176,6 +192,36 @@ class ProcessLifecycleManager:
         self._quarantined_inference_slots = set()
         self._num_slots_quarantined = 0
         self._safety_recovery_history = []
+
+    def _validate_spawn_start_method(self) -> None:
+        """Fail loudly if children would be created with a CUDA-unsafe start method.
+
+        Inference/safety children import torch and ComfyUI, which initialize CUDA at import time. On
+        POSIX the default start method is ``fork``; a forked child of a CUDA-initialized parent dies
+        with "Cannot re-initialize CUDA in forked subprocess". The context is pinned to spawn at
+        construction, so a non-spawn method here means a misconfigured launcher handed us the wrong
+        context: surface it instead of crash-looping every child.
+        """
+        if sys.platform == "win32":
+            return
+
+        try:
+            method = self._ctx.get_start_method()
+        except Exception:
+            # A test double (Mock context) has no real start method; nothing to validate.
+            return
+
+        if not isinstance(method, str) or method == "spawn":
+            return
+
+        message = (
+            f"Child processes would be created with the '{method}' start method, but CUDA requires "
+            "'spawn'. Forked children of a CUDA-initialized parent raise 'Cannot re-initialize CUDA "
+            "in forked subprocess'. Launch via the standard entry points so the spawn context is set."
+        )
+        logger.critical(message)
+        if not os.environ.get("AI_HORDE_TESTING"):
+            raise RuntimeError(message)
 
     def set_process_recovery_observer(self, observer: Callable[[HordeProcessInfo, str], None]) -> None:
         """Register a callback invoked with the process info and a reason on each recovery.
@@ -290,11 +336,11 @@ class ProcessLifecycleManager:
 
         for _ in range(num_processes_to_start):
             pid = self._process_map.num_safety_processes()
-            pipe_connection, child_pipe_connection = multiprocessing.Pipe(duplex=True)
+            pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
 
             cpu_only = not bridge_data.safety_on_gpu
 
-            process = multiprocessing.Process(
+            process = self._new_process(
                 target=self._entry_points.safety_entry_point,
                 args=(
                     pid,
@@ -337,9 +383,9 @@ class ProcessLifecycleManager:
             return
 
         bridge_data = self._runtime_config.bridge_data
-        pipe_connection, child_pipe_connection = multiprocessing.Pipe(duplex=True)
+        pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
 
-        process = multiprocessing.Process(
+        process = self._new_process(
             target=self._entry_points.download_entry_point,
             args=(
                 DOWNLOAD_PROCESS_ID,
@@ -465,8 +511,8 @@ class ProcessLifecycleManager:
         logger.info(f"Starting inference process on PID {pid}")
         vram_heavy_models = any(model in VRAM_HEAVY_MODELS for model in bridge_data.image_models_to_load)
 
-        pipe_connection, child_pipe_connection = multiprocessing.Pipe(duplex=True)
-        process = multiprocessing.Process(
+        pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
+        process = self._new_process(
             target=self._entry_points.inference_entry_point,
             args=(
                 pid,

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import multiprocessing
 import time
+from multiprocessing.process import BaseProcess
 from typing import override
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -32,8 +32,13 @@ except Exception:
 class HordeProcessInfo:
     """Contains information about a horde child process."""
 
-    mp_process: multiprocessing.Process
-    """The multiprocessing.Process object for this process."""
+    mp_process: BaseProcess
+    """The multiprocessing process object for this process.
+
+    Typed as ``BaseProcess`` (not ``multiprocessing.Process``) because the parent creates children
+    from an explicit spawn context (``ctx.Process(...)``), which returns a ``SpawnProcess`` -- a
+    sibling of ``multiprocessing.Process``, both subclassing ``BaseProcess``.
+    """
     pipe_connection: Connection
     """The connection through which messages can be sent to this process."""
     process_id: int
@@ -133,7 +138,7 @@ class HordeProcessInfo:
 
     def __init__(
         self,
-        mp_process: multiprocessing.Process,
+        mp_process: BaseProcess,
         pipe_connection: Connection,
         process_id: int,
         process_type: HordeProcessType,
@@ -144,7 +149,7 @@ class HordeProcessInfo:
         """Initialize a new HordeProcessInfo object.
 
         Args:
-            mp_process (multiprocessing.Process): The multiprocessing.Process object for this process.
+            mp_process (BaseProcess): The multiprocessing process object for this process.
             pipe_connection (Connection): The connection through which messages can be sent to this process.
             process_id (int): The ID of this process. This is not an OS process ID.
             process_type (HordeProcessType): The type of this process.

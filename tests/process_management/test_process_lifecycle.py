@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import multiprocessing
+import sys
 import time
 from unittest.mock import Mock
+
+import pytest
 
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.job_tracker import JobTracker
@@ -20,6 +24,7 @@ def _make_plm(
     *,
     process_map: ProcessMap | None = None,
     job_tracker: JobTracker | None = None,
+    ctx: object | None = None,
 ) -> ProcessLifecycleManager:
     """Helper to build a PLM with mostly-mocked dependencies."""
     bridge_data = Mock()
@@ -37,6 +42,7 @@ def _make_plm(
     bridge_data.exit_on_unhandled_faults = False
 
     return ProcessLifecycleManager(
+        ctx=ctx if ctx is not None else multiprocessing.get_context("spawn"),  # type: ignore[arg-type]
         process_map=process_map or ProcessMap({}),
         horde_model_map=Mock(),
         job_tracker=job_tracker or JobTracker(),
@@ -54,6 +60,35 @@ def _make_plm(
         abort_callback=Mock(),
         state=WorkerState(),
     )
+
+
+def test_inference_child_is_created_from_the_injected_context() -> None:
+    """Children must be spawned via the injected context, not the process-global multiprocessing.Process.
+
+    Using the global default would fork on POSIX, killing any child that touches CUDA after the parent
+    initialized it ("Cannot re-initialize CUDA in forked subprocess").
+    """
+    fake_ctx = Mock()
+    fake_ctx.get_start_method.return_value = "spawn"
+    fake_ctx.Pipe.return_value = (Mock(), Mock())
+    fake_ctx.Process.return_value.pid = 12345
+
+    plm = _make_plm(ctx=fake_ctx)
+    plm._start_inference_process(0)
+
+    fake_ctx.Process.assert_called_once()
+
+
+def test_non_spawn_context_is_rejected_on_posix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fork (or forkserver) context must fail loudly outside tests rather than crash-loop every child."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("AI_HORDE_TESTING", raising=False)
+
+    fork_ctx = Mock()
+    fork_ctx.get_start_method.return_value = "fork"
+
+    with pytest.raises(RuntimeError, match="spawn"):
+        _make_plm(ctx=fork_ctx)
 
 
 def test_broadcast_reload_model_database_targets_inference_and_download() -> None:

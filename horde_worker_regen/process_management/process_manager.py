@@ -584,6 +584,7 @@ class HordeWorkerProcessManager:
         self._action_ledger = ActionLedger(path=ledger_path)
 
         self._process_lifecycle = ProcessLifecycleManager(
+            ctx=ctx,
             process_map=self._process_map,
             horde_model_map=self._horde_model_map,
             job_tracker=self._job_tracker,
