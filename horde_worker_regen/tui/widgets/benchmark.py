@@ -9,6 +9,8 @@ GPU-exclusive worker/benchmark hand-off.
 from __future__ import annotations
 
 import contextlib
+import json
+import subprocess
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -22,6 +24,7 @@ from textual.widgets import Button, Input, Label, Static, Switch
 
 from horde_worker_regen import __version__
 from horde_worker_regen.app_state import AppStateStore, BenchmarkAvailability, benchmark_status_summary
+from horde_worker_regen.benchmark.progress_channel import LevelPlanRow
 from horde_worker_regen.tui.benchmark_launcher import (
     BenchmarkOptions,
     BenchmarkRunState,
@@ -37,6 +40,9 @@ _OUTCOME_COLOURS: dict[str, str] = {
     "skipped": "grey50",
 }
 
+_PLAN_PREVIEW_TIMEOUT_SECONDS = 180.0
+"""Cap on the `plan` subprocess: it imports the inference stack and probes the GPU (slow, cold)."""
+
 
 class BenchmarkView(VerticalScroll):
     """Launch and monitor a benchmark ramp, then apply the recommended bridgeData."""
@@ -49,11 +55,11 @@ class BenchmarkView(VerticalScroll):
     BenchmarkView #benchmark-actions Button {
         margin-right: 1;
     }
-    BenchmarkView #benchmark-options {
+    BenchmarkView #benchmark-options, BenchmarkView #benchmark-options-2 {
         height: 3;
         padding: 0 1;
     }
-    BenchmarkView #benchmark-options Label {
+    BenchmarkView #benchmark-options Label, BenchmarkView #benchmark-options-2 Label {
         content-align: left middle;
         height: 3;
         padding: 0 1;
@@ -94,6 +100,7 @@ class BenchmarkView(VerticalScroll):
         """Lay out the action bar, the options row, and the live body panel."""
         with Horizontal(id="benchmark-actions"):
             yield Button("Run benchmark", id="benchmark-run", variant="success")
+            yield Button("Preview plan", id="benchmark-preview", variant="primary")
             yield Button("Cancel", id="benchmark-cancel", variant="warning")
             yield Button("Apply suggested config", id="benchmark-apply", variant="primary")
             yield Button("Restore last-known-good", id="benchmark-restore", variant="default")
@@ -108,7 +115,19 @@ class BenchmarkView(VerticalScroll):
             yield Switch(value=False, id="benchmark-downloads")
             yield Label("Verbose")
             yield Switch(value=False, id="benchmark-verbose")
+        with Horizontal(id="benchmark-options-2"):
+            yield Label("Concurrency")
+            yield Switch(value=True, id="benchmark-concurrency")
+            yield Label("Features")
+            yield Switch(value=True, id="benchmark-features")
+            yield Label("Alchemy")
+            yield Switch(value=True, id="benchmark-alchemy")
+            yield Label("Warm")
+            yield Switch(value=True, id="benchmark-warm")
+            yield Label("Force")
+            yield Switch(value=False, id="benchmark-force")
         yield Static(self._app_state_summary, id="benchmark-status", classes="benchmark-body")
+        yield Static(id="benchmark-plan", classes="benchmark-body")
         yield Static(id="benchmark-body", classes="benchmark-body")
 
     def on_mount(self) -> None:
@@ -123,14 +142,20 @@ class BenchmarkView(VerticalScroll):
             self.query_one("#benchmark-status", Static).update(self._app_state_summary)
 
     def update_view(self, run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus) -> None:
-        """Refresh the action buttons and the body panel from the supervisor's latest state."""
+        """Refresh the action buttons, the plan pane, and the body panel from the supervisor's latest state."""
         self._update_buttons(status, run_state)
         self.query_one("#benchmark-body", Static).update(self._render_body(run_state, status))
+        # A run's RampPlanned event overrides any idle preview with the authoritative plan; an empty
+        # plan (before RampPlanned) leaves a previously-previewed plan in place rather than clearing it.
+        if run_state.plan_rows:
+            self.query_one("#benchmark-plan", Static).update(self._plan_panel(run_state.plan_rows))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Translate the action buttons into messages the app coordinates."""
         if event.button.id == "benchmark-run":
             self.post_message(self.RunRequested(self._collect_options()))
+        elif event.button.id == "benchmark-preview":
+            self._start_plan_preview()
         elif event.button.id == "benchmark-cancel":
             self.post_message(self.CancelRequested())
         elif event.button.id == "benchmark-apply":
@@ -152,8 +177,99 @@ class BenchmarkView(VerticalScroll):
             validate=self.query_one("#benchmark-validate", Switch).value,
             soak_minutes=soak_minutes,
             include_downloads=self.query_one("#benchmark-downloads", Switch).value,
+            include_concurrency=self.query_one("#benchmark-concurrency", Switch).value,
+            include_features=self.query_one("#benchmark-features", Switch).value,
+            include_alchemy=self.query_one("#benchmark-alchemy", Switch).value,
+            warm=self.query_one("#benchmark-warm", Switch).value,
+            force=self.query_one("#benchmark-force", Switch).value,
             verbose=self.query_one("#benchmark-verbose", Switch).value,
         )
+
+    def _start_plan_preview(self) -> None:
+        """Shell ``horde-benchmark plan --json`` in a worker thread and render the result.
+
+        The plan starts no worker and never touches the GPU, so it is safe to run while idle without the
+        worker/benchmark GPU hand-off the Run path needs.
+        """
+        self.query_one("#benchmark-plan", Static).update(
+            Panel(
+                Text("Computing plan (detecting hardware; no worker is started)…", style="yellow"),
+                title="Resource plan",
+                title_align="left",
+                border_style="grey37",
+            ),
+        )
+        options = self._collect_options()
+        self.run_worker(
+            lambda: self._compute_plan_preview(options),
+            thread=True,
+            exclusive=True,
+            group="benchmark-plan",
+        )
+
+    def _compute_plan_preview(self, options: BenchmarkOptions) -> None:
+        """(Worker thread) run the plan subcommand and hand the parsed rows back to the UI thread."""
+        try:
+            result = subprocess.run(
+                options.build_plan_command(),
+                capture_output=True,
+                text=True,
+                timeout=_PLAN_PREVIEW_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception as e:  # noqa: BLE001 - the preview is best-effort; surface it, never crash the TUI
+            self.app.call_from_thread(self._render_plan_error, f"{type(e).__name__}: {e}")
+            return
+        if result.returncode != 0 or not result.stdout.strip():
+            tail = (result.stderr or result.stdout or "no output").strip().splitlines()
+            self.app.call_from_thread(self._render_plan_error, tail[-1] if tail else "no output")
+            return
+        try:
+            rows = [LevelPlanRow.model_validate(item) for item in json.loads(result.stdout)]
+        except (json.JSONDecodeError, ValueError) as e:
+            self.app.call_from_thread(self._render_plan_error, f"could not parse plan output: {e}")
+            return
+        self.app.call_from_thread(self._render_plan_preview, rows)
+
+    def _render_plan_preview(self, rows: list[LevelPlanRow]) -> None:
+        """(UI thread) render the previewed plan rows."""
+        self.query_one("#benchmark-plan", Static).update(self._plan_panel(rows))
+
+    def _render_plan_error(self, message: str) -> None:
+        """(UI thread) show why the plan preview could not be produced."""
+        self.query_one("#benchmark-plan", Static).update(
+            Panel(
+                Text(f"Plan preview failed: {message}", style="red"),
+                title="Resource plan",
+                title_align="left",
+                border_style="red",
+            ),
+        )
+
+    @staticmethod
+    def _plan_panel(rows: list[LevelPlanRow]) -> Panel:
+        """Render the per-level resource plan and predicted run/skip verdicts as a table."""
+        table = Table(expand=True)
+        table.add_column("Level")
+        table.add_column("Stage/Tier")
+        table.add_column("VRAM", justify="right")
+        table.add_column("Disk", justify="right")
+        table.add_column("Net")
+        table.add_column("Key")
+        table.add_column("Verdict")
+        for row in rows:
+            vram = "-" if row.estimated_vram_mb is None else f"{row.estimated_vram_mb / 1024:.1f}G"
+            verdict = Text("RUN", style="green") if row.will_run else Text(f"SKIP ({row.verdict})", style="grey50")
+            table.add_row(
+                row.level_id,
+                f"{row.stage}/{row.tier}",
+                vram,
+                f"{row.min_disk_free_gb:.0f}G",
+                "yes" if row.requires_network else "-",
+                "civitai" if row.requires_civitai_key else "-",
+                verdict,
+            )
+        return Panel(table, title="Resource plan", title_align="left", border_style="grey37")
 
     def _update_buttons(self, status: BenchmarkSupervisorStatus, run_state: BenchmarkRunState) -> None:
         """Enable only the actions valid for the current status."""
@@ -163,6 +279,7 @@ class BenchmarkView(VerticalScroll):
         active = status in (BenchmarkSupervisorStatus.PREPARING, BenchmarkSupervisorStatus.RUNNING)
         has_suggestion = bool(run_state.suggested_bridge_data_yaml)
         self.query_one("#benchmark-run", Button).disabled = active
+        self.query_one("#benchmark-preview", Button).disabled = active
         self.query_one("#benchmark-cancel", Button).disabled = not running
         self.query_one("#benchmark-apply", Button).disabled = not (
             status is BenchmarkSupervisorStatus.FINISHED and has_suggestion

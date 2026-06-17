@@ -19,7 +19,8 @@ from loguru import logger
 from horde_worker_regen.benchmark.enums import BenchTier
 
 if TYPE_CHECKING:
-    from horde_worker_regen.benchmark.report import BenchmarkReport
+    from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel
+    from horde_worker_regen.benchmark.report import BenchmarkReport, MachineInfo
 
 
 def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -43,10 +44,13 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
     ramp.add_argument("--resume", action="store_true", help="Reuse existing level results in --out.")
     ramp.add_argument("--only-level", default=None, help="Run a single level id (remediation loop).")
     ramp.add_argument("--skip-downloads", action="store_true", help="Skip levels that need network access.")
-    ramp.add_argument("--include-downloads", action="store_true", help="Include the ad-hoc download levels.")
-    ramp.add_argument("--no-alchemy", action="store_true", help="Skip the alchemy levels.")
-    ramp.add_argument("--no-features", action="store_true", help="Skip the feature levels (stage C).")
-    ramp.add_argument("--no-concurrency", action="store_true", help="Skip the concurrency levels (stage B).")
+    _add_stage_selection_args(ramp)
+    ramp.add_argument(
+        "--force",
+        action="store_true",
+        help="Attempt levels that would otherwise be skipped for not fitting this machine (insufficient "
+        "VRAM/disk) or lacking a CivitAI token. An absent checkpoint is still skipped.",
+    )
     ramp.add_argument(
         "--no-validate",
         action="store_true",
@@ -80,6 +84,39 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
     )
 
 
+def _add_stage_selection_args(parser: argparse.ArgumentParser) -> None:
+    """Add the stage-inclusion flags shared by ``ramp`` and ``plan`` (so the two stay in lockstep)."""
+    parser.add_argument("--include-downloads", action="store_true", help="Include the ad-hoc download levels.")
+    parser.add_argument("--no-alchemy", action="store_true", help="Skip the alchemy levels.")
+    parser.add_argument("--no-features", action="store_true", help="Skip the feature levels (stage C).")
+    parser.add_argument("--no-concurrency", action="store_true", help="Skip the concurrency levels (stage B).")
+
+
+def _add_plan_parser(subparsers: argparse._SubParsersAction) -> None:
+    plan = subparsers.add_parser(
+        "plan",
+        help="Show each level's resource requirements and predicted run/skip verdict (no worker is started).",
+    )
+    plan.add_argument(
+        "--tiers",
+        default="sd15,sdxl",
+        help="Comma-separated model tiers to plan (sd15, sdxl, flux, qwen).",
+    )
+    plan.add_argument(
+        "--process-mode",
+        default="real",
+        choices=("fake", "dry_run", "real"),
+        help="Resource gates (disk/VRAM/model presence) apply only in real mode; fake/dry_run always run.",
+    )
+    _add_stage_selection_args(plan)
+    plan.add_argument(
+        "--force",
+        action="store_true",
+        help="Reflect a forced ramp: show levels that do not fit the machine (or lack a CivitAI token) as RUN.",
+    )
+    plan.add_argument("--json", action="store_true", help="Emit the plan rows as JSON instead of a table.")
+
+
 def _parse_tiers(raw_tiers: str) -> list[BenchTier] | None:
     """Parse the comma-separated ``--tiers`` value into tiers, or None on an unknown tier (logged)."""
     tiers: list[BenchTier] = []
@@ -92,6 +129,73 @@ def _parse_tiers(raw_tiers: str) -> list[BenchTier] | None:
             logger.error(f"Unknown tier {token!r}; valid tiers: {', '.join(tier.value for tier in BenchTier)}")
             return None
     return tiers
+
+
+def _prepare_ladder(
+    args: argparse.Namespace,
+    tiers: list[BenchTier],
+) -> tuple[list[RampLevel], MachineInfo, LadderOptions]:
+    """Apply the worker env, detect the machine, and build the ladder for the given selection.
+
+    Shared by ``ramp`` and ``plan`` so the plan an operator previews is built from the exact same
+    ladder (and the same detected VRAM) the ramp would run.
+    """
+    from horde_worker_regen.benchmark.controller import detect_machine_info
+    from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
+    from horde_worker_regen.benchmark.worker_env import ensure_worker_env
+
+    # The harness never reads bridgeData.yaml, so set AIWORKER_CACHE_HOME (and friends) here, before
+    # spawning level subprocesses, so the real inference children resolve the worker's actual model
+    # directory instead of hordelib's empty ./models fallback. Children inherit this process's env.
+    # Passing the tiers also opts into the beta reference when a beta tier (qwen) is requested.
+    ensure_worker_env(args.process_mode, tiers)
+
+    # Detect the machine once: the ladder uses the VRAM to size the post-processing sweep, and the
+    # controller reuses the same info instead of re-detecting.
+    machine = detect_machine_info()
+
+    options = LadderOptions(
+        tiers=tiers,
+        jobs_per_level=getattr(args, "jobs_per_level", 4),
+        include_concurrency=not args.no_concurrency,
+        include_features=not args.no_features,
+        include_alchemy=not args.no_alchemy,
+        include_downloads=args.include_downloads,
+        level_timeout_seconds=getattr(args, "level_timeout", 900.0),
+        total_vram_mb=machine.total_vram_mb,
+    )
+    return build_default_ladder(options), machine, options
+
+
+def _run_plan(args: argparse.Namespace) -> int:
+    """Print each level's resource requirements and predicted verdict against the detected machine."""
+    from horde_worker_regen.benchmark.controller import BenchmarkController
+    from horde_worker_regen.benchmark.progress_console import format_plan_table
+
+    tiers = _parse_tiers(args.tiers)
+    if tiers is None:
+        return 2
+
+    logger.info("Building benchmark plan (detecting hardware; no worker is started) ...")
+    ladder, machine, _options = _prepare_ladder(args, tiers)
+
+    # The controller owns the pre-flight verdict, so build one (without running it) to reuse that logic.
+    controller = BenchmarkController(
+        ladder,
+        Path("benchmark_plan"),
+        process_mode=args.process_mode,
+        force=args.force,
+        machine=machine,
+    )
+    rows = controller.build_plan_rows(machine)
+
+    if args.json:
+        import json
+
+        print(json.dumps([row.model_dump() for row in rows], indent=2))  # noqa: T201
+    else:
+        print(format_plan_table(rows))  # noqa: T201
+    return 0
 
 
 def _run_ramp(args: argparse.Namespace) -> int:
@@ -125,31 +229,9 @@ def _run_ramp(args: argparse.Namespace) -> int:
         ),
     )
 
-    from horde_worker_regen.benchmark.controller import BenchmarkController, detect_machine_info
-    from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
-    from horde_worker_regen.benchmark.worker_env import ensure_worker_env
+    from horde_worker_regen.benchmark.controller import BenchmarkController
 
-    # The harness never reads bridgeData.yaml, so set AIWORKER_CACHE_HOME (and friends) here, before
-    # spawning level subprocesses, so the real inference children resolve the worker's actual model
-    # directory instead of hordelib's empty ./models fallback. Children inherit this process's env.
-    # Passing the tiers also opts into the beta reference when a beta tier (qwen) is requested.
-    ensure_worker_env(args.process_mode, tiers)
-
-    # Detect the machine once: the ladder uses the VRAM to size the post-processing sweep, and the
-    # controller reuses the same info instead of re-detecting.
-    machine = detect_machine_info()
-
-    options = LadderOptions(
-        tiers=tiers,
-        jobs_per_level=args.jobs_per_level,
-        include_concurrency=not args.no_concurrency,
-        include_features=not args.no_features,
-        include_alchemy=not args.no_alchemy,
-        include_downloads=args.include_downloads,
-        level_timeout_seconds=args.level_timeout,
-        total_vram_mb=machine.total_vram_mb,
-    )
-    ladder = build_default_ladder(options)
+    ladder, machine, _options = _prepare_ladder(args, tiers)
     logger.info(f"Ramp ladder has {len(ladder)} level(s); output in {out_dir}")
 
     controller = BenchmarkController(
@@ -165,6 +247,7 @@ def _run_ramp(args: argparse.Namespace) -> int:
         warm=args.warm,
         verbose=args.verbose,
         abort_on_catastrophe=not args.no_abort_on_catastrophe,
+        force=args.force,
         machine=machine,
     )
     try:
@@ -257,6 +340,7 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     _add_ramp_parser(subparsers)
+    _add_plan_parser(subparsers)
 
     report = subparsers.add_parser("report", help="Re-render the markdown report from an output directory.")
     report.add_argument("out_dir", type=Path)
@@ -276,6 +360,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "ramp":
         return _run_ramp(args)
+    if args.command == "plan":
+        return _run_plan(args)
     if args.command == "report":
         return _run_report(args)
     if args.command == "monitor":

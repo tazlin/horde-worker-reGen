@@ -7,9 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from horde_worker_regen.benchmark.controller import BenchmarkController, _weights_root_has_checkpoint
+from horde_worker_regen.benchmark import controller as controller_mod
+from horde_worker_regen.benchmark.controller import (
+    BenchmarkController,
+    _WarmSessionDriver,
+    _weights_root_has_checkpoint,
+)
 from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage
 from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel, build_default_ladder
+from horde_worker_regen.benchmark.report import MachineInfo
 from horde_worker_regen.benchmark.scenarios import CannedImageJobSpec, ScenarioSpec
 
 
@@ -24,6 +30,26 @@ def _mini_ladder(jobs: int = 2) -> list[RampLevel]:
             include_alchemy=False,
         ),
     )
+
+
+def test_build_plan_rows_one_per_level_all_run_in_fake(tmp_path: Path) -> None:
+    """In fake mode no resource gate applies, so every level's plan row is a RUN."""
+    controller = BenchmarkController(_mini_ladder(), tmp_path, process_mode="fake", warm=False, validate=False)
+    rows = controller.build_plan_rows(MachineInfo())
+    assert len(rows) == len(_mini_ladder())
+    assert all(row.will_run for row in rows)
+    assert all(not row.verdict for row in rows)
+
+
+def test_build_plan_rows_marks_only_level_others_not_selected(tmp_path: Path) -> None:
+    """--only-level keeps one level RUN and marks the rest as not selected (without a resource verdict)."""
+    ladder = build_default_ladder(LadderOptions(tiers=["sd15"], include_features=False, include_alchemy=False))
+    assert len(ladder) > 1  # the concurrency stage gives us more than the baseline to deselect
+    controller = BenchmarkController(ladder, tmp_path, process_mode="fake", only_level=ladder[0].id)
+    rows = controller.build_plan_rows(MachineInfo())
+    running = [row for row in rows if row.will_run]
+    assert [row.level_id for row in running] == [ladder[0].id]
+    assert any("not selected" in row.verdict for row in rows)
 
 
 def test_weights_root_scan_finds_a_checkpoint(tmp_path: Path) -> None:
@@ -44,6 +70,58 @@ def test_weights_root_scan_fails_open_when_budget_exhausted(tmp_path: Path) -> N
     """A zero-length budget yields None (inconclusive) so the caller fails open rather than skipping."""
     (tmp_path / "sub").mkdir()
     assert _weights_root_has_checkpoint(tmp_path, budget_seconds=0.0) is None
+
+
+def test_warm_driver_skipped_when_every_level_fails_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no fixed level can pass pre-flight, the warm worker is never booted (no wasted startup).
+
+    This is the disk-starved / no-checkpoints-on-disk case: previously the controller paid the full
+    (minutes-long) worker boot only to skip every level anyway.
+    """
+    controller = BenchmarkController(_mini_ladder(), tmp_path, process_mode="fake", warm=True, validate=False)
+    monkeypatch.setattr(BenchmarkController, "_pre_flight_skip_reason", lambda self, level, machine: "no disk")
+
+    def _must_not_boot(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the warm worker must not boot when every fixed level fails pre-flight")
+
+    monkeypatch.setattr(controller_mod, "_WarmSessionDriver", _must_not_boot)
+
+    controller._maybe_start_warm_driver(MachineInfo())
+    assert controller._warm_driver is None
+
+
+def test_warm_driver_start_emits_heartbeats_during_slow_boot() -> None:
+    """A boot slower than the heartbeat interval republishes startup-phase heartbeats, then completes.
+
+    The boot runs on the driver's loop thread; the controller thread polls and surfaces the otherwise
+    silent window. This guards the visibility fix for healthy machines, where the real boot (hordelib
+    init plus the first model load) is the tens-of-seconds-to-minutes dark window.
+    """
+    import asyncio
+    import threading
+
+    class _SlowSession:
+        async def __aenter__(self) -> _SlowSession:
+            await asyncio.sleep(0.25)
+            return self
+
+    driver = object.__new__(_WarmSessionDriver)
+    driver._session = _SlowSession()  # type: ignore[assignment]  # white-box: only __aenter__ is exercised
+    driver._loop = asyncio.new_event_loop()
+    driver._thread = threading.Thread(target=driver._loop.run_forever, name="test-warm-loop", daemon=True)
+
+    beats: list[float] = []
+    try:
+        driver.start(on_heartbeat=beats.append, heartbeat_interval=0.05)
+    finally:
+        driver._loop.call_soon_threadsafe(driver._loop.stop)
+        driver._thread.join(timeout=5.0)
+
+    assert beats, "a boot slower than the heartbeat interval must emit at least one heartbeat"
+    assert all(elapsed >= 0.0 for elapsed in beats)
 
 
 @pytest.mark.e2e

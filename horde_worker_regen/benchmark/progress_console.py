@@ -9,10 +9,12 @@ from __future__ import annotations
 from horde_worker_regen.benchmark.progress_channel import (
     BenchmarkProgressEvent,
     LevelFinished,
+    LevelPlanRow,
     LevelProgress,
     LevelStarted,
     ProgressSink,
     RampFinished,
+    RampPlanned,
     RampStarted,
     RampStarting,
 )
@@ -31,6 +33,8 @@ def format_progress_event(event: BenchmarkProgressEvent, *, verbose: bool = Fals
         tiers = ", ".join(event.tiers) or "-"
         gpu = event.gpu_name or "unknown GPU"
         return f"> Ramp {event.run_id}: {event.num_levels} levels - tiers={tiers} - mode={event.process_mode} - {gpu}"
+    if isinstance(event, RampPlanned):
+        return format_plan_table(event.rows)
     if isinstance(event, LevelStarted):
         position = f"{event.level_index + 1}/{event.num_levels}" if event.num_levels else "soak"
         expected = f" - {event.jobs_expected} jobs" if event.jobs_expected is not None else ""
@@ -77,6 +81,41 @@ def _progress_detail(event: LevelProgress, *, verbose: bool = False) -> str:
     return " - ".join(parts)
 
 
+def _format_mb(value_mb: int | None) -> str:
+    """Render a VRAM figure in GB (e.g. ``2.1G``), or ``-`` when unknown."""
+    if value_mb is None:
+        return "-"
+    return f"{value_mb / 1024:.1f}G"
+
+
+def format_plan_table(rows: list[LevelPlanRow]) -> str:
+    """Render the resource plan as an aligned text table (LEVEL / VRAM / DISK / NET / KEY / VERDICT)."""
+    header = ("LEVEL", "VRAM", "DISK", "NET", "KEY", "VERDICT")
+    body: list[tuple[str, str, str, str, str, str]] = []
+    for row in rows:
+        body.append(
+            (
+                row.level_id,
+                _format_mb(row.estimated_vram_mb),
+                f"{row.min_disk_free_gb:.0f}G",
+                "yes" if row.requires_network else "-",
+                "civitai" if row.requires_civitai_key else "-",
+                "RUN" if row.will_run else f"SKIP ({row.verdict})",
+            ),
+        )
+
+    widths = [len(col) for col in header]
+    for cells in body:
+        widths = [max(width, len(cell)) for width, cell in zip(widths, cells, strict=True)]
+
+    def _line(cells: tuple[str, ...]) -> str:
+        return "  ".join(cell.ljust(width) for cell, width in zip(cells, widths, strict=True)).rstrip()
+
+    lines = ["Resource plan (verdicts reflect the detected machine):", _line(header)]
+    lines.extend(_line(cells) for cells in body)
+    return "\n".join(lines)
+
+
 def _finished_detail(event: LevelFinished) -> str:
     """Render the trailing detail (it/s and notes) of a :class:`LevelFinished` event."""
     parts: list[str] = []
@@ -102,4 +141,4 @@ class ConsoleProgressSink(ProgressSink):
             print(line)  # noqa: T201
 
 
-__all__ = ["ConsoleProgressSink", "format_progress_event"]
+__all__ = ["ConsoleProgressSink", "format_plan_table", "format_progress_event"]

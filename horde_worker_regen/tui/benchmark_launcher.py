@@ -30,10 +30,12 @@ from horde_worker_regen.benchmark.progress_channel import (
     PROGRESS_FILENAME,
     BenchmarkProgressEvent,
     LevelFinished,
+    LevelPlanRow,
     LevelProgress,
     LevelStarted,
     ProgressTailer,
     RampFinished,
+    RampPlanned,
     RampStarted,
     RampStarting,
 )
@@ -82,7 +84,24 @@ class BenchmarkOptions:
     include_concurrency: bool = True
     include_features: bool = True
     include_alchemy: bool = True
+    warm: bool = True
+    force: bool = False
     verbose: bool = False
+
+    def _stage_selection_args(self) -> list[str]:
+        """The stage-inclusion + tier flags shared by the ``ramp`` and ``plan`` argv."""
+        args = ["--process-mode", self.process_mode, "--tiers", ",".join(self.tiers)]
+        if self.include_downloads:
+            args.append("--include-downloads")
+        if not self.include_concurrency:
+            args.append("--no-concurrency")
+        if not self.include_features:
+            args.append("--no-features")
+        if not self.include_alchemy:
+            args.append("--no-alchemy")
+        if self.force:
+            args.append("--force")
+        return args
 
     def build_command(self, out_dir: Path) -> list[str]:
         """Return the ``horde-benchmark ramp`` argv that runs this configuration into ``out_dir``."""
@@ -96,10 +115,7 @@ class BenchmarkOptions:
             "-m",
             "horde_worker_regen.benchmark.cli",
             "ramp",
-            "--process-mode",
-            self.process_mode,
-            "--tiers",
-            ",".join(self.tiers),
+            *self._stage_selection_args(),
             "--out",
             str(out_dir),
             "--soak-minutes",
@@ -107,17 +123,22 @@ class BenchmarkOptions:
         ]
         if not self.validate:
             command.append("--no-validate")
-        if self.include_downloads:
-            command.append("--include-downloads")
-        if not self.include_concurrency:
-            command.append("--no-concurrency")
-        if not self.include_features:
-            command.append("--no-features")
-        if not self.include_alchemy:
-            command.append("--no-alchemy")
+        if not self.warm:
+            command.append("--no-warm")
         if self.verbose:
             command.append("--verbose")
         return command
+
+    def build_plan_command(self) -> list[str]:
+        """Return the ``horde-benchmark plan --json`` argv that previews this configuration (no worker)."""
+        return [
+            sys.executable,
+            "-m",
+            "horde_worker_regen.benchmark.cli",
+            "plan",
+            *self._stage_selection_args(),
+            "--json",
+        ]
 
 
 @dataclasses.dataclass
@@ -160,6 +181,8 @@ class BenchmarkRunState:
         """A pre-level phase to display while the run has not produced any levels yet (worker stop, the
         subprocess's import/hardware-probe window). Cleared once the first level starts."""
         self.gpu_name: str | None = None
+        self.plan_rows: list[LevelPlanRow] = []
+        """The per-level resource plan and predicted verdicts, from the RampPlanned event."""
         self.level_order: list[str] = []
         self.levels: dict[str, LevelState] = {}
         self.current_level_id: str | None = None
@@ -182,6 +205,8 @@ class BenchmarkRunState:
             self.tiers = list(event.tiers)
             self.process_mode = event.process_mode
             self.gpu_name = event.gpu_name
+        elif isinstance(event, RampPlanned):
+            self.plan_rows = list(event.rows)
         elif isinstance(event, LevelStarted):
             self.startup_phase = ""  # a level is running now; the pre-level phase no longer applies
             level = self._level(event.level_id)

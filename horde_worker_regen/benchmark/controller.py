@@ -14,11 +14,11 @@ import contextlib
 import dataclasses
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -42,12 +42,15 @@ from horde_worker_regen.benchmark.memory_preflight import plan_soak_topology
 from horde_worker_regen.benchmark.progress_channel import (
     LevelFinished,
     LevelLiveSnapshot,
+    LevelPlanRow,
     LevelProgress,
     LevelStarted,
     NullProgressSink,
     ProgressSink,
     RampFinished,
+    RampPlanned,
     RampStarted,
+    RampStarting,
 )
 from horde_worker_regen.benchmark.report import (
     BenchmarkReport,
@@ -61,6 +64,13 @@ from horde_worker_regen.benchmark.report import (
     render_markdown,
     synthesize_bridge_data,
     synthesize_capabilities,
+)
+from horde_worker_regen.benchmark.requirements import (
+    LevelRequirements,
+    civitai_token_available,
+    compute_level_requirements,
+    model_present_on_disk,
+    requirement_skip_reason,
 )
 from horde_worker_regen.benchmark.soak import build_validation_level
 from horde_worker_regen.process_management.owned_process_registry import kill_process_tree
@@ -80,6 +90,10 @@ _MODEL_FILE_SUFFIXES = (".safetensors", ".ckpt", ".gguf")
 _MODEL_SCAN_BUDGET_SECONDS = 5.0
 """Soft wall-clock budget for the model-presence scan; on expiry it fails open (the level proceeds)."""
 
+_WARM_BOOT_HEARTBEAT_SECONDS = 5.0
+"""How often the warm-worker boot republishes a startup-phase heartbeat so the (tens-of-seconds to
+minutes) cold start reads as motion in the live view and TUI rather than a silent hang."""
+
 
 def _weights_root_has_checkpoint(root: Path, *, budget_seconds: float = _MODEL_SCAN_BUDGET_SECONDS) -> bool | None:
     """Whether the weights root holds at least one checkpoint, scanning for at most ``budget_seconds``.
@@ -98,6 +112,22 @@ def _weights_root_has_checkpoint(root: Path, *, budget_seconds: float = _MODEL_S
         if time.monotonic() >= deadline:
             return None
     return False
+
+
+def _plan_row(req: LevelRequirements, verdict: str | None) -> LevelPlanRow:
+    """Project a level's requirements and pre-flight verdict into a compact plan row."""
+    return LevelPlanRow(
+        level_id=req.level_id,
+        stage=req.stage,
+        tier=req.tier,
+        estimated_vram_mb=req.estimated_vram_mb,
+        min_disk_free_gb=req.min_disk_free_gb,
+        requires_network=req.requires_network,
+        requires_civitai_key=req.requires_civitai_key,
+        features=req.features,
+        will_run=verdict is None,
+        verdict=verdict or "",
+    )
 
 
 def _log_system_snapshot(label: str) -> None:
@@ -185,10 +215,36 @@ class _WarmSessionDriver:
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, name="warm-benchmark-loop", daemon=True)
 
-    def start(self, timeout_seconds: float = 180.0) -> None:
-        """Start the loop thread and bring the worker up (processes warm)."""
+    def start(
+        self,
+        timeout_seconds: float = 180.0,
+        *,
+        on_heartbeat: Callable[[float], None] | None = None,
+        heartbeat_interval: float = _WARM_BOOT_HEARTBEAT_SECONDS,
+    ) -> None:
+        """Start the loop thread and bring the worker up (processes warm).
+
+        Bringing the worker up (hordelib init plus the first model load(s)) is tens of seconds to a few
+        minutes cold, all of it on the loop thread. When ``on_heartbeat`` is given the controller thread
+        polls the boot future on ``heartbeat_interval`` and calls it with the elapsed seconds between
+        polls, so the otherwise-dark window can be surfaced as progress; the boot itself is unaffected.
+        """
         self._thread.start()
-        asyncio.run_coroutine_threadsafe(self._session.__aenter__(), self._loop).result(timeout=timeout_seconds)
+        future = asyncio.run_coroutine_threadsafe(self._session.__aenter__(), self._loop)
+        if on_heartbeat is None:
+            future.result(timeout=timeout_seconds)
+            return
+        start = time.monotonic()
+        deadline = start + timeout_seconds
+        while True:
+            try:
+                future.result(timeout=heartbeat_interval)
+                return
+            except TimeoutError:
+                if time.monotonic() >= deadline:
+                    future.cancel()
+                    raise
+                on_heartbeat(time.monotonic() - start)
 
     def run_level(
         self,
@@ -267,6 +323,7 @@ class BenchmarkController:
         warm: bool = False,
         verbose: bool = False,
         abort_on_catastrophe: bool = True,
+        force: bool = False,
         machine: MachineInfo | None = None,
     ) -> None:
         """Initialize the controller.
@@ -291,6 +348,9 @@ class BenchmarkController:
                 every level, so a fundamental failure (a broken dependency, a wedged startup) repeats on
                 every subsequent level; aborting turns ~30 wasted minutes into one finding. Disable to
                 collect every level's outcome regardless (e.g. when characterising a flaky failure).
+            force: Attempt levels that would otherwise be skipped for not fitting the machine
+                (insufficient VRAM/disk) or lacking a CivitAI token. A genuinely-absent checkpoint is
+                still skipped, since there is nothing to run.
             machine: Pre-detected hardware info; when None it is detected on ``run()``. The CLI passes
                 the same info it used to size the ladder so detection happens once.
         """
@@ -306,6 +366,7 @@ class BenchmarkController:
         self._warm = warm
         self._verbose = verbose
         self._abort_on_catastrophe = abort_on_catastrophe
+        self._force = force
         self._warm_driver: _WarmSessionDriver | None = None
         self._machine = machine
 
@@ -324,9 +385,10 @@ class BenchmarkController:
         self._prewarm_inference_imports()
         self._warn_about_huge_tiers(machine)
         self._emit_ramp_started(machine)
+        self._emit_ramp_plan(machine)
         reports: list[LevelReport] = []
 
-        self._maybe_start_warm_driver()
+        self._maybe_start_warm_driver(machine)
         aborted_reason: str | None = None
         try:
             for level_index, level in enumerate(self._ladder):
@@ -446,6 +508,27 @@ class BenchmarkController:
                 total_vram_mb=machine.total_vram_mb,
             ),
         )
+
+    def _emit_ramp_plan(self, machine: MachineInfo) -> None:
+        """Publish the resource plan (one row per level) before the first level runs."""
+        self._sink.emit(RampPlanned(run_id=self._out_dir.name, rows=self.build_plan_rows(machine)))
+
+    def build_plan_rows(self, machine: MachineInfo) -> list[LevelPlanRow]:
+        """Build the per-level resource plan and predicted verdict for this machine.
+
+        Reuses the same pre-flight decision the ramp makes, so the preview cannot drift from the run.
+        At plan time the failed-baseline/axis sets are empty, so the verdicts reflect the machine-fit
+        and configuration gates an operator can act on (VRAM, disk, downloads, CivitAI key, --only-level).
+        """
+        rows: list[LevelPlanRow] = []
+        for level in self._ladder:
+            req = compute_level_requirements(level, present_resolver=model_present_on_disk)
+            if self._only_level is not None and level.id != self._only_level:
+                verdict: str | None = "not selected (--only-level)"
+            else:
+                verdict = self._pre_flight_skip_reason(level, machine)
+            rows.append(_plan_row(req, verdict))
+        return rows
 
     def _emit_level_started(self, level: RampLevel, *, level_index: int, num_levels: int) -> None:
         """Announce that a level is beginning (or about to be skipped)."""
@@ -676,50 +759,14 @@ class BenchmarkController:
             logger.debug(f"Burden estimate unavailable for {tier}: {e}")
             return None
 
-    def _huge_tier_skip_reason(self, level: RampLevel) -> str | None:
-        """Return why a huge/beta tier's level should be skipped, or None to proceed.
-
-        Real-mode benchmarking never downloads checkpoints, so a huge tier whose model is not on disk
-        would only crash; for the beta qwen tier the model is not yet published at all. Skipping with a
-        clear reason keeps such a tier from aborting the ramp. Fail-open: an indeterminate check
-        (reference unavailable) proceeds rather than skips.
-        """
-        if level.tier not in HUGE_TIERS:
-            return None
-        model_name = BENCH_TIER_MODELS[level.tier]
-        present = self._model_present_on_disk(model_name)
-        if present is False:
-            beta_hint = (
-                " (a beta model: set HORDE_MODEL_REFERENCE_PRIMARY_API_URL and await publication)"
-                if level.tier in BETA_TIERS
-                else " (real-mode benchmarking does not download checkpoints)"
-            )
-            return f"{level.tier} model {model_name!r} is not present on disk{beta_hint}"
-        return None
-
-    @staticmethod
-    def _model_present_on_disk(model_name: str) -> bool | None:
-        """Return whether *model_name*'s files are all on disk, or None when it cannot be determined.
-
-        Uses the parent-owned reference (the parent is the only process allowed to fetch references)
-        and the existing :func:`is_model_present` existence check. Returns None on any error so the
-        caller fails open.
-        """
-        try:
-            from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
-
-            from horde_worker_regen.model_download_plan import is_model_present
-            from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
-
-            manager = ensure_model_reference_manager_initialized()
-            records = manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
-            return is_model_present(model_name, records)
-        except Exception as e:  # noqa: BLE001 - presence is best-effort; fail open
-            logger.debug(f"Could not determine on-disk presence of {model_name!r}: {e}")
-            return None
-
     def _pre_flight_skip_reason(self, level: RampLevel, machine: MachineInfo) -> str | None:
-        """Return why the level should be skipped without running, or None to proceed."""
+        """Return why the level should be skipped without running, or None to proceed.
+
+        The dynamic ramp gates live here (``--skip-downloads``, the failed-baseline/axis cascades, and
+        the empty-weights-root guard); the per-level resource verdict (disk, model presence, VRAM, a
+        CivitAI key) is delegated to :func:`requirement_skip_reason` so the ``plan`` preview and this
+        decision share one source of truth.
+        """
         if self._skip_downloads and level.requires_network:
             return "requires network access (--skip-downloads)"
         if level.establishes_tier_baseline and level.tier in self._failed_tier_baselines:
@@ -729,42 +776,22 @@ class BenchmarkController:
         if (level.tier, level.axis) in self._failed_axes and not level.establishes_tier_baseline:
             return f"axis {level.axis} already failed at a lower rung"
 
-        # The disk gate protects the model-download cache, which only fills in real
-        # mode (fake/dry-run download nothing). Check the cache volume where checkpoints
-        # actually land — frequently a different drive than the report output dir.
+        # The empty-weights-root guard is a global (not per-level) check: the non-warm path never
+        # downloads checkpoints, so a misconfigured root would wedge every level until timeout.
         if self._process_mode == "real":
-            disk_check_path = self._model_cache_path()
-            free_disk = shutil.disk_usage(disk_check_path).free
-            if free_disk < level.criteria.min_disk_free_gb * 1024**3:
-                return f"insufficient disk on {disk_check_path}: {free_disk / 1024**3:.1f} GB free"
-
             no_models_reason = self._no_local_models_reason()
             if no_models_reason is not None:
                 return no_models_reason
 
-            huge_tier_reason = self._huge_tier_skip_reason(level)
-            if huge_tier_reason is not None:
-                return huge_tier_reason
-
-        if self._process_mode == "real" and machine.total_vram_mb:
-            try:
-                from hordelib.api import estimate_job_burden
-
-                burden = estimate_job_burden(
-                    baseline=level.baseline_hordelib,
-                    width=max((job.width for job in level.scenario.image_jobs), default=512),
-                    height=max((job.height for job in level.scenario.image_jobs), default=512),
-                    batch=max((job.n_iter for job in level.scenario.image_jobs), default=1),
-                )
-                if burden.vram_mb > machine.total_vram_mb:
-                    return (
-                        f"insufficient VRAM: estimated {burden.vram_mb} MB needed, "
-                        f"{machine.total_vram_mb} MB available"
-                    )
-            except Exception as e:  # noqa: BLE001 - pre-flight must never block the ramp
-                logger.debug(f"Pre-flight burden estimate unavailable: {e}")
-
-        return None
+        req = compute_level_requirements(level, present_resolver=model_present_on_disk)
+        return requirement_skip_reason(
+            req,
+            machine=machine,
+            process_mode=self._process_mode,
+            cache_path=self._model_cache_path(),
+            civitai_available=civitai_token_available(),
+            force=self._force,
+        )
 
     def _warm_session_params(self) -> tuple[list[str], int]:
         """Return the union of fixed-scenario level models and the max thread count to provision."""
@@ -797,13 +824,28 @@ class BenchmarkController:
             return
         logger.info(f"Pre-warmed hordelib inference imports in {time.monotonic() - start:.1f}s")
 
-    def _maybe_start_warm_driver(self) -> None:
+    def _maybe_start_warm_driver(self, machine: MachineInfo) -> None:
         """Bring up the shared warm worker, if warm mode is enabled and any level needs it."""
         if not self._warm or self._resume:
             return
-        has_fixed_level = any(level.scenario.soak_seconds is None for level in self._ladder)
-        if not has_fixed_level:
+        fixed_levels = [level for level in self._ladder if level.scenario.soak_seconds is None]
+        if self._only_level is not None:
+            fixed_levels = [level for level in fixed_levels if level.id == self._only_level]
+        if not fixed_levels:
             return
+
+        # Don't pay the (tens of seconds to minutes) worker-boot cost when every fixed level would be
+        # skipped anyway: in real mode an insufficient-disk or no-checkpoints-on-disk machine fails the
+        # pre-flight for all of them, so booting a worker only to tear it back down is pure dead time.
+        # At boot the per-tier baseline/axis failure sets are still empty, so this sees the true
+        # cold-machine verdict. Fake/dry-run never trip these gates, so they still boot.
+        if not any(self._pre_flight_skip_reason(level, machine) is None for level in fixed_levels):
+            logger.warning(
+                "Skipping warm-worker startup: every fixed-scenario level fails pre-flight "
+                "(see the per-level skip reasons that follow); recording them without booting a worker",
+            )
+            return
+
         model_names, ceiling = self._warm_session_params()
         logger.info(f"Starting warm benchmark worker (models: {model_names}, thread ceiling: {ceiling})")
         driver = _WarmSessionDriver(
@@ -812,13 +854,31 @@ class BenchmarkController:
             max_threads_ceiling=ceiling,
         )
         try:
-            driver.start()
+            driver.start(on_heartbeat=lambda elapsed: self._emit_warm_boot_heartbeat(model_names, elapsed))
         except Exception as e:  # noqa: BLE001 - fall back to per-level subprocesses if warmup fails
             logger.error(f"Warm worker failed to start ({type(e).__name__}: {e}); using per-level subprocesses")
             with contextlib.suppress(Exception):
                 driver.close()
             return
         self._warm_driver = driver
+
+    def _emit_warm_boot_heartbeat(self, model_names: list[str], elapsed: float) -> None:
+        """Republish a startup-phase event while the warm worker boots so the dark window reads as motion.
+
+        Re-emitting :class:`RampStarting` (rather than a level event) matches how both consumers already
+        render the pre-first-level window: the console prints a starting line and the TUI updates its
+        ``startup_phase``, which a later ``LevelStarted`` clears.
+        """
+        self._sink.emit(
+            RampStarting(
+                run_id=self._out_dir.name,
+                process_mode=self._process_mode,
+                phase=(
+                    f"starting warm worker: loading {len(model_names)} model(s), "
+                    f"hordelib init + first model load ({elapsed:.0f}s elapsed)"
+                ),
+            ),
+        )
 
     def _stop_warm_driver(self) -> None:
         """Tear down the shared warm worker, if one is running."""

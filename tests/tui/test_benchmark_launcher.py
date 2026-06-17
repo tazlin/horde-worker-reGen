@@ -11,9 +11,11 @@ from horde_worker_regen.benchmark.progress_channel import (
     PROGRESS_FILENAME,
     JsonlProgressSink,
     LevelFinished,
+    LevelPlanRow,
     LevelProgress,
     LevelStarted,
     RampFinished,
+    RampPlanned,
     RampStarted,
     RampStarting,
 )
@@ -124,6 +126,44 @@ def test_build_command_includes_selected_flags() -> None:
     assert "sd15,sdxl" in command
     assert "--no-validate" in command
     assert "--include-downloads" in command
+
+
+def test_build_command_maps_stage_warm_and_force_toggles() -> None:
+    """The new TUI parity toggles map to the matching ramp flags (off-by-default stages and warm)."""
+    options = BenchmarkOptions(
+        tiers=["sd15"],
+        include_concurrency=False,
+        include_features=False,
+        include_alchemy=False,
+        warm=False,
+        force=True,
+    )
+    command = options.build_command(Path("out"))
+    assert {"--no-concurrency", "--no-features", "--no-alchemy", "--no-warm", "--force"} <= set(command)
+
+
+def test_build_plan_command_previews_without_running() -> None:
+    """The plan command targets the `plan` subcommand with --json and carries the same selection flags."""
+    options = BenchmarkOptions(tiers=["sd15"], include_features=False, force=True)
+    command = options.build_plan_command()
+    assert command[1:4] == ["-m", "horde_worker_regen.benchmark.cli", "plan"]
+    assert "--json" in command
+    assert "--no-features" in command
+    assert "--force" in command
+    assert "--out" not in command  # the plan starts no run, so it has no output directory
+
+
+def test_run_state_captures_ramp_plan() -> None:
+    """A RampPlanned event populates the run state's per-level resource plan."""
+    state = BenchmarkRunState()
+    state.apply(
+        RampPlanned(
+            run_id="run1",
+            rows=[LevelPlanRow(level_id="A-sd15-baseline", stage="A", tier="sd15", will_run=True)],
+        ),
+    )
+    assert len(state.plan_rows) == 1
+    assert state.plan_rows[0].level_id == "A-sd15-baseline"
 
 
 def test_apply_suggested_to_config_preserves_untouched_keys(tmp_path: Path) -> None:

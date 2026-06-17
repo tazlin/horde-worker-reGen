@@ -26,8 +26,12 @@ from pydantic import BaseModel, Field, ValidationError
 PROGRESS_FILENAME = "progress.jsonl"
 """The progress event log written into a run's output directory."""
 
-BENCHMARK_PROGRESS_PROTOCOL_VERSION = 1
-"""Bumped when the event schema changes incompatibly; stamped into every event and checked by readers."""
+BENCHMARK_PROGRESS_PROTOCOL_VERSION = 2
+"""Bumped when the event schema changes incompatibly; stamped into every event and checked by readers.
+
+v2 adds ``RAMP_PLANNED`` (the per-level resource-requirements plan). Readers tolerate unknown kinds
+(``parse_progress_event`` returns None), so a v1 reader simply ignores the new event.
+"""
 
 
 class ProgressEventKind(enum.StrEnum):
@@ -35,6 +39,7 @@ class ProgressEventKind(enum.StrEnum):
 
     RAMP_STARTING = "ramp_starting"
     RAMP_STARTED = "ramp_started"
+    RAMP_PLANNED = "ramp_planned"
     LEVEL_STARTED = "level_started"
     LEVEL_PROGRESS = "level_progress"
     LEVEL_FINISHED = "level_finished"
@@ -75,6 +80,39 @@ class RampStarted(BenchmarkProgressEvent):
     process_mode: str = "real"
     gpu_name: str | None = None
     total_vram_mb: int | None = None
+
+
+class LevelPlanRow(BaseModel):
+    """One level's projected resource requirements and predicted run/skip verdict.
+
+    A compact, JSON-round-trippable projection of
+    [`LevelRequirements`][horde_worker_regen.benchmark.requirements.LevelRequirements] plus the verdict
+    the controller's pre-flight would reach on this machine, so the preview and the actual ramp agree.
+    """
+
+    level_id: str
+    stage: str = ""
+    tier: str = ""
+    estimated_vram_mb: int | None = None
+    min_disk_free_gb: float = 0.0
+    requires_network: bool = False
+    requires_civitai_key: bool = False
+    features: list[str] = Field(default_factory=list)
+    will_run: bool = True
+    verdict: str = ""
+    """Empty when the level will run; otherwise the skip reason."""
+
+
+class RampPlanned(BenchmarkProgressEvent):
+    """Emitted once before the first level, carrying the resource plan for every ladder level.
+
+    Lets a tailing ``monitor``/TUI show, up front, what each level needs and whether it will run on
+    this machine, instead of learning only when a level finishes as ``SKIPPED``.
+    """
+
+    kind: Literal[ProgressEventKind.RAMP_PLANNED] = ProgressEventKind.RAMP_PLANNED
+    run_id: str = ""
+    rows: list[LevelPlanRow] = Field(default_factory=list)
 
 
 class LevelStarted(BenchmarkProgressEvent):
@@ -141,7 +179,7 @@ class RampFinished(BenchmarkProgressEvent):
 
 
 AnyProgressEvent = Annotated[
-    RampStarting | RampStarted | LevelStarted | LevelProgress | LevelFinished | RampFinished,
+    RampStarting | RampStarted | RampPlanned | LevelStarted | LevelProgress | LevelFinished | RampFinished,
     Field(discriminator="kind"),
 ]
 """The union of all concrete progress events, discriminated by ``kind``."""
@@ -149,6 +187,7 @@ AnyProgressEvent = Annotated[
 _EVENT_MODEL_BY_KIND: dict[str, type[BenchmarkProgressEvent]] = {
     ProgressEventKind.RAMP_STARTING: RampStarting,
     ProgressEventKind.RAMP_STARTED: RampStarted,
+    ProgressEventKind.RAMP_PLANNED: RampPlanned,
     ProgressEventKind.LEVEL_STARTED: LevelStarted,
     ProgressEventKind.LEVEL_PROGRESS: LevelProgress,
     ProgressEventKind.LEVEL_FINISHED: LevelFinished,
@@ -330,6 +369,7 @@ __all__ = [
     "JsonlProgressSink",
     "LevelFinished",
     "LevelLiveSnapshot",
+    "LevelPlanRow",
     "LevelProgress",
     "LevelStarted",
     "MultiProgressSink",
@@ -338,6 +378,7 @@ __all__ = [
     "ProgressSink",
     "ProgressTailer",
     "RampFinished",
+    "RampPlanned",
     "RampStarted",
     "RampStarting",
     "parse_progress_event",
