@@ -126,6 +126,23 @@ def test_init_stores_references() -> None:
     assert plm._hung_processes_detected_time == 0.0
 
 
+def test_reset_recovery_counter_zeroes_count_but_keeps_crash_loop_history() -> None:
+    """The level-boundary reset zeroes the cumulative counter without forgetting the crash-loop window.
+
+    The warm benchmark worker reuses one pool across levels, so the per-level recovery count must
+    reset; but the slot-recovery history that backs the crash-loop breaker must survive so a genuine
+    crash loop spanning levels is still caught.
+    """
+    plm = _make_plm()
+    plm._num_process_recoveries = 3
+    plm._slot_recovery_history = {1: [time.time()]}
+
+    plm.reset_recovery_counter()
+
+    assert plm._num_process_recoveries == 0
+    assert plm._slot_recovery_history == {1: [pytest.approx(plm._slot_recovery_history[1][0])]}
+
+
 def test_get_processes_with_model_for_queued_job_empty() -> None:
     """If there are no processes or no jobs pending inference, the result should be empty."""
     plm = _make_plm()

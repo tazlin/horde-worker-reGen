@@ -835,6 +835,11 @@ def _build_warm_bridge_data(
     return bridge_data
 
 
+_WARMUP_DRAIN_TIMEOUT_SECONDS = 300.0
+"""Bound on a level's pre-warm pass: enough for a cold heavy-model load plus one recovery-and-reload
+cycle, after which the warm pass is abandoned and the measured pass runs anyway."""
+
+
 class WarmHarnessSession:
     """A long-lived worker reused across benchmark levels, to eliminate per-level warm-up.
 
@@ -947,33 +952,24 @@ class WarmHarnessSession:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._loop_task, timeout=60.0)
 
-    async def run_level(
+    async def _drain_installed_scenario(
         self,
         *,
-        jobs: list[ImageGenerateJobPopResponse] | None,
-        alchemy_forms: list[AlchemyFormSpec] | None = None,
-        threads: int = 1,
-        timeout_seconds: float = 120.0,
-    ) -> HarnessResult:
-        """Run one fixed-scenario level on the warm worker and report its outcome.
+        num_jobs_expected: int,
+        num_forms_expected: int,
+        base_completed: int,
+        base_faulted: int,
+        timeout_seconds: float,
+    ) -> bool:
+        """Wait until the currently installed scenario's jobs and alchemy forms are accounted for.
 
-        Completion is tracked by the delta in the job tracker's cumulative counters (the tracker is
-        not reset between levels), so this returns once the level's own jobs and alchemy forms are
-        accounted for, or when ``timeout_seconds`` elapses.
+        Job completion is a delta over the job tracker's cumulative counters (the tracker is not reset
+        between levels); the alchemy-form counters are reset by ``install_benchmark_scenario`` so they
+        are read absolutely. Returns ``True`` if it drained within ``timeout_seconds``, ``False`` if it
+        timed out.
         """
         manager = self.manager
-        scenario_jobs = jobs or []
-        num_jobs_expected = len(scenario_jobs)
-        num_forms_expected = len(alchemy_forms or [])
-
-        base_completed = manager._job_tracker.total_num_completed_jobs
-        base_faulted = manager._job_tracker.num_jobs_faulted
-
-        manager._apply_set_concurrency(target_threads=threads, target_processes=None)
-        manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=alchemy_forms)
-
         time_started = time.time()
-        timed_out = False
         while True:
             await asyncio.sleep(0.1)
             completed = manager._job_tracker.total_num_completed_jobs - base_completed
@@ -983,10 +979,69 @@ class WarmHarnessSession:
                 + manager._alchemy_coordinator.num_canned_forms_faulted
             )
             if (completed + faulted) >= num_jobs_expected and forms_done >= num_forms_expected:
-                break
+                return True
             if time.time() - time_started > timeout_seconds:
-                timed_out = True
-                break
+                return False
+
+    async def run_level(
+        self,
+        *,
+        jobs: list[ImageGenerateJobPopResponse] | None,
+        alchemy_forms: list[AlchemyFormSpec] | None = None,
+        threads: int = 1,
+        timeout_seconds: float = 120.0,
+        warmup: bool = False,
+    ) -> HarnessResult:
+        """Run one fixed-scenario level on the warm worker and report its outcome.
+
+        Completion is tracked by the delta in the job tracker's cumulative counters (the tracker is
+        not reset between levels), so this returns once the level's own jobs and alchemy forms are
+        accounted for, or when ``timeout_seconds`` elapses.
+
+        When ``warmup`` is set, the level's full scenario is run once first to load any
+        feature-specific weights (controlnet/QR checkpoints, upscaler/face-fixer/BLIP models) the warm
+        worker has not touched yet. The whole scenario is warmed (not just its first job) because a
+        sweep level loads a *distinct* model per variant (canny/depth/openpose controlnets; each
+        upscaler/face-fixer), so warming only the first would leave the rest to cold-load while
+        measured. A first cold load happens inside ``INFERENCE_STARTING`` (or blocks the safety loop)
+        and can exceed ``inference_step_timeout``, tripping a benign process recovery that completes the
+        work on the replacement. Absorbing that here makes the measured pass reflect steady state,
+        matching a production worker that has preloaded its models. The measured pass re-installs the
+        scenario, which resets the per-level metrics and the recovery counter, so the warmup's recovery
+        never counts against the level.
+        """
+        manager = self.manager
+        scenario_jobs = jobs or []
+        scenario_forms = alchemy_forms or []
+        num_jobs_expected = len(scenario_jobs)
+        num_forms_expected = len(alchemy_forms or [])
+
+        manager._apply_set_concurrency(target_threads=threads, target_processes=None)
+
+        if warmup and (scenario_jobs or scenario_forms):
+            manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=scenario_forms)
+            await self._drain_installed_scenario(
+                num_jobs_expected=num_jobs_expected,
+                num_forms_expected=num_forms_expected,
+                base_completed=manager._job_tracker.total_num_completed_jobs,
+                base_faulted=manager._job_tracker.num_jobs_faulted,
+                timeout_seconds=min(timeout_seconds, _WARMUP_DRAIN_TIMEOUT_SECONDS),
+            )
+
+        base_completed = manager._job_tracker.total_num_completed_jobs
+        base_faulted = manager._job_tracker.num_jobs_faulted
+
+        manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=alchemy_forms)
+
+        time_started = time.time()
+        drained = await self._drain_installed_scenario(
+            num_jobs_expected=num_jobs_expected,
+            num_forms_expected=num_forms_expected,
+            base_completed=base_completed,
+            base_faulted=base_faulted,
+            timeout_seconds=timeout_seconds,
+        )
+        timed_out = not drained
 
         with contextlib.suppress(Exception):
             await manager.receive_and_handle_process_messages()

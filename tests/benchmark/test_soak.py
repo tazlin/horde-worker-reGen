@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.report import SuggestedBridgeData
 from horde_worker_regen.benchmark.scenarios import CannedAlchemyFormSpec, CannedImageJobSpec, ScenarioSpec
 from horde_worker_regen.benchmark.soak import build_soak_scenario, build_validation_level
@@ -46,7 +47,7 @@ class TestBuildSoakScenario:
             alchemist=True,
             models_to_load=["Deliberate"],
         )
-        scenario = build_soak_scenario(suggested, "sd15", soak_seconds=120.0)
+        scenario = build_soak_scenario(suggested, BenchTier.SD15, soak_seconds=120.0)
 
         assert scenario.soak_seconds == 120.0
         # A light baseline job plus the three heavy job types (batch, controlnet, post-processing).
@@ -63,7 +64,7 @@ class TestBuildSoakScenario:
     def test_minimal_when_nothing_extra_enabled(self) -> None:
         """A bare config soaks only a single plain job type and no alchemy."""
         suggested = SuggestedBridgeData(models_to_load=["Deliberate"])
-        scenario = build_soak_scenario(suggested, "sd15", soak_seconds=60.0)
+        scenario = build_soak_scenario(suggested, BenchTier.SD15, soak_seconds=60.0)
 
         assert len(scenario.image_jobs) == 1
         assert scenario.image_jobs[0].n_iter == 1
@@ -77,7 +78,7 @@ class TestBuildSoakScenario:
         """
         suggested = SuggestedBridgeData(max_batch=4, models_to_load=["Deliberate"])
         pool = ["Deliberate", "Dreamshaper", "ICBINP"]
-        scenario = build_soak_scenario(suggested, "sd15", soak_seconds=60.0, model_pool=pool)
+        scenario = build_soak_scenario(suggested, BenchTier.SD15, soak_seconds=60.0, model_pool=pool)
 
         # Two profiles (baseline + batch) replicated across three models.
         assert sorted(scenario.models_referenced()) == sorted(pool)
@@ -90,7 +91,7 @@ class TestBuildSoakScenario:
     def test_single_model_pool_matches_default(self) -> None:
         """A one-entry pool produces the same shape as the default single-model soak."""
         suggested = SuggestedBridgeData(models_to_load=["Deliberate"])
-        scenario = build_soak_scenario(suggested, "sd15", soak_seconds=60.0, model_pool=["Deliberate"])
+        scenario = build_soak_scenario(suggested, BenchTier.SD15, soak_seconds=60.0, model_pool=["Deliberate"])
         assert len(scenario.image_jobs) == 1
         assert scenario.image_jobs[0].model == "Deliberate"
 
@@ -109,7 +110,7 @@ class TestBuildValidationLevel:
             alchemy_allow_concurrent=True,
             models_to_load=["Deliberate"],
         )
-        level = build_validation_level(suggested, "sd15", soak_seconds=120.0)
+        level = build_validation_level(suggested, BenchTier.SD15, soak_seconds=120.0)
 
         assert level.stage == "V"
         assert level.axis == "validation"
@@ -131,7 +132,7 @@ class TestBuildValidationLevel:
         """A multi-model validation level loads every pool model and spreads the soak over them."""
         suggested = SuggestedBridgeData(max_threads=2, queue_size=2, models_to_load=["Deliberate"])
         pool = ["Deliberate", "Dreamshaper", "ICBINP", "Anything Diffusion"]
-        level = build_validation_level(suggested, "sd15", soak_seconds=120.0, model_pool=pool)
+        level = build_validation_level(suggested, BenchTier.SD15, soak_seconds=120.0, model_pool=pool)
 
         assert level.bridge_data_overrides["models_to_load"] == pool
         assert sorted(level.scenario.models_referenced()) == sorted(pool)
@@ -139,7 +140,7 @@ class TestBuildValidationLevel:
     def test_residency_expectation_flows_to_criteria(self) -> None:
         """The residency-defeated advisory is enabled only when residency is expected."""
         suggested = SuggestedBridgeData(models_to_load=["Deliberate"])
-        level = build_validation_level(suggested, "sd15", soak_seconds=60.0, expect_vram_residency=True)
+        level = build_validation_level(suggested, BenchTier.SD15, soak_seconds=60.0, expect_vram_residency=True)
         assert level.criteria.expect_vram_residency is True
 
 

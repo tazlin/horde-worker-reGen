@@ -143,6 +143,7 @@ def make_canned_job(
     loras: list[LorasPayloadEntry] | None = None,
     tis: list[TIPayloadEntry] | None = None,
     control_type: str | None = None,
+    workflow: str | None = None,
     post_processing: list[str] | None = None,
     hires_fix: bool = False,
     source_image_base64: str | None = None,
@@ -151,8 +152,9 @@ def make_canned_job(
     """Create a single canned job with configurable size, steps, batch amount, and features.
 
     Batched jobs (``n_iter > 1``) get one generation ID and R2 upload slot per image,
-    as the live API provides. A controlnet job without an explicit source image gets a
-    synthetic one automatically.
+    as the live API provides. A controlnet job, or a workflow job (e.g. ``qr_code``), without
+    an explicit source image gets a synthetic one automatically, since both consume a control
+    image.
     """
     job = dummy_job_factory(model_name)
     data = job.model_dump(by_alias=True)
@@ -176,6 +178,10 @@ def make_canned_job(
         data["payload"]["post_processing"] = post_processing
     if control_type is not None:
         data["payload"]["control_type"] = control_type
+        if source_image_base64 is None:
+            source_image_base64 = make_source_image_base64()
+    if workflow is not None:
+        data["payload"]["workflow"] = workflow
         if source_image_base64 is None:
             source_image_base64 = make_source_image_base64()
     if source_image_base64 is not None:
@@ -374,6 +380,7 @@ class SoakImageTemplate:
     steps: int = 30
     n_iter: int = 1
     control_type: str | None = None
+    workflow: str | None = None
     post_processing: list[str] = field(default_factory=list)
     hires_fix: bool = False
     weight: float = 1.0
@@ -426,6 +433,7 @@ class GeneratingJobSource(CannedJobSource):
             ddim_steps=template.steps,
             n_iter=template.n_iter,
             control_type=template.control_type,
+            workflow=template.workflow,
             post_processing=template.post_processing or None,
             hires_fix=template.hires_fix,
         )

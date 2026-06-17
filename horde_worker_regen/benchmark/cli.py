@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from horde_worker_regen.benchmark.enums import BenchTier
+
 if TYPE_CHECKING:
     from horde_worker_regen.benchmark.report import BenchmarkReport
 
@@ -25,7 +27,9 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
     ramp.add_argument(
         "--tiers",
         default="sd15,sdxl",
-        help="Comma-separated model tiers to attempt (sd15, sdxl, flux). flux is opt-in.",
+        help="Comma-separated model tiers to attempt (sd15, sdxl, flux, qwen). flux/qwen are opt-in "
+        "(very large: 17-20 GB download, 13-16 GB VRAM) and auto-skip when the machine cannot hold them; "
+        "qwen is a beta model sourced from the pending reference.",
     )
     ramp.add_argument(
         "--process-mode",
@@ -76,26 +80,50 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
     )
 
 
+def _parse_tiers(raw_tiers: str) -> list[BenchTier] | None:
+    """Parse the comma-separated ``--tiers`` value into tiers, or None on an unknown tier (logged)."""
+    tiers: list[BenchTier] = []
+    for token in (token.strip() for token in raw_tiers.split(",")):
+        if not token:
+            continue
+        try:
+            tiers.append(BenchTier(token))
+        except ValueError:
+            logger.error(f"Unknown tier {token!r}; valid tiers: {', '.join(tier.value for tier in BenchTier)}")
+            return None
+    return tiers
+
+
 def _run_ramp(args: argparse.Namespace) -> int:
-    from horde_worker_regen.benchmark.controller import BenchmarkController
+    from horde_worker_regen.benchmark.controller import BenchmarkController, detect_machine_info
     from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
     from horde_worker_regen.benchmark.worker_env import ensure_worker_env
+
+    tiers = _parse_tiers(args.tiers)
+    if tiers is None:
+        return 2
 
     # The harness never reads bridgeData.yaml, so set AIWORKER_CACHE_HOME (and friends) here, before
     # spawning level subprocesses, so the real inference children resolve the worker's actual model
     # directory instead of hordelib's empty ./models fallback. Children inherit this process's env.
-    ensure_worker_env(args.process_mode)
+    # Passing the tiers also opts into the beta reference when a beta tier (qwen) is requested.
+    ensure_worker_env(args.process_mode, tiers)
 
     out_dir: Path = args.out if args.out is not None else Path("benchmark_results") / time.strftime("%Y%m%d-%H%M%S")
 
+    # Detect the machine once: the ladder uses the VRAM to size the post-processing sweep, and the
+    # controller reuses the same info instead of re-detecting.
+    machine = detect_machine_info()
+
     options = LadderOptions(
-        tiers=[tier.strip() for tier in args.tiers.split(",") if tier.strip()],
+        tiers=tiers,
         jobs_per_level=args.jobs_per_level,
         include_concurrency=not args.no_concurrency,
         include_features=not args.no_features,
         include_alchemy=not args.no_alchemy,
         include_downloads=args.include_downloads,
         level_timeout_seconds=args.level_timeout,
+        total_vram_mb=machine.total_vram_mb,
     )
     ladder = build_default_ladder(options)
     logger.info(f"Ramp ladder has {len(ladder)} level(s); output in {out_dir}")
@@ -121,6 +149,7 @@ def _run_ramp(args: argparse.Namespace) -> int:
         warm=args.warm,
         verbose=args.verbose,
         abort_on_catastrophe=not args.no_abort_on_catastrophe,
+        machine=machine,
     )
     try:
         report = controller.run()

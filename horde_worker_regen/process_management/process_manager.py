@@ -1660,6 +1660,10 @@ class HordeWorkerProcessManager:
         self._job_popper.set_canned_job_source(CannedJobSource(jobs or []))
         self._alchemy_coordinator.set_canned_alchemy_source(CannedAlchemySource(alchemy_forms or []))
         self._run_metrics.reset()
+        # The recovery counter is cumulative for the worker's lifetime; the warm benchmark reuses one
+        # worker across levels, so it must be zeroed here too or each level after the first recovery
+        # would inherit a non-zero count and be failed for a recovery it never had.
+        self._process_lifecycle.reset_recovery_counter()
 
     def _supervisor_state_signature(self) -> tuple[object, ...]:
         """A cheap fingerprint of the display-relevant worker state.

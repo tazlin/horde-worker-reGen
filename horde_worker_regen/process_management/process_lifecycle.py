@@ -813,6 +813,18 @@ class ProcessLifecycleManager:
         self._slot_recovery_history[process_id] = recent
         return len(recent)
 
+    def reset_recovery_counter(self) -> None:
+        """Zero the cumulative process-recovery counter at a benchmark level boundary.
+
+        The warm benchmark worker reuses one process pool across levels. The counter is otherwise
+        only ever incremented, so without this every level after the first genuine recovery would
+        inherit that level's count and read as having recovered itself. This mirrors
+        ``WorkerRunMetrics.reset`` (which clears the per-level crash-event list); the slot-recovery
+        *history* backing the crash-loop breaker is deliberately left intact so a genuine crash loop
+        spanning levels is still caught.
+        """
+        self._num_process_recoveries = 0
+
     def _record_start_failure(self, process_info: HordeProcessInfo) -> int:
         """Track consecutive replacements that never advanced past PROCESS_STARTING; return the streak.
 

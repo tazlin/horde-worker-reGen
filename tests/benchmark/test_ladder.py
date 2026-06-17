@@ -24,8 +24,8 @@ class TestDefaultLadder:
             assert all(stage_a_index < i for i in dependent_indices)
 
         alchemy_levels = [level for level in ladder if level.stage == "D"]
-        assert len(alchemy_levels) == 2
-        assert alchemy_levels[0].rung < alchemy_levels[1].rung
+        # The two alchemy lanes (CLIP, graph) plus the concurrent-with-image rung, each its own axis.
+        assert {level.axis for level in alchemy_levels} == {"alchemy_clip", "alchemy_graph", "alchemy_concurrent"}
 
     def test_stage_a_establishes_baseline(self) -> None:
         """Only stage-A levels establish tier baselines."""
@@ -58,9 +58,9 @@ class TestDefaultLadder:
         assert not any(level.axis == "controlnet" for level in ladder)
 
     def test_unknown_tier_rejected(self) -> None:
-        """An unknown tier name raises immediately."""
-        with pytest.raises(ValueError, match="Unknown tier"):
-            build_default_ladder(LadderOptions(tiers=["sd99"]))
+        """An unknown tier name is rejected when the options are validated (it is not a BenchTier)."""
+        with pytest.raises(ValueError):  # noqa: PT011 - pydantic raises a plain ValidationError (a ValueError)
+            LadderOptions(tiers=["sd99"])
 
     def test_level_ids_unique(self) -> None:
         """Level IDs are unique (they key result files on disk)."""

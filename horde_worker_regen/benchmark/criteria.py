@@ -68,6 +68,8 @@ class LevelStats(BaseModel):
     num_jobs_expected: int = 0
     num_jobs_completed: int = 0
     num_jobs_faulted: int = 0
+    num_alchemy_forms_expected: int = 0
+    num_alchemy_forms_completed: int = 0
     num_alchemy_forms_faulted: int = 0
     num_audit_failures: int = 0
     num_process_recoveries: int = 0
@@ -126,6 +128,10 @@ def evaluate_level(
         reasons.append("level timed out before the scenario completed")
     if stats.num_jobs_completed < stats.num_jobs_expected:
         reasons.append(f"only {stats.num_jobs_completed}/{stats.num_jobs_expected} jobs completed")
+    if stats.num_alchemy_forms_completed < stats.num_alchemy_forms_expected:
+        reasons.append(
+            f"only {stats.num_alchemy_forms_completed}/{stats.num_alchemy_forms_expected} alchemy forms completed",
+        )
     if criteria.min_completed_jobs > 0 and stats.num_jobs_completed < criteria.min_completed_jobs:
         reasons.append(
             f"soak completed only {stats.num_jobs_completed} jobs (need {criteria.min_completed_jobs} "

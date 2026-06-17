@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from horde_worker_regen.benchmark.controller import BenchmarkController
+from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage
 from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel, build_default_ladder
 from horde_worker_regen.benchmark.scenarios import CannedImageJobSpec, ScenarioSpec
 
@@ -119,8 +120,8 @@ def test_failed_axis_skips_higher_rungs(tmp_path: Path) -> None:
     failing = base.model_copy(
         update={
             "id": "B-sd15-slow1",
-            "stage": "B",
-            "axis": "slow",
+            "stage": BenchStage.CONCURRENCY,
+            "axis": BenchAxis.BATCH,
             "rung": 1,
             "scenario": scenario,
             "timeout_seconds": 8.0,

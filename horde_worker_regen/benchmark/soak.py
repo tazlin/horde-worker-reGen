@@ -14,7 +14,16 @@ the first half (see ``LevelCriteria.min_its_retention``).
 
 from __future__ import annotations
 
+import dataclasses
+
+from horde_sdk.generation_parameters.alchemy.consts import (
+    KNOWN_CLIP_BLIP_TYPES,
+    KNOWN_FACEFIXERS,
+    KNOWN_UPSCALERS,
+)
+
 from horde_worker_regen.benchmark.criteria import LevelCriteria
+from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage, BenchTier
 from horde_worker_regen.benchmark.ladder import (
     _TIER_BASELINES,
     _TIER_RESOLUTIONS,
@@ -28,13 +37,28 @@ from horde_worker_regen.benchmark.scenarios import (
     ScenarioSpec,
 )
 
+_SOAK_POST_PROCESSING = [KNOWN_UPSCALERS.RealESRGAN_x4plus.value, KNOWN_FACEFIXERS.GFPGAN.value]
+"""A representative upscaler + face-fixer pair for the soak's post-processing profile."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _SoakProfile:
+    """One weighted job shape in the soak mix, replicated across every model in the pool."""
+
+    weight: int
+    n_iter: int = 1
+    control_type: str | None = None
+    workflow: str | None = None
+    post_processing: list[str] = dataclasses.field(default_factory=list)
+
+
 _SOAK_START_MARGIN_SECONDS = 180.0
 """Headroom over the soak period for model load at startup and the drain at the end."""
 
 
 def build_soak_scenario(
     suggested: SuggestedBridgeData,
-    tier: str,
+    tier: BenchTier,
     *,
     soak_seconds: float,
     model_pool: list[str] | None = None,
@@ -54,29 +78,46 @@ def build_soak_scenario(
     models = model_pool if model_pool else [BENCH_TIER_MODELS[tier]]
     resolution = _TIER_RESOLUTIONS[tier]
 
-    # (extra kwargs, relative weight) for each enabled profile; replicated across every model.
-    profiles: list[tuple[dict, int]] = [
+    # One weighted profile per enabled job shape, replicated across every model in the pool.
+    profiles: list[_SoakProfile] = [
         # A baseline single-image job keeps the mix realistic (not literally everything maxed).
-        ({}, 1),
+        _SoakProfile(weight=1),
     ]
     if suggested.max_batch > 1:
-        profiles.append(({"n_iter": suggested.max_batch}, 3))
-    if suggested.allow_controlnet:
-        profiles.append(({"control_type": "canny"}, 3))
+        profiles.append(_SoakProfile(weight=3, n_iter=suggested.max_batch))
+    # Controlnet stress is tier-specific: SD1.5 uses a preprocessor control type; the SDXL controlnet
+    # capability is the qr_code workflow, so an SDXL soak must drive that, not a (non-existent) SDXL
+    # canny controlnet.
+    if suggested.allow_sdxl_controlnet and tier is BenchTier.SDXL:
+        profiles.append(_SoakProfile(weight=3, workflow="qr_code"))
+    elif suggested.allow_controlnet and tier is BenchTier.SD15:
+        profiles.append(_SoakProfile(weight=3, control_type="canny"))
     if suggested.allow_post_processing:
-        profiles.append(({"post_processing": ["RealESRGAN_x4plus", "GFPGAN"]}, 2))
+        profiles.append(_SoakProfile(weight=2, post_processing=list(_SOAK_POST_PROCESSING)))
 
     image_jobs: list[CannedImageJobSpec] = [
-        CannedImageJobSpec(model=model, width=resolution, height=resolution, count=weight, **kwargs)
+        CannedImageJobSpec(
+            model=model,
+            width=resolution,
+            height=resolution,
+            count=profile.weight,
+            n_iter=profile.n_iter,
+            control_type=profile.control_type,
+            workflow=profile.workflow,
+            post_processing=list(profile.post_processing),
+        )
         for model in models
-        for kwargs, weight in profiles
+        for profile in profiles
     ]
 
     alchemy_forms: list[CannedAlchemyFormSpec] = []
     if suggested.alchemist:
+        # Exercise both alchemy lanes in the soak: a CLIP form (safety process) and graph forms
+        # (inference processes), so sustained-load alchemy is not silently single-lane.
         alchemy_forms = [
-            CannedAlchemyFormSpec(form="caption", count=1),
-            CannedAlchemyFormSpec(form="RealESRGAN_x4plus", count=2),
+            CannedAlchemyFormSpec(form=KNOWN_CLIP_BLIP_TYPES.caption.value, count=1),
+            CannedAlchemyFormSpec(form=KNOWN_UPSCALERS.RealESRGAN_x4plus.value, count=2),
+            CannedAlchemyFormSpec(form=KNOWN_FACEFIXERS.GFPGAN.value, count=1),
         ]
 
     return ScenarioSpec(
@@ -89,7 +130,7 @@ def build_soak_scenario(
 
 def build_validation_level(
     suggested: SuggestedBridgeData,
-    tier: str,
+    tier: BenchTier,
     *,
     soak_seconds: float,
     drain_timeout_seconds: float = 60.0,
@@ -117,9 +158,9 @@ def build_validation_level(
 
     return RampLevel(
         id=f"V-{tier}-soak",
-        stage="V",
+        stage=BenchStage.VALIDATION,
         tier=tier,
-        axis="validation",
+        axis=BenchAxis.VALIDATION,
         rung=1,
         description=(
             f"{tier} sustained-load validation: ~{soak_seconds:.0f}s of mixed, mostly-max-config "
@@ -137,3 +178,6 @@ def build_validation_level(
             expect_vram_residency=expect_vram_residency,
         ),
     )
+
+
+__all__ = ["build_soak_scenario", "build_validation_level"]

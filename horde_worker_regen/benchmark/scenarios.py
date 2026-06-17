@@ -40,6 +40,9 @@ class CannedImageJobSpec(BaseModel):
     lora_names: list[str] = Field(default_factory=list)
     ti_names: list[str] = Field(default_factory=list)
     control_type: str | None = None
+    workflow: str | None = None
+    """A named hordelib workflow (e.g. ``qr_code``); the SDXL controlnet capability is this, not
+    a preprocessor control type. Sets ``payload.workflow``."""
     post_processing: list[str] = Field(default_factory=list)
     count: int = 1
     """How many identical jobs this spec expands to."""
@@ -109,6 +112,7 @@ class ScenarioSpec(BaseModel):
                             else None
                         ),
                         control_type=spec.control_type,
+                        workflow=spec.workflow,
                         post_processing=spec.post_processing if spec.post_processing else None,
                     ),
                 )
@@ -147,6 +151,7 @@ class ScenarioSpec(BaseModel):
                 steps=spec.steps,
                 n_iter=spec.n_iter,
                 control_type=spec.control_type,
+                workflow=spec.workflow,
                 post_processing=list(spec.post_processing),
                 hires_fix=spec.hires_fix,
                 weight=float(spec.count),

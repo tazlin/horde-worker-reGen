@@ -83,3 +83,21 @@ class TestManagerSetConcurrency:
         )
         assert manager.max_concurrent_inference_processes == 1
         manager._process_lifecycle.scale_inference_processes.assert_called_once_with(2)
+
+
+class TestInstallBenchmarkScenario:
+    """The warm-benchmark per-level scenario swap."""
+
+    def test_install_benchmark_scenario_resets_recovery_counter(self) -> None:
+        """Swapping in a new level's scenario zeroes the cumulative recovery counter.
+
+        The warm worker reuses one pool across levels; the counter is otherwise only incremented, so
+        without this reset every level after the first genuine recovery would read as having recovered.
+        """
+        manager = make_testable_process_manager()
+        manager._process_lifecycle._num_process_recoveries = 2
+
+        manager.install_benchmark_scenario(jobs=[])
+
+        assert manager._process_lifecycle._num_process_recoveries == 0
+        assert manager.get_run_metrics_snapshot().num_process_recoveries == 0

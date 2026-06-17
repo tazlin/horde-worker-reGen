@@ -240,6 +240,7 @@ def load_seed_its_by_signature(results_dir: Path | str) -> dict[str, float]:
     schema-mismatched report yields an empty seed rather than blocking worker startup. The benchmark
     import chain is loaded lazily here so this module stays import-light.
     """
+    from horde_worker_regen.benchmark.enums import BenchTier
     from horde_worker_regen.benchmark.ladder import _TIER_BASELINES, _TIER_RESOLUTIONS
     from horde_worker_regen.benchmark.report import BenchmarkReport
 
@@ -254,7 +255,11 @@ def load_seed_its_by_signature(results_dir: Path | str) -> dict[str, float]:
         return {}
 
     seed: dict[str, float] = {}
-    for tier, its_p50 in report.tier_baselines_its.items():
+    for tier_name, its_p50 in report.tier_baselines_its.items():
+        try:
+            tier = BenchTier(tier_name)
+        except ValueError:
+            continue  # A tier the current build no longer knows (e.g. an older report); skip it.
         baseline = _TIER_BASELINES.get(tier)
         resolution = _TIER_RESOLUTIONS.get(tier)
         if baseline is None or resolution is None or its_p50 <= 0:
