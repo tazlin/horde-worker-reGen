@@ -4,7 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "horde_worker_regen"
-version = "12.5.12"
+# The version is sourced from horde_worker_regen/__init__.py (__version__) via [tool.hatch.version]
+# below, so it lives in exactly one place. Bump the literal there, not here.
+dynamic = ["version"]
 description = "Allows you to connect to the AI Horde and generate images for users."
 authors = [
     {name = "tazlin", email = "tazlin.on.github@gmail.com"},
@@ -177,6 +179,12 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 # -- hatchling build config --
+
+[tool.hatch.version]
+# Single source of truth for the release version: hatchling reads __version__ from this file at build
+# time, and the worker reads the same literal at runtime. No git or installed-metadata lookup is needed,
+# so the .git-less release zip bundle still builds correctly under `uv sync`.
+path = "horde_worker_regen/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["horde_worker_regen"]

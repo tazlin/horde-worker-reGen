@@ -1181,7 +1181,6 @@ wheels = [
 
 [[package]]
 name = "horde-worker-regen"
-version = "12.5.12"
 source = { editable = "." }
 dependencies = [
     { name = "aiodns" },
@@ -1294,7 +1293,7 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'cu132'", index = "https://download.pytorch.org/whl/cu132", conflict = { package = "horde-worker-regen", extra = "cu132" } },
     { name = "typing-extensions" },
 ]
-provides-extras = ["cu126", "cu130", "cu132", "cpu", "post-processing", "controlnet"]
+provides-extras = ["controlnet", "cpu", "cu126", "cu130", "cu132", "post-processing"]
 
 [package.metadata.requires-dev]
 dev = [

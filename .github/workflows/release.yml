@@ -17,6 +17,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Guard against a tag/version mismatch
+        # The release version lives in exactly one place: __version__ in horde_worker_regen/__init__.py
+        # (pyproject.toml derives it via [tool.hatch.version]). A release must be tagged v<that literal>,
+        # so a tag pushed without bumping the literal (or vice versa) is caught here instead of shipping a
+        # bundle whose advertised version disagrees with its tag.
+        run: |
+          set -eu
+          version="$(grep -oE '__version__ *= *"[^"]+"' horde_worker_regen/__init__.py | grep -oE '"[^"]+"' | tr -d '"')"
+          if [ -z "$version" ]; then
+            echo "::error file=horde_worker_regen/__init__.py::Could not read __version__."
+            exit 1
+          fi
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Tag '${GITHUB_REF_NAME}' does not match __version__ 'v${version}'. Bump horde_worker_regen/__init__.py to match the tag (or retag)."
+            exit 1
+          fi
+          echo "Tag matches __version__ (v${version})."
+
       - name: Guard against a local path source in pyproject
         # A released bundle must depend on published versions; a leftover local `path =` source under
         # [tool.uv.sources] (used for in-repo dev against hordelib) would make `uv sync` fail on a user's
@@ -101,8 +119,18 @@ jobs:
     # still ships the zip and the one-line / winget paths keep working.
     needs: bundle
     runs-on: windows-latest
+    # The Azure Trusted Signing federated credential pins its subject to this exact environment name
+    # (repo:<owner>/<repo>:environment:release-channel); the OIDC token's `sub` claim must match or
+    # azure/login is rejected. Do not rename without updating the federated credential in Entra.
+    environment: release-channel
     permissions:
       contents: write
+      # Required so azure/login can mint the OIDC token Trusted Signing exchanges for a signing credential.
+      id-token: write
+    env:
+      # Signing is gated on the secret being present so a tag pushed before secrets are configured still
+      # ships an (unsigned) installer instead of failing the job. Once secrets exist, both steps run.
+      SIGN_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -133,6 +161,30 @@ jobs:
           if (-not (Test-Path (Join-Path $out 'HordeWorker-Setup.exe'))) {
             throw 'ISCC did not produce HordeWorker-Setup.exe'
           }
+
+      - name: Azure login (OIDC, no client secret)
+        if: ${{ env.SIGN_ENABLED == 'true' }}
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign the installer with Azure Trusted Signing
+        # Signs the finished HordeWorker-Setup.exe in place (dist/). Runs before the publish step below so
+        # the SHA256SUMS hash is computed over the signed binary. Timestamping (RFC3161) keeps the
+        # signature valid after the signing certificate's short rotation window expires.
+        if: ${{ env.SIGN_ENABLED == 'true' }}
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: https://weu.codesigning.azure.net/
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Publish the installer and extend SHA256SUMS
         shell: pwsh

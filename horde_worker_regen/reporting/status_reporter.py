@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-import horde_worker_regen
+from horde_worker_regen.runtime_version import runtime_version
 
 if TYPE_CHECKING:
     from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, UserDetailsResponse
@@ -400,7 +400,7 @@ class StatusReporter:
             + " | ".join(
                 [
                     f"dreamer_name: {bridge_data.dreamer_worker_name}",
-                    f"(v{horde_worker_regen.__version__})",
+                    f"(v{runtime_version()})",
                     f"horde user: {user_info.username if user_info is not None else 'Unknown'}",
                     f"num_models: {len(bridge_data.image_models_to_load)}",
                     f"custom_models: {bool(bridge_data.custom_models)}",

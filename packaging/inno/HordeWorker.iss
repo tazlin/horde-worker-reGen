@@ -48,10 +48,10 @@ LicenseFile={#StageDir}\THIRD-PARTY-NOTICES.md
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName=AI Horde Worker
-; Code signing is deferred (the project has no certificate yet); the download triggers a one-click
-; SmartScreen "More info -> Run anyway" until then. When a cert is available, configure a SignTool in
-; ISCC (see packaging/inno/README.md) and uncomment the next line; no other change is needed.
-; SignTool=hordesign $f
+; The finished HordeWorker-Setup.exe is signed post-build by the release workflow 
+; (.github/workflows/release.yml) using Azure Trusted Signing over OIDC, which keeps
+; Local builds are therefore unsigned and will trip SmartScreen; that is expected for dev builds. 
+; Do not re-enable an ISCC SignTool here.
 
 [Tasks]
 ; Shortcuts are opt-in (unchecked by default), matching the one-line installers' conservative default.
@@ -80,7 +80,9 @@ Filename: "{app}\horde-worker.cmd"; WorkingDir: "{app}"; Description: "Launch AI
 
 [UninstallDelete]
 ; These are generated after install (not tracked by the installer), so remove them explicitly. bridgeData.yaml
-; and the model cache (which lives outside {app}) are intentionally left alone.
+; is intentionally left alone. The uv cache, managed Python, and model weights live in the peered "{app}-data"
+; sibling folder (set up by runtime.cmd, see worker_bootstrap\paths.py:data_root), which is outside {app} and
+; so is never touched here: a reinstall reuses the cached deps and downloaded models.
 Type: filesandordirs; Name: "{app}\.venv"
 Type: filesandordirs; Name: "{app}\bin"
 

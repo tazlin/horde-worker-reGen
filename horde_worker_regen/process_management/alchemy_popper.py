@@ -40,7 +40,6 @@ from horde_sdk.generation_parameters.alchemy.consts import (
 )
 from loguru import logger
 
-import horde_worker_regen
 from horde_worker_regen.capabilities import strip_background_available
 from horde_worker_regen.process_management._canned_scenarios import CannedAlchemySource
 from horde_worker_regen.process_management.api_sessions import ApiSessions
@@ -56,6 +55,7 @@ from horde_worker_regen.process_management.messages import (
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.runtime_version import runtime_version
 
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -416,7 +416,7 @@ class AlchemyCoordinator:
         pop_request = _AlchemyPopRequest(
             apikey=bridge_data.api_key,
             name=bridge_data.alchemist_name,
-            bridge_agent=f"AI Horde Worker reGen:{horde_worker_regen.__version__}:https://github.com/Haidra-Org/horde-worker-reGen",
+            bridge_agent=f"AI Horde Worker reGen:{runtime_version()}:https://github.com/Haidra-Org/horde-worker-reGen",
             priority_usernames=bridge_data.priority_usernames,
             forms=expand_offered_forms(bridge_data),
             amount=max(bridge_data.queue_size, 1),

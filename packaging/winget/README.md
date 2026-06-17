@@ -83,11 +83,13 @@ the workflow's **Run workflow** button with a tag.
 
 ## Manual fallback
 
-The three static manifests here are kept as a `winget validate` reference and a manual fallback. To submit by
-hand: bump `PackageVersion` in all three files, point `InstallerUrl` at the new tag, set `InstallerSha256`
-(from the release's `SHA256SUMS` asset, or `sha256sum horde-worker-reGen.zip`), then:
+The three static manifests here are kept as a `winget validate` reference and a manual fallback. Their
+`PackageVersion` and tagged `InstallerUrl` are written by `packaging/sync-winget-version.py` (and guarded
+against drift by `tests/test_packaging_versions.py`), so do not hand-edit the version. To submit by hand:
 
 ```powershell
+# Sync the version (defaults to horde_worker_regen/__init__.py's __version__) and the installer hash:
+python packaging\sync-winget-version.py --sha256 <hash-from-SHA256SUMS-or-sha256sum>
 winget validate --manifest packaging\winget
 winget install --manifest packaging\winget   # local smoke test in a sandbox
 wingetcreate submit --token <gh-token> packaging\winget

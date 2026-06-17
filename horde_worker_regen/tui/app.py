@@ -29,6 +29,7 @@ from horde_worker_regen.app_state import (
 )
 from horde_worker_regen.process_management.supervisor_channel import WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
+from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.tui import socket_protocol as sp
 from horde_worker_regen.tui.attach import AttachedWorkerSupervisor, SupervisorLike
 from horde_worker_regen.tui.benchmark_launcher import (
@@ -161,7 +162,7 @@ class HordeWorkerTUI(App[None]):
         if info is None:
             return
         self.notify(
-            f"Update available: v{__version__} -> v{info.latest_version}. Update with "
+            f"Update available: v{runtime_version()} -> v{info.latest_version}. Update with "
             "'winget upgrade Haidra.HordeWorker', or re-run the installer (the same install command).",
             title="Update available",
             timeout=10,

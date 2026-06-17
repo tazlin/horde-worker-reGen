@@ -16,7 +16,6 @@ from horde_sdk.ai_horde_api.apimodels import (
 )
 from loguru import logger
 
-import horde_worker_regen
 from horde_worker_regen.process_management._canned_scenarios import CannedJobSource, make_default_dry_run_source
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.job_models import APIWorkerMessage
@@ -31,6 +30,7 @@ from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.source_image_downloader import SourceImageDownloader
 from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
+from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.telemetry_spans import queue_depth_counter, span_job_pop
 from horde_worker_regen.utils.job_utils import get_single_job_magnitude
 
@@ -447,7 +447,7 @@ class JobPopper:
             job_pop_request = ImageGenerateJobPopRequest(
                 apikey=bridge_data.api_key,
                 name=bridge_data.dreamer_worker_name,
-                bridge_agent=f"AI Horde Worker reGen:{horde_worker_regen.__version__}:https://github.com/Haidra-Org/horde-worker-reGen",
+                bridge_agent=f"AI Horde Worker reGen:{runtime_version()}:https://github.com/Haidra-Org/horde-worker-reGen",
                 models=list(models),
                 blacklist=bridge_data.blacklist,
                 nsfw=bridge_data.nsfw,
