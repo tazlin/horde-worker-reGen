@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
+from horde_sdk.ai_horde_api import GENERATION_STATE
+
+from horde_worker_regen.process_management.job_models import HordeJobInfo
 from horde_worker_regen.process_management.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.messages import HordeImageResult
 
 from .conftest import (
     make_mock_job,
@@ -307,3 +311,41 @@ class TestJobStages:
         # The (late) safety result must not be able to re-queue the job for submit
         assert await job_tracker.take_being_safety_checked(job.id_) is None  # pyrefly: ignore
         assert len(job_tracker.jobs_pending_submit) == 1
+
+    async def test_refused_safety_requeue_preserves_existing_result(self, job_tracker: JobTracker) -> None:
+        """A stale/duplicate safety re-queue of a PENDING_SUBMIT job must not corrupt its stored result.
+
+        Regression for a shutdown crash loop: queue_for_safety used to overwrite ``job_info`` *before*
+        validating the transition, so a late inference result for an already-terminal job replaced its
+        safety-checked result with a fresh, pre-safety one (censored=None) while the refused transition
+        left the job in PENDING_SUBMIT. The resulting un-submittable "poison" job spun the submit loop
+        forever and blocked shutdown.
+        """
+        job = await track_popped_job_async(job_tracker, make_mock_job())
+        assert job.id_ is not None
+
+        safety_checked = HordeJobInfo(
+            sdk_api_job_info=job,
+            state=GENERATION_STATE.ok,
+            censored=False,
+            time_popped=0.0,
+            job_image_results=[HordeImageResult(image_base64="data")],
+        )
+        await job_tracker.queue_for_submit(safety_checked)
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+
+        # A late/duplicate inference result tries to send the already-terminal job back for safety.
+        stale_pre_safety = HordeJobInfo(
+            sdk_api_job_info=job,
+            state=None,
+            censored=None,
+            time_popped=0.0,
+            job_image_results=[HordeImageResult(image_base64="data")],
+        )
+        await job_tracker.queue_for_safety(stale_pre_safety)
+
+        # Stage is preserved AND the safety-checked result is untouched (not corrupted to censored=None).
+        assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+        head = job_tracker.jobs_pending_submit[0]
+        assert head is safety_checked
+        assert head.censored is False

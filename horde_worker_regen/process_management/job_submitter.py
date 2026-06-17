@@ -35,6 +35,7 @@ from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer
 
 if TYPE_CHECKING:
     from horde_model_reference.model_reference_records import ImageGenerationModelRecord
+    from horde_sdk.ai_horde_api.fields import GenerationID
 
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
     from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
@@ -58,6 +59,9 @@ class JobSubmitter:
 
     _num_job_slowdowns: int
     _job_submit_loop_interval: float
+
+    _consecutive_head_submit_failures: int
+    _last_failed_head_job_id: GenerationID | None
 
     def __init__(
         self,
@@ -93,6 +97,9 @@ class JobSubmitter:
 
         self._num_job_slowdowns = 0
         self._job_submit_loop_interval = 0.02
+
+        self._consecutive_head_submit_failures = 0
+        self._last_failed_head_job_id = None
 
     @property
     def num_job_slowdowns(self) -> int:
@@ -136,7 +143,14 @@ class JobSubmitter:
 
         logger.debug(f"Preparing to submit job {new_submit.job_id}")
 
-        if new_submit.image_result is None and not new_submit.is_faulted:
+        # A job whose generation faulted carries no image but must still be *reported* to the horde as
+        # faulted (state=faulted, set on the submit request below) so the horde reissues it promptly;
+        # only a non-faulted job with no image is a local error worth dropping here. Guarding solely on
+        # ``new_submit.is_faulted`` (the per-submit-task flag, never set on a fresh task) made faulted
+        # jobs return without ever reporting the fault, so the horde only reissued them after its own
+        # timeout.
+        job_generation_faulted = new_submit.completed_job_info.state == GENERATION_STATE.faulted
+        if new_submit.image_result is None and not new_submit.is_faulted and not job_generation_faulted:
             logger.error(f"Job {new_submit.job_id} has no image result")
             new_submit.fault()
             return new_submit
@@ -351,7 +365,6 @@ class JobSubmitter:
         new_submit.succeed(new_submit.kudos_reward, new_submit.kudos_per_second)
         return new_submit
 
-    @logger.catch(reraise=True)
     async def api_submit_job(self) -> None:
         """Submit a job result to the API, if any are completed (safety checked too) and ready to be submitted."""
         if len(self._job_tracker.jobs_pending_submit) == 0:
@@ -362,6 +375,30 @@ class JobSubmitter:
 
         if completed_job_info.state is None:
             logger.error(f"Job {job_info.ids} has no state, assuming faulted")
+            completed_job_info.state = GENERATION_STATE.faulted
+
+        # A job that reached PENDING_SUBMIT but cannot be submitted as-is is *punted*: faulted and
+        # reported so the horde reissues it, then removed from the queue by the normal finalize path
+        # below. Raising here instead (as the old code did for each of these conditions) left the same
+        # un-submittable job at the head of jobs_pending_submit, so api_submit_job re-picked it every
+        # loop iteration and spun forever -- emitting thousands of identical tracebacks and, because
+        # is_time_for_shutdown() waits for the submit queue to drain, wedging shutdown entirely. A
+        # job with images but no safety verdict (censored is None) must never be uploaded as-is: it
+        # could leak uncensored NSFW/CSAM content, so faulting is the only safe response.
+        punt_reason: str | None = None
+        if job_info.id_ is None:
+            punt_reason = "job has no generation id"
+        elif completed_job_info.job_image_results is not None and completed_job_info.censored is None:
+            punt_reason = "job has images but never received a safety verdict (censored is None)"
+        elif completed_job_info.job_image_results is not None and job_info.r2_upload is None:
+            punt_reason = "job has images but no R2 upload URL"
+
+        if punt_reason is not None:
+            logger.warning(
+                f"Job {job_info.id_} reached submit but is not submittable ({punt_reason}); "
+                "faulting it so the horde reissues it.",
+            )
+            completed_job_info.fault_job()
             completed_job_info.state = GENERATION_STATE.faulted
 
         if completed_job_info.state == GENERATION_STATE.faulted:
@@ -380,23 +417,15 @@ class JobSubmitter:
             elif len(completed_job_info.job_image_results) > 1:
                 logger.info("Attempting to return batched jobs results")
 
-            if completed_job_info.censored is None:
-                raise ValueError("completed_job_info.censored is None")
-        if job_info.id_ is None:
-            raise ValueError("job_info.id_ is None")
-
-        if job_info.payload.seed is None:
-            raise ValueError("job_info.payload.seed is None")
-
-        if job_info.r2_upload is None:  # TODO: r2_upload should be being set somewhere
-            raise ValueError("job_info.r2_upload is None")
-
         highest_reward = 0
         highest_kudos_per_second = 0.0
         submit_tasks: list[Task[PendingSubmitJob]] = []
         finished_submit_jobs: list[PendingSubmitJob] = []
         iterations = 1
-        job_faulted = False
+        # Seed job_faulted from the job's own state: a generation-faulted job whose fault *report*
+        # submits successfully must still count as a consecutive failure (it really did fail), so the
+        # success-path reset below must not fire for it.
+        job_faulted = completed_job_info.state == GENERATION_STATE.faulted
         if completed_job_info.job_image_results is not None:
             iterations = len(completed_job_info.job_image_results)
         for gen_iter in range(iterations):
@@ -473,18 +502,58 @@ class JobSubmitter:
                 f"{completed_job_info.sdk_api_job_info.id_} but it has already been removed.",
             )
 
+    _MAX_CONSECUTIVE_HEAD_SUBMIT_FAILURES = 3
+    """How many times the submit loop may fail on the *same* head-of-queue job before that job is
+    forcibly dropped. api_submit_job is expected to punt un-submittable jobs itself, so this only
+    guards against an unforeseen exception spinning the loop (and blocking shutdown) forever."""
+
+    async def _handle_unexpected_submit_failure(self, error: Exception) -> None:
+        """Survive an unexpected submit-loop failure; drop a job that repeatedly wedges the head of queue.
+
+        Without this, an exception raised while processing the head-of-queue job would recur every
+        iteration (the job is never removed), reproducing the multi-thousand-line crash loop that
+        prevented a clean shutdown. Bounded, identical retries on one job end with that job being
+        discarded so the queue can drain.
+        """
+        pending = self._job_tracker.jobs_pending_submit
+        head_job_id = pending[0].sdk_api_job_info.id_ if pending else None
+
+        if head_job_id is not None and head_job_id == self._last_failed_head_job_id:
+            self._consecutive_head_submit_failures += 1
+        else:
+            self._consecutive_head_submit_failures = 1
+            self._last_failed_head_job_id = head_job_id
+
+        if self._consecutive_head_submit_failures < self._MAX_CONSECUTIVE_HEAD_SUBMIT_FAILURES:
+            logger.opt(exception=error).error(
+                f"Job submit loop error (attempt {self._consecutive_head_submit_failures} on job {head_job_id})",
+            )
+            return
+
+        logger.critical(
+            f"Job submit loop failed {self._consecutive_head_submit_failures} times on job {head_job_id}; "
+            f"forcibly dropping it so the submit queue can drain. Last error: {type(error).__name__}: {error}",
+        )
+        if head_job_id is not None and await self._job_tracker.discard_job(head_job_id):
+            self._state.consecutive_failed_jobs += 1
+        self._consecutive_head_submit_failures = 0
+        self._last_failed_head_job_id = None
+
     async def run(self) -> None:
         """Run the job submit loop."""
         logger.debug("In JobSubmitter.run")
         while True:
-            with logger.catch():
-                try:
-                    await self.api_submit_job()
-                except CancelledError as e:
-                    self._shutdown_manager.shutdown()
-                    logger.debug(f"CancelledError: {e}")
+            try:
+                await self.api_submit_job()
+                self._consecutive_head_submit_failures = 0
+                self._last_failed_head_job_id = None
+            except CancelledError as e:
+                self._shutdown_manager.shutdown()
+                logger.debug(f"CancelledError: {e}")
+            except Exception as error:  # noqa: BLE001 - the loop must survive any submit failure
+                await self._handle_unexpected_submit_failure(error)
 
-            # Checked outside the catch block so persistent errors cannot prevent shutdown.
+            # Checked outside the try block so persistent errors cannot prevent shutdown.
             if self._shutdown_manager.is_time_for_shutdown() or self._state.shut_down:
                 break
 

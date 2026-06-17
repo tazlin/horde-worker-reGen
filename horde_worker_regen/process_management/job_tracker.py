@@ -522,8 +522,18 @@ class JobTracker:
                 time_popped=None,
             )
             return
+        # Validate the transition *before* adopting the new result. A stale or duplicate inference
+        # result for a job that already reached the terminal PENDING_SUBMIT stage would otherwise
+        # overwrite its safety-checked job_info with a fresh, pre-safety one (censored=None) while the
+        # refused transition left the job in PENDING_SUBMIT, producing an un-submittable "poison" job
+        # that wedges the submit loop. Only adopt the new job_info if the move is actually legal.
+        if not self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK):
+            logger.warning(
+                f"Refusing to re-queue job {job_info.sdk_api_job_info.id_} for safety from stage "
+                f"{tracked.stage.name}; keeping its existing result (likely a stale/duplicate result).",
+            )
+            return
         tracked.job_info = job_info
-        self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
 
     async def queue_for_submit(self, job_info: HordeJobInfo) -> None:
         """Queue a job for submission."""
@@ -543,8 +553,15 @@ class JobTracker:
                 time_popped=None,
             )
             return
+        # As in queue_for_safety: only adopt the new result if the transition is legal, so a refused
+        # move can never leave the job carrying a mismatched job_info.
+        if not self._set_stage(tracked, JobStage.PENDING_SUBMIT):
+            logger.warning(
+                f"Refusing to re-queue job {job_info.sdk_api_job_info.id_} for submit from stage "
+                f"{tracked.stage.name}; keeping its existing result.",
+            )
+            return
         tracked.job_info = job_info
-        self._set_stage(tracked, JobStage.PENDING_SUBMIT)
 
     async def begin_safety_check(self, job_info: HordeJobInfo) -> None:
         """Begin the safety check process for a job."""
@@ -790,6 +807,19 @@ class JobTracker:
                 ref=f"faulted after {tracked.inference_attempts} attempt(s): {reason}"[:255],
             ),
         )
+
+    async def discard_job(self, job_id: GenerationID) -> bool:
+        """Forcibly remove a job from the tracker by ID, regardless of its current stage.
+
+        A last-resort drop for the submit loop's backstop: a job the submitter cannot make progress on
+        (it keeps raising) is removed here so the queue can drain, rather than the loop spinning on the
+        same head-of-queue job forever. Returns True if a job was removed.
+        """
+        removed = self._jobs.pop(job_id, None)
+        self._job_faults.pop(job_id, None)
+        if removed is not None:
+            self._last_job_submitted_time = time.time()
+        return removed is not None
 
     async def purge_jobs(self) -> None:
         """Clear all jobs from the tracker."""

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, Mock, patch
 
-from horde_worker_regen.process_management.job_models import PendingSubmitJob
+from horde_sdk.ai_horde_api import GENERATION_STATE
+
+from horde_worker_regen.process_management.job_models import HordeJobInfo, PendingSubmitJob
 from horde_worker_regen.process_management.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.job_tracker import JobTracker
+from horde_worker_regen.process_management.messages import HordeImageResult
 from horde_worker_regen.process_management.worker_state import WorkerState
 
 from .conftest import (
@@ -64,6 +67,9 @@ class TestSubmitSingleGeneration:
         new_submit.job_id = "test-id"
         new_submit.image_result = None
         new_submit.is_faulted = False
+        # A real PendingSubmitJob always carries completed_job_info; a non-faulted state keeps this on
+        # the "no image is a local error" path rather than the fault-report path.
+        new_submit.completed_job_info = Mock(state=None)
 
         await submitter.submit_single_generation(new_submit)
         new_submit.fault.assert_called_once()
@@ -87,6 +93,36 @@ class TestSubmitSingleGeneration:
 
         await submitter.submit_single_generation(new_submit)
         new_submit.fault.assert_not_called()
+
+    async def test_generation_faulted_no_image_is_reported_to_api(self) -> None:
+        """A job whose generation faulted (images cleared, state=faulted) is still reported to the horde.
+
+        The submit used to early-return for any imageless job whose per-submit-task ``is_faulted`` flag
+        was unset (it never is on a fresh task), so a generation fault was never reported and the horde
+        only reissued the job after its own timeout. The job's own faulted state must drive the report.
+        """
+        horde_session = AsyncMock()
+        # Returning None short-circuits before the kudos math; we only need to prove the API was called.
+        horde_session.submit_request = AsyncMock(return_value=None)
+        submitter = _make_submitter(horde_client_session=horde_session)
+
+        completed_info = Mock()
+        completed_info.sdk_api_job_info = Mock()
+        completed_info.sdk_api_job_info.payload = Mock()
+        completed_info.sdk_api_job_info.payload.seed = 42
+        completed_info.sdk_api_job_info.get_follow_up_default_request_type.return_value = Mock
+        completed_info.state = GENERATION_STATE.faulted
+
+        new_submit = Mock(spec=PendingSubmitJob)
+        new_submit.job_id = "test-id"
+        new_submit.image_result = None
+        new_submit.is_faulted = False
+        new_submit.completed_job_info = completed_info
+
+        await submitter.submit_single_generation(new_submit)
+
+        new_submit.fault.assert_not_called()
+        horde_session.submit_request.assert_awaited_once()
 
 
 class TestApiSubmitJob:
@@ -131,4 +167,73 @@ class TestApiSubmitJob:
             mock_submit.return_value = faulted_submit
             await submitter.api_submit_job()
 
+        assert state.consecutive_failed_jobs >= 1
+
+    async def test_unsafetychecked_job_is_punted_not_raised(self) -> None:
+        """A PENDING_SUBMIT job with images but no safety verdict must be punted, not crash the loop.
+
+        Regression for the shutdown crash loop: such a "poison" job used to make api_submit_job raise
+        ``ValueError("censored is None")`` every iteration without ever removing the job, so the submit
+        queue never drained and shutdown wedged. It must instead be faulted, reported, and removed.
+        """
+        state = WorkerState()
+        job_tracker = JobTracker()
+
+        horde_session = AsyncMock()
+        horde_session.submit_request = AsyncMock(return_value=Mock(reward=6.65))
+        submitter = _make_submitter(
+            state=state,
+            job_tracker=job_tracker,
+            horde_client_session=horde_session,
+            aiohttp_session=AsyncMock(),
+        )
+
+        job = make_job_pop_response("stable_diffusion", r2_upload="https://example.com/upload")
+        poison = HordeJobInfo(
+            sdk_api_job_info=job,
+            state=GENERATION_STATE.ok,
+            time_popped=0.0,
+            job_image_results=[HordeImageResult(image_base64="data")],
+            censored=None,
+        )
+        await track_popped_job_async(job_tracker, job, time_popped=0.0)
+        await queue_job_for_submit_async(job_tracker, poison)
+        assert len(job_tracker.jobs_pending_submit) == 1
+
+        # Must not raise, and must drain the job (reported as a fault) so the loop can make progress.
+        await submitter.api_submit_job()
+
+        assert len(job_tracker.jobs_pending_submit) == 0
+        horde_session.submit_request.assert_awaited()
+        assert state.consecutive_failed_jobs >= 1
+
+    async def test_repeated_head_failures_drop_the_stuck_job(self) -> None:
+        """The submit loop's backstop drops a head-of-queue job that keeps raising, so the queue drains.
+
+        api_submit_job punts known-bad jobs itself; this guards against an *unforeseen* exception
+        recurring on the same head job forever (the shape that produced thousands of identical
+        tracebacks and blocked shutdown).
+        """
+        state = WorkerState()
+        job_tracker = JobTracker()
+        submitter = _make_submitter(state=state, job_tracker=job_tracker)
+
+        job = make_job_pop_response("stable_diffusion")
+        job_info = HordeJobInfo(
+            sdk_api_job_info=job,
+            state=GENERATION_STATE.ok,
+            censored=False,
+            time_popped=0.0,
+            job_image_results=[HordeImageResult(image_base64="data")],
+        )
+        await track_popped_job_async(job_tracker, job, time_popped=0.0)
+        await queue_job_for_submit_async(job_tracker, job_info)
+
+        error = RuntimeError("unexpected submit failure")
+        for _ in range(submitter._MAX_CONSECUTIVE_HEAD_SUBMIT_FAILURES - 1):
+            await submitter._handle_unexpected_submit_failure(error)
+            assert len(job_tracker.jobs_pending_submit) == 1, "job dropped too early"
+
+        await submitter._handle_unexpected_submit_failure(error)
+        assert len(job_tracker.jobs_pending_submit) == 0
         assert state.consecutive_failed_jobs >= 1

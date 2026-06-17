@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from horde_sdk.ai_horde_api import GENERATION_STATE
 
+from horde_worker_regen.process_management.job_models import HordeJobInfo
+from horde_worker_regen.process_management.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.messages import HordeImageResult, HordeProcessState
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.shutdown_manager import (
     _SHUTDOWN_GRACE_BASE_SECONDS,
@@ -19,7 +22,11 @@ from horde_worker_regen.process_management.shutdown_manager import (
 from horde_worker_regen.process_management.worker_state import WorkerState
 
 from .conftest import (
+    make_job_pop_response,
     make_mock_process_info,
+    make_test_api_sessions,
+    make_test_model_metadata,
+    make_test_runtime_config,
     mark_job_in_progress_async,
     move_job_to_being_safety_checked_async,
     queue_job_for_safety_async,
@@ -243,6 +250,56 @@ class TestFaultReportOutstandingJobs:
         shutdown_manager = _make_shutdown_manager(state=state)
         shutdown_manager._fault_report_outstanding_jobs()
         assert len(shutdown_manager._job_tracker.jobs_pending_submit) == 0
+
+
+class TestShutdownDrainsUnsubmittableJob:
+    """Integration: an un-submittable job must never be able to block shutdown forever.
+
+    This reproduces the observed failure end to end: a job reaches PENDING_SUBMIT without a safety
+    verdict (censored is None), is_time_for_shutdown() stays False because the submit queue is
+    non-empty, and (before the fix) the submitter spun on it forever. The submitter must punt the job
+    so the queue drains and shutdown can complete.
+    """
+
+    async def test_poison_submit_job_is_drained_and_shutdown_completes(self) -> None:
+        """A poison submit job blocks shutdown until the submitter punts it, then shutdown is ready."""
+        state = WorkerState(shutting_down=True)
+        job_tracker = JobTracker()
+
+        job = make_job_pop_response("stable_diffusion", r2_upload="https://example.com/upload")
+        poison = HordeJobInfo(
+            sdk_api_job_info=job,
+            state=GENERATION_STATE.ok,
+            time_popped=0.0,
+            job_image_results=[HordeImageResult(image_base64="data")],
+            censored=None,
+        )
+        await track_popped_job_async(job_tracker, job, time_popped=0.0)
+        await queue_job_for_submit_async(job_tracker, poison)
+
+        shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
+        # The poison job keeps shutdown from completing: jobs_pending_submit > 0.
+        assert shutdown_manager.is_time_for_shutdown() is False
+
+        horde_session = AsyncMock()
+        horde_session.submit_request = AsyncMock(return_value=Mock(reward=0.0))
+        submitter = JobSubmitter(
+            state=state,
+            job_tracker=job_tracker,
+            shutdown_manager=shutdown_manager,
+            runtime_config=make_test_runtime_config(),
+            api_sessions=make_test_api_sessions(
+                horde_client_session=horde_session,
+                aiohttp_session=AsyncMock(),
+            ),
+            model_metadata=make_test_model_metadata(),
+        )
+
+        await submitter.api_submit_job()
+
+        assert len(job_tracker.jobs_pending_submit) == 0
+        # With the queue drained and no live processes, shutdown can finally complete.
+        assert shutdown_manager.is_time_for_shutdown() is True
 
 
 class TestStartTimedShutdownIdempotent:

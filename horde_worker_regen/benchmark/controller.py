@@ -64,6 +64,43 @@ _LEVEL_POLL_INTERVAL_SECONDS = 1.0
 _SUBPROCESS_KILL_WAIT_SECONDS = 10.0
 """How long to wait for a killed (hung) level subprocess to actually exit."""
 
+_SPAWN_TIMING_ENV = "AIWORKER_SPAWN_TIMING"
+
+
+def _log_system_snapshot(label: str) -> None:
+    """Diagnostic (opt-in via ``AIWORKER_SPAWN_TIMING``): log python-process count, RSS, and GPU memory.
+
+    Logged before and after each level so the deltas reveal child processes or VRAM that a prior level
+    failed to release. Best-effort and never raises; a no-op when the env var is unset so it costs nothing
+    in normal runs.
+
+    Currently hardcoded to nvidia-smi but could be extended to AMD GPUs with rocm-smi or similar if needed.
+    """
+    if not os.environ.get(_SPAWN_TIMING_ENV):
+        return
+    py_count = -1
+    py_rss_mb = -1.0
+    with contextlib.suppress(Exception):
+        import psutil
+
+        procs = [p for p in psutil.process_iter(["name", "memory_info"]) if "python" in (p.info["name"] or "").lower()]
+        py_count = len(procs)
+        py_rss_mb = sum((p.info["memory_info"].rss for p in procs if p.info["memory_info"]), 0) / (1024 * 1024)
+    vram = "n/a"
+    with contextlib.suppress(Exception):
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0:
+            vram = result.stdout.strip().replace("\n", " ; ")
+    logger.info(
+        f"[sys-snapshot] {label}: python_procs={py_count} python_rss_mb={py_rss_mb:.0f} vram_used/total_mb=[{vram}]",
+    )
+
 
 def _expected_jobs(level: RampLevel) -> int | None:
     """Return the number of image jobs a level expects, or None for an open-ended soak."""
@@ -716,6 +753,7 @@ class BenchmarkController:
         # reason a crashed or wedged child left "no useful logs": its traceback, OOM message, and
         # ComfyUI console output had nowhere to land. The structured `level_<id>.log` only carries the
         # manager's own loguru output, never the children's.
+        _log_system_snapshot(f"pre-level {level.id}")
         subprocess_log = subprocess_log_path.open("w", encoding="utf-8", errors="replace")
         process = subprocess.Popen(command, stdout=subprocess_log, stderr=subprocess.STDOUT)
         try:
@@ -738,6 +776,7 @@ class BenchmarkController:
                 with contextlib.suppress(Exception):
                     kill_process_tree(process.pid, grace_seconds=_SUBPROCESS_KILL_WAIT_SECONDS)
             subprocess_log.close()
+            _log_system_snapshot(f"post-level {level.id}")
 
     def _emit_live_progress(self, level: RampLevel, live_path: Path, last_signature: str | None) -> str | None:
         """Emit a :class:`LevelProgress` event when the level's live snapshot has changed; return its signature."""

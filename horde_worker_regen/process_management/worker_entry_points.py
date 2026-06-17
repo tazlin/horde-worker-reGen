@@ -1,6 +1,7 @@
 import contextlib
 import os
 import sys
+import time
 from typing import Protocol
 
 try:
@@ -21,6 +22,23 @@ WORKER_LOG_VERBOSITY_ENV = "AIWORKER_PROCESS_LOG_VERBOSITY"
 # Floor for worker processes. Maps to DEBUG, the level the bridge.log file sink uses; previously
 # every worker was hardcoded to 5 (TRACE), which forced trace.log's diagnose output on permanently.
 _DEFAULT_WORKER_LOG_VERBOSITY = 4
+
+_SPAWN_TIMING_ENV = "AIWORKER_SPAWN_TIMING"
+
+
+def _spawn_timing_mark(process_id: int, kind: str, label: str) -> None:
+    """Diagnostic: write a raw wall-clock marker to fd 2 for spawn/import-phase timing analysis.
+
+    Opt-in via ``AIWORKER_SPAWN_TIMING``; a no-op otherwise. Uses ``os.write(2, ...)`` rather than
+    ``logger`` so the marker lands in the process's inherited stderr (the benchmark's per-level
+    ``*.subprocess.log``) regardless of how loguru is later reconfigured, and so the very first
+    marker can fire *before any import*, making the spawn-bootstrap + arg-unpickle window
+    (parent ``process.start()`` to child entry) directly measurable.
+    """
+    if not os.environ.get(_SPAWN_TIMING_ENV):
+        return
+    with contextlib.suppress(Exception):
+        os.write(2, f"[spawn-timing] {kind} process_id={process_id} {label} t={time.time():.3f}\n".encode())
 
 
 def resolve_worker_log_verbosity() -> int:
@@ -157,6 +175,7 @@ def start_inference_process(
         gpu_sampling_lease (Semaphore | None, optional): Shared lease for cross-process GPU sampling
             coordination, registered with hordelib. None disables it. Defaults to None.
     """
+    _spawn_timing_mark(process_id, "inference", "entry")
     with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
         logger.remove()
         maybe_wait_for_process_debugger(process_id, "inference")
@@ -173,11 +192,15 @@ def start_inference_process(
 
             from hordelib.api import HordeLog
 
+            _spawn_timing_mark(process_id, "inference", "imported-hordelib-api")
+
             HordeLog.initialise(
                 setup_logging=True,
                 process_id=process_id,
                 verbosity_count=resolve_worker_log_verbosity(),
             )
+
+            _spawn_timing_mark(process_id, "inference", "hordelog-initialised")
 
             from horde_worker_regen.telemetry import configure_child_telemetry
 
@@ -253,6 +276,8 @@ def start_inference_process(
             logger.critical(f"Failed to initialise hordelib: {type(e).__name__} {e}")
             sys.exit(1)
 
+        _spawn_timing_mark(process_id, "inference", "hordelib-initialised")
+
         from horde_worker_regen.process_management.inference_process import HordeInferenceProcess
 
         worker_process = HordeInferenceProcess(
@@ -271,6 +296,8 @@ def start_inference_process(
             # (no per-job aggressive unload / RAM->VRAM reload) when there is VRAM headroom.
             high_memory_mode=high_memory_mode or very_high_memory_mode,
         )
+
+        _spawn_timing_mark(process_id, "inference", "process-constructed")
 
         worker_process.main_loop()
 
@@ -305,6 +332,7 @@ def start_safety_process(
         dry_run_skip_safety (bool, optional): If true, skip real safety checks and return a dummy result.
             Defaults to False.
     """
+    _spawn_timing_mark(process_id, "safety", "entry")
     with contextlib.nullcontext():  # contextlib.redirect_stdout(), contextlib.redirect_stderr():
         logger.remove()
         maybe_wait_for_process_debugger(process_id, "safety")
@@ -321,11 +349,15 @@ def start_safety_process(
 
             from hordelib.api import HordeLog
 
+            _spawn_timing_mark(process_id, "safety", "imported-hordelib-api")
+
             HordeLog.initialise(
                 setup_logging=True,
                 process_id=process_id,
                 verbosity_count=resolve_worker_log_verbosity(),
             )
+
+            _spawn_timing_mark(process_id, "safety", "hordelog-initialised")
 
             from horde_worker_regen.telemetry import configure_child_telemetry
 
