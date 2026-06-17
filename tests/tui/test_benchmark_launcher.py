@@ -89,7 +89,8 @@ def test_build_command_includes_selected_flags() -> None:
         include_downloads=True,
     )
     command = options.build_command(Path("out"))
-    assert command[1:4] == ["-m", "horde_worker_regen.benchmark.cli", "ramp"]
+    assert command[1] == "-u"  # unbuffered so console.log populates live during a wedged startup
+    assert command[2:5] == ["-m", "horde_worker_regen.benchmark.cli", "ramp"]
     assert "real" in command
     assert "sd15,sdxl" in command
     assert "--no-validate" in command

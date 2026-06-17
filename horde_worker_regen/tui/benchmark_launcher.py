@@ -86,6 +86,11 @@ class BenchmarkOptions:
         """Return the ``horde-benchmark ramp`` argv that runs this configuration into ``out_dir``."""
         command = [
             sys.executable,
+            # Unbuffered: the child's stdout/stderr is redirected to console.log (a regular file, not a
+            # TTY), so CPython would otherwise block-buffer it and loguru's stderr sink would not reach
+            # disk until the process exits. A wedged startup would then leave console.log empty, hiding
+            # exactly the tracebacks/early logs needed to diagnose the hang. -u flushes them live.
+            "-u",
             "-m",
             "horde_worker_regen.benchmark.cli",
             "ramp",
