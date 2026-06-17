@@ -9,6 +9,7 @@ pending, a crash that orphans a held semaphore, and a slot that crash-loops. The
 
 from __future__ import annotations
 
+import multiprocessing
 import time
 from unittest.mock import Mock
 
@@ -46,6 +47,7 @@ def _make_plm(*, process_map: ProcessMap | None = None) -> ProcessLifecycleManag
     bridge_data.exit_on_unhandled_faults = False
 
     plm = ProcessLifecycleManager(
+        ctx=multiprocessing.get_context("spawn"),
         process_map=process_map or ProcessMap({}),
         horde_model_map=Mock(),
         job_tracker=JobTracker(),
