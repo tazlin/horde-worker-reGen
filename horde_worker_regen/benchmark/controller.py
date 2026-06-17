@@ -75,6 +75,30 @@ _SUBPROCESS_KILL_WAIT_SECONDS = 10.0
 
 _SPAWN_TIMING_ENV = "AIWORKER_SPAWN_TIMING"
 
+_MODEL_FILE_SUFFIXES = (".safetensors", ".ckpt", ".gguf")
+"""Checkpoint file extensions the real-mode model-presence pre-flight looks for."""
+_MODEL_SCAN_BUDGET_SECONDS = 5.0
+"""Soft wall-clock budget for the model-presence scan; on expiry it fails open (the level proceeds)."""
+
+
+def _weights_root_has_checkpoint(root: Path, *, budget_seconds: float = _MODEL_SCAN_BUDGET_SECONDS) -> bool | None:
+    """Whether the weights root holds at least one checkpoint, scanning for at most ``budget_seconds``.
+
+    Walks the tree once, testing every suffix per file, and returns on the first match. The previous
+    implementation ran an unbounded ``rglob`` per suffix, so an empty-but-deep weights root (or a slow
+    network volume) was walked three times in full: on a cold first level this was the bulk of the silent
+    pre-flight stall. Returns None when the budget elapses before a verdict so the caller fails open
+    (proceeds) rather than skipping the level on an inconclusive scan.
+    """
+    deadline = time.monotonic() + budget_seconds
+    for _dirpath, _dirnames, filenames in os.walk(root):
+        for filename in filenames:
+            if filename.endswith(_MODEL_FILE_SUFFIXES):
+                return True
+        if time.monotonic() >= deadline:
+            return None
+    return False
+
 
 def _log_system_snapshot(label: str) -> None:
     """Diagnostic (opt-in via ``AIWORKER_SPAWN_TIMING``): log python-process count, RSS, and GPU memory.
@@ -297,6 +321,7 @@ class BenchmarkController:
         """Run the ramp and return (and persist) the full report."""
         self._out_dir.mkdir(parents=True, exist_ok=True)
         machine = self._machine if self._machine is not None else detect_machine_info()
+        self._prewarm_inference_imports()
         self._warn_about_huge_tiers(machine)
         self._emit_ramp_started(machine)
         reports: list[LevelReport] = []
@@ -364,6 +389,7 @@ class BenchmarkController:
                 logger.info(f"Resuming level {level.id} from its existing result")
                 return self._evaluate_result(level, prior_result, machine, log_tail=[])
 
+        self._emit_preflight_progress(level)
         skip_reason = self._pre_flight_skip_reason(level, machine)
         if skip_reason is not None:
             logger.warning(f"Skipping level {level.id}: {skip_reason}")
@@ -434,6 +460,25 @@ class BenchmarkController:
                 num_levels=num_levels,
                 jobs_expected=_expected_jobs(level),
                 timeout_seconds=level.timeout_seconds,
+            ),
+        )
+
+    def _emit_preflight_progress(self, level: RampLevel) -> None:
+        """Emit a pre-flight phase event so the dark window before a level runs reads as motion.
+
+        The pre-flight checks (disk free, VRAM burden, on-disk model presence) run synchronously on the
+        controller thread after the level is announced but before its subprocess or warm run begins. On a
+        cold first real level that window can be several seconds with no other output, which reads as a
+        hang; this gives the live view a phase to show. Only emitted in real mode, where the checks
+        actually do work (fake/dry-run pre-flight is a no-op).
+        """
+        if self._process_mode != "real":
+            return
+        self._sink.emit(
+            LevelProgress(
+                level_id=level.id,
+                jobs_expected=_expected_jobs(level),
+                phase="pre-flight checks (disk, VRAM, model presence)",
             ),
         )
 
@@ -590,9 +635,12 @@ class BenchmarkController:
         hint = "set `cache_home` in bridgeData.yaml or AIWORKER_CACHE_HOME"
         if not root.exists():
             return f"no model weights root at {root}; {hint}"
-        for pattern in ("*.safetensors", "*.ckpt", "*.gguf"):
-            if next(iter(root.rglob(pattern)), None) is not None:
-                return None
+        has_checkpoint = _weights_root_has_checkpoint(root)
+        if has_checkpoint is None:
+            logger.debug(f"Model-presence scan of {root} exceeded its time budget; proceeding without the guard")
+            return None
+        if has_checkpoint:
+            return None
         return f"no model files found under {root}; {hint} (real-mode benchmarking does not download checkpoints)"
 
     def _warn_about_huge_tiers(self, machine: MachineInfo) -> None:
@@ -730,6 +778,24 @@ class BenchmarkController:
                     models.add(job.model)
             ceiling = max(ceiling, _override_int(level, "max_threads", 1))
         return sorted(models), ceiling
+
+    def _prewarm_inference_imports(self) -> None:
+        """Import the hordelib burden API once, up front, so no individual level pays the cold import.
+
+        ``estimate_job_burden`` (used by the per-level VRAM pre-flight) lives in ``hordelib.api``, whose
+        first import pulls in torch and is tens of seconds cold. Machine detection usually pays this
+        already, but doing it here under timing guarantees the per-level hot path is warm and surfaces the
+        cost in the log rather than burying it inside the first level's otherwise-silent pre-flight.
+        """
+        if self._process_mode != "real":
+            return
+        start = time.monotonic()
+        try:
+            import hordelib.api  # noqa: F401 - imported for its side effect of warming the module cache
+        except Exception as e:  # noqa: BLE001 - prewarm is best-effort; per-level guards already fail open
+            logger.debug(f"Could not pre-warm hordelib inference imports: {e}")
+            return
+        logger.info(f"Pre-warmed hordelib inference imports in {time.monotonic() - start:.1f}s")
 
     def _maybe_start_warm_driver(self) -> None:
         """Bring up the shared warm worker, if warm mode is enabled and any level needs it."""

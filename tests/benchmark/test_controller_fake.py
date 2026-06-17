@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from horde_worker_regen.benchmark.controller import BenchmarkController
+from horde_worker_regen.benchmark.controller import BenchmarkController, _weights_root_has_checkpoint
 from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage
 from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel, build_default_ladder
 from horde_worker_regen.benchmark.scenarios import CannedImageJobSpec, ScenarioSpec
@@ -24,6 +24,26 @@ def _mini_ladder(jobs: int = 2) -> list[RampLevel]:
             include_alchemy=False,
         ),
     )
+
+
+def test_weights_root_scan_finds_a_checkpoint(tmp_path: Path) -> None:
+    """The bounded scan returns True on the first checkpoint, regardless of suffix or nesting depth."""
+    nested = tmp_path / "a" / "b" / "c"
+    nested.mkdir(parents=True)
+    (nested / "model.safetensors").write_bytes(b"x")
+    assert _weights_root_has_checkpoint(tmp_path) is True
+
+
+def test_weights_root_scan_reports_empty_root(tmp_path: Path) -> None:
+    """An empty (or checkpoint-free) root scans to completion and returns False, so the level is skipped."""
+    (tmp_path / "notes.txt").write_text("no weights here", encoding="utf-8")
+    assert _weights_root_has_checkpoint(tmp_path) is False
+
+
+def test_weights_root_scan_fails_open_when_budget_exhausted(tmp_path: Path) -> None:
+    """A zero-length budget yields None (inconclusive) so the caller fails open rather than skipping."""
+    (tmp_path / "sub").mkdir()
+    assert _weights_root_has_checkpoint(tmp_path, budget_seconds=0.0) is None
 
 
 @pytest.mark.e2e
