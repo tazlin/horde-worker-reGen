@@ -1,7 +1,11 @@
 import torch
 from loguru import logger
 
-if "AMD" in torch.cuda.get_device_name() or "Radeon" in torch.cuda.get_device_name():
+# torch.cuda.get_device_name() raises when no CUDA/ROCm device is present, so guard the probe:
+# this hijack only applies to AMD GPUs (which present through torch.cuda), and other backends skip it.
+_device_name = torch.cuda.get_device_name() if torch.cuda.is_available() else ""
+
+if "AMD" in _device_name or "Radeon" in _device_name:
     try:  # this import is handled via  script, skipping it in mypy. If this fails somehow the module will simply not run.
         from flash_attn import flash_attn_func  # type: ignore
 
@@ -39,11 +43,9 @@ if "AMD" in torch.cuda.get_device_name() or "Radeon" in torch.cuda.get_device_na
                 )
             return hidden_states
 
-        torch.nn.functional.scaled_dot_product_attention = (
-            sdpa_hijack  # pyrefly: ignore - hijacks are inherently not type safe
-        )
+        torch.nn.functional.scaled_dot_product_attention = sdpa_hijack  # pyrefly: ignore - hijacks are inherently not type safe
         logger.debug("# # # AMD GO FAST # # #")
     except ImportError as e:
         logger.debug(f"# # # AMD GO SLOW {e} # # #")
 else:
-    logger.debug(f"# # # AMD GO SLOW Could not detect AMD GPU from: {torch.cuda.get_device_name()} # # #")
+    logger.debug(f"# # # AMD GO SLOW Could not detect AMD GPU from: {_device_name!r} # # #")

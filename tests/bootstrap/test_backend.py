@@ -58,9 +58,24 @@ def _write_pyproject(tmp_path: Path) -> Path:
     return pyproject
 
 
+def _write_pyproject_with_features(tmp_path: Path) -> Path:
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project.optional-dependencies]\ncu126 = ["torch"]\ncpu = ["torch"]\n'
+        'controlnet = ["horde-engine[controlnet]"]\npost-processing = ["horde-engine[rembg]"]\n',
+        encoding="utf-8",
+    )
+    return pyproject
+
+
 def test_locked_extras_reads_pyproject(tmp_path: Path) -> None:
     """locked_extras returns the optional-dependency keys (sorted)."""
     assert backend.locked_extras(_write_pyproject(tmp_path)) == ["cpu", "cu126", "cu130", "cu132"]
+
+
+def test_locked_extras_excludes_feature_extras(tmp_path: Path) -> None:
+    """Feature extras are not torch builds, so locked_extras filters them out."""
+    assert backend.locked_extras(_write_pyproject_with_features(tmp_path)) == ["cpu", "cu126"]
 
 
 def test_validate_accepts_locked(tmp_path: Path) -> None:
@@ -73,3 +88,42 @@ def test_validate_rejects_unlocked(tmp_path: Path, token: str) -> None:
     """A non-locked build raises ValueError with actionable guidance."""
     with pytest.raises(ValueError, match="not a locked build"):
         backend.validate_locked_extra(token, _write_pyproject(tmp_path))
+
+
+def test_validate_rejects_feature_extra_as_build(tmp_path: Path) -> None:
+    """A feature extra is not a valid backend token even though it is a real extra."""
+    with pytest.raises(ValueError, match="not a locked build"):
+        backend.validate_locked_extra("post-processing", _write_pyproject_with_features(tmp_path))
+
+
+@pytest.mark.parametrize("token", ["cu126", "cu130", "cu132", "cpu"])
+def test_full_builds_default_to_all_feature_extras(token: str) -> None:
+    """NVIDIA/CPU builds keep the full feature set by default (zero-change UX)."""
+    assert backend.desired_feature_extras(token) == backend.FEATURE_EXTRAS
+
+
+@pytest.mark.parametrize("token", ["rocm", "xpu", "mps"])
+def test_lean_builds_default_to_no_feature_extras(token: str) -> None:
+    """Non-NVIDIA backends default lean: no feature extras unless opted in."""
+    assert backend.desired_feature_extras(token) == ()
+
+
+def test_feature_extras_env_override_opts_in_on_lean_build() -> None:
+    """HORDE_WORKER_FEATURES opts a lean backend into specific extras."""
+    assert backend.desired_feature_extras("rocm", env_value="controlnet") == ("controlnet",)
+    assert backend.desired_feature_extras("rocm", env_value="controlnet, post-processing") == (
+        "controlnet",
+        "post-processing",
+    )
+
+
+def test_feature_extras_env_none_forces_lean_on_full_build() -> None:
+    """An explicit 'none' (or empty) override strips features even from a full build."""
+    assert backend.desired_feature_extras("cu132", env_value="none") == ()
+    assert backend.desired_feature_extras("cu132", env_value="   ") == backend.FEATURE_EXTRAS
+
+
+def test_feature_extras_env_rejects_unknown() -> None:
+    """An override naming a non-feature extra raises with guidance."""
+    with pytest.raises(ValueError, match="unknown feature extra"):
+        backend.desired_feature_extras("cu126", env_value="cu126")

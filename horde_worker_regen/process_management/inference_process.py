@@ -798,11 +798,11 @@ class HordeInferenceProcess(HordeProcess):
 
     @staticmethod
     def clear_gc_and_torch_cache() -> None:
-        """Clear the garbage collector and the PyTorch cache."""
+        """Clear the garbage collector and the active backend's device cache."""
         gc.collect()
-        from torch.cuda import empty_cache
+        from hordelib.api import clear_accelerator_cache
 
-        empty_cache()
+        clear_accelerator_cache()
 
     @logger.catch(reraise=True)
     def unload_models_from_vram(self) -> None:

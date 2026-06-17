@@ -41,6 +41,7 @@ from horde_sdk.generation_parameters.alchemy.consts import (
 from loguru import logger
 
 import horde_worker_regen
+from horde_worker_regen.capabilities import strip_background_available
 from horde_worker_regen.process_management._canned_scenarios import CannedAlchemySource
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.horde_process import WorkerCapability
@@ -128,7 +129,13 @@ def expand_offered_forms(bridge_data: reGenBridgeData) -> list[str]:
     if "post-process" in configured:
         offered.extend(m.value for m in KNOWN_UPSCALERS if m != KNOWN_UPSCALERS.BACKEND_DEFAULT)
         offered.extend(m.value for m in KNOWN_FACEFIXERS if m != KNOWN_FACEFIXERS.BACKEND_DEFAULT)
-        offered.extend(m.value for m in KNOWN_MISC_POST_PROCESSORS)
+        # strip_background needs rembg (no wheels on some backends); drop just it on a lean install.
+        # Upscalers/face-fixers above are pure torch and stay on offer. Unlike image-generation
+        # post-processing, alchemy forms are enumerated per-form, so this granular drop is possible.
+        if strip_background_available():
+            offered.extend(m.value for m in KNOWN_MISC_POST_PROCESSORS)
+        else:
+            offered.extend(m.value for m in KNOWN_MISC_POST_PROCESSORS if not is_strip_background_form(m.value))
 
     return offered
 

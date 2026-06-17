@@ -11,6 +11,8 @@
 # Options (environment variables, so they work with the curl | sh form):
 #   HORDE_WORKER_DIR         install location (default: ./horde-worker in the current directory)
 #   HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | rocm | cpu (default: detected from the GPU/driver)
+#   HORDE_WORKER_FEATURES    optional feature extras to install: comma/space list of post-processing,
+#                            controlnet, or 'none' (default: all on NVIDIA/CPU, none on other backends)
 #   HORDE_WORKER_ASSUME_YES  accept the install notice without prompting (required when piped, no terminal)
 #   HORDE_WORKER_SHORTCUTS   create the applications-menu entry without prompting
 #   HORDE_WORKER_NO_SHORTCUTS skip the applications-menu entry entirely

@@ -44,6 +44,7 @@ from pydantic import ValidationError
 from horde_worker_regen.app_state import AppStateStore, WorkerRunRecord, default_app_state_dir
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.bridge_data.load_config import BridgeDataLoader
+from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities
 from horde_worker_regen.consts import (
     BRIDGE_CONFIG_FILENAME,
     VRAM_HEAVY_MODELS,
@@ -118,24 +119,23 @@ class SystemResources:
 
     @classmethod
     def detect(cls) -> SystemResources:
-        """Detect system resources by probing psutil and torch.cuda."""
+        """Detect system resources via psutil and hordelib's backend-agnostic accelerator inventory.
+
+        Device discovery goes through ``enumerate_accelerators`` rather than ``torch.cuda`` directly so
+        every ComfyUI-supported backend (CUDA/ROCm, Intel XPU, Apple MPS, DirectML, CPU) populates the
+        device map; a bare ``torch.cuda.device_count()`` loop would yield no devices on non-CUDA backends.
+        """
         import psutil
-        import torch
+        from hordelib.api import enumerate_accelerators
 
         total_ram = psutil.virtual_memory().total
 
         device_map = TorchDeviceMap(root={})
-        for i in range(torch.cuda.device_count()):
-            device = torch.cuda.get_device_properties(i)
-
-            if not hasattr(device, "name") or not hasattr(device, "total_memory"):
-                logger.debug(f"Skipping CUDA device {i} due to missing attributes.")
-                continue
-
-            device_map.root[i] = TorchDeviceInfo(
-                device_name=device.name,
-                device_index=i,
-                total_memory=device.total_memory,
+        for accelerator in enumerate_accelerators():
+            device_map.root[accelerator.index] = TorchDeviceInfo(
+                device_name=accelerator.name,
+                device_index=accelerator.index,
+                total_memory=accelerator.total_vram_mb * 1024 * 1024,
             )
 
         return cls(total_ram_bytes=total_ram, device_map=device_map)
@@ -1898,6 +1898,9 @@ class HordeWorkerProcessManager:
                 file_path=BRIDGE_CONFIG_FILENAME,
                 horde_model_reference_manager=self.horde_model_reference_manager,
             )
+            # Re-coerce on every reload so a config edit re-enabling a feature whose packages are still
+            # missing is caught again; the warning only fires when a flag actually flips, not each tick.
+            coerce_bridge_data_to_capabilities(self.bridge_data)
             new_effective = self._runtime_config.effective_max_threads
             if new_effective != previous_effective:
                 logger.info(

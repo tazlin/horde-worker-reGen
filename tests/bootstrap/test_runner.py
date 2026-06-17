@@ -68,6 +68,30 @@ def test_uv_sync_argv_and_exit_code(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert captured["cwd"] == str(tmp_path)
 
 
+def test_uv_sync_appends_feature_extras(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Each feature extra is passed as its own --extra flag after the build extra."""
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], cwd: str, env: dict[str, str], check: bool) -> _FakeCompleted:
+        captured["cmd"] = cmd
+        return _FakeCompleted(0)
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    runner.uv_sync("UV", "cu132", extras=("controlnet", "post-processing"), root=tmp_path)
+
+    assert captured["cmd"] == [
+        "UV",
+        "sync",
+        "--locked",
+        "--extra",
+        "cu132",
+        "--extra",
+        "controlnet",
+        "--extra",
+        "post-processing",
+    ]
+
+
 def test_uv_run_no_sync_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """uv_run builds `run --no-sync <command...>` with passthrough args intact."""
     captured: dict[str, object] = {}

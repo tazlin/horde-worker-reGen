@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 from worker_bootstrap import paths
@@ -49,12 +50,25 @@ def run_uv(uv: str, args: list[str], *, root: Path | None = None) -> int:
     return completed.returncode
 
 
-def uv_sync(uv: str, extra: str, *, root: Path | None = None, locked: bool = True) -> int:
-    """Run ``uv sync [--locked] --extra <extra>`` and return its exit code."""
+def uv_sync(
+    uv: str,
+    extra: str,
+    *,
+    extras: Sequence[str] = (),
+    root: Path | None = None,
+    locked: bool = True,
+) -> int:
+    """Run ``uv sync [--locked] --extra <extra> [--extra <e> ...]`` and return its exit code.
+
+    ``extra`` is the torch build; ``extras`` are any additional (feature) extras to install alongside
+    it, each passed as its own ``--extra`` flag.
+    """
     args = ["sync"]
     if locked:
         args.append("--locked")
     args += ["--extra", extra]
+    for feature_extra in extras:
+        args += ["--extra", feature_extra]
     return run_uv(uv, args, root=root)
 
 

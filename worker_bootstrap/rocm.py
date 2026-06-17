@@ -15,7 +15,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from worker_bootstrap import paths, runner
+from worker_bootstrap import backend, paths, runner
 
 _DEFAULT_TORCH = "2.9.1"
 _DEFAULT_INDEX = "https://download.pytorch.org/whl/rocm6.4"
@@ -45,8 +45,13 @@ def _patch_wsl_libhsa(root: Path) -> None:
 def sync_rocm(uv: str, *, root: Path | None = None) -> int:
     """Install the base environment then the ad-hoc ROCm torch stack; return the final exit code."""
     root = root or paths.install_root()
-    print("Installing the base environment (everything except the GPU torch build)...")
-    base_rc = runner.uv_sync(uv, "cpu", root=root)
+    # ROCm is a lean "others" backend: the cpu extra provides only the universal deps. Feature extras
+    # (rembg/onnxruntime) are off by default and opt-in via HORDE_WORKER_FEATURES (their CPU wheels do
+    # exist on x86 Linux), resolved against the "rocm" token so the cpu base does not auto-pull them.
+    feature_extras = backend.desired_feature_extras("rocm", env_value=os.environ.get("HORDE_WORKER_FEATURES"))
+    features_note = ", ".join(feature_extras) if feature_extras else "none (lean base)"
+    print(f"Installing the base environment (everything except the GPU torch build; features: {features_note})...")
+    base_rc = runner.uv_sync(uv, "cpu", extras=feature_extras, root=root)
     if base_rc != 0:
         return base_rc
 

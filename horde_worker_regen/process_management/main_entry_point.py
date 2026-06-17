@@ -14,6 +14,7 @@ from horde_worker_regen.app_state import (
     compute_config_digest,
 )
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.worker_identity import WorkerNameConfigError, verify_worker_identity
 
@@ -59,6 +60,11 @@ def start_working(
     except WorkerNameConfigError as name_error:
         logger.error(str(name_error))
         sys.exit(1)
+
+    # Disable any advertised feature whose backend packages are not installed (e.g. controlnet /
+    # post-processing on a lean non-NVIDIA install) so the worker never pops a job it cannot serve.
+    # Covers env-var configs too (which never hot-reload); file reloads are re-coerced in the manager.
+    coerce_bridge_data_to_capabilities(bridge_data)
 
     process_manager = HordeWorkerProcessManager(
         ctx=ctx,

@@ -11,6 +11,8 @@
 # Options come from environment variables (so they work with the irm | iex form):
 #   $env:HORDE_WORKER_DIR         install location (default: .\HordeWorker in the current directory)
 #   $env:HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | cpu (default: detected from the GPU driver)
+#   $env:HORDE_WORKER_FEATURES    optional feature extras: comma/space list of post-processing, controlnet,
+#                                 or 'none' (default: all on NVIDIA/CPU, none on other backends)
 #   $env:HORDE_WORKER_ASSUME_YES  accept the install notice without prompting (required when non-interactive)
 #   $env:HORDE_WORKER_SHORTCUTS   create Desktop/Start Menu shortcuts without prompting
 #   $env:HORDE_WORKER_NO_SHORTCUTS skip shortcut creation entirely

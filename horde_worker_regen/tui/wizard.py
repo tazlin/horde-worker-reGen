@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import enum
 import os
-import warnings
 from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
@@ -83,23 +82,19 @@ def is_setup_incomplete(config_path: Path = DEFAULT_CONFIG_PATH) -> bool:
 
 
 def _detect_total_vram_mb() -> int | None:
-    """Best-effort read of the primary GPU's total VRAM in MB via NVML, or None when unavailable.
+    """Best-effort read of the primary device's total VRAM in MB, or None when unavailable.
 
-    Mirrors the graceful-degradation pattern in ``utils.gpu_monitor``: any NVML failure (no NVIDIA GPU,
-    no pynvml, AMD/CPU) yields None so the caller falls back to a safe default rather than erroring.
+    Routes through hordelib's backend-agnostic helper (which works without ComfyUI loaded and across
+    CUDA/ROCm/XPU/MPS/CPU) rather than NVML, so non-NVIDIA cards size the wizard correctly. Any failure
+    or a zero reading yields None so the caller falls back to a safe default rather than erroring.
     """
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")  # silence pynvml's deprecation FutureWarning
-            import pynvml
+        from hordelib.api import get_torch_total_vram_mb
 
-            pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            total_bytes = int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
-            pynvml.nvmlShutdown()
+        total_mb = get_torch_total_vram_mb()
     except Exception:  # noqa: BLE001 - "no GPU telemetry" is expected, not a crash
         return None
-    return total_bytes // (1024 * 1024)
+    return total_mb or None
 
 
 def _top_n_for_vram(total_mb: int | None) -> int:

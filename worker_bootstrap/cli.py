@@ -11,6 +11,7 @@ from worker_bootstrap import backend as backend_mod
 from worker_bootstrap import config_seed, consent, detect, gitbin, paths, runner, uvbin
 
 _BACKEND_ENV = "HORDE_WORKER_BACKEND"
+_FEATURES_ENV = "HORDE_WORKER_FEATURES"
 
 # launch mode -> the uv-run command (console scripts from pyproject [project.scripts]). "bridge" is handled
 # separately because it downloads models before starting the worker, matching the old horde-bridge.cmd.
@@ -74,11 +75,13 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None) -> int:
         return rocm.sync_rocm(uv, root=root)
     try:
         backend_mod.validate_locked_extra(token, paths.pyproject_path(root))
+        feature_extras = backend_mod.desired_feature_extras(token, env_value=os.environ.get(_FEATURES_ENV))
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    print(f"Installing dependencies for GPU backend: {token}")
-    return runner.uv_sync(uv, token, root=root)
+    features_note = ", ".join(feature_extras) if feature_extras else "none (lean base)"
+    print(f"Installing dependencies for GPU backend: {token} (features: {features_note})")
+    return runner.uv_sync(uv, token, extras=feature_extras, root=root)
 
 
 def _ensure_synced(uv: str, root: Path, *, cli_flag: str | None) -> int:

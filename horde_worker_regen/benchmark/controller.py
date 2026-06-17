@@ -151,12 +151,13 @@ def detect_machine_info() -> MachineInfo:
     except Exception:  # noqa: BLE001 - purely informational
         pass
     try:
-        import torch
+        from hordelib.api import enumerate_accelerators
 
-        if torch.cuda.is_available():
-            properties = torch.cuda.get_device_properties(0)
-            info.gpu_name = properties.name
-            info.total_vram_mb = round(properties.total_memory / (1024 * 1024))
+        accelerators = enumerate_accelerators()
+        if accelerators:
+            primary = accelerators[0]
+            info.gpu_name = primary.name
+            info.total_vram_mb = primary.total_vram_mb
     except Exception:  # noqa: BLE001 - purely informational
         pass
     return info
