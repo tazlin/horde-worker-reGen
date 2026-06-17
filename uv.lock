@@ -759,6 +759,26 @@ wheels = [
 ]
 
 [[package]]
+name = "diffusers"
+version = "0.38.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "filelock" },
+    { name = "httpx" },
+    { name = "huggingface-hub" },
+    { name = "importlib-metadata" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "regex" },
+    { name = "requests" },
+    { name = "safetensors" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/01/ed/255d3dfd4a2271dffc8f1895f9d2720b3bf1beaecf02148bb5604439e594/diffusers-0.38.0.tar.gz", hash = "sha256:1e094ec5c16f18c42fb89d37f07a94cf9aab3ebbe527ab059c609597b8857626", size = 4328401, upload-time = "2026-05-01T05:42:15.276Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/c0/3237566ea6e3a542f3c0669a253d62fe75f27b84b3d7bd4fb3b5ee89d73c/diffusers-0.38.0-py3-none-any.whl", hash = "sha256:18e53f9e539096320470f62c6360a6fd5727ff28cffda566265316e13fcdb612", size = 5245919, upload-time = "2026-05-01T05:42:12.779Z" },
+]
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1078,6 +1098,9 @@ controlnet = [
     { name = "trimesh", extra = ["easy"] },
     { name = "yacs" },
 ]
+layerdiffuse = [
+    { name = "diffusers" },
+]
 rembg = [
     { name = "rembg", extra = ["cpu"] },
 ]
@@ -1154,13 +1177,13 @@ wheels = [
 
 [[package]]
 name = "horde-worker-regen"
-version = "12.5.4"
+version = "12.5.5"
 source = { editable = "." }
 dependencies = [
     { name = "aiodns" },
     { name = "babel" },
     { name = "certifi" },
-    { name = "horde-engine" },
+    { name = "horde-engine", extra = ["layerdiffuse"] },
     { name = "horde-model-reference" },
     { name = "horde-safety" },
     { name = "horde-sdk" },
@@ -1239,8 +1262,8 @@ requires-dist = [
     { name = "aiodns", specifier = ">=3.0.0,<4.0.0" },
     { name = "babel" },
     { name = "certifi" },
-    { name = "horde-engine", specifier = ">=3.2.4,<4.0.0" },
     { name = "horde-engine", extras = ["controlnet"], marker = "extra == 'controlnet'" },
+    { name = "horde-engine", extras = ["layerdiffuse"], specifier = ">=3.2.4,<4.0.0" },
     { name = "horde-engine", extras = ["rembg"], marker = "extra == 'post-processing'" },
     { name = "horde-model-reference", specifier = ">=5.3.0,<6.0.0" },
     { name = "horde-safety", specifier = "~=0.3.0" },

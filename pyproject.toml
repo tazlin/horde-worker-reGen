@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "horde_worker_regen"
-version = "12.5.4"
+version = "12.5.5"
 description = "Allows you to connect to the AI Horde and generate images for users."
 authors = [
     {name = "tazlin", email = "tazlin.on.github@gmail.com"},
@@ -31,7 +31,13 @@ dependencies = [
     # torchaudio as a hard dep, and exposes the optional-feature extras + capability registry
     # (hordelib.api.available_features) that the worker's `post-processing`/`controlnet` extras and the
     # config coercion in horde_worker_regen/capabilities.py depend on.
-    "horde_engine>=3.2.4,<4.0.0",
+    # The [layerdiffuse] extra is pulled into the BASE deps (not opt-in like post-processing/controlnet)
+    # because the default Stable Diffusion pipeline wires in the layer_diffuse_apply / LayeredDiffusionApply
+    # node unconditionally: that node must import for ANY job to run. 3.2.4 demoted its sole requirement
+    # (diffusers) from a core dep to this extra, so plain horde_engine leaves the node un-importable and
+    # faults all inference with a KeyError on LayeredDiffusionApply. Keep this until the pipeline gates the
+    # node on transparent output (then it can move to an opt-in extra).
+    "horde_engine[layerdiffuse]>=3.2.4,<4.0.0",
     "horde_model_reference>=5.3.0,<6.0.0",
     "python-dotenv",
     "ruamel.yaml",
