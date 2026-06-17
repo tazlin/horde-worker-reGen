@@ -29,7 +29,7 @@ class LevelCriteria(BaseModel):
     timeouts, OOM, or recoveries) decides the verdict."""
     min_vram_headroom_mb: int = 1500
     """Total VRAM minus the observed high-water mark must never drop below this."""
-    min_disk_free_gb: float = 10.0
+    min_disk_free_gb: float = 1.0
     min_download_mbps: float | None = None
     """Advisory floor for download levels (a miss is reported but does not fail the level)."""
     min_its_retention: float | None = None

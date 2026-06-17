@@ -16,7 +16,6 @@ machines: requirements only decide *whether* a level runs, never *what* it runs.
 from __future__ import annotations
 
 import os
-import shutil
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -30,8 +29,6 @@ from horde_worker_regen.benchmark.ladder import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from horde_worker_regen.benchmark.enums import BenchTier
     from horde_worker_regen.benchmark.report import MachineInfo
     from horde_worker_regen.model_download_plan import DownloadPlan
@@ -255,38 +252,26 @@ def requirement_skip_reason(
     *,
     machine: MachineInfo,
     process_mode: str,
-    cache_path: Path,
     civitai_available: bool,
     force: bool = False,
 ) -> str | None:
     """Return why *req* cannot run on this machine, or None to proceed.
 
-    Covers only the per-level *resource* gates (disk, model presence, VRAM, CivitAI key); the dynamic
+    Covers only the per-level *resource* gates (model presence, VRAM, CivitAI key); the dynamic
     ramp gates (failed-baseline/axis cascades, ``--skip-downloads``, the empty-weights-root guard) stay
     with the controller, which calls this after them. ``force`` bypasses the machine-fit and key gates
-    (insufficient VRAM/disk, missing CivitAI key) but never the absent-checkpoint gate: there is simply
+    (insufficient VRAM, missing CivitAI key) but never the absent-checkpoint gate: there is simply
     nothing to run when the weights are not present.
+
+    Disk space is not gated here: if the model is already on disk nothing additional is needed, and
+    real-mode benchmarking never downloads checkpoints mid-run. The runtime ``min_disk_free_gb``
+    criterion in :class:`~horde_worker_regen.benchmark.criteria.LevelCriteria` catches genuine disk
+    exhaustion during a level run.
 
     Resource gates apply only in ``real`` mode; ``fake``/``dry_run`` download and infer nothing.
     """
     if process_mode != "real":
         return None
-
-    if not force:
-        free_disk = shutil.disk_usage(cache_path).free
-        if free_disk < req.min_disk_free_gb * 1024**3:
-            shortfall_gb = (req.min_disk_free_gb * 1024**3 - free_disk) / 1024**3
-            download_note = ""
-            if req.download_bytes_needed > 0:
-                download_note = (
-                    f"; {len(req.models_missing)} model(s) ({req.download_bytes_needed / 1024**3:.1f} GB) "
-                    f"still to download via Download models"
-                )
-            return (
-                f"insufficient disk on {cache_path}: needs {req.min_disk_free_gb:.0f} GB free to run safely, "
-                f"only {free_disk / 1024**3:.1f} GB free "
-                f"(free up ~{shortfall_gb:.1f} GB, or choose a smaller tier){download_note}"
-            )
 
     # A genuinely-absent huge/beta checkpoint is a hard skip even under --force: real-mode benchmarking
     # never downloads checkpoints, so there is nothing to run.

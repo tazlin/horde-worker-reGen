@@ -786,7 +786,7 @@ class BenchmarkController:
         """Return why the level should be skipped without running, or None to proceed.
 
         The dynamic ramp gates live here (``--skip-downloads``, the failed-baseline/axis cascades, and
-        the empty-weights-root guard); the per-level resource verdict (disk, model presence, VRAM, a
+        the empty-weights-root guard); the per-level resource verdict (model presence, VRAM, a
         CivitAI key) is delegated to :func:`requirement_skip_reason` so the ``plan`` preview and this
         decision share one source of truth.
         """
@@ -811,7 +811,6 @@ class BenchmarkController:
             req,
             machine=machine,
             process_mode=self._process_mode,
-            cache_path=self._model_cache_path(),
             civitai_available=civitai_token_available(),
             force=self._force,
         )
@@ -858,7 +857,7 @@ class BenchmarkController:
             return
 
         # Don't pay the (tens of seconds to minutes) worker-boot cost when every fixed level would be
-        # skipped anyway: in real mode an insufficient-disk or no-checkpoints-on-disk machine fails the
+        # skipped anyway: in real mode a no-checkpoints-on-disk machine or VRAM mismatch fails the
         # pre-flight for all of them, so booting a worker only to tear it back down is pure dead time.
         # At boot the per-tier baseline/axis failure sets are still empty, so this sees the true
         # cold-machine verdict. Fake/dry-run never trip these gates, so they still boot.

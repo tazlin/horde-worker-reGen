@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import types
-from pathlib import Path
-
 import pytest
 
 from horde_worker_regen.benchmark import requirements as requirements_mod
@@ -12,7 +9,6 @@ from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel, build_
 from horde_worker_regen.benchmark.report import MachineInfo
 from horde_worker_regen.benchmark.requirements import (
     LevelRequirements,
-    MissingModel,
     compute_level_requirements,
     requirement_skip_reason,
 )
@@ -72,20 +68,19 @@ def _req(**overrides: object) -> LevelRequirements:
     return LevelRequirements(**base)  # type: ignore[arg-type]
 
 
-def test_verdict_is_none_outside_real_mode(tmp_path: Path) -> None:
+def test_verdict_is_none_outside_real_mode() -> None:
     """fake/dry_run download and infer nothing, so resource gates never apply."""
     req = _req(estimated_vram_mb=999_999, requires_civitai_key=True)
     reason = requirement_skip_reason(
         req,
         machine=MachineInfo(total_vram_mb=1),
         process_mode="fake",
-        cache_path=tmp_path,
         civitai_available=False,
     )
     assert reason is None
 
 
-def test_insufficient_vram_skips_unless_forced(tmp_path: Path) -> None:
+def test_insufficient_vram_skips_unless_forced() -> None:
     """A level that needs more VRAM than the machine has is skipped, but --force attempts it anyway."""
     req = _req(estimated_vram_mb=24_000)
     machine = MachineInfo(total_vram_mb=8_000)
@@ -93,7 +88,6 @@ def test_insufficient_vram_skips_unless_forced(tmp_path: Path) -> None:
         req,
         machine=machine,
         process_mode="real",
-        cache_path=tmp_path,
         civitai_available=True,
     )
     assert skip is not None
@@ -103,14 +97,13 @@ def test_insufficient_vram_skips_unless_forced(tmp_path: Path) -> None:
         req,
         machine=machine,
         process_mode="real",
-        cache_path=tmp_path,
         civitai_available=True,
         force=True,
     )
     assert forced is None
 
 
-def test_missing_civitai_token_skips_lora_level_unless_forced(tmp_path: Path) -> None:
+def test_missing_civitai_token_skips_lora_level_unless_forced() -> None:
     """A lora/TI level without a configured token is skipped with a clear reason; --force overrides."""
     req = _req(requires_civitai_key=True, estimated_vram_mb=2_000)
     machine = MachineInfo(total_vram_mb=8_000)
@@ -118,7 +111,6 @@ def test_missing_civitai_token_skips_lora_level_unless_forced(tmp_path: Path) ->
         req,
         machine=machine,
         process_mode="real",
-        cache_path=tmp_path,
         civitai_available=False,
     )
     assert skip is not None
@@ -129,7 +121,6 @@ def test_missing_civitai_token_skips_lora_level_unless_forced(tmp_path: Path) ->
             req,
             machine=machine,
             process_mode="real",
-            cache_path=tmp_path,
             civitai_available=True,
         )
         is None
@@ -139,75 +130,11 @@ def test_missing_civitai_token_skips_lora_level_unless_forced(tmp_path: Path) ->
             req,
             machine=machine,
             process_mode="real",
-            cache_path=tmp_path,
             civitai_available=False,
             force=True,
         )
         is None
     )
-
-
-def test_insufficient_disk_skips_unless_forced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The live disk-free check skips a level when the cache volume is below the floor; --force overrides."""
-    req = _req(min_disk_free_gb=10.0, estimated_vram_mb=2_000)
-    machine = MachineInfo(total_vram_mb=8_000)
-    monkeypatch.setattr(
-        requirements_mod.shutil,
-        "disk_usage",
-        lambda _path: types.SimpleNamespace(total=0, used=0, free=1 * 1024**3),
-    )
-    skip = requirement_skip_reason(
-        req,
-        machine=machine,
-        process_mode="real",
-        cache_path=tmp_path,
-        civitai_available=True,
-    )
-    assert skip is not None
-    assert "insufficient disk" in skip
-
-    assert (
-        requirement_skip_reason(
-            req,
-            machine=machine,
-            process_mode="real",
-            cache_path=tmp_path,
-            civitai_available=True,
-            force=True,
-        )
-        is None
-    )
-
-
-def test_insufficient_disk_message_names_delta_and_downloads(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The disk verdict states how much to free up and points at Download models for the missing weights."""
-    req = _req(
-        min_disk_free_gb=10.0,
-        estimated_vram_mb=2_000,
-        models_missing=["some-model"],
-        missing_models=[MissingModel(name="some-model", size_bytes=3 * 1024**3)],
-        download_bytes_needed=3 * 1024**3,
-    )
-    monkeypatch.setattr(
-        requirements_mod.shutil,
-        "disk_usage",
-        lambda _path: types.SimpleNamespace(total=0, used=0, free=1 * 1024**3),
-    )
-    skip = requirement_skip_reason(
-        req,
-        machine=MachineInfo(total_vram_mb=8_000),
-        process_mode="real",
-        cache_path=tmp_path,
-        civitai_available=True,
-    )
-    assert skip is not None
-    assert "insufficient disk" in skip
-    assert "free up ~9.0 GB" in skip  # needs 10 GB, only 1 GB free
-    assert "Download models" in skip
-    assert "1 model(s)" in skip
 
 
 def test_compute_requirements_uses_the_real_disk_plan(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -237,14 +164,13 @@ def test_compute_requirements_uses_the_real_disk_plan(monkeypatch: pytest.Monkey
     assert [model.target_path for model in req.missing_models] == ["/b"]
 
 
-def test_absent_huge_checkpoint_is_a_hard_skip_even_when_forced(tmp_path: Path) -> None:
+def test_absent_huge_checkpoint_is_a_hard_skip_even_when_forced() -> None:
     """A missing flux/qwen checkpoint cannot be forced: real-mode benchmarking never downloads weights."""
     req = _req(tier="flux", models_missing=["Flux.1-Schnell fp8 (Compact)"])
     reason = requirement_skip_reason(
         req,
         machine=MachineInfo(total_vram_mb=80_000),
         process_mode="real",
-        cache_path=tmp_path,
         civitai_available=True,
         force=True,
     )
