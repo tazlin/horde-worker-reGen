@@ -35,6 +35,7 @@ from horde_worker_regen.benchmark.progress_channel import (
     ProgressTailer,
     RampFinished,
     RampStarted,
+    RampStarting,
 )
 from horde_worker_regen.process_management.owned_process_registry import kill_process_tree
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH, load_config, save_config
@@ -62,6 +63,7 @@ class BenchmarkSupervisorStatus(enum.StrEnum):
     """The supervisor's view of the benchmark subprocess lifecycle."""
 
     IDLE = "idle"
+    PREPARING = "preparing"
     RUNNING = "running"
     FINISHED = "finished"
     FAILED = "failed"
@@ -154,6 +156,9 @@ class BenchmarkRunState:
         self.num_levels: int = 0
         self.tiers: list[str] = []
         self.process_mode: str = ""
+        self.startup_phase: str = ""
+        """A pre-level phase to display while the run has not produced any levels yet (worker stop, the
+        subprocess's import/hardware-probe window). Cleared once the first level starts."""
         self.gpu_name: str | None = None
         self.level_order: list[str] = []
         self.levels: dict[str, LevelState] = {}
@@ -167,13 +172,18 @@ class BenchmarkRunState:
 
     def apply(self, event: BenchmarkProgressEvent) -> None:
         """Fold one progress event into the accumulated state."""
-        if isinstance(event, RampStarted):
+        if isinstance(event, RampStarting):
+            self.run_id = event.run_id
+            self.process_mode = event.process_mode
+            self.startup_phase = event.phase
+        elif isinstance(event, RampStarted):
             self.run_id = event.run_id
             self.num_levels = event.num_levels
             self.tiers = list(event.tiers)
             self.process_mode = event.process_mode
             self.gpu_name = event.gpu_name
         elif isinstance(event, LevelStarted):
+            self.startup_phase = ""  # a level is running now; the pre-level phase no longer applies
             level = self._level(event.level_id)
             level.description = event.description
             level.stage = event.stage
@@ -257,8 +267,23 @@ class BenchmarkSupervisor:
 
     @property
     def is_active(self) -> bool:
-        """Whether a benchmark subprocess is currently running."""
-        return self._status is BenchmarkSupervisorStatus.RUNNING
+        """Whether a benchmark is being prepared or is currently running.
+
+        Includes the ``PREPARING`` window (the worker is being stopped to free the GPU, before the
+        subprocess launches) so the app rejects a second run request during that blocking hand-off.
+        """
+        return self._status in (BenchmarkSupervisorStatus.PREPARING, BenchmarkSupervisorStatus.RUNNING)
+
+    def mark_preparing(self) -> None:
+        """Enter the pre-launch ``PREPARING`` state so the tab shows motion while the worker is stopped.
+
+        The app stops the worker (a blocking call that can take up to ~100s) before launching the
+        benchmark subprocess; without a visible state for that window the stop reads as a hang. Call this
+        on the UI thread before kicking off the stop-then-launch flow.
+        """
+        self._status = BenchmarkSupervisorStatus.PREPARING
+        self.run_state = BenchmarkRunState()
+        self.run_state.startup_phase = "Stopping the worker to free the GPU for the benchmark…"
 
     def start(self, options: BenchmarkOptions) -> None:
         """Launch a benchmark ramp subprocess into a fresh timestamped output directory."""
@@ -266,6 +291,7 @@ class BenchmarkSupervisor:
         out_dir.mkdir(parents=True, exist_ok=True)
         self._out_dir = out_dir
         self.run_state = BenchmarkRunState()
+        self.run_state.startup_phase = "Launching benchmark subprocess…"
         self.report = None
 
         # Redirect the benchmark's console output to a file: it would otherwise corrupt the Textual terminal.

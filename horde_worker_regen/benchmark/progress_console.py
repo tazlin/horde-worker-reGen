@@ -14,6 +14,7 @@ from horde_worker_regen.benchmark.progress_channel import (
     ProgressSink,
     RampFinished,
     RampStarted,
+    RampStarting,
 )
 
 
@@ -23,6 +24,9 @@ def format_progress_event(event: BenchmarkProgressEvent, *, verbose: bool = Fals
     With ``verbose`` set, level-progress lines also carry the compact per-process state summary, for
     operators who want to watch the worker's cold start phase-by-phase.
     """
+    if isinstance(event, RampStarting):
+        phase = f" - {event.phase}" if event.phase else ""
+        return f"> Ramp {event.run_id} starting (mode={event.process_mode}){phase} ..."
     if isinstance(event, RampStarted):
         tiers = ", ".join(event.tiers) or "-"
         gpu = event.gpu_name or "unknown GPU"

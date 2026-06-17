@@ -158,13 +158,16 @@ class BenchmarkView(VerticalScroll):
     def _update_buttons(self, status: BenchmarkSupervisorStatus, run_state: BenchmarkRunState) -> None:
         """Enable only the actions valid for the current status."""
         running = status is BenchmarkSupervisorStatus.RUNNING
+        # PREPARING (worker being stopped, before the subprocess launches) is busy too: block a second
+        # Run and the worker-restarting Restore, but there is no subprocess yet to Cancel.
+        active = status in (BenchmarkSupervisorStatus.PREPARING, BenchmarkSupervisorStatus.RUNNING)
         has_suggestion = bool(run_state.suggested_bridge_data_yaml)
-        self.query_one("#benchmark-run", Button).disabled = running
+        self.query_one("#benchmark-run", Button).disabled = active
         self.query_one("#benchmark-cancel", Button).disabled = not running
         self.query_one("#benchmark-apply", Button).disabled = not (
             status is BenchmarkSupervisorStatus.FINISHED and has_suggestion
         )
-        self.query_one("#benchmark-restore", Button).disabled = running or not self._has_known_good
+        self.query_one("#benchmark-restore", Button).disabled = active or not self._has_known_good
 
     def _build_app_state_summary(self) -> Text:
         """Render the persisted last-benchmark status (and any known-good config) as a short summary."""
@@ -205,6 +208,11 @@ class BenchmarkView(VerticalScroll):
         if status is BenchmarkSupervisorStatus.IDLE and not run_state.level_order:
             return self._render_idle_hint()
 
+        # Before any level exists (worker stop, then the subprocess's import + hardware-probe window),
+        # show the startup phase so the slow hand-off reads as motion rather than a frozen blank tab.
+        if not run_state.level_order and run_state.startup_phase:
+            return self._render_starting(run_state, status)
+
         sections: list[RenderableType] = [self._render_headline(run_state, status)]
         current = run_state.current_level_id
         if current is not None and current in run_state.levels:
@@ -231,12 +239,31 @@ class BenchmarkView(VerticalScroll):
         return Panel(body, title="Benchmark", title_align="left", border_style="cyan")
 
     @staticmethod
+    def _render_starting(run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus) -> Panel:
+        """The pre-level startup card: shows the current phase during the worker-stop and import window."""
+        run_id = run_state.run_id or "-"
+        body = Text.assemble(
+            (f" {status.value.upper()} ", "black on yellow"),
+            "  ",
+            (run_id, "bold"),
+            "\n\n",
+            (run_state.startup_phase or "Starting…", "yellow"),
+            "\n\n",
+            ("This can take a minute on a cold start (importing the inference stack and probing the GPU). ", "grey70"),
+            ("Live detail is written to the run's ", "grey70"),
+            ("console.log", "grey85"),
+            (".", "grey70"),
+        )
+        return Panel(body, title="Benchmark starting", title_align="left", border_style="yellow")
+
+    @staticmethod
     def _render_headline(run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus) -> Panel:
         """A one-line summary of the run's identity, mode, and overall progress."""
         finished_levels = sum(1 for level in run_state.levels.values() if level.outcome is not None)
         total = run_state.num_levels or run_state.levels_total or len(run_state.level_order)
         gpu = run_state.gpu_name or "unknown GPU"
         status_colour = {
+            BenchmarkSupervisorStatus.PREPARING: "yellow",
             BenchmarkSupervisorStatus.RUNNING: "yellow",
             BenchmarkSupervisorStatus.FINISHED: "green",
             BenchmarkSupervisorStatus.FAILED: "red",

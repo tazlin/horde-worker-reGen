@@ -443,6 +443,15 @@ class HordeWorkerTUI(App[None]):
             self.notify("A benchmark is already running.", severity="warning")
             return
         self._pending_benchmark_options = message.options
+        # Show the PREPARING state immediately: the stop below blocks for up to ~100s, and without a
+        # visible phase on the Benchmark tab that wait is indistinguishable from a hang.
+        self._benchmark_supervisor.mark_preparing()
+        with contextlib.suppress(NoMatches):
+            self.query_one(BenchmarkView).update_view(
+                self._benchmark_supervisor.run_state,
+                self._benchmark_supervisor.status,
+            )
+            self.query_one("#main-tabs", TabbedContent).active = "tab-benchmark"
         self.notify("Stopping worker to free the GPU for the benchmark…")
         self.run_worker(self._start_benchmark_flow, thread=True, exclusive=True, group="lifecycle")
 

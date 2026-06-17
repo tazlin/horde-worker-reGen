@@ -33,6 +33,7 @@ BENCHMARK_PROGRESS_PROTOCOL_VERSION = 1
 class ProgressEventKind(enum.StrEnum):
     """Discriminates the kind of a benchmark progress event."""
 
+    RAMP_STARTING = "ramp_starting"
     RAMP_STARTED = "ramp_started"
     LEVEL_STARTED = "level_started"
     LEVEL_PROGRESS = "level_progress"
@@ -45,6 +46,23 @@ class BenchmarkProgressEvent(BaseModel):
 
     protocol_version: int = BENCHMARK_PROGRESS_PROTOCOL_VERSION
     timestamp: float = Field(default_factory=time.time)
+
+
+class RampStarting(BenchmarkProgressEvent):
+    """Emitted immediately when a ramp process begins, before the slow import + hardware-probe phase.
+
+    ``RampStarted`` cannot be emitted until the machine has been detected and the ladder built, which
+    requires importing torch/hordelib (tens of seconds cold) and probing the GPU. That whole window is
+    otherwise dark: the progress file does not exist yet and the redirected console is buffered. This
+    early heartbeat creates the progress file and gives the TUI a visible startup phase to render so a
+    slow or wedged startup reads as motion rather than a hang.
+    """
+
+    kind: Literal[ProgressEventKind.RAMP_STARTING] = ProgressEventKind.RAMP_STARTING
+    run_id: str = ""
+    process_mode: str = "real"
+    phase: str = ""
+    """A human-readable description of what the starting process is doing (e.g. "detecting hardware")."""
 
 
 class RampStarted(BenchmarkProgressEvent):
@@ -123,12 +141,13 @@ class RampFinished(BenchmarkProgressEvent):
 
 
 AnyProgressEvent = Annotated[
-    RampStarted | LevelStarted | LevelProgress | LevelFinished | RampFinished,
+    RampStarting | RampStarted | LevelStarted | LevelProgress | LevelFinished | RampFinished,
     Field(discriminator="kind"),
 ]
 """The union of all concrete progress events, discriminated by ``kind``."""
 
 _EVENT_MODEL_BY_KIND: dict[str, type[BenchmarkProgressEvent]] = {
+    ProgressEventKind.RAMP_STARTING: RampStarting,
     ProgressEventKind.RAMP_STARTED: RampStarted,
     ProgressEventKind.LEVEL_STARTED: LevelStarted,
     ProgressEventKind.LEVEL_PROGRESS: LevelProgress,
@@ -320,6 +339,7 @@ __all__ = [
     "ProgressTailer",
     "RampFinished",
     "RampStarted",
+    "RampStarting",
     "parse_progress_event",
     "read_progress_events",
 ]

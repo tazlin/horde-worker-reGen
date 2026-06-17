@@ -95,21 +95,45 @@ def _parse_tiers(raw_tiers: str) -> list[BenchTier] | None:
 
 
 def _run_ramp(args: argparse.Namespace) -> int:
-    from horde_worker_regen.benchmark.controller import BenchmarkController, detect_machine_info
-    from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
-    from horde_worker_regen.benchmark.worker_env import ensure_worker_env
+    from horde_worker_regen.benchmark.progress_channel import (
+        PROGRESS_FILENAME,
+        JsonlProgressSink,
+        MultiProgressSink,
+        RampStarting,
+    )
+    from horde_worker_regen.benchmark.progress_console import ConsoleProgressSink
 
     tiers = _parse_tiers(args.tiers)
     if tiers is None:
         return 2
+
+    out_dir: Path = args.out if args.out is not None else Path("benchmark_results") / time.strftime("%Y%m%d-%H%M%S")
+
+    # Tee progress to a durable JSONL log (for the TUI / `monitor` to tail) and a live console view.
+    # The sink is created up front, before the slow hardware-detection and import phase below, so the
+    # first heartbeat creates progress.jsonl immediately and the TUI has something to render. Without it
+    # the entire startup window (torch/hordelib import + GPU probe) is dark on both the progress file and
+    # the buffered console, so a slow or wedged startup is indistinguishable from a hang.
+    progress_sink = MultiProgressSink(
+        [JsonlProgressSink(out_dir / PROGRESS_FILENAME), ConsoleProgressSink(verbose=args.verbose)],
+    )
+    progress_sink.emit(
+        RampStarting(
+            run_id=out_dir.name,
+            process_mode=args.process_mode,
+            phase="loading worker environment and detecting hardware",
+        ),
+    )
+
+    from horde_worker_regen.benchmark.controller import BenchmarkController, detect_machine_info
+    from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
+    from horde_worker_regen.benchmark.worker_env import ensure_worker_env
 
     # The harness never reads bridgeData.yaml, so set AIWORKER_CACHE_HOME (and friends) here, before
     # spawning level subprocesses, so the real inference children resolve the worker's actual model
     # directory instead of hordelib's empty ./models fallback. Children inherit this process's env.
     # Passing the tiers also opts into the beta reference when a beta tier (qwen) is requested.
     ensure_worker_env(args.process_mode, tiers)
-
-    out_dir: Path = args.out if args.out is not None else Path("benchmark_results") / time.strftime("%Y%m%d-%H%M%S")
 
     # Detect the machine once: the ladder uses the VRAM to size the post-processing sweep, and the
     # controller reuses the same info instead of re-detecting.
@@ -127,14 +151,6 @@ def _run_ramp(args: argparse.Namespace) -> int:
     )
     ladder = build_default_ladder(options)
     logger.info(f"Ramp ladder has {len(ladder)} level(s); output in {out_dir}")
-
-    from horde_worker_regen.benchmark.progress_channel import PROGRESS_FILENAME, JsonlProgressSink, MultiProgressSink
-    from horde_worker_regen.benchmark.progress_console import ConsoleProgressSink
-
-    # Tee progress to a durable JSONL log (for the TUI / `monitor` to tail) and a live console view.
-    progress_sink = MultiProgressSink(
-        [JsonlProgressSink(out_dir / PROGRESS_FILENAME), ConsoleProgressSink(verbose=args.verbose)],
-    )
 
     controller = BenchmarkController(
         ladder,

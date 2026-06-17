@@ -15,6 +15,7 @@ from horde_worker_regen.benchmark.progress_channel import (
     LevelStarted,
     RampFinished,
     RampStarted,
+    RampStarting,
 )
 from horde_worker_regen.tui.benchmark_launcher import (
     BenchmarkOptions,
@@ -77,6 +78,34 @@ def test_run_state_tracks_current_level() -> None:
     assert state.levels["A"].jobs_completed == 1
     state.apply(LevelFinished(level_id="A", outcome="passed"))
     assert state.current_level_id is None
+
+
+def test_run_state_shows_startup_phase_until_first_level() -> None:
+    """A RampStarting heartbeat sets a pre-level phase that the first LevelStarted clears."""
+    state = BenchmarkRunState()
+    state.apply(RampStarting(run_id="run1", process_mode="real", phase="detecting hardware"))
+    assert state.run_id == "run1"
+    assert state.process_mode == "real"
+    assert state.startup_phase == "detecting hardware"
+    assert not state.level_order  # nothing to render as a level yet
+
+    state.apply(RampStarted(run_id="run1", num_levels=1))
+    assert state.startup_phase == "detecting hardware"  # still pre-level; warm worker may be coming up
+
+    state.apply(LevelStarted(level_id="A", num_levels=1))
+    assert state.startup_phase == ""  # a level is running now
+
+
+def test_mark_preparing_sets_visible_phase() -> None:
+    """mark_preparing enters a busy, non-running state with a worker-stop phase to render."""
+    supervisor = BenchmarkSupervisor()
+    assert supervisor.status is BenchmarkSupervisorStatus.IDLE
+    assert supervisor.is_active is False
+
+    supervisor.mark_preparing()
+    assert supervisor.status is BenchmarkSupervisorStatus.PREPARING
+    assert supervisor.is_active is True  # blocks a second run request during the blocking worker stop
+    assert "GPU" in supervisor.run_state.startup_phase
 
 
 def test_build_command_includes_selected_flags() -> None:
