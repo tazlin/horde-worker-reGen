@@ -189,9 +189,6 @@ path = "horde_worker_regen/__init__.py"
 [tool.hatch.build.targets.wheel]
 packages = ["horde_worker_regen"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"horde_worker_regen/assets" = "horde_worker_regen/assets"
-
 [tool.ruff]
 line-length = 119 # ruff format is canonical formatter
 lint.select = [
