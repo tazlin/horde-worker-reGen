@@ -72,4 +72,12 @@ fi
 
 # --no-project + PEP 723 inline metadata means uv ignores the project and runs bootstrap.py in a tiny
 # stdlib-only environment, so it works before .venv exists. --python 3.12 pins a managed CPython.
-exec "$SCRIPT_DIR/bin/uv" run --python 3.12 --no-project --script "$SCRIPT_DIR/bootstrap.py" "$@"
+#
+# --cache-dir gives THIS parent `uv run` its own tiny cache, deliberately NOT the worker UV_CACHE_DIR the
+# children use. `uv run --script` holds a shared (read) flock on its cache's .lock for the whole script
+# lifetime, while the post-sync `uv cache prune` child wants an exclusive (write) flock on the same file.
+# Pointing them at the same cache deadlocks prune until it times out (a ~5 min apparent hang). UV_CACHE_DIR
+# is still exported, so the sync/prune children below inherit the worker cache; only this parent is moved.
+exec "$SCRIPT_DIR/bin/uv" run --python 3.12 --no-project \
+    --cache-dir "$HORDE_WORKER_DATA_DIR/bootstrap_cache" \
+    --script "$SCRIPT_DIR/bootstrap.py" "$@"

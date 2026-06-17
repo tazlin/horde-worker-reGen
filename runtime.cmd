@@ -34,7 +34,13 @@ if errorlevel 1 exit /b 1
 REM --no-project + PEP 723 inline metadata means uv ignores the project here and runs bootstrap.py in a
 REM tiny stdlib-only environment, so it works before .venv exists. --python 3.12 pins a managed CPython
 REM rather than grabbing an ambient (e.g. conda) interpreter.
-"%~dp0bin\uv.exe" run --python 3.12 --no-project --script "%~dp0bootstrap.py" %*
+REM
+REM --cache-dir gives THIS parent `uv run` its own tiny cache, deliberately NOT the worker UV_CACHE_DIR the
+REM children use. `uv run --script` holds a shared (read) lock on its cache's .lock for the whole script
+REM lifetime, while the post-sync `uv cache prune` child wants an exclusive (write) lock on the same file.
+REM Pointing them at the same cache deadlocks prune until it times out (a ~5 min apparent hang). UV_CACHE_DIR
+REM stays set, so the sync/prune children inherit the worker cache; only this parent is moved.
+"%~dp0bin\uv.exe" run --python 3.12 --no-project --cache-dir "%HORDE_WORKER_DATA_DIR%\bootstrap_cache" --script "%~dp0bootstrap.py" %*
 exit /b %errorlevel%
 
 REM ---------------------------------------------------------------------------

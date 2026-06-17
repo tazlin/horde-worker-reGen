@@ -218,7 +218,11 @@ max_models_to_download: 10 # Currently unused in reGen
 stats_output_frequency: 20
 
 # Location where models are stored.
-cache_home: "./models/"
+# Left commented by default: the scripted installers keep models in a peered data dir (a sibling of the
+# worker folder named <worker>-data, preserved across reinstalls), defaulting to <data>/models. Precedence
+# is: an AIWORKER_CACHE_HOME env var wins; else this cache_home; else the peered default. Uncomment and give
+# an absolute path to override the model location, or set HORDE_WORKER_DATA_DIR to move the whole data dir.
+# cache_home: "./models/"
 
 # Location of the temp directory, also used for the model cache.
 temp_dir: "./tmp" # Currently unused in reGen
