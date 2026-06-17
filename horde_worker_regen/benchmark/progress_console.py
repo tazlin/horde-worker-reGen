@@ -103,8 +103,21 @@ def _format_mb(value_mb: int | None) -> str:
     return f"{value_mb / 1024:.1f}G"
 
 
+def _format_disk(row: LevelPlanRow) -> str:
+    """Render the disk cell as ``free/needed`` GB when free space is known, else just ``needed``."""
+    needed = f"{row.min_disk_free_gb:.0f}G"
+    if row.free_disk_bytes is None:
+        return needed
+    return f"{row.free_disk_bytes / 1024**3:.0f}/{needed}"
+
+
 def format_plan_table(rows: list[LevelPlanRow]) -> str:
-    """Render the resource plan as an aligned text table (LEVEL / VRAM / DISK / NET / KEY / VERDICT)."""
+    """Render the resource plan as an aligned text table (LEVEL / VRAM / DISK / NET / KEY / VERDICT).
+
+    The DISK cell reads ``free/needed`` so a shortfall is visible at a glance, and a trailing line prompts
+    the ``download`` subcommand whenever any level still needs models, so a slow mid-run download does not
+    quietly skew the timing.
+    """
     header = ("LEVEL", "VRAM", "DISK", "NET", "KEY", "VERDICT")
     body: list[tuple[str, str, str, str, str, str]] = []
     for row in rows:
@@ -112,7 +125,7 @@ def format_plan_table(rows: list[LevelPlanRow]) -> str:
             (
                 row.level_id,
                 _format_mb(row.estimated_vram_mb),
-                f"{row.min_disk_free_gb:.0f}G",
+                _format_disk(row),
                 "yes" if row.requires_network else "-",
                 "civitai" if row.requires_civitai_key else "-",
                 "RUN" if row.will_run else f"SKIP ({row.verdict})",
@@ -128,6 +141,11 @@ def format_plan_table(rows: list[LevelPlanRow]) -> str:
 
     lines = ["Resource plan (verdicts reflect the detected machine):", _line(header)]
     lines.extend(_line(cells) for cells in body)
+    if any(row.num_models_missing for row in rows):
+        lines.append(
+            "Some levels need models that are not downloaded yet. Run `horde-benchmark download` first so "
+            "the timed run is not slowed (and skewed) by downloading mid-benchmark.",
+        )
     return "\n".join(lines)
 
 

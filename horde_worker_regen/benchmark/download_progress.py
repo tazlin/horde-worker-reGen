@@ -1,0 +1,90 @@
+"""Structured, line-delimited progress for the ``horde-benchmark download`` subcommand.
+
+The TUI runs ``download`` as a subprocess and streams its stdout to show live, per-model progress. That
+stdout is *not* pure JSON: the benchmark imports the inference stack and loguru/hordelib write banners and
+log lines onto the same stream. So each progress event is emitted on its own line, wrapped in unmistakable
+sentinels, and the reader scans line-by-line for the payload (mirroring the ``plan`` JSON convention in
+:mod:`horde_worker_regen.benchmark.progress_channel`).
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+_DL_BEGIN = "<<<HORDE_BENCHMARK_DL>>>"
+_DL_END = "<<<END_HORDE_BENCHMARK_DL>>>"
+
+
+class DownloadModelRow(BaseModel):
+    """One model in the download plan: its size, whether it is already present, and where it lives."""
+
+    name: str
+    size_bytes: int | None = None
+    on_disk: bool = False
+    target_path: str = ""
+
+
+class DownloadEvent(BaseModel):
+    """A single line of download progress, discriminated by :attr:`kind`.
+
+    One lean model (rather than a class per kind) keeps the line encoder/decoder trivial; unused fields
+    simply stay at their defaults for a given kind.
+    """
+
+    kind: Literal["planned", "model_started", "model_finished", "complete"]
+
+    # kind == "planned"
+    models: list[DownloadModelRow] = Field(default_factory=list)
+    present_bytes: int = 0
+    to_download_bytes: int = 0
+    free_disk_bytes: int | None = None
+    fits: bool = True
+    shortfall_bytes: int = 0
+
+    # kind in {"model_started", "model_finished"}
+    name: str = ""
+    index: int = 0
+    """1-based position of this model among those being downloaded."""
+    total: int = 0
+    """How many models are being downloaded in total."""
+    ok: bool = True
+    detail: str = ""
+
+    # kind == "complete"
+    downloaded: int = 0
+    failed: int = 0
+
+
+def encode_download_event(event: DownloadEvent) -> str:
+    """Serialise one event as a sentinel-wrapped line the reader can isolate from log noise."""
+    return f"{_DL_BEGIN}{event.model_dump_json()}{_DL_END}"
+
+
+def decode_download_events(raw_stdout: str) -> list[DownloadEvent]:
+    """Extract every sentinel-wrapped event from a (possibly noisy) chunk of subprocess stdout."""
+    events: list[DownloadEvent] = []
+    cursor = 0
+    while True:
+        start = raw_stdout.find(_DL_BEGIN, cursor)
+        if start == -1:
+            return events
+        end = raw_stdout.find(_DL_END, start + len(_DL_BEGIN))
+        if end == -1:
+            return events
+        payload = raw_stdout[start + len(_DL_BEGIN) : end]
+        cursor = end + len(_DL_END)
+        try:
+            events.append(DownloadEvent.model_validate(json.loads(payload)))
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+
+__all__ = [
+    "DownloadEvent",
+    "DownloadModelRow",
+    "decode_download_events",
+    "encode_download_event",
+]

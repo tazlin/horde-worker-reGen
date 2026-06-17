@@ -13,8 +13,9 @@ def test_plan_subcommand_emits_one_row_per_level(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`plan --json` exits 0 and prints one verdict row per ladder level without starting a worker."""
-    # Avoid the reference-manager network fetch; presence is irrelevant to the fake-mode verdict.
-    monkeypatch.setattr("horde_worker_regen.benchmark.controller.model_present_on_disk", lambda _name: True)
+    # Avoid the reference-manager network fetch: skip the sized disk plan and report every model present.
+    monkeypatch.setattr("horde_worker_regen.benchmark.requirements.models_disk_plan", lambda _names: None)
+    monkeypatch.setattr("horde_worker_regen.benchmark.requirements.model_present_on_disk", lambda _name: True)
 
     rc = main(
         [
@@ -43,7 +44,9 @@ def test_plan_subcommand_honours_exclude_axis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`--exclude-axis` drops just that axis's levels while leaving the rest of the stage intact."""
-    monkeypatch.setattr("horde_worker_regen.benchmark.controller.model_present_on_disk", lambda _name: True)
+    # Avoid the reference-manager network fetch: skip the sized disk plan and report every model present.
+    monkeypatch.setattr("horde_worker_regen.benchmark.requirements.models_disk_plan", lambda _names: None)
+    monkeypatch.setattr("horde_worker_regen.benchmark.requirements.model_present_on_disk", lambda _name: True)
 
     rc = main(["plan", "--tiers", "sd15", "--process-mode", "fake", "--exclude-axis", "controlnet", "--json"])
     assert rc == 0

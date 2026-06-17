@@ -2,7 +2,10 @@
 
 Subcommands:
 - ``ramp``: run the ramp ladder via the canned-job harness (reproducible, no API).
+- ``plan``: preview each level's resource needs and run/skip verdict (no worker is started).
+- ``download``: fetch the checkpoints the selected tiers need, ahead of a timed ramp.
 - ``report``: re-render the markdown report from an existing output directory.
+- ``monitor``: tail a run's progress.jsonl live (attach or replay).
 - ``live``: open-loop load generation against a live AI-Horde API (separate phase).
 """
 
@@ -19,8 +22,12 @@ from loguru import logger
 from horde_worker_regen.benchmark.enums import SELECTABLE_AXES, BenchAxis, BenchTier
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from horde_worker_regen.benchmark.download_progress import DownloadEvent
     from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel
     from horde_worker_regen.benchmark.report import BenchmarkReport, MachineInfo
+    from horde_worker_regen.model_download_plan import DownloadPlan
 
 
 def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -127,6 +134,34 @@ def _add_plan_parser(subparsers: argparse._SubParsersAction) -> None:
     plan.add_argument("--json", action="store_true", help="Emit the plan rows as JSON instead of a table.")
 
 
+def _add_download_parser(subparsers: argparse._SubParsersAction) -> None:
+    download = subparsers.add_parser(
+        "download",
+        help="Download the model checkpoints the selected tiers need, so the timed ramp is not slowed by "
+        "downloading mid-run. Shows which models are needed, their size, and where they will be stored.",
+    )
+    download.add_argument(
+        "--tiers",
+        default="sd15,sdxl",
+        help="Comma-separated model tiers whose checkpoints to download (sd15, sdxl, flux, qwen).",
+    )
+    # The download path always sets up the real worker env (so AIWORKER_CACHE_HOME resolves) and only ever
+    # runs in real mode; kept as a fixed attribute so the shared _prepare_ladder helper has what it needs.
+    download.set_defaults(process_mode="real")
+    _add_stage_selection_args(download)
+    download.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the download plan (which models, their size, where they go) without downloading anything.",
+    )
+    download.add_argument(
+        "--json-progress",
+        action="store_true",
+        help="Emit structured, line-delimited progress events for a parent process (used by the TUI).",
+    )
+    download.add_argument("--directml", type=int, default=None, help="DirectML device index (for Windows AMD GPUs).")
+
+
 def _parse_tiers(raw_tiers: str) -> list[BenchTier] | None:
     """Parse the comma-separated ``--tiers`` value into tiers, or None on an unknown tier (logged)."""
     tiers: list[BenchTier] = []
@@ -207,6 +242,168 @@ def _run_plan(args: argparse.Namespace) -> int:
         print(encode_plan_rows(rows))  # noqa: T201
     else:
         print(format_plan_table(rows))  # noqa: T201
+    return 0
+
+
+def _format_download_plan(tiers: list[BenchTier], model_names: list[str], plan: DownloadPlan | None) -> str:
+    """Render the download plan as plain text: which models, their size, present-or-not, and where they go."""
+    tier_label = ", ".join(tier.value for tier in tiers)
+    lines = [f"Models needed for tiers {tier_label}: {len(model_names)}"]
+    if plan is None:
+        lines.append("  (could not size the on-disk picture; every model will be checked when downloading)")
+        lines.extend(f"  [unknown ] {name}" for name in model_names)
+        return "\n".join(lines)
+
+    for info in plan.models:
+        tag = "on disk " if info.on_disk else "download"
+        size = f"{info.size_bytes / 1024**3:.1f} GB" if info.size_bytes else "size unknown"
+        path = info.target_path or "(path undetermined)"
+        lines.append(f"  [{tag}] {info.name} ({size})  ->  {path}")
+
+    free = "unknown" if plan.free_disk_bytes is None else f"{plan.free_disk_bytes / 1024**3:.1f} GB free"
+    lines.append(
+        f"Already present: {plan.present_bytes / 1024**3:.1f} GB"
+        f"  ·  To download: {plan.to_download_bytes / 1024**3:.1f} GB"
+        f"  ·  Volume: {free}",
+    )
+    if not plan.fits:
+        lines.append(f"  WARNING: not enough free space — about {plan.shortfall_bytes / 1024**3:.1f} GB short.")
+    return "\n".join(lines)
+
+
+def _download_compvis_models(
+    model_names: list[str],
+    *,
+    emit: Callable[[DownloadEvent], None],
+    json_progress: bool,
+    directml: int | None,
+) -> int:
+    """Download each named checkpoint via the shared compvis manager; return how many failed.
+
+    Mirrors the validated download loop in :func:`horde_worker_regen.download_models.download_all_models`
+    (download, then re-download once if the on-disk SHA does not match the record), scoped to an explicit
+    list instead of the worker config.
+    """
+    import hordelib
+
+    from horde_worker_regen.benchmark.download_progress import DownloadEvent
+
+    extra_comfyui_args = [f"--directml={directml}"] if directml is not None else []
+    hordelib.initialise(extra_comfyui_args=extra_comfyui_args)
+
+    from hordelib.api import SharedModelManager
+
+    SharedModelManager.load_model_managers()
+    compvis = SharedModelManager.manager.compvis
+    if compvis is None:
+        logger.error("Failed to load the compvis (Stable Diffusion) model manager; cannot download.")
+        return len(model_names)
+
+    failed = 0
+    total = len(model_names)
+    for index, name in enumerate(model_names, start=1):
+        emit(DownloadEvent(kind="model_started", name=name, index=index, total=total))
+        if not json_progress:
+            logger.info(f"[{index}/{total}] Downloading {name} ...")
+        ok = bool(compvis.download_model(name))
+        if ok and not compvis.validate_model(name):
+            ok = bool(compvis.download_model(name))  # the record changed or the file is corrupt: fetch again
+        if not ok:
+            failed += 1
+            logger.error(f"[{index}/{total}] Failed to download {name}.")
+        elif not json_progress:
+            logger.success(f"[{index}/{total}] {name}: done.")
+        emit(DownloadEvent(kind="model_finished", name=name, index=index, total=total, ok=ok))
+    return failed
+
+
+def _run_download(args: argparse.Namespace) -> int:
+    """Download the checkpoints the selected tiers need, after showing exactly what will be fetched and where."""
+    from horde_worker_regen.benchmark.download_progress import (
+        DownloadEvent,
+        DownloadModelRow,
+        encode_download_event,
+    )
+    from horde_worker_regen.benchmark.requirements import models_disk_plan
+
+    tiers = _parse_tiers(args.tiers)
+    if tiers is None:
+        return 2
+
+    logger.info("Resolving the models the selected tiers need (detecting hardware; no worker is started) ...")
+    ladder, _machine, _options = _prepare_ladder(args, tiers)
+    model_names = sorted({name for level in ladder for name in level.scenario.models_referenced()})
+    if not model_names:
+        logger.warning("The selected tiers reference no image checkpoints; nothing to download.")
+        return 0
+
+    plan = models_disk_plan(model_names)
+    json_progress: bool = args.json_progress
+
+    def emit(event: DownloadEvent) -> None:
+        if json_progress:
+            # Sentinel-wrapped so the TUI can isolate each event from interleaved log lines on this stdout.
+            print(encode_download_event(event))  # noqa: T201
+
+    if plan is not None:
+        rows = [
+            DownloadModelRow(
+                name=info.name,
+                size_bytes=info.size_bytes,
+                on_disk=info.on_disk,
+                target_path=info.target_path,
+            )
+            for info in plan.models
+        ]
+        emit(
+            DownloadEvent(
+                kind="planned",
+                models=rows,
+                present_bytes=plan.present_bytes,
+                to_download_bytes=plan.to_download_bytes,
+                free_disk_bytes=plan.free_disk_bytes,
+                fits=plan.fits,
+                shortfall_bytes=plan.shortfall_bytes,
+            ),
+        )
+        missing = [info.name for info in plan.models if not info.on_disk]
+    else:
+        emit(DownloadEvent(kind="planned", models=[DownloadModelRow(name=name) for name in model_names]))
+        missing = model_names
+
+    if not json_progress:
+        print(_format_download_plan(tiers, model_names, plan))  # noqa: T201
+
+    if not missing:
+        logger.success("All required models are already on disk; nothing to download.")
+        emit(DownloadEvent(kind="complete", downloaded=0, failed=0))
+        return 0
+
+    if args.dry_run:
+        if not json_progress:
+            print(f"\nDry run: {len(missing)} model(s) would be downloaded. Re-run without --dry-run to fetch.")  # noqa: T201
+        emit(DownloadEvent(kind="complete", downloaded=0, failed=0))
+        return 0
+
+    if plan is not None and not plan.fits:
+        logger.error(
+            f"Not enough free disk to download: about {plan.shortfall_bytes / 1024**3:.1f} GB short. "
+            "Free up space or select fewer tiers.",
+        )
+        emit(DownloadEvent(kind="complete", downloaded=0, failed=len(missing), detail="insufficient disk"))
+        return 1
+
+    failed = _download_compvis_models(
+        missing,
+        emit=emit,
+        json_progress=json_progress,
+        directml=args.directml,
+    )
+    emit(DownloadEvent(kind="complete", downloaded=len(missing) - failed, failed=failed))
+    if failed:
+        logger.error(f"{failed} of {len(missing)} model(s) failed to download.")
+        return 1
+    logger.success(f"Downloaded {len(missing)} model(s); the benchmark can now run them without a mid-run fetch.")
     return 0
 
 
@@ -353,6 +550,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _add_ramp_parser(subparsers)
     _add_plan_parser(subparsers)
+    _add_download_parser(subparsers)
 
     report = subparsers.add_parser("report", help="Re-render the markdown report from an output directory.")
     report.add_argument("out_dir", type=Path)
@@ -374,6 +572,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_ramp(args)
     if args.command == "plan":
         return _run_plan(args)
+    if args.command == "download":
+        return _run_download(args)
     if args.command == "report":
         return _run_report(args)
     if args.command == "monitor":

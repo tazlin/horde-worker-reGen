@@ -96,6 +96,12 @@ class LevelPlanRow(BaseModel):
     tier: str = ""
     estimated_vram_mb: int | None = None
     min_disk_free_gb: float = 0.0
+    free_disk_bytes: int | None = None
+    """Free space on the model volume when known, so a surface can show ``free / needed`` without re-probing."""
+    download_bytes_needed: int = 0
+    """Declared bytes the level's absent models would download (0 when nothing is missing or sizes are unknown)."""
+    num_models_missing: int = 0
+    """How many of the level's models are not yet on disk (drives the "download first" prompt)."""
     requires_network: bool = False
     requires_civitai_key: bool = False
     features: list[str] = Field(default_factory=list)

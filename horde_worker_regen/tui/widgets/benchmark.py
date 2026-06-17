@@ -207,6 +207,7 @@ class BenchmarkView(VerticalScroll):
         """
         with Horizontal(id="benchmark-actions"):
             yield Button("Preview plan", id="benchmark-preview", variant="primary")
+            yield Button("Download models", id="benchmark-download", variant="default")
             yield Button("Run benchmark", id="benchmark-run", variant="success")
             yield Button("History", id="benchmark-history", variant="default")
             yield Button("Cancel", id="benchmark-cancel", variant="warning")
@@ -316,12 +317,19 @@ class BenchmarkView(VerticalScroll):
             ("Preview plan", "bold"),
             (" - see what each level needs and what will run on this machine. No GPU, no risk.\n", "grey70"),
             ("2. ", "bold cyan"),
+            ("Download models", "bold"),
+            (
+                " - fetch any checkpoints the plan says you are missing, so the timed run is not slowed by "
+                "downloading mid-benchmark. Skip this if the plan shows nothing to download.\n",
+                "grey70",
+            ),
+            ("3. ", "bold cyan"),
             ("Run benchmark", "bold"),
             (
                 " - measures the worker (this stops the worker; it needs the GPU) and suggests a tuned config.\n",
                 "grey70",
             ),
-            ("3. ", "bold cyan"),
+            ("4. ", "bold cyan"),
             ("Apply suggested config", "bold"),
             (" - write the recommendation into bridgeData.yaml.\n\n", "grey70"),
             ("Open ", "grey70"),
@@ -358,6 +366,8 @@ class BenchmarkView(VerticalScroll):
             self.post_message(self.RunRequested(self._collect_options()))
         elif event.button.id == "benchmark-preview":
             self._start_plan_preview()
+        elif event.button.id == "benchmark-download":
+            self._open_download()
         elif event.button.id == "benchmark-history":
             self._open_history()
         elif event.button.id == "benchmark-cancel":
@@ -405,6 +415,21 @@ class BenchmarkView(VerticalScroll):
         from horde_worker_regen.tui.widgets.benchmark_history import BenchmarkHistoryModal
 
         self.app.push_screen(BenchmarkHistoryModal())
+
+    def _open_download(self) -> None:
+        """Open the Download models modal for the current tier/option selection.
+
+        When the modal reports it downloaded something, re-run the plan preview so the operator sees the
+        levels flip from "to download" to RUN: visible proof the problem is solved. Imported lazily to keep
+        the modal's subprocess plumbing off the TUI's hot path.
+        """
+        from horde_worker_regen.tui.widgets.benchmark_download import BenchmarkDownloadModal
+
+        def _after(downloaded_any: bool | None) -> None:
+            if downloaded_any:
+                self._start_plan_preview()
+
+        self.app.push_screen(BenchmarkDownloadModal(self._collect_options()), _after)
 
     def _start_plan_preview(self) -> None:
         """Shell ``horde-benchmark plan --json`` in a worker thread and render the result.
@@ -468,13 +493,25 @@ class BenchmarkView(VerticalScroll):
         )
 
     @staticmethod
+    def _plan_disk_cell(row: LevelPlanRow) -> str:
+        """Render the disk cell as ``free / needed`` GB when free space is known, else just ``needed``."""
+        needed = f"{row.min_disk_free_gb:.0f}G"
+        if row.free_disk_bytes is None:
+            return needed
+        return f"{row.free_disk_bytes / 1024**3:.0f} / {needed}"
+
+    @staticmethod
     def _plan_panel(rows: list[LevelPlanRow]) -> Panel:
-        """Render the per-level resource plan and predicted run/skip verdicts as a table."""
+        """Render the per-level resource plan and predicted run/skip verdicts as a table.
+
+        When any level still needs models, a plain-language banner sits above the table pointing at the
+        Download models button, so a novice sees the one concrete next step rather than a wall of verdicts.
+        """
         table = Table(expand=True)
         table.add_column("Level")
         table.add_column("Stage/Tier")
         table.add_column("VRAM", justify="right")
-        table.add_column("Disk", justify="right")
+        table.add_column("Disk (free/need)", justify="right")
         table.add_column("Net")
         table.add_column("Key")
         table.add_column("Verdict")
@@ -485,12 +522,22 @@ class BenchmarkView(VerticalScroll):
                 row.level_id,
                 f"{row.stage}/{row.tier}",
                 vram,
-                f"{row.min_disk_free_gb:.0f}G",
+                BenchmarkView._plan_disk_cell(row),
                 "yes" if row.requires_network else "-",
                 "civitai" if row.requires_civitai_key else "-",
                 verdict,
             )
-        return Panel(table, title="Resource plan", title_align="left", border_style="grey37")
+
+        body: RenderableType = table
+        if any(row.num_models_missing for row in rows):
+            banner = Text(
+                "Some of these levels need models you have not downloaded yet. Press “Download models” "
+                "below to fetch them first: otherwise the benchmark will download them mid-run, which makes the "
+                "timing slower and less accurate.",
+                style="yellow",
+            )
+            body = Group(banner, Text(""), table)
+        return Panel(body, title="Resource plan", title_align="left", border_style="grey37")
 
     def _update_buttons(self, status: BenchmarkSupervisorStatus, run_state: BenchmarkRunState) -> None:
         """Enable only the actions valid for the current status."""
@@ -501,6 +548,8 @@ class BenchmarkView(VerticalScroll):
         has_suggestion = bool(run_state.suggested_bridge_data_yaml)
         self.query_one("#benchmark-run", Button).disabled = active
         self.query_one("#benchmark-preview", Button).disabled = active
+        # Downloading contends with the GPU-exclusive run and stops a level mid-flight, so gate it while busy.
+        self.query_one("#benchmark-download", Button).disabled = active
         # History only reads completed runs from disk, so it is safe (and useful) at any time.
         self.query_one("#benchmark-history", Button).disabled = False
         self.query_one("#benchmark-cancel", Button).disabled = not running

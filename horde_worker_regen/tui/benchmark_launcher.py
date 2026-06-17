@@ -145,6 +145,39 @@ class BenchmarkOptions:
             "--json",
         ]
 
+    def build_download_command(self, *, dry_run: bool = False) -> list[str]:
+        """Return the ``horde-benchmark download`` argv that fetches this configuration's models.
+
+        The download path is always real-mode and never forced (it only fetches the checkpoints the selected
+        tiers and stages reference), so it does not share ``_stage_selection_args`` (which carries
+        ``--process-mode``/``--force``). ``dry_run`` previews the plan without downloading.
+        """
+        command = [
+            sys.executable,
+            # Unbuffered so the parent (the Download models modal) sees each progress line live rather than
+            # in one block-buffered burst when the child exits.
+            "-u",
+            "-m",
+            "horde_worker_regen.benchmark.cli",
+            "download",
+            "--tiers",
+            ",".join(self.tiers),
+            "--json-progress",
+        ]
+        if self.include_downloads:
+            command.append("--include-downloads")
+        if not self.include_concurrency:
+            command.append("--no-concurrency")
+        if not self.include_features:
+            command.append("--no-features")
+        if not self.include_alchemy:
+            command.append("--no-alchemy")
+        for axis in self.excluded_axes:
+            command.extend(["--exclude-axis", axis])
+        if dry_run:
+            command.append("--dry-run")
+        return command
+
 
 @dataclasses.dataclass
 class LevelState:

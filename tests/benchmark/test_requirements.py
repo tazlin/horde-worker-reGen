@@ -12,9 +12,11 @@ from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel, build_
 from horde_worker_regen.benchmark.report import MachineInfo
 from horde_worker_regen.benchmark.requirements import (
     LevelRequirements,
+    MissingModel,
     compute_level_requirements,
     requirement_skip_reason,
 )
+from horde_worker_regen.model_download_plan import DownloadPlan, ModelDiskInfo
 
 
 def _present(_name: str) -> bool | None:
@@ -175,6 +177,64 @@ def test_insufficient_disk_skips_unless_forced(tmp_path: Path, monkeypatch: pyte
         )
         is None
     )
+
+
+def test_insufficient_disk_message_names_delta_and_downloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The disk verdict states how much to free up and points at Download models for the missing weights."""
+    req = _req(
+        min_disk_free_gb=10.0,
+        estimated_vram_mb=2_000,
+        models_missing=["some-model"],
+        missing_models=[MissingModel(name="some-model", size_bytes=3 * 1024**3)],
+        download_bytes_needed=3 * 1024**3,
+    )
+    monkeypatch.setattr(
+        requirements_mod.shutil,
+        "disk_usage",
+        lambda _path: types.SimpleNamespace(total=0, used=0, free=1 * 1024**3),
+    )
+    skip = requirement_skip_reason(
+        req,
+        machine=MachineInfo(total_vram_mb=8_000),
+        process_mode="real",
+        cache_path=tmp_path,
+        civitai_available=True,
+    )
+    assert skip is not None
+    assert "insufficient disk" in skip
+    assert "free up ~9.0 GB" in skip  # needs 10 GB, only 1 GB free
+    assert "Download models" in skip
+    assert "1 model(s)" in skip
+
+
+def test_compute_requirements_uses_the_real_disk_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no injected resolver, the level's sized disk plan drives the missing models and download bytes."""
+    fake_plan = DownloadPlan(
+        models=[
+            ModelDiskInfo(name="present", category=None, size_bytes=2 * 1024**3, on_disk=True, target_path="/a"),
+            ModelDiskInfo(name="absent", category=None, size_bytes=5 * 1024**3, on_disk=False, target_path="/b"),
+        ],
+        present_bytes=2 * 1024**3,
+        to_download_bytes=5 * 1024**3,
+        total_bytes=7 * 1024**3,
+        free_disk_bytes=100 * 1024**3,
+        fits=True,
+        shortfall_bytes=0,
+        unknown_size_models=[],
+    )
+    monkeypatch.setattr(requirements_mod, "models_disk_plan", lambda _names: fake_plan)
+    baseline, _ = _sd15_baseline_and_download_levels()
+
+    req = compute_level_requirements(baseline)
+
+    assert req.models_missing == ["absent"]
+    assert req.download_bytes_needed == 5 * 1024**3
+    assert req.present_bytes == 2 * 1024**3
+    assert req.free_disk_bytes == 100 * 1024**3
+    assert [model.target_path for model in req.missing_models] == ["/b"]
 
 
 def test_absent_huge_checkpoint_is_a_hard_skip_even_when_forced(tmp_path: Path) -> None:

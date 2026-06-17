@@ -34,10 +34,21 @@ if TYPE_CHECKING:
 
     from horde_worker_regen.benchmark.enums import BenchTier
     from horde_worker_regen.benchmark.report import MachineInfo
+    from horde_worker_regen.model_download_plan import DownloadPlan
 
 _CIVITAI_TOKEN_ENV_VARS = ("CIVIT_API_TOKEN", "AIWORKER_CIVITAI_API_TOKEN")
 """Env vars that carry a CivitAI token. ``load_env_vars`` populates ``CIVIT_API_TOKEN`` from the
 config's ``civitai_api_token``; the Docker images use ``AIWORKER_CIVITAI_API_TOKEN``."""
+
+
+class MissingModel(BaseModel):
+    """A model a level needs that is not yet on disk, with the facts an operator needs to act on it."""
+
+    name: str
+    size_bytes: int | None = None
+    """Declared download size, or None when the record carries no size metadata."""
+    target_path: str = ""
+    """Where the model's primary file will be written when downloaded; empty when undeterminable."""
 
 
 class LevelRequirements(BaseModel):
@@ -56,6 +67,18 @@ class LevelRequirements(BaseModel):
     models_required: list[str] = Field(default_factory=list)
     models_missing: list[str] = Field(default_factory=list)
     """The subset of ``models_required`` confirmed absent on disk (indeterminate ones are omitted)."""
+    missing_models: list[MissingModel] = Field(default_factory=list)
+    """The same absent models as :attr:`models_missing`, enriched with size and download target path.
+
+    Empty when the on-disk picture could not be sized (e.g. the cheap ``present_resolver`` path), even if
+    ``models_missing`` is non-empty; consumers should treat sizes as unknown then.
+    """
+    download_bytes_needed: int = 0
+    """Total declared bytes the absent models would download (0 when sizes are unknown or nothing is missing)."""
+    present_bytes: int = 0
+    """Declared bytes already on disk for this level's models (0 when the picture could not be sized)."""
+    free_disk_bytes: int | None = None
+    """Free space on the model volume when known, so a surface can show ``free`` without re-probing."""
     requires_network: bool = False
     requires_civitai_key: bool = False
     """True when a job pulls loras/TIs, which are fetched from CivitAI and may need a token."""
@@ -85,6 +108,27 @@ def model_present_on_disk(model_name: str) -> bool | None:
         return is_model_present(model_name, records)
     except Exception as e:  # noqa: BLE001 - presence is best-effort; fail open
         logger.debug(f"Could not determine on-disk presence of {model_name!r}: {e}")
+        return None
+
+
+def models_disk_plan(model_names: list[str]) -> DownloadPlan | None:
+    """The on-disk/size/free-space picture for ``model_names``, or None when it cannot be determined.
+
+    Reuses the same planner the config model-picker uses (so the benchmark's disk story matches the rest of
+    the worker) over the parent-owned reference. Fails open (returns None) so callers fall back to a cheap,
+    presence-only path offline or in tests.
+    """
+    try:
+        from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
+
+        from horde_worker_regen.model_download_plan import compute_download_plan
+        from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
+
+        manager = ensure_model_reference_manager_initialized()
+        records = manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
+        return compute_download_plan(model_names, records)
+    except Exception as e:  # noqa: BLE001 - disk sizing is best-effort; fail open to the presence-only path
+        logger.debug(f"Could not compute a disk plan for {model_names!r}: {e}")
         return None
 
 
@@ -152,16 +196,39 @@ def compute_level_requirements(
 ) -> LevelRequirements:
     """Derive the read-only resource requirements of *level*.
 
+    By default this loads the real disk plan (presence, per-model size, download target, free space) via
+    :func:`models_disk_plan`, so every surface can name *which* model is missing, *how big* it is, and
+    *where* it will land. When a ``present_resolver`` is supplied the cheap presence-only path is used
+    instead (no reference load), keeping the ``plan`` preview's offline mode and the unit tests fast.
+
     Args:
         level: The ladder level to inspect (never mutated).
-        present_resolver: Returns whether a model's files are on disk (True/False/None=unknown);
-            defaults to :func:`model_present_on_disk`. Injectable so the ``plan`` subcommand and tests
-            can supply a cheap or fixed resolver instead of touching the reference manager.
+        present_resolver: When given, a presence-only resolver (True/False/None=unknown) used in place of
+            the sized disk plan. Injectable so tests and offline previews avoid touching the reference
+            manager; sizes are reported as unknown in that mode.
     """
-    resolver = present_resolver if present_resolver is not None else model_present_on_disk
     models_required = level.scenario.models_referenced()
-    models_missing = [name for name in models_required if resolver(name) is False]
     requires_civitai_key = any(job.lora_names or job.ti_names for job in level.scenario.image_jobs)
+
+    plan = models_disk_plan(models_required) if present_resolver is None else None
+    if plan is not None:
+        missing_models = [
+            MissingModel(name=info.name, size_bytes=info.size_bytes, target_path=info.target_path)
+            for info in plan.models
+            if not info.on_disk
+        ]
+        models_missing = [model.name for model in missing_models]
+        download_bytes_needed = plan.to_download_bytes
+        present_bytes = plan.present_bytes
+        free_disk_bytes = plan.free_disk_bytes
+    else:
+        resolver = present_resolver if present_resolver is not None else model_present_on_disk
+        models_missing = [name for name in models_required if resolver(name) is False]
+        missing_models = [MissingModel(name=name) for name in models_missing]
+        download_bytes_needed = 0
+        present_bytes = 0
+        free_disk_bytes = None
+
     return LevelRequirements(
         level_id=level.id,
         stage=str(level.stage),
@@ -173,6 +240,10 @@ def compute_level_requirements(
         estimated_download_bytes=_tier_download_bytes(level.tier),
         models_required=models_required,
         models_missing=models_missing,
+        missing_models=missing_models,
+        download_bytes_needed=download_bytes_needed,
+        present_bytes=present_bytes,
+        free_disk_bytes=free_disk_bytes,
         requires_network=level.requires_network,
         requires_civitai_key=requires_civitai_key,
         features=_level_features(level),
@@ -204,7 +275,18 @@ def requirement_skip_reason(
     if not force:
         free_disk = shutil.disk_usage(cache_path).free
         if free_disk < req.min_disk_free_gb * 1024**3:
-            return f"insufficient disk on {cache_path}: {free_disk / 1024**3:.1f} GB free"
+            shortfall_gb = (req.min_disk_free_gb * 1024**3 - free_disk) / 1024**3
+            download_note = ""
+            if req.download_bytes_needed > 0:
+                download_note = (
+                    f"; {len(req.models_missing)} model(s) ({req.download_bytes_needed / 1024**3:.1f} GB) "
+                    f"still to download via Download models"
+                )
+            return (
+                f"insufficient disk on {cache_path}: needs {req.min_disk_free_gb:.0f} GB free to run safely, "
+                f"only {free_disk / 1024**3:.1f} GB free "
+                f"(free up ~{shortfall_gb:.1f} GB, or choose a smaller tier){download_note}"
+            )
 
     # A genuinely-absent huge/beta checkpoint is a hard skip even under --force: real-mode benchmarking
     # never downloads checkpoints, so there is nothing to run.
@@ -212,9 +294,9 @@ def requirement_skip_reason(
         beta_hint = (
             " (a beta model: set HORDE_MODEL_REFERENCE_PRIMARY_API_URL and await publication)"
             if _tier_is_beta(req.tier)
-            else " (real-mode benchmarking does not download checkpoints)"
+            else " (real-mode benchmarking does not download checkpoints; use Download models first)"
         )
-        missing = ", ".join(repr(name) for name in req.models_missing)
+        missing = ", ".join(_missing_label(req, name) for name in req.models_missing)
         return f"{req.tier} model {missing} is not present on disk{beta_hint}"
 
     if (
@@ -234,6 +316,12 @@ def requirement_skip_reason(
     return None
 
 
+def _missing_label(req: LevelRequirements, name: str) -> str:
+    """Render a missing model as ``'name' (N.N GB)`` when its size is known, else just ``'name'``."""
+    size = next((model.size_bytes for model in req.missing_models if model.name == name), None)
+    return f"{name!r} ({size / 1024**3:.1f} GB)" if size else repr(name)
+
+
 def _tier_is_huge(tier: str) -> bool:
     """Whether the (stringified) tier is one of the huge-download tiers."""
     return any(tier == str(huge) for huge in HUGE_TIERS)
@@ -246,8 +334,10 @@ def _tier_is_beta(tier: str) -> bool:
 
 __all__ = [
     "LevelRequirements",
+    "MissingModel",
     "civitai_token_available",
     "compute_level_requirements",
     "model_present_on_disk",
+    "models_disk_plan",
     "requirement_skip_reason",
 ]

@@ -73,7 +73,6 @@ from horde_worker_regen.benchmark.requirements import (
     LevelRequirements,
     civitai_token_available,
     compute_level_requirements,
-    model_present_on_disk,
     requirement_skip_reason,
 )
 from horde_worker_regen.benchmark.soak import build_validation_level
@@ -126,6 +125,9 @@ def _plan_row(req: LevelRequirements, verdict: str | None) -> LevelPlanRow:
         tier=req.tier,
         estimated_vram_mb=req.estimated_vram_mb,
         min_disk_free_gb=req.min_disk_free_gb,
+        free_disk_bytes=req.free_disk_bytes,
+        download_bytes_needed=req.download_bytes_needed,
+        num_models_missing=len(req.models_missing),
         requires_network=req.requires_network,
         requires_civitai_key=req.requires_civitai_key,
         features=req.features,
@@ -538,7 +540,7 @@ class BenchmarkController:
         """
         rows: list[LevelPlanRow] = []
         for level in self._ladder:
-            req = compute_level_requirements(level, present_resolver=model_present_on_disk)
+            req = compute_level_requirements(level)
             if self._only_level is not None and level.id != self._only_level:
                 verdict: str | None = "not selected (--only-level)"
             else:
@@ -804,7 +806,7 @@ class BenchmarkController:
             if no_models_reason is not None:
                 return no_models_reason
 
-        req = compute_level_requirements(level, present_resolver=model_present_on_disk)
+        req = compute_level_requirements(level)
         return requirement_skip_reason(
             req,
             machine=machine,
