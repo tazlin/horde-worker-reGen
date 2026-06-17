@@ -238,7 +238,7 @@ def build_default_ladder(options: LadderOptions | None = None) -> list[RampLevel
                     False,
                 ),
             ]
-            if tier in ("sd15", "sdxl"):
+            if tier in ("sd15",):
                 feature_specs.append(
                     (
                         "controlnet",
