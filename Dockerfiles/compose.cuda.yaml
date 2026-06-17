@@ -1,12 +1,13 @@
 services:
   regen:
+    # To use the prebuilt image instead of building locally, comment out `build:` and uncomment:
+    # image: ghcr.io/haidra-org/horde-worker-regen:latest
     build:
-      context: ./
-      dockerfile: ./Dockerfile.cuda
+      # Build context is the repo root: the image bakes the source in (see Dockerfile.cuda).
+      context: ../
+      dockerfile: Dockerfiles/Dockerfile.cuda
       args:
         - CUDA_VERSION=12.8.1
-        - GIT_BRANCH=main
-        - GIT_OWNER=Haidra-Org
     container_name: reGen
     tty: true
     group_add:

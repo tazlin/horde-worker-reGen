@@ -1,140 +1,144 @@
-# How to Use horde-worker-reGen Dockerfiles (CUDA and ROCm)
+# horde-worker-reGen in Docker (CUDA and ROCm)
 
-This guide explains how to use the Dockerfiles for building the horde-worker-reGen application, supporting both NVIDIA (CUDA) and AMD (ROCm) GPUs.
+These images run the worker in a container for either NVIDIA (CUDA) or AMD (ROCm) GPUs.
+
+The images are **immutable**: the worker source and all of its dependencies are baked in at build
+time. A container does **not** clone the repo or reinstall dependencies on startup; it just runs the
+worker. To update, pull (or rebuild) a newer image and recreate the container.
 
 ## Prerequisites
 
 - Docker installed on your system
-- Git installed on your system
-- NVIDIA GPU with appropriate drivers (for CUDA version)
-- AMD GPU with appropriate drivers (for ROCm version)
+- NVIDIA GPU with current drivers + the NVIDIA Container Toolkit (for the CUDA image), or
+- AMD GPU with current ROCm-capable drivers (for the ROCm image)
 
-## Checkout only this directory
+## Option A: Use the prebuilt CUDA image (recommended)
+
+Prebuilt CUDA images are published to the GitHub Container Registry:
 
 ```bash
-git clone --sparse https://github.com/Haidra-Org/horde-worker-reGen.git
-cd horde-worker-reGen
-git sparse-checkout set --no-cone Dockerfiles /bridgeData_template.yaml
+docker pull ghcr.io/haidra-org/horde-worker-regen:latest   # newest main build
+# or a specific release, e.g.:
+# docker pull ghcr.io/haidra-org/horde-worker-regen:v12.7.4
 ```
 
-# Basic setup
-## Using docker compose
+Configure the worker entirely through `AIWORKER_*` environment variables (see
+[Configuration](#configuration)) and run it with the GPU passed through and a host directory mounted
+for the model cache:
 
-If your system is set up properly (see [Prerequisites](#prerequisites))
-you can just [setup](https://github.com/Haidra-Org/horde-worker-reGen?tab=readme-ov-file#configure) your bridgeData.yaml file and then run
 ```bash
-docker compose -f Dockerfiles/compose.[cuda|rocm].yaml build --pull
-docker compose -f Dockerfiles/compose.[cuda|rocm].yaml up -dV
+docker run -it --gpus all \
+  -e AIWORKER_API_KEY=your_api_key_here \
+  -e AIWORKER_DREAMER_NAME=your_worker_name_here \
+  -e AIWORKER_CACHE_HOME=/horde-worker-reGen/models \
+  -v "$(pwd)/models":/horde-worker-reGen/models \
+  ghcr.io/haidra-org/horde-worker-regen:latest
 ```
 
-> **Warning**: The compose files will automatically pull in your bridgeData.yaml as a mount inside the container. If you have any configuration options set to absolute or windows-style directories (**especially `cache_home`**), this will cause the worker inside the container to not work as expected. You can set `AIWORKER_BRIDGE_DATA_LOCATION` environment variable to set the location of the config file you would like to use if you need an alternative file and you can set `AIWORKER_CACHE_HOME` to set the location of your models folder on the host.
+> ROCm images are not currently published; build them locally (see
+> [Building locally](#option-c-build-locally)).
 
-Remember to replace placeholders (e.g. `[cuda|rocm]`) with appropriate values for your setup.
-If you want to monitor the containers progress downloading models and working through jobs: [start-or-monitor-running-container](#start-or-monitor-running-container).
-The compose file creates a `models` directory in your `horde-worker-reGen` to avoid having to download selected models again.
+## Option B: Use docker compose
 
-### Start or monitor running container
-To start a container or look at a running containers output.
-CTRL+C detaches the container, but leaves it running in the background:
+A compose file is provided for each GPU type. By default it builds the image locally; to use the
+prebuilt CUDA image instead, edit `compose.cuda.yaml` to comment out the `build:` block and uncomment
+the `image:` line.
+
+Set up your `bridgeData.yaml` (see the repository
+[configuration guide](https://github.com/Haidra-Org/horde-worker-reGen?tab=readme-ov-file#configure)),
+then from the repository root:
+
 ```bash
-docker start -ai reGen
+docker compose -f Dockerfiles/compose.cuda.yaml up -dV   # or compose.rocm.yaml
 ```
 
-### Stop
+> **Warning**: The compose files mount your `bridgeData.yaml` into the container. If any setting points
+> at an absolute or Windows-style path (**especially `cache_home`**), the worker inside the container
+> will not behave as expected. Use `AIWORKER_BRIDGE_DATA_LOCATION` to point at a different config file
+> and `AIWORKER_CACHE_HOME` to set the host models directory.
 
-> Note: To reduce the chances of dropping jobs due to the `docker stop` timeout running out, please set your worker into maintenance mode first whenever possible via the [API](https://aihorde.net/api/) PUT endpoint `/v2/workers/{worker_id}` or with a frontend like [artbot.site](https://artbot.site/).
+The compose file mounts a `models` directory next to the repository so selected models are not
+re-downloaded each time.
 
-To stop a running container:
+### Start, monitor, and stop a compose container
+
 ```bash
-docker stop reGen
+docker start -ai reGen   # attach to (or start) the container; CTRL+C detaches but leaves it running
+docker start reGen       # start detached (background)
+docker stop reGen        # stop
 ```
 
-### Start detached
-To start a container detached (running in the background):
+> Note: To reduce the chance of dropping jobs when `docker stop` times out, set your worker into
+> maintenance mode first whenever possible (the AI Horde [API](https://aihorde.net/api/) PUT endpoint
+> `/v2/workers/{worker_id}`, or a frontend like [artbot.site](https://artbot.site/)).
+
+### Updating with compose
+
+Pull the latest source, rebuild, and let compose recreate the container:
+
 ```bash
-docker start reGen
-```
-
-## Updating your worker
-You just need to go to the `horde-worker-reGen` directory, update the git repo, build the new image and let compose recreate the container:
-```
-cd horde-worker-reGen
 git pull
-docker compose -f Dockerfiles/compose.[cuda|rocm].yaml build --pull
-docker compose -f Dockerfiles/compose.[cuda|rocm].yaml up -dV
+docker compose -f Dockerfiles/compose.cuda.yaml build --pull
+docker compose -f Dockerfiles/compose.cuda.yaml up -dV
 ```
 
-# Advanced options
-## Dockerfile Overview
+## Option C: Build locally
 
-Two Dockerfiles are provided:
-- `Dockerfile.cuda` for NVIDIA GPUs
-- `Dockerfile.rocm` for AMD GPUs
-
-Both use multi-stage builds and support customization through build arguments.
-
-## Build Arguments
-
-These can be set either in the `compose.[cuda|rocm].yaml` file, in the `Dockerfile.[cuda|rocm]` or as [CLI arguments](#building-docker-images) for a manual build without compose.
-Common build arguments for both Dockerfiles:
-
-- `GIT_BRANCH`: Branch of the repository to clone (default: main)
-- `GIT_OWNER`: Owner of the GitHub repository (default: Haidra-Org)
-
-Specific build arguments:
-- For CUDA: `CUDA_VERSION` (default: 12.8.1)
-- For ROCm: `ROCM_VERSION` (default: 6.4)
-
-## Building Docker Images
-
-### NVIDIA (CUDA) Version
+The build context is the **repository root** (the image copies the source in), so build from the root
+and point `-f` at the Dockerfile:
 
 ```bash
-docker build -f Dockerfile.cuda \
-  --build-arg CUDA_VERSION=12.8.1 \
-  --build-arg GIT_BRANCH=main \
-  --build-arg GIT_OWNER=Haidra-Org \
-  -t horde-worker-regen:cuda .
+# NVIDIA (CUDA)
+docker build -f Dockerfiles/Dockerfile.cuda -t horde-worker-regen:cuda .
+
+# AMD (ROCm)
+docker build -f Dockerfiles/Dockerfile.rocm -t horde-worker-regen:rocm .
 ```
 
-### AMD (ROCm) Version
+To build a fork or a feature branch, simply check it out first (`git switch <branch>`) and build; the
+image bakes in whatever source tree you build from.
+
+### Build arguments
+
+CUDA (`Dockerfile.cuda`):
+
+- `CUDA_VERSION` (default `12.8.1`) selects the `nvidia/cuda:<version>-runtime-ubuntu22.04` base.
+- `TORCH_BACKEND` (default `cu126`) selects the PyTorch build extra. `cu126` is the only CUDA-12 build
+  of the pinned torch and also runs on CUDA-13 drivers; use `cu130` for a CUDA-13 base image.
+
+ROCm (`Dockerfile.rocm`):
+
+- `ROCM_VERSION` (default `6.2.1`) selects the `rocm/rocm-terminal:<version>` base.
+- `HORDE_WORKER_ROCM_TORCH` (default `2.9.1`) and `HORDE_WORKER_ROCM_INDEX`
+  (default `https://download.pytorch.org/whl/rocm6.4`) pin the ROCm PyTorch overlay, which is installed
+  ad-hoc because ROCm builds are not in `uv.lock`.
+
+### Running a locally built image
 
 ```bash
-docker build -f Dockerfile.rocm \
-  --build-arg ROCM_VERSION=6.4 \
-  --build-arg GIT_BRANCH=main \
-  --build-arg GIT_OWNER=Haidra-Org \
-  -t horde-worker-regen:rocm .
-```
-
-## Running Containers
-
-### NVIDIA (CUDA) Version
-
-```bash
+# NVIDIA (CUDA)
 docker run -it --gpus all horde-worker-regen:cuda
-```
 
-### AMD (ROCm) Version
-
-```bash
+# AMD (ROCm)
 docker run -it --device=/dev/kfd --device=/dev/dri --group-add video horde-worker-regen:rocm
 ```
 
 ## Configuration
 
-- The entrypoint script (`entrypoint.sh`) automatically detects the GPU environment (CUDA or ROCm) and sets up accordingly.
-- If `bridgeData.yaml` exists in the container, it will be used for configuration. Otherwise, environment variables will be used.
+The entrypoint applies the right GPU-specific runtime setup based on the image (`GPU_TYPE`) and then
+launches the worker. Configure the worker one of two ways:
+
+- Mount a `bridgeData.yaml` at `/horde-worker-reGen/bridgeData.yaml`, or
+- Set `AIWORKER_*` environment variables (used when no `bridgeData.yaml` is present).
 
 ### Setting config by environment variables
 
-You can set all of the settings for the docker worker via environment variables. Any configuration option in the `bridgeData_template.yaml` can be set this way be prepending `AIWORKER_` to it; see below for some examples.
-
-A typical config might include (be sure to change any settings as appropriate as these settings will not work for every machine):
+Any option in `bridgeData_template.yaml` can be set by prefixing it with `AIWORKER_`. A typical config
+(adjust for your machine; these values will not suit every system):
 
 ```
 AIWORKER_API_KEY=your_api_key_here          # Important
-AIWORKER_CACHE_HOME=/workspace/models       # Important
+AIWORKER_CACHE_HOME=/horde-worker-reGen/models  # Important
 AIWORKER_DREAMER_NAME=your_worker_name_here # Important
 AIWORKER_ALLOW_CONTROLNET=True
 AIWORKER_ALLOW_LORA=True
@@ -142,7 +146,7 @@ AIWORKER_MAX_LORA_CACHE_SIZE=50
 AIWORKER_ALLOW_PAINTING=True
 AIWORKER_MAX_POWER=38
 AIWORKER_MAX_THREADS=1 # Only set to 2 on high end or xx90 machines
-AIWORKER_MODELS_TO_LOAD=['TOP 3', 'AlbedoBase XL (SDXL)'] # Be mindful of download times; each model average 2-8 gb
+AIWORKER_MODELS_TO_LOAD=['TOP 3', 'AlbedoBase XL (SDXL)'] # Mind download times; ~2-8 GB each
 AIWORKER_MODELS_TO_SKIP=['pix2pix', 'SDXL_beta::stability.ai#6901']
 AIWORKER_QUEUE_SIZE=2
 AIWORKER_MAX_BATCH=4
@@ -150,74 +154,22 @@ AIWORKER_SAFETY_ON_GPU=True
 AIWORKER_CIVITAI_API_TOKEN=your_token_here
 ```
 
-See the bridgeData_template.yaml for more options and specific information about each.
+See `bridgeData_template.yaml` for the full set of options.
 
 #### Generating an `.env` file from a `bridgeData.yaml`
-If you have a local install of the worker, you can use the script `convert_config_to_env.py` to convert a bridgeData.yaml to a valid .env file, as seen here:
 
-- update-runtime users, windows
-  ```
-  .\runtime.cmd python -s -m convert_config_to_env --file .\bridgeData.yaml
-  ```
+If you have a local install of the worker, convert a `bridgeData.yaml` into a `.env` file suitable for
+`docker run --env-file`:
 
-- update-runtime users, linux
-  ```
-  ./runtime.sh python -s -m convert_config_to_env --file .\bridgeData.yaml
-  ```
+```bash
+uv run python -m convert_config_to_env --file ./bridgeData.yaml
+```
 
-- uv users
-  ```
-  uv run python -m convert_config_to_env --file .\bridgeData.yaml
-  ```
-
-... which will write a file to your current working directory named `bridgeData.env`, which is suitable for passing to `docker run` with the `--env-file` cli option. Note that the models_to_load and models_to_skip will be resolved to a list of models if you specified a meta-load command such as `TOP 5` (it would write out the top 5 at that time, **not** the literal `TOP 5`). If you want the dynamic nature of those commands, you should specify them manually.
-
-## Customization
-
-- To add GPU-specific setup steps, create `setup_cuda.sh` or `setup_rocm.sh` in the project root and include them in the respective Dockerfile.
-
-## Development Use Cases for GIT_* Variables
-
-1. **Testing Branches in Haidra-Org**:
-   ```bash
-   --build-arg GIT_BRANCH=feature-new-model
-   ```
-   Test new features before merging.
-
-2. **Working with Forks**:
-   ```bash
-   --build-arg GIT_OWNER=your-github-username \
-   --build-arg GIT_BRANCH=your-feature-branch
-   ```
-   Easily switch between forks and branches.
-
-3. **CI/CD Integration**:
-   ```bash
-   --build-arg GIT_BRANCH=${CI_COMMIT_BRANCH} \
-   --build-arg GIT_OWNER=${CI_PROJECT_NAMESPACE}
-   ```
-   Automate testing and deployment.
-
-4. **Pull Request Review**:
-   Reviewers can build and test changes directly:
-   ```bash
-   --build-arg GIT_OWNER=contributor-username \
-   --build-arg GIT_BRANCH=feature-branch
-   ```
+This writes `bridgeData.env` to the current directory. Note that `models_to_load`/`models_to_skip`
+meta-commands such as `TOP 5` are resolved to a concrete list at the time of conversion (not kept
+dynamic); specify models manually if you want the dynamic behavior.
 
 ## Troubleshooting
 
-1. Ensure you have the necessary GPU drivers installed on your host system.
-2. For ROCm, make sure your system supports the specified ROCm version.
-
-## Updating
-
-To update the worker:
-
-1. Rebuild the Docker image with the latest code:
-   ```bash
-   docker build -f Dockerfile.[cuda|amd] -t horde-worker-regen:[cuda|rocm] .
-   ```
-2. Stop the existing container and start a new one with the updated image.
-
-Remember to replace placeholders (e.g. `[cuda|amd]`) with appropriate values for your setup.
+1. Ensure the host has current GPU drivers (and, for NVIDIA, the NVIDIA Container Toolkit).
+2. For ROCm, confirm the host supports the `ROCM_VERSION` the image was built against.

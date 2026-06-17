@@ -1,5 +1,18 @@
-# Stage 1: Base environment setup
+# syntax=docker/dockerfile:1
+#
+# Immutable, baked AMD/ROCm worker image. Like Dockerfile.cuda, the source is COPY'd in and all
+# dependencies are installed at build time; the container does not clone, pull, or re-sync. The only
+# runtime setup is host-GPU-dependent flash-attention selection (see entrypoint.sh).
+#
+# Build from the repo ROOT (not from Dockerfiles/):
+#   docker build -f Dockerfiles/Dockerfile.rocm -t horde-worker-regen:rocm .
+#
+# NOTE: ROCm is installed AD-HOC (it is not in uv.lock; see the [tool.uv.sources] comment in
+# pyproject.toml). The torch stack below is therefore pinned explicitly rather than locked.
+
 ARG ROCM_VERSION=6.2.1
+
+# Stage 1: Base OS + system libraries + uv.
 FROM rocm/rocm-terminal:${ROCM_VERSION} AS base
 
 USER root
@@ -13,54 +26,44 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ninja-build \
     rocm \
-    git \
-    curl \
     ca-certificates && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# Pinned uv (reproducible builds).
+COPY --from=ghcr.io/astral-sh/uv:0.11.21 /uv /uvx /bin/
 
-# The uv cache below is a BuildKit cache mount on a different filesystem than the image layers, so uv
-# cannot hardlink from it into .venv. Copy mode avoids the per-build warning and the fallback churn.
-# (Inherited by the builder and final stages, covering both build-time and entrypoint uv operations.)
 ENV UV_LINK_MODE=copy
 
-# Stage 2: Install dependencies (cached layer)
-FROM base AS builder
+# Stage 2: Install dependencies + project, then overlay the ROCm torch build. Also the runtime image.
+FROM base AS final
 
-ARG GIT_BRANCH=main
-ARG GIT_OWNER=Haidra-Org
-
-RUN echo "export GIT_BRANCH=${GIT_BRANCH}" >> /env_vars && \
-    echo "export GIT_OWNER=${GIT_OWNER}" >> /env_vars && \
-    echo "export GPU_TYPE=rocm" >> /env_vars
+# Defaults match update-runtime-rocm.sh: torch 2.9.1 on the ROCm 6.4 wheel index.
+ARG HORDE_WORKER_ROCM_TORCH=2.9.1
+ARG HORDE_WORKER_ROCM_INDEX=https://download.pytorch.org/whl/rocm6.4
 
 WORKDIR "${APP_HOME}"
 
-# Clone the repository
-RUN git clone "https://github.com/${GIT_OWNER}/horde-worker-reGen.git" . && \
-    git switch "${GIT_BRANCH}"
-
-# Install dependencies first (better layer caching)
+# Cache the heavy base (cpu-extra) dependency layer independently of source changes.
+COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --extra cpu
 
-# Install the project itself
+COPY . .
+# Install the project (cpu base), then overlay the ROCm PyTorch stack (not lockable) over it and strip
+# any NVIDIA helpers pulled in transitively. Kept in one layer so the container starts without a
+# runtime re-sync (and to avoid a redundant intermediate layer).
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --extra cpu
+    uv sync --locked --extra cpu --extra post-processing --extra controlnet && \
+    uv pip install --reinstall \
+    "torch==${HORDE_WORKER_ROCM_TORCH}" torchvision torchaudio pytorch-triton-rocm \
+    --extra-index-url "${HORDE_WORKER_ROCM_INDEX}" && \
+    { uv pip uninstall pynvml nvidia-ml-py || true; }
 
-# Remove NVIDIA packages that may have leaked in
-RUN uv pip uninstall pynvml nvidia-ml-py 2>/dev/null || true
+# This is the ROCm image; the entrypoint reads GPU_TYPE to pick ROCm-specific runtime setup.
+ENV GPU_TYPE=rocm
 
-# Stage 3: Final stage
-FROM builder AS final
-
-WORKDIR "${APP_HOME}"
-COPY entrypoint.sh /entrypoint.sh
-COPY setup_*.sh "${APP_HOME}"
-RUN chmod +x /entrypoint.sh
+COPY --chmod=755 Dockerfiles/entrypoint.sh /entrypoint.sh
 
 STOPSIGNAL SIGINT
 

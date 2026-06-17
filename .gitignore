@@ -10,6 +10,9 @@ kudos_training_data*
 
 benchmark_results/runs
 benchmark_results/*-*/*
+benchmark_results/*_validate/*
+
+logs/remote_logs/*
 
 .horde_worker_regen/*
 

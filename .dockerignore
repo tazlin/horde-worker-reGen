@@ -1,0 +1,40 @@
+# The Docker build context is the repo root (the images COPY the source in and bake deps at build
+# time). Everything below is either rebuilt inside the image, irrelevant to the worker runtime, or
+# local state/secrets that must never leak into a published image.
+
+# Version control and CI
+.git
+.github
+.gitignore
+
+# Local virtualenv / build caches (deps are reinstalled inside the image)
+.venv
+*.egg-info
+build/
+dist/
+stage/
+
+# Tooling caches
+.mypy_cache
+.pytest_cache
+.ruff_cache
+**/__pycache__/
+*.py[cod]
+
+# Worker runtime state mounted at runtime, not baked in
+models/
+logs/
+.horde_worker_regen/
+
+# Local configuration / secrets (the image is configured via AIWORKER_* env vars)
+bridgeData.yaml
+*.env
+!*.env.example
+
+# Docs and tests are not needed in the runtime image
+docs/
+tests/
+
+# Misc local artifacts
+*.zip
+*.log

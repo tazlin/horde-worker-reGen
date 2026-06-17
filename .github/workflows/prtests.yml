@@ -17,6 +17,7 @@ on:
       - 'bridgeData_template.yaml'
       - 'pyproject.toml'
       - 'uv.lock'
+      - 'Dockerfiles/**'
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
@@ -32,7 +33,7 @@ jobs:
   dockerfile-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Lint CUDA Dockerfile
         uses: hadolint/hadolint-action@master
         with:

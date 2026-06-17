@@ -1,12 +1,12 @@
 services:
   regen:
+    # ROCm images are not currently published; build locally.
     build:
-      context: ./
-      dockerfile: ./Dockerfile.rocm
+      # Build context is the repo root: the image bakes the source in (see Dockerfile.rocm).
+      context: ../
+      dockerfile: Dockerfiles/Dockerfile.rocm
       args:
         - ROCM_VERSION=6.2.1
-        - GIT_BRANCH=main
-        - GIT_OWNER=Haidra-Org
     container_name: reGen
     tty: true
     #environment:
