@@ -56,8 +56,11 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     ramp.add_argument(
         "--warm",
-        action="store_true",
-        help="Reuse one warm worker across fixed-scenario levels (skips per-level startup cost).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse one warm worker across fixed-scenario levels instead of cold-starting a fresh worker "
+        "(and respawning every inference process) per level. On by default; pass --no-warm to run each "
+        "level in its own isolated subprocess (full crash isolation at the cost of per-level startup).",
     )
     ramp.add_argument(
         "-v",
