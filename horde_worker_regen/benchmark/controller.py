@@ -51,6 +51,7 @@ from horde_worker_regen.benchmark.progress_channel import (
     RampPlanned,
     RampStarted,
     RampStarting,
+    SuggestionDecisionRow,
 )
 from horde_worker_regen.benchmark.report import (
     BenchmarkReport,
@@ -60,10 +61,13 @@ from horde_worker_regen.benchmark.report import (
     LevelRunResult,
     MachineInfo,
     SuggestedBridgeData,
+    SuggestionDecision,
     compute_level_stats,
+    describe_decision,
     render_markdown,
     synthesize_bridge_data,
     synthesize_capabilities,
+    verify_suggestion_consistency,
 )
 from horde_worker_regen.benchmark.requirements import (
     LevelRequirements,
@@ -127,6 +131,18 @@ def _plan_row(req: LevelRequirements, verdict: str | None) -> LevelPlanRow:
         features=req.features,
         will_run=verdict is None,
         verdict=verdict or "",
+    )
+
+
+def _decision_row(decision: SuggestionDecision) -> SuggestionDecisionRow:
+    """Project a recommendation decision into the lean, pre-rendered row the progress stream carries."""
+    value_text, basis_label, detail = describe_decision(decision)
+    return SuggestionDecisionRow(
+        setting=decision.setting,
+        value_text=value_text,
+        basis=str(decision.basis),
+        basis_label=basis_label,
+        detail=detail,
     )
 
 
@@ -582,8 +598,11 @@ class BenchmarkController:
         )
 
     def _emit_ramp_finished(self, report: BenchmarkReport) -> None:
-        """Announce the ramp totals and the synthesized recommendation."""
+        """Announce the ramp totals, the synthesized recommendation, and its per-setting provenance."""
         levels_passed = sum(1 for level in report.levels if level.outcome == LevelOutcome.PASSED)
+        warnings = verify_suggestion_consistency(report)
+        for warning in warnings:
+            logger.warning(f"Recommendation consistency: {warning}")
         self._sink.emit(
             RampFinished(
                 run_id=report.run_id,
@@ -592,6 +611,8 @@ class BenchmarkController:
                 num_findings=len(report.findings),
                 report_path=str(self._out_dir / "report.json"),
                 suggested_bridge_data_yaml=report.suggested_bridge_data.as_yaml_block(),
+                suggestion_decisions=[_decision_row(decision) for decision in report.suggested_bridge_data.decisions],
+                consistency_warnings=warnings,
             ),
         )
 

@@ -38,6 +38,7 @@ from horde_worker_regen.benchmark.progress_channel import (
     RampPlanned,
     RampStarted,
     RampStarting,
+    SuggestionDecisionRow,
 )
 from horde_worker_regen.process_management.owned_process_registry import kill_process_tree
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH, load_config, save_config
@@ -84,6 +85,8 @@ class BenchmarkOptions:
     include_concurrency: bool = True
     include_features: bool = True
     include_alchemy: bool = True
+    excluded_axes: list[str] = dataclasses.field(default_factory=list)
+    """Individual ramp axes to drop (BenchAxis values), independent of the coarse stage toggles."""
     warm: bool = True
     force: bool = False
     verbose: bool = False
@@ -99,6 +102,8 @@ class BenchmarkOptions:
             args.append("--no-features")
         if not self.include_alchemy:
             args.append("--no-alchemy")
+        for axis in self.excluded_axes:
+            args.extend(["--exclude-axis", axis])
         if self.force:
             args.append("--force")
         return args
@@ -190,6 +195,10 @@ class BenchmarkRunState:
         self.levels_total: int = 0
         self.num_findings: int = 0
         self.suggested_bridge_data_yaml: str = ""
+        self.suggestion_decisions: list[SuggestionDecisionRow] = []
+        """Per-setting recommendation provenance, from the RampFinished event."""
+        self.consistency_warnings: list[str] = []
+        """Recommendation self-consistency warnings, from the RampFinished event."""
         self.report_path: str | None = None
         self.finished: bool = False
 
@@ -241,6 +250,8 @@ class BenchmarkRunState:
             self.levels_total = event.levels_total
             self.num_findings = event.num_findings
             self.suggested_bridge_data_yaml = event.suggested_bridge_data_yaml
+            self.suggestion_decisions = list(event.suggestion_decisions)
+            self.consistency_warnings = list(event.consistency_warnings)
             self.report_path = event.report_path
             self.finished = True
 

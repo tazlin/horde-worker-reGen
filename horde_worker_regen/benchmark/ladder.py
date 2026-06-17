@@ -169,6 +169,12 @@ class LadderOptions(BaseModel):
     include_alchemy: bool = True
     include_downloads: bool = False
     """Download levels need network + (for loras) a CivitAI-reachable connection."""
+    excluded_axes: set[BenchAxis] = Field(default_factory=set)
+    """Individual axes to drop from the ladder, independent of the coarse stage toggles above.
+
+    Lets a caller deselect a single capability (e.g. just controlnet, or just the alchemy graph lane)
+    rather than a whole stage. A level is built only if its stage is included *and* its axis is not
+    excluded; the two filters compose. BASELINE/DOWNLOADS/VALIDATION are not user-excludable here."""
     download_lora_names: list[str] = Field(default_factory=lambda: ["GlowingRunesAI"])
     level_timeout_seconds: float = 900.0
     total_vram_mb: int | None = None
@@ -231,6 +237,10 @@ def build_default_ladder(options: LadderOptions | None = None) -> list[RampLevel
         establishes_tier_baseline: bool = False,
         criteria: LevelCriteria | None = None,
     ) -> None:
+        # One chokepoint for per-axis deselection: every level declares its axis here, so excluding an
+        # axis cleanly drops exactly its levels without each stage builder needing to know about it.
+        if axis in opts.excluded_axes:
+            return
         levels.append(
             RampLevel(
                 id=f"{stage}-{tier}-{name}",

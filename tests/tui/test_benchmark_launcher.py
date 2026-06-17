@@ -18,6 +18,7 @@ from horde_worker_regen.benchmark.progress_channel import (
     RampPlanned,
     RampStarted,
     RampStarting,
+    SuggestionDecisionRow,
 )
 from horde_worker_regen.tui.benchmark_launcher import (
     BenchmarkOptions,
@@ -142,6 +143,17 @@ def test_build_command_maps_stage_warm_and_force_toggles() -> None:
     assert {"--no-concurrency", "--no-features", "--no-alchemy", "--no-warm", "--force"} <= set(command)
 
 
+def test_build_command_emits_one_exclude_axis_per_deselected_axis() -> None:
+    """Each excluded axis becomes its own ``--exclude-axis AXIS`` pair in both ramp and plan argv."""
+    options = BenchmarkOptions(tiers=["sd15"], excluded_axes=["controlnet", "alchemy_graph"])
+    command = options.build_command(Path("out"))
+    assert command.count("--exclude-axis") == 2
+    assert "controlnet" in command
+    assert "alchemy_graph" in command
+    # The same selection flows into the plan preview so the preview matches what the ramp would run.
+    assert options.build_plan_command().count("--exclude-axis") == 2
+
+
 def test_build_plan_command_previews_without_running() -> None:
     """The plan command targets the `plan` subcommand with --json and carries the same selection flags."""
     options = BenchmarkOptions(tiers=["sd15"], include_features=False, force=True)
@@ -151,6 +163,32 @@ def test_build_plan_command_previews_without_running() -> None:
     assert "--no-features" in command
     assert "--force" in command
     assert "--out" not in command  # the plan starts no run, so it has no output directory
+
+
+def test_run_state_captures_suggestion_provenance() -> None:
+    """A RampFinished event populates the run state's per-setting provenance and consistency warnings."""
+    state = BenchmarkRunState()
+    state.apply(
+        RampFinished(
+            run_id="run1",
+            levels_passed=1,
+            levels_total=1,
+            suggested_bridge_data_yaml="allow_lora: false",
+            suggestion_decisions=[
+                SuggestionDecisionRow(
+                    setting="allow_lora",
+                    value_text="off",
+                    basis="untested_skipped",
+                    basis_label="off: never tested (skipped)",
+                ),
+            ],
+            consistency_warnings=["allow_lora untested"],
+        ),
+    )
+    assert len(state.suggestion_decisions) == 1
+    assert state.suggestion_decisions[0].setting == "allow_lora"
+    assert state.suggestion_decisions[0].basis == "untested_skipped"
+    assert state.consistency_warnings == ["allow_lora untested"]
 
 
 def test_run_state_captures_ramp_plan() -> None:

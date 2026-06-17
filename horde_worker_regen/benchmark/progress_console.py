@@ -45,11 +45,26 @@ def format_progress_event(event: BenchmarkProgressEvent, *, verbose: bool = Fals
         return f"  '- {event.level_id}: {event.outcome.upper()}{_finished_detail(event)}"
     if isinstance(event, RampFinished):
         findings = f" - {event.num_findings} findings" if event.num_findings else ""
-        return (
+        lines = [
             f"= Ramp complete: {event.levels_passed}/{event.levels_total} passed{findings} - "
-            f"report={event.report_path}"
-        )
+            f"report={event.report_path}",
+        ]
+        lines.extend(_provenance_lines(event))
+        for warning in event.consistency_warnings:
+            lines.append(f"  (!) consistency: {warning}")
+        return "\n".join(lines)
     return None
+
+
+def _provenance_lines(event: RampFinished) -> list[str]:
+    """Render the recommendation's per-setting provenance under the completion line, if present."""
+    if not event.suggestion_decisions:
+        return []
+    lines = ["  why each suggested value:"]
+    for decision in event.suggestion_decisions:
+        detail = f" - {decision.detail}" if decision.detail else ""
+        lines.append(f"    - {decision.setting}={decision.value_text} [{decision.basis_label}]{detail}")
+    return lines
 
 
 def _progress_detail(event: LevelProgress, *, verbose: bool = False) -> str:

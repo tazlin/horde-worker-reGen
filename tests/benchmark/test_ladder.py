@@ -57,6 +57,18 @@ class TestDefaultLadder:
         ladder = build_default_ladder(LadderOptions(tiers=["flux"]))
         assert not any(level.axis == "controlnet" for level in ladder)
 
+    def test_excluded_axis_drops_only_that_axis(self) -> None:
+        """Excluding a single axis removes its levels while leaving its stage siblings in place."""
+        from horde_worker_regen.benchmark.enums import BenchAxis
+
+        full = build_default_ladder(LadderOptions(tiers=["sd15"]))
+        assert any(level.axis == "controlnet" for level in full)
+
+        pruned = build_default_ladder(LadderOptions(tiers=["sd15"], excluded_axes={BenchAxis.CONTROLNET}))
+        assert not any(level.axis == "controlnet" for level in pruned)
+        # A sibling feature axis (post-processing) is untouched by excluding controlnet.
+        assert any(level.axis == "post_processing" for level in pruned)
+
     def test_unknown_tier_rejected(self) -> None:
         """An unknown tier name is rejected when the options are validated (it is not a BenchTier)."""
         with pytest.raises(ValueError):  # noqa: PT011 - pydantic raises a plain ValidationError (a ValueError)

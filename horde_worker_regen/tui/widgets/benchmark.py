@@ -9,8 +9,8 @@ GPU-exclusive worker/benchmark hand-off.
 from __future__ import annotations
 
 import contextlib
-import json
 import subprocess
+import typing
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -20,11 +20,12 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
-from textual.widgets import Button, Input, Label, Static, Switch
+from textual.widgets import Button, Collapsible, Input, Label, Static, Switch
 
 from horde_worker_regen import __version__
 from horde_worker_regen.app_state import AppStateStore, BenchmarkAvailability, benchmark_status_summary
-from horde_worker_regen.benchmark.progress_channel import LevelPlanRow
+from horde_worker_regen.benchmark.enums import BenchAxis, BenchTier
+from horde_worker_regen.benchmark.progress_channel import LevelPlanRow, decode_plan_rows
 from horde_worker_regen.tui.benchmark_launcher import (
     BenchmarkOptions,
     BenchmarkRunState,
@@ -40,8 +41,97 @@ _OUTCOME_COLOURS: dict[str, str] = {
     "skipped": "grey50",
 }
 
+_BASIS_STYLES: dict[str, str] = {
+    "proven": "green",
+    "disabled_failed": "red",
+    "untested_skipped": "grey50",
+    "not_in_ladder": "grey50",
+    "capped_vram": "yellow",
+    "capped_soak": "yellow",
+}
+"""Colour for each recommendation basis: proven is grounded (green), failed is a real negative (red),
+untested is unknown (grey), and capped is a deliberate headroom/stability hold-back (yellow)."""
+
 _PLAN_PREVIEW_TIMEOUT_SECONDS = 180.0
 """Cap on the `plan` subprocess: it imports the inference stack and probes the GPU (slow, cold)."""
+
+
+class _TierToggle(typing.NamedTuple):
+    """One selectable model tier as presented in the primary controls."""
+
+    tier: BenchTier
+    label: str
+    help_text: str
+    default: bool
+
+
+_TIER_TOGGLES: tuple[_TierToggle, ...] = (
+    _TierToggle(BenchTier.SD15, "SD 1.5", "Smallest and fastest; the recommended starting point.", True),
+    _TierToggle(BenchTier.SDXL, "SDXL", "Larger SDXL checkpoints; needs more VRAM than SD 1.5.", True),
+    _TierToggle(
+        BenchTier.FLUX, "Flux", "Very large (17-20 GB download, 13-16 GB VRAM); auto-skips if it does not fit.", False
+    ),
+    _TierToggle(
+        BenchTier.QWEN, "Qwen", "Very large beta model; needs the pending reference, auto-skips if absent.", False
+    ),
+)
+"""The model tiers an operator can select. flux/qwen default off: they are large and opt-in, and the
+ramp pre-flight auto-skips them when the machine cannot hold them."""
+
+
+def _tier_switch_id(tier: BenchTier) -> str:
+    """The widget id for a tier toggle (kept derivable so collection and layout cannot drift)."""
+    return f"benchmark-tier-{tier.value}"
+
+
+class _AxisToggle(typing.NamedTuple):
+    """One individually selectable ramp axis as presented in the Advanced panel."""
+
+    axis: BenchAxis
+    label: str
+    help_text: str
+
+
+_AXIS_GROUPS: tuple[tuple[str, tuple[_AxisToggle, ...]], ...] = (
+    (
+        "Concurrency",
+        (
+            _AxisToggle(BenchAxis.QUEUE_SIZE, "Queue depth", "Preload the next job while one samples (queue_size)."),
+            _AxisToggle(BenchAxis.THREADS, "Thread count", "Run two inference jobs at once (max_threads)."),
+            _AxisToggle(BenchAxis.BATCH, "Batch size", "Sample several images per step (n_iter / max_batch)."),
+        ),
+    ),
+    (
+        "Features",
+        (
+            _AxisToggle(BenchAxis.HIRES_FIX, "Hires-fix", "A second, upscaled sampling pass."),
+            _AxisToggle(
+                BenchAxis.POST_PROCESSING, "Post-processing", "Upscalers and face-fixers on generated images."
+            ),
+            _AxisToggle(BenchAxis.CONTROLNET, "Controlnet", "Classic preprocessor controlnet (SD1.5)."),
+            _AxisToggle(BenchAxis.QR_CODE, "QR-code controlnet", "The QR-code workflow (the SDXL controlnet path)."),
+        ),
+    ),
+    (
+        "Alchemy",
+        (
+            _AxisToggle(
+                BenchAxis.ALCHEMY_CLIP, "Alchemy: CLIP lane", "Caption / interrogation / NSFW (safety process)."
+            ),
+            _AxisToggle(BenchAxis.ALCHEMY_GRAPH, "Alchemy: graph lane", "Upscale / face-fix / strip-background."),
+            _AxisToggle(BenchAxis.ALCHEMY_CONCURRENT, "Alchemy: concurrent", "Alchemy forms alongside image jobs."),
+        ),
+    ),
+)
+"""The per-axis toggles shown in the Advanced panel, grouped by stage for a clear visual hierarchy.
+
+Each axis is independently selectable: deselecting one drops only its levels (see
+`LadderOptions.excluded_axes`), so an operator can benchmark, say, post-processing without controlnet."""
+
+
+def _axis_switch_id(axis: BenchAxis) -> str:
+    """The widget id for an axis toggle (kept derivable so collection and layout cannot drift)."""
+    return f"benchmark-axis-{axis.value}"
 
 
 class BenchmarkView(VerticalScroll):
@@ -55,17 +145,30 @@ class BenchmarkView(VerticalScroll):
     BenchmarkView #benchmark-actions Button {
         margin-right: 1;
     }
-    BenchmarkView #benchmark-options, BenchmarkView #benchmark-options-2 {
-        height: 3;
+    BenchmarkView .adv-group {
+        text-style: bold;
+        color: $text;
+        padding: 1 1 0 1;
+    }
+    BenchmarkView .adv-section-help {
         padding: 0 1;
     }
-    BenchmarkView #benchmark-options Label, BenchmarkView #benchmark-options-2 Label {
+    BenchmarkView .adv-row {
+        height: 3;
+    }
+    BenchmarkView .adv-row .adv-label {
+        content-align: left middle;
+        height: 3;
+        width: 18;
+        padding: 0 1;
+    }
+    BenchmarkView .adv-row .adv-input {
+        width: 12;
+    }
+    BenchmarkView .adv-row .adv-help {
         content-align: left middle;
         height: 3;
         padding: 0 1;
-    }
-    BenchmarkView #benchmark-options Input {
-        width: 22;
     }
     BenchmarkView .benchmark-body {
         padding: 1 1;
@@ -97,38 +200,137 @@ class BenchmarkView(VerticalScroll):
         self._has_known_good = False
 
     def compose(self) -> ComposeResult:
-        """Lay out the action bar, the options row, and the live body panel."""
+        """Lay out the guided steps, the primary controls, the collapsed advanced options, and the body.
+
+        The order encodes the recommended path top-to-bottom: read the steps, set the tiers, optionally
+        open Advanced, then act from the button bar (Preview plan leads, since it needs no GPU).
+        """
         with Horizontal(id="benchmark-actions"):
-            yield Button("Run benchmark", id="benchmark-run", variant="success")
             yield Button("Preview plan", id="benchmark-preview", variant="primary")
+            yield Button("Run benchmark", id="benchmark-run", variant="success")
+            yield Button("History", id="benchmark-history", variant="default")
             yield Button("Cancel", id="benchmark-cancel", variant="warning")
             yield Button("Apply suggested config", id="benchmark-apply", variant="primary")
             yield Button("Restore last-known-good", id="benchmark-restore", variant="default")
-        with Horizontal(id="benchmark-options"):
-            yield Label("Tiers")
-            yield Input(value="sd15,sdxl", id="benchmark-tiers")
-            yield Label("Soak (min)")
-            yield Input(value="5", id="benchmark-soak", type="number")
-            yield Label("Validate")
-            yield Switch(value=True, id="benchmark-validate")
-            yield Label("Downloads")
-            yield Switch(value=False, id="benchmark-downloads")
-            yield Label("Verbose")
-            yield Switch(value=False, id="benchmark-verbose")
-        with Horizontal(id="benchmark-options-2"):
-            yield Label("Concurrency")
-            yield Switch(value=True, id="benchmark-concurrency")
-            yield Label("Features")
-            yield Switch(value=True, id="benchmark-features")
-            yield Label("Alchemy")
-            yield Switch(value=True, id="benchmark-alchemy")
-            yield Label("Warm")
-            yield Switch(value=True, id="benchmark-warm")
-            yield Label("Force")
-            yield Switch(value=False, id="benchmark-force")
+        yield Static(self._guided_steps(), id="benchmark-steps", classes="benchmark-body")
+        yield Label("Model tiers", classes="adv-group")
+        yield Static(
+            Text(
+                "Model families to benchmark, in order. sd15/sdxl are the common path; flux/qwen are very "
+                "large and auto-skip if they do not fit this machine.",
+                style="grey50",
+            ),
+            classes="adv-section-help",
+        )
+        for tier_toggle in _TIER_TOGGLES:
+            yield self._switch_row(
+                tier_toggle.label,
+                _tier_switch_id(tier_toggle.tier),
+                default=tier_toggle.default,
+                help_text=tier_toggle.help_text,
+            )
+        with Collapsible(title="Advanced options", collapsed=True, id="benchmark-advanced"):
+            yield self._number_row(
+                "Soak (min)",
+                "benchmark-soak",
+                "5",
+                "How long the post-ramp sustained-load soak runs.",
+            )
+            yield self._switch_row(
+                "Validate",
+                "benchmark-validate",
+                default=True,
+                help_text="Run the post-ramp soak that proves the suggested config holds under load.",
+            )
+            yield self._switch_row(
+                "Downloads",
+                "benchmark-downloads",
+                default=False,
+                help_text="Include the level that fetches a lora from CivitAI (needs network + a token).",
+            )
+            yield Static(
+                Text(
+                    "Capabilities to measure. Each is separate: turn off any you do not run, and only its "
+                    "levels are skipped.",
+                    style="grey50",
+                ),
+                classes="adv-section-help",
+            )
+            for group_name, toggles in _AXIS_GROUPS:
+                yield Label(group_name, classes="adv-group")
+                for toggle in toggles:
+                    yield self._switch_row(
+                        toggle.label,
+                        _axis_switch_id(toggle.axis),
+                        default=True,
+                        help_text=toggle.help_text,
+                    )
+            yield self._switch_row(
+                "Warm worker",
+                "benchmark-warm",
+                default=True,
+                help_text="Reuse one warm worker across levels (faster). Off isolates each level.",
+            )
+            yield self._switch_row(
+                "Force",
+                "benchmark-force",
+                default=False,
+                help_text="Attempt levels that do not fit this machine (insufficient VRAM/disk) or lack a token.",
+            )
+            yield self._switch_row(
+                "Verbose",
+                "benchmark-verbose",
+                default=False,
+                help_text="Write extra per-process detail to the run's console.log.",
+            )
         yield Static(self._app_state_summary, id="benchmark-status", classes="benchmark-body")
         yield Static(id="benchmark-plan", classes="benchmark-body")
         yield Static(id="benchmark-body", classes="benchmark-body")
+
+    @staticmethod
+    def _switch_row(label: str, switch_id: str, *, default: bool, help_text: str) -> Horizontal:
+        """One advanced-option row: a name, a switch, and a visible plain-language explanation."""
+        return Horizontal(
+            Label(label, classes="adv-label"),
+            Switch(value=default, id=switch_id),
+            Static(Text(help_text, style="grey50"), classes="adv-help"),
+            classes="adv-row",
+        )
+
+    @staticmethod
+    def _number_row(label: str, input_id: str, default: str, help_text: str) -> Horizontal:
+        """One advanced-option row backed by a numeric input rather than a switch."""
+        return Horizontal(
+            Label(label, classes="adv-label"),
+            Input(value=default, id=input_id, type="number", classes="adv-input"),
+            Static(Text(help_text, style="grey50"), classes="adv-help"),
+            classes="adv-row",
+        )
+
+    @staticmethod
+    def _guided_steps() -> Panel:
+        """The plan-first guided path shown above the controls, in plain language."""
+        body = Text.assemble(
+            ("New to benchmarking? Follow these steps:\n\n", "bold"),
+            ("1. ", "bold cyan"),
+            ("Preview plan", "bold"),
+            (" - see what each level needs and what will run on this machine. No GPU, no risk.\n", "grey70"),
+            ("2. ", "bold cyan"),
+            ("Run benchmark", "bold"),
+            (
+                " - measures the worker (this stops the worker; it needs the GPU) and suggests a tuned config.\n",
+                "grey70",
+            ),
+            ("3. ", "bold cyan"),
+            ("Apply suggested config", "bold"),
+            (" - write the recommendation into bridgeData.yaml.\n\n", "grey70"),
+            ("Open ", "grey70"),
+            ("Advanced options", "italic"),
+            (" only if you want to narrow the run. ", "grey70"),
+            ("History", "italic"),
+            (" reviews and compares past runs.", "grey70"),
+        )
+        return Panel(body, title="How this works", title_align="left", border_style="cyan")
 
     def on_mount(self) -> None:
         """Load the persisted benchmark status and render the initial idle view."""
@@ -156,6 +358,8 @@ class BenchmarkView(VerticalScroll):
             self.post_message(self.RunRequested(self._collect_options()))
         elif event.button.id == "benchmark-preview":
             self._start_plan_preview()
+        elif event.button.id == "benchmark-history":
+            self._open_history()
         elif event.button.id == "benchmark-cancel":
             self.post_message(self.CancelRequested())
         elif event.button.id == "benchmark-apply":
@@ -165,25 +369,42 @@ class BenchmarkView(VerticalScroll):
 
     def _collect_options(self) -> BenchmarkOptions:
         """Build ramp options from the option widgets (the app overrides the process mode)."""
-        tiers_raw = self.query_one("#benchmark-tiers", Input).value
-        tiers = [tier.strip() for tier in tiers_raw.split(",") if tier.strip()] or ["sd15", "sdxl"]
+        tiers = [
+            toggle.tier.value
+            for toggle in _TIER_TOGGLES
+            if self.query_one(f"#{_tier_switch_id(toggle.tier)}", Switch).value
+        ] or ["sd15"]
         try:
             soak_minutes = float(self.query_one("#benchmark-soak", Input).value or "5")
         except ValueError:
             soak_minutes = 5.0
+        excluded_axes = [
+            toggle.axis.value
+            for _group_name, toggles in _AXIS_GROUPS
+            for toggle in toggles
+            if not self.query_one(f"#{_axis_switch_id(toggle.axis)}", Switch).value
+        ]
         return BenchmarkOptions(
             tiers=tiers,
             process_mode=self._worker_mode,
             validate=self.query_one("#benchmark-validate", Switch).value,
             soak_minutes=soak_minutes,
             include_downloads=self.query_one("#benchmark-downloads", Switch).value,
-            include_concurrency=self.query_one("#benchmark-concurrency", Switch).value,
-            include_features=self.query_one("#benchmark-features", Switch).value,
-            include_alchemy=self.query_one("#benchmark-alchemy", Switch).value,
+            excluded_axes=excluded_axes,
             warm=self.query_one("#benchmark-warm", Switch).value,
             force=self.query_one("#benchmark-force", Switch).value,
             verbose=self.query_one("#benchmark-verbose", Switch).value,
         )
+
+    def _open_history(self) -> None:
+        """Open the past-runs history/compare modal.
+
+        Imported lazily: the modal pulls the report/history models, which are not worth loading until
+        the user actually asks to review prior runs.
+        """
+        from horde_worker_regen.tui.widgets.benchmark_history import BenchmarkHistoryModal
+
+        self.app.push_screen(BenchmarkHistoryModal())
 
     def _start_plan_preview(self) -> None:
         """Shell ``horde-benchmark plan --json`` in a worker thread and render the result.
@@ -225,8 +446,8 @@ class BenchmarkView(VerticalScroll):
             self.app.call_from_thread(self._render_plan_error, tail[-1] if tail else "no output")
             return
         try:
-            rows = [LevelPlanRow.model_validate(item) for item in json.loads(result.stdout)]
-        except (json.JSONDecodeError, ValueError) as e:
+            rows = decode_plan_rows(result.stdout)
+        except ValueError as e:
             self.app.call_from_thread(self._render_plan_error, f"could not parse plan output: {e}")
             return
         self.app.call_from_thread(self._render_plan_preview, rows)
@@ -280,6 +501,8 @@ class BenchmarkView(VerticalScroll):
         has_suggestion = bool(run_state.suggested_bridge_data_yaml)
         self.query_one("#benchmark-run", Button).disabled = active
         self.query_one("#benchmark-preview", Button).disabled = active
+        # History only reads completed runs from disk, so it is safe (and useful) at any time.
+        self.query_one("#benchmark-history", Button).disabled = False
         self.query_one("#benchmark-cancel", Button).disabled = not running
         self.query_one("#benchmark-apply", Button).disabled = not (
             status is BenchmarkSupervisorStatus.FINISHED and has_suggestion
@@ -342,16 +565,22 @@ class BenchmarkView(VerticalScroll):
 
     @staticmethod
     def _render_idle_hint() -> Panel:
-        """The pre-run message describing what a benchmark does and its GPU-exclusivity caveat."""
+        """The pre-run message: recommend Preview plan first, before committing the GPU."""
         body = Text.assemble(
             (
                 "A benchmark ramps the worker through safe difficulty levels, suggests a tuned bridgeData, "
                 "and flags robustness problems.\n\n",
                 "grey70",
             ),
-            ("Running it stops the worker (the benchmark needs the GPU). Press ", "grey70"),
+            ("Start with ", "grey70"),
+            ("Preview plan", "bold cyan"),
+            (
+                ": it shows what each level needs and what will run on this machine, without starting the "
+                "worker or using the GPU. When you are ready, ",
+                "grey70",
+            ),
             ("Run benchmark", "bold green"),
-            (" to start.", "grey70"),
+            (" stops the worker and measures it for real.", "grey70"),
         )
         return Panel(body, title="Benchmark", title_align="left", border_style="cyan")
 
@@ -443,11 +672,33 @@ class BenchmarkView(VerticalScroll):
 
     @staticmethod
     def _render_suggestion(run_state: BenchmarkRunState) -> Panel:
-        """The recommended bridgeData plus the run totals and findings count."""
+        """The recommended bridgeData, its run totals, and the per-setting provenance behind each value."""
         findings = f"  ·  {run_state.num_findings} robustness findings" if run_state.num_findings else ""
         header = Text.from_markup(
             f"[bold]{run_state.levels_passed}/{run_state.levels_total}[/] levels passed{findings}\n"
             "Press [bold green]Apply suggested config[/] to write these into bridgeData.yaml.\n",
         )
-        body = Group(header, Text(run_state.suggested_bridge_data_yaml, style="grey82"))
-        return Panel(body, title="Suggested bridgeData", title_align="left", border_style="green")
+        sections: list[RenderableType] = [header, Text(run_state.suggested_bridge_data_yaml, style="grey82")]
+        if run_state.suggestion_decisions:
+            sections.append(Text("\nWhy each value:", style="bold"))
+            sections.append(BenchmarkView._provenance_table(run_state))
+        for warning in run_state.consistency_warnings:
+            sections.append(Text(f"(!) {warning}", style="yellow"))
+        return Panel(Group(*sections), title="Suggested bridgeData", title_align="left", border_style="green")
+
+    @staticmethod
+    def _provenance_table(run_state: BenchmarkRunState) -> Table:
+        """Render why each suggested setting holds its value, colour-coded by the strength of evidence."""
+        table = Table(expand=True, show_edge=False, pad_edge=False)
+        table.add_column("Setting")
+        table.add_column("Value")
+        table.add_column("Basis")
+        table.add_column("Detail")
+        for decision in run_state.suggestion_decisions:
+            table.add_row(
+                decision.setting,
+                decision.value_text,
+                Text(decision.basis_label, style=_BASIS_STYLES.get(decision.basis, "grey70")),
+                Text(decision.detail, style="grey50"),
+            )
+        return table

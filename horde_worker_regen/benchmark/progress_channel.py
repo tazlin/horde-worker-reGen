@@ -26,11 +26,12 @@ from pydantic import BaseModel, Field, ValidationError
 PROGRESS_FILENAME = "progress.jsonl"
 """The progress event log written into a run's output directory."""
 
-BENCHMARK_PROGRESS_PROTOCOL_VERSION = 2
+BENCHMARK_PROGRESS_PROTOCOL_VERSION = 3
 """Bumped when the event schema changes incompatibly; stamped into every event and checked by readers.
 
-v2 adds ``RAMP_PLANNED`` (the per-level resource-requirements plan). Readers tolerate unknown kinds
-(``parse_progress_event`` returns None), so a v1 reader simply ignores the new event.
+v2 added ``RAMP_PLANNED`` (the per-level resource-requirements plan). v3 adds
+``RampFinished.suggestion_decisions`` (per-setting recommendation provenance). Readers tolerate unknown
+kinds and unknown fields default in, so an older reader simply ignores the additions.
 """
 
 
@@ -103,6 +104,40 @@ class LevelPlanRow(BaseModel):
     """Empty when the level will run; otherwise the skip reason."""
 
 
+_PLAN_JSON_BEGIN = "<<<HORDE_BENCHMARK_PLAN_JSON>>>"
+_PLAN_JSON_END = "<<<END_HORDE_BENCHMARK_PLAN_JSON>>>"
+
+
+def encode_plan_rows(rows: list[LevelPlanRow]) -> str:
+    """Serialise plan rows for ``plan --json``, wrapped in sentinels so a reader can isolate the payload.
+
+    The benchmark imports the inference stack and the project routes loguru/logfire to stdout, so a
+    subprocess's stdout is *not* guaranteed to be pure JSON: it can carry log lines and library banners
+    before, around, and after our output. Bracketing the JSON with unmistakable markers lets the reader
+    extract exactly our payload regardless of that noise (see `decode_plan_rows`).
+    """
+    payload = json.dumps([row.model_dump() for row in rows])
+    return f"{_PLAN_JSON_BEGIN}{payload}{_PLAN_JSON_END}"
+
+
+def decode_plan_rows(raw_stdout: str) -> list[LevelPlanRow]:
+    """Extract and parse the plan rows emitted by `encode_plan_rows` from a noisy subprocess stdout.
+
+    Raises:
+        ValueError: if the sentinel-delimited payload is absent or unparseable.
+    """
+    start = raw_stdout.find(_PLAN_JSON_BEGIN)
+    end = raw_stdout.find(_PLAN_JSON_END, start + len(_PLAN_JSON_BEGIN)) if start != -1 else -1
+    if start == -1 or end == -1:
+        raise ValueError("plan JSON markers not found in output")
+    payload = raw_stdout[start + len(_PLAN_JSON_BEGIN) : end]
+    try:
+        items = json.loads(payload)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"plan JSON payload is malformed: {e}") from e
+    return [LevelPlanRow.model_validate(item) for item in items]
+
+
 class RampPlanned(BenchmarkProgressEvent):
     """Emitted once before the first level, carrying the resource plan for every ladder level.
 
@@ -166,6 +201,23 @@ class LevelFinished(BenchmarkProgressEvent):
     num_findings: int = 0
 
 
+class SuggestionDecisionRow(BaseModel):
+    """One suggested setting's provenance, projected for the live stream.
+
+    A lean, import-light mirror of
+    [`SuggestionDecision`][horde_worker_regen.benchmark.report.SuggestionDecision] (the controller maps
+    one to the other when emitting) so a tailing TUI/console can show *why* each value holds without
+    importing the report/hordelib chain. ``value_text`` is pre-rendered (``on``/``off``/list) to keep
+    this purely presentational.
+    """
+
+    setting: str
+    value_text: str = ""
+    basis: str = ""
+    basis_label: str = ""
+    detail: str = ""
+
+
 class RampFinished(BenchmarkProgressEvent):
     """Emitted once at the end of a ramp, carrying the totals and the synthesized recommendation."""
 
@@ -176,6 +228,10 @@ class RampFinished(BenchmarkProgressEvent):
     num_findings: int = 0
     report_path: str | None = None
     suggested_bridge_data_yaml: str = ""
+    suggestion_decisions: list[SuggestionDecisionRow] = Field(default_factory=list)
+    """Per-setting provenance for the recommendation; empty for runs from before protocol v3."""
+    consistency_warnings: list[str] = Field(default_factory=list)
+    """Messages from the recommendation's self-consistency check (empty when fully grounded)."""
 
 
 AnyProgressEvent = Annotated[
@@ -381,6 +437,9 @@ __all__ = [
     "RampPlanned",
     "RampStarted",
     "RampStarting",
+    "SuggestionDecisionRow",
+    "decode_plan_rows",
+    "encode_plan_rows",
     "parse_progress_event",
     "read_progress_events",
 ]

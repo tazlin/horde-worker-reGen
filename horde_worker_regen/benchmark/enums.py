@@ -86,7 +86,27 @@ class FindingKind(StrEnum):
     SWALLOWED_ERROR = auto()
 
 
+SELECTABLE_AXES: tuple[BenchAxis, ...] = (
+    BenchAxis.QUEUE_SIZE,
+    BenchAxis.THREADS,
+    BenchAxis.BATCH,
+    BenchAxis.HIRES_FIX,
+    BenchAxis.POST_PROCESSING,
+    BenchAxis.CONTROLNET,
+    BenchAxis.QR_CODE,
+    BenchAxis.ALCHEMY_CLIP,
+    BenchAxis.ALCHEMY_GRAPH,
+    BenchAxis.ALCHEMY_CONCURRENT,
+)
+"""The axes an operator can individually deselect (CLI ``--exclude-axis``, TUI per-axis switches).
+
+Ordered by stage (concurrency, then features, then alchemy) for stable presentation. BASELINE,
+DOWNLOADS, and VALIDATION are deliberately excluded: they are governed by other flags (the tier set,
+``--include-downloads``, and ``--no-validate``) rather than by per-axis selection."""
+
+
 __all__ = [
+    "SELECTABLE_AXES",
     "BenchAxis",
     "BenchStage",
     "BenchTier",

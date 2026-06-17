@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "horde_worker_regen"
-version = "12.5.11"
+version = "12.5.12"
 description = "Allows you to connect to the AI Horde and generate images for users."
 authors = [
     {name = "tazlin", email = "tazlin.on.github@gmail.com"},

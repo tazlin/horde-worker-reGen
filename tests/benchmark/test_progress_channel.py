@@ -22,6 +22,7 @@ from horde_worker_regen.benchmark.progress_channel import (
     RampFinished,
     RampPlanned,
     RampStarted,
+    SuggestionDecisionRow,
     parse_progress_event,
     read_progress_events,
 )
@@ -91,6 +92,16 @@ def _all_event_kinds() -> list[BenchmarkProgressEvent]:
             levels_total=2,
             report_path="x/report.json",
             suggested_bridge_data_yaml="max_threads: 2",
+            suggestion_decisions=[
+                SuggestionDecisionRow(
+                    setting="allow_lora",
+                    value_text="off",
+                    basis="untested_skipped",
+                    basis_label="off: never tested (skipped)",
+                    detail="insufficient disk",
+                ),
+            ],
+            consistency_warnings=["allow_lora is enabled on a 'untested_skipped' basis, not a proven pass."],
         ),
     ]
 
@@ -233,10 +244,16 @@ def test_fake_ramp_emits_lifecycle_events(tmp_path: Path) -> None:
         ),
     )
     sink = JsonlProgressSink(tmp_path / PROGRESS_FILENAME)
-    BenchmarkController(ladder, tmp_path, process_mode="fake", progress_sink=sink).run()
+    BenchmarkController(ladder, tmp_path, process_mode="fake", validate=False, progress_sink=sink).run()
 
-    emitted_types = {type(event) for event in read_progress_events(tmp_path / PROGRESS_FILENAME)}
+    events = read_progress_events(tmp_path / PROGRESS_FILENAME)
+    emitted_types = {type(event) for event in events}
     assert RampStarted in emitted_types
     assert LevelStarted in emitted_types
     assert LevelFinished in emitted_types
     assert RampFinished in emitted_types
+
+    finished = next(event for event in events if isinstance(event, RampFinished))
+    # The recommendation provenance rides along on the completion event (protocol v3).
+    assert finished.suggestion_decisions
+    assert any(decision.setting == "models_to_load" for decision in finished.suggestion_decisions)

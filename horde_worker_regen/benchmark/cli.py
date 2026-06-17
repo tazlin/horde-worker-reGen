@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from horde_worker_regen.benchmark.enums import BenchTier
+from horde_worker_regen.benchmark.enums import SELECTABLE_AXES, BenchAxis, BenchTier
 
 if TYPE_CHECKING:
     from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel
@@ -90,6 +90,16 @@ def _add_stage_selection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-alchemy", action="store_true", help="Skip the alchemy levels.")
     parser.add_argument("--no-features", action="store_true", help="Skip the feature levels (stage C).")
     parser.add_argument("--no-concurrency", action="store_true", help="Skip the concurrency levels (stage B).")
+    parser.add_argument(
+        "--exclude-axis",
+        action="append",
+        default=[],
+        choices=[axis.value for axis in SELECTABLE_AXES],
+        metavar="AXIS",
+        help="Drop a single ramp axis, independent of the coarse stage flags (repeatable). One of: "
+        + ", ".join(axis.value for axis in SELECTABLE_AXES)
+        + ".",
+    )
 
 
 def _add_plan_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -161,6 +171,7 @@ def _prepare_ladder(
         include_features=not args.no_features,
         include_alchemy=not args.no_alchemy,
         include_downloads=args.include_downloads,
+        excluded_axes={BenchAxis(value) for value in getattr(args, "exclude_axis", [])},
         level_timeout_seconds=getattr(args, "level_timeout", 900.0),
         total_vram_mb=machine.total_vram_mb,
     )
@@ -190,9 +201,10 @@ def _run_plan(args: argparse.Namespace) -> int:
     rows = controller.build_plan_rows(machine)
 
     if args.json:
-        import json
+        from horde_worker_regen.benchmark.progress_channel import encode_plan_rows
 
-        print(json.dumps([row.model_dump() for row in rows], indent=2))  # noqa: T201
+        # Sentinel-wrapped so a reader can isolate the payload from log lines/banners on this same stdout.
+        print(encode_plan_rows(rows))  # noqa: T201
     else:
         print(format_plan_table(rows))  # noqa: T201
     return 0
