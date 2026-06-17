@@ -110,6 +110,21 @@ class TestModelAvailability:
         availability.update(present={"a"}, currently_downloading=None, pending=(), failed=())
         assert availability.scan_complete is True
 
+    def test_safety_present_round_trip(self) -> None:
+        """The required-safety-models flag defaults False and round-trips through an update."""
+        availability = ModelAvailability()
+        assert availability.safety_present is False
+        availability.update(present={"a"}, currently_downloading=None, pending=(), failed=())
+        assert availability.safety_present is False
+        availability.update(
+            present={"a"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            safety_present=True,
+        )
+        assert availability.safety_present is True
+
 
 class TestSelectModelsForPopGating:
     """``_select_models_for_pop`` must only advertise models that are on disk."""
@@ -257,6 +272,91 @@ class TestManagerDownloadHandling:
         manager._on_download_availability(_availability_message(["a"]))
         manager._process_lifecycle.request_downloads.assert_called_once()
         manager._process_lifecycle.start_inference_processes.assert_called_once()
+
+
+class TestManagerSafetyDeferral:
+    """The manager defers the safety-process launch until the download process provides its models.
+
+    Starting the safety process before the safety models (DeepDanbooru + CLIP, ~2.3GB) are on disk would
+    make it download them synchronously in its constructor, which reads as a hung worker.
+    """
+
+    def _manager_in_download_mode(self, **bridge_overrides: object) -> Mock:
+        manager = make_testable_process_manager(**bridge_overrides)  # type: ignore
+        manager._enable_background_downloads = True
+        manager._download_wait_started = time.time()
+        manager._process_lifecycle = Mock()
+        return manager  # type: ignore[return-value]
+
+    def test_safety_present_report_starts_safety(self) -> None:
+        """A report that the safety models are present starts the safety process once."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        manager._on_download_availability(_availability_message(["a"], safety_models_present=True))
+
+        manager._process_lifecycle.start_safety_processes.assert_called_once()
+        assert manager._safety_processes_started is True
+
+    def test_safety_absent_and_not_yet_attempted_defers(self) -> None:
+        """A transient post-scan report (ensure not yet attempted) must not trip the launch."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        downloading = DownloadStatusSnapshot(
+            phase=DownloadPhase.DOWNLOADING,
+            current=CurrentDownloadStatus(model_name="safety models", feature="safety models", target_dir=""),
+        )
+        manager._on_download_availability(
+            _availability_message(
+                ["a"],
+                safety_models_present=False,
+                safety_models_attempted=False,
+                status=downloading,
+            ),
+        )
+
+        manager._process_lifecycle.start_safety_processes.assert_not_called()
+        assert manager._safety_processes_started is False
+
+    def test_safety_started_when_attempted_without_success(self) -> None:
+        """If the ensure finished without producing them, start safety to self-fetch/surface the error."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        idle = DownloadStatusSnapshot(phase=DownloadPhase.IDLE)
+        manager._on_download_availability(
+            _availability_message(
+                ["a"],
+                safety_models_present=False,
+                safety_models_attempted=True,
+                status=idle,
+            ),
+        )
+
+        manager._process_lifecycle.start_safety_processes.assert_called_once()
+        assert manager._safety_processes_started is True
+
+    def test_safety_grace_fallback_when_no_report(self) -> None:
+        """A download process that never reports cannot wedge startup past the grace window."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        manager._download_wait_started = time.time() - (manager._DOWNLOAD_STARTUP_GRACE_SECONDS + 1.0)
+
+        manager._maybe_start_safety_processes()
+
+        manager._process_lifecycle.start_safety_processes.assert_called_once()
+        assert manager._safety_processes_started is True
+
+    def test_safety_no_grace_fallback_before_window(self) -> None:
+        """Before the grace window elapses (and with no report), the safety launch stays deferred."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+
+        manager._maybe_start_safety_processes()
+
+        manager._process_lifecycle.start_safety_processes.assert_not_called()
+        assert manager._safety_processes_started is False
+
+    def test_safety_starts_only_once(self) -> None:
+        """Repeated present reports do not relaunch the safety pool."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        manager._on_download_availability(_availability_message(["a"], safety_models_present=True))
+        manager._on_download_availability(_availability_message(["a"], safety_models_present=True))
+
+        manager._process_lifecycle.start_safety_processes.assert_called_once()
 
 
 class TestDispatcherRoutesDownloadMessages:

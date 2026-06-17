@@ -457,6 +457,7 @@ class HordeWorkerProcessManager:
         self._model_availability = ModelAvailability()
         self._enable_background_downloads = enable_background_downloads
         self._inference_processes_started = False
+        self._safety_processes_started = False
         self._initial_download_requested = False
         self._download_wait_started = 0.0
         self._download_plan_summary: DownloadPlanSummary | None = None
@@ -1048,6 +1049,7 @@ class HordeWorkerProcessManager:
             await self._sleep(self._loop_interval)
 
             await self.receive_and_handle_process_messages()
+            self._maybe_start_safety_processes()
             self._maybe_start_inference_processes()
             self.detect_deadlock()
 
@@ -1155,6 +1157,8 @@ class HordeWorkerProcessManager:
             failed=tuple(message.failed_downloads),
             status=message.status,
             scan_complete=message.scan_complete,
+            safety_present=message.safety_models_present,
+            safety_attempted=message.safety_models_attempted,
         )
 
         # A completed download changed the on-disk reference (a new image model, or the LoRa/TI/aux
@@ -1181,7 +1185,56 @@ class HordeWorkerProcessManager:
                 )
                 self._process_lifecycle.request_downloads(missing, download_aux=download_aux)
 
+        self._maybe_start_safety_processes()
         self._maybe_start_inference_processes()
+
+    def _maybe_start_safety_processes(self) -> None:
+        """Start safety processes once the required safety models are on disk (background-download mode).
+
+        The safety models (DeepDanbooru + CLIP, ~2.3GB) are fetched by the dedicated download process.
+        Starting the safety process before they are present would make it download them synchronously in
+        its constructor: minutes of work with no parent-visible state change, which reads as a hung
+        worker (especially under the TUI, whose console is redirected). So we defer the launch until the
+        download process reports them present.
+
+        The fallback is deliberately narrow to avoid a duplicate, concurrent download: we only start the
+        safety process early (to let it self-fetch) once the download process has *finished* its one-shot
+        ensure without producing them (``safety_attempted`` but not ``safety_present`` -- e.g. the download
+        failed), or when it never reported at all (a crashed import, bounded by the startup grace). While
+        the ensure is still pending or in flight we simply wait, which is the whole point: the operator
+        sees a real "downloading safety models" phase instead of a freeze. A transient post-scan idle
+        report (ensure not yet attempted) must not trip the fallback, which is why this keys on
+        ``safety_attempted`` rather than the download phase.
+        """
+        if self._safety_processes_started or not self._enable_background_downloads:
+            return
+
+        availability = self._model_availability
+        if availability.safety_present:
+            logger.info("Required safety models are present on disk; starting safety processes")
+            self._process_lifecycle.start_safety_processes()
+            self._safety_processes_started = True
+            return
+
+        if availability.safety_attempted:
+            logger.warning(
+                "Download process finished without providing the safety models; starting the safety "
+                "process to fetch them directly (it will surface any download error)",
+            )
+            self._process_lifecycle.start_safety_processes()
+            self._safety_processes_started = True
+            return
+
+        # A download process that never reported at all (crashed/hung import) must not wedge startup.
+        if not availability.is_known and (time.time() - self._download_wait_started) > (
+            self._DOWNLOAD_STARTUP_GRACE_SECONDS
+        ):
+            logger.warning(
+                "No model availability report after "
+                f"{self._DOWNLOAD_STARTUP_GRACE_SECONDS:.0f}s; starting safety processes anyway",
+            )
+            self._process_lifecycle.start_safety_processes()
+            self._safety_processes_started = True
 
     def _maybe_start_inference_processes(self) -> None:
         """Start inference processes once at least one model is present (background-download mode).
@@ -1349,13 +1402,18 @@ class HordeWorkerProcessManager:
             self._abort()
 
     async def _process_control_loop(self) -> None:
-        self._process_lifecycle.start_safety_processes()
         self._download_wait_started = time.time()
         if self._enable_background_downloads:
             self._process_lifecycle.start_download_process()
-            # Inference processes are started lazily once a model is on disk; see
-            # _maybe_start_inference_processes (called from the availability handler and each tick).
+            # Both the safety and inference processes are started lazily once their required models are on
+            # disk; see _maybe_start_safety_processes / _maybe_start_inference_processes (called from the
+            # availability handler and each tick). Starting the safety process up front would make it
+            # download the ~2.3GB safety models synchronously (and invisibly) in its constructor.
         else:
+            # Without a download process there is nothing to defer to: start everything up front and let
+            # the safety process fetch its own models (the legacy behaviour for tests/harness/dry-run).
+            self._process_lifecycle.start_safety_processes()
+            self._safety_processes_started = True
             self._process_lifecycle.start_inference_processes()
             self._inference_processes_started = True
 
@@ -1683,8 +1741,18 @@ class HordeWorkerProcessManager:
             )
             for info in self._process_map.values()
         )
+        # The download process lives outside the process map, so its phase/current-download is folded in
+        # here too; otherwise a startup that is only downloading (e.g. the required safety models, before
+        # any process is up) would ride the 2s heartbeat and read as a frozen frame for that window.
+        download_status = self._model_availability.status
+        download_fingerprint: tuple[object, ...] = (
+            (download_status.phase, download_status.current.model_name if download_status.current else None)
+            if download_status is not None
+            else ()
+        )
         return (
             per_process,
+            download_fingerprint,
             self.num_jobs_total,
             self._job_tracker.total_num_completed_jobs,
             self._job_tracker.num_jobs_faulted,

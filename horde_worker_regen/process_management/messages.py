@@ -240,6 +240,15 @@ class HordeDownloadAvailabilityMessage(HordeProcessMessage):
     """Models whose download was attempted and failed (will not be retried automatically)."""
     scan_complete: bool = True
     """False for early initializing/scanning reports whose on-disk set is not yet authoritative."""
+    safety_models_present: bool = False
+    """True once the required safety models (DeepDanbooru + CLIP) are confirmed on disk. The main
+    process defers the safety-process launch until this is set, so the safety process finds them
+    already downloaded instead of fetching ~2.3GB synchronously (and invisibly) in its constructor."""
+    safety_models_attempted: bool = False
+    """True once the download process has finished its one-shot ensure of the safety models, whether it
+    succeeded or failed. Lets the main process tell 'not tried yet' (a transient post-scan idle report,
+    keep waiting) apart from 'tried and could not provide them' (start the safety process so it self-fetches
+    and surfaces the real error). Always True alongside ``safety_models_present``."""
     status: DownloadStatusSnapshot | None = None
     """Rich, display-oriented status (phase, current download, queue, failures) for the TUI/console."""
     reference_changed: bool = False

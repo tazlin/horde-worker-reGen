@@ -746,6 +746,10 @@ class FakeDownloadProcess(HordeProcess):
                 currently_downloading=self._currently_downloading,
                 pending_downloads=list(self._pending),
                 failed_downloads=list(self._failed),
+                # The dry-run harness has no real safety models; report them present so the parent starts
+                # the (dry-run) safety process immediately, matching the worker's pre-deferral behaviour.
+                safety_models_present=True,
+                safety_models_attempted=True,
                 status=self._status_snapshot(),
             ),
         )

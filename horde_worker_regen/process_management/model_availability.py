@@ -29,6 +29,8 @@ class ModelAvailability:
     _failed: tuple[str, ...]
     _status: DownloadStatusSnapshot | None
     _scan_complete: bool
+    _safety_present: bool
+    _safety_attempted: bool
 
     def __init__(self) -> None:
         """Initialise with availability unknown (no report received yet)."""
@@ -38,6 +40,8 @@ class ModelAvailability:
         self._failed = ()
         self._status = None
         self._scan_complete = False
+        self._safety_present = False
+        self._safety_attempted = False
 
     @property
     def is_known(self) -> bool:
@@ -48,6 +52,16 @@ class ModelAvailability:
     def scan_complete(self) -> bool:
         """Whether the latest report is an authoritative post-disk-scan one."""
         return self._scan_complete
+
+    @property
+    def safety_present(self) -> bool:
+        """Whether the required safety models (DeepDanbooru + CLIP) are confirmed on disk."""
+        return self._safety_present
+
+    @property
+    def safety_attempted(self) -> bool:
+        """Whether the download process has finished its one-shot ensure of the safety models."""
+        return self._safety_attempted
 
     @property
     def status(self) -> DownloadStatusSnapshot | None:
@@ -83,6 +97,8 @@ class ModelAvailability:
         failed: tuple[str, ...],
         status: DownloadStatusSnapshot | None = None,
         scan_complete: bool = True,
+        safety_present: bool = False,
+        safety_attempted: bool = False,
     ) -> None:
         """Replace the availability snapshot with a fresh report from the download process."""
         self._present = set(present)
@@ -91,6 +107,8 @@ class ModelAvailability:
         self._failed = failed
         self._status = status
         self._scan_complete = scan_complete
+        self._safety_present = safety_present
+        self._safety_attempted = safety_attempted
 
     def is_present(self, model_name: str) -> bool:
         """Return whether ``model_name`` is present on disk.
