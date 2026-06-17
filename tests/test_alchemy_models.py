@@ -73,7 +73,9 @@ class TestExpandOfferedForms:
         assert "4x_AnimeSharp" in offered
         assert "GFPGAN" in offered
         assert "CodeFormers" in offered
-        assert "strip_background" in offered
+        assert "strip_background" not in offered, (
+            "strip_background is not currently offered by default, so being here would be a surprise"
+        )
         assert "BACKEND_DEFAULT" not in offered
 
     def test_caption_offered_with_opt_in(self) -> None:
