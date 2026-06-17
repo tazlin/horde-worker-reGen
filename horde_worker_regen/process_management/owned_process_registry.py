@@ -183,3 +183,42 @@ class OwnedProcessRegistry:
                 proc.kill()
                 killed.append(record.os_pid)
         return killed
+
+
+def kill_process_tree(pid: int, *, grace_seconds: float = 5.0) -> list[int]:
+    """Kill a process and all of its descendants (best-effort); return the pids targeted.
+
+    Killing only a top-level process orphans its children on platforms (notably Windows) where a
+    child's lifetime is not tied to its parent's by a process group or job object. The benchmark stack
+    is three deep -- controller -> per-level runner -> worker children (inference/safety/download) -- so
+    a cancel or a hung-level kill that targets only the top process leaves the GPU-resident workers
+    running long after the user asked them to stop (the exact symptom this addresses). This enumerates
+    the whole descendant tree *first* (so nothing is reparented out of reach mid-kill), asks each to
+    terminate, then hard-kills any survivor after a short grace.
+
+    This complements -- it does not replace -- :class:`OwnedProcessRegistry`: the registry reaps a prior
+    run's orphans on the *next* startup and ``atexit`` kills children on a *graceful* exit, but neither
+    can kill a still-living tree the moment a user cancels or a parent is hard-killed (``atexit`` never
+    runs on ``TerminateProcess``/``SIGKILL``).
+    """
+    try:
+        root = psutil.Process(pid)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return []
+
+    try:
+        tree = [*root.children(recursive=True), root]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        tree = [root]
+
+    for proc in tree:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            proc.terminate()
+
+    _gone, alive = psutil.wait_procs(tree, timeout=grace_seconds)
+    for proc in alive:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            proc.kill()
+    psutil.wait_procs(alive, timeout=grace_seconds)
+
+    return [proc.pid for proc in tree]

@@ -65,6 +65,12 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Show per-process state in the live view and raise spawned worker logging to TRACE.",
     )
+    ramp.add_argument(
+        "--no-abort-on-catastrophe",
+        action="store_true",
+        help="Keep running after a level hangs/crashes instead of aborting the whole ramp "
+        "(by default the first catastrophic failure stops the ramp, since the worker stack is shared).",
+    )
 
 
 def _run_ramp(args: argparse.Namespace) -> int:
@@ -111,6 +117,7 @@ def _run_ramp(args: argparse.Namespace) -> int:
         progress_sink=progress_sink,
         warm=args.warm,
         verbose=args.verbose,
+        abort_on_catastrophe=not args.no_abort_on_catastrophe,
     )
     try:
         report = controller.run()

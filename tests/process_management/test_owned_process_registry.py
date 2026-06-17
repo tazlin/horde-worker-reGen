@@ -20,6 +20,7 @@ import pytest
 from horde_worker_regen.process_management.owned_process_registry import (
     OwnedProcessRecord,
     OwnedProcessRegistry,
+    kill_process_tree,
 )
 
 _SLEEPER_CODE = "import time; time.sleep(30)"
@@ -128,6 +129,51 @@ def test_kill_all_owned(tmp_path: Path, sleeper: subprocess.Popen[bytes]) -> Non
     while psutil.pid_exists(sleeper.pid) and time.time() < deadline:
         time.sleep(0.05)
     assert not _is_running(sleeper.pid)
+
+
+def test_kill_process_tree_kills_descendants(tmp_path: Path) -> None:
+    """kill_process_tree reaps a parent *and* its children -- the orphan source on cancel/hung-level kill.
+
+    A benchmark cancel that targeted only the controller left the level runner and its GPU-resident
+    worker children alive (no parent-child lifetime link under spawn on Windows). This spawns a parent
+    that itself spawns a child and asserts that killing the *tree* takes both down.
+    """
+    parent_code = (
+        "import subprocess, sys, time; "
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        "time.sleep(60)"
+    )
+    parent = subprocess.Popen([sys.executable, "-c", parent_code])  # noqa: S603
+    child_pids: list[int] = []
+    try:
+        # Wait for the grandchild to come up so the tree actually has depth to orphan.
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                child_pids = [c.pid for c in psutil.Process(parent.pid).children(recursive=True)]
+            if child_pids:
+                break
+            time.sleep(0.1)
+        assert child_pids, "parent never spawned a child for the test to orphan"
+
+        targeted = kill_process_tree(parent.pid, grace_seconds=5.0)
+        assert parent.pid in targeted
+        assert all(pid in targeted for pid in child_pids)
+
+        # The parent and every descendant are gone shortly after (zombies count as dead).
+        all_pids = [parent.pid, *child_pids]
+        gone_deadline = time.time() + 5
+        while time.time() < gone_deadline and any(_is_running(pid) for pid in all_pids):
+            time.sleep(0.05)
+        for pid in all_pids:
+            assert not _is_running(pid), f"pid {pid} survived the tree kill"
+    finally:
+        with contextlib.suppress(Exception):
+            parent.kill()
+            parent.wait(timeout=5)
+        for pid in child_pids:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                psutil.Process(pid).kill()
 
 
 def _is_running(pid: int) -> bool:

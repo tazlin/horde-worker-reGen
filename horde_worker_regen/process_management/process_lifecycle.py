@@ -43,6 +43,19 @@ each restart costs a model (re)load and starves the worker. Past this count the 
 recovery supervisor rather than papered over by an unbounded respawn loop.
 """
 
+CRASH_LOOP_MAX_START_FAILURES: int = 3
+"""Consecutive replacements while still in ``PROCESS_STARTING`` before a slot is quarantined.
+
+This is the rate-independent companion to the sliding-window breaker above. A slot that *never*
+advances past ``PROCESS_STARTING`` before dying has not proven it can initialise at all (a broken
+dependency, a missing model, an import error). Such a failure is deterministic, so each restart costs
+the full, slow cold-start before failing again -- and if that cold-start is slower than
+``CRASH_LOOP_WINDOW_SECONDS / CRASH_LOOP_MAX_REPLACEMENTS`` the window breaker can never accumulate
+enough replacements *within the window* to trip (the early ones age out), so the slot would respawn
+forever. Counting consecutive start-failures regardless of spacing catches exactly that case. The
+streak resets the moment the slot reaches any later state (it did initialise, then failed differently).
+"""
+
 SAFETY_CRASH_LOOP_MAX: int = 3
 """Safety-pool replacements within ``CRASH_LOOP_WINDOW_SECONDS`` before the pool is reported as failing.
 
@@ -94,6 +107,7 @@ class ProcessLifecycleManager:
     _hung_processes_detected: bool
     _hung_processes_detected_time: float
     _slot_recovery_history: dict[int, list[float]]
+    _slot_consecutive_start_failures: dict[int, int]
     _quarantined_inference_slots: set[int]
     _num_slots_quarantined: int
     _safety_recovery_history: list[float]
@@ -158,6 +172,7 @@ class ProcessLifecycleManager:
         self._on_process_recovery: Callable[[HordeProcessInfo, str], None] | None = None
         self._download_process_info = None
         self._slot_recovery_history = {}
+        self._slot_consecutive_start_failures = {}
         self._quarantined_inference_slots = set()
         self._num_slots_quarantined = 0
         self._safety_recovery_history = []
@@ -752,15 +767,33 @@ class ProcessLifecycleManager:
         self._slot_recovery_history[process_id] = recent
         return len(recent)
 
-    def _quarantine_inference_slot(self, process_info: HordeProcessInfo, replacements_in_window: int) -> None:
-        """Take a crash-looping inference slot out of the pool instead of respawning it again.
+    def _record_start_failure(self, process_info: HordeProcessInfo) -> int:
+        """Track consecutive replacements that never advanced past PROCESS_STARTING; return the streak.
 
-        The slot has died or hung ``replacements_in_window`` times inside the crash-loop window, so
-        respawning it would just repeat the loop and keep starving the worker. Its OS process was
-        already ended by the caller, and the caller already recorded the recovery event; here we only
-        drop it from the process map and remember it so it is not silently refilled. The lost capacity
-        is surfaced via ``num_slots_quarantined`` so the higher-level recovery supervisor (Phase 5)
-        can escalate when too much capacity is lost.
+        A replacement while still in ``PROCESS_STARTING`` means the slot died (or was killed) before it
+        ever became job-capable, so it never proved it can initialise. These are counted consecutively
+        and the streak resets the moment a slot is replaced from any later state (it did initialise, then
+        failed differently). Unlike :meth:`_record_slot_recovery`, this is independent of how long each
+        failed start took, so a slow but deterministic crash-on-start is still caught.
+        """
+        process_id = process_info.process_id
+        if process_info.last_process_state == HordeProcessState.PROCESS_STARTING:
+            streak = self._slot_consecutive_start_failures.get(process_id, 0) + 1
+            self._slot_consecutive_start_failures[process_id] = streak
+            return streak
+        self._slot_consecutive_start_failures.pop(process_id, None)
+        return 0
+
+    def _quarantine_inference_slot(self, process_info: HordeProcessInfo, reason: str) -> None:
+        """Take a crash-looping (or crash-on-start) inference slot out of the pool instead of respawning it.
+
+        The slot has tripped one of the circuit breakers (too many replacements in the window, or too
+        many consecutive failures before reaching readiness), so respawning it would just repeat the
+        loop and keep starving the worker. Its OS process was already ended by the caller, and the
+        caller already recorded the recovery event; here we only drop it from the process map and
+        remember it so it is not silently refilled. The lost capacity is surfaced via
+        ``num_slots_quarantined`` so the higher-level recovery supervisor (Phase 5) can escalate when
+        too much capacity is lost.
         """
         self._quarantined_inference_slots.add(process_info.process_id)
         self._num_slots_quarantined += 1
@@ -770,11 +803,10 @@ class ProcessLifecycleManager:
             process_id=process_info.process_id,
             os_pid=process_info.os_pid,
             launch_identifier=process_info.process_launch_identifier,
-            reason=f"crash loop: {replacements_in_window} replacements in {CRASH_LOOP_WINDOW_SECONDS:.0f}s",
+            reason=reason,
         )
         logger.critical(
-            f"Inference slot {process_info.process_id} quarantined after {replacements_in_window} replacements "
-            f"within {CRASH_LOOP_WINDOW_SECONDS:.0f}s (crash loop); not respawning it.",
+            f"Inference slot {process_info.process_id} quarantined ({reason}); not respawning it.",
         )
 
     def rebuild_inference_pool(self, *, reason: str) -> None:
@@ -788,6 +820,7 @@ class ProcessLifecycleManager:
         """
         logger.error(f"Soft reset: rebuilding inference pool ({reason}).")
         self._slot_recovery_history.clear()
+        self._slot_consecutive_start_failures.clear()
 
         revived = sorted(self._quarantined_inference_slots)
         self._quarantined_inference_slots.clear()
@@ -859,12 +892,23 @@ class ProcessLifecycleManager:
             )
 
         replacements_in_window = self._record_slot_recovery(process_info.process_id)
-        will_quarantine = replacements_in_window > CRASH_LOOP_MAX_REPLACEMENTS
-        recovery_reason = (
-            f"inference slot quarantined (crash loop: {replacements_in_window} replacements)"
-            if will_quarantine
-            else "inference process replaced (crashed or hung)"
-        )
+        consecutive_start_failures = self._record_start_failure(process_info)
+        crash_looped = replacements_in_window > CRASH_LOOP_MAX_REPLACEMENTS
+        crash_on_start = consecutive_start_failures >= CRASH_LOOP_MAX_START_FAILURES
+        will_quarantine = crash_looped or crash_on_start
+        if not will_quarantine:
+            quarantine_reason = ""
+            recovery_reason = "inference process replaced (crashed or hung)"
+        elif crash_on_start:
+            quarantine_reason = (
+                f"crash on start: {consecutive_start_failures} consecutive failures before reaching readiness"
+            )
+            recovery_reason = f"inference slot quarantined ({quarantine_reason})"
+        else:
+            quarantine_reason = (
+                f"crash loop: {replacements_in_window} replacements within {CRASH_LOOP_WINDOW_SECONDS:.0f}s"
+            )
+            recovery_reason = f"inference slot quarantined ({quarantine_reason})"
         # Record the recovery while the process info still reflects the faulted state: ending the
         # process first overwrites last_process_state with PROCESS_ENDING and loses that diagnostic.
         self._log_recovery_diagnostics(process_info, recovery_reason)
@@ -885,7 +929,7 @@ class ProcessLifecycleManager:
         self._num_process_recoveries += 1
 
         if will_quarantine:
-            self._quarantine_inference_slot(process_info, replacements_in_window)
+            self._quarantine_inference_slot(process_info, quarantine_reason)
             return
 
         self._start_inference_process(process_info.process_id)
@@ -1035,6 +1079,16 @@ class ProcessLifecycleManager:
             self._recently_recovered = False
 
         now = time.time()
+
+        # A live inference slot that has advanced past PROCESS_STARTING has proven it can initialise,
+        # so clear any consecutive crash-on-start streak it accrued. Only slots that never get past
+        # startup keep accumulating toward the crash-on-start breaker in `_replace_inference_process`.
+        for live_process in self._process_map.values():
+            if (
+                live_process.process_type == HordeProcessType.INFERENCE
+                and live_process.last_process_state != HordeProcessState.PROCESS_STARTING
+            ):
+                self._slot_consecutive_start_failures.pop(live_process.process_id, None)
 
         # Soft, evidence-based slowdown grading runs every tick (cheap, no side effects beyond logging
         # and audit) regardless of the recovery debounce below, which only gates hard replacement.

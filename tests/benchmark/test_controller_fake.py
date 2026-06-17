@@ -158,6 +158,77 @@ def test_crashed_subprocess_recorded_and_ramp_survives(tmp_path: Path, monkeypat
     assert (tmp_path / "report.md").exists()
 
 
+def test_catastrophic_level_aborts_whole_ramp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hung/crashed level aborts the entire ramp: later levels (even in other tiers) are skipped, not run.
+
+    The worker stack is shared across every level, so a fundamental failure (the observed broken-dependency
+    crash-on-start, or a wedged startup) would repeat on every later level and burn the full ramp's
+    timeouts doing nothing. The first catastrophic outcome must short-circuit the rest.
+    """
+    calls = {"n": 0}
+
+    def _hung_subprocess(self: BenchmarkController, level: object, command: object) -> tuple[int, bool]:
+        calls["n"] += 1
+        return -1, True  # every level "hangs"
+
+    monkeypatch.setattr(BenchmarkController, "_run_level_subprocess", _hung_subprocess)
+
+    ladder = build_default_ladder(
+        LadderOptions(
+            tiers=["sd15", "sdxl"],
+            jobs_per_level=2,
+            include_concurrency=False,
+            include_features=False,
+            include_alchemy=False,
+        ),
+    )
+    assert len(ladder) >= 2, "need a second (different-tier) level to prove the abort skips it"
+
+    controller = BenchmarkController(ladder, tmp_path, process_mode="fake", validate=False)
+    report = controller.run()
+
+    assert report.levels[0].outcome == "crashed_hang"
+    # Only the first level ran; the rest were skipped by the abort, not executed.
+    assert calls["n"] == 1, "only the first (catastrophic) level should have run"
+    later = report.levels[1:]
+    assert later and all(level.outcome == "skipped" for level in later)
+    assert all(any("aborted" in reason for reason in level.reasons) for level in later)
+
+
+def test_abort_on_catastrophe_can_be_disabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the abort disabled, the ramp runs every level despite a catastrophic first level."""
+    calls = {"n": 0}
+
+    def _hung_subprocess(self: BenchmarkController, level: object, command: object) -> tuple[int, bool]:
+        calls["n"] += 1
+        return -1, True
+
+    monkeypatch.setattr(BenchmarkController, "_run_level_subprocess", _hung_subprocess)
+
+    ladder = build_default_ladder(
+        LadderOptions(
+            tiers=["sd15", "sdxl"],
+            jobs_per_level=2,
+            include_concurrency=False,
+            include_features=False,
+            include_alchemy=False,
+        ),
+    )
+
+    controller = BenchmarkController(
+        ladder,
+        tmp_path,
+        process_mode="fake",
+        validate=False,
+        abort_on_catastrophe=False,
+    )
+    report = controller.run()
+
+    # Both tier baselines run (different tiers, so the tier-skip rule never engages); none skipped-by-abort.
+    assert calls["n"] == len(ladder)
+    assert all(level.outcome == "crashed_hang" for level in report.levels)
+
+
 def test_hung_subprocess_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A level subprocess that exceeds its timeout is killed and recorded as a hang."""
 

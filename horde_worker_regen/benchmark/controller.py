@@ -54,6 +54,7 @@ from horde_worker_regen.benchmark.report import (
     synthesize_bridge_data,
 )
 from horde_worker_regen.benchmark.soak import build_validation_level
+from horde_worker_regen.process_management.owned_process_registry import kill_process_tree
 from horde_worker_regen.process_management.worker_entry_points import WORKER_LOG_VERBOSITY_ENV
 
 _SUBPROCESS_GRACE_SECONDS = 120.0
@@ -180,6 +181,7 @@ class BenchmarkController:
         progress_sink: ProgressSink | None = None,
         warm: bool = False,
         verbose: bool = False,
+        abort_on_catastrophe: bool = True,
     ) -> None:
         """Initialize the controller.
 
@@ -198,6 +200,11 @@ class BenchmarkController:
                 use their own isolated subprocess.
             verbose: Raise the spawned worker children's log verbosity to TRACE so their per-process
                 logs capture the full cold-start detail (for diagnosing slow/wedged startups).
+            abort_on_catastrophe: Stop the whole ramp the first time a level hangs, crashes, or a tier
+                baseline does no work while its processes crash-loop. The worker stack is shared across
+                every level, so a fundamental failure (a broken dependency, a wedged startup) repeats on
+                every subsequent level; aborting turns ~30 wasted minutes into one finding. Disable to
+                collect every level's outcome regardless (e.g. when characterising a flaky failure).
         """
         self._ladder = ladder
         self._out_dir = out_dir
@@ -210,6 +217,7 @@ class BenchmarkController:
         self._sink = progress_sink if progress_sink is not None else NullProgressSink()
         self._warm = warm
         self._verbose = verbose
+        self._abort_on_catastrophe = abort_on_catastrophe
         self._warm_driver: _WarmSessionDriver | None = None
 
         if verbose:
@@ -228,16 +236,34 @@ class BenchmarkController:
         reports: list[LevelReport] = []
 
         self._maybe_start_warm_driver()
+        aborted_reason: str | None = None
         try:
             for level_index, level in enumerate(self._ladder):
                 if self._only_level is not None and level.id != self._only_level:
                     continue
 
                 self._emit_level_started(level, level_index=level_index, num_levels=len(self._ladder))
+
+                # Once the ramp has aborted, the remaining levels are recorded as skipped (with the
+                # abort reason) so the report and progress stream stay complete, but none are run.
+                if aborted_reason is not None:
+                    report = LevelReport(level=level, outcome="skipped", reasons=[aborted_reason])
+                    reports.append(report)
+                    self._emit_level_finished(report)
+                    continue
+
                 report = self._resolve_level_report(level, machine)
                 reports.append(report)
                 self._emit_level_finished(report)
                 self._record_baseline_bookkeeping(level, report)
+
+                if self._abort_on_catastrophe and self._is_catastrophic_outcome(level, report):
+                    aborted_reason = (
+                        f"ramp aborted after catastrophic failure in {level.id} ({report.outcome}): "
+                        "the worker stack is shared across all levels, so a fundamental failure repeats; "
+                        "skipping all remaining levels"
+                    )
+                    logger.error(aborted_reason)
         finally:
             self._stop_warm_driver()
 
@@ -285,6 +311,28 @@ class BenchmarkController:
             self._failed_tier_baselines.add(level.tier)
         self._failed_axes.add((level.tier, level.axis))
         logger.warning(f"Level {level.id} did not pass: {'; '.join(report.reasons) or report.outcome}")
+
+    def _is_catastrophic_outcome(self, level: RampLevel, report: LevelReport) -> bool:
+        """Whether a level's outcome means the shared worker stack is broken (so the ramp should abort).
+
+        Two shapes qualify, both distinct from a level that merely ran too slow (a normal ``failed`` that
+        only skips its own tier/axis):
+
+        - ``crashed`` / ``crashed_hang``: the level subprocess hung or died without a usable result, i.e.
+          the worker process itself fell over. Every later level reuses that same stack.
+        - a tier *baseline* that completed zero jobs while its processes crashed or had to be recovered:
+          the simplest possible workload could not be served, so nothing heavier in the ramp will be.
+        """
+        if report.outcome in ("crashed", "crashed_hang"):
+            return True
+        if report.outcome == "failed" and level.establishes_tier_baseline:
+            completed = report.harness.num_jobs_completed if report.harness is not None else 0
+            fell_over = any(
+                finding.kind in ("crash", "oom", "hang", "process_recovery") for finding in report.findings
+            )
+            if completed == 0 and fell_over:
+                return True
+        return False
 
     # region progress events
 
@@ -678,14 +726,17 @@ class BenchmarkController:
                 except subprocess.TimeoutExpired:
                     last_live_signature = self._emit_live_progress(level, live_path, last_live_signature)
                     if time.time() >= deadline:
-                        process.kill()
+                        # Kill the whole tree, not just the level runner: under spawn the runner's worker
+                        # children (inference/safety/download) are grandchildren of this controller and
+                        # would otherwise be orphaned (GPU still resident) when the runner is killed.
+                        kill_process_tree(process.pid, grace_seconds=_SUBPROCESS_KILL_WAIT_SECONDS)
                         with contextlib.suppress(Exception):
                             process.wait(timeout=_SUBPROCESS_KILL_WAIT_SECONDS)
                         return -1, True
         finally:
             if process.poll() is None:
                 with contextlib.suppress(Exception):
-                    process.kill()
+                    kill_process_tree(process.pid, grace_seconds=_SUBPROCESS_KILL_WAIT_SECONDS)
             subprocess_log.close()
 
     def _emit_live_progress(self, level: RampLevel, live_path: Path, last_signature: str | None) -> str | None:

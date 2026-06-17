@@ -12,10 +12,17 @@ from __future__ import annotations
 import time
 from unittest.mock import Mock
 
+import pytest
+
+import horde_worker_regen.process_management.process_lifecycle as process_lifecycle_module
 from horde_worker_regen.process_management.action_ledger import LedgerEventType
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import HordeHeartbeatType, HordeProcessState
-from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.process_lifecycle import (
+    CRASH_LOOP_MAX_START_FAILURES,
+    CRASH_LOOP_WINDOW_SECONDS,
+    ProcessLifecycleManager,
+)
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
@@ -185,3 +192,70 @@ def test_quarantine_is_recorded_in_action_ledger() -> None:
 
     events = [event.event_type for event in plm.action_ledger.recent(process_id=0, limit=50)]
     assert LedgerEventType.PROCESS_QUARANTINED in events
+
+
+def test_slow_crash_on_start_is_quarantined_despite_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deterministic crash-on-start that dies slower than the window can count must still be quarantined.
+
+    This is the empirical shape of the observed benchmark wedge: an inference child crashed during
+    ``hordelib.initialise()`` (a broken dependency) every launch, but each crash took ~30-250s, so the
+    sliding-window breaker -- which only fires on more than ``CRASH_LOOP_MAX_REPLACEMENTS`` replacements
+    *within* ``CRASH_LOOP_WINDOW_SECONDS`` -- could never accumulate enough before the early ones aged
+    out. The slot respawned for the full level timeout (~15 min, 0 jobs). The consecutive crash-on-start
+    streak quarantines it regardless of how slow each crash is.
+    """
+    dead = make_mock_process_info(0, model_name=None, state=HordeProcessState.PROCESS_STARTING)
+    dead.mp_process.is_alive.return_value = False
+    dead.mp_process.exitcode = 1  # pyrefly: ignore
+    plm = _make_plm(process_map=ProcessMap({0: dead}))
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+
+    # Space the crashes so that the sliding window can hold at most two at a time: the rate breaker
+    # provably cannot fire, isolating the consecutive-start-failure path under test.
+    clock = [1000.0]
+    spacing = CRASH_LOOP_WINDOW_SECONDS / 2 + 1.0
+    monkeypatch.setattr(process_lifecycle_module.time, "time", lambda: clock[0])
+
+    for _ in range(CRASH_LOOP_MAX_START_FAILURES):
+        plm._replace_inference_process(dead)
+        clock[0] += spacing
+
+    assert 0 in plm.quarantined_inference_slots
+    # The window never held more than two replacements, so the rate breaker alone would not have fired.
+    assert len(plm._slot_recovery_history.get(0, [])) <= 2
+
+
+def test_consecutive_start_failures_reset_once_a_slot_reaches_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A slot that crashes on start, then successfully initialises, must not carry its old failure streak.
+
+    The crash-on-start breaker counts *consecutive* failures before readiness. Reaching any later state
+    proves the slot can initialise, so a single later crash must not tip an old, unrelated streak over
+    the quarantine threshold (which would wrongly retire a healthy-but-occasionally-faulting slot).
+    """
+    clock = [1000.0]
+    monkeypatch.setattr(process_lifecycle_module.time, "time", lambda: clock[0])
+
+    dead = make_mock_process_info(0, model_name=None, state=HordeProcessState.PROCESS_STARTING)
+    dead.mp_process.is_alive.return_value = False
+    dead.mp_process.exitcode = 1  # pyrefly: ignore
+    plm = _make_plm(process_map=ProcessMap({0: dead}))
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+
+    # Two crash-on-start failures: one short of the quarantine threshold.
+    for _ in range(CRASH_LOOP_MAX_START_FAILURES - 1):
+        plm._replace_inference_process(dead)
+        clock[0] += 1.0
+    assert plm._slot_consecutive_start_failures.get(0) == CRASH_LOOP_MAX_START_FAILURES - 1
+
+    # The slot now comes up healthy (reaches WAITING_FOR_JOB); the watchdog tick clears its streak.
+    ready = make_mock_process_info(0, model_name="m", state=HordeProcessState.WAITING_FOR_JOB)
+    plm._process_map[0] = ready
+    plm.replace_hung_processes()
+    assert 0 not in plm._slot_consecutive_start_failures
+
+    # A later, isolated crash-on-start starts a fresh streak rather than tipping into quarantine.
+    plm._replace_inference_process(dead)
+    assert 0 not in plm.quarantined_inference_slots
+    assert plm._slot_consecutive_start_failures.get(0) == 1

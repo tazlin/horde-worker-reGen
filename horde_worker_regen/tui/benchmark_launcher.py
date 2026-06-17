@@ -36,6 +36,7 @@ from horde_worker_regen.benchmark.progress_channel import (
     RampFinished,
     RampStarted,
 )
+from horde_worker_regen.process_management.owned_process_registry import kill_process_tree
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH, load_config, save_config
 
 if TYPE_CHECKING:
@@ -291,14 +292,17 @@ class BenchmarkSupervisor:
         return events
 
     def cancel(self) -> None:
-        """Terminate the benchmark subprocess (and its level child) if it is still running."""
+        """Terminate the benchmark subprocess tree (controller, level runner, and worker children).
+
+        Killing only the controller process orphans the level runner and its GPU-resident worker
+        children under spawn (no parent-child lifetime link on Windows), which is exactly why cancelled
+        benchmarks were observed to keep running. ``kill_process_tree`` reaps the whole descendant tree.
+        """
         process = self._process
         if process is not None and process.poll() is None:
-            process.terminate()
-            try:
+            kill_process_tree(process.pid, grace_seconds=_CANCEL_GRACE_SECONDS)
+            with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(_CANCEL_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                process.kill()
         self._close_console()
         if self._status is BenchmarkSupervisorStatus.RUNNING:
             self._status = BenchmarkSupervisorStatus.CANCELLED
