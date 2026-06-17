@@ -1,0 +1,5 @@
+title: Reference
+nav:
+    - cli.md
+    - logs.md
+    - codebase-map.md

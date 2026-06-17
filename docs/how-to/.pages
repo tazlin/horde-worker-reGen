@@ -1,0 +1,13 @@
+title: How-to guides
+nav:
+    - install.md
+    - configure-for-your-gpu.md
+    - use-the-dashboard.md
+    - run-headless.md
+    - update-the-worker.md
+    - run-multiple-gpus.md
+    - add-custom-models.md
+    - run-on-amd-rocm.md
+    - choose-a-pytorch-build.md
+    - run-in-docker.md
+    - troubleshoot.md

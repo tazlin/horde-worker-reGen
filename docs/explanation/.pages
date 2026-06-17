@@ -1,0 +1,16 @@
+title: Explanation
+nav:
+    - architecture.md
+    - job_lifecycle.md
+    - job_state_machine.md
+    - bridge_config.md
+    - ipc_and_messaging.md
+    - process_lifecycle.md
+    - performance_and_backpressure.md
+    - compute_backends.md
+    - shutdown_and_faults.md
+    - resilience_and_recovery.md
+    - model_downloads.md
+    - frontend_and_state.md
+    - telemetry.md
+    - code_issues_for_remediation.md
