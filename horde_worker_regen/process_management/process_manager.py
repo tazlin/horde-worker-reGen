@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import asyncio.exceptions
 import dataclasses
-import multiprocessing
 import os
 import ssl
 import sys
@@ -201,7 +200,13 @@ class MultiprocessingPrimitives:
         the bound is never hit in normal operation.
         """
         return cls(
-            process_message_queue=multiprocessing.Queue(),
+            # ctx.Queue(), NOT multiprocessing.Queue(): a Queue carries an internal SemLock, and the
+            # children are started from this (spawn) ctx. The global multiprocessing module defaults to
+            # fork on Linux, so a global Queue() yields a fork-context SemLock that cannot be pickled into
+            # a spawn child ("A SemLock created in a fork context is being shared with a process in a spawn
+            # context"). The worker happens to dodge this only because _prepare_runtime forces the global
+            # start method to spawn; the benchmark never does, so binding to ctx is the real fix.
+            process_message_queue=ctx.Queue(),
             inference_semaphore=BoundedSemaphore_MultiProcessing(max_concurrent_inference, ctx=ctx),
             disk_lock=Lock_MultiProcessing(ctx=ctx),
             aux_model_lock=Lock_MultiProcessing(ctx=ctx),
