@@ -42,6 +42,31 @@ def _spawn_timing_mark(process_id: int, kind: str, label: str) -> None:
         os.write(2, f"[spawn-timing] {kind} process_id={process_id} {label} t={time.time():.3f}\n".encode())
 
 
+_CUDA_ALLOC_CONF_ENV = "PYTORCH_CUDA_ALLOC_CONF"
+_HIP_ALLOC_CONF_ENV = "PYTORCH_HIP_ALLOC_CONF"
+_EXPANDABLE_SEGMENTS_VALUE = "expandable_segments:True"
+
+
+def _enable_expandable_segments(*, amd_gpu: bool, directml: int | None) -> None:
+    """Opt the inference child's CUDA/ROCm caching allocator into expandable segments.
+
+    Fragmentation (large ``reserved but unallocated`` pools) is a frequent cause of the OOM that
+    killed live jobs even when the device still reported free memory; torch's own OOM message
+    recommends this setting. It must be set *before* torch is imported, so this runs at the very top
+    of the spawned child. We only touch the variable when the operator has not set their own value,
+    and we skip DirectML (a different allocator entirely). The env name differs by build: CUDA builds
+    read ``PYTORCH_CUDA_ALLOC_CONF``; ROCm/HIP builds read ``PYTORCH_HIP_ALLOC_CONF`` (older ROCm
+    builds still honor the CUDA name), so for AMD we set both.
+    """
+    if directml is not None:
+        return
+
+    if _CUDA_ALLOC_CONF_ENV not in os.environ:
+        os.environ[_CUDA_ALLOC_CONF_ENV] = _EXPANDABLE_SEGMENTS_VALUE
+    if amd_gpu and _HIP_ALLOC_CONF_ENV not in os.environ:
+        os.environ[_HIP_ALLOC_CONF_ENV] = _EXPANDABLE_SEGMENTS_VALUE
+
+
 def resolve_worker_log_verbosity() -> int:
     """Resolve the ``verbosity_count`` a spawned worker process should initialise logging with.
 
@@ -177,6 +202,9 @@ def start_inference_process(
             coordination, registered with hordelib. None disables it. Defaults to None.
     """
     _spawn_timing_mark(process_id, "inference", "entry")
+    # Must precede the first torch/hordelib import below so the allocator reads it.
+    if not dry_run_skip_inference:
+        _enable_expandable_segments(amd_gpu=amd_gpu, directml=directml)
     enable_child_faulthandler(f"inference_{process_id}")
     with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
         logger.remove()

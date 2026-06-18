@@ -74,6 +74,9 @@ class _DryRunResultingImage:
 class HordeInferenceProcess(HordeProcess):
     """Represents an inference process, which generates images."""
 
+    _periodic_report_includes_vram: bool = True
+    """Inference processes own the GPU, so their interval memory report samples device-wide VRAM."""
+
     _inference_semaphore: Semaphore
     """A semaphore used to limit the number of concurrent inference jobs."""
 

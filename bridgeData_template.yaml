@@ -231,7 +231,8 @@ temp_dir: "./tmp" # Currently unused in reGen
 always_download: true # Currently unused in reGen
 
 # Disable the terminal GUI, which displays information about the worker and the Horde.
-disable_terminal_ui: false # Currently unused in reGen
+# NOTE: reGen defaults this to true (TUI disabled). Set to false to enable the TUI.
+disable_terminal_ui: false
 
 # Obsolete
 vram_to_leave_free: "80%" # Currently unused in reGen
@@ -388,3 +389,144 @@ alchemy_max_concurrency: 1
 # Acts as the floor for the headroom estimator, which raises the requirement toward the
 # observed median cost of recent alchemy forms.
 alchemy_vram_headroom_mb: 2000
+
+##########################################
+## reGen Advanced Settings              ##
+##########################################
+
+# Use even more RAM/VRAM to keep additional models resident simultaneously.
+# This has data-center grade cards in mind, and is not recommended for consumer grade cards.
+# Implies high_memory_mode.
+very_high_memory_mode: false
+
+# If true, the process will stop and restart when the model loaded changes.
+# Warning: This can cause substantial delays in processing.
+cycle_process_on_model_change: false
+
+#############################
+## Timeouts & Retry Limits ##
+#############################
+
+# Maximum time (seconds) to allow a job to run before it is killed.
+# High-performance mode divides this by 3; moderate-performance mode divides by 2.
+process_timeout: 300
+
+# Maximum time (seconds) for post-processing (e.g. upscaling, face-fixing) before the job is killed.
+post_process_timeout: 60
+
+# Maximum time (seconds) to allow a model to load from disk into VRAM before the process is killed.
+preload_timeout: 80
+
+# Maximum time (seconds) to allow a single inference step before the process is killed.
+inference_step_timeout: 15
+
+# Maximum time (seconds) to allow an auxiliary model (LoRA, etc.) to download before it is killed.
+download_timeout: 121
+
+# How many times a single job may be dispatched to inference before it is reported faulted.
+# 1 = no retry (one shot, then fault). 2 (default) = one bounded retry.
+# A resource (out-of-memory) failure spends its retry in a degraded, isolated dispatch.
+max_inference_attempts: 2
+
+# Maximum minutes the worker will stay alive with no jobs before exiting.
+# Set to 0 to disable this safeguard (worker runs indefinitely).
+minutes_allowed_without_jobs: 30
+
+# Percent chance (0.0 to 1.0) that the currently loaded models will be favored when popping a job.
+# Higher values keep the same model loaded longer, reducing model switches at the cost of throughput.
+# In config files this field is `model_stickiness` (without the horde_ prefix).
+horde_model_stickiness: 0.0
+
+#############################
+## GPU Sampling Lease      ##
+#############################
+
+# Coordinate the GPU denoising loop across inference processes with a shared lease.
+# When true, at most `gpu_sampling_lease_slots` processes run the denoising loop at once;
+# extra processes stage their next pipeline concurrently, keeping the GPU busy between jobs.
+# Trades extra resident VRAM for higher GPU utilization. REQUIRES residency:
+#   high_memory_mode: true + unload_models_from_vram_often: false
+gpu_sampling_lease_enabled: false
+
+# How many inference processes may run the GPU denoising loop at once when
+# `gpu_sampling_lease_enabled` is true. 1 (default) serializes denoising.
+# Values > 1 permit concurrent denoise loops. No effect unless the lease is enabled.
+gpu_sampling_lease_slots: 1
+
+#############################
+## VRAM / RAM Budget       ##
+#############################
+
+# Gate model preloads and concurrent dispatch on a measured VRAM budget. When true (default),
+# the worker refuses to preload a model or stage another concurrent job unless the device's
+# measured free VRAM covers the job's estimated peak plus vram_reserve_mb, and it evicts the
+# coldest idle resident model under pressure. This is the proactive guard against multiple
+# inference processes over-committing a shared GPU (the cause of out-of-memory crashes). Set
+# false only to restore the prior availability-only behavior.
+enable_vram_budget: true
+
+# Free VRAM (MB) the budget keeps in reserve on top of a job's estimated peak. Covers transient
+# spikes the steady-state estimate misses, most notably tiled VAE decode. Larger values trade
+# throughput for safety. Only used when enable_vram_budget is true.
+vram_reserve_mb: 2048
+
+# Available system RAM (MB) the budget keeps in reserve so resident-in-RAM models do not force
+# the OS to page to disk. Only used when enable_vram_budget is true.
+ram_reserve_mb: 4096
+
+#############################
+## Model Downloads         ##
+#############################
+
+# Cap background model downloads to this many KB/s (unset or 0 = unlimited).
+# Approximate: enforced at 16 MB-chunk granularity.
+# download_rate_limit_kbps:
+
+# If true, background model downloads are held until resumed.
+# Honored on config reload; overridable live from the TUI.
+downloads_paused: false
+
+# Additional directories to search for already-downloaded model files.
+# Each entry should be laid out like the primary model folder (containing compvis/, lora/, etc.).
+# New downloads always target the primary root.
+# Also settable via the AIWORKER_EXTRA_MODEL_DIRECTORIES env var (os.pathsep-separated).
+extra_model_directories: []
+
+#############################
+## Custom Models           ##
+#############################
+
+# Define custom models not in the official model reference.
+# Each entry requires: name, baseline, filepath.
+# Example:
+# custom_models:
+#   - name: "my-custom-model"
+#     baseline: "stable_diffusion"
+#     filepath: "/path/to/model.safetensors"
+custom_models: []
+
+#############################
+## Kudos Training Data     ##
+#############################
+
+# Capture telemetry for kudos model training.
+capture_kudos_training_data: false
+
+# File path to write kudos training data to (only used when capture_kudos_training_data is true).
+# kudos_training_data_file:
+
+#############################
+## Dry-Run / Testing       ##
+#############################
+
+# Skip real GPU inference and return a dummy 1x1 image instead.
+dry_run_skip_inference: false
+
+# Skip the safety (NSFW/CSAM) evaluation model.
+dry_run_skip_safety: false
+
+# Skip API calls (job pop and submit) and use canned scenarios.
+dry_run_skip_api: false
+
+# Seconds to sleep when dry-run inference is active, simulating work.
+dry_run_inference_delay: 1.0

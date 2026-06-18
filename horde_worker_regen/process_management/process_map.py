@@ -137,6 +137,15 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].last_job_referenced = None
         self[process_id].batch_amount = 1
 
+        # Drop this slot's last VRAM/RAM sample. A dead process reports nothing further, so its final
+        # pre-death figure would otherwise persist in get_free_vram_mb()/RAM accounting and either keep
+        # counting freed VRAM as "used" (under-counting headroom) or, once the device reclaims it,
+        # over-state headroom. Zeroing total_vram_mb also drops the slot from get_free_vram_mb()'s
+        # reporting set until its replacement re-reports real numbers.
+        self[process_id].ram_usage_bytes = 0
+        self[process_id].vram_usage_mb = 0
+        self[process_id].total_vram_mb = 0
+
         self.reset_heartbeat_state(process_id)
 
         self[process_id].last_received_timestamp = time.time()

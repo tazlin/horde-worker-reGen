@@ -400,6 +400,26 @@ class reGenBridgeData(CombinedHordeBridgeData):
     reports; when unavailable, alchemy falls back to backfill-only behavior.
     """
 
+    enable_vram_budget: bool = Field(default=True)
+    """Gate model preloads and concurrent dispatch on a measured VRAM budget.
+
+    When true (the default), the scheduler refuses to preload a model or stage another concurrent
+    job unless the device's measured free VRAM covers the job's estimated peak plus
+    `vram_reserve_mb`, and it evicts the coldest idle resident model under pressure. This is the
+    proactive guard against the multi-process over-commit that OOMs a shared GPU. Set false to
+    restore the prior availability-only behavior (not recommended on a shared/consumer GPU)."""
+
+    vram_reserve_mb: int = Field(default=2048, ge=0)
+    """Free VRAM (MB) the budget keeps in reserve on top of a job's estimated peak.
+
+    Covers transient spikes the steady-state estimate misses, most notably tiled VAE decode (the
+    phase that produced the observed live OOM). Larger values trade throughput for safety. Only used
+    when `enable_vram_budget` is true."""
+
+    ram_reserve_mb: int = Field(default=4096, ge=0)
+    """Available system RAM (MB) the budget keeps in reserve so resident-in-RAM models do not force
+    the OS to page to disk. Only used when `enable_vram_budget` is true."""
+
     dry_run_skip_inference: bool = Field(default=False)
     """Skip real GPU inference and return a dummy 1x1 image instead."""
 

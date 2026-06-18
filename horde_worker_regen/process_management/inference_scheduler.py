@@ -31,6 +31,7 @@ from horde_worker_regen.process_management.performance_model import PerformanceM
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.resource_budget import VramBudget
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.telemetry_spans import span_preload_model
@@ -49,6 +50,10 @@ _RESIDENCY_GRACE_SECONDS = 30.0
 models-exceed-processes regime. Bridges the gap between a model's consecutive jobs so a
 process does not disk-reload the very model it just used when the next job for it has not yet
 been popped."""
+
+_DEFAULT_VRAM_RESERVE_MB = 2048.0
+"""Fallback VRAM reserve (MB) used until the live config value is read. Matches the
+``vram_reserve_mb`` config default; covers transient spikes such as tiled VAE decode."""
 
 
 class InferenceScheduler:
@@ -72,6 +77,7 @@ class InferenceScheduler:
     _batch_wait_log_time: float
     _pending_line_skip: NextJobAndProcess | None
     _model_last_in_demand: dict[str, float]
+    _vram_budget: VramBudget
 
     def __init__(
         self,
@@ -132,6 +138,11 @@ class InferenceScheduler:
         self._pending_line_skip = None
         self._model_last_in_demand = {}
 
+        # Constructed with a safe default; the live reserve is synced from the (reloadable) config each
+        # scheduling cycle by _vram_budget_active(), which also tolerates partially-mocked test config.
+        self._vram_budget = VramBudget(reserve_mb=_DEFAULT_VRAM_RESERVE_MB)
+        self._vram_budget_defer_notified = False
+
     @property
     def _max_concurrent_inference_processes(self) -> int:
         """The live concurrent-inference cap (effective ``max_threads``), bounded by the ceiling."""
@@ -164,6 +175,29 @@ class InferenceScheduler:
             return None
         return self._performance_model.expected_sampling_seconds(signature)
 
+    def _vram_budget_active(self) -> bool:
+        """Whether the measured-VRAM budget gates preload/dispatch this cycle.
+
+        Disabled by config (``enable_vram_budget=false``) restores the prior availability-only
+        behavior. The budget keeps its reserve in sync with the (live-reloadable) config here.
+        """
+        bridge_data = self._runtime_config.bridge_data
+        enabled = getattr(bridge_data, "enable_vram_budget", False)
+        reserve = getattr(bridge_data, "vram_reserve_mb", None)
+        # Tests construct the scheduler with a mocked bridge_data whose attributes are Mocks rather than
+        # real values; in that case (or any partial config) fall back to the pre-budget behavior instead
+        # of acting on a non-numeric reserve.
+        if not isinstance(enabled, bool) or not isinstance(reserve, (int, float)) or isinstance(reserve, bool):
+            return False
+        if not enabled:
+            return False
+        self._vram_budget.set_reserve_mb(float(reserve))
+        return True
+
+    def _measured_free_vram_mb(self) -> float | None:
+        """The most conservative measured device-wide free VRAM (MB), or None when not yet reported."""
+        return self._process_map.get_free_vram_mb()
+
     def _max_jobs_in_progress_allowed(self, processes_post_processing: int) -> int:
         """The cap on concurrently in-progress jobs for this scheduling decision.
 
@@ -180,8 +214,15 @@ class InferenceScheduler:
         if not self._runtime_config.bridge_data.gpu_sampling_lease_enabled:
             return base
 
+        # Floor the speculative-staging headroom at the budget's reserve when it is active, so
+        # pre-staging never eats into the VRAM the budget is holding back for the in-flight job's
+        # transient spikes; otherwise keep the standalone staging threshold.
+        staging_floor = _SPECULATIVE_DISPATCH_MIN_FREE_VRAM_MB
+        if self._vram_budget_active():
+            staging_floor = max(staging_floor, self._vram_budget.reserve_mb)
+
         free_vram_mb = self._process_map.get_free_vram_mb()
-        if free_vram_mb is None or free_vram_mb < _SPECULATIVE_DISPATCH_MIN_FREE_VRAM_MB:
+        if free_vram_mb is None or free_vram_mb < staging_floor:
             return base
 
         return self._max_inference_processes + processes_post_processing
@@ -299,6 +340,25 @@ class InferenceScheduler:
                     )
                     self._preload_delay_notified = True
                 return False
+
+            # VRAM budget gate: a fresh preload loads this model's weights into the shared device, so
+            # admit it only when measured free VRAM covers its estimated peak plus the reserve. This is
+            # the proactive guard against the multi-process over-commit that OOMs the GPU. When it does
+            # not fit, start reclaiming VRAM from idle resident models (overriding residency under
+            # pressure) and defer this preload to a later cycle rather than over-committing now.
+            if self._vram_budget_active():
+                baseline = self._model_metadata.get_baseline(job.model)
+                verdict = self._vram_budget.check_job(job, baseline, self._measured_free_vram_mb())
+                if not verdict.fits:
+                    if not self._vram_budget_defer_notified:
+                        logger.opt(ansi=True).warning(
+                            f"<fg #f0beff>VRAM budget deferring preload of {job.model}: {verdict.reason()}. "
+                            "Reclaiming idle VRAM.</>",
+                        )
+                        self._vram_budget_defer_notified = True
+                    self.unload_models_from_vram(available_process, under_pressure=True)
+                    return False
+                self._vram_budget_defer_notified = False
 
             self._preload_delay_notified = False
             logger.debug(f"Preloading model {job.model} on process {available_process.process_id}")
@@ -724,6 +784,7 @@ class InferenceScheduler:
         wanted_models: set[str],
         *,
         vram: bool,
+        under_pressure: bool = False,
     ) -> bool:
         """Whether residency policy should keep ``model_name`` loaded rather than evict it now.
 
@@ -738,11 +799,18 @@ class InferenceScheduler:
           grace period — cheap to hold, and it avoids the expensive disk reload between a model's
           consecutive jobs. VRAM, the scarce resource, is still reclaimed promptly.
 
-        Genuine memory-pressure-aware eviction (a worker-owned aggregate VRAM budget) is WS-1 and
-        not yet implemented; in the fits regime the model count is bounded by the process count,
-        so unconditional residency there does not over-commit VRAM for the sd15-class workloads.
+        ``under_pressure`` is the measured-VRAM-budget override (the WS-1 "aggregate VRAM budget"):
+        the fits-regime assumption that model-count <= process-count implies the resident set fits the
+        device only holds for sd15-class weights, so when the budget reports the device cannot absorb
+        the next job, VRAM residency protection is dropped to let an idle resident model be evicted.
+        It never overrides the in-progress / next-model guards in the caller, so live and imminent work
+        is still never evicted. RAM residency (``vram=False``) is unaffected: holding weights in RAM
+        does not contend for the scarce device VRAM.
         """
         if model_name is None:
+            return False
+
+        if vram and under_pressure:
             return False
 
         if affinity_active(len(wanted_models), self._max_inference_processes) and model_name in wanted_models:
@@ -753,8 +821,15 @@ class InferenceScheduler:
     def unload_models_from_vram(
         self,
         process_with_model: HordeProcessInfo,
+        *,
+        under_pressure: bool = False,
     ) -> None:
-        """Unload models from VRAM from processes that are not running a job."""
+        """Unload models from VRAM from processes that are not running a job.
+
+        ``under_pressure`` (set by the VRAM budget when the next job does not fit) drops residency
+        protection and the single-model hold-back so the coldest idle resident copy is reclaimed,
+        while still never touching an in-progress or next-up model.
+        """
         bridge_data = self._runtime_config.bridge_data
         wanted_models = self._compute_wanted_models()
         next_n_models = list(self.get_next_n_models(self._max_inference_processes))
@@ -776,7 +851,7 @@ class InferenceScheduler:
                 logger.debug(f"Process {process_info.process_id} is busy")
 
             if process_info.loaded_horde_model_name is not None:
-                if len(bridge_data.image_models_to_load) == 1:
+                if len(bridge_data.image_models_to_load) == 1 and not under_pressure:
                     logger.debug("Not unloading models from VRAM because there is only one model to load.")
                     continue
 
@@ -790,6 +865,7 @@ class InferenceScheduler:
                     process_info.loaded_horde_model_name,
                     wanted_models,
                     vram=True,
+                    under_pressure=under_pressure,
                 ):
                     continue
 

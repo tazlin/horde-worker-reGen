@@ -96,6 +96,16 @@ class HordeProcess(abc.ABC):
     _memory_report_interval: float = 5.0
     """The time to wait between each memory report."""
 
+    _last_periodic_memory_report_time: float = 0.0
+    """Wall-clock time of the last interval-driven memory report (0 = none sent yet)."""
+
+    _periodic_report_includes_vram: bool = False
+    """Whether the interval-driven memory report should sample VRAM.
+
+    Inference processes set this True so the main process keeps a fresh device-wide free-VRAM
+    figure to budget against; the CPU-only safety process leaves it False (it has no GPU to sample).
+    """
+
     _last_sent_process_state: HordeProcessState = HordeProcessState.PROCESS_STARTING
     """The last process state that was sent to the main process."""
 
@@ -231,6 +241,21 @@ class HordeProcess(abc.ABC):
             return
         self.send_heartbeat_message(HordeHeartbeatType.OTHER)
 
+    def _maybe_send_periodic_memory_report(self) -> None:
+        """Emit an interval-driven memory report so the main process's free-VRAM view stays fresh.
+
+        The event-driven reports (model load/unload, inference failure) only fire on state
+        transitions, so during a long single job or an idle stretch the main process's last
+        free-VRAM figure goes stale. The worker's VRAM/RAM budget gates dispatch on that figure, so
+        a stale read can both over-commit (acting on freed-but-still-counted VRAM) and under-commit.
+        This adds a low-frequency floor independent of transitions; the event-driven reports remain.
+        """
+        now = time.time()
+        if now - self._last_periodic_memory_report_time < self._memory_report_interval:
+            return
+        self._last_periodic_memory_report_time = now
+        self.send_memory_report_message(include_vram=self._periodic_report_includes_vram)
+
     @abstractmethod
     def cleanup_for_exit(self) -> None:
         """Cleanup and exit the process."""
@@ -309,6 +334,7 @@ class HordeProcess(abc.ABC):
             self.receive_and_handle_control_messages()
             self.worker_cycle()
             self._maybe_send_idle_heartbeat()
+            self._maybe_send_periodic_memory_report()
 
         # We escaped the loop, so the process is ending
         self.send_process_state_change_message(

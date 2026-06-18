@@ -1,8 +1,10 @@
 """Contains methods for loading the config file."""
 
+import asyncio
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from enum import auto
 from pathlib import Path
 
@@ -15,6 +17,25 @@ from strenum import StrEnum
 
 from horde_worker_regen.bridge_data import AIWORKER_REGEN_PREFIX
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+
+
+def _make_image_model_load_resolver() -> ImageModelLoadResolver:
+    """Construct an ``ImageModelLoadResolver``, safe to call whether or not an event loop is running.
+
+    The SDK constructor calls ``asyncio.run()`` to initialise its model reference manager. On a config
+    *reload* this runs inside the worker's already-running event loop (the bridge-data watcher calls the
+    sync loader from an async coroutine), where ``asyncio.run()`` raises and leaves its init coroutine
+    un-awaited: the meta-instruction reload then silently fails. Building the resolver on a short-lived
+    worker thread gives ``asyncio.run()`` the clean, loop-free thread it requires. Off the event loop
+    (startup) we construct it inline, with no thread overhead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return ImageModelLoadResolver()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(ImageModelLoadResolver).result()
 
 
 class UnsupportedConfigFormat(Exception):
@@ -268,7 +289,7 @@ class BridgeDataLoader:
         Returns:
             list[str]: The image models that will be loaded.
         """
-        load_resolver = ImageModelLoadResolver()
+        load_resolver = _make_image_model_load_resolver()
 
         resolved_models = None
         if bridge_data.meta_load_instructions is not None:
