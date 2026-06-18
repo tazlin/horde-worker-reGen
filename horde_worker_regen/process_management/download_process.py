@@ -33,7 +33,7 @@ try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
 except Exception:
     from multiprocessing.connection import Connection  # type: ignore
-from multiprocessing.synchronize import Lock
+from multiprocessing.synchronize import Lock, Semaphore
 
 from loguru import logger
 
@@ -88,6 +88,7 @@ class HordeDownloadProcess(HordeProcess):
         process_message_queue: ProcessQueue,
         pipe_connection: Connection,
         disk_lock: Lock,
+        download_bandwidth_semaphore: Semaphore,
         process_launch_identifier: int,
         *,
         nsfw: bool = True,
@@ -119,6 +120,8 @@ class HordeDownloadProcess(HordeProcess):
         self._purge_loras = purge_loras
         self._amd_gpu = amd_gpu
         self._directml = directml
+        self._download_bandwidth_semaphore = download_bandwidth_semaphore
+        self._download_bandwidth_acquired = False
 
         self._lock = threading.Lock()
         self._pending: list[str] = []
@@ -425,6 +428,9 @@ class HordeDownloadProcess(HordeProcess):
         self._send_status(DownloadPhase.DOWNLOADING)
 
     def _begin_download_context(self, *, model: str, feature: str, target_dir: str) -> None:
+        if not self._download_bandwidth_acquired:
+            self._download_bandwidth_semaphore.acquire()
+            self._download_bandwidth_acquired = True
         self._cb_model = model
         self._cb_feature = feature
         self._cb_target_dir = target_dir
@@ -438,6 +444,9 @@ class HordeDownloadProcess(HordeProcess):
     def _end_download_context(self) -> None:
         with self._lock:
             self._current = None
+        if self._download_bandwidth_acquired:
+            self._download_bandwidth_semaphore.release()
+            self._download_bandwidth_acquired = False
 
     def _record_failure(self, model: str, feature: str, reason: str) -> None:
         with self._lock:
@@ -466,6 +475,7 @@ class HordeDownloadProcess(HordeProcess):
             if succeeded and compvis.validate_model(model_name) is False:
                 succeeded = bool(compvis.download_model(model_name, callback=self._progress_callback))
         except _DownloadInterrupted:
+            self._end_download_context()
             return
         except OSError as e:
             reason = "out of disk space" if e.errno == 28 else f"{type(e).__name__}: {e}"

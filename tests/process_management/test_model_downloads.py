@@ -110,6 +110,34 @@ class TestModelAvailability:
         availability.update(present={"a"}, currently_downloading=None, pending=(), failed=())
         assert availability.scan_complete is True
 
+    def test_background_download_active_requires_downloading_current(self) -> None:
+        """Only an active current download suppresses LoRA pops."""
+        availability = ModelAvailability()
+        assert availability.background_download_active is False
+
+        availability.update(
+            present={"a"},
+            currently_downloading=None,
+            pending=("b",),
+            failed=(),
+            status=DownloadStatusSnapshot(
+                phase=DownloadPhase.PAUSED, pending=[DownloadItem(model_name="b", feature="image model")]
+            ),
+        )
+        assert availability.background_download_active is False
+
+        availability.update(
+            present={"a"},
+            currently_downloading="b",
+            pending=(),
+            failed=(),
+            status=DownloadStatusSnapshot(
+                phase=DownloadPhase.DOWNLOADING,
+                current=CurrentDownloadStatus(model_name="b", feature="image model", target_dir=""),
+            ),
+        )
+        assert availability.background_download_active is True
+
     def test_safety_present_round_trip(self) -> None:
         """The required-safety-models flag defaults False and round-trips through an update."""
         availability = ModelAvailability()
@@ -212,6 +240,7 @@ class TestManagerDownloadHandling:
         manager._enable_background_downloads = True
         manager._download_wait_started = time.time()
         manager._process_lifecycle = Mock()
+        manager._process_lifecycle._num_process_recoveries = 0
         return manager  # type: ignore[return-value]
 
     def test_first_report_requests_missing_and_starts_inference(self) -> None:
@@ -272,6 +301,44 @@ class TestManagerDownloadHandling:
         manager._on_download_availability(_availability_message(["a"]))
         manager._process_lifecycle.request_downloads.assert_called_once()
         manager._process_lifecycle.start_inference_processes.assert_called_once()
+
+    def test_snapshot_marks_lora_blocked_by_active_download(self) -> None:
+        """The supervisor snapshot explains temporary LoRA pop suppression."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"], allow_lora=True)
+        manager._on_download_availability(
+            _availability_message(
+                ["a"],
+                status=DownloadStatusSnapshot(
+                    phase=DownloadPhase.DOWNLOADING,
+                    current=CurrentDownloadStatus(model_name="b", feature="image model", target_dir=""),
+                ),
+            )
+        )
+
+        snapshot = manager._build_worker_state_snapshot()
+
+        assert snapshot.config.allow_lora is True
+        assert snapshot.config.effective_allow_lora is False
+        assert snapshot.lora_pops_blocked_by_downloads is True
+
+    def test_snapshot_does_not_mark_lora_blocked_when_lora_disabled(self) -> None:
+        """Active downloads do not imply a temporary LoRA override when LoRA is off by config."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"], allow_lora=False)
+        manager._on_download_availability(
+            _availability_message(
+                ["a"],
+                status=DownloadStatusSnapshot(
+                    phase=DownloadPhase.DOWNLOADING,
+                    current=CurrentDownloadStatus(model_name="b", feature="image model", target_dir=""),
+                ),
+            )
+        )
+
+        snapshot = manager._build_worker_state_snapshot()
+
+        assert snapshot.config.allow_lora is False
+        assert snapshot.config.effective_allow_lora is False
+        assert snapshot.lora_pops_blocked_by_downloads is False
 
 
 class TestManagerSafetyDeferral:

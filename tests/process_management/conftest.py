@@ -161,6 +161,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.max_threads = 1
     bd.queue_size = 1
     bd.high_memory_mode = False
+    bd.very_high_memory_mode = False
     bd.high_performance_mode = False
     bd.moderate_performance_mode = False
     bd.safety_on_gpu = False
@@ -200,6 +201,12 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.extra_slow_worker = False
     bd.limit_max_steps = False
     bd.allow_lora = True
+    bd.alchemist = False
+    bd.alchemy_allow_concurrent = True
+    bd.alchemy_max_concurrency = 1
+    bd.alchemy_vram_headroom_mb = 2000
+    bd.alchemy_caption_enabled = False
+    bd.forms = []
     bd._loaded_from_env_vars = False
     bd.dry_run_skip_inference = False
     bd.dry_run_skip_safety = False
@@ -307,6 +314,7 @@ def make_test_mp_primitives() -> MultiprocessingPrimitives:
         aux_model_lock=Mock(),
         vae_decode_semaphore=Mock(),
         gpu_sampling_lease=Mock(),
+        download_bandwidth_semaphore=Mock(),
     )
 
 

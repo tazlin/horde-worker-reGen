@@ -815,6 +815,7 @@ def start_fake_download_process(
     process_message_queue: ProcessQueue,
     pipe_connection: Connection,
     disk_lock: Lock,
+    download_bandwidth_semaphore: Semaphore,
     process_launch_identifier: int,
     *,
     nsfw: bool = True,

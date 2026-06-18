@@ -120,6 +120,8 @@ class WorkerConfigSummary(BaseModel):
     safety_on_gpu: bool = False
     allow_img2img: bool = True
     allow_lora: bool = False
+    effective_allow_lora: bool | None = None
+    """Whether job pops currently advertise LoRA support; None means same as ``allow_lora``."""
     allow_controlnet: bool = False
     allow_sdxl_controlnet: bool = False
     allow_post_processing: bool = True
@@ -426,6 +428,8 @@ class WorkerStateSnapshot(BaseModel):
     """Live download-subsystem state (None when background downloads are disabled)."""
     download_plan: DownloadPlanSummary | None = None
     """The one-time disk implications of the configured models (None when not computed)."""
+    lora_pops_blocked_by_downloads: bool = False
+    """Configured LoRA support is temporarily suppressed because background downloads are active."""
 
     recent_jobs: list[RecentJobRecord] = Field(default_factory=list)
     """The most recent finished-job records, newest last (capped)."""

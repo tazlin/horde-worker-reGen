@@ -37,6 +37,7 @@ _STATIC_GLYPHS: dict[WorkerPhase, str] = {
     WorkerPhase.READY: "●",
 }
 
+
 class OverviewView(VerticalScroll):
     """A dashboard led by a living status hero and a health checklist."""
 
@@ -103,6 +104,13 @@ class OverviewView(VerticalScroll):
             why_no_work = summarize_skips(snapshot.last_pop_skipped_reasons)
             if why_no_work:
                 body.append(Text.assemble(("∅ why no work: ", "yellow"), (why_no_work, "italic yellow")))
+            if snapshot.lora_pops_blocked_by_downloads:
+                body.append(
+                    Text(
+                        "LoRA pops paused while background downloads are active.",
+                        style="yellow",
+                    )
+                )
             for message in snapshot.api_messages[:3]:
                 body.append(Text.assemble(("✉ ", "cyan"), (message, "italic cyan")))
 
@@ -213,7 +221,10 @@ class OverviewView(VerticalScroll):
         if config.allow_img2img:
             flags.append("img2img")
         if config.allow_lora:
-            flags.append("lora")
+            if snapshot.lora_pops_blocked_by_downloads or config.effective_allow_lora is False:
+                flags.append("lora paused")
+            else:
+                flags.append("lora")
         if config.allow_controlnet:
             flags.append("controlnet")
         if config.allow_post_processing:
@@ -254,11 +265,16 @@ class OverviewView(VerticalScroll):
         active_colour = "green" if total_active > 0 else "grey62"
         faulted_colour = "red" if snapshot.alchemy_total_faulted else "grey62"
         runtime_text = Text.assemble(
-            (str(snapshot.alchemy_forms_pending), active_colour), (" pending  ", "grey50"),
-            (str(snapshot.alchemy_forms_in_flight), active_colour), (" in flight  ", "grey50"),
-            (str(snapshot.alchemy_forms_awaiting_submit), "grey62"), (" submitting  ", "grey50"),
-            (str(snapshot.alchemy_total_submitted), "grey70"), (" done  ", "grey50"),
-            (str(snapshot.alchemy_total_faulted), faulted_colour), (" faulted", "grey50"),
+            (str(snapshot.alchemy_forms_pending), active_colour),
+            (" pending  ", "grey50"),
+            (str(snapshot.alchemy_forms_in_flight), active_colour),
+            (" in flight  ", "grey50"),
+            (str(snapshot.alchemy_forms_awaiting_submit), "grey62"),
+            (" submitting  ", "grey50"),
+            (str(snapshot.alchemy_total_submitted), "grey70"),
+            (" done  ", "grey50"),
+            (str(snapshot.alchemy_total_faulted), faulted_colour),
+            (" faulted", "grey50"),
         )
 
         table.add_row("Mode", mode_text, "Forms", forms_text)
@@ -350,11 +366,7 @@ class OverviewView(VerticalScroll):
             table.add_row(Text("queue empty", style="grey50"), "", "", "")
         else:
             for entry in snapshot.pending_jobs:
-                features_text = (
-                    ", ".join(entry.features.as_tags())
-                    if entry.features is not None
-                    else "-"
-                )
+                features_text = ", ".join(entry.features.as_tags()) if entry.features is not None else "-"
                 size = f"{entry.width}×{entry.height}" if entry.width and entry.height else "-"
                 table.add_row(
                     shorten(entry.model, 28),
@@ -394,11 +406,7 @@ class OverviewView(VerticalScroll):
                 else:
                     model_text = Text(shorten(job.model_name, 24) if job.model_name else "?", style="")
 
-                features_text = (
-                    ", ".join(job.features.as_tags())
-                    if job.features is not None
-                    else "-"
-                )
+                features_text = ", ".join(job.features.as_tags()) if job.features is not None else "-"
                 e2e = human_duration(job.e2e_seconds) if job.e2e_seconds is not None else "-"
                 table.add_row(
                     glyph,

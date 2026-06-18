@@ -137,6 +137,7 @@ class DownloadProcessEntryPoint(Protocol):
         process_message_queue: ProcessQueue,
         pipe_connection: Connection,
         disk_lock: Lock,
+        download_bandwidth_semaphore: Semaphore,
         process_launch_identifier: int,
         *,
         nsfw: bool = True,
@@ -438,6 +439,7 @@ def start_download_process(
     process_message_queue: ProcessQueue,
     pipe_connection: Connection,
     disk_lock: Lock,
+    download_bandwidth_semaphore: Semaphore,
     process_launch_identifier: int,
     *,
     nsfw: bool = True,
@@ -458,6 +460,7 @@ def start_download_process(
         process_message_queue (ProcessQueue): The queue to send messages to the main process.
         pipe_connection (Connection): Receives ``HordeControlMessage``s from the main process.
         disk_lock (Lock): Coordinates disk access with the inference/safety processes.
+        download_bandwidth_semaphore (Semaphore): Held while this process is actively downloading.
         process_launch_identifier (int): The unique identifier for this launch.
         nsfw (bool): Whether NSFW default LoRas may be fetched. Defaults to True.
         allow_lora (bool): Whether to fetch the default LoRas during an aux pass. Defaults to False.
@@ -504,6 +507,7 @@ def start_download_process(
             process_message_queue=process_message_queue,
             pipe_connection=pipe_connection,
             disk_lock=disk_lock,
+            download_bandwidth_semaphore=download_bandwidth_semaphore,
             process_launch_identifier=process_launch_identifier,
             nsfw=nsfw,
             allow_lora=allow_lora,

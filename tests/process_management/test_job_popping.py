@@ -17,8 +17,14 @@ from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.job_popper import JobPopper
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.model_availability import ModelAvailability
 from horde_worker_regen.process_management.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.supervisor_channel import (
+    CurrentDownloadStatus,
+    DownloadPhase,
+    DownloadStatusSnapshot,
+)
 from horde_worker_regen.process_management.worker_state import WorkerState
 
 from .conftest import (
@@ -45,6 +51,7 @@ def _make_popper(
     max_concurrent_inference_processes: int = 1,
     image_models_to_load: list[str] | None = None,
     dry_run_skip_api: bool = False,
+    model_availability: ModelAvailability | None = None,
 ) -> JobPopper:
     """Build a JobPopper with mostly-mocked dependencies."""
     if state is None:
@@ -78,6 +85,7 @@ def _make_popper(
         max_inference_processes=max_inference_processes,
         max_concurrent_inference_processes=max_concurrent_inference_processes,
         dry_run_skip_api=dry_run_skip_api,
+        model_availability=model_availability,
     )
 
 
@@ -769,6 +777,8 @@ class TestApiJobPopFullFlow:
         api_response: object | None = None,
         state: WorkerState | None = None,
         job_tracker: JobTracker | None = None,
+        bridge_data: Mock | None = None,
+        model_availability: ModelAvailability | None = None,
     ) -> JobPopper:
         """Create a popper in a state where all guard clauses pass."""
         if state is None:
@@ -786,7 +796,9 @@ class TestApiJobPopFullFlow:
             state=state,
             process_map=pm,
             job_tracker=job_tracker,
+            bridge_data=bridge_data,
             horde_client_session=horde_session,
+            model_availability=model_availability,
         )
 
     @_full_flow_patches
@@ -906,6 +918,70 @@ class TestApiJobPopFullFlow:
         await popper.api_job_pop()
 
         assert state.last_job_pop_time > 0
+
+    @_full_flow_patches
+    async def test_allow_lora_true_when_configured_and_downloads_idle(self, mock_req_cls: Mock) -> None:
+        """Configured LoRA support is advertised while background downloads are idle."""
+        availability = ModelAvailability()
+        availability.update(
+            present={"stable_diffusion"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            status=DownloadStatusSnapshot(phase=DownloadPhase.IDLE),
+        )
+        popper = self._make_ready_popper(
+            api_response=make_job_pop_response(),
+            model_availability=availability,
+        )
+
+        await popper.api_job_pop()
+
+        assert mock_req_cls.call_args.kwargs["allow_lora"] is True
+
+    @_full_flow_patches
+    async def test_allow_lora_false_while_background_download_active(self, mock_req_cls: Mock) -> None:
+        """Active background downloads suppress LoRA advertisement for new pops."""
+        availability = ModelAvailability()
+        availability.update(
+            present={"stable_diffusion"},
+            currently_downloading="Flux",
+            pending=(),
+            failed=(),
+            status=DownloadStatusSnapshot(
+                phase=DownloadPhase.DOWNLOADING,
+                current=CurrentDownloadStatus(model_name="Flux", feature="image model", target_dir="models/compvis"),
+            ),
+        )
+        popper = self._make_ready_popper(
+            api_response=make_job_pop_response(),
+            model_availability=availability,
+        )
+
+        await popper.api_job_pop()
+
+        assert mock_req_cls.call_args.kwargs["allow_lora"] is False
+
+    @_full_flow_patches
+    async def test_allow_lora_false_when_disabled_in_config(self, mock_req_cls: Mock) -> None:
+        """The temporary gate cannot enable LoRA when the user disabled it."""
+        availability = ModelAvailability()
+        availability.update(
+            present={"stable_diffusion"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            status=DownloadStatusSnapshot(phase=DownloadPhase.IDLE),
+        )
+        popper = self._make_ready_popper(
+            api_response=make_job_pop_response(),
+            bridge_data=make_mock_bridge_data(allow_lora=False),
+            model_availability=availability,
+        )
+
+        await popper.api_job_pop()
+
+        assert mock_req_cls.call_args.kwargs["allow_lora"] is False
 
 
 class TestJobPopFrequency:

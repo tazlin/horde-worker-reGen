@@ -268,6 +268,12 @@ class JobPopper:
             max_jobs_in_queue += bridge_data.max_threads - 1
         return len(self._job_tracker.jobs_pending_inference) >= max_jobs_in_queue
 
+    def _effective_allow_lora(self, bridge_data: reGenBridgeData) -> bool:
+        """Return whether this pop should advertise LoRA support."""
+        if not bridge_data.allow_lora:
+            return False
+        return not (self._model_availability is not None and self._model_availability.background_download_active)
+
     def _is_hungry(self, bridge_data: reGenBridgeData) -> bool:
         """Whether the worker should pop again immediately instead of waiting the poll interval.
 
@@ -462,7 +468,7 @@ class JobPopper:
                 allow_sdxl_controlnet=bridge_data.allow_sdxl_controlnet,
                 extra_slow_worker=bridge_data.extra_slow_worker,
                 limit_max_steps=bridge_data.limit_max_steps,
-                allow_lora=bridge_data.allow_lora,
+                allow_lora=self._effective_allow_lora(bridge_data),
                 amount=bridge_data.max_batch,
             )
 

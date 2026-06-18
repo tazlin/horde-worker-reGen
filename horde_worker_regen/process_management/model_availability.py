@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.supervisor_channel import DownloadStatusSnapshot
 
+_DOWNLOADING_PHASE_VALUE = "downloading"
+
 
 class ModelAvailability:
     """Holds the set of image models currently present on disk, plus the live download status.
@@ -67,6 +69,15 @@ class ModelAvailability:
     def status(self) -> DownloadStatusSnapshot | None:
         """The latest rich download-status snapshot, if any has been reported."""
         return self._status
+
+    @property
+    def background_download_active(self) -> bool:
+        """Whether the background download process is actively consuming download bandwidth."""
+        return (
+            self._status is not None
+            and self._status.phase.value == _DOWNLOADING_PHASE_VALUE
+            and self._status.current is not None
+        )
 
     @property
     def present(self) -> set[str] | None:

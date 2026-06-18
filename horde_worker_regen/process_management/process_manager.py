@@ -181,6 +181,9 @@ class MultiprocessingPrimitives:
     """Serializes the GPU denoising loop across inference processes so they pipeline (one
     samples while others stage their next pipeline) rather than idling the GPU in lockstep.
     Sized to the number of GPU sampling slots (1 for a single GPU)."""
+    download_bandwidth_semaphore: Semaphore
+    """Held by the background download process while it is actively downloading, so the parent can
+    coordinate pop policy around WAN-bandwidth contention."""
 
     @classmethod
     def create(
@@ -216,6 +219,7 @@ class MultiprocessingPrimitives:
             aux_model_lock=Lock_MultiProcessing(ctx=ctx),
             vae_decode_semaphore=BoundedSemaphore_MultiProcessing(vae_decode_semaphore_max, ctx=ctx),
             gpu_sampling_lease=BoundedSemaphore_MultiProcessing(max(1, gpu_sampling_lease_slots), ctx=ctx),
+            download_bandwidth_semaphore=BoundedSemaphore_MultiProcessing(1, ctx=ctx),
         )
 
 
@@ -577,6 +581,7 @@ class HordeWorkerProcessManager:
         self._aux_model_lock = mp_primitives.aux_model_lock
         self._vae_decode_semaphore = mp_primitives.vae_decode_semaphore
         self._gpu_sampling_lease = mp_primitives.gpu_sampling_lease
+        self._download_bandwidth_semaphore = mp_primitives.download_bandwidth_semaphore
 
         # Take ownership of child OS pids so a parent that died hard can have its orphaned children
         # reaped on the next startup. Disabled under test: it touches real OS processes and a shared
@@ -606,6 +611,7 @@ class HordeWorkerProcessManager:
             aux_model_lock=self._aux_model_lock,
             vae_decode_semaphore=self._vae_decode_semaphore,
             gpu_sampling_lease=self._gpu_sampling_lease,
+            download_bandwidth_semaphore=self._download_bandwidth_semaphore,
             gpu_sampling_lease_enabled=self.bridge_data.gpu_sampling_lease_enabled,
             runtime_config=self._runtime_config,
             max_inference_processes=self.max_inference_processes,
@@ -2043,6 +2049,7 @@ class HordeWorkerProcessManager:
             safety_on_gpu=bridge_data.safety_on_gpu,
             allow_img2img=bridge_data.allow_img2img,
             allow_lora=bridge_data.allow_lora,
+            effective_allow_lora=bridge_data.allow_lora and not self._model_availability.background_download_active,
             allow_controlnet=bridge_data.allow_controlnet,
             allow_sdxl_controlnet=bridge_data.allow_sdxl_controlnet,
             allow_post_processing=bridge_data.allow_post_processing,
@@ -2101,6 +2108,9 @@ class HordeWorkerProcessManager:
             ],
             downloads=self._model_availability.status,
             download_plan=self._get_download_plan_summary(),
+            lora_pops_blocked_by_downloads=(
+                bridge_data.allow_lora and self._model_availability.background_download_active
+            ),
             alchemy_forms_pending=self._alchemy_coordinator.num_forms_pending,
             alchemy_forms_in_flight=self._alchemy_coordinator.num_forms_in_flight,
             alchemy_forms_awaiting_submit=self._alchemy_coordinator.num_forms_awaiting_submit,

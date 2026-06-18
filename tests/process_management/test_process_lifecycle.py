@@ -52,6 +52,7 @@ def _make_plm(
         aux_model_lock=Mock(),
         vae_decode_semaphore=Mock(),
         gpu_sampling_lease=Mock(),
+        download_bandwidth_semaphore=Mock(),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         max_inference_processes=2,
         max_safety_processes=1,

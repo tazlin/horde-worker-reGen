@@ -89,6 +89,7 @@ class ProcessLifecycleManager:
     _aux_model_lock: Lock_MultiProcessing
     _vae_decode_semaphore: Semaphore
     _gpu_sampling_lease: Semaphore
+    _download_bandwidth_semaphore: Semaphore
     _gpu_sampling_lease_enabled: bool
     _runtime_config: RuntimeConfig
     _max_inference_processes: int
@@ -128,6 +129,7 @@ class ProcessLifecycleManager:
         aux_model_lock: Lock_MultiProcessing,
         vae_decode_semaphore: Semaphore,
         gpu_sampling_lease: Semaphore,
+        download_bandwidth_semaphore: Semaphore,
         gpu_sampling_lease_enabled: bool = False,
         runtime_config: RuntimeConfig,
         max_inference_processes: int,
@@ -162,6 +164,7 @@ class ProcessLifecycleManager:
         self._aux_model_lock = aux_model_lock
         self._vae_decode_semaphore = vae_decode_semaphore
         self._gpu_sampling_lease = gpu_sampling_lease
+        self._download_bandwidth_semaphore = download_bandwidth_semaphore
         self._gpu_sampling_lease_enabled = gpu_sampling_lease_enabled
         self._runtime_config = runtime_config
         self._max_inference_processes = max_inference_processes
@@ -392,6 +395,7 @@ class ProcessLifecycleManager:
                 self._process_message_queue,
                 child_pipe_connection,
                 self._disk_lock,
+                self._download_bandwidth_semaphore,
                 self.num_processes_launched,
             ),
             kwargs={
