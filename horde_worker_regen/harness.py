@@ -839,6 +839,10 @@ _WARMUP_DRAIN_TIMEOUT_SECONDS = 300.0
 """Bound on a level's pre-warm pass: enough for a cold heavy-model load plus one recovery-and-reload
 cycle, after which the warm pass is abandoned and the measured pass runs anyway."""
 
+_WARM_PROGRESS_INTERVAL_SECONDS = 1.0
+"""How often the warm session samples the live worker metrics for the progress hook. Snappier than the
+subprocess path's 2s so the reused warm worker's live card visibly advances while a level runs."""
+
 
 class WarmHarnessSession:
     """A long-lived worker reused across benchmark levels, to eliminate per-level warm-up.
@@ -991,6 +995,7 @@ class WarmHarnessSession:
         threads: int = 1,
         timeout_seconds: float = 120.0,
         warmup: bool = False,
+        on_progress: Callable[[RunMetricsSnapshot, float], None] | None = None,
     ) -> HarnessResult:
         """Run one fixed-scenario level on the warm worker and report its outcome.
 
@@ -1009,6 +1014,9 @@ class WarmHarnessSession:
         matching a production worker that has preloaded its models. The measured pass re-installs the
         scenario, which resets the per-level metrics and the recovery counter, so the warmup's recovery
         never counts against the level.
+
+        ``on_progress`` is invoked roughly every :data:`_WARM_PROGRESS_INTERVAL_SECONDS` with the live run
+        metrics and the seconds elapsed since this call began, so a caller can stream the level's progress.
         """
         manager = self.manager
         scenario_jobs = jobs or []
@@ -1018,33 +1026,56 @@ class WarmHarnessSession:
 
         manager._apply_set_concurrency(target_threads=threads, target_processes=None)
 
-        if warmup and (scenario_jobs or scenario_forms):
-            manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=scenario_forms)
-            await self._drain_installed_scenario(
-                num_jobs_expected=num_jobs_expected,
-                num_forms_expected=num_forms_expected,
-                base_completed=manager._job_tracker.total_num_completed_jobs,
-                base_faulted=manager._job_tracker.num_jobs_faulted,
-                timeout_seconds=min(timeout_seconds, _WARMUP_DRAIN_TIMEOUT_SECONDS),
+        # Stream live metrics for the whole call (warmup included) so the TUI/console live card advances
+        # while the level runs. Without this the warm path is silent between LevelStarted and LevelFinished
+        # (the subprocess path streams via the on-disk live file; the warm worker has no such file), which
+        # is what made the live card look frozen. Started before the warmup drain so even a long cold
+        # feature-model load reads as motion; the elapsed clock therefore spans warmup + measured.
+        progress_task: asyncio.Task[None] | None = None
+        call_started = time.time()
+        if on_progress is not None:
+            progress_task = asyncio.create_task(
+                _emit_progress_periodically(
+                    manager,
+                    on_progress=on_progress,
+                    interval_seconds=_WARM_PROGRESS_INTERVAL_SECONDS,
+                    time_started=call_started,
+                ),
             )
 
-        base_completed = manager._job_tracker.total_num_completed_jobs
-        base_faulted = manager._job_tracker.num_jobs_faulted
+        try:
+            if warmup and (scenario_jobs or scenario_forms):
+                manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=scenario_forms)
+                await self._drain_installed_scenario(
+                    num_jobs_expected=num_jobs_expected,
+                    num_forms_expected=num_forms_expected,
+                    base_completed=manager._job_tracker.total_num_completed_jobs,
+                    base_faulted=manager._job_tracker.num_jobs_faulted,
+                    timeout_seconds=min(timeout_seconds, _WARMUP_DRAIN_TIMEOUT_SECONDS),
+                )
 
-        manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=alchemy_forms)
+            base_completed = manager._job_tracker.total_num_completed_jobs
+            base_faulted = manager._job_tracker.num_jobs_faulted
 
-        time_started = time.time()
-        drained = await self._drain_installed_scenario(
-            num_jobs_expected=num_jobs_expected,
-            num_forms_expected=num_forms_expected,
-            base_completed=base_completed,
-            base_faulted=base_faulted,
-            timeout_seconds=timeout_seconds,
-        )
-        timed_out = not drained
+            manager.install_benchmark_scenario(jobs=scenario_jobs, alchemy_forms=alchemy_forms)
 
-        with contextlib.suppress(Exception):
-            await manager.receive_and_handle_process_messages()
+            time_started = time.time()
+            drained = await self._drain_installed_scenario(
+                num_jobs_expected=num_jobs_expected,
+                num_forms_expected=num_forms_expected,
+                base_completed=base_completed,
+                base_faulted=base_faulted,
+                timeout_seconds=timeout_seconds,
+            )
+            timed_out = not drained
+
+            with contextlib.suppress(Exception):
+                await manager.receive_and_handle_process_messages()
+        finally:
+            if progress_task is not None and not progress_task.done():
+                progress_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await progress_task
 
         completed = manager._job_tracker.total_num_completed_jobs - base_completed
         faulted = manager._job_tracker.num_jobs_faulted - base_faulted

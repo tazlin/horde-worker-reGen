@@ -27,6 +27,8 @@ from loguru import logger
 if TYPE_CHECKING:
     from hordelib.feature_impact import BurdenEstimate
 
+    from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
+
 from horde_worker_regen.benchmark.criteria import TierBaseline, evaluate_level
 from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage, BenchTier, FindingKind, LevelOutcome
 from horde_worker_regen.benchmark.ladder import (
@@ -272,15 +274,32 @@ class _WarmSessionDriver:
         threads: int,
         timeout_seconds: float,
         warmup: bool = False,
+        on_progress: Callable[[RunMetricsSnapshot, float], None] | None = None,
+        poll_interval: float = _LEVEL_POLL_INTERVAL_SECONDS,
     ) -> object:
         """Run one level on the warm worker and return its ``HarnessResult``.
 
         When ``warmup`` is set the session runs a bounded pre-warm pass before measuring, so the
         blocking future is allowed that much extra wall-clock on top of the level's own budget.
+
+        When ``on_progress`` is given, the otherwise-blocking wait becomes a poll loop: the session's
+        progress hook (which runs on the loop thread) stashes the latest live metrics, and this controller
+        thread drains them every ``poll_interval`` seconds, so ``on_progress`` is always called from the
+        controller thread (the same thread that emits every other progress event, avoiding a cross-thread
+        sink). The overall wall-clock budget is unchanged.
         """
         from horde_worker_regen.harness import _WARMUP_DRAIN_TIMEOUT_SECONDS
 
         warmup_budget = _WARMUP_DRAIN_TIMEOUT_SECONDS if warmup else 0.0
+        overall_timeout = timeout_seconds + warmup_budget + _WARM_LEVEL_TIMEOUT_MARGIN_SECONDS
+
+        latest: list[tuple[RunMetricsSnapshot, float] | None] = [None]
+        lock = threading.Lock()
+
+        def _stash(snapshot: RunMetricsSnapshot, elapsed: float) -> None:
+            with lock:
+                latest[0] = (snapshot, elapsed)
+
         future = asyncio.run_coroutine_threadsafe(
             self._session.run_level(
                 jobs=jobs,
@@ -288,10 +307,26 @@ class _WarmSessionDriver:
                 threads=threads,
                 timeout_seconds=timeout_seconds,
                 warmup=warmup,
+                on_progress=_stash if on_progress is not None else None,
             ),
             self._loop,
         )
-        return future.result(timeout=timeout_seconds + warmup_budget + _WARM_LEVEL_TIMEOUT_MARGIN_SECONDS)
+
+        if on_progress is None:
+            return future.result(timeout=overall_timeout)
+
+        deadline = time.monotonic() + overall_timeout
+        while True:
+            try:
+                return future.result(timeout=poll_interval)
+            except TimeoutError:
+                if time.monotonic() >= deadline:
+                    future.cancel()
+                    raise
+                with lock:
+                    sample = latest[0]
+                if sample is not None:
+                    on_progress(*sample)
 
     def close(self) -> None:
         """Shut the worker down and stop the loop thread."""
@@ -920,6 +955,14 @@ class BenchmarkController:
         # pre-warm to absorb the one-time cold-load process recovery; baseline/concurrency levels reuse
         # the already-warm base checkpoint and need no warmup.
         warmup = level.stage in (BenchStage.FEATURES, BenchStage.ALCHEMY)
+        # Republish the warm worker's live metrics as LevelProgress so the live card advances while the
+        # level runs, exactly as the subprocess path does by tailing the on-disk live file.
+        last_signature: str | None = None
+
+        def _on_progress(snapshot: RunMetricsSnapshot, elapsed: float) -> None:
+            nonlocal last_signature
+            last_signature = self._emit_warm_progress(level, snapshot, elapsed, last_signature)
+
         try:
             harness_result = self._warm_driver.run_level(
                 jobs=level.scenario.expand_image_jobs(),
@@ -927,6 +970,7 @@ class BenchmarkController:
                 threads=threads,
                 timeout_seconds=level.timeout_seconds,
                 warmup=warmup,
+                on_progress=_on_progress,
             )
         except Exception as e:  # noqa: BLE001 - a wedged warm level is a finding, not a ramp abort
             logger.error(f"Warm level {level.id} failed: {type(e).__name__}: {e}")
@@ -1050,10 +1094,32 @@ class BenchmarkController:
             _log_system_snapshot(f"post-level {level.id}")
 
     def _emit_live_progress(self, level: RampLevel, live_path: Path, last_signature: str | None) -> str | None:
-        """Emit a :class:`LevelProgress` event when the level's live snapshot has changed; return its signature."""
+        """Emit a :class:`LevelProgress` event when the subprocess level's live file has changed.
+
+        Returns the new signature (or the prior one when unchanged/absent). Used by the isolated-subprocess
+        path, which streams live metrics through the on-disk ``level_<id>.live.json`` file.
+        """
         live = self._read_live_snapshot(live_path)
         if live is None:
             return last_signature
+        return self._emit_live_snapshot(level, live, last_signature)
+
+    def _emit_warm_progress(
+        self, level: RampLevel, snapshot: RunMetricsSnapshot, elapsed_seconds: float, last_signature: str | None
+    ) -> str | None:
+        """Emit a :class:`LevelProgress` from the warm worker's in-memory metrics; return its signature.
+
+        The warm path has no on-disk live file: the controller is handed the worker's live run metrics
+        directly, distilled here through the same :class:`LevelLiveSnapshot` shape the subprocess path
+        writes, so both paths produce identical events.
+        """
+        live = LevelLiveSnapshot.from_run_metrics(snapshot, elapsed_seconds)
+        return self._emit_live_snapshot(level, live, last_signature)
+
+    def _emit_live_snapshot(
+        self, level: RampLevel, live: LevelLiveSnapshot, last_signature: str | None
+    ) -> str | None:
+        """Emit a :class:`LevelProgress` for ``live`` when it differs from ``last_signature``; return its signature."""
         signature = live.model_dump_json()
         if signature == last_signature:
             return last_signature

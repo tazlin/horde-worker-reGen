@@ -196,6 +196,7 @@ class LevelState:
     gpu_busy_percent: float | None = None
     elapsed_seconds: float = 0.0
     phase: str = ""
+    process_summary: str = ""
     num_process_recoveries: int = 0
     outcome: str | None = None
     reasons: list[str] = dataclasses.field(default_factory=list)
@@ -268,6 +269,7 @@ class BenchmarkRunState:
             level.gpu_busy_percent = event.gpu_busy_percent
             level.elapsed_seconds = event.elapsed_seconds
             level.phase = event.phase
+            level.process_summary = event.process_summary
             level.num_process_recoveries = event.num_process_recoveries
         elif isinstance(event, LevelFinished):
             level = self._level(event.level_id)

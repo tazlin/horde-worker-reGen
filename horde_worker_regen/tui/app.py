@@ -298,6 +298,7 @@ class HordeWorkerTUI(App[None]):
             self.query_one(BenchmarkView).update_view(
                 self._benchmark_supervisor.run_state,
                 self._benchmark_supervisor.status,
+                frame=self._frame,
             )
         except NoMatches:
             # The refresh interval can fire during mount or teardown; skip until the DOM is ready.

@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, TextIO
 from loguru import logger
 
 if TYPE_CHECKING:
-    from horde_worker_regen.benchmark.progress_channel import LevelLiveSnapshot
     from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
 
 _HEARTBEAT_INTERVAL_SECONDS = 5.0
@@ -49,46 +48,18 @@ _HANG_DUMP_MARGIN_SECONDS = 30.0
 """Seconds after a level's own timeout to fire the C-level faulthandler backstop (a GIL-proof dump)."""
 
 
-def _build_live_snapshot(metrics: RunMetricsSnapshot, elapsed_seconds: float) -> LevelLiveSnapshot:
-    """Distill the live run metrics into the lean latest-only snapshot the controller republishes."""
-    from horde_worker_regen.benchmark.progress_channel import LevelLiveSnapshot
-
-    jobs = metrics.jobs
-    jobs_faulted = sum(1 for job in jobs if job.faulted)
-
-    latest_its: float | None = None
-    for job in jobs:
-        if job.phase_metrics is not None and job.phase_metrics.sampling is not None:
-            sampled_its = job.phase_metrics.sampling.iterations_per_second
-            if sampled_its > 0:
-                latest_its = sampled_its
-
-    vram_used_mb: int | None = None
-    if metrics.vram_used_high_water_mb_per_process:
-        vram_used_mb = max(metrics.vram_used_high_water_mb_per_process.values())
-
-    return LevelLiveSnapshot(
-        jobs_completed=len(jobs),
-        jobs_faulted=jobs_faulted,
-        iterations_per_second=latest_its,
-        vram_used_mb=vram_used_mb,
-        gpu_busy_percent=metrics.gpu_utilization_mean_percent,
-        elapsed_seconds=elapsed_seconds,
-        phase=metrics.phase,
-        process_summary=metrics.process_state_summary,
-        num_process_recoveries=metrics.num_process_recoveries,
-    )
-
-
 def _write_live_snapshot(live_path: Path, metrics: RunMetricsSnapshot, elapsed_seconds: float) -> None:
     """Write the latest live metrics atomically, best-effort (a missed sample is harmless).
 
     The atomic temp-then-replace guarantees the controller, which reads this file concurrently, never
     sees a half-written line.
     """
+    from horde_worker_regen.benchmark.progress_channel import LevelLiveSnapshot
+
     with contextlib.suppress(OSError):
+        snapshot = LevelLiveSnapshot.from_run_metrics(metrics, elapsed_seconds)
         temp_path = live_path.with_suffix(".tmp")
-        temp_path.write_text(_build_live_snapshot(metrics, elapsed_seconds).model_dump_json(), encoding="utf-8")
+        temp_path.write_text(snapshot.model_dump_json(), encoding="utf-8")
         os.replace(temp_path, live_path)
 
 

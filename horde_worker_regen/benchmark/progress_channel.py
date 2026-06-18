@@ -18,10 +18,13 @@ import enum
 import json
 import time
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
+
+if TYPE_CHECKING:
+    from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
 
 PROGRESS_FILENAME = "progress.jsonl"
 """The progress event log written into a run's output directory."""
@@ -276,6 +279,40 @@ class LevelLiveSnapshot(BaseModel):
     """Compact per-process state line; see :class:`LevelProgress.process_summary`."""
     num_process_recoveries: int = 0
     """Cumulative child-process restarts; see :class:`LevelProgress.num_process_recoveries`."""
+
+    @classmethod
+    def from_run_metrics(cls, metrics: RunMetricsSnapshot, elapsed_seconds: float) -> LevelLiveSnapshot:
+        """Distill a worker's live run metrics into the lean latest-only snapshot the controller republishes.
+
+        Shared by both level-execution paths (the isolated subprocess writes it to disk; the warm worker
+        hands it straight to the controller) so a level's live card is populated identically regardless of
+        how the level ran.
+        """
+        jobs = metrics.jobs
+        jobs_faulted = sum(1 for job in jobs if job.faulted)
+
+        latest_its: float | None = None
+        for job in jobs:
+            if job.phase_metrics is not None and job.phase_metrics.sampling is not None:
+                sampled_its = job.phase_metrics.sampling.iterations_per_second
+                if sampled_its > 0:
+                    latest_its = sampled_its
+
+        vram_used_mb: int | None = None
+        if metrics.vram_used_high_water_mb_per_process:
+            vram_used_mb = max(metrics.vram_used_high_water_mb_per_process.values())
+
+        return cls(
+            jobs_completed=len(jobs),
+            jobs_faulted=jobs_faulted,
+            iterations_per_second=latest_its,
+            vram_used_mb=vram_used_mb,
+            gpu_busy_percent=metrics.gpu_utilization_mean_percent,
+            elapsed_seconds=elapsed_seconds,
+            phase=metrics.phase,
+            process_summary=metrics.process_state_summary,
+            num_process_recoveries=metrics.num_process_recoveries,
+        )
 
 
 def parse_progress_event(raw_line: str) -> BenchmarkProgressEvent | None:

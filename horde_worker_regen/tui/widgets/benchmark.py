@@ -55,6 +55,10 @@ untested is unknown (grey), and capped is a deliberate headroom/stability hold-b
 _PLAN_PREVIEW_TIMEOUT_SECONDS = 180.0
 """Cap on the `plan` subprocess: it imports the inference stack and probes the GPU (slow, cold)."""
 
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+"""Braille spinner frames, advanced once per app tick, so an in-progress benchmark always shows motion
+even between the (1-2s apart) live-metric samples."""
+
 
 class _TierToggle(typing.NamedTuple):
     """One selectable model tier as presented in the primary controls."""
@@ -351,10 +355,16 @@ class BenchmarkView(VerticalScroll):
         with contextlib.suppress(NoMatches):
             self.query_one("#benchmark-status", Static).update(self._app_state_summary)
 
-    def update_view(self, run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus) -> None:
-        """Refresh the action buttons, the plan pane, and the body panel from the supervisor's latest state."""
+    def update_view(
+        self, run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus, *, frame: int = 0
+    ) -> None:
+        """Refresh the action buttons, the plan pane, and the body panel from the supervisor's latest state.
+
+        ``frame`` is the app's monotonically increasing tick counter, used only to animate the spinner so
+        a running level reads as live even when its metrics have not changed since the last sample.
+        """
         self._update_buttons(status, run_state)
-        self.query_one("#benchmark-body", Static).update(self._render_body(run_state, status))
+        self.query_one("#benchmark-body", Static).update(self._render_body(run_state, status, frame))
         # A run's RampPlanned event overrides any idle preview with the authoritative plan; an empty
         # plan (before RampPlanned) leaves a previously-previewed plan in place rather than clearing it.
         if run_state.plan_rows:
@@ -592,7 +602,9 @@ class BenchmarkView(VerticalScroll):
             )
         return summary
 
-    def _render_body(self, run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus) -> RenderableType:
+    def _render_body(
+        self, run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus, frame: int
+    ) -> RenderableType:
         """Render the headline, current-level card, per-level table, and (when done) the recommendation."""
         if status is BenchmarkSupervisorStatus.IDLE and not run_state.level_order:
             return self._render_idle_hint()
@@ -600,12 +612,12 @@ class BenchmarkView(VerticalScroll):
         # Before any level exists (worker stop, then the subprocess's import + hardware-probe window),
         # show the startup phase so the slow hand-off reads as motion rather than a frozen blank tab.
         if not run_state.level_order and run_state.startup_phase:
-            return self._render_starting(run_state, status)
+            return self._render_starting(run_state, status, frame)
 
-        sections: list[RenderableType] = [self._render_headline(run_state, status)]
+        sections: list[RenderableType] = [self._render_headline(run_state, status, frame)]
         current = run_state.current_level_id
         if current is not None and current in run_state.levels:
-            sections.append(self._render_current_level(run_state.levels[current]))
+            sections.append(self._render_current_level(run_state.levels[current], frame))
         if run_state.level_order:
             sections.append(self._render_level_table(run_state))
         if run_state.finished and run_state.suggested_bridge_data_yaml:
@@ -634,14 +646,16 @@ class BenchmarkView(VerticalScroll):
         return Panel(body, title="Benchmark", title_align="left", border_style="cyan")
 
     @staticmethod
-    def _render_starting(run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus) -> Panel:
+    def _render_starting(run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus, frame: int) -> Panel:
         """The pre-level startup card: shows the current phase during the worker-stop and import window."""
         run_id = run_state.run_id or "-"
+        spinner = _SPINNER[frame % len(_SPINNER)]
         body = Text.assemble(
             (f" {status.value.upper()} ", "black on yellow"),
             "  ",
             (run_id, "bold"),
             "\n\n",
+            (f"{spinner} ", "bold yellow"),
             (run_state.startup_phase or "Starting…", "yellow"),
             "\n\n",
             ("This can take a minute on a cold start (importing the inference stack and probing the GPU). ", "grey70"),
@@ -652,7 +666,7 @@ class BenchmarkView(VerticalScroll):
         return Panel(body, title="Benchmark starting", title_align="left", border_style="yellow")
 
     @staticmethod
-    def _render_headline(run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus) -> Panel:
+    def _render_headline(run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus, frame: int) -> Panel:
         """A one-line summary of the run's identity, mode, and overall progress."""
         finished_levels = sum(1 for level in run_state.levels.values() if level.outcome is not None)
         total = run_state.num_levels or run_state.levels_total or len(run_state.level_order)
@@ -665,8 +679,10 @@ class BenchmarkView(VerticalScroll):
             BenchmarkSupervisorStatus.CANCELLED: "grey50",
             BenchmarkSupervisorStatus.IDLE: "grey50",
         }.get(status, "white")
+        active = status in (BenchmarkSupervisorStatus.PREPARING, BenchmarkSupervisorStatus.RUNNING)
+        badge = f"{_SPINNER[frame % len(_SPINNER)]} {status.value.upper()} " if active else f" {status.value.upper()} "
         body = Text.assemble(
-            (f" {status.value.upper()} ", f"black on {status_colour}"),
+            (badge, f"black on {status_colour}"),
             "  ",
             (f"{run_state.run_id or '-'}", "bold"),
             (f"   mode={run_state.process_mode or '-'}   {gpu}   ", "grey62"),
@@ -675,27 +691,43 @@ class BenchmarkView(VerticalScroll):
         return Panel(body, border_style=status_colour)
 
     @staticmethod
-    def _render_current_level(level: LevelState) -> Panel:
-        """A live metric card for the level currently running."""
+    def _jobs_cell(level: LevelState) -> RenderableType:
+        """The Jobs row: a filled progress bar when the job count is known, else a bare counter.
+
+        A bar gives an at-a-glance sense of how far through the level we are, which a raw ``3/8`` does not."""
+        suffix = Text(f"  ({level.jobs_faulted} faulted)", style="red") if level.jobs_faulted else Text("")
+        if not level.jobs_expected:
+            return Text.assemble((str(level.jobs_completed), "white"), suffix)
+        width = 20
+        fraction = max(0.0, min(1.0, level.jobs_completed / level.jobs_expected))
+        filled = int(round(fraction * width))
+        bar = Text("█" * filled, style="green")
+        bar.append("░" * (width - filled), style="grey37")
+        bar.append(f"  {level.jobs_completed}/{level.jobs_expected}  {fraction * 100:.0f}%", style="grey70")
+        bar.append_text(suffix)
+        return bar
+
+    @staticmethod
+    def _render_current_level(level: LevelState, frame: int) -> Panel:
+        """A live metric card for the level currently running, led by a spinner so it always reads as live."""
+        spinner = _SPINNER[frame % len(_SPINNER)]
+        title = Text.assemble((f"{spinner} ", "bold cyan"), ("Current level", "bold"))
         table = Table.grid(padding=(0, 2))
         table.add_column(justify="right", style="bold cyan")
         table.add_column()
-        jobs = (
-            f"{level.jobs_completed}/{level.jobs_expected}"
-            if level.jobs_expected is not None
-            else str(level.jobs_completed)
-        )
         table.add_row("Level", f"{level.level_id} ({level.stage}/{level.tier}/{level.axis})")
         if level.phase:
             table.add_row("Status", Text(level.phase, style="yellow"))
-        table.add_row("Jobs", jobs + (f"  ({level.jobs_faulted} faulted)" if level.jobs_faulted else ""))
+        table.add_row("Jobs", BenchmarkView._jobs_cell(level))
         table.add_row("it/s", "-" if level.iterations_per_second is None else f"{level.iterations_per_second:.2f}")
         table.add_row("VRAM", "-" if level.vram_used_mb is None else f"{level.vram_used_mb} MB")
         table.add_row("GPU busy", "-" if level.gpu_busy_percent is None else f"{level.gpu_busy_percent:.0f}%")
         table.add_row("Elapsed", f"{level.elapsed_seconds:.0f}s")
         if level.num_process_recoveries:
             table.add_row("Restarts", Text(f"{level.num_process_recoveries} (!)", style="bold red"))
-        return Panel(table, title="Current level", title_align="left", border_style="cyan")
+        if level.process_summary:
+            table.add_row("Processes", Text(level.process_summary, style="grey62"))
+        return Panel(table, title=title, title_align="left", border_style="cyan")
 
     def _render_level_table(self, run_state: BenchmarkRunState) -> Panel:
         """A per-level verdict table built up as levels finish."""
