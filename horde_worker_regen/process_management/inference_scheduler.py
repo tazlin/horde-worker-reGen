@@ -60,6 +60,9 @@ _DEFAULT_RAM_RESERVE_MB = 4096.0
 """Fallback system-RAM reserve (MB) used until the live config value is read. Matches the
 ``ram_reserve_mb`` config default; keeps resident-in-RAM weights from forcing the OS to page."""
 
+_STALE_RAM_UNLOAD_REPLACE_BYTES = 1024 * 1024 * 1024
+"""RSS threshold above which a model-less idle process is still materially holding RAM after unload."""
+
 
 class InferenceScheduler:
     """Owns model preloading, inference start, and model unloading logic."""
@@ -249,6 +252,61 @@ class InferenceScheduler:
 
         return self._max_inference_processes + processes_post_processing
 
+    def _expire_stale_model_map_entries(self) -> list[str]:
+        """Expire model-map entries whose owning process can no longer be loading that model."""
+        expired: list[str] = []
+        loading_owner_states = {
+            HordeProcessState.PROCESS_STARTING,
+            HordeProcessState.DOWNLOADING_MODEL,
+            HordeProcessState.PRELOADING_MODEL,
+        }
+
+        for model_name, model_info in list(self._horde_model_map.root.items()):
+            process_info = self._process_map.get(model_info.process_id)
+            if process_info is None:
+                self._horde_model_map.expire_entry(model_name)
+                expired.append(model_name)
+                logger.warning(
+                    f"Expiring stale model-map entry for {model_name}: process {model_info.process_id} is gone.",
+                )
+                continue
+
+            if (
+                model_info.horde_model_load_state == ModelLoadState.LOADING
+                and process_info.last_process_state not in loading_owner_states
+            ):
+                self._horde_model_map.expire_entry(model_name)
+                expired.append(model_name)
+                logger.warning(
+                    f"Expiring stale loading entry for {model_name} on process {process_info.process_id}: "
+                    f"process is {process_info.last_process_state.name}.",
+                )
+
+        return expired
+
+    def _replace_stale_ram_unload_process(self) -> bool:
+        """Cycle an idle inference process that did not actually release RAM after a RAM-unload request."""
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.is_process_busy():
+                continue
+            if process_info.loaded_horde_model_name is not None:
+                continue
+            if process_info.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
+                continue
+            if process_info.ram_usage_bytes < _STALE_RAM_UNLOAD_REPLACE_BYTES:
+                continue
+
+            logger.warning(
+                f"RAM unload did not release process {process_info.process_id}'s resident memory "
+                f"({process_info.ram_usage_bytes} bytes); replacing the idle process.",
+            )
+            self._process_lifecycle._replace_inference_process(process_info)
+            return True
+
+        return False
+
     def preload_models(self) -> bool:
         """Preload models that are likely to be used soon.
 
@@ -256,6 +314,7 @@ class InferenceScheduler:
             True if a model was preloaded, False otherwise.
         """
         bridge_data = self._runtime_config.bridge_data
+        self._expire_stale_model_map_entries()
         loaded_models = {process.loaded_horde_model_name for process in self._process_map.values()}
         loaded_models = loaded_models.union(
             model.horde_model_name
@@ -392,7 +451,8 @@ class InferenceScheduler:
                             "Reclaiming idle RAM.</>",
                         )
                         self._ram_budget_defer_notified = True
-                    self.unload_models(under_pressure=True)
+                    if not self.unload_models(under_pressure=True):
+                        self._replace_stale_ram_unload_process()
                     return False
                 self._ram_budget_defer_notified = False
 

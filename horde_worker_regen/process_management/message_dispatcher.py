@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from multiprocessing import Queue
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
@@ -45,6 +46,22 @@ from horde_worker_regen.telemetry_spans import (
 )
 
 _excludes_for_job_dump = {"source_image", "source_mask", "extra_source_images", "r2_upload"}
+
+
+@dataclass(frozen=True)
+class DeadlockSnapshot:
+    """Represents the currently observed scheduler deadlock state."""
+
+    in_deadlock: bool
+    in_queue_deadlock: bool
+    deadlock_started_at: float
+    queue_deadlock_started_at: float
+    queue_deadlock_model: str | None
+    queue_deadlock_process_id: int | None
+
+    def has_active_deadlock(self) -> bool:
+        """Return whether any deadlock detector is currently active."""
+        return self.in_deadlock or self.in_queue_deadlock
 
 
 class MessageDispatcher:
@@ -140,9 +157,6 @@ class MessageDispatcher:
             except queue.Empty:
                 logger.debug("Queue was empty, breaking")
                 break
-
-            self._in_deadlock = False
-            self._in_queue_deadlock = False
 
             # The download process lives outside the process map, so its messages must be handled
             # (or ignored) before any of the process-map lookups below, which would otherwise raise.
@@ -601,6 +615,17 @@ class MessageDispatcher:
 
         await self._job_tracker.queue_for_submit(completed_job_info)
 
+    def get_deadlock_snapshot(self) -> DeadlockSnapshot:
+        """Return a snapshot of the currently detected deadlock state."""
+        return DeadlockSnapshot(
+            in_deadlock=self._in_deadlock,
+            in_queue_deadlock=self._in_queue_deadlock,
+            deadlock_started_at=self._last_deadlock_detected_time,
+            queue_deadlock_started_at=self._last_queue_deadlock_detected_time,
+            queue_deadlock_model=self._queue_deadlock_model,
+            queue_deadlock_process_id=self._queue_deadlock_process_id,
+        )
+
     def detect_deadlock(self) -> None:
         """Detect if there are jobs in the queue but no processes doing anything."""
 
@@ -615,13 +640,30 @@ class MessageDispatcher:
             logger.debug(f"process_map: {self._process_map}")
 
         if self._state.last_pop_recently():
+            if self._in_deadlock or self._in_queue_deadlock:
+                logger.debug("Deadlock cleared after recent job pop.")
+            self._in_deadlock = False
+            self._in_queue_deadlock = False
+            self._queue_deadlock_model = None
+            self._queue_deadlock_process_id = None
             return
 
-        if (
-            not self._in_queue_deadlock
-            and self._process_map.all_waiting_for_job()
+        queue_deadlock_condition = (
+            self._process_map.all_waiting_for_job()
             and len(self._job_tracker.jobs_pending_inference) > 0
+            and not any(job in self._job_tracker.jobs_in_progress for job in self._job_tracker.jobs_pending_inference)
+        )
+        if (
+            self._in_queue_deadlock
+            and not queue_deadlock_condition
+            and self._process_map.num_starting_processes() == 0
         ):
+            logger.debug("Queue deadlock cleared.")
+            self._in_queue_deadlock = False
+            self._queue_deadlock_model = None
+            self._queue_deadlock_process_id = None
+
+        if not self._in_queue_deadlock and queue_deadlock_condition:
             currently_loaded_models = set()
             model_process_map: dict[str, int] = {}
             for process in self._process_map.values():
@@ -649,7 +691,7 @@ class MessageDispatcher:
                 self._last_queue_deadlock_detected_time = time.time()
                 return
 
-            logger.debug("Queue deadlock detected")
+            logger.debug("Queue deadlock still detected after 30 seconds.")
             _print_deadlock_info()
 
             if self._queue_deadlock_model is not None:
@@ -657,35 +699,22 @@ class MessageDispatcher:
             else:
                 logger.warning("Queue deadlock detected but no model causing it.")
 
-            self._in_queue_deadlock = False
-            self._queue_deadlock_model = None
-            self._queue_deadlock_process_id = None
+            # Keep the flag set so the recovery supervisor can act on a sustained deadlock.
 
-        if (
-            (not self._in_deadlock)
-            and (
-                len(self._job_tracker.jobs_pending_inference) > 0
-                or len(self._job_tracker.jobs_in_progress) > 0
-                or len(self._job_tracker.jobs_lookup) > 0
-            )
-            and self._process_map.num_busy_processes() == 0
-        ):
+        deadlock_condition = (
+            len(self._job_tracker.jobs_pending_inference) > 0
+            or len(self._job_tracker.jobs_in_progress) > 0
+            or len(self._job_tracker.jobs_lookup) > 0
+        ) and self._process_map.num_busy_processes() == 0
+
+        if (not self._in_deadlock) and deadlock_condition:
             self._last_deadlock_detected_time = time.time()
             self._in_deadlock = True
             logger.debug("Deadlock detected")
             _print_deadlock_info()
-        elif (
-            self._in_deadlock
-            and (self._last_deadlock_detected_time + 10) < time.time()
-            and self._process_map.num_busy_processes() == 0
-        ):
+        elif self._in_deadlock and (self._last_deadlock_detected_time + 10) < time.time() and deadlock_condition:
             logger.debug("Deadlock still detected after 10 seconds.")
-
-            self._in_deadlock = False
-        elif (
-            self._in_deadlock
-            and (self._last_deadlock_detected_time + 5) < time.time()
-            and self._process_map.num_busy_processes() > 0
-        ):
-            logger.debug("Deadlock was likely false-alarm.")
+            _print_deadlock_info()
+        elif self._in_deadlock and not deadlock_condition:
+            logger.debug("Deadlock cleared.")
             self._in_deadlock = False

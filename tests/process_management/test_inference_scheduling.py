@@ -18,6 +18,7 @@ from horde_worker_regen.process_management.lru_cache import LRUCache
 from horde_worker_regen.process_management.messages import (
     HordeControlFlag,
     HordeProcessState,
+    ModelInfo,
     ModelLoadState,
 )
 from horde_worker_regen.process_management.process_map import ProcessMap
@@ -106,6 +107,37 @@ class TestPreloadModels:
         result = inference_scheduler.preload_models()
         assert result is True
         assert process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+
+    async def test_preload_expires_stale_loading_entry_for_idle_process(self) -> None:
+        """A stale loading model-map entry must not prevent a queued model from being preloaded."""
+        process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: process_info})
+        horde_model_map = HordeModelMap(
+            root={
+                "new_model": ModelInfo(
+                    horde_model_name="new_model",
+                    horde_model_load_state=ModelLoadState.LOADING,
+                    process_id=0,
+                ),
+            },
+        )
+        job_tracker = JobTracker()
+
+        job = make_job_pop_response("new_model")
+        await track_popped_job_async(job_tracker, job)
+
+        inference_scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+        )
+
+        result = inference_scheduler.preload_models()
+
+        assert result is True
+        assert process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        assert horde_model_map.root["new_model"].horde_model_load_state == ModelLoadState.LOADING
+        assert horde_model_map.root["new_model"].process_id == 0
 
     async def test_no_available_process_returns_false(self) -> None:
         """Preload should return False if there are no available processes to load the model."""
@@ -388,6 +420,18 @@ class TestUnloadModels:
         old_control_flag = process_info.last_control_flag
         inference_scheduler.unload_from_ram(0)
         assert process_info.last_control_flag == old_control_flag
+
+    def test_replace_stale_ram_unload_process_cycles_model_less_idle_slot(self) -> None:
+        """An idle model-less process that still holds RAM after unload should be replaced."""
+        process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+        process_info.ram_usage_bytes = 2 * 1024 * 1024 * 1024
+        process_map = ProcessMap({0: process_info})
+
+        inference_scheduler = _make_inference_scheduler(process_map=process_map)
+
+        assert inference_scheduler._replace_stale_ram_unload_process() is True
+        inference_scheduler._process_lifecycle._replace_inference_process.assert_called_once_with(process_info)
 
 
 class TestSpeculativeDispatchCap:

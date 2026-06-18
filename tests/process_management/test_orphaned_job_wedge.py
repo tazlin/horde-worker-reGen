@@ -165,6 +165,20 @@ def test_repeated_orphan_punts_escalate_to_wedge() -> None:
     assert pm._assess_wedge() is True
 
 
+async def test_detected_deadlock_escalates_to_recovery_wedge() -> None:
+    """A detected scheduler deadlock must be visible to the recovery supervisor."""
+    pm = make_testable_process_manager()
+    pm._state.last_job_pop_time = time.time() - 60
+
+    job = make_job_pop_response(model="stable_diffusion")
+    await track_popped_job_async(pm._job_tracker, job)
+
+    pm.detect_deadlock()
+
+    assert pm._message_dispatcher.get_deadlock_snapshot().has_active_deadlock() is True
+    assert pm._assess_wedge() is True
+
+
 def test_stale_orphan_punts_age_out_of_the_wedge_window() -> None:
     """Punts older than the window do not count, so a long-ago blip is not treated as an active wedge."""
     pm = make_testable_process_manager()
