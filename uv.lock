@@ -1107,7 +1107,7 @@ wheels = [
 
 [[package]]
 name = "horde-engine"
-version = "3.2.5"
+version = "3.2.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1173,9 +1173,9 @@ dependencies = [
     { name = "yapf" },
     { name = "yarl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bb/79/2bb0664848e92eeecc5192fe215468acfcfac57923e1a5a557bc65b09fbf/horde_engine-3.2.5.tar.gz", hash = "sha256:2a168b9bc8f68d70b12da23fcf95575e217d2487d12808b0d9f7e973e5a4eed6", size = 370935, upload-time = "2026-06-17T12:58:07.086Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cf/6f/053d66ee788b257b3079921b1c5969fdad34fd12984b1153d19ad2302ac9/horde_engine-3.2.6.tar.gz", hash = "sha256:570805a383aaa2e1e4493c81be32f498913520bd2d35ef72e9baef73854a00a7", size = 371719, upload-time = "2026-06-18T14:34:39.606Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fc/37/4a118ac6c94d4af139be794d7bea20122d25c6bc481d37fdd7fb9237b39a/horde_engine-3.2.5-py3-none-any.whl", hash = "sha256:83ff8ace0f9f0c175bd9b1e7faf615c225ee1cdfba01ed30713509812f2ff605", size = 476378, upload-time = "2026-06-17T12:58:05.072Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/a0/ff592b0915bdbee5053033f8820e36eec726aa72a7d40bebbcdc13f23295/horde_engine-3.2.6-py3-none-any.whl", hash = "sha256:673cf2e5a70156291cdc5309917b7205fb929dd85ab861fd09ca7f507277e3d8", size = 477392, upload-time = "2026-06-18T14:34:37.802Z" },
 ]
 
 [package.optional-dependencies]
@@ -1364,7 +1364,7 @@ requires-dist = [
     { name = "babel" },
     { name = "certifi" },
     { name = "horde-engine", extras = ["controlnet"], marker = "extra == 'controlnet'" },
-    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=3.2.5,<4.0.0" },
+    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=3.2.6,<4.0.0" },
     { name = "horde-engine", extras = ["rembg"], marker = "extra == 'post-processing'" },
     { name = "horde-model-reference", specifier = ">=5.3.0,<6.0.0" },
     { name = "horde-safety", specifier = "~=0.3.0" },
@@ -4285,10 +4285,10 @@ dependencies = [
     { name = "typing-extensions", marker = "(sys_platform != 'darwin' and extra == 'extra-18-horde-worker-regen-cpu') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132')" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.1%2Bcpu-cp312-cp312-linux_s390x.whl", upload-time = "2026-06-17T14:43:17Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.1%2Bcpu-cp312-cp312-manylinux_2_28_aarch64.whl", upload-time = "2026-06-17T14:43:19Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl", upload-time = "2026-06-17T14:43:19Z" },
-    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.1%2Bcpu-cp312-cp312-win_amd64.whl", upload-time = "2026-06-17T14:43:20Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.1%2Bcpu-cp312-cp312-linux_s390x.whl", hash = "sha256:900b253fc8c739bebffb63d7f75abff4cd53d79947265a00c16cb53b68ecdb91", upload-time = "2026-06-18T01:57:23Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.1%2Bcpu-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:d1620bc7bcf8087f3e48821b5db994a03e32ddb083d58c000b8e032f8a6e2d15", upload-time = "2026-06-18T01:57:29Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.1%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:ae4bb28409f5370852bd71af221066236c38d647f780d9b0a7240c330a9c12df", upload-time = "2026-06-18T01:57:35Z" },
+    { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.1%2Bcpu-cp312-cp312-win_amd64.whl", hash = "sha256:51c6c6e26eaa0d64ed439ebdc9ce3b8cc2d5cfcc7cdd4e72f17831d80886b7f4", upload-time = "2026-06-18T01:57:42Z" },
 ]
 
 [[package]]
@@ -4312,9 +4312,9 @@ dependencies = [
     { name = "typing-extensions", marker = "extra == 'extra-18-horde-worker-regen-cu126' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132')" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.12.1%2Bcu126-cp312-cp312-manylinux_2_28_aarch64.whl", upload-time = "2026-06-17T14:43:45Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.12.1%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl", upload-time = "2026-06-17T14:43:53Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.12.1%2Bcu126-cp312-cp312-win_amd64.whl", upload-time = "2026-06-17T14:43:53Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.12.1%2Bcu126-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:56cf3005c798fdbce26e330440c6713a4dd3e19e545ad4d83443f57e476d0d9d", upload-time = "2026-06-18T02:06:06Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.12.1%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:fcc3cf2026f15afeb69f51fa3fde7b286ffd7e6d9b8e070021ca8abd95bd220a", upload-time = "2026-06-18T02:06:37Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.12.1%2Bcu126-cp312-cp312-win_amd64.whl", hash = "sha256:71ee0eca3bde3a4067dfbc28c705b914d0773edd29ac4a634ad5e7a07f336aa1", upload-time = "2026-06-18T02:08:20Z" },
 ]
 
 [[package]]
@@ -4339,9 +4339,9 @@ dependencies = [
     { name = "typing-extensions", marker = "extra == 'extra-18-horde-worker-regen-cu130' or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132') or (extra == 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132')" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl", upload-time = "2026-06-17T14:46:28Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", upload-time = "2026-06-17T14:46:30Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp312-cp312-win_amd64.whl", upload-time = "2026-06-17T14:46:38Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:2d3e87d41ffb340ddf8c99e2a690a29feea9f5271459dd57621cd11317a434f2", upload-time = "2026-06-18T02:38:10Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:4bafc356fbb622e2756179406825c3a56c17b401196435a1487c5b40c657706c", upload-time = "2026-06-18T02:38:36Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp312-cp312-win_amd64.whl", hash = "sha256:52c5da6a0898d5d3473c02bd304b7a3bc0b72e351c6f3bfa0783e45ef9f4cd61", upload-time = "2026-06-18T02:39:58Z" },
 ]
 
 [[package]]
@@ -4365,9 +4365,9 @@ dependencies = [
     { name = "typing-extensions", marker = "(extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu126') or (extra == 'extra-18-horde-worker-regen-cpu' and extra == 'extra-18-horde-worker-regen-cu130') or (extra == 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu130') or (extra != 'extra-18-horde-worker-regen-cu130' and extra == 'extra-18-horde-worker-regen-cu132') or (extra != 'extra-18-horde-worker-regen-cpu' and extra != 'extra-18-horde-worker-regen-cu126' and extra == 'extra-18-horde-worker-regen-cu132')" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp312-cp312-manylinux_2_28_aarch64.whl", upload-time = "2026-06-17T14:48:01Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl", upload-time = "2026-06-17T14:48:07Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp312-cp312-win_amd64.whl", upload-time = "2026-06-17T14:48:14Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:8139af68deafa649e0f0313684791e93ab4269ecf550535284dbfb549fdac41a", upload-time = "2026-06-18T02:55:38Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:b18be7b089e85324b18d26aba82d0e6de896d884568349e1d6832498fbdffdb3", upload-time = "2026-06-18T02:56:03Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp312-cp312-win_amd64.whl", hash = "sha256:5c6c00824a460bfc970d81fc869924b2510cc42e8857c4e87156b8b282e1f5c3", upload-time = "2026-06-18T02:57:07Z" },
 ]
 
 [[package]]
@@ -4470,7 +4470,7 @@ dependencies = [
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cu126/torchvision-0.27.1%2Bcu126-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6aecfcc18b6d16c6057ca742ec59165d174ca43e8defd45ce602dfd12b3071f2", upload-time = "2026-06-17T15:44:39Z" },
     { url = "https://download-r2.pytorch.org/whl/cu126/torchvision-0.27.1%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:17db807b431323cb86682006e043337316598239bae5b5a8f405d304b746a316", upload-time = "2026-06-17T15:44:39Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu126/torchvision-0.27.1%2Bcu126-cp312-cp312-win_amd64.whl", upload-time = "2026-06-17T15:44:39Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torchvision-0.27.1%2Bcu126-cp312-cp312-win_amd64.whl", hash = "sha256:0f8b5e370b1ed989fe73fdd86baf3bc7f516f919b3136bfb1d22ce4cf265afe9", upload-time = "2026-06-18T04:00:05Z" },
 ]
 
 [[package]]
@@ -4485,7 +4485,7 @@ dependencies = [
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cu130/torchvision-0.27.1%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:d2b15508b03a8949d8ff1e67a61342e9191c3fde2bf750996b24b3d472bcd7cb", upload-time = "2026-06-17T15:44:44Z" },
     { url = "https://download-r2.pytorch.org/whl/cu130/torchvision-0.27.1%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:abbfc724597c16da177002a16979aa8c44c4898c97bcb731b647cc57507f5772", upload-time = "2026-06-17T15:44:44Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu130/torchvision-0.27.1%2Bcu130-cp312-cp312-win_amd64.whl", upload-time = "2026-06-17T15:44:44Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu130/torchvision-0.27.1%2Bcu130-cp312-cp312-win_amd64.whl", hash = "sha256:1bf254c102bfaf97d3e7878b76b68999bcd4dcd4303c109e76b4fbf9b15265c5", upload-time = "2026-06-18T04:00:18Z" },
 ]
 
 [[package]]
@@ -4500,7 +4500,7 @@ dependencies = [
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cu132/torchvision-0.27.1%2Bcu132-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:cd58f5e0e48648ab797a995df73e1b33bc5ae711d2a7d2103ab50adcc2b0bcc2", upload-time = "2026-06-17T15:44:45Z" },
     { url = "https://download-r2.pytorch.org/whl/cu132/torchvision-0.27.1%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:679aedb2c3c3c72fdbbd8bb716cac3abc023da972e435e4cebaa7c9cb92074f4", upload-time = "2026-06-17T15:44:45Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu132/torchvision-0.27.1%2Bcu132-cp312-cp312-win_amd64.whl", upload-time = "2026-06-17T15:44:45Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu132/torchvision-0.27.1%2Bcu132-cp312-cp312-win_amd64.whl", hash = "sha256:705e69fbca1adf20f73fe31ede91f4bdfb81c2bc342503fcdf8e04d0ecd5d5cf", upload-time = "2026-06-18T04:00:23Z" },
 ]
 
 [[package]]

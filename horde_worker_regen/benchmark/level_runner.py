@@ -47,6 +47,72 @@ _STALL_CHECK_INTERVAL_SECONDS = 15.0
 _HANG_DUMP_MARGIN_SECONDS = 30.0
 """Seconds after a level's own timeout to fire the C-level faulthandler backstop (a GIL-proof dump)."""
 
+_ANNOTATOR_PREWARM_TIMEOUT_SECONDS = 300.0
+"""Bound on the controlnet annotator pre-warm subprocess: enough for a cold annotator download (the LeReS
+checkpoints are ~0.8 GB) and a single verify run, after which the pre-warm is abandoned and the level runs
+anyway (the first controlnet job then cold-loads as before)."""
+
+
+def _annotator_prewarm_entry(directml: int | None) -> None:
+    """Spawn target: download/verify the controlnet annotators, then exit so the GPU is freed.
+
+    Runs ``SharedModelManager.preload_annotators`` (the same call the worker's download process uses), which
+    is idempotent and fast once the on-disk preload marker exists. Constructing ComfyUI here loads the GPU,
+    but this process exits immediately afterwards, so no resident VRAM survives into the timed run. Crash
+    capture mirrors the other spawn targets so a failure leaves a discoverable trace rather than dying
+    silently.
+    """
+    from horde_worker_regen.process_management.child_crash_capture import (
+        enable_child_faulthandler,
+        write_startup_crash,
+    )
+
+    enable_child_faulthandler("cn_annotator_prewarm")
+    try:
+        import hordelib
+        from hordelib.api import SharedModelManager
+
+        extra_comfyui_args = [f"--directml={directml}"] if directml is not None else []
+        hordelib.initialise(extra_comfyui_args=extra_comfyui_args)
+        SharedModelManager.preload_annotators()
+    except BaseException as exc:  # noqa: BLE001 - best-effort; record and exit so the level still runs
+        write_startup_crash("cn_annotator_prewarm", exc)
+
+
+def _level_exercises_controlnet(level: object) -> bool:
+    """Whether *level* runs any classic controlnet preprocessor (has a job with a ``control_type``)."""
+    scenario = getattr(level, "scenario", None)
+    image_jobs = getattr(scenario, "image_jobs", []) if scenario is not None else []
+    return any(getattr(job, "control_type", None) for job in image_jobs)
+
+
+def _prewarm_controlnet_annotators(directml: int | None) -> None:
+    """Pre-download the controlnet annotators in a throwaway process before the timed children start.
+
+    Caching the annotators on disk first removes the slow one-time download from the first controlnet job,
+    which otherwise happens inside ``INFERENCE_STARTING`` (before the first sampling step) and trips the 15s
+    ``inference_step_timeout`` watchdog, faulting/recovering the slot and skewing the level's timing. Done in
+    a separate spawned process that exits before ``run_harness`` launches the inference children, so the
+    heavy ComfyUI/GPU init it needs leaves no resident VRAM behind. Best-effort and time-bounded.
+    """
+    import multiprocessing
+
+    logger.info("Pre-warming controlnet annotators before the timed run (one-time download/verify) ...")
+    started = time.time()
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(target=_annotator_prewarm_entry, args=(directml,), name="cn-annotator-prewarm", daemon=False)
+    proc.start()
+    proc.join(_ANNOTATOR_PREWARM_TIMEOUT_SECONDS)
+    if proc.is_alive():
+        logger.warning(
+            f"Controlnet annotator pre-warm did not finish within {_ANNOTATOR_PREWARM_TIMEOUT_SECONDS:.0f}s; "
+            "abandoning it (the first controlnet job will cold-load as before).",
+        )
+        proc.terminate()
+        proc.join(10)
+        return
+    logger.info(f"Controlnet annotator pre-warm finished in {time.time() - started:.1f}s (exit={proc.exitcode}).")
+
 
 def _write_live_snapshot(live_path: Path, metrics: RunMetricsSnapshot, elapsed_seconds: float) -> None:
     """Write the latest live metrics atomically, best-effort (a missed sample is harmless).
@@ -245,6 +311,13 @@ def run_level(level_json_path: Path, out_dir: Path, *, process_mode: str = "real
                 on_progress=_on_progress,
                 progress_interval_seconds=_PROGRESS_INTERVAL_SECONDS,
             )
+        # The warm path pre-warms feature levels via WarmHarnessSession; this isolated subprocess path has no
+        # such step, so a controlnet level here would cold-load its annotator inside the first job. Pre-fetch
+        # the annotators now (in a throwaway process) so the timed children find them cached.
+        if process_mode == "real" and _level_exercises_controlnet(level):
+            with contextlib.suppress(Exception):
+                _prewarm_controlnet_annotators(directml=None)
+
         harness_result = run_harness(config)
         harness_dict = dataclasses.asdict(harness_result)
         # Drop the nested metrics snapshot before filtering kwargs into HarnessSummary;

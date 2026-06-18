@@ -79,6 +79,18 @@ class LevelRequirements(BaseModel):
     requires_network: bool = False
     requires_civitai_key: bool = False
     """True when a job pulls loras/TIs, which are fetched from CivitAI and may need a token."""
+    requires_controlnet: bool = False
+    """True when a job exercises a classic controlnet preprocessor (has a ``control_type``)."""
+    controlnet_installed: bool | None = None
+    """Whether the controlnet extra (onnxruntime annotators) is installed, or None when undeterminable."""
+    controlnet_annotator_bytes: int = 0
+    """ROM annotator-checkpoint download size for the level's control types (0 when not a controlnet level).
+
+    These annotator weights are fetched lazily on first use and are *not* part of ``download_bytes_needed``
+    (which counts only image checkpoints); a surface that wants the full "to fetch" figure must add them.
+    """
+    controlnet_install_hint: str = ""
+    """How to enable controlnet when the level needs it but the extra is absent (empty otherwise)."""
     features: list[str] = Field(default_factory=list)
     """Human-readable feature tags exercised by the level (hires_fix, controlnet, post_processing, ...)."""
 
@@ -163,6 +175,39 @@ def _tier_download_bytes(tier: BenchTier) -> int | None:
         return None
 
 
+def _level_control_types(level: RampLevel) -> list[str]:
+    """Return the distinct controlnet ``control_type``s the level's image jobs exercise (may be empty)."""
+    return sorted({job.control_type for job in level.scenario.image_jobs if job.control_type})
+
+
+def controlnet_installed() -> bool | None:
+    """Whether the controlnet extra (onnxruntime annotators) is installed, or None when undeterminable.
+
+    Fails open (None) so the cheap offline ``plan`` preview and the unit tests, which may not import
+    hordelib, do not turn an unknown into a false "missing".
+    """
+    try:
+        from horde_worker_regen.capabilities import controlnet_available
+
+        return controlnet_available()
+    except Exception as e:  # noqa: BLE001 - capability probe is best-effort; fail open to "unknown"
+        logger.debug(f"Could not determine controlnet availability: {e}")
+        return None
+
+
+def _controlnet_annotator_bytes(control_types: list[str]) -> int:
+    """ROM annotator-download size for *control_types* via hordelib, or 0 when unavailable/none."""
+    if not control_types:
+        return 0
+    try:
+        from hordelib.api import controlnet_annotator_download_bytes
+
+        return controlnet_annotator_download_bytes(control_types)
+    except Exception as e:  # noqa: BLE001 - sizing is informational; fail open to 0
+        logger.debug(f"Could not size controlnet annotators for {control_types}: {e}")
+        return 0
+
+
 def _level_features(level: RampLevel) -> list[str]:
     """Human-readable feature tags the level exercises, derived from its image jobs."""
     jobs = level.scenario.image_jobs
@@ -207,6 +252,19 @@ def compute_level_requirements(
     models_required = level.scenario.models_referenced()
     requires_civitai_key = any(job.lora_names or job.ti_names for job in level.scenario.image_jobs)
 
+    control_types = _level_control_types(level)
+    requires_controlnet = bool(control_types)
+    cn_installed = controlnet_installed() if requires_controlnet else None
+    cn_install_hint = ""
+    if requires_controlnet and cn_installed is False:
+        try:
+            from horde_worker_regen.capabilities import controlnet_install_hint
+
+            cn_install_hint = controlnet_install_hint()
+        except Exception as e:  # noqa: BLE001 - hint is advisory; a generic message covers the gap
+            logger.debug(f"Could not build controlnet install hint: {e}")
+            cn_install_hint = "install the `horde-worker-reGen[controlnet]` extra to enable controlnet"
+
     plan = models_disk_plan(models_required) if present_resolver is None else None
     if plan is not None:
         missing_models = [
@@ -243,6 +301,10 @@ def compute_level_requirements(
         free_disk_bytes=free_disk_bytes,
         requires_network=level.requires_network,
         requires_civitai_key=requires_civitai_key,
+        requires_controlnet=requires_controlnet,
+        controlnet_installed=cn_installed,
+        controlnet_annotator_bytes=_controlnet_annotator_bytes(control_types),
+        controlnet_install_hint=cn_install_hint,
         features=_level_features(level),
     )
 
@@ -284,6 +346,13 @@ def requirement_skip_reason(
         missing = ", ".join(_missing_label(req, name) for name in req.models_missing)
         return f"{req.tier} model {missing} is not present on disk{beta_hint}"
 
+    # Mirror the runtime coercion in capabilities.coerce_bridge_data_to_capabilities: a worker without the
+    # controlnet extra advertises controlnet off, so a controlnet level cannot run there. Surfacing it as a
+    # skip (with the install remedy) keeps the preview honest rather than letting the level "run" and fault.
+    if not force and req.requires_controlnet and req.controlnet_installed is False:
+        hint = req.controlnet_install_hint or "install the `horde-worker-reGen[controlnet]` extra"
+        return f"controlnet not installed: {hint}"
+
     if (
         not force
         and req.estimated_vram_mb is not None
@@ -322,6 +391,7 @@ __all__ = [
     "MissingModel",
     "civitai_token_available",
     "compute_level_requirements",
+    "controlnet_installed",
     "model_present_on_disk",
     "models_disk_plan",
     "requirement_skip_reason",

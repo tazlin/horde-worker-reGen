@@ -39,6 +39,37 @@ def test_plan_subcommand_emits_one_row_per_level(
     assert all(row.will_run for row in rows)  # fake mode never gates on resources
 
 
+def test_plan_table_renders_controlnet_column() -> None:
+    """The text plan table shows a CN column (size / MISSING) and prompts to download annotators."""
+    from horde_worker_regen.benchmark.progress_channel import LevelPlanRow
+    from horde_worker_regen.benchmark.progress_console import format_plan_table
+
+    rows = [
+        LevelPlanRow(
+            level_id="C-sd15-controlnet",
+            requires_controlnet=True,
+            controlnet_installed=True,
+            controlnet_annotator_bytes=800 * 1024**2,
+            will_run=True,
+        ),
+        LevelPlanRow(
+            level_id="C-sd15-cn-absent",
+            requires_controlnet=True,
+            controlnet_installed=False,
+            will_run=False,
+            verdict="controlnet not installed",
+        ),
+        LevelPlanRow(level_id="A-sd15-baseline", will_run=True),
+    ]
+
+    table = format_plan_table(rows)
+
+    assert "CN" in table
+    assert "MISSING" in table
+    assert "~0.8G" in table
+    assert "controlnet annotators" in table
+
+
 def test_plan_subcommand_honours_exclude_axis(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,

@@ -93,6 +93,17 @@ def controlnet_available() -> bool:
     return FEATURE_KIND.controlnet in _available_features()
 
 
+def controlnet_install_hint() -> str:
+    """Build the actionable "install the controlnet extra" fragment naming the missing packages.
+
+    Public wrapper around :func:`_install_hint` for the benchmark planner, so a controlnet level that
+    cannot run on this install surfaces the same remedy the runtime coercion logs.
+    """
+    from hordelib.feature_impact import FEATURE_KIND
+
+    return _install_hint(FEATURE_KIND.controlnet)
+
+
 def _install_hint(feature: FEATURE_KIND) -> str:
     """Build an actionable "install this extra" fragment naming the missing packages for *feature*."""
     from hordelib.api import missing_packages

@@ -107,6 +107,12 @@ class LevelPlanRow(BaseModel):
     """How many of the level's models are not yet on disk (drives the "download first" prompt)."""
     requires_network: bool = False
     requires_civitai_key: bool = False
+    requires_controlnet: bool = False
+    """True when the level exercises a classic controlnet preprocessor."""
+    controlnet_installed: bool | None = None
+    """Whether the controlnet extra is installed, or None when undeterminable."""
+    controlnet_annotator_bytes: int = 0
+    """ROM annotator-checkpoint download size for the level's control types (separate from model bytes)."""
     features: list[str] = Field(default_factory=list)
     will_run: bool = True
     verdict: str = ""

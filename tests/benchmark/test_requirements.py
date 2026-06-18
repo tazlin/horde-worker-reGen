@@ -164,6 +164,66 @@ def test_compute_requirements_uses_the_real_disk_plan(monkeypatch: pytest.Monkey
     assert [model.target_path for model in req.missing_models] == ["/b"]
 
 
+def _sd15_controlnet_level() -> RampLevel:
+    """Build an sd15 feature ladder and return the classic controlnet (preprocessor) level."""
+    ladder = build_default_ladder(
+        LadderOptions(
+            tiers=["sd15"],
+            include_concurrency=False,
+            include_features=True,
+            include_alchemy=False,
+        ),
+    )
+    return next(level for level in ladder if level.id.endswith("-controlnet"))
+
+
+def test_controlnet_level_surfaces_installed_and_annotator_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A controlnet level reports requires_controlnet, the installed flag, and a non-zero annotator ROM."""
+    monkeypatch.setattr(requirements_mod, "controlnet_installed", lambda: True)
+    monkeypatch.setattr(requirements_mod, "_controlnet_annotator_bytes", lambda control_types: 800 * 1024**2)
+
+    req = compute_level_requirements(_sd15_controlnet_level(), present_resolver=_present)
+
+    assert req.requires_controlnet is True
+    assert req.controlnet_installed is True
+    assert req.controlnet_annotator_bytes == 800 * 1024**2
+    assert req.controlnet_install_hint == ""
+    assert "controlnet" in req.features
+
+
+def test_non_controlnet_level_has_no_controlnet_requirement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A plain baseline never probes controlnet and reports it as not required, size zero."""
+    monkeypatch.setattr(requirements_mod, "controlnet_installed", lambda: True)
+    baseline, _ = _sd15_baseline_and_download_levels()
+
+    req = compute_level_requirements(baseline, present_resolver=_present)
+
+    assert req.requires_controlnet is False
+    assert req.controlnet_installed is None
+    assert req.controlnet_annotator_bytes == 0
+
+
+def test_controlnet_not_installed_skips_with_install_hint() -> None:
+    """A controlnet level on a worker without the extra is skipped with the install remedy; --force overrides."""
+    machine = MachineInfo(total_vram_mb=8_000)
+    req = _req(
+        requires_controlnet=True,
+        controlnet_installed=False,
+        controlnet_install_hint="install `horde-worker-reGen[controlnet]`",
+        estimated_vram_mb=2_000,
+    )
+    skip = requirement_skip_reason(req, machine=machine, process_mode="real", civitai_available=True)
+    assert skip is not None
+    assert "controlnet not installed" in skip
+    assert "horde-worker-reGen[controlnet]" in skip
+
+    forced = requirement_skip_reason(req, machine=machine, process_mode="real", civitai_available=True, force=True)
+    assert forced is None
+
+    installed = _req(requires_controlnet=True, controlnet_installed=True, estimated_vram_mb=2_000)
+    assert requirement_skip_reason(installed, machine=machine, process_mode="real", civitai_available=True) is None
+
+
 def test_absent_huge_checkpoint_is_a_hard_skip_even_when_forced() -> None:
     """A missing flux/qwen checkpoint cannot be forced: real-mode benchmarking never downloads weights."""
     req = _req(tier="flux", models_missing=["Flux.1-Schnell fp8 (Compact)"])

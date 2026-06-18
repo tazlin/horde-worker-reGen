@@ -25,7 +25,7 @@ from horde_worker_regen.benchmark.enums import SELECTABLE_AXES, BenchAxis, Bench
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from horde_worker_regen.benchmark.download_progress import DownloadEvent
+    from horde_worker_regen.benchmark.download_progress import DownloadEvent, DownloadModelRow
     from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel
     from horde_worker_regen.benchmark.report import BenchmarkReport, MachineInfo
     from horde_worker_regen.model_download_plan import DownloadPlan
@@ -246,7 +246,12 @@ def _run_plan(args: argparse.Namespace) -> int:
     return 0
 
 
-def _format_download_plan(tiers: list[BenchTier], model_names: list[str], plan: DownloadPlan | None) -> str:
+def _format_download_plan(
+    tiers: list[BenchTier],
+    model_names: list[str],
+    plan: DownloadPlan | None,
+    annotator_row: DownloadModelRow | None = None,
+) -> str:
     """Render the download plan as plain text: which models, their size, present-or-not, and where they go."""
     tier_label = ", ".join(tier.value for tier in tiers)
     lines = [f"Models needed for tiers {tier_label}: {len(model_names)}"]
@@ -269,7 +274,45 @@ def _format_download_plan(tiers: list[BenchTier], model_names: list[str], plan: 
     )
     if not plan.fits:
         lines.append(f"  WARNING: not enough free space — about {plan.shortfall_bytes / 1024**3:.1f} GB short.")
+    if annotator_row is not None:
+        size = f"~{annotator_row.size_bytes / 1024**3:.1f} GB" if annotator_row.size_bytes else "size unknown"
+        lines.append(f"Controlnet annotators (lazy, fetched on first use): {size}")
     return "\n".join(lines)
+
+
+def _ladder_control_types(ladder: list[RampLevel]) -> list[str]:
+    """Return the distinct controlnet ``control_type``s any level in the ladder exercises (may be empty)."""
+    return sorted({job.control_type for level in ladder for job in level.scenario.image_jobs if job.control_type})
+
+
+def _controlnet_annotator_row(control_types: list[str]) -> DownloadModelRow | None:
+    """Build the synthetic annotator plan row (ROM size) for *control_types*, or None when none apply."""
+    if not control_types:
+        return None
+    from horde_worker_regen.benchmark.download_progress import DownloadModelRow
+
+    try:
+        from hordelib.api import controlnet_annotator_download_bytes
+
+        size = controlnet_annotator_download_bytes(control_types)
+    except Exception as e:  # noqa: BLE001 - sizing is informational; show the row without a size
+        logger.debug(f"Could not size controlnet annotators: {e}")
+        size = None
+    return DownloadModelRow(name="ControlNet annotators", size_bytes=size or None, target_path="(annotator cache)")
+
+
+def _download_controlnet_annotators(*, directml: int | None) -> bool:
+    """Download (and verify) the controlnet annotators via the worker's standard preload path.
+
+    Mirrors ``download_process._download_controlnet_models``: idempotent and fast once the on-disk preload
+    marker exists, so it is safe to call even when annotators are already present. Returns success.
+    """
+    import hordelib
+    from hordelib.api import SharedModelManager
+
+    extra_comfyui_args = [f"--directml={directml}"] if directml is not None else []
+    hordelib.initialise(extra_comfyui_args=extra_comfyui_args)
+    return bool(SharedModelManager.preload_annotators())
 
 
 def _download_compvis_models(
@@ -341,6 +384,15 @@ def _run_download(args: argparse.Namespace) -> int:
     plan = models_disk_plan(model_names)
     json_progress: bool = args.json_progress
 
+    # Controlnet annotators are lazily-downloaded checkpoints distinct from the image models; surface them
+    # as an explicit plan row (ROM size) and fetch them too, so a controlnet level does not cold-load the
+    # annotator mid-run (the cause of the spurious step-timeout recovery the benchmark used to mask).
+    control_types = _ladder_control_types(ladder)
+    from horde_worker_regen.benchmark.requirements import controlnet_installed
+
+    cn_installed = controlnet_installed() if control_types else None
+    annotator_row = _controlnet_annotator_row(control_types) if cn_installed is not False else None
+
     def emit(event: DownloadEvent) -> None:
         if json_progress:
             # Sentinel-wrapped so the TUI can isolate each event from interleaved log lines on this stdout.
@@ -356,12 +408,17 @@ def _run_download(args: argparse.Namespace) -> int:
             )
             for info in plan.models
         ]
+        annotator_bytes = annotator_row.size_bytes or 0 if annotator_row is not None else 0
+        if annotator_row is not None:
+            rows.append(annotator_row)
         emit(
             DownloadEvent(
                 kind="planned",
                 models=rows,
                 present_bytes=plan.present_bytes,
-                to_download_bytes=plan.to_download_bytes,
+                # Fold the annotator ROM into the displayed "to download" so the count and the byte figure
+                # agree; the fits/shortfall below stay checkpoint-based (the real, sized disk constraint).
+                to_download_bytes=plan.to_download_bytes + annotator_bytes,
                 free_disk_bytes=plan.free_disk_bytes,
                 fits=plan.fits,
                 shortfall_bytes=plan.shortfall_bytes,
@@ -369,24 +426,43 @@ def _run_download(args: argparse.Namespace) -> int:
         )
         missing = [info.name for info in plan.models if not info.on_disk]
     else:
-        emit(DownloadEvent(kind="planned", models=[DownloadModelRow(name=name) for name in model_names]))
+        unsized_rows = [DownloadModelRow(name=name) for name in model_names]
+        if annotator_row is not None:
+            unsized_rows.append(annotator_row)
+        emit(DownloadEvent(kind="planned", models=unsized_rows))
         missing = model_names
 
     if not json_progress:
-        print(_format_download_plan(tiers, model_names, plan))  # noqa: T201
+        print(_format_download_plan(tiers, model_names, plan, annotator_row))  # noqa: T201
 
-    if not missing:
+    # A controlnet level needs annotators, but the extra is not installed: nothing to fetch, so tell the
+    # operator how to enable it rather than silently omitting the annotators from the plan.
+    if control_types and cn_installed is False:
+        from horde_worker_regen.capabilities import controlnet_install_hint
+
+        with contextlib.suppress(Exception):
+            logger.warning(
+                f"A selected level uses controlnet, but the controlnet extra is not installed, so its "
+                f"annotators were skipped: {controlnet_install_hint()}",
+            )
+
+    fetch_annotators = bool(control_types) and cn_installed is not False
+
+    if not missing and not fetch_annotators:
         logger.success("All required models are already on disk; nothing to download.")
         emit(DownloadEvent(kind="complete", downloaded=0, failed=0))
         return 0
 
     if args.dry_run:
         if not json_progress:
-            print(f"\nDry run: {len(missing)} model(s) would be downloaded. Re-run without --dry-run to fetch.")  # noqa: T201
+            todo = [f"{len(missing)} model(s)"] if missing else []
+            if fetch_annotators:
+                todo.append("controlnet annotators")
+            print(f"\nDry run: would fetch {', '.join(todo)}. Re-run without --dry-run to fetch.")  # noqa: T201
         emit(DownloadEvent(kind="complete", downloaded=0, failed=0))
         return 0
 
-    if plan is not None and not plan.fits:
+    if missing and plan is not None and not plan.fits:
         logger.error(
             f"Not enough free disk to download: about {plan.shortfall_bytes / 1024**3:.1f} GB short. "
             "Free up space or select fewer tiers.",
@@ -394,17 +470,39 @@ def _run_download(args: argparse.Namespace) -> int:
         emit(DownloadEvent(kind="complete", downloaded=0, failed=len(missing), detail="insufficient disk"))
         return 1
 
-    failed = _download_compvis_models(
-        missing,
-        emit=emit,
-        json_progress=json_progress,
-        directml=args.directml,
-    )
-    emit(DownloadEvent(kind="complete", downloaded=len(missing) - failed, failed=failed))
-    if failed:
-        logger.error(f"{failed} of {len(missing)} model(s) failed to download.")
+    failed = 0
+    if missing:
+        failed = _download_compvis_models(
+            missing,
+            emit=emit,
+            json_progress=json_progress,
+            directml=args.directml,
+        )
+
+    annotators_failed = 0
+    if fetch_annotators:
+        emit(DownloadEvent(kind="model_started", name="ControlNet annotators", index=1, total=1))
+        if not json_progress:
+            logger.info("Downloading controlnet annotators ...")
+        annotators_ok = False
+        try:
+            annotators_ok = _download_controlnet_annotators(directml=args.directml)
+        except Exception as e:  # noqa: BLE001 - annotators are best-effort; report, do not crash the download
+            logger.error(f"Failed to download controlnet annotators: {type(e).__name__} {e}")
+        if not annotators_ok:
+            annotators_failed = 1
+            logger.error("Controlnet annotators failed to download.")
+        elif not json_progress:
+            logger.success("Controlnet annotators: done.")
+        emit(DownloadEvent(kind="model_finished", name="ControlNet annotators", index=1, total=1, ok=annotators_ok))
+
+    total_failed = failed + annotators_failed
+    total_items = len(missing) + (1 if fetch_annotators else 0)
+    emit(DownloadEvent(kind="complete", downloaded=total_items - total_failed, failed=total_failed))
+    if total_failed:
+        logger.error(f"{total_failed} of {total_items} item(s) failed to download.")
         return 1
-    logger.success(f"Downloaded {len(missing)} model(s); the benchmark can now run them without a mid-run fetch.")
+    logger.success(f"Downloaded {total_items} item(s); the benchmark can now run them without a mid-run fetch.")
     return 0
 
 

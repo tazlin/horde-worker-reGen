@@ -111,15 +111,27 @@ def _format_disk(row: LevelPlanRow) -> str:
     return f"{row.free_disk_bytes / 1024**3:.0f}/{needed}"
 
 
-def format_plan_table(rows: list[LevelPlanRow]) -> str:
-    """Render the resource plan as an aligned text table (LEVEL / VRAM / DISK / NET / KEY / VERDICT).
+def _format_controlnet(row: LevelPlanRow) -> str:
+    """Render the controlnet cell: ``-`` (n/a), ``MISSING`` (extra absent), or the annotator ROM size."""
+    if not row.requires_controlnet:
+        return "-"
+    if row.controlnet_installed is False:
+        return "MISSING"
+    if row.controlnet_annotator_bytes > 0:
+        return f"~{row.controlnet_annotator_bytes / 1024**3:.1f}G"
+    return "ok"
 
-    The DISK cell reads ``free/needed`` so a shortfall is visible at a glance, and a trailing line prompts
-    the ``download`` subcommand whenever any level still needs models, so a slow mid-run download does not
-    quietly skew the timing.
+
+def format_plan_table(rows: list[LevelPlanRow]) -> str:
+    """Render the resource plan as an aligned text table (LEVEL / VRAM / DISK / NET / KEY / CN / VERDICT).
+
+    The DISK cell reads ``free/needed`` so a shortfall is visible at a glance, the CN cell shows whether a
+    controlnet level can run (and its annotator-download ROM), and a trailing line prompts the ``download``
+    subcommand whenever any level still needs models or annotators, so a slow mid-run fetch does not quietly
+    skew the timing.
     """
-    header = ("LEVEL", "VRAM", "DISK", "NET", "KEY", "VERDICT")
-    body: list[tuple[str, str, str, str, str, str]] = []
+    header = ("LEVEL", "VRAM", "DISK", "NET", "KEY", "CN", "VERDICT")
+    body: list[tuple[str, str, str, str, str, str, str]] = []
     for row in rows:
         body.append(
             (
@@ -128,6 +140,7 @@ def format_plan_table(rows: list[LevelPlanRow]) -> str:
                 _format_disk(row),
                 "yes" if row.requires_network else "-",
                 "civitai" if row.requires_civitai_key else "-",
+                _format_controlnet(row),
                 "RUN" if row.will_run else f"SKIP ({row.verdict})",
             ),
         )
@@ -141,9 +154,12 @@ def format_plan_table(rows: list[LevelPlanRow]) -> str:
 
     lines = ["Resource plan (verdicts reflect the detected machine):", _line(header)]
     lines.extend(_line(cells) for cells in body)
-    if any(row.num_models_missing for row in rows):
+    needs_models = any(row.num_models_missing for row in rows)
+    needs_annotators = any(row.requires_controlnet and row.controlnet_annotator_bytes > 0 for row in rows)
+    if needs_models or needs_annotators:
+        what = "models" if needs_models and not needs_annotators else "models/controlnet annotators"
         lines.append(
-            "Some levels need models that are not downloaded yet. Run `horde-benchmark download` first so "
+            f"Some levels need {what} that are not downloaded yet. Run `horde-benchmark download` first so "
             "the timed run is not slowed (and skewed) by downloading mid-benchmark.",
         )
     return "\n".join(lines)
