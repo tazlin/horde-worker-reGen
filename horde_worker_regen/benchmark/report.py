@@ -39,6 +39,12 @@ _FAILED_OUTCOMES = frozenset({LevelOutcome.FAILED, LevelOutcome.CRASHED, LevelOu
 _MIN_VRAM_HEADROOM_MB = 1500
 """A tier's model is only recommended for ``models_to_load`` if its peak VRAM leaves this much free."""
 
+_HEADROOM_HINT_MB = 4000
+"""When the busiest level still left at least this much VRAM unused, the recommendation adds an
+advisory that higher concurrency/batch than the benchmarked rungs is likely safe. The ladder ramps
+only to a fixed top rung, so on a large card (e.g. a 24 GB 4090 that peaked ~12 GB) the proven values
+under-provision the hardware; the operator should be told the ceiling is the ladder's, not the GPU's."""
+
 
 def _current_worker_version() -> str:
     """Return the running worker version (local import keeps this module import-light)."""
@@ -338,7 +344,12 @@ def _phase_breakdown(jobs: list[JobMetricsRecord]) -> dict[str, float]:
         disk_load = sum(m.duration_seconds for m in pm.model_loads if m.phase == "disk_to_ram")
         vram_load = sum(m.duration_seconds for m in pm.model_loads if m.phase == "ram_to_vram")
         sampling = pm.sampling.duration_seconds if pm.sampling is not None else 0.0
-        vae = sum((pm.phase_seconds or {}).values())
+        # Only the VAE-decode phase belongs in the vae bucket. Summing all of phase_seconds
+        # (clip_encode plus pipeline_setup/validate/execute/finalize) folded the whole ComfyUI
+        # execution into "vae" (pipeline_execute alone covers most of the job) which mislabelled
+        # nearly every job as VAE-bound and zeroed other_inference. The residual subtraction below
+        # already attributes that overhead (graph build, prompt encode, IPC) to other_inference.
+        vae = (pm.phase_seconds or {}).get("vae_decode", 0.0)
         other = max(0.0, inference_total - disk_load - vram_load - sampling - vae)
 
         samples["disk_load"].append(disk_load)
@@ -469,22 +480,51 @@ def _axis_passed(levels: list[LevelReport], axis: BenchAxis) -> bool:
     return any(report.outcome == LevelOutcome.PASSED for report in levels if report.level.axis == axis)
 
 
+def _level_did_nothing(report: LevelReport) -> bool:
+    """True when a level ran to its end without completing or faulting any job or alchemy form.
+
+    A level that timed out having dispatched no work at all proves nothing about the capability:
+    it is closer to 'never exercised' than to 'tested and failed'. Treating it as untested rather
+    than failed keeps the recommendation from reporting an axis that never actually ran as a hard,
+    proven-off failure.
+    """
+    stats = report.stats
+    if stats is None:
+        return False
+    activity = (
+        stats.num_jobs_completed
+        + stats.num_jobs_faulted
+        + stats.num_alchemy_forms_completed
+        + stats.num_alchemy_forms_faulted
+    )
+    expected = stats.num_jobs_expected + stats.num_alchemy_forms_expected
+    return activity == 0 and expected > 0
+
+
 def _axis_status(levels: list[LevelReport], *axes: BenchAxis) -> tuple[SuggestionBasis, str]:
     """Classify how one or more axes fared, so a suggestion can record proof versus absence.
 
-    Accepts several axes for capabilities that any of multiple axes can establish (controlnet is
-    proven by either the classic or the QR-code workflow; alchemy by either lane). Precedence is
-    proven > failed > skipped > not-in-ladder: a single pass proves the capability regardless of other
-    rungs, and a level that ran-and-failed is a stronger signal than one that was never reached.
+    Accepts several axes for capabilities that any of multiple axes can establish (alchemy is proven
+    by either lane). Precedence is proven > failed > skipped/untested > not-in-ladder: a single pass
+    proves the capability regardless of other rungs, and a level that ran-and-failed *with real
+    activity* is a stronger signal than one that was never reached. A failed level that dispatched no
+    work (see :func:`_level_did_nothing`) is downgraded to untested rather than reported as a failure.
     """
     relevant = [report for report in levels if report.level.axis in axes]
     if not relevant:
         return SuggestionBasis.NOT_IN_LADDER, ""
     if any(report.outcome == LevelOutcome.PASSED for report in relevant):
         return SuggestionBasis.PROVEN, ""
-    for report in relevant:
-        if report.outcome in _FAILED_OUTCOMES:
-            return SuggestionBasis.DISABLED_FAILED, "; ".join(report.reasons) or report.outcome.value
+    failed = [report for report in relevant if report.outcome in _FAILED_OUTCOMES]
+    real_failures = [report for report in failed if not _level_did_nothing(report)]
+    if real_failures:
+        report = real_failures[0]
+        return SuggestionBasis.DISABLED_FAILED, "; ".join(report.reasons) or report.outcome.value
+    if failed:
+        # Every failure on the axis dispatched no work, so the axis was never actually exercised.
+        report = failed[0]
+        detail = "; ".join(report.reasons) or "level ran but dispatched no work"
+        return SuggestionBasis.UNTESTED_SKIPPED, f"never exercised: {detail}"
     for report in relevant:
         if report.outcome == LevelOutcome.SKIPPED:
             return SuggestionBasis.UNTESTED_SKIPPED, "; ".join(report.reasons) or "level was skipped"
@@ -562,35 +602,107 @@ def _fits_with_headroom(*, baseline_passed: bool, peak_vram_mb: int | None, tota
     return (total_vram_mb - peak_vram_mb) >= _MIN_VRAM_HEADROOM_MB
 
 
-class _SoakOutcome(BaseModel):
-    """How the sustained-load soak fared, split so skipped is never reported as failed.
+def _vram_headroom_note(
+    levels: list[LevelReport],
+    models_to_load: list[str],
+    total_vram_mb: int | None,
+) -> str | None:
+    """Advise when the GPU has substantial VRAM the benchmarked rungs never touched.
 
-    A soak that *ran and did not hold up* is real evidence against keeping a tier's model resident; a
-    soak that was *skipped* (its pre-flight gate could not assemble the resident pool) produced no
-    evidence at all. Both lead to a conservative omission, but the operator must be told which it was.
+    ``max_threads``/``queue_size``/``max_batch`` are taken as the highest *tested* rung, which is the
+    ladder's fixed ceiling, not the hardware's. On a large card the proven values can badly
+    under-provision it. Rather than fabricate untested numbers (which would break the proven-only
+    contract), surface the unused headroom so the operator knows higher is likely safe. Returns None
+    when VRAM is unknown, nothing is loaded, or the busiest level already used most of the card.
+    """
+    if total_vram_mb is None or not models_to_load:
+        return None
+    observed_peaks = [
+        report.stats.vram_used_high_water_mb
+        for report in levels
+        if report.stats is not None and report.stats.vram_used_high_water_mb is not None
+    ]
+    if not observed_peaks:
+        return None
+    spare = total_vram_mb - max(observed_peaks)
+    if spare < _HEADROOM_HINT_MB:
+        return None
+    return (
+        f"This GPU never used more than {max(observed_peaks)} of {total_vram_mb} MB VRAM across the "
+        f"whole run (~{spare} MB free at the busiest point). max_threads, queue_size, and max_batch "
+        "above are the highest rungs the ladder tested, not the highest this card can sustain; higher "
+        "values are likely safe but were not benchmarked."
+    )
+
+
+_SOAK_MEANINGFUL_MIN_JOBS = 4
+"""A failed soak is only proof of *sustained-load* instability if it completed at least this many
+jobs. Below it the soak never exercised sustained load at all (it wedged at startup or crashed
+early), which is a worker/startup bug to fix, not grounds to stop loading a model whose isolated
+baseline passed cleanly."""
+
+
+class _SoakOutcome(BaseModel):
+    """How the sustained-load soak fared, split by what its failure actually proves.
+
+    The conservative recommendation must not drop a model whose isolated baseline passed unless the
+    soak gives *real* evidence the model is unstable under load. So a soak failure is graded:
+
+    - ``unstable_tiers``: the soak ran a meaningful number of jobs and then showed hard trouble
+      (faults, recoveries, OOM, hang). Genuine evidence against keeping the model resident -> dropped.
+    - ``inconclusive_tiers``: the soak failed for a reason that is *not* load instability: it
+      completed too few jobs to test sustained load (a startup wedge), or it failed only on a soft
+      gate (e.g. the GPU duty-cycle floor). The baseline still passed, so the model is kept resident
+      with a caveat rather than silently dropped.
+    - ``skipped_tiers``: the soak existed but never ran (a pre-flight gate); no evidence either way.
     """
 
-    failed_tiers: set[BenchTier] = Field(default_factory=set)
-    """Tiers whose soak ran and did not pass."""
+    unstable_tiers: set[BenchTier] = Field(default_factory=set)
+    """Tiers whose soak ran meaningfully and then proved unstable (model dropped)."""
+    inconclusive_tiers: set[BenchTier] = Field(default_factory=set)
+    """Tiers whose soak failed for a non-stability reason (model kept with a caveat)."""
+    inconclusive_reasons: dict[BenchTier, str] = Field(default_factory=dict)
+    """Per-tier human-readable explanation of why an inconclusive soak does not disqualify the model."""
     skipped_tiers: set[BenchTier] = Field(default_factory=set)
     """Tiers whose soak existed in the ladder but was skipped (no sustained-load evidence)."""
     any_unstable: bool = False
-    """Whether any soak failed with a hard robustness finding (faults, recoveries, OOM, hang)."""
+    """Whether any soak failed with a hard robustness finding (faults, recoveries, OOM, hang). Gates
+    concurrent alchemy regardless of job count: a crash is a crash, even if it happened early."""
+
+
+def _inconclusive_soak_reason(report: LevelReport, completed: int) -> str:
+    """Explain why a failed-but-inconclusive soak does not count against keeping the model resident."""
+    if completed == 0:
+        return (
+            "its soak completed no jobs (a worker/startup issue, not sustained-load instability), so "
+            "load stability was neither proven nor disproven"
+        )
+    detail = "; ".join(report.reasons)
+    if detail:
+        return f"its soak failed without a sustained-load instability finding ({detail})"
+    return "its soak failed on a non-stability gate"
 
 
 def _soak_outcome(levels: list[LevelReport]) -> _SoakOutcome:
-    """Summarize the validation soak, separating ran-and-failed tiers from never-run (skipped) ones."""
+    """Summarize the validation soak, grading each failure by what it actually proves about the model."""
     outcome = _SoakOutcome()
     hard = {FindingKind.OOM, FindingKind.HANG, FindingKind.CRASH, FindingKind.PROCESS_RECOVERY, FindingKind.LOST_JOB}
     for report in levels:
         if report.level.stage != BenchStage.VALIDATION or report.outcome == LevelOutcome.PASSED:
             continue
+        tier = report.level.tier
         if report.outcome == LevelOutcome.SKIPPED:
-            outcome.skipped_tiers.add(report.level.tier)
+            outcome.skipped_tiers.add(tier)
             continue
-        outcome.failed_tiers.add(report.level.tier)
-        if any(finding.kind in hard for finding in report.findings):
+        has_hard_finding = any(finding.kind in hard for finding in report.findings)
+        if has_hard_finding:
             outcome.any_unstable = True
+        completed = report.stats.num_jobs_completed if report.stats is not None else 0
+        if has_hard_finding and completed >= _SOAK_MEANINGFUL_MIN_JOBS:
+            outcome.unstable_tiers.add(tier)
+        else:
+            outcome.inconclusive_tiers.add(tier)
+            outcome.inconclusive_reasons[tier] = _inconclusive_soak_reason(report, completed)
     return outcome
 
 
@@ -620,7 +732,11 @@ def synthesize_bridge_data(levels: list[LevelReport], *, total_vram_mb: int | No
         elif level.axis == BenchAxis.CONTROLNET:
             suggestion.allow_controlnet = True
         elif level.axis == BenchAxis.QR_CODE:
-            suggestion.allow_controlnet = True
+            # The QR-code workflow proves the *SDXL-controlnet* path, not classic preprocessor
+            # controlnet. allow_controlnet (canny/depth/openpose) is therefore left to the CONTROLNET
+            # axis alone: enabling it off a QR-code pass made the worker advertise and accept classic
+            # controlnet jobs that the CONTROLNET level had just shown to crash (the 4090 run did
+            # exactly this — allow_controlnet:on while the report's own capability table said ✗).
             if level.tier == BenchTier.SDXL:
                 suggestion.allow_sdxl_controlnet = True
         elif level.axis == BenchAxis.POST_PROCESSING:
@@ -649,7 +765,7 @@ def synthesize_bridge_data(levels: list[LevelReport], *, total_vram_mb: int | No
                 f"{_MIN_VRAM_HEADROOM_MB} MB headroom on this GPU.",
             )
             continue
-        if tier in soak.failed_tiers:
+        if tier in soak.unstable_tiers:
             notes.append(
                 f"{BENCH_TIER_MODELS[tier]} omitted from models_to_load: its sustained-load soak ran and did "
                 "not hold up.",
@@ -661,8 +777,19 @@ def synthesize_bridge_data(levels: list[LevelReport], *, total_vram_mb: int | No
                 "stability under combined load was never validated.",
             )
             continue
+        if tier in soak.inconclusive_tiers:
+            # The baseline passed and fits with headroom; the soak failure was not load instability, so
+            # keep the model resident rather than zeroing out the recommendation, but say so plainly.
+            notes.append(
+                f"{BENCH_TIER_MODELS[tier]} kept in models_to_load despite an inconclusive soak: "
+                f"{soak.inconclusive_reasons[tier]}.",
+            )
         models_to_load.append(BENCH_TIER_MODELS[tier])
     suggestion.models_to_load = models_to_load
+
+    headroom_note = _vram_headroom_note(levels, models_to_load, total_vram_mb)
+    if headroom_note is not None:
+        notes.append(headroom_note)
 
     concurrent_capped_by_soak = False
     if suggestion.alchemy_allow_concurrent and soak.any_unstable:
@@ -705,7 +832,7 @@ def _build_decisions(
         axis_decision("max_threads", suggestion.max_threads, BenchAxis.THREADS),
         axis_decision("queue_size", suggestion.queue_size, BenchAxis.QUEUE_SIZE),
         axis_decision("max_batch", suggestion.max_batch, BenchAxis.BATCH),
-        axis_decision("allow_controlnet", suggestion.allow_controlnet, BenchAxis.CONTROLNET, BenchAxis.QR_CODE),
+        axis_decision("allow_controlnet", suggestion.allow_controlnet, BenchAxis.CONTROLNET),
         axis_decision("allow_sdxl_controlnet", suggestion.allow_sdxl_controlnet, BenchAxis.QR_CODE),
         axis_decision("allow_post_processing", suggestion.allow_post_processing, BenchAxis.POST_PROCESSING),
         axis_decision("allow_lora", suggestion.allow_lora, BenchAxis.DOWNLOADS),
@@ -751,7 +878,10 @@ def _models_to_load_decision(
         )
     if passing_tiers:
         # Every passing tier was held back; report the dominant reason so it does not read as a failure.
-        basis = SuggestionBasis.CAPPED_SOAK if soak.failed_tiers or soak.skipped_tiers else SuggestionBasis.CAPPED_VRAM
+        # (Inconclusive soaks keep their model, so they never reach this empty-list branch.)
+        basis = (
+            SuggestionBasis.CAPPED_SOAK if soak.unstable_tiers or soak.skipped_tiers else SuggestionBasis.CAPPED_VRAM
+        )
         return SuggestionDecision(
             setting="models_to_load",
             value=[],
