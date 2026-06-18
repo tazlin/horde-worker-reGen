@@ -330,7 +330,13 @@ class JobSubmitter:
             )
             new_submit.completed_job_info.time_to_generate = 0.0
         else:
-            kudos_per_second = job_submit_response.reward / new_submit.completed_job_info.time_to_generate
+            if new_submit.completed_job_info.time_to_generate > 0:
+                kudos_per_second = job_submit_response.reward / new_submit.completed_job_info.time_to_generate
+            else:
+                logger.warning(
+                    f"Job {new_submit.job_id} has non-positive time_to_generate, cannot calculate kudos/second.",
+                )
+                kudos_per_second = 0.0
 
         # If the job was not faulted, log the job submission as a success
         if new_submit.completed_job_info.state != GENERATION_STATE.faulted:
