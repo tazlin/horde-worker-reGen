@@ -12,6 +12,8 @@ benchmark_results/runs
 benchmark_results/*-*/*
 benchmark_results/*_validate/*
 
+*.faulthandler
+
 logs/remote_logs/*
 
 .horde_worker_regen/*
