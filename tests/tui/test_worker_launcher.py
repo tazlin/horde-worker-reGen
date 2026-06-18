@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import time
 
 import pytest
+from loguru import logger
 
 from horde_worker_regen.process_management.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
@@ -157,6 +159,64 @@ def test_no_auto_restart_leaves_worker_stopped() -> None:
     supervisor.tick()
     assert ctx.process_count == 1
     assert supervisor.status is SupervisorStatus.CRASHED
+
+
+def _capture_supervisor_logs() -> tuple[io.StringIO, int]:
+    """Attach a StringIO sink to the global loguru logger and return it with its sink id.
+
+    The supervisor logs through loguru, whose default sink binds to the real stderr fd and so dodges
+    pytest's capsys/capfd; an explicit sink on the same logger captures its output deterministically.
+    """
+    sink = io.StringIO()
+    return sink, logger.add(sink, level="DEBUG", format="{message}")
+
+
+def test_early_crash_without_snapshot_points_at_startup_log() -> None:
+    """A worker that dies before ever reporting is flagged as a startup crash with a log pointer."""
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(
+        WorkerLaunchOptions(),
+        mode=WorkerProcessMode.FAKE,
+        ctx=ctx,  # type: ignore[arg-type]
+        auto_restart=False,
+    )
+    supervisor.start()
+    assert ctx.last_process is not None
+    ctx.last_process.kill_it()
+
+    sink, sink_id = _capture_supervisor_logs()
+    try:
+        supervisor.tick()
+    finally:
+        logger.remove(sink_id)
+
+    logged = sink.getvalue()
+    assert "crashed during startup" in logged
+    assert "bridge_main_startup.log" in logged
+
+
+def test_crash_after_reporting_omits_startup_hint() -> None:
+    """A worker that reported at least one snapshot crashed mid-run, so no startup-crash pointer is given."""
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(
+        WorkerLaunchOptions(),
+        mode=WorkerProcessMode.FAKE,
+        ctx=ctx,  # type: ignore[arg-type]
+        auto_restart=False,
+    )
+    supervisor.start()
+    # Stand in for a worker that ran and reported before dying; this is not a startup failure.
+    supervisor.latest_snapshot = _stub_snapshot()
+    assert ctx.last_process is not None
+    ctx.last_process.kill_it()
+
+    sink, sink_id = _capture_supervisor_logs()
+    try:
+        supervisor.tick()
+    finally:
+        logger.remove(sink_id)
+
+    assert "crashed during startup" not in sink.getvalue()
 
 
 def test_request_graceful_stop_is_non_blocking_and_finalized_by_tick() -> None:

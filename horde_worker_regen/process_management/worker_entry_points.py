@@ -13,6 +13,7 @@ from multiprocessing.synchronize import Lock, Semaphore
 from loguru import logger
 
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.child_crash_capture import enable_child_faulthandler, write_startup_crash
 from horde_worker_regen.process_management.debug_attach import maybe_wait_for_process_debugger
 
 # Env var the parent process sets (from its own ``-v`` count) so spawned workers inherit the
@@ -176,6 +177,7 @@ def start_inference_process(
             coordination, registered with hordelib. None disables it. Defaults to None.
     """
     _spawn_timing_mark(process_id, "inference", "entry")
+    enable_child_faulthandler(f"inference_{process_id}")
     with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
         logger.remove()
         maybe_wait_for_process_debugger(process_id, "inference")
@@ -273,7 +275,10 @@ def start_inference_process(
                 logger.info(f"Dry-run mode: skipping hordelib initialisation for process {process_id}")
 
         except Exception as e:
+            # logger.critical reaches nowhere when the crash precedes HordeLog.initialise (no sink yet);
+            # the startup file is the loguru-independent backstop for that window.
             logger.critical(f"Failed to initialise hordelib: {type(e).__name__} {e}")
+            write_startup_crash(f"inference_{process_id}", e)
             sys.exit(1)
 
         _spawn_timing_mark(process_id, "inference", "hordelib-initialised")
@@ -333,6 +338,7 @@ def start_safety_process(
             Defaults to False.
     """
     _spawn_timing_mark(process_id, "safety", "entry")
+    enable_child_faulthandler(f"safety_{process_id}")
     with contextlib.nullcontext():  # contextlib.redirect_stdout(), contextlib.redirect_stderr():
         logger.remove()
         maybe_wait_for_process_debugger(process_id, "safety")
@@ -375,6 +381,7 @@ def start_safety_process(
 
         except Exception as e:
             logger.critical(f"Failed to initialise: {type(e).__name__} {e}")
+            write_startup_crash(f"safety_{process_id}", e)
             sys.exit(1)
 
         from horde_worker_regen.process_management.safety_process import HordeSafetyProcess
@@ -435,6 +442,7 @@ def start_download_process(
         rate_limit_kbps (int | None): Initial bandwidth cap in KB/s (None/0 = unlimited). Defaults to None.
         paused (bool): Whether downloads start paused. Defaults to False.
     """
+    enable_child_faulthandler(f"download_{process_id}")
     with contextlib.nullcontext():
         logger.remove()
         maybe_wait_for_process_debugger(process_id, "download")
@@ -458,6 +466,7 @@ def start_download_process(
             configure_child_telemetry(process_id)
         except Exception as e:
             logger.critical(f"Failed to initialise download process: {type(e).__name__} {e}")
+            write_startup_crash(f"download_{process_id}", e)
             sys.exit(1)
 
         from horde_worker_regen.process_management.download_process import HordeDownloadProcess

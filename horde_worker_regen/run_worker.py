@@ -363,15 +363,28 @@ def init() -> None:
         directml=args.directml,
     )
 
-    _prepare_runtime(options)
-
-    # We only need to download the legacy DBs once, so we do it here instead of in the worker processes
-    main(
-        multiprocessing.get_context("spawn"),
-        options.load_config_from_env_vars,
-        amd_gpu=options.amd,
-        directml=options.directml,
+    from horde_worker_regen.process_management.child_crash_capture import (
+        enable_child_faulthandler,
+        write_startup_crash,
     )
+
+    # Headless prints to the terminal, but mirror the supervised path so a startup crash also leaves a
+    # discoverable bridge_main_startup.log (and faulthandler trace) instead of only terminal scrollback.
+    enable_child_faulthandler("main")
+    try:
+        _prepare_runtime(options)
+        # We only need to download the legacy DBs once, so we do it here instead of in the worker processes
+        main(
+            multiprocessing.get_context("spawn"),
+            options.load_config_from_env_vars,
+            amd_gpu=options.amd,
+            directml=options.directml,
+        )
+    except Exception as worker_error:
+        with contextlib.suppress(Exception):
+            logger.exception("The worker crashed.")
+        write_startup_crash("main", worker_error)
+        raise
 
 
 def run_supervised(supervisor_connection: Connection, options: WorkerLaunchOptions) -> None:
@@ -381,14 +394,30 @@ def run_supervised(supervisor_connection: Connection, options: WorkerLaunchOptio
     console redirected to a file and a supervisor pipe wired in for state snapshots and control.
     This must be a top-level function so it is picklable as a ``multiprocessing`` spawn target.
     """
-    _prepare_runtime(options, supervised=True)
-    main(
-        multiprocessing.get_context("spawn"),
-        options.load_config_from_env_vars,
-        amd_gpu=options.amd,
-        directml=options.directml,
-        supervisor_connection=supervisor_connection,
+    from horde_worker_regen.process_management.child_crash_capture import (
+        enable_child_faulthandler,
+        write_startup_crash,
     )
+
+    # The whole preflight runs before hordelib opens bridge.log, and this child's stderr is the TUI's
+    # discarded one, so without this an early crash leaves no log at all. Capture it before anything risky.
+    enable_child_faulthandler("main")
+    try:
+        _prepare_runtime(options, supervised=True)
+        main(
+            multiprocessing.get_context("spawn"),
+            options.load_config_from_env_vars,
+            amd_gpu=options.amd,
+            directml=options.directml,
+            supervisor_connection=supervisor_connection,
+        )
+    except Exception as worker_error:
+        # Route the crash through loguru (so it reaches bridge.log once a sink exists) and, regardless,
+        # to the loguru-independent startup file (so the no-sink preflight window is never silent).
+        with contextlib.suppress(Exception):
+            logger.exception("The supervised worker crashed.")
+        write_startup_crash("main", worker_error)
+        raise
 
 
 if __name__ == "__main__":

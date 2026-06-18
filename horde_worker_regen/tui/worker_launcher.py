@@ -318,19 +318,35 @@ class WorkerSupervisor:
         self._intentional_stop = False
         self._set_status(SupervisorStatus.STOPPED)
 
+    def _startup_crash_hint(self) -> str:
+        """Point the operator at the child's crash logs when a worker died young without ever reporting.
+
+        A worker that exits before sending a single snapshot almost certainly failed during startup, where
+        the crash predates hordelib's bridge.log sink; the child's own crash-capture writes the reason to
+        bridge_main_startup.log / bridge_main_console.log instead. The parent only knows the exit code, so
+        without this pointer the operator has the exit code but no idea where the "why" landed.
+        """
+        if self.latest_snapshot is not None or (time.time() - self._last_spawn_time) >= _HEALTHY_UPTIME_SECONDS:
+            return ""
+        return " It never reported, so it likely crashed during startup; see logs/bridge_main_startup.log"
+
     def _handle_unexpected_exit(self, process: BaseProcess) -> None:
         """React to a worker that exited on its own: relaunch within budget, else mark crashed."""
         # Reserve the alarming CRASHED state for the terminal case (auto-restart off, or the restart
         # budget exhausted); a recoverable relaunch should read as a calm "Restarting…" from the instant
         # the exit is observed, not flash red first.
+        startup_hint = self._startup_crash_hint()
         terminal = (not self._auto_restart) or (self._restart_attempts >= self._max_restart_attempts)
         if terminal:
             self._set_status(SupervisorStatus.CRASHED)
             if not self._auto_restart:
-                logger.warning(f"Worker process exited unexpectedly (exitcode={process.exitcode}); not restarting.")
+                logger.warning(
+                    f"Worker process exited unexpectedly (exitcode={process.exitcode}); not restarting.{startup_hint}",
+                )
             else:
                 logger.error(
-                    f"Worker exceeded the restart budget ({self._max_restart_attempts}); leaving it stopped.",
+                    f"Worker exceeded the restart budget ({self._max_restart_attempts}); leaving it "
+                    f"stopped.{startup_hint}",
                 )
             return
 
@@ -339,7 +355,9 @@ class WorkerSupervisor:
         now = time.time()
         if self._last_crash_time == 0.0:
             self._last_crash_time = now
-            logger.warning(f"Worker process exited unexpectedly (exitcode={process.exitcode}); relaunching.")
+            logger.warning(
+                f"Worker process exited unexpectedly (exitcode={process.exitcode}); relaunching.{startup_hint}",
+            )
         if now - self._last_crash_time < self._restart_backoff:
             return  # Honour the backoff; a later tick performs the relaunch.
 
