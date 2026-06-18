@@ -33,7 +33,7 @@ dependencies = [
     # torchaudio as a hard dep, and exposes the optional-feature extras + capability registry
     # (hordelib.api.available_features) that the worker's `post-processing`/`controlnet` extras and the
     # config coercion in horde_worker_regen/capabilities.py depend on.
-    "horde_engine[layerdiffuse,upscale-extra]>=3.2.6,<4.0.0",
+    "horde_engine[layerdiffuse,upscale-extra]>=3.2.7,<4.0.0",
     "horde_model_reference>=5.3.0,<6.0.0",
     "python-dotenv",
     "ruamel.yaml",

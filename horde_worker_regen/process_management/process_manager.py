@@ -531,6 +531,8 @@ class HordeWorkerProcessManager:
                 f"total_ram_bytes ({self.total_ram_bytes})",
             )
 
+        self._log_resource_budget_posture()
+
         self._status_message_frequency = bridge_data.stats_output_frequency
 
         logger.debug(f"Total RAM: {self.total_ram_bytes / 1024 / 1024 / 1024} GB")
@@ -852,6 +854,43 @@ class HordeWorkerProcessManager:
         Delegates to MessageDispatcher.
         """
         await self._message_dispatcher.receive_and_handle_process_messages()
+
+    def _log_resource_budget_posture(self) -> None:
+        """Log, once at startup, whether the VRAM/RAM budget is active and how it will behave.
+
+        This is the "warn loudly" half of the auto-throttle: when residency-favoring modes
+        (``high_memory_mode``/``very_high_memory_mode``) are combined with a model set or queue depth
+        that can over-commit the device, the operator is told up front that the budget will evict
+        resident models under measured pressure (so any eviction churn they see later is expected and
+        the fix is to reduce the model set or disable the mode). The runtime budget is the actual
+        enforcement; this only surfaces the posture.
+        """
+        if not getattr(self.bridge_data, "enable_vram_budget", False):
+            logger.warning(
+                "VRAM/RAM budget is disabled (enable_vram_budget=false): the worker will not guard "
+                "against multiple inference processes over-committing the GPU. Not recommended on a "
+                "shared or consumer GPU.",
+            )
+            return
+
+        primary_device = self._device_map.root.get(0)
+        total_vram_mb = round(primary_device.total_memory / (1024 * 1024)) if primary_device is not None else None
+        total_vram_note = f"{total_vram_mb} MB VRAM" if total_vram_mb is not None else "an unknown amount of VRAM"
+
+        residency_mode = self.bridge_data.high_memory_mode or self.bridge_data.very_high_memory_mode
+        logger.info(
+            f"VRAM/RAM budget active (reserve {self.bridge_data.vram_reserve_mb} MB VRAM / "
+            f"{self.bridge_data.ram_reserve_mb} MB RAM on {total_vram_note}): preloads and concurrent "
+            "dispatch are gated on measured free VRAM/RAM, and idle resident models are evicted under "
+            "pressure to prevent out-of-memory crashes.",
+        )
+        if residency_mode:
+            logger.warning(
+                "high_memory_mode keeps models resident; with several inference processes this can "
+                "over-commit the GPU. The VRAM budget will auto-throttle by evicting idle resident "
+                "models when free VRAM runs low. If you see frequent eviction/reload churn, reduce the "
+                "number of loaded models or disable high_memory_mode.",
+            )
 
     async def unload_models_from_vram(
         self,

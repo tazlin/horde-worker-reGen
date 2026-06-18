@@ -79,6 +79,26 @@ preloads models.
 abundant RAM/VRAM. They relax constraints on concurrent model preloading and
 model eviction.
 
+### VRAM and RAM budget
+
+Because several inference processes share one GPU, residency-favoring settings
+(`high_memory_mode`, a large model set, deep `queue_size`) can over-commit the
+device and crash with an out-of-memory error. The VRAM/RAM budget guards against
+this by gating model preloads on **measured** free VRAM and available RAM rather
+than process counts. See
+[The VRAM and RAM budget](performance_and_backpressure.md#the-vram-and-ram-budget)
+for how it works.
+
+| Field                | Default | Effect                                                                                                                                                                  |
+| -------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enable_vram_budget` | `true`  | Gate preloads and concurrent dispatch on measured free VRAM/RAM, and evict idle resident models under pressure. Disable only to restore the prior availability-only behavior (not recommended on a shared/consumer GPU). |
+| `vram_reserve_mb`    | `2048`  | Free VRAM (MB) kept in reserve on top of a job's estimated peak. Covers transient spikes such as tiled VAE decode. Larger trades throughput for safety.                |
+| `ram_reserve_mb`     | `4096`  | Available system RAM (MB) kept in reserve so resident-in-RAM models do not force the OS to page to disk.                                                               |
+
+When the budget overrides `high_memory_mode` residency to reclaim VRAM/RAM under
+pressure, it logs prominently; frequent eviction/reload churn is a signal to
+reduce the model set or disable `high_memory_mode`.
+
 ### Very fast disk mode
 
 `very_fast_disk_mode` tells the scheduler that model loading from disk is

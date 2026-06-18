@@ -7,9 +7,13 @@
     - [Pop-rate throttling](#pop-rate-throttling)
     - [Queue sizing and the hold-back gate](#queue-sizing-and-the-hold-back-gate)
     - [Inference scheduling priorities](#inference-scheduling-priorities)
+        - [Performance-model scoring](#performance-model-scoring)
+        - [Model affinity (high-throughput regime)](#model-affinity-high-throughput-regime)
         - [The line-skip cache](#the-line-skip-cache)
     - [Model eviction (LRU)](#model-eviction-lru)
+    - [The VRAM and RAM budget](#the-vram-and-ram-budget)
     - [Alchemy backpressure](#alchemy-backpressure)
+    - [See also](#see-also)
 
 The worker sits between two external systems: the AI Horde API (which can flood
 it with jobs) and the GPU (which has finite VRAM and throughput). This page
@@ -107,7 +111,9 @@ would appear full when it still has capacity.
 in this order:
 
 1. **Preload models**: for the first pending job whose model isn't loaded, pick
-   a free process and send `PRELOAD_MODEL`.
+   a free process and send `PRELOAD_MODEL`, subject to the
+   [VRAM and RAM budget](#the-vram-and-ram-budget), which defers the preload (and
+   reclaims idle resident models) when the device cannot absorb the new model.
 2. **Peek ahead**: call `get_next_job_and_process(information_only=True)` to
    decide whether to block on a heavy model or batch.
 3. **Blocking rules**: defer launch if:
@@ -174,6 +180,55 @@ Eviction happens in two stages:
 (since reloading from disk is cheap) and less aggressive about VRAM eviction
 (since keeping models in VRAM is the real win).
 
+## The VRAM and RAM budget
+
+Each inference process loads models into the **same** GPU independently. Without a
+shared accountant, their combined resident footprint can exceed device VRAM,
+producing an out-of-memory crash (and, for system RAM, paging to disk that
+collapses throughput). The eviction rules above are *count*-based. They assume
+that if the working set fits the process count it fits the device, which only
+holds for SD1.5-class weights. The budget makes the worker decide on **measured**
+resources instead.
+
+[`VramBudget` and `RamBudget`][horde_worker_regen.process_management.resource_budget]
+predict a job's peak VRAM and RAM cost from hordelib's per-job burden estimate
+([`estimate_job_burden`][hordelib.feature_impact.estimate_job_burden], the same
+estimate the benchmark pre-flight trusts) and compare it against:
+
+- **measured device-wide free VRAM**: the conservative minimum across inference
+  processes' memory reports
+  ([`ProcessMap.get_free_vram_mb`][horde_worker_regen.process_management.process_map.ProcessMap.get_free_vram_mb]),
+  plus
+- **measured available system RAM**: read live from the parent via psutil.
+
+A job is admitted only when free VRAM and available RAM each cover the prediction
+plus a reserve (`vram_reserve_mb`, default 2048; `ram_reserve_mb`, default 4096).
+The reserve absorbs transient spikes the steady-state estimate misses, most
+notably tiled VAE decode (the phase that produced the observed live OOM).
+
+When a resource does not fit, the scheduler **defers** the preload for that cycle
+and starts **reclaiming** the resource from idle resident models, overriding the
+count-based residency protection (`under_pressure`) so an idle copy is evicted
+even in the affinity regime but never an in-progress or next-up model. This is
+the "auto-throttle" behavior: it overrides the residency that `high_memory_mode`
+would otherwise hold, and logs prominently when it does so.
+
+Cold start (no VRAM telemetry yet) and a missing burden estimate both **admit**,
+so the budget never wedges a worker that has not yet reported memory. Set
+`enable_vram_budget: false` to restore the prior availability-only behavior (not
+recommended on a shared or consumer GPU).
+
+> The prediction is the conservative hordelib estimate, not a learned per-job
+> measurement. The only measurement the worker has (per-process VRAM high-water)
+> is device-wide (it reflects *every* resident model, not one job's marginal
+> cost), so feeding it back would over-throttle a multi-model worker. A true
+> marginal per-job measurement is a hordelib-side follow-up.
+
+To keep measurements fresh, inference processes emit an interval-driven memory
+report (every `_memory_report_interval`, 5 s) in addition to the event-driven
+reports at model load/unload, and a dead process's stale VRAM figure is cleared on
+recovery so it cannot be counted as either used or free.
+
 ## Alchemy backpressure
 
 When `alchemist: true`, `AlchemyCoordinator` runs its own pop loop (≈ every 1 s,
@@ -207,3 +262,4 @@ no-jobs-available accounting (`WorkerState.alchemy_forms_in_flight` gates it).
 - [`PopThrottler`][horde_worker_regen.process_management.pop_throttler.PopThrottler]
 - [`InferenceScheduler`][horde_worker_regen.process_management.inference_scheduler.InferenceScheduler]
 - [`LRUCache`][horde_worker_regen.process_management.lru_cache.LRUCache]
+- [`VramBudget` / `RamBudget`][horde_worker_regen.process_management.resource_budget]

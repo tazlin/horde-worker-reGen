@@ -27,32 +27,36 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
 if TYPE_CHECKING:
-    from hordelib.feature_impact import FEATURE_KIND
+    from hordelib.feature_impact import FEATURE_KIND, BurdenEstimate
 
 
 @dataclass(frozen=True)
 class BudgetVerdict:
-    """Represents the outcome of a single VRAM-budget check, with enough detail to log a useful reason."""
+    """Represents the outcome of a single resource-budget check, with enough detail to log a reason.
+
+    Shared by the VRAM and RAM budgets; ``predicted_mb`` and ``available_mb`` carry whichever resource
+    the producing budget measures (free device VRAM, or available system RAM).
+    """
 
     fits: bool
-    """Whether the job's predicted peak plus the reserve fits the measured free VRAM."""
-    predicted_vram_mb: float | None
-    """The job's predicted peak VRAM (MB), or None when no estimate could be produced."""
-    free_vram_mb: float | None
-    """The measured device-wide free VRAM (MB) at check time, or None when no telemetry exists yet."""
+    """Whether the job's predicted cost plus the reserve fits the measured available resource."""
+    predicted_mb: float | None
+    """The job's predicted cost (MB) for this resource, or None when no estimate could be produced."""
+    available_mb: float | None
+    """The measured available resource (MB) at check time, or None when no telemetry exists yet."""
     reserve_mb: float
     """The reserve (MB) required on top of the prediction."""
 
     def reason(self) -> str:
-        """A short human-readable explanation, for logging an admit/defer decision."""
-        if self.free_vram_mb is None:
-            return "no VRAM telemetry yet (cold start); admitted"
-        if self.predicted_vram_mb is None:
-            return f"no burden estimate; admitted on {self.free_vram_mb:.0f} MB free"
+        """Return a short human-readable explanation, for logging an admit/defer decision."""
+        if self.available_mb is None:
+            return "no telemetry yet (cold start); admitted"
+        if self.predicted_mb is None:
+            return f"no burden estimate; admitted on {self.available_mb:.0f} MB available"
         verb = "fits" if self.fits else "does NOT fit"
         return (
-            f"job needs ~{self.predicted_vram_mb:.0f} MB + {self.reserve_mb:.0f} MB reserve "
-            f"vs {self.free_vram_mb:.0f} MB free: {verb}"
+            f"job needs ~{self.predicted_mb:.0f} MB + {self.reserve_mb:.0f} MB reserve "
+            f"vs {self.available_mb:.0f} MB available: {verb}"
         )
 
 
@@ -98,19 +102,38 @@ def predict_job_vram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) 
     yields None so the caller treats the cost as unknown (and admits) rather than crashing the
     scheduling cycle.
     """
+    burden = _estimate_job_burden(job, baseline)
+    return None if burden is None else float(burden.vram_mb)
+
+
+def predict_job_ram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
+    """Return a job's predicted system-RAM cost (MB) via hordelib's burden estimate, or None.
+
+    The RAM analogue of :func:`predict_job_vram_mb`; used by the RAM budget to keep resident-in-RAM
+    weights from forcing the OS to page. Never raises (see :func:`predict_job_vram_mb`).
+    """
+    burden = _estimate_job_burden(job, baseline)
+    return None if burden is None else float(burden.ram_mb)
+
+
+def _estimate_job_burden(job: ImageGenerateJobPopResponse, baseline: str | None) -> BurdenEstimate | None:
+    """Return hordelib's ``BurdenEstimate`` for a job, or None when the estimate cannot be produced.
+
+    Imported lazily so the parent process never eagerly pulls hordelib. Never raises: any error is
+    logged at debug and yields None so the scheduling cycle is never crashed by a bad estimate.
+    """
     try:
         from hordelib.api import estimate_job_burden
 
-        burden = estimate_job_burden(
+        return estimate_job_burden(
             baseline=str(baseline) if baseline is not None else "",
             width=job.payload.width,
             height=job.payload.height,
             batch=max(1, job.payload.n_iter),
             features=_job_feature_kinds(job),
         )
-        return float(burden.vram_mb)
     except Exception as e:
-        logger.debug(f"VRAM burden estimate failed for job {getattr(job, 'id_', None)}: {type(e).__name__} {e}")
+        logger.debug(f"Job burden estimate failed for job {getattr(job, 'id_', None)}: {type(e).__name__} {e}")
         return None
 
 
@@ -147,21 +170,76 @@ class VramBudget:
         ``free >= predicted + reserve``.
         """
         if free_vram_mb is None:
-            return BudgetVerdict(fits=True, predicted_vram_mb=None, free_vram_mb=None, reserve_mb=self._reserve_mb)
+            return BudgetVerdict(fits=True, predicted_mb=None, available_mb=None, reserve_mb=self._reserve_mb)
 
         predicted = predict_job_vram_mb(job, baseline)
         if predicted is None:
             return BudgetVerdict(
                 fits=True,
-                predicted_vram_mb=None,
-                free_vram_mb=free_vram_mb,
+                predicted_mb=None,
+                available_mb=free_vram_mb,
                 reserve_mb=self._reserve_mb,
             )
 
         fits = free_vram_mb >= predicted + self._reserve_mb
         return BudgetVerdict(
             fits=fits,
-            predicted_vram_mb=predicted,
-            free_vram_mb=free_vram_mb,
+            predicted_mb=predicted,
+            available_mb=free_vram_mb,
+            reserve_mb=self._reserve_mb,
+        )
+
+
+class RamBudget:
+    """Decides whether measured available system RAM can absorb another job's predicted RAM cost.
+
+    The RAM analogue of :class:`VramBudget`. ``high_memory_mode`` keeps model weights resident in
+    system RAM as well as VRAM; with several processes that can exhaust RAM and force the OS to page
+    to disk (observed in the live run as a worker paging out under load), which collapses throughput.
+    The available-RAM figure is system-wide (it already reflects every process), so like the VRAM
+    budget this needs no per-process bookkeeping.
+    """
+
+    def __init__(self, *, reserve_mb: float) -> None:
+        """Initialize with the reserve (MB) to keep available on top of any job's predicted RAM cost."""
+        self._reserve_mb = reserve_mb
+
+    @property
+    def reserve_mb(self) -> float:
+        """The reserve (MB) kept available on top of a job's predicted RAM cost."""
+        return self._reserve_mb
+
+    def set_reserve_mb(self, reserve_mb: float) -> None:
+        """Update the reserve (MB); honored live on config reload."""
+        self._reserve_mb = reserve_mb
+
+    def check_job(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: str | None,
+        available_ram_mb: float | None,
+    ) -> BudgetVerdict:
+        """Return the budget verdict for admitting ``job`` given the measured available system RAM.
+
+        Admits (fits=True) when no measurement or estimate is available, so the budget never wedges a
+        worker; otherwise requires ``available >= predicted + reserve``.
+        """
+        if available_ram_mb is None:
+            return BudgetVerdict(fits=True, predicted_mb=None, available_mb=None, reserve_mb=self._reserve_mb)
+
+        predicted = predict_job_ram_mb(job, baseline)
+        if predicted is None:
+            return BudgetVerdict(
+                fits=True,
+                predicted_mb=None,
+                available_mb=available_ram_mb,
+                reserve_mb=self._reserve_mb,
+            )
+
+        fits = available_ram_mb >= predicted + self._reserve_mb
+        return BudgetVerdict(
+            fits=fits,
+            predicted_mb=predicted,
+            available_mb=available_ram_mb,
             reserve_mb=self._reserve_mb,
         )
