@@ -16,7 +16,7 @@
 #   HORDE_WORKER_ASSUME_YES  accept the install notice without prompting (required when piped, no terminal)
 #   HORDE_WORKER_SHORTCUTS   create the applications-menu entry without prompting
 #   HORDE_WORKER_NO_SHORTCUTS skip the applications-menu entry entirely
-#   HORDE_WORKER_NO_LAUNCH   set to skip auto-launching the dashboard after install
+#   HORDE_WORKER_NO_LAUNCH   skip the "Start now?" prompt and do not launch after install
 set -eu
 
 OWNER="tazlin"
@@ -161,14 +161,40 @@ fi
 
 echo ""
 echo "To open the dashboard again later:"
-echo "  - run $INSTALL_DIR/horde-worker.sh  (add --terminal for the in-terminal UI), or"
+echo "  - run $INSTALL_DIR/horde-worker.sh  (add --terminal for the in-terminal UI, --headless for no UI), or"
 echo "  - launch 'AI Horde Worker' from your applications menu."
 echo "To update later: run $INSTALL_DIR/update.sh or re-run the same install command (both keep $INSTALL_DIR-data intact)."
 echo ""
 
 if [ -n "${HORDE_WORKER_NO_LAUNCH:-}" ]; then
     echo "Start it whenever you're ready with the command above."
+elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf "Start the worker now? [(y)es / (n)o / (t)erminal UI / (h)eadless]: " > /dev/tty
+    while true; do
+        reply=""
+        read -r reply < /dev/tty || reply=""
+        case "$reply" in
+            [Yy]|[Yy][Ee][Ss])
+                echo "Starting the worker dashboard..."
+                exec ./horde-worker.sh
+                ;;
+            [Nn]|[Nn][Oo]|"")
+                echo "Start it whenever you're ready with the command above."
+                break
+                ;;
+            [Tt])
+                echo "Starting the in-terminal UI..."
+                exec ./horde-worker.sh --terminal
+                ;;
+            [Hh])
+                echo "Starting the worker in headless mode..."
+                exec ./horde-worker.sh --headless
+                ;;
+            *)
+                printf "Please enter y, n, t, or h: " > /dev/tty
+                ;;
+        esac
+    done
 else
-    echo "Starting the worker dashboard..."
-    exec ./horde-worker.sh
+    echo "Start it whenever you're ready with the command above."
 fi

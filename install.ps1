@@ -16,7 +16,7 @@
 #   $env:HORDE_WORKER_ASSUME_YES  accept the install notice without prompting (required when non-interactive)
 #   $env:HORDE_WORKER_SHORTCUTS   create Desktop/Start Menu shortcuts without prompting
 #   $env:HORDE_WORKER_NO_SHORTCUTS skip shortcut creation entirely
-#   $env:HORDE_WORKER_NO_LAUNCH   set to skip auto-launching the dashboard after install
+#   $env:HORDE_WORKER_NO_LAUNCH   skip the "Start now?" prompt and do not launch after install
 
 #Requires -Version 5.1
 $ErrorActionPreference = "Stop"
@@ -40,6 +40,21 @@ function Read-YesNo([string]$Prompt, [bool]$DefaultYes = $false) {
     $answer = (Read-Host "$Prompt $suffix").Trim().ToLower()
     if (-not $answer) { return $DefaultYes }
     return ($answer -eq "y" -or $answer -eq "yes")
+}
+
+function Read-LaunchChoice([string]$Prompt) {
+    while ($true) {
+        $answer = (Read-Host $Prompt).Trim().ToLower()
+        switch ($answer) {
+            { $_ -in "y", "yes" }       { return "web" }
+            { $_ -in "n", "no", "" }    { return "no" }
+            "t"                          { return "terminal" }
+            "h"                          { return "headless" }
+            default {
+                Write-Host "Please enter y, n, t, or h." -ForegroundColor Yellow
+            }
+        }
+    }
 }
 
 function New-Shortcut([string]$LinkPath, [string]$TargetPath, [string]$WorkingDir) {
@@ -181,14 +196,32 @@ Write-Host "To open the dashboard again later:" -ForegroundColor Cyan
 if ($madeShortcut) {
     Write-Host "  - click the 'AI Horde Worker' shortcut on your Desktop or in the Start Menu, or"
 }
-Write-Host "  - run horde-worker.cmd in $InstallDir."
+Write-Host "  - run horde-worker.cmd in $InstallDir (add --terminal for the in-terminal UI, --headless for no UI)."
 Write-Host "To update later: run update.cmd in $InstallDir, re-run the same install command, or"
 Write-Host "  'winget upgrade Haidra.HordeWorker'. Any of these keep your $InstallDir-data folder intact."
 Write-Host ""
 
 if (Get-Option "HORDE_WORKER_NO_LAUNCH" "") {
     Write-Host "Start it whenever you're ready using a shortcut above."
+} elseif ([Environment]::UserInteractive) {
+    $choice = Read-LaunchChoice "Start the worker now? [(y)es / (n)o / (t)erminal UI / (h)eadless]"
+    switch ($choice) {
+        "web" {
+            Write-Host "Opening the worker dashboard in your browser now..."
+            Start-Process -FilePath $launcher -WorkingDirectory $InstallDir
+        }
+        "terminal" {
+            Write-Host "Starting the in-terminal UI..."
+            & $launcher --terminal
+        }
+        "headless" {
+            Write-Host "Starting the worker in headless mode..."
+            Start-Process -FilePath $launcher -ArgumentList "--headless" -WorkingDirectory $InstallDir -WindowStyle Hidden
+        }
+        default {
+            Write-Host "Start it whenever you're ready using a shortcut above."
+        }
+    }
 } else {
-    Write-Host "Opening the worker dashboard in your browser now..."
-    Start-Process -FilePath $launcher -WorkingDirectory $InstallDir
+    Write-Host "Start it whenever you're ready using a shortcut above."
 }

@@ -2,17 +2,23 @@
 cd /d "%~dp0"
 title AI Horde Worker
 
-REM Default: serve the dashboard in your web browser. Pass --terminal for the in-terminal UI.
+REM Default: serve the dashboard in your web browser. Pass --terminal for the in-terminal UI,
+REM or --headless to run without any UI (host mode, for servers/scripts).
 REM Power users can bind the LAN with: horde-worker.cmd --host 0.0.0.0  (unauthenticated; opt-in).
 if /I "%~1"=="--terminal" (
     call "%~dp0runtime.cmd" launch terminal
     goto :done
 )
 
+if /I "%~1"=="--headless" (
+    call "%~dp0runtime.cmd" launch host
+    goto :done
+)
+
 echo Starting the AI Horde Worker dashboard...
 echo This window runs the worker: closing it (or pressing Ctrl+C here) stops the worker.
 echo Closing just the dashboard window/tab leaves the worker running; reopen to reconnect.
-echo Pass --terminal for the in-terminal UI.
+echo Pass --terminal for the in-terminal UI, or --headless for no UI.
 echo.
 call "%~dp0runtime.cmd" launch web %*
 
