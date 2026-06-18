@@ -32,6 +32,18 @@ case "$INSTALL_DIR" in
     *" "*) echo "ERROR: the install path must not contain spaces: $INSTALL_DIR" >&2; exit 1 ;;
 esac
 
+# Guard against running the installer from inside an existing horde-worker installation.
+# When no explicit destination was given, the default ($PWD/horde-worker) would create a
+# nested copy. Presence of runtime.sh in the CWD is a reliable sentinel for an existing install.
+if [ -z "${HORDE_WORKER_DIR:-}" ] && [ -z "${1:-}" ] && [ -f "$PWD/runtime.sh" ]; then
+    echo "ERROR: the current directory looks like an existing horde-worker installation (runtime.sh is here)." >&2
+    echo "       Installing from here would create a nested copy at: $INSTALL_DIR" >&2
+    echo "       To update the current install, run:  $PWD/update.sh" >&2
+    echo "       To install elsewhere, cd to another directory first, or set:" >&2
+    echo "         HORDE_WORKER_DIR=/path/to/new-location" >&2
+    exit 1
+fi
+
 echo ""
 echo "=== AI Horde Worker installer ==="
 echo "Install location: $INSTALL_DIR"

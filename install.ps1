@@ -73,6 +73,18 @@ if ($InstallDir -match "\s") {
     exit 1
 }
 
+# Guard against running the installer from inside an existing horde-worker installation.
+# When no explicit destination was given, the default (.\HordeWorker) would create a
+# nested copy. Presence of runtime.cmd in the CWD is a reliable sentinel for an existing install.
+if (-not (Get-Option "HORDE_WORKER_DIR" "") -and $args.Count -eq 0 -and (Test-Path (Join-Path (Get-Location).Path "runtime.cmd"))) {
+    Write-Host "ERROR: the current directory looks like an existing horde-worker installation (runtime.cmd is here)." -ForegroundColor Red
+    Write-Host "       Installing from here would create a nested copy at: $InstallDir" -ForegroundColor Red
+    Write-Host "       To update the current install, run:  update.cmd" -ForegroundColor Yellow
+    Write-Host "       To install elsewhere, cd to another directory first, or set:" -ForegroundColor Yellow
+    Write-Host "         `$env:HORDE_WORKER_DIR = 'C:\path\to\new-location'" -ForegroundColor Yellow
+    exit 1
+}
+
 Write-Host ""
 Write-Host "=== AI Horde Worker installer ===" -ForegroundColor Cyan
 Write-Host "Install location: $InstallDir"
