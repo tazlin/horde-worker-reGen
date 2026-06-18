@@ -7,6 +7,7 @@ import contextlib
 import gc
 import io
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -47,6 +48,9 @@ from horde_worker_regen.process_management.messages import (
     HordeProcessState,
     ModelLoadState,
 )
+
+AUX_DOWNLOAD_HEARTBEAT_INTERVAL_SECONDS = 5.0
+"""How often a child reports liveness while blocked in an ad-hoc AUX-model download."""
 
 if TYPE_CHECKING:
     from hordelib.api import HordeLib, ProgressReport, ResultingImageReturn, SharedModelManager
@@ -351,14 +355,10 @@ class HordeInferenceProcess(HordeProcess):
             time_start = time.time()
 
             lora_manager = self._shared_model_manager.manager.lora
-
             if lora_manager is None:
                 raise RuntimeError("Failed to load LORA model manager")
 
-            performed_a_download = False
-
             loras = job_info.payload.loras or []
-
             if not loras:
                 logger.info("No auxiliary models to download")
                 return None
@@ -370,8 +370,22 @@ class HordeInferenceProcess(HordeProcess):
                 logger.error(f"Failed to reset adhoc loras: {type(e).__name__} {e}")
 
             time_to_wait_for_downloads = 0
-            for lora_entry in loras:
-                if not lora_manager.is_model_available(lora_entry.name):
+            aux_heartbeat_stop: threading.Event | None = None
+            aux_heartbeat_thread: threading.Thread | None = None
+            performed_a_download = False
+
+            try:
+                for lora_entry in loras:
+                    # Already on disk — nothing to fetch, but still drain any in-flight downloads.
+                    if lora_manager.is_model_available(lora_entry.name):
+                        logger.info(f"Model {lora_entry.name} already downloaded")
+                        try:
+                            lora_manager.wait_for_downloads(time_to_wait_for_downloads)
+                        except Exception as e:
+                            logger.error(f"Failed to wait for downloads: {type(e).__name__} {e}")
+                        continue
+
+                    # --- Model needs downloading ---
                     if not performed_a_download:
                         self.send_aux_model_message(
                             process_state=HordeProcessState.DOWNLOADING_AUX_MODEL,
@@ -379,23 +393,28 @@ class HordeInferenceProcess(HordeProcess):
                             time_elapsed=0.0,
                             job_info=job_info,
                         )
+                        self.send_heartbeat_message(HordeHeartbeatType.OTHER)
+                        aux_heartbeat_stop, aux_heartbeat_thread = self._start_aux_download_heartbeat_thread()
                         performed_a_download = True
+
                     lora_manager.fetch_adhoc_lora(lora_entry.name, timeout=None, is_version=lora_entry.is_version)
-                    if time_to_wait_for_downloads == 0:
-                        time_to_wait_for_downloads = BASE_LORA_DOWNLOAD_TIMEOUT
-                    else:
-                        time_to_wait_for_downloads += EXTRA_LORA_DOWNLOAD_TIMEOUT
-                else:
-                    logger.info(f"Model {lora_entry.name} already downloaded")
-                try:
-                    lora_manager.wait_for_downloads(time_to_wait_for_downloads)
-                except Exception as e:
-                    logger.error(f"Failed to wait for downloads: {type(e).__name__} {e}")
+                    time_to_wait_for_downloads = (
+                        BASE_LORA_DOWNLOAD_TIMEOUT
+                        if time_to_wait_for_downloads == 0
+                        else time_to_wait_for_downloads + EXTRA_LORA_DOWNLOAD_TIMEOUT
+                    )
+                    try:
+                        lora_manager.wait_for_downloads(time_to_wait_for_downloads)
+                    except Exception as e:
+                        logger.error(f"Failed to wait for downloads: {type(e).__name__} {e}")
+            finally:
+                if aux_heartbeat_stop is not None:
+                    aux_heartbeat_stop.set()
+                if aux_heartbeat_thread is not None:
+                    aux_heartbeat_thread.join(timeout=1.0)
 
             time_elapsed = round(time.time() - time_start, 2)
-
             lora_manager.save_reference_to_disk()
-
             self._send_download_metrics_if_any()
 
             if performed_a_download:
@@ -403,7 +422,6 @@ class HordeInferenceProcess(HordeProcess):
                 return time_elapsed
 
             logger.info("No auxiliary models downloaded")
-
             return None
 
     @logger.catch(reraise=True)
@@ -637,6 +655,30 @@ class HordeInferenceProcess(HordeProcess):
             )
         except Exception as e:
             logger.warning(f"Failed to send download metrics: {type(e).__name__} {e}")
+
+    def _start_aux_download_heartbeat_thread(self) -> tuple[threading.Event, threading.Thread]:
+        """Start a short-lived liveness loop for blocking AUX-model downloads.
+
+        The LoRA manager's ad-hoc download path can block inside ``fetch_adhoc_lora`` /
+        ``wait_for_downloads`` without returning to the child process main loop. Without this loop, the
+        parent and TUI only see the initial ``DOWNLOADING_AUX_MODEL`` state change until the download
+        completes, so a healthy WAN transfer can look silent. These are ``OTHER`` heartbeats, not
+        ``INFERENCE_STEP`` heartbeats, so mid-sampling hang detection remains unchanged.
+        """
+        stop_event = threading.Event()
+
+        def _heartbeat_loop() -> None:
+            while not stop_event.wait(AUX_DOWNLOAD_HEARTBEAT_INTERVAL_SECONDS):
+                self.send_heartbeat_message(HordeHeartbeatType.OTHER)
+                self._send_download_metrics_if_any()
+
+        thread = threading.Thread(
+            target=_heartbeat_loop,
+            name=f"horde-aux-download-heartbeat-{self.process_id}",
+            daemon=True,
+        )
+        thread.start()
+        return stop_event, thread
 
     def start_inference(self, job_info: ImageGenerateJobPopResponse) -> list[ResultingImageReturn] | None:
         """Start an inference job in the HordeLib instance.

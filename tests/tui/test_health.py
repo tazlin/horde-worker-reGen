@@ -90,6 +90,23 @@ def test_unresponsive_on_stale_snapshot() -> None:
     assert report.severity is HealthStatus.ERROR
 
 
+def test_brief_silence_under_base_threshold_is_not_unresponsive() -> None:
+    """A silence between the old (8s) and new (20s) base threshold must not read as unresponsive."""
+    report = derive(_snapshot(processes=[_process("WAITING_FOR_JOB")]), SupervisorStatus.RUNNING, 15.0)
+    assert report.phase is not WorkerPhase.UNRESPONSIVE
+
+
+def test_download_in_flight_gets_a_longer_staleness_grace() -> None:
+    """While a download/load is in flight the unresponsive alarm holds off past the base threshold."""
+    downloading = _snapshot(processes=[_process("DOWNLOADING_AUX_MODEL", loaded_horde_model_name="SomeModel")])
+    # Past the 20s base budget but within the 90s download budget: not unresponsive (it is warming up).
+    report = derive(downloading, SupervisorStatus.RUNNING, 45.0)
+    assert report.phase is not WorkerPhase.UNRESPONSIVE
+    # Far enough past even the download budget: genuinely stuck.
+    stuck = derive(downloading, SupervisorStatus.RUNNING, 120.0)
+    assert stuck.phase is WorkerPhase.UNRESPONSIVE
+
+
 def test_degraded_on_consecutive_failures() -> None:
     """The repeated-failure flag surfaces as DEGRADED."""
     report = derive(

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import abc
 import enum
+import queue
 import signal
 import sys
+import threading
 import time
 from abc import abstractmethod
 from enum import auto
@@ -145,10 +147,52 @@ class HordeProcess(abc.ABC):
         self.disk_lock = disk_lock
         self.process_launch_identifier = process_launch_identifier
 
+        self._control_inbox: queue.SimpleQueue[object] = queue.SimpleQueue()
+        self._control_reader_stop = threading.Event()
+        self._control_reader_thread: threading.Thread | None = None
+
         self.send_process_state_change_message(
             process_state=HordeProcessState.PROCESS_STARTING,
             info="Process starting",
         )
+
+    def _start_control_pipe_reader(self) -> None:
+        """Start a daemon thread that drains the control pipe into an in-memory inbox.
+
+        The main loop handles a preload (and its blocking aux-model download) synchronously, so without
+        this it stops calling ``recv()`` for the whole download. The parent's ``safe_send_message`` is a
+        blocking ``pipe_connection.send()``; once the OS pipe buffer to a non-draining child fills, that
+        send blocks the parent's *entire* control loop, which then stops publishing supervisor snapshots
+        and the dashboard ages into a false "Worker Unresponsive". Draining on a dedicated thread keeps
+        the pipe readable at all times so the parent can never wedge on a busy child. Messages are only
+        *handled* on the main loop (see :meth:`receive_and_handle_control_messages`); this thread never
+        touches model/GPU state. The download process already does this (its ``_control_loop``); this
+        brings the inference and safety processes to parity.
+        """
+        if self._control_reader_thread is not None:
+            return
+        thread = threading.Thread(
+            target=self._control_pipe_reader_loop,
+            name=f"horde-control-reader-{self.process_id}",
+            daemon=True,
+        )
+        self._control_reader_thread = thread
+        thread.start()
+
+    def _control_pipe_reader_loop(self) -> None:
+        """Block on the control pipe and forward each message to the inbox until told to stop."""
+        while not self._control_reader_stop.is_set():
+            try:
+                # Poll with a timeout so the thread can observe the stop event between messages rather
+                # than blocking forever in recv() after the main loop has decided to exit.
+                if not self.pipe_connection.poll(0.1):
+                    continue
+                message = self.pipe_connection.recv()
+            except (EOFError, OSError):
+                # Parent gone / pipe closed: ask the main loop to exit, then stop draining.
+                self._end_process = True
+                return
+            self._control_inbox.put(message)
 
     def send_process_state_change_message(
         self,
@@ -297,9 +341,12 @@ class HordeProcess(abc.ABC):
         """
 
     def receive_and_handle_control_messages(self) -> None:
-        """Get and handle any control messages pending from the main process."""
-        while self.pipe_connection.poll():
-            message = self.pipe_connection.recv()
+        """Handle any control messages the reader thread has drained from the main process."""
+        while True:
+            try:
+                message = self._control_inbox.get_nowait()
+            except queue.Empty:
+                return
 
             if not isinstance(message, HordeControlMessage):
                 logger.critical(f"Received unexpected message type: {type(message).__name__}")
@@ -329,12 +376,16 @@ class HordeProcess(abc.ABC):
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
+        self._start_control_pipe_reader()
+
         while not self._end_process:
             time.sleep(self._loop_interval)
             self.receive_and_handle_control_messages()
             self.worker_cycle()
             self._maybe_send_idle_heartbeat()
             self._maybe_send_periodic_memory_report()
+
+        self._control_reader_stop.set()
 
         # We escaped the loop, so the process is ending
         self.send_process_state_change_message(

@@ -57,6 +57,13 @@ class HordeProcessInfo:
     """The kinds of work this process can be dispatched (job routing keys on this)."""
     last_process_state: HordeProcessState
     """The last known state of this process."""
+    last_process_state_started_at: float
+    """Epoch time when ``last_process_state`` was first observed.
+
+    This is intentionally separate from ``last_received_timestamp`` and heartbeat timestamps. A process
+    can be alive and sending liveness messages while still spending too long in one state, and a process
+    can also be legitimately quiet while inside blocking child-side work.
+    """
 
     last_heartbeat_timestamp: float
     """Last time we received a heartbeat from this process."""
@@ -177,6 +184,7 @@ class HordeProcessInfo:
         self.process_type = process_type
         self.capabilities = capabilities if capabilities is not None else DEFAULT_CAPABILITIES[process_type]
         self.last_process_state = last_process_state
+        self.last_process_state_started_at = time.time()
         self.last_received_timestamp = time.time()
         self.loaded_horde_model_name = None
         self.loaded_horde_model_baseline = None

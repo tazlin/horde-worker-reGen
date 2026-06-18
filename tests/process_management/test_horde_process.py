@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import queue
 import time
 from typing import override
@@ -9,6 +10,7 @@ from unittest.mock import Mock
 
 from horde_worker_regen.process_management.horde_process import HordeProcess
 from horde_worker_regen.process_management.messages import (
+    HordeControlFlag,
     HordeControlMessage,
     HordeHeartbeatType,
     HordeProcessHeartbeatMessage,
@@ -19,13 +21,17 @@ from horde_worker_regen.process_management.messages import (
 class _StubProcess(HordeProcess):
     """A minimal concrete HordeProcess for exercising base-class behaviour without a real subprocess."""
 
+    handled: list[HordeControlMessage]
+
     @override
     def cleanup_for_exit(self) -> None:
         return
 
     @override
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
-        return
+        if not hasattr(self, "handled"):
+            self.handled = []
+        self.handled.append(message)
 
 
 def _make_stub() -> _StubProcess:
@@ -75,3 +81,66 @@ def test_idle_heartbeat_is_throttled() -> None:
     proc._maybe_send_idle_heartbeat()
 
     proc.process_message_queue.put.assert_not_called()  # pyrefly: ignore
+
+
+def _make_piped_stub() -> tuple[_StubProcess, object]:
+    """Build a stub wired to a real duplex pipe; returns the stub and the parent's send end."""
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+    proc = _StubProcess(
+        process_id=7,
+        process_message_queue=Mock(spec=queue.Queue),
+        pipe_connection=child_conn,
+        disk_lock=Mock(),
+        process_launch_identifier=0,
+    )
+    return proc, parent_conn
+
+
+def test_control_reader_drains_pipe_without_the_main_loop() -> None:
+    """The reader thread keeps the control pipe drained even if the main loop never consumes.
+
+    This is the anti-wedge guarantee: the parent's blocking ``send()`` can never back up on a child
+    that is busy (e.g. mid aux-model download), because a dedicated thread always reads the pipe.
+    """
+    proc, parent_conn = _make_piped_stub()
+    proc._start_control_pipe_reader()
+    try:
+        for _ in range(50):
+            parent_conn.send(HordeControlMessage(control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM))
+
+        # Without ever calling receive_and_handle_control_messages, every message should land in the
+        # inbox: the reader thread drained the pipe on its own.
+        deadline = time.time() + 5.0
+        while proc._control_inbox.qsize() < 50 and time.time() < deadline:
+            time.sleep(0.01)
+        assert proc._control_inbox.qsize() == 50
+    finally:
+        proc._control_reader_stop.set()
+
+
+def test_control_messages_are_handled_in_order_from_the_inbox() -> None:
+    """Drained messages are handled on the main loop, in order, and END_PROCESS stops the loop."""
+    proc, parent_conn = _make_piped_stub()
+    proc._start_control_pipe_reader()
+    try:
+        parent_conn.send(HordeControlMessage(control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM))
+        parent_conn.send(HordeControlMessage(control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_RAM))
+
+        deadline = time.time() + 5.0
+        while proc._control_inbox.qsize() < 2 and time.time() < deadline:
+            time.sleep(0.01)
+
+        proc.receive_and_handle_control_messages()
+        assert [m.control_flag for m in proc.handled] == [
+            HordeControlFlag.UNLOAD_MODELS_FROM_VRAM,
+            HordeControlFlag.UNLOAD_MODELS_FROM_RAM,
+        ]
+
+        parent_conn.send(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
+        deadline = time.time() + 5.0
+        while proc._control_inbox.qsize() < 1 and time.time() < deadline:
+            time.sleep(0.01)
+        proc.receive_and_handle_control_messages()
+        assert proc._end_process is True
+    finally:
+        proc._control_reader_stop.set()

@@ -302,6 +302,54 @@ def test_stuck_starting_safety_arms_replacement() -> None:
     assert plm.safety_processes_should_be_replaced is True
 
 
+def test_aux_download_timeout_uses_state_duration_not_recent_liveness() -> None:
+    """AUX download replacement is bounded by time in state, not by heartbeat silence.
+
+    The child now emits liveness while blocked in the LoRA download path. That should keep the worker
+    from looking globally unresponsive, but it must not make a download unkillable if it exceeds the
+    configured operation timeout.
+    """
+    aux = make_mock_process_info(0, model_name="m", state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+    now = time.time()
+    aux.last_process_state_started_at = now - 1000
+    aux.last_received_timestamp = now
+    aux.last_heartbeat_timestamp = now
+    plm = _make_plm(process_map=ProcessMap({0: aux}))
+    plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+
+    replaced = plm._check_and_replace_process(
+        aux,
+        120.0,
+        HordeProcessState.DOWNLOADING_AUX_MODEL,
+        "stuck downloading",
+        use_state_duration=True,
+    )
+
+    assert replaced is True
+    plm._replace_inference_process.assert_called_once_with(aux)
+
+
+def test_silence_timeout_still_uses_recent_liveness_by_default() -> None:
+    """Non-operation checks keep their existing silence-based behavior."""
+    aux = make_mock_process_info(0, model_name="m", state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+    now = time.time()
+    aux.last_process_state_started_at = now - 1000
+    aux.last_received_timestamp = now
+    aux.last_heartbeat_timestamp = now
+    plm = _make_plm(process_map=ProcessMap({0: aux}))
+    plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+
+    replaced = plm._check_and_replace_process(
+        aux,
+        120.0,
+        HordeProcessState.DOWNLOADING_AUX_MODEL,
+        "stuck downloading",
+    )
+
+    assert replaced is False
+    plm._replace_inference_process.assert_not_called()
+
+
 def test_reap_if_crashed_recovers_dead_inference() -> None:
     """A dead inference child (no longer alive) is recovered without waiting on a state timer."""
     dead = make_mock_process_info(1, model_name=None, state=HordeProcessState.PROCESS_STARTING)

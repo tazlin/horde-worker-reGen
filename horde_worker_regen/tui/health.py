@@ -18,8 +18,21 @@ from horde_worker_regen.process_management.supervisor_channel import WorkerState
 from horde_worker_regen.tui.formatters import human_bytes, human_duration
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
-STALE_SNAPSHOT_SECONDS = 8.0
-"""No snapshot for this long (while the process is alive) means the worker is likely stuck."""
+STALE_SNAPSHOT_SECONDS = 20.0
+"""No snapshot for this long (while the process is alive) means the worker is likely stuck.
+
+Deliberately well above the worker's snapshot floor (~2s) so a momentarily busy control loop never
+reads as "unresponsive". The previous 8s was aggressive enough that a single slow control-loop tick
+(or a child blocking the parent on a control-pipe send) flipped the dashboard to UNRESPONSIVE and,
+in attached/host setups, churned restarts. The underlying parent-stall is fixed at the source (the
+child now drains its control pipe on a dedicated thread), so this is a backstop, not the front line."""
+
+STALE_SNAPSHOT_DOWNLOAD_SECONDS = 90.0
+"""More generous staleness budget when the last snapshot showed a model download/load in flight.
+
+A worker fetching weights (base or aux/LoRA) or loading a model is legitimately busy and the operator
+expects it to take a while, so the "unresponsive" alarm should hold off longer in that case rather
+than cry wolf on a healthy WAN transfer. Applied via :func:`_stale_threshold`."""
 
 IDLE_SECONDS = 600.0
 """No work for this long is treated as an idle/low-demand state rather than active serving."""
@@ -147,7 +160,7 @@ def derive(
 
     checks = _build_checks(snapshot, snapshot_age)
 
-    if snapshot_age is not None and snapshot_age > STALE_SNAPSHOT_SECONDS:
+    if snapshot_age is not None and snapshot_age > _stale_threshold(snapshot):
         return HealthReport(
             WorkerPhase.UNRESPONSIVE,
             HealthStatus.ERROR,
@@ -245,6 +258,17 @@ def derive(
     )
 
 
+def _stale_threshold(snapshot: WorkerStateSnapshot) -> float:
+    """The staleness budget for this snapshot: extended while a model download/load is in flight.
+
+    Reads the *last* snapshot we have (possibly the stale one itself): if it shows any process mid
+    download or load, a longer silence is expected and tolerated before declaring the worker stuck.
+    """
+    if any(process.last_process_state in _LOADING_STATES for process in snapshot.processes):
+        return STALE_SNAPSHOT_DOWNLOAD_SECONDS
+    return STALE_SNAPSHOT_SECONDS
+
+
 def summarize_skips(skipped_reasons: dict[str, int], *, limit: int = 4) -> str:
     """Render the last pop's skip reasons as a compact, count-ordered phrase ("3 models · 1 nsfw")."""
     ranked = sorted(((reason, count) for reason, count in skipped_reasons.items() if count), key=lambda r: -r[1])
@@ -335,7 +359,7 @@ def _build_checks(snapshot: WorkerStateSnapshot, snapshot_age: float | None) -> 
         checks.append(HealthCheck("Work", HealthStatus.INFO, f"Last pop skipped: {skips}"))
 
     if snapshot_age is not None:
-        responsive = snapshot_age <= STALE_SNAPSHOT_SECONDS
+        responsive = snapshot_age <= _stale_threshold(snapshot)
         status = HealthStatus.OK if responsive else HealthStatus.ERROR
         checks.append(HealthCheck("Responsiveness", status, f"Last update {human_duration(snapshot_age)} ago"))
 

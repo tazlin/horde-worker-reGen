@@ -1064,6 +1064,8 @@ class ProcessLifecycleManager:
         timeout: float,
         state: HordeProcessState,
         error_message: str,
+        *,
+        use_state_duration: bool = False,
     ) -> bool:
         """Check if a process has been stuck in a state for too long and replace it if it has.
 
@@ -1071,8 +1073,11 @@ class ProcessLifecycleManager:
             True if the process was replaced, False otherwise
         """
         now = time.time()
-        time_elapsed = now - process_info.last_received_timestamp
-        time_elapsed = min(time_elapsed, now - process_info.last_heartbeat_timestamp)
+        if use_state_duration:
+            time_elapsed = now - process_info.last_process_state_started_at
+        else:
+            time_elapsed = now - process_info.last_received_timestamp
+            time_elapsed = min(time_elapsed, now - process_info.last_heartbeat_timestamp)
 
         if time_elapsed > timeout and process_info.last_process_state == state:
             logger.error(f"{process_info} {error_message}, replacing it")
@@ -1082,7 +1087,12 @@ class ProcessLifecycleManager:
                 os_pid=process_info.os_pid,
                 launch_identifier=process_info.process_launch_identifier,
                 reason=error_message,
-                detail={"state": state.name, "elapsed_s": round(time_elapsed, 1), "timeout_s": timeout},
+                detail={
+                    "state": state.name,
+                    "elapsed_s": round(time_elapsed, 1),
+                    "timeout_s": timeout,
+                    "elapsed_source": "state_duration" if use_state_duration else "message_or_heartbeat_silence",
+                },
             )
             if process_info.process_type == HordeProcessType.SAFETY:
                 self._log_recovery_diagnostics(process_info, error_message)
@@ -1211,38 +1221,49 @@ class ProcessLifecycleManager:
                 self._recently_recovered = True
                 threading.Thread(target=timed_unset_recently_recovered).start()
             else:
-                conditions: list[tuple[float, HordeProcessState, str]] = [
+                conditions: list[tuple[float, HordeProcessState, str, bool]] = [
                     (
                         bridge_data.preload_timeout,
                         HordeProcessState.PRELOADING_MODEL,
                         "seems to be stuck preloading a model",
+                        False,
                     ),
                     (
                         bridge_data.download_timeout,
                         HordeProcessState.DOWNLOADING_AUX_MODEL,
                         "seems to be stuck downloading an auxiliary model (LoRa, etc)",
+                        True,
                     ),
                     (
                         bridge_data.preload_timeout,
                         HordeProcessState.PROCESS_STARTING,
                         "seems to be stuck starting",
+                        False,
                     ),
                     (
                         bridge_data.post_process_timeout + (3 * bridge_data.max_batch),
                         HordeProcessState.INFERENCE_POST_PROCESSING,
                         "seems to be stuck post processing",
+                        False,
                     ),
                     (
                         bridge_data.process_timeout,
                         HordeProcessState.WAITING_FOR_JOB,
                         "seems to be stuck idle (silent) while there is work to do",
+                        False,
                     ),
                 ]
                 if self._state.last_pop_no_jobs_available:
                     continue
 
-                for timeout, state, error_message in conditions:
-                    if self._check_and_replace_process(process_info, timeout, state, error_message):
+                for timeout, state, error_message, use_state_duration in conditions:
+                    if self._check_and_replace_process(
+                        process_info,
+                        timeout,
+                        state,
+                        error_message,
+                        use_state_duration=use_state_duration,
+                    ):
                         any_replaced = True
                         self._recently_recovered = True
 

@@ -132,6 +132,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             process_id (int): The ID of the process that has ended.
         """
         self[process_id].last_process_state = HordeProcessState.PROCESS_ENDING
+        self[process_id].last_process_state_started_at = time.time()
         self[process_id].loaded_horde_model_name = None
         self[process_id].loaded_horde_model_baseline = None
         self[process_id].last_job_referenced = None
@@ -215,8 +216,11 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 f"Process {process_id} made an unexpected state transition: {old_state.name} -> {new_state.name}",
             )
 
+        now = time.time()
+        if old_state != new_state:
+            self[process_id].last_process_state_started_at = now
         self[process_id].last_process_state = new_state
-        self[process_id].last_received_timestamp = time.time()
+        self[process_id].last_received_timestamp = now
 
         if (
             new_state == HordeProcessState.INFERENCE_COMPLETE

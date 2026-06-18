@@ -118,6 +118,21 @@ class TestProcessStateTransitions:
 
         assert warnings == []
 
+    def test_state_started_at_changes_only_on_state_change(self) -> None:
+        """Heartbeat and memory liveness must not reset the current state's duration clock."""
+        proc = make_mock_process_info(0, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+        process_map = ProcessMap({0: proc})
+        proc.last_process_state_started_at = 123.0
+
+        process_map.on_heartbeat(0, HordeHeartbeatType.OTHER)
+        process_map.on_memory_report(0, ram_usage_bytes=1)
+
+        assert proc.last_process_state_started_at == 123.0
+
+        process_map.on_process_state_change(0, HordeProcessState.PRELOADING_MODEL)
+
+        assert proc.last_process_state_started_at != 123.0
+
     def test_unrestricted_states_are_silent_from_anywhere(self) -> None:
         """Idle/teardown states can be entered from any state without warnings."""
         proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
