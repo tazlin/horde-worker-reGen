@@ -56,6 +56,7 @@ from horde_worker_regen.process_management.fake_worker_processes import (
     start_fake_safety_process,
 )
 from horde_worker_regen.process_management.fault_injection import FaultProfile
+from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.messages import AlchemyFormSpec
 from horde_worker_regen.process_management.process_manager import (
     HordeWorkerProcessManager,
@@ -786,6 +787,40 @@ def run_harness(config: HarnessConfig) -> HarnessResult:
     return asyncio.run(run_harness_async(config))
 
 
+def _summarize_worker_processes(manager: HordeWorkerProcessManager) -> str:
+    """A one-line ``id=state`` (with ``/DEAD`` when the OS process has exited) summary of every child.
+
+    The warm benchmark's silent failure mode is a child that never reaches readiness or dies during
+    startup; the level then just times out with zero context. Folding the per-process state into the
+    readiness/timeout logs turns "0 jobs, timed out" into an actionable trace of which process is wedged
+    or already gone (the matching startup-crash trace, if any, is in ``logs/bridge_*_startup.log``).
+    """
+    infos = list(manager._process_map.values())
+    if not infos:
+        return "no child processes in the process map"
+    parts: list[str] = []
+    for info in infos:
+        alive = ""
+        with contextlib.suppress(Exception):
+            if not info.mp_process.is_alive():
+                alive = "/DEAD"
+        parts.append(f"{info.process_type.name.lower()}#{info.process_id}={info.last_process_state.name}{alive}")
+    return ", ".join(parts)
+
+
+def _all_inference_processes_dead(manager: HordeWorkerProcessManager) -> bool:
+    """Whether the worker has inference processes and every one of them has exited at the OS level.
+
+    Used to fast-fail a draining level against a wedged worker. ``False`` when no inference process has
+    been launched yet (nothing to be dead) or when at least one is alive (including a freshly respawned
+    replacement during recovery), so a normal recovery window does not trip it.
+    """
+    inference = [info for info in manager._process_map.values() if info.process_type == HordeProcessType.INFERENCE]
+    if not inference:
+        return False
+    return all(not info.mp_process.is_alive() for info in inference)
+
+
 def _warm_model_reference(model_names: list[str]) -> dict[str, ImageGenerationModelRecord]:
     """Build a minimal model reference covering every model the warm session may run."""
     return {
@@ -842,6 +877,18 @@ cycle, after which the warm pass is abandoned and the measured pass runs anyway.
 _WARM_PROGRESS_INTERVAL_SECONDS = 1.0
 """How often the warm session samples the live worker metrics for the progress hook. Snappier than the
 subprocess path's 2s so the reused warm worker's live card visibly advances while a level runs."""
+
+_WARM_READINESS_HEARTBEAT_SECONDS = 15.0
+"""How often the warm worker's (otherwise silent) wait for inference readiness logs a progress heartbeat
+with the per-process states, so a slow cold start or a wedged child is visible in the log rather than a
+minutes-long dark window."""
+
+_WARM_DEAD_WORKER_GRACE_SECONDS = 15.0
+"""How long every inference process may be dead (with no replacement coming up) before a draining level
+abandons early instead of burning its full timeout against a worker that can never make progress. The
+grace absorbs the normal recovery window, where a hung process is briefly dead before its replacement is
+spawned; a genuine wedge (nothing respawns) persists past it. Levels default to a 900s timeout, so without
+this a dead worker silently wastes ~15 minutes per level."""
 
 
 class WarmHarnessSession:
@@ -932,20 +979,60 @@ class WarmHarnessSession:
         Waiting for a process to merely *exist* (the historical behaviour) let the first level start
         while the worker was still doing its minute-plus cold start, so the level "ran" against a
         not-yet-ready worker. Gate on real readiness instead: a process the scheduler would hand a job
-        to (WAITING_FOR_JOB / PRELOADED). Best-effort: on timeout we log and proceed, leaving the
-        per-level timeout as the backstop.
+        to (WAITING_FOR_JOB / PRELOADED).
+
+        The wait is no longer silent. It logs when it begins, emits a heartbeat with the per-process
+        states every :data:`_WARM_READINESS_HEARTBEAT_SECONDS` (so a slow cold start or a wedge is
+        visible rather than a minutes-long dark window), logs the latency on success, and **fast-fails**
+        the moment every launched inference process has exited: continuing to wait the full timeout for a
+        child that has already died only hides the crash (whose trace is in ``logs/bridge_*_startup.log``).
+        On a genuine timeout it logs and proceeds, leaving the per-level timeout as the backstop.
         """
-        deadline = time.time() + timeout_seconds
+        manager = self._manager
+        if manager is None:
+            return
+
+        started = time.time()
+        deadline = started + timeout_seconds
+        expected = manager._process_map.num_inference_processes()
+        logger.info(
+            f"Warm worker: waiting up to {timeout_seconds:.0f}s for an inference process to become ready "
+            f"({expected} inference process(es) launched). Process states: {_summarize_worker_processes(manager)}",
+        )
+
+        next_heartbeat = started + _WARM_READINESS_HEARTBEAT_SECONDS
         while time.time() < deadline:
-            if (
-                self._manager is not None
-                and self._manager._process_map.get_first_available_inference_process() is not None
-            ):
+            if manager._process_map.get_first_available_inference_process() is not None:
+                logger.info(
+                    f"Warm worker: inference process ready after {time.time() - started:.1f}s "
+                    f"({_summarize_worker_processes(manager)})",
+                )
                 return
+
+            now = time.time()
+            inference_infos = [
+                info for info in manager._process_map.values() if info.process_type == HordeProcessType.INFERENCE
+            ]
+            if inference_infos and all(not info.mp_process.is_alive() for info in inference_infos):
+                logger.error(
+                    f"Warm worker: every inference process exited during startup after {now - started:.1f}s "
+                    f"without becoming ready ({_summarize_worker_processes(manager)}); abandoning the readiness "
+                    "wait. Inspect logs/bridge_*_startup.log and logs/bridge_*.faulthandler for the cause.",
+                )
+                return
+
+            if now >= next_heartbeat:
+                logger.info(
+                    f"Warm worker: still waiting for inference readiness ({now - started:.0f}s elapsed); "
+                    f"process states: {_summarize_worker_processes(manager)}",
+                )
+                next_heartbeat = now + _WARM_READINESS_HEARTBEAT_SECONDS
             await asyncio.sleep(0.1)
+
         logger.warning(
             f"Warm worker: no inference process became ready within {timeout_seconds:.0f}s; "
-            "starting levels anyway (the per-level timeout will catch a wedged worker)",
+            "starting levels anyway (the per-level timeout will catch a wedged worker). "
+            f"Process states: {_summarize_worker_processes(manager)}",
         )
 
     async def aclose(self) -> None:
@@ -974,6 +1061,7 @@ class WarmHarnessSession:
         """
         manager = self.manager
         time_started = time.time()
+        dead_since: float | None = None
         while True:
             await asyncio.sleep(0.1)
             completed = manager._job_tracker.total_num_completed_jobs - base_completed
@@ -986,6 +1074,24 @@ class WarmHarnessSession:
                 return True
             if time.time() - time_started > timeout_seconds:
                 return False
+
+            # Fast-fail a wedged worker: if every inference process has been dead for longer than the
+            # recovery grace, no further progress is possible, so abandon the level now (with a clear
+            # reason) instead of waiting out the full, often minutes-long, timeout.
+            now = time.time()
+            if _all_inference_processes_dead(manager):
+                if dead_since is None:
+                    dead_since = now
+                elif now - dead_since > _WARM_DEAD_WORKER_GRACE_SECONDS:
+                    logger.error(
+                        f"Warm level abandoned after {now - time_started:.0f}s: every inference process has been "
+                        f"dead for over {_WARM_DEAD_WORKER_GRACE_SECONDS:.0f}s with no replacement "
+                        f"({_summarize_worker_processes(manager)}); the worker cannot make progress. See "
+                        "logs/bridge_*_startup.log and logs/bridge_*.faulthandler for the cause.",
+                    )
+                    return False
+            else:
+                dead_since = None
 
     async def run_level(
         self,
@@ -1079,6 +1185,26 @@ class WarmHarnessSession:
 
         completed = manager._job_tracker.total_num_completed_jobs - base_completed
         faulted = manager._job_tracker.num_jobs_faulted - base_faulted
+
+        # A warm level that times out previously returned ``timed_out=True`` with no explanation, which is
+        # the warm-path equivalent of the subprocess path's "no useful logs". Collect the same diagnostics
+        # the full harness does (processes started? jobs popped? counts?) plus a per-process state snapshot,
+        # attach them to the result, and log them, so a 0/N timeout is self-explaining in the benchmark log.
+        diagnostics: list[str] = []
+        if timed_out:
+            elapsed = time.time() - time_started
+            diagnostics = _collect_run_diagnostics(
+                manager=manager,
+                num_jobs_expected=num_jobs_expected,
+                elapsed=elapsed,
+            )
+            diagnostics.append(f"worker process states at timeout: {_summarize_worker_processes(manager)}")
+            logger.warning(
+                f"Warm level timed out after {elapsed:.0f}s with {completed}/{num_jobs_expected} jobs completed "
+                f"({faulted} faulted, {num_forms_expected} alchemy forms expected); "
+                f"diagnostics: {'; '.join(diagnostics)}",
+            )
+
         return HarnessResult(
             num_jobs_expected=num_jobs_expected,
             num_jobs_completed=completed,
@@ -1086,6 +1212,7 @@ class WarmHarnessSession:
             elapsed_seconds=time.time() - time_started,
             timed_out=timed_out,
             exit_reason="timed_out" if timed_out else "completed",
+            diagnostics=diagnostics,
             metrics=manager.get_run_metrics_snapshot(),
             num_alchemy_forms_expected=num_forms_expected,
             num_alchemy_forms_completed=manager._alchemy_coordinator.num_canned_forms_completed,

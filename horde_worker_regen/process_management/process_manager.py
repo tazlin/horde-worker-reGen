@@ -37,6 +37,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     SingleWorkerDetailsResponse,
     UserDetailsResponse,
 )
+from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 from pydantic import ValidationError
 
@@ -684,6 +685,15 @@ class HordeWorkerProcessManager:
         self._recovery_supervisor = RecoverySupervisor()
         self._limp_by_active = False
 
+        # Orphaned-in-progress-job watchdog: a job left INFERENCE_IN_PROGRESS that no live inference
+        # slot owns will never produce a result, so it wedges the head of the queue forever unless
+        # something punts it. `_orphan_in_progress_since` records when each such job was first seen
+        # un-owned (so a brief dispatch race is ridden out before punting); `_orphan_punt_history`
+        # records recent punts so a recurring orphan storm escalates into the save-our-ship wedge path
+        # (soft reset + limp-by) rather than silently punting jobs forever at full settings.
+        self._orphan_in_progress_since: dict[GenerationID, float] = {}
+        self._orphan_punt_history: list[float] = []
+
         self._job_submitter = JobSubmitter(
             state=self._state,
             job_tracker=self._job_tracker,
@@ -1086,6 +1096,10 @@ class HordeWorkerProcessManager:
                 await self._sleep(self._loop_interval / 2)
             self._process_lifecycle._replace_all_safety_process()
 
+            # Backstop the per-slot recovery: punt any job left in-progress with no owning live slot
+            # before it can wedge the head of the queue (the 2026-06-18 overnight wedge).
+            self._reconcile_orphaned_in_progress_jobs()
+
             # Save-our-ship: above the per-slot recovery, escalate a worker that is wedged as a whole
             # (no live process for pending work) to a soft reset and finally to giving up cleanly.
             self._run_recovery_supervisor()
@@ -1315,16 +1329,108 @@ class HordeWorkerProcessManager:
         """
         return self._process_lifecycle.safety_pool_failing and not self._is_safety_pool_ready()
 
-    def _assess_wedge(self) -> bool:
-        """Whether the worker structurally cannot make progress (the save-our-ship trigger).
+    _ORPHAN_IN_PROGRESS_GRACE_SECONDS = 30.0
+    """How long a job may sit INFERENCE_IN_PROGRESS with no owning live slot before it is punted.
 
-        Keyed on the two crash-loop signals, not on transient capacity gaps: every inference slot has
-        been quarantined, or the safety pool is crash-looping with no healthy process. A merely slow,
-        busy, replacing, or model-loading worker trips neither, so a healthy worker is never wedged.
+    Long enough to ride out the brief window between a job being marked in-progress and its owning
+    slot's reference being recorded (and any in-flight result still on the wire), short enough that a
+    truly orphaned job drains in well under a minute instead of wedging the queue head indefinitely."""
+
+    _ORPHAN_PUNT_WINDOW_SECONDS = 300.0
+    """Sliding window over which repeated orphan punts are counted toward the wedge escalation."""
+
+    _ORPHAN_PUNT_WEDGE_THRESHOLD = 3
+    """Orphan punts within the window that escalate to the save-our-ship wedge path (soft reset/limp-by)."""
+
+    def _inference_slot_owns_job(self, job_id: GenerationID) -> bool:
+        """Whether some live inference slot is currently working on (references) the given job."""
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if not process_info.is_process_alive():
+                continue
+            referenced = process_info.last_job_referenced
+            if referenced is not None and referenced.id_ == job_id:
+                return True
+        return False
+
+    def _reconcile_orphaned_in_progress_jobs(self) -> None:
+        """Punt jobs stuck INFERENCE_IN_PROGRESS that no live inference slot owns.
+
+        Per-slot recovery faults the job of the slot it replaces, but a mis-association, a lost result,
+        or a requeue race can still leave a *different* job marked in-progress with no owning slot. No
+        result will ever arrive for it, so it pins the head of the queue forever (the 2026-06-18
+        overnight wedge: one orphaned job stalled all image inference for 6.5h). This watchdog is the
+        backstop: an in-progress job that no live slot has referenced for ``_ORPHAN_IN_PROGRESS_GRACE``
+        seconds is faulted (retryable, so it requeues or, once attempts are exhausted, is reported
+        faulted and drains). Recurring orphans feed the wedge escalation so the worker limps by.
+        """
+        now = time.time()
+        in_progress = self._job_tracker.jobs_in_progress
+        live_ids = {job.id_ for job in in_progress if job.id_ is not None and self._inference_slot_owns_job(job.id_)}
+
+        # Forget jobs that are owned again or no longer in progress, so the grace clock only runs while
+        # a job is continuously orphaned.
+        current_ids = {job.id_ for job in in_progress if job.id_ is not None}
+        for job_id in list(self._orphan_in_progress_since):
+            if job_id not in current_ids or job_id in live_ids:
+                del self._orphan_in_progress_since[job_id]
+
+        for job in in_progress:
+            job_id = job.id_
+            if job_id is None or job_id in live_ids:
+                continue
+            first_seen = self._orphan_in_progress_since.setdefault(job_id, now)
+            if (now - first_seen) < self._ORPHAN_IN_PROGRESS_GRACE_SECONDS:
+                continue
+
+            logger.error(
+                f"Job {job_id} has been in progress with no live inference slot for "
+                f"{now - first_seen:.0f}s; punting it so the queue can drain (orphaned-job watchdog).",
+            )
+            self._action_ledger.record(
+                LedgerEventType.INFERENCE_FAULTED,
+                job_id=str(job_id),
+                reason="orphaned in-progress job (no owning live inference slot)",
+                detail={"stuck_seconds": round(now - first_seen, 1)},
+            )
+            self._job_tracker.handle_job_fault_now(
+                faulted_job=job,
+                process_timeout=self.bridge_data.process_timeout,
+                retryable=True,
+            )
+            del self._orphan_in_progress_since[job_id]
+            self._orphan_punt_history.append(now)
+
+    def _orphan_wedge_active(self) -> bool:
+        """Whether orphaned-job punts have recurred often enough to count as a worker-level wedge.
+
+        A single orphan is handled by punting it; a *storm* of them means something upstream keeps
+        stranding jobs (a flaky GPU that hangs each inference, say), which the punt alone does not fix.
+        Surfacing it as a wedge lets the recovery supervisor soft-reset the pools and limp by at
+        reduced concurrency, then restore settings once the storm subsides.
+        """
+        now = time.time()
+        self._orphan_punt_history = [
+            t for t in self._orphan_punt_history if (now - t) <= self._ORPHAN_PUNT_WINDOW_SECONDS
+        ]
+        return len(self._orphan_punt_history) >= self._ORPHAN_PUNT_WEDGE_THRESHOLD
+
+    def _assess_wedge(self) -> bool:
+        """Whether the worker structurally cannot make progress (the SOS/save-our-ship trigger).
+
+        Keyed on the crash-loop signals (every inference slot quarantined, or the safety pool
+        crash-looping with no healthy process) plus a recurring orphaned-job storm, not on transient
+        capacity gaps. A merely slow, busy, replacing, or model-loading worker trips none of these, so
+        a healthy worker is never wedged.
         """
         if self._state.shutting_down:
             return False
-        return self._is_inference_pool_unrecoverable() or self._is_safety_pool_unrecoverable()
+        return (
+            self._is_inference_pool_unrecoverable()
+            or self._is_safety_pool_unrecoverable()
+            or self._orphan_wedge_active()
+        )
 
     def _run_recovery_supervisor(self) -> None:
         """Drive the save-our-ship escalation one tick and perform any action it returns."""

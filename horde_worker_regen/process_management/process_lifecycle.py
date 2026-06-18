@@ -913,23 +913,19 @@ class ProcessLifecycleManager:
         """
         bridge_data = self._runtime_config.bridge_data
         logger.debug(f"Replacing {process_info}")
-        job_to_remove = None
-        for process in self._process_map.values():
-            if (
-                process.last_job_referenced is not None
-                and process.last_job_referenced in self._job_tracker.jobs_lookup
-            ):
-                job_to_remove = process.last_job_referenced
-                break
+        # Fault the job *this* process was working on. It must be taken from process_info, never by
+        # scanning the whole map for "the first process holding any in-flight job": a scan could fault
+        # an unrelated (often healthy) process's job and can leave this dying process's actual job stuck in
+        # INFERENCE_IN_PROGRESS with no owner, wedging the head of the queue indefinitely.
+        # The orphaned-job watchdog in the manager is the backstop for any in-progress job that still
+        # ends up without an owner; this is the primary, correct path.
+        job_to_remove = process_info.last_job_referenced
+        if job_to_remove is not None and job_to_remove not in self._job_tracker.jobs_lookup:
+            job_to_remove = None
 
         self._release_held_primitives(process_info)
 
-        if (
-            process_info.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL
-            and process_info.last_job_referenced is not None
-            and process_info.last_job_referenced in self._job_tracker.jobs_lookup
-        ):
-            job_to_remove = process_info.last_job_referenced
+        if process_info.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL and job_to_remove is not None:
             logger.error(
                 f"Job {job_to_remove.id_ or job_to_remove.ids} was in aux model preload on process "
                 f"{process_info.process_id} but it failed. Removing.",

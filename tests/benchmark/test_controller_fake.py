@@ -173,6 +173,46 @@ def test_warm_mode_runs_fixed_levels_without_subprocesses(tmp_path: Path, monkey
     assert (tmp_path / "report.json").exists()
 
 
+def test_warm_mode_streams_live_progress(tmp_path: Path) -> None:
+    """A warm-mode level republishes the reused worker's live metrics as LevelProgress while it runs.
+
+    This is the warm-path equivalent of the subprocess path's live-file streaming: without it the live
+    card sits frozen between LevelStarted and LevelFinished for the whole level.
+    """
+    from horde_worker_regen.benchmark.progress_channel import (
+        BenchmarkProgressEvent,
+        LevelProgress,
+        ProgressSink,
+    )
+
+    class _RecordingSink(ProgressSink):
+        def __init__(self) -> None:
+            self.events: list[BenchmarkProgressEvent] = []
+
+        def emit(self, event: BenchmarkProgressEvent) -> None:
+            self.events.append(event)
+
+    # More jobs per level => the level runs long enough for at least one live sample to land.
+    ladder = build_default_ladder(
+        LadderOptions(
+            tiers=["sd15"],
+            jobs_per_level=6,
+            include_concurrency=False,
+            include_features=False,
+            include_alchemy=False,
+        ),
+    )
+    sink = _RecordingSink()
+    BenchmarkController(
+        ladder, tmp_path, process_mode="fake", warm=True, validate=False, progress_sink=sink
+    ).run()
+
+    progress = [event for event in sink.events if isinstance(event, LevelProgress)]
+    assert progress, "warm mode emitted no LevelProgress events; the live card would never update"
+    # The streamed metrics advance: at least one sample reports jobs actually completing.
+    assert any(event.jobs_completed > 0 for event in progress)
+
+
 @pytest.mark.e2e
 def test_validation_soak_runs_after_ramp(tmp_path: Path) -> None:
     """After the ramp, a stage-V soak runs the synthesized config under sustained generated load."""

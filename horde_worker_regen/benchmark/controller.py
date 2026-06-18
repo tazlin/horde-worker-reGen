@@ -987,7 +987,18 @@ class BenchmarkController:
                 result.model_dump_json(indent=2),  # type: ignore[attr-defined]
                 encoding="utf-8",
             )
-        return self._evaluate_result(level, result, machine, log_tail=[])  # type: ignore[arg-type]
+
+        # The warm path has no per-level subprocess log to tail, so a timed-out level would otherwise
+        # reach the report with an empty log_tail and an unexplained FAILED. Surface the harness's
+        # diagnostics (process states, "no jobs popped", etc.) into the report so report.md and the
+        # controller log carry the reason a 0-job level stalled.
+        diagnostics = list(getattr(harness_result, "diagnostics", []) or [])
+        if diagnostics:
+            logger.warning(f"Warm level {level.id} diagnostics: {'; '.join(diagnostics)}")
+        report = self._evaluate_result(level, result, machine, log_tail=diagnostics)  # type: ignore[arg-type]
+        if diagnostics:
+            report.reasons = [*report.reasons, *(f"diagnostic: {entry}" for entry in diagnostics)]
+        return report
 
     def _run_level(self, level: RampLevel, machine: MachineInfo) -> LevelReport:
         """Run one level and evaluate its outcome.
@@ -1116,9 +1127,7 @@ class BenchmarkController:
         live = LevelLiveSnapshot.from_run_metrics(snapshot, elapsed_seconds)
         return self._emit_live_snapshot(level, live, last_signature)
 
-    def _emit_live_snapshot(
-        self, level: RampLevel, live: LevelLiveSnapshot, last_signature: str | None
-    ) -> str | None:
+    def _emit_live_snapshot(self, level: RampLevel, live: LevelLiveSnapshot, last_signature: str | None) -> str | None:
         """Emit a :class:`LevelProgress` for ``live`` when it differs from ``last_signature``; return its signature."""
         signature = live.model_dump_json()
         if signature == last_signature:

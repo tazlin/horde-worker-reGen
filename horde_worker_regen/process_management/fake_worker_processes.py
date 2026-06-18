@@ -32,6 +32,7 @@ from loguru import logger
 
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management._dummy_images import make_dummy_png_base64
+from horde_worker_regen.process_management.child_crash_capture import enable_child_faulthandler, write_startup_crash
 from horde_worker_regen.process_management.debug_attach import maybe_wait_for_process_debugger
 from horde_worker_regen.process_management.fault_injection import (
     FAULT_INFO_PREFIX,
@@ -617,20 +618,28 @@ def start_fake_inference_process(
     corrupt message), letting harnesses exercise the recovery paths. Inject either with
     ``functools.partial`` (partials of module-level functions stay picklable under spawn).
     """
+    enable_child_faulthandler(f"fake_inference_{process_id}")
     logger.remove()
     maybe_wait_for_process_debugger(process_id, "fake inference")
-    worker_process = FakeInferenceProcess(
-        process_id=process_id,
-        process_message_queue=process_message_queue,
-        pipe_connection=pipe_connection,
-        inference_semaphore=inference_semaphore,
-        disk_lock=disk_lock,
-        process_launch_identifier=process_launch_identifier,
-        job_delay_seconds=dry_run_inference_delay,
-        fail_every_n=fail_every_n,
-        fault_profile=fault_profile,
-    )
-    worker_process.main_loop()
+    try:
+        worker_process = FakeInferenceProcess(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            inference_semaphore=inference_semaphore,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+            job_delay_seconds=dry_run_inference_delay,
+            fail_every_n=fail_every_n,
+            fault_profile=fault_profile,
+        )
+        worker_process.main_loop()
+    except Exception as e:
+        # Mirror the real entry points: a fake child that dies during startup runs with no loguru sink
+        # (logger.remove() above), so without this its traceback goes nowhere and the warm worker just
+        # wedges until the per-level timeout with nothing in logs/. See child_crash_capture.
+        write_startup_crash(f"fake_inference_{process_id}", e)
+        raise
 
 
 def start_fake_safety_process(
@@ -654,17 +663,24 @@ def start_fake_safety_process(
     accepted and ignored. ``fault_profile`` scripts misbehaviour on the safety-eval path;
     inject it with ``functools.partial`` (partials of module-level functions stay picklable).
     """
+    enable_child_faulthandler(f"fake_safety_{process_id}")
     logger.remove()
     maybe_wait_for_process_debugger(process_id, "fake safety")
-    worker_process = FakeSafetyProcess(
-        process_id=process_id,
-        process_message_queue=process_message_queue,
-        pipe_connection=pipe_connection,
-        disk_lock=disk_lock,
-        process_launch_identifier=process_launch_identifier,
-        fault_profile=fault_profile,
-    )
-    worker_process.main_loop()
+    try:
+        worker_process = FakeSafetyProcess(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+            fault_profile=fault_profile,
+        )
+        worker_process.main_loop()
+    except Exception as e:
+        # See start_fake_inference_process: leave a discoverable trace for a startup death that would
+        # otherwise be silent (logger.remove() drops all sinks).
+        write_startup_crash(f"fake_safety_{process_id}", e)
+        raise
 
 
 class FakeDownloadProcess(HordeProcess):
