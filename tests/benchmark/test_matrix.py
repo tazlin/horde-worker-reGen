@@ -191,7 +191,12 @@ class TestConservativeRecommendation:
         soak_level = build_validation_level(suggestion_input, BenchTier.SD15, soak_seconds=60.0)
         reports = [
             _baseline_report(BenchTier.SD15, peak_vram_mb=3000),
-            LevelReport(level=soak_level, outcome=LevelOutcome.FAILED, stats=LevelStats()),
+            LevelReport(
+                level=soak_level,
+                outcome=LevelOutcome.FAILED,
+                stats=LevelStats(num_jobs_completed=20),
+                findings=[Finding(kind=FindingKind.PROCESS_RECOVERY, level_id=soak_level.id, evidence="crash")],
+            ),
         ]
         suggestion = synthesize_bridge_data(reports, total_vram_mb=16000)
         assert BENCH_TIER_MODELS[BenchTier.SD15] not in suggestion.models_to_load
