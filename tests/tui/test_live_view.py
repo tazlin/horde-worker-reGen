@@ -90,3 +90,16 @@ def test_fresh_snapshot_has_no_banner() -> None:
     view.update_snapshot(_snapshot(), snapshot_age=0.5)
     text = _render(body.renderable)
     assert "old" not in text
+
+
+def test_aux_download_heartbeat_is_rendered_as_expected_quiet_work() -> None:
+    """AUX downloads can block without child heartbeats, so the panel should not imply a dead process."""
+    text = LiveView._heartbeat_text(12.0, True, "DOWNLOADING_AUX_MODEL").plain
+    assert text == "working quietly for 12.0s"
+
+
+def test_sampling_stale_heartbeat_still_warns() -> None:
+    """Sampling silence remains suspicious because INFERENCE_STEP heartbeats are the liveness signal."""
+    text = LiveView._heartbeat_text(16.0, True, "INFERENCE_STARTING")
+    assert text.plain == "16.0s ago"
+    assert text.style == "red"

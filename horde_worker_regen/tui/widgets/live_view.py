@@ -33,6 +33,15 @@ _ACTIVE_STATES = frozenset(
 # job's numbers, so the panel renders the progress row only while the process is genuinely sampling.
 _SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "INFERENCE_POST_PROCESSING", "ALCHEMY_STARTING"})
 _FAILED_STATES = frozenset({"INFERENCE_FAILED", "ALCHEMY_FAILED", "SAFETY_FAILED", "PROCESS_ENDED"})
+_EXPECTED_QUIET_STATES = frozenset(
+    {
+        "PROCESS_STARTING",
+        "PRELOADING_MODEL",
+        "DOWNLOADING_MODEL",
+        "DOWNLOADING_AUX_MODEL",
+    },
+)
+"""States whose child-side work can block without emitting per-process heartbeats."""
 
 _STALE_AFTER_SECONDS = 4.0
 """Beyond this snapshot age the live view is no longer trustworthy; it dims and flags the panels."""
@@ -130,7 +139,7 @@ class LiveView(VerticalScroll):
             "RAM",
             f"{human_mb(process.ram_usage_bytes / 1024 / 1024)}   (peak {human_mb(process.ram_used_high_water_mb)})",
         )
-        body.add_row("Heartbeat", self._heartbeat_text(heartbeat_age, process.is_alive))
+        body.add_row("Heartbeat", self._heartbeat_text(heartbeat_age, process.is_alive, process.last_process_state))
         # A running tally so a healthy-but-quiet process (the safety process especially, whose checks
         # are each over in milliseconds) visibly does work rather than looking parked.
         work_label = "Checked" if process.process_type == "SAFETY" else "Completed"
@@ -154,12 +163,14 @@ class LiveView(VerticalScroll):
         return "yellow"
 
     @staticmethod
-    def _heartbeat_text(age: float | None, is_alive: bool) -> Text:
+    def _heartbeat_text(age: float | None, is_alive: bool, state: str) -> Text:
         """Render heartbeat freshness, coloured by staleness."""
         if not is_alive:
             return Text("process not alive", style="bold red")
         if age is None:
             return Text("-", style="grey62")
+        if state in _EXPECTED_QUIET_STATES:
+            return Text(f"working quietly for {age:.1f}s", style="grey70" if age < 30 else "yellow")
         if age < 5:
             colour = "green"
         elif age < 15:
