@@ -12,6 +12,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 import time
 from pathlib import Path
@@ -407,6 +408,28 @@ def _run_download(args: argparse.Namespace) -> int:
     return 0
 
 
+def _setup_controller_file_logging(out_dir: Path) -> None:
+    """Give the benchmark controller process its own on-disk log in the run directory.
+
+    The controller's loguru otherwise goes only to its stderr: under the TUI that is captured to the
+    run's ``console.log``, but a CLI run leaves it on the terminal only, so nothing of the controller's
+    own diagnostics (level lifecycle, abort reasons, "level died without a result", and -- in warm mode,
+    where the harness runs in-process here -- the entire warm session) survives on disk. This writes
+    those to ``controller.log`` for both paths. Writes are synchronous so a controller crash keeps its
+    final lines. It also points the operator at the per-process child logs, which hordelib writes to
+    ``logs/`` relative to the working directory (``bridge_*``/``stdout_*``/``stderr_*``/``trace_*``),
+    not into the run directory, so a reader of the run dir knows where to look next.
+    """
+    with contextlib.suppress(Exception):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        logger.add(out_dir / "controller.log", level="DEBUG", backtrace=True, diagnose=True)
+        logger.info(f"Benchmark controller log: {(out_dir / 'controller.log').resolve()}")
+        logger.info(
+            "Per-process worker (subprocess/grand-subprocess) logs are written by hordelib to "
+            f"{Path('logs').resolve()} (bridge_*.log, stdout_*/stderr_*/trace_*, *.faulthandler).",
+        )
+
+
 def _run_ramp(args: argparse.Namespace) -> int:
     from horde_worker_regen.benchmark.progress_channel import (
         PROGRESS_FILENAME,
@@ -421,6 +444,7 @@ def _run_ramp(args: argparse.Namespace) -> int:
         return 2
 
     out_dir: Path = args.out if args.out is not None else Path("benchmark_results") / time.strftime("%Y%m%d-%H%M%S")
+    _setup_controller_file_logging(out_dir)
 
     # Tee progress to a durable JSONL log (for the TUI / `monitor` to tail) and a live console view.
     # The sink is created up front, before the slow hardware-detection and import phase below, so the
@@ -461,6 +485,10 @@ def _run_ramp(args: argparse.Namespace) -> int:
     )
     try:
         report = controller.run()
+    except Exception:
+        # With controller.log now installed, surface a controller-process crash to disk (not just stderr).
+        logger.exception("The benchmark controller crashed.")
+        raise
     finally:
         progress_sink.close()
     _record_benchmark_in_app_state(report, out_dir)
