@@ -12,9 +12,11 @@ import asyncio
 import contextlib
 import multiprocessing
 import os
+import sys
 import time
 from pathlib import Path
 
+from loguru import logger
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.css.query import NoMatches
@@ -42,6 +44,7 @@ from horde_worker_regen.tui.benchmark_launcher import (
 )
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, derive
+from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.update_check import check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
@@ -586,7 +589,41 @@ def main(argv: list[str] | None = None) -> None:
     multiprocessing.freeze_support()
     args = _parse_args(argv)
 
+    # Give the supervisor process its own on-disk log before the worker is launched, so worker
+    # launch/restart/crash diagnostics survive even when no worker runs (the worker writes its own
+    # bridge.log, but only once it starts). quiet_console: this is a full-screen Textual app, so the
+    # default stderr sink would corrupt the display.
+    setup_supervisor_file_logging("tui", quiet_console=True)
+
+    # Record an unhandled crash of the TUI process itself to bridge_tui.log. Textual lets such an
+    # exception propagate out here and its traceback would otherwise reach only stderr, which a
+    # double-click launch or the alternate-screen buffer discards, leaving no on-disk trace.
+    try:
+        _run_app(args)
+    except Exception:
+        logger.exception("The worker TUI exited with an unhandled exception.")
+        raise
+
+
+def _run_app(args: argparse.Namespace) -> None:
+    """Build the supervisor and run the Textual app (the body of :func:`main`, wrapped for logging)."""
     supervisor = _build_supervisor(args)
+
+    from multiprocessing import resource_tracker
+
+    # While the Textual app is running, it replaces sys.stdout / sys.stderr with its own capture/redirect objects so
+    # library writes don't corrupt the rendered screen. Those replacement stream objects return -1 (or otherwise
+    # don't map to a real OS fd) from .fileno() rather than raising, so the except Exception guard doesn't catch
+    # it. The -1 sails through into fork_exec, which rejects it and the app crashes on any attempt to spawn a process
+    # (e.g. the worker or benchmark subprocesses). By calling ensure_running() here, the resource tracker starts with
+    # the original sys.stdout/sys.stderr and their real file descriptors. This eager start is not sufficient on its
+    # own: if the tracker later dies, ensure_running() relaunches it under the redirected streams. The actual
+    # guarantee is WorkerSupervisor._spawn restoring the real streams around every spawn; see
+    # worker_launcher._real_std_streams_for_spawn.
+
+    # Only works on Linux, so let's make sure this is a linux system
+    if sys.platform.startswith("linux"):
+        resource_tracker.ensure_running()
 
     app = HordeWorkerTUI(
         supervisor,

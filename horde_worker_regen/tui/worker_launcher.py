@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import io
 import multiprocessing
+import os
+import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
+from typing import TextIO
 
 from loguru import logger
 
@@ -64,6 +68,52 @@ GRACEFUL_STOP_TIMEOUT_SECONDS = 95.0
 Kept above the worker's own force-kill backstop (``shutdown_manager.MAX_SHUTDOWN_GRACE_SECONDS``, 90s)
 so the worker always exits on its own first; ``terminate()`` then becomes a true last resort instead
 of firing mid-drain, which previously re-orphaned in-flight jobs."""
+
+
+def _stream_has_real_fd(stream: TextIO | None) -> bool:
+    """Whether ``stream`` maps to a usable OS file descriptor.
+
+    Textual's screen-capture replacements for ``sys.stdout``/``sys.stderr`` return -1 from ``fileno()``
+    (rather than raising), so a plain truthiness or ``hasattr`` check would accept them; require a real,
+    non-negative descriptor instead.
+    """
+    if stream is None:
+        return False
+    try:
+        return stream.fileno() >= 0
+    except (OSError, ValueError, io.UnsupportedOperation):
+        return False
+
+
+@contextlib.contextmanager
+def _real_std_streams_for_spawn() -> Iterator[None]:
+    """Restore the interpreter's real ``stdout``/``stderr`` for the duration of a child-process spawn.
+
+    On POSIX, multiprocessing's resource-tracker process is (re)launched lazily, and
+    ``resource_tracker.ensure_running`` passes ``sys.stderr.fileno()`` to it. While the Textual app is
+    running it swaps in capture streams whose ``fileno()`` is -1, which ``fork_exec`` rejects with
+    ``ValueError: bad value(s) in fds_to_keep``. A one-time warm-up at startup is not enough: if the
+    tracker dies mid-session, ``ensure_running`` relaunches it on the next spawn, again under the
+    redirected streams. Pointing ``sys.stdout``/``sys.stderr`` back at the originals (which keep their
+    real descriptors) just for the spawn makes that handshake succeed every time.
+
+    A no-op on Windows, where multiprocessing never spawns a resource-tracker process.
+    """
+    if os.name != "posix":
+        yield
+        return
+
+    saved_stdout, saved_stderr = sys.stdout, sys.stderr
+    # __stdout__/__stderr__ can be None or closed under pythonw/detached runs; leave such a stream as-is
+    # since the original is no better than the current one.
+    if _stream_has_real_fd(sys.__stdout__):
+        sys.stdout = sys.__stdout__
+    if _stream_has_real_fd(sys.__stderr__):
+        sys.stderr = sys.__stderr__
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = saved_stdout, saved_stderr
 
 
 def _target_for_mode(mode: WorkerProcessMode) -> Callable[..., None]:
@@ -172,7 +222,10 @@ class WorkerSupervisor:
             name=f"horde-worker-{self._mode.value}",
             daemon=False,
         )
-        process.start()
+        # Restore the real std streams across the spawn so a lazy resource-tracker (re)launch under
+        # Textual's redirected streams does not crash with "bad value(s) in fds_to_keep" (POSIX only).
+        with _real_std_streams_for_spawn():
+            process.start()
         # The parent never uses the child's end; closing it lets us detect child exit via EOF.
         child_connection.close()
 

@@ -30,6 +30,7 @@ from loguru import logger
 from horde_worker_regen.process_management.supervisor_channel import SupervisorControlMessage
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui import socket_protocol as sp
+from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupervisor
 
 _ACCEPT_TIMEOUT_SECONDS = 0.5
@@ -286,6 +287,10 @@ def main(argv: list[str] | None = None) -> None:
     """Console-script entry point (``horde-worker-host``): own the worker and serve it over a socket."""
     multiprocessing.freeze_support()
     args = _parse_args(argv)
+
+    # The host owns a worker the same way the TUI does, so give it its own on-disk log for launch and
+    # restart diagnostics. Its console output is still useful to the web launcher, so keep stderr.
+    setup_supervisor_file_logging("host")
 
     options = WorkerLaunchOptions(
         load_config_from_env_vars=args.load_config_from_env_vars,
