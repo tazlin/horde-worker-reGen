@@ -107,6 +107,15 @@ def required_capability(form: str) -> WorkerCapability:
     return WorkerCapability.ALCHEMY_CLIP
 
 
+DEFAULT_ALCHEMY_FORMS: tuple[str, ...] = ("caption", "nsfw", "interrogation", "post-process")
+"""Forms an alchemist offers when ``bridge_data.forms`` is left unset (an empty list means "all").
+
+The SDK's ``default_forms`` validator does not fire for the default empty list, so both the dispatch
+path and the dashboard projection fall back to this set. The yaml/legacy spelling is ``post-process``;
+the SDK enum value is ``post_process``.
+"""
+
+
 def expand_offered_forms(bridge_data: reGenBridgeData) -> list[str]:
     """Expand the bridge-data `forms` config into the individual form names the API expects.
 
@@ -114,10 +123,7 @@ def expand_offered_forms(bridge_data: reGenBridgeData) -> list[str]:
     mirroring the legacy alchemist. Caption requires the explicit BLIP opt-in.
     """
     offered: list[str] = []
-    # An unset `forms` means "all of them" (the SDK's default_forms validator doesn't fire
-    # for the default empty list). The yaml/legacy spelling is "post-process"; the SDK enum
-    # value is "post_process".
-    configured_forms = bridge_data.forms or ["caption", "nsfw", "interrogation", "post-process"]
+    configured_forms = bridge_data.forms or list(DEFAULT_ALCHEMY_FORMS)
     configured = {"post-process" if str(form) == "post_process" else str(form) for form in configured_forms}
 
     if "caption" in configured and bridge_data.alchemy_caption_enabled:
@@ -249,6 +255,10 @@ class AlchemyCoordinator:
         self._canned_alchemy_source = canned_alchemy_source
         self.num_canned_forms_completed = 0
         self.num_canned_forms_faulted = 0
+        self.num_forms_submitted = 0
+        """Cumulative forms successfully submitted to the API (or recorded in canned mode) this session."""
+        self.num_forms_faulted = 0
+        """Cumulative forms that permanently faulted (stale/invalid/unrecoverable) this session."""
 
         self._pending_forms = deque()
         self._in_flight = {}
@@ -263,6 +273,21 @@ class AlchemyCoordinator:
         self._pop_frequency = 4.0
         self._error_pop_frequency = 15.0
         self._loop_interval = 1.0
+
+    @property
+    def num_forms_pending(self) -> int:
+        """Forms popped from the API but not yet dispatched to a child process."""
+        return len(self._pending_forms)
+
+    @property
+    def num_forms_in_flight(self) -> int:
+        """Forms dispatched to a child process, awaiting a result message."""
+        return len(self._in_flight)
+
+    @property
+    def num_forms_awaiting_submit(self) -> int:
+        """Forms with a result, waiting for API submission."""
+        return len(self._pending_submits)
 
     def set_canned_alchemy_source(self, source: CannedAlchemySource | None) -> None:
         """Swap the canned alchemy source at runtime and reset its per-level counters."""
@@ -608,6 +633,7 @@ class AlchemyCoordinator:
             if "does not exist" in message_lower or "already submitted" in message_lower:
                 logger.warning(f"Alchemy form {submit.form_id} stale on submit: {response.message}")
                 submit.fault()
+                self.num_forms_faulted += 1
                 return
             logger.error(f"Failed to submit alchemy form (API Error) {submit.retry_attempts_string}: {response}")
             submit.retry()
@@ -621,12 +647,14 @@ class AlchemyCoordinator:
         self._state.kudos_generated_this_session += response.reward
         self._state.kudos_events.append((time.time(), response.reward))
         submit.succeed(int(response.reward))
+        self.num_forms_submitted += 1
 
     def _canned_submit_alchemy(self) -> None:
         """Record a completed form locally instead of submitting to the API."""
         submit = self._pending_submits.popleft()
         if submit.result_message.state == GENERATION_STATE.ok:
             self.num_canned_forms_completed += 1
+            self.num_forms_submitted += 1
             submit.succeed(0)
             time_taken = round(time.time() - submit.time_popped, 2)
             logger.opt(ansi=True).success(
@@ -635,6 +663,7 @@ class AlchemyCoordinator:
             )
         else:
             self.num_canned_forms_faulted += 1
+            self.num_forms_faulted += 1
             submit.fault()
             logger.error(f"Canned alchemy form {submit.form_id} faulted")
 

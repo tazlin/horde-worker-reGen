@@ -2,6 +2,34 @@
 
 from __future__ import annotations
 
+STATE_LABELS: dict[str, str] = {
+    "PROCESS_STARTING": "Starting",
+    "WAITING_FOR_JOB": "Idle",
+    "PRELOADING_MODEL": "Preloading",
+    "PRELOADED_MODEL": "Preloaded",
+    "DOWNLOADING_MODEL": "Downloading",
+    "DOWNLOADING_AUX_MODEL": "Fetching aux",
+    "INFERENCE_STARTING": "Sampling",
+    "INFERENCE_POST_PROCESSING": "Post-proc",
+    "INFERENCE_COMPLETE": "Inference done",
+    "INFERENCE_FAILED": "Failed",
+    "JOB_RECEIVED": "Job received",
+    "ALCHEMY_STARTING": "Alchemy",
+    "ALCHEMY_COMPLETE": "Alchemy done",
+    "ALCHEMY_FAILED": "Alchemy failed",
+    "SAFETY_STARTING": "Safety check",
+    "EVALUATING_SAFETY": "Safety check",
+    "SAFETY_FAILED": "Safety failed",
+    "PROCESS_ENDING": "Ending",
+    "PROCESS_ENDED": "Ended",
+}
+"""Human-readable labels for ``HordeProcessState`` names carried in a snapshot."""
+
+
+def label_state(state: str) -> str:
+    """Return a human-readable label for a process-state name, title-casing unknowns."""
+    return STATE_LABELS.get(state, state.replace("_", " ").title())
+
 
 def human_bytes(num_bytes: float | None) -> str:
     """Render a byte count as a human-readable string (e.g. ``12.3 GB``)."""

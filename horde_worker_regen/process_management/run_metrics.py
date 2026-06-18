@@ -13,7 +13,7 @@ import time
 from typing import TYPE_CHECKING
 
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from horde_worker_regen.process_management.messages import (
     HordeDownloadMetricsMessage,
@@ -47,6 +47,16 @@ class JobMetricsRecord(BaseModel):
     """Safety-check queue entry to submit-ready."""
     phase_metrics: JobPhaseMetrics | None = None
     """Model-load/sampling/memory metrics reported by the child process, when correlated."""
+
+    model_name: str | None = None
+    steps: int | None = None
+    width: int | None = None
+    height: int | None = None
+    loras_count: int = 0
+    tis_count: int = 0
+    control_type: str | None = None
+    post_processing: list[str] = Field(default_factory=list)
+    hires_fix: bool = False
 
 
 class ProcessCrashRecord(BaseModel):
@@ -171,6 +181,11 @@ class WorkerRunMetrics:
             job_safety_histogram.record(safety)
 
         job_id = str(tracked.job_id)
+        api_job = tracked.sdk_api_job_info
+        model_name: str | None = str(api_job.model) if api_job.model is not None else None
+        payload = api_job.payload
+        control_type: str | None = str(payload.control_type) if payload.control_type else None
+
         self._jobs.append(
             JobMetricsRecord(
                 job_id=job_id,
@@ -181,6 +196,15 @@ class WorkerRunMetrics:
                 e2e_seconds=e2e,
                 safety_seconds=safety,
                 phase_metrics=self._phase_metrics_by_job.pop(job_id, None),
+                model_name=model_name,
+                steps=payload.ddim_steps,
+                width=payload.width,
+                height=payload.height,
+                loras_count=len(payload.loras) if payload.loras else 0,
+                tis_count=len(payload.tis) if payload.tis else 0,
+                control_type=control_type,
+                post_processing=[str(post_proc_step) for post_proc_step in payload.post_processing],
+                hires_fix=payload.hires_fix,
             ),
         )
 

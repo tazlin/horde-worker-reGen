@@ -52,20 +52,40 @@ def test_snapshot_json_roundtrip() -> None:
     assert restored.num_jobs_submitted == 7
 
 
-def test_recent_job_record_from_metrics_like() -> None:
-    """RecentJobRecord projects the lean fields from a metrics-record-like object."""
-    record = SimpleNamespace(
+def test_recent_job_record_from_metrics_record() -> None:
+    """RecentJobRecord projects the lean fields (including job features) from a metrics record."""
+    from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
+
+    record = JobMetricsRecord(
         job_id="abc",
         is_alchemy=True,
         faulted=False,
         queue_wait_seconds=1.5,
         e2e_seconds=12.0,
         safety_seconds=0.4,
+        model_name="Deliberate",
+        steps=30,
+        loras_count=2,
+        control_type="canny",
     )
-    lean = RecentJobRecord.from_metrics_record(record)  # type: ignore[arg-type]
+    lean = RecentJobRecord.from_metrics_record(record)
     assert lean.job_id == "abc"
     assert lean.is_alchemy is True
     assert lean.e2e_seconds == 12.0
+    assert lean.model_name == "Deliberate"
+    assert lean.features is not None
+    assert lean.features.loras == 2
+    assert lean.features.control_type == "canny"
+
+
+def test_recent_job_record_without_features() -> None:
+    """A plain job (no LoRAs/controlnet/etc.) projects with no feature summary."""
+    from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
+
+    record = JobMetricsRecord(job_id="plain", e2e_seconds=3.0, steps=20)
+    lean = RecentJobRecord.from_metrics_record(record)
+    assert lean.features is None
+    assert lean.steps == 20
 
 
 def _fake_process_info() -> SimpleNamespace:

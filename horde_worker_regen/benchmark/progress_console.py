@@ -112,14 +112,17 @@ def _format_disk(row: LevelPlanRow) -> str:
 
 
 def _format_controlnet(row: LevelPlanRow) -> str:
-    """Render the controlnet cell: ``-`` (n/a), ``MISSING`` (extra absent), or the annotator ROM size."""
+    """Render the controlnet cell: ``-`` (n/a), ``MISSING`` (extra absent), or the annotator ROM size.
+
+    When the extra is absent the prospective annotator size is still shown (when known) so an operator
+    weighing whether to install it sees both the gap and its disk cost.
+    """
     if not row.requires_controlnet:
         return "-"
+    size = f"~{row.controlnet_annotator_bytes / 1024**3:.1f}G" if row.controlnet_annotator_bytes > 0 else ""
     if row.controlnet_installed is False:
-        return "MISSING"
-    if row.controlnet_annotator_bytes > 0:
-        return f"~{row.controlnet_annotator_bytes / 1024**3:.1f}G"
-    return "ok"
+        return f"MISSING {size}".rstrip()
+    return size or "ok"
 
 
 def format_plan_table(rows: list[LevelPlanRow]) -> str:

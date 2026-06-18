@@ -13,7 +13,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from horde_worker_regen.process_management.supervisor_channel import ProcessSnapshot, WorkerStateSnapshot
-from horde_worker_regen.tui.formatters import format_its, human_mb, shorten
+from horde_worker_regen.tui.formatters import STATE_LABELS, format_its, human_mb, label_state, shorten
 
 _BAR_WIDTH = 36
 
@@ -25,6 +25,8 @@ _ACTIVE_STATES = frozenset(
         "PRELOADING_MODEL",
         "DOWNLOADING_MODEL",
         "DOWNLOADING_AUX_MODEL",
+        "JOB_RECEIVED",
+        "EVALUATING_SAFETY",
     },
 )
 # Only these states have a live, meaningful sampling step/it-s; the snapshot may still carry the last
@@ -87,12 +89,16 @@ class LiveView(VerticalScroll):
         body.add_column(justify="right", style="bold cyan", no_wrap=True)
         body.add_column(ratio=1)
 
-        body.add_row("State", Text(process.last_process_state, style=state_colour))
+        state_label = label_state(process.last_process_state)
+        body.add_row("State", Text(state_label, style=state_colour))
         body.add_row("Model", shorten(process.loaded_horde_model_name, 40))
         if process.loaded_horde_model_baseline:
             body.add_row("Baseline", process.loaded_horde_model_baseline)
         if process.current_job_id:
             body.add_row("Job", process.current_job_id)
+
+        if process.current_job_features is not None and not process.current_job_features.is_empty():
+            body.add_row("Features", ", ".join(process.current_job_features.as_tags()))
 
         # Sampling progress is only meaningful while the process is actually sampling; otherwise the
         # step/it-s carried in the snapshot are last-job residue, so suppress the row when idle.
@@ -110,6 +116,10 @@ class LiveView(VerticalScroll):
                 ),
             )
             body.add_row("Throughput", format_its(process.last_iterations_per_second))
+        elif process.last_process_state in _ACTIVE_STATES:
+            # Show a stable placeholder row so the layout doesn't jump when sampling starts/stops.
+            working_label = STATE_LABELS.get(process.last_process_state, "working")
+            body.add_row("Working", Text(working_label + "…", style="yellow"))
 
         body.add_row(
             "VRAM",

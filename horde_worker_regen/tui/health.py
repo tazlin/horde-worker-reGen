@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import os
+import shutil
+from pathlib import Path
 
 from horde_worker_regen.process_management.supervisor_channel import WorkerStateSnapshot
 from horde_worker_regen.tui.formatters import human_bytes, human_duration
@@ -100,11 +103,19 @@ def derive(
     snapshot: WorkerStateSnapshot | None,
     supervisor_status: SupervisorStatus,
     snapshot_age: float | None,
+    *,
+    offline_checks: list[HealthCheck] | None = None,
 ) -> HealthReport:
-    """Compute the worker's phase and health checklist (handles the no-snapshot startup case too)."""
+    """Compute the worker's phase and health checklist (handles the no-snapshot startup case too).
+
+    ``offline_checks`` are pre-flight checks the caller computes from the filesystem (see
+    :func:`build_offline_checks`); they are shown while there is no live snapshot so the panel is
+    useful before the worker starts rather than empty. This function itself stays pure.
+    """
+    pre_flight = offline_checks or []
     if supervisor_status is SupervisorStatus.STOPPED:
         return HealthReport(
-            WorkerPhase.STOPPED, HealthStatus.INFO, "Worker stopped", "The worker is not running.", [], False
+            WorkerPhase.STOPPED, HealthStatus.INFO, "Worker stopped", "The worker is not running.", pre_flight, False
         )
     if supervisor_status is SupervisorStatus.CRASHED:
         return HealthReport(
@@ -112,7 +123,7 @@ def derive(
             HealthStatus.ERROR,
             "Worker crashed",
             "The worker process exited unexpectedly. Check the logs; it was not (or could not be) restarted.",
-            [],
+            pre_flight,
             False,
         )
     if supervisor_status is SupervisorStatus.RESTARTING:
@@ -121,7 +132,7 @@ def derive(
             HealthStatus.WARN,
             "Restarting worker…",
             "Relaunching the worker. This is expected after a manual restart or an automatic recovery.",
-            [],
+            pre_flight,
             True,
         )
     if snapshot is None:
@@ -130,7 +141,7 @@ def derive(
             HealthStatus.INFO,
             "Starting worker…",
             "Loading the model reference and spawning inference processes. The first run can take several minutes.",
-            [],
+            pre_flight,
             True,
         )
 
@@ -350,3 +361,42 @@ def _disk_check(snapshot: WorkerStateSnapshot) -> HealthCheck:
     if worst_free < _DISK_FLOOR_BYTES:
         return HealthCheck("Disk", HealthStatus.WARN, f"Low: {human_bytes(worst_free)} free on {worst_path}")
     return HealthCheck("Disk", HealthStatus.OK, f"{human_bytes(worst_free)} free")
+
+
+def build_offline_checks(config_path: Path) -> list[HealthCheck]:
+    """Build pre-flight checks shown while the worker is stopped (config presence, free disk).
+
+    Unlike :func:`derive`, this touches the filesystem: it reads the config file and queries free disk
+    space. Both are cheap and wrapped so a failure degrades to an informational check rather than
+    raising into the UI tick.
+    """
+    return [_config_file_check(config_path), _offline_disk_check()]
+
+
+def _config_file_check(config_path: Path) -> HealthCheck:
+    """Check that the bridgeData config exists and parses, for the stopped-worker pre-flight."""
+    if not config_path.exists():
+        return HealthCheck("Config", HealthStatus.WARN, f"{config_path} not found; run setup to create it")
+    from ruamel.yaml import YAMLError
+
+    from horde_worker_regen.tui.config_form import load_config
+
+    try:
+        load_config(config_path)
+    except (OSError, YAMLError) as config_error:
+        return HealthCheck("Config", HealthStatus.ERROR, f"{config_path} is unreadable: {config_error}")
+    return HealthCheck("Config", HealthStatus.OK, f"{config_path} present and valid")
+
+
+def _offline_disk_check() -> HealthCheck:
+    """Check free space on the model-cache disk (or the working directory) before the worker starts."""
+    cache_home = os.environ.get("AIWORKER_CACHE_HOME")
+    target = Path(cache_home) if cache_home else Path.cwd()
+    probe = target if target.exists() else Path.cwd()
+    try:
+        free_bytes = shutil.disk_usage(probe).free
+    except OSError as disk_error:
+        return HealthCheck("Disk", HealthStatus.INFO, f"Free space unavailable: {disk_error}")
+    if free_bytes < _DISK_FLOOR_BYTES:
+        return HealthCheck("Disk", HealthStatus.WARN, f"Low: {human_bytes(free_bytes)} free on {probe}")
+    return HealthCheck("Disk", HealthStatus.OK, f"{human_bytes(free_bytes)} free on {probe}")

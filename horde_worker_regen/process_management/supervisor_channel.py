@@ -23,19 +23,82 @@ from pydantic import BaseModel, Field
 if TYPE_CHECKING:
     from multiprocessing.connection import Connection
 
+    from horde_sdk.ai_horde_api.apimodels.generate.pop import ImageGenerateJobPopPayload
+
     from horde_worker_regen.process_management.process_info import HordeProcessInfo
     from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
 
-SUPERVISOR_PROTOCOL_VERSION = 2
+SUPERVISOR_PROTOCOL_VERSION = 3
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
-last-pop no-jobs/skip-reason fields. All are defaulted, so the change is wire-compatible, but the
-bump keeps host/attach diagnostics honest.
+last-pop no-jobs/skip-reason fields.
+v3 added alchemy config/runtime fields, ``pending_jobs``, ``JobFeatureSummary``, and extended
+``RecentJobRecord`` with model name and feature data.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
 """How many of the most recent finished-job records to carry in a snapshot (bounds payload size)."""
+
+PENDING_JOBS_IN_SNAPSHOT = 8
+"""How many pending-inference jobs to carry in a snapshot (bounds payload size)."""
+
+
+class JobFeatureSummary(BaseModel):
+    """The notable features of one image-generation job, for compact display."""
+
+    loras: int = 0
+    tis: int = 0
+    control_type: str | None = None
+    post_processing: list[str] = Field(default_factory=list)
+    hires_fix: bool = False
+    workflow: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: ImageGenerateJobPopPayload) -> JobFeatureSummary:
+        """Summarize the notable features of an image-generation job payload."""
+        return cls(
+            loras=len(payload.loras) if payload.loras else 0,
+            tis=len(payload.tis) if payload.tis else 0,
+            control_type=str(payload.control_type) if payload.control_type else None,
+            post_processing=[str(post_proc_step) for post_proc_step in payload.post_processing],
+            hires_fix=payload.hires_fix,
+            workflow=str(payload.workflow) if payload.workflow else None,
+        )
+
+    def as_tags(self) -> list[str]:
+        """Compact display tags (e.g. ``['2×LoRA', 'canny', 'HiRes']``)."""
+        tags: list[str] = []
+        if self.loras:
+            tags.append(f"{self.loras}×LoRA")
+        if self.tis:
+            tags.append(f"{self.tis}×TI")
+        if self.control_type:
+            tags.append(self.control_type)
+        for post_proc_step in self.post_processing:
+            tags.append(post_proc_step)
+        if self.hires_fix:
+            tags.append("HiRes")
+        if self.workflow:
+            tags.append(f"wf:{self.workflow}")
+        return tags
+
+    def is_empty(self) -> bool:
+        """True when no notable features are present."""
+        return not (
+            self.loras or self.tis or self.control_type or self.post_processing or self.hires_fix or self.workflow
+        )
+
+
+class JobQueueEntry(BaseModel):
+    """A pending-inference job, for the queue-preview on the overview screen."""
+
+    job_id: str
+    model: str
+    steps: int | None = None
+    width: int | None = None
+    height: int | None = None
+    features: JobFeatureSummary | None = None
 
 
 class WorkerConfigSummary(BaseModel):
@@ -65,6 +128,13 @@ class WorkerConfigSummary(BaseModel):
     high_memory_mode: bool = False
     very_high_memory_mode: bool = False
     extra_slow_worker: bool = False
+
+    alchemist: bool = False
+    alchemy_concurrent: bool = True
+    alchemy_max_concurrency: int = 1
+    alchemy_vram_headroom_mb: int = 2000
+    alchemy_caption_enabled: bool = False
+    alchemy_forms: list[str] = Field(default_factory=list)
 
 
 class ProcessSnapshot(BaseModel):
@@ -103,12 +173,22 @@ class ProcessSnapshot(BaseModel):
     num_jobs_completed: int = 0
     """Jobs/forms this slot has finished (inference, safety check, or alchemy form); resets on replace."""
 
+    current_job_features: JobFeatureSummary | None = None
+    """Notable features of the active job (LoRAs, ControlNet, etc.); None when idle."""
+
     @classmethod
     def from_process_info(cls, info: HordeProcessInfo) -> ProcessSnapshot:
         """Build a snapshot from a live ``HordeProcessInfo`` (read-only; no import coupling)."""
         job = info.last_job_referenced
         current_job_id = str(job.id_.root) if job is not None and job.id_ is not None else None
         baseline = info.loaded_horde_model_baseline
+
+        features: JobFeatureSummary | None = None
+        if info.is_process_busy() and job is not None:
+            candidate = JobFeatureSummary.from_payload(job.payload)
+            if not candidate.is_empty():
+                features = candidate
+
         return cls(
             process_id=info.process_id,
             process_type=info.process_type.name,
@@ -133,6 +213,7 @@ class ProcessSnapshot(BaseModel):
             vram_used_high_water_mb=info.vram_used_high_water_mb,
             ram_used_high_water_mb=info.ram_used_high_water_mb,
             num_jobs_completed=info.num_jobs_completed,
+            current_job_features=features,
         )
 
 
@@ -149,10 +230,31 @@ class RecentJobRecord(BaseModel):
     queue_wait_seconds: float | None = None
     e2e_seconds: float | None = None
     safety_seconds: float | None = None
+    model_name: str | None = None
+    steps: int | None = None
+    width: int | None = None
+    height: int | None = None
+    features: JobFeatureSummary | None = None
 
     @classmethod
     def from_metrics_record(cls, record: JobMetricsRecord) -> RecentJobRecord:
         """Project a worker-side ``JobMetricsRecord`` into the lean wire form."""
+        features: JobFeatureSummary | None = None
+        has_features = bool(
+            record.loras_count
+            or record.tis_count
+            or record.control_type
+            or record.post_processing
+            or record.hires_fix,
+        )
+        if has_features:
+            features = JobFeatureSummary(
+                loras=record.loras_count,
+                tis=record.tis_count,
+                control_type=record.control_type,
+                post_processing=record.post_processing,
+                hires_fix=record.hires_fix,
+            )
         return cls(
             job_id=record.job_id,
             is_alchemy=record.is_alchemy,
@@ -160,6 +262,11 @@ class RecentJobRecord(BaseModel):
             queue_wait_seconds=record.queue_wait_seconds,
             e2e_seconds=record.e2e_seconds,
             safety_seconds=record.safety_seconds,
+            model_name=record.model_name,
+            steps=record.steps,
+            width=record.width,
+            height=record.height,
+            features=features,
         )
 
 
@@ -322,6 +429,20 @@ class WorkerStateSnapshot(BaseModel):
 
     recent_jobs: list[RecentJobRecord] = Field(default_factory=list)
     """The most recent finished-job records, newest last (capped)."""
+
+    alchemy_forms_pending: int = 0
+    """Forms popped from the API but not yet dispatched to a child process."""
+    alchemy_forms_in_flight: int = 0
+    """Forms dispatched to a child process, awaiting a result message."""
+    alchemy_forms_awaiting_submit: int = 0
+    """Forms with a completed result, waiting for API submission."""
+    alchemy_total_submitted: int = 0
+    """Cumulative forms successfully submitted this session."""
+    alchemy_total_faulted: int = 0
+    """Cumulative forms that faulted (permanently failed) this session."""
+
+    pending_jobs: list[JobQueueEntry] = Field(default_factory=list)
+    """Pending-inference jobs (capped at :data:`PENDING_JOBS_IN_SNAPSHOT`), oldest first."""
 
 
 class SupervisorCommand(enum.Enum):

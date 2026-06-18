@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from horde_worker_regen.process_management.supervisor_channel import (
     ProcessSnapshot,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
-from horde_worker_regen.tui.health import HealthStatus, WorkerPhase, derive, summarize_skips
+from horde_worker_regen.tui.health import (
+    HealthStatus,
+    WorkerPhase,
+    build_offline_checks,
+    derive,
+    summarize_skips,
+)
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
 
@@ -162,6 +172,50 @@ def test_summarize_skips_orders_by_count_and_drops_zeros() -> None:
     """The skip summary is count-ordered and omits zero-count reasons."""
     assert summarize_skips({"nsfw": 1, "models": 3, "untouched": 0}) == "3 models · 1 nsfw"
     assert summarize_skips({}) == ""
+
+
+def test_offline_checks_surface_in_stopped_report(tmp_path: Path) -> None:
+    """A stopped worker shows pre-flight checks (config + disk) instead of an empty checklist."""
+    config_path = tmp_path / "bridgeData.yaml"
+    config_path.write_text("dreamer_worker_name: Test\n", encoding="utf-8")
+    offline = build_offline_checks(config_path)
+    report = derive(None, SupervisorStatus.STOPPED, None, offline_checks=offline)
+    assert report.phase is WorkerPhase.STOPPED
+    names = {check.name for check in report.checks}
+    assert {"Config", "Disk"} <= names
+    config_check = next(check for check in report.checks if check.name == "Config")
+    assert config_check.status is HealthStatus.OK
+
+
+def test_offline_config_check_warns_when_missing(tmp_path: Path) -> None:
+    """A missing config file is a warning (the setup wizard is the intended remedy), not an error."""
+    checks = build_offline_checks(tmp_path / "absent.yaml")
+    config_check = next(check for check in checks if check.name == "Config")
+    assert config_check.status is HealthStatus.WARN
+
+
+def test_offline_config_check_errors_on_unparseable_yaml(tmp_path: Path) -> None:
+    """A present-but-corrupt config surfaces as an error."""
+    config_path = tmp_path / "bridgeData.yaml"
+    config_path.write_text("dreamer_worker_name: [unterminated\n", encoding="utf-8")
+    checks = build_offline_checks(config_path)
+    config_check = next(check for check in checks if check.name == "Config")
+    assert config_check.status is HealthStatus.ERROR
+
+
+def test_offline_disk_check_warns_below_floor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The offline disk check warns when free space is under the floor."""
+    import horde_worker_regen.tui.health as health_module
+
+    monkeypatch.setattr(
+        health_module.shutil,
+        "disk_usage",
+        lambda _path: type("Usage", (), {"total": 0, "used": 0, "free": 1024})(),
+    )
+    monkeypatch.setenv("AIWORKER_CACHE_HOME", str(tmp_path))
+    checks = build_offline_checks(tmp_path / "bridgeData.yaml")
+    disk_check = next(check for check in checks if check.name == "Disk")
+    assert disk_check.status is HealthStatus.WARN
 
 
 def test_checks_cover_core_dimensions() -> None:

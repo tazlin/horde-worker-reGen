@@ -52,7 +52,7 @@ from horde_worker_regen.consts import (
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.action_ledger import ActionLedger, LedgerEventType
-from horde_worker_regen.process_management.alchemy_popper import AlchemyCoordinator
+from horde_worker_regen.process_management.alchemy_popper import DEFAULT_ALCHEMY_FORMS, AlchemyCoordinator
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
@@ -85,8 +85,11 @@ from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.safety_orchestrator import SafetyOrchestrator
 from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
 from horde_worker_regen.process_management.supervisor_channel import (
+    PENDING_JOBS_IN_SNAPSHOT,
     RECENT_JOBS_IN_SNAPSHOT,
     DownloadPlanSummary,
+    JobFeatureSummary,
+    JobQueueEntry,
     ProcessSnapshot,
     RecentJobRecord,
     SupervisorChannel,
@@ -1941,6 +1944,25 @@ class HordeWorkerProcessManager:
         self._download_plan_computed = True
         return self._download_plan_summary
 
+    def _build_pending_jobs_list(self) -> list[JobQueueEntry]:
+        """Build a capped list of pending-inference jobs for the overview queue display."""
+        entries: list[JobQueueEntry] = []
+        for api_job in self._job_tracker.jobs_pending_inference[:PENDING_JOBS_IN_SNAPSHOT]:
+            payload = api_job.payload
+            candidate = JobFeatureSummary.from_payload(payload)
+            features = candidate if not candidate.is_empty() else None
+            entries.append(
+                JobQueueEntry(
+                    job_id=str(api_job.id_.root) if api_job.id_ is not None else "",
+                    model=str(api_job.model) if api_job.model is not None else "?",
+                    steps=payload.ddim_steps,
+                    width=payload.width,
+                    height=payload.height,
+                    features=features,
+                )
+            )
+        return entries
+
     def _build_worker_state_snapshot(self) -> WorkerStateSnapshot:
         """Assemble current worker state for the supervisor pipe (mirrors what StatusReporter prints)."""
         import horde_worker_regen
@@ -1990,6 +2012,12 @@ class HordeWorkerProcessManager:
             high_memory_mode=bridge_data.high_memory_mode,
             very_high_memory_mode=bridge_data.very_high_memory_mode,
             extra_slow_worker=bridge_data.extra_slow_worker,
+            alchemist=bridge_data.alchemist,
+            alchemy_concurrent=bridge_data.alchemy_allow_concurrent,
+            alchemy_max_concurrency=bridge_data.alchemy_max_concurrency,
+            alchemy_vram_headroom_mb=bridge_data.alchemy_vram_headroom_mb,
+            alchemy_caption_enabled=bridge_data.alchemy_caption_enabled,
+            alchemy_forms=list(bridge_data.forms) if bridge_data.forms else list(DEFAULT_ALCHEMY_FORMS),
         )
 
         return WorkerStateSnapshot(
@@ -2034,6 +2062,12 @@ class HordeWorkerProcessManager:
             ],
             downloads=self._model_availability.status,
             download_plan=self._get_download_plan_summary(),
+            alchemy_forms_pending=self._alchemy_coordinator.num_forms_pending,
+            alchemy_forms_in_flight=self._alchemy_coordinator.num_forms_in_flight,
+            alchemy_forms_awaiting_submit=self._alchemy_coordinator.num_forms_awaiting_submit,
+            alchemy_total_submitted=self._alchemy_coordinator.num_forms_submitted,
+            alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
+            pending_jobs=self._build_pending_jobs_list(),
         )
 
     def build_run_record(self) -> WorkerRunRecord:

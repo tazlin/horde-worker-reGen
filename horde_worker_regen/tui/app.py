@@ -43,7 +43,7 @@ from horde_worker_regen.tui.benchmark_launcher import (
     record_suggested_as_known_good,
 )
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
-from horde_worker_regen.tui.health import HealthReport, HealthStatus, derive
+from horde_worker_regen.tui.health import HealthReport, HealthStatus, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.update_check import check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
@@ -141,7 +141,7 @@ class HordeWorkerTUI(App[None]):
 
     def on_mount(self) -> None:
         """Begin the refresh loop, then run first-run setup or the usual start/onboarding prompts."""
-        self.set_interval(0.25, self._tick)
+        self.set_interval(0.1, self._tick)
         self._maybe_check_for_updates()
         if self._should_run_setup_wizard():
             self._run_setup_wizard()
@@ -284,7 +284,8 @@ class HordeWorkerTUI(App[None]):
         self._frame += 1
         snapshot = self._supervisor.latest_snapshot
         snapshot_age = (time.time() - snapshot.timestamp) if snapshot is not None else None
-        report = derive(snapshot, self._supervisor.status, snapshot_age)
+        offline_checks = build_offline_checks(self._config_path) if snapshot is None else None
+        report = derive(snapshot, self._supervisor.status, snapshot_age, offline_checks=offline_checks)
         try:
             self._update_status_bar(report, snapshot)
             self.query_one(OverviewView).update_view(report, snapshot, frame=self._frame)

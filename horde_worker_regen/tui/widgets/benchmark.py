@@ -355,9 +355,7 @@ class BenchmarkView(VerticalScroll):
         with contextlib.suppress(NoMatches):
             self.query_one("#benchmark-status", Static).update(self._app_state_summary)
 
-    def update_view(
-        self, run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus, *, frame: int = 0
-    ) -> None:
+    def update_view(self, run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus, *, frame: int = 0) -> None:
         """Refresh the action buttons, the plan pane, and the body panel from the supervisor's latest state.
 
         ``frame`` is the app's monotonically increasing tick counter, used only to animate the spinner so
@@ -524,6 +522,7 @@ class BenchmarkView(VerticalScroll):
         table.add_column("Disk (free/need)", justify="right")
         table.add_column("Net")
         table.add_column("Key")
+        table.add_column("Controlnet")
         table.add_column("Verdict")
         for row in rows:
             vram = "-" if row.estimated_vram_mb is None else f"{row.estimated_vram_mb / 1024:.1f}G"
@@ -535,19 +534,37 @@ class BenchmarkView(VerticalScroll):
                 BenchmarkView._plan_disk_cell(row),
                 "yes" if row.requires_network else "-",
                 "civitai" if row.requires_civitai_key else "-",
+                BenchmarkView._plan_controlnet_cell(row),
                 verdict,
             )
 
         body: RenderableType = table
-        if any(row.num_models_missing for row in rows):
+        needs_models = any(row.num_models_missing for row in rows)
+        needs_annotators = any(row.requires_controlnet and row.controlnet_annotator_bytes > 0 for row in rows)
+        if needs_models or needs_annotators:
+            what = "models" if needs_models and not needs_annotators else "models or controlnet annotators"
             banner = Text(
-                "Some of these levels need models you have not downloaded yet. Press “Download models” "
+                f"Some of these levels need {what} you have not downloaded yet. Press “Download models” "
                 "below to fetch them first: otherwise the benchmark will download them mid-run, which makes the "
                 "timing slower and less accurate.",
                 style="yellow",
             )
             body = Group(banner, Text(""), table)
         return Panel(body, title="Resource plan", title_align="left", border_style="grey37")
+
+    @staticmethod
+    def _plan_controlnet_cell(row: LevelPlanRow) -> Text:
+        """Render the controlnet cell: ``-`` (n/a), red ``missing`` (extra absent), or the annotator ROM size.
+
+        When the extra is absent the prospective annotator size is still shown (when known) so an operator
+        weighing whether to install it sees both the gap and its disk cost.
+        """
+        if not row.requires_controlnet:
+            return Text("-")
+        size = f"~{row.controlnet_annotator_bytes / 1024**3:.1f}G" if row.controlnet_annotator_bytes > 0 else ""
+        if row.controlnet_installed is False:
+            return Text(f"missing {size}".rstrip(), style="red")
+        return Text(size or "ok", style="green" if not size else "")
 
     def _update_buttons(self, status: BenchmarkSupervisorStatus, run_state: BenchmarkRunState) -> None:
         """Enable only the actions valid for the current status."""
