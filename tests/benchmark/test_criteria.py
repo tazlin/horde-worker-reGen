@@ -50,7 +50,7 @@ class TestEvaluateLevel:
             ({"num_audit_failures": 1}, "audit failures"),
             ({"num_process_recoveries": 1}, "process recoveries"),
             ({"vram_used_high_water_mb": 23500}, "VRAM headroom"),
-            ({"disk_min_free_bytes": 1 * 1024**3}, "disk free space"),
+            ({"disk_min_free_bytes": int(0.99 * 1024**3)}, "disk free space"),
         ],
     )
     def test_single_violation_fails(self, overrides: dict, reason_fragment: str) -> None:
