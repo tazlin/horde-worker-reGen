@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
+    from horde_model_reference.model_reference_manager import ModelReferenceManager
     from horde_model_reference.model_reference_records import GenericModelRecord
 
     from horde_worker_regen.model_download_plan import ModelDiskInfo
@@ -42,6 +44,8 @@ class ModelInfo:
     """Whether the model's files already exist on disk (existence-only, not integrity-checked)."""
     target_path: str = ""
     """Where the model's primary file lives (or would be downloaded to)."""
+    is_beta: bool = False
+    """Whether this model comes from a PRIMARY's pending (beta) queue rather than the canonical reference."""
 
 
 def load_image_models() -> list[ModelInfo]:
@@ -73,8 +77,7 @@ def load_image_models() -> list[ModelInfo]:
 
     manager = asyncio.run(ensure_model_reference_manager_initialized())
 
-    references = manager.get_all_model_references()
-    records = references.get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
+    records, beta_names = _image_records_with_beta(manager)
 
     disk_by_name = _disk_info_by_name(records)
 
@@ -93,10 +96,81 @@ def load_image_models() -> list[ModelInfo]:
             size_on_disk_bytes=disk_by_name[name].size_bytes if name in disk_by_name else None,
             on_disk=disk_by_name[name].on_disk if name in disk_by_name else False,
             target_path=disk_by_name[name].target_path if name in disk_by_name else "",
+            is_beta=name in beta_names,
         )
         for name, record in records.items()
     ]
     return sorted(models, key=lambda model: model.name.lower())
+
+
+# Mirrors hordelib.beta_models.BETA_CATEGORIES_ENV_VAR. Duplicated here as a literal so the cheap
+# "is beta even opted into?" gate below never has to import hordelib (a heavy import) just to read it.
+_BETA_CATEGORIES_ENV_VAR = "HORDELIB_BETA_MODEL_CATEGORIES"
+
+
+def _image_records_with_beta(
+    manager: ModelReferenceManager,
+) -> tuple[Mapping[str, GenericModelRecord], set[str]]:
+    """Return the image-gen records to show, plus the names that are beta (pending-queue) models.
+
+    The canonical reference (``get_all_model_references``) never includes a PRIMARY's pending-queue
+    (beta) models, so a promotion candidate like qwen stays invisible in the picker until it lands in
+    the canonical data. When the operator has opted into the image-generation beta (the same env-var
+    contract the worker subprocesses use), register the pending provider and merge it via ``query`` so
+    those models surface and can be flagged. Beta is best-effort: any failure degrades to the canonical
+    catalog rather than breaking the picker.
+    """
+    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
+
+    category = MODEL_REFERENCE_CATEGORY.image_generation
+    canonical = manager.get_all_model_references().get(category) or {}
+
+    sourced = _query_beta_records(manager, category)
+    if sourced is None:
+        return canonical, set()
+
+    from horde_model_reference import PENDING_SOURCE_ID
+
+    records: dict[str, GenericModelRecord] = {}
+    beta_names: set[str] = set()
+    for record, source in sourced:
+        records[record.name] = record
+        if source == PENDING_SOURCE_ID:
+            beta_names.add(record.name)
+    return records, beta_names
+
+
+def _query_beta_records(
+    manager: ModelReferenceManager,
+    category: MODEL_REFERENCE_CATEGORY,
+) -> list[tuple[GenericModelRecord, str]] | None:
+    """Register the pending (beta) provider if opted in, and return ``(record, source)`` pairs, or None.
+
+    Returns None (falling back to canonical-only) when beta is not opted into or not fully configured
+    (missing API key / PRIMARY URL); ``hordelib.beta_models`` logs the specific reason in that case.
+    """
+    import os
+
+    if not os.environ.get(_BETA_CATEGORIES_ENV_VAR, "").strip():
+        return None
+
+    from loguru import logger
+
+    try:
+        from horde_model_reference import PENDING_SOURCE_ID
+
+        from hordelib.beta_models import beta_source_for, build_pending_provider
+
+        if manager.get_provider(PENDING_SOURCE_ID) is None:
+            provider = build_pending_provider()
+            if provider is None:
+                return None
+            manager.register_provider(provider, replace=True)
+
+        return manager.query(category, source=beta_source_for(category, manager)).to_list_with_source()
+    except Exception as error:  # noqa: BLE001 - beta is best-effort enrichment, never fatal to the picker
+        logger.warning(f"Could not load beta models for the picker: {type(error).__name__}: {error}")
+        return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -349,6 +423,10 @@ _FRIENDLY_BASELINES: dict[str, str] = {
     "stable_diffusion_xl": "SDXL",
     "stable_cascade": "Cascade",
     "flux_1": "Flux",
+    "flux_schnell": "Flux Schnell",
+    "flux_dev": "Flux Dev",
+    "qwen_image": "Qwen",
+    "z_image_turbo": "Z-Image Turbo",
 }
 
 

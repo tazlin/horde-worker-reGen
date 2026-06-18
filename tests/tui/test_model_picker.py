@@ -44,6 +44,23 @@ def test_flags_for() -> None:
     assert ModelPickerModal._flags_for(_MODELS[1]) == ""
 
 
+def test_flags_for_beta_model() -> None:
+    """A beta (pending-queue) model is flagged, leading the flag string."""
+    beta_model = ModelInfo("Qwen-Image", "qwen_image", nsfw=False, inpainting=False, is_beta=True)
+    assert ModelPickerModal._flags_for(beta_model) == "beta"
+    assert ModelPickerModal._flags_for(
+        ModelInfo("Qwen NSFW", "qwen_image", nsfw=True, inpainting=False, is_beta=True),
+    ) == "beta nsfw"
+
+
+def test_detail_for_shows_beta_source() -> None:
+    """The detail panel labels a beta model's provenance."""
+    beta_model = ModelInfo("Qwen-Image", "qwen_image", nsfw=False, inpainting=False, is_beta=True)
+    detail = _render(ModelPickerModal._detail_for(beta_model))
+    assert "beta" in detail
+    assert "pending queue" in detail
+
+
 def test_detail_for_shows_full_record_with_homepage() -> None:
     """The detail panel renders the full record including a homepage link."""
     detail = _render(ModelPickerModal._detail_for(_MODELS[0]))

@@ -160,6 +160,8 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
     def _flags_for(model: ModelInfo) -> str:
         """A compact flags string for a model."""
         flags = []
+        if model.is_beta:
+            flags.append("beta")
         if model.nsfw:
             flags.append("nsfw")
         if model.inpainting:
@@ -268,6 +270,8 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         grid = Table.grid(padding=(0, 1))
         grid.add_column(style="bold cyan", justify="right", no_wrap=True)
         grid.add_column()
+        if model.is_beta:
+            grid.add_row("Source", Text("beta (PRIMARY pending queue)", style="magenta"))
         grid.add_row("Baseline", model.baseline or "-")
         disk_text = (
             Text("on disk (unverified)", style="green")
