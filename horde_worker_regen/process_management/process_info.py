@@ -134,6 +134,17 @@ class HordeProcessInfo:
     process_launch_identifier: int
     """The identifier for the process launch. Used to track restarting of specific process slots."""
 
+    end_intended: bool
+    """Whether the supervisor deliberately initiated this slot's end (shutdown, scale-down, replacement).
+
+    Distinguishes an expected exit from an unexpected one. A child can reach ``PROCESS_ENDED`` two ways:
+    the parent sent ``END_PROCESS`` (intended), or the child caught a fatal error (e.g. a ``PRELOAD_MODEL``
+    handler that raised), set its own end flag, and exited gracefully-looking via the same shutdown path.
+    The two are indistinguishable by state alone, so the parent records its own intent here: the reaper
+    recovers a dead slot only when the end was *not* intended, and never double-counts a deliberate end as
+    a recovery.
+    """
+
     # TODO: VRAM usage
 
     def __init__(
@@ -200,6 +211,7 @@ class HordeProcessInfo:
         self.recently_unloaded_from_ram = False
 
         self.process_launch_identifier = process_launch_identifier
+        self.end_intended = False
 
     def is_process_busy(self) -> bool:
         """Return true if the process is actively engaged in a task.

@@ -326,12 +326,37 @@ def test_reap_if_crashed_recovers_dead_safety() -> None:
     assert plm.safety_processes_should_be_replaced is True
 
 
-def test_reap_if_crashed_ignores_live_and_ending_processes() -> None:
-    """A live process, or one we are intentionally ending, is never reaped as a crash."""
+def test_reap_if_crashed_ignores_live_and_intentionally_ended_processes() -> None:
+    """A live process, or one we deliberately ended, is never reaped as a crash."""
     live = make_mock_process_info(1, model_name=None, state=HordeProcessState.PROCESS_STARTING)
     plm = _make_plm(process_map=ProcessMap({1: live}))
     assert plm._reap_if_crashed(live) is False
 
-    ending = make_mock_process_info(2, model_name=None, state=HordeProcessState.PROCESS_ENDING)
-    ending.mp_process.is_alive.return_value = False
-    assert plm._reap_if_crashed(ending) is False
+    # A dead slot whose end the supervisor *intended* (shutdown/scale-down/replacement) is left alone,
+    # even though its OS process has exited and it reports an ending state.
+    intended = make_mock_process_info(2, model_name=None, state=HordeProcessState.PROCESS_ENDING)
+    intended.mp_process.is_alive.return_value = False
+    intended.end_intended = True
+    assert plm._reap_if_crashed(intended) is False
+
+
+def test_reap_if_crashed_recovers_unintended_ended_process() -> None:
+    """A dead slot reporting an ending state that we did *not* intend is recovered, not left wedged.
+
+    The soak wedge: a child exited during preload and reported PROCESS_ENDED via its graceful shutdown
+    path (it was never sent END_PROCESS), so state alone is indistinguishable from an intended end. With
+    intent tracked separately, the reaper recovers it.
+    """
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+
+    crashed = make_mock_process_info(3, model_name=None, state=HordeProcessState.PROCESS_ENDED)
+    crashed.mp_process.is_alive.return_value = False
+    crashed.mp_process.exitcode = 0
+    plm._process_map[3] = crashed
+    assert crashed.end_intended is False
+
+    assert plm._reap_if_crashed(crashed) is True
+    plm._start_inference_process.assert_called_once_with(3)
+    assert plm._num_process_recoveries == 1

@@ -58,6 +58,24 @@ class HordeModelMap(RootModel[dict[str, ModelInfo]]):
         """
         return self.root.pop(horde_model_name, None)
 
+    def expire_entries_for_process(self, process_id: int) -> list[str]:
+        """Remove every model entry that is loaded on (or loading into) the given process.
+
+        Used when a process dies: a model the scheduler believes is ``LOADING`` (or loaded) on a now-dead
+        slot is otherwise treated as resident forever (``preload_models`` skips any model already in the
+        loaded/loading set), so the pending job that wanted it is never re-preloaded onto a fresh slot.
+        Keying off ``process_id`` rather than the dead slot's ``loaded_horde_model_name`` is essential
+        because that name is cleared the moment the child reports ``PROCESS_ENDING``, leaving the stale
+        map entry as the only remaining record of the wedge.
+
+        Returns:
+            The names of the models whose entries were removed.
+        """
+        expired = [name for name, info in self.root.items() if info.process_id == process_id]
+        for name in expired:
+            self.root.pop(name, None)
+        return expired
+
     def is_model_loaded(self, horde_model_name: str) -> bool:
         """Return true if the given model is loaded in any process."""
         if horde_model_name not in self.root:

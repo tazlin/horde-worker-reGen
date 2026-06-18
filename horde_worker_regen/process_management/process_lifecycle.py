@@ -630,6 +630,9 @@ class ProcessLifecycleManager:
 
     def _end_inference_process(self, process_info: HordeProcessInfo) -> None:
         """Ends an inference process."""
+        # Mark the end as supervisor-intended *before* doing anything else, so the crash reaper does not
+        # mistake this slot's imminent exit for an unexpected death and try to "recover" (and re-count) it.
+        process_info.end_intended = True
         self._process_map.on_process_ending(process_id=process_info.process_id)
         if process_info.loaded_horde_model_name is not None:
             self._horde_model_map.expire_entry(process_info.loaded_horde_model_name)
@@ -692,10 +695,18 @@ class ProcessLifecycleManager:
         would otherwise leave it pinned at its last reported state forever. Detecting the exit directly
         lets us restart it promptly and log the exit code so the cause is visible.
 
+        Recovery is gated on *intent*, not on the last reported state. A child reaches ``PROCESS_ENDED``
+        both when the parent asked it to (shutdown/scale-down/replacement) and when it caught a fatal
+        error and exited via its own graceful shutdown path -- for example a ``PRELOAD_MODEL`` handler
+        that raised, which sets the child's end flag and emits ``PROCESS_ENDED`` indistinguishably from
+        an intended end (an observed soak wedge: process died mid-preload, reported ``PROCESS_ENDED``,
+        and was never replaced, stranding the popped job forever). Keying off intent rather than state
+        lets us recover that case while still leaving a genuinely intended end alone.
+
         Returns:
             True if the process was found dead and a replacement was initiated.
         """
-        if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
+        if process_info.end_intended:
             return False
         if process_info.mp_process.is_alive():
             return False
@@ -933,6 +944,15 @@ class ProcessLifecycleManager:
 
         if process_info.loaded_horde_model_name is not None:
             self._horde_model_map.expire_entry(process_info.loaded_horde_model_name)
+        # Also clear any entry still pointing at this slot by id. When a child reports PROCESS_ENDING
+        # before we replace it, on_process_ending already nulled loaded_horde_model_name, so the line
+        # above is a no-op and a stale LOADING entry would otherwise pin the model as "resident" on the
+        # dead slot, starving the pending job of any re-preload (the soak re-dispatch wedge).
+        expired_by_pid = self._horde_model_map.expire_entries_for_process(process_info.process_id)
+        if expired_by_pid:
+            logger.debug(
+                f"Expired model-map entries {expired_by_pid} stranded on dead process {process_info.process_id}",
+            )
 
         if job_to_remove is not None:
             # A slot crash/hang mid-job is retryable: the job is requeued to a fresh slot (bounded by
