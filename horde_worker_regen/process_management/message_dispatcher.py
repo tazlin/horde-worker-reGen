@@ -47,6 +47,17 @@ from horde_worker_regen.telemetry_spans import (
 
 _excludes_for_job_dump = {"source_image", "source_mask", "extra_source_images", "r2_upload"}
 
+_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS = 20.0
+"""How long a queue deadlock must persist continuously before it counts as a structural wedge.
+
+The recovery supervisor's give-up budget is calibrated for *definitive* signals (a crash-looped pool),
+which a slow model load or a normal slot replacement never trips. The instantaneous queue-deadlock flag
+does not meet that bar on its own: it also flips during the brief all-idle window between a job finishing
+and the scheduler preloading the next model, and the detector deliberately holds it set across that
+preload (its anti-flap guard keeps it set while a process is starting). Requiring the deadlock to outlast
+any normal model-load / churn window before it drives save-our-ship restores the supervisor's
+definitive-signal assumption, so a head whose model is merely loading is not faulted as unrecoverable."""
+
 
 @dataclass(frozen=True)
 class DeadlockSnapshot:
@@ -63,17 +74,21 @@ class DeadlockSnapshot:
         """Return whether any deadlock detector is currently active (diagnostics-grade)."""
         return self.in_deadlock or self.in_queue_deadlock
 
-    def indicates_structural_wedge(self) -> bool:
+    def indicates_structural_wedge(self, now: float | None = None) -> bool:
         """Return whether the deadlock state is a genuine, recoverable inference-pool wedge.
 
-        Only the *queue* deadlock qualifies: pending inference work exists, every process is idle, and
-        the model is already loaded (or unspecified), so a soft reset is the right remedy. The general
-        ``in_deadlock`` flag is deliberately excluded: it also fires for any tracked job while no process
-        is busy, which includes a job legitimately draining through the post-inference safety/submit tail
-        during a queue lull. Treating that benign tail as a wedge would needlessly cycle healthy processes
-        and limp the worker's concurrency, so it must not drive the save-our-ship reset.
+        Only a *sustained* queue deadlock qualifies: pending inference work exists, every process is
+        idle, and the head's model is not becoming resident, held continuously past any normal
+        model-load / churn window (:data:`_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS`). A just-detected queue
+        deadlock is the normal all-idle gap between jobs (or a model mid-preload) and must not drive the
+        save-our-ship reset, whose give-up budget assumes only definitive signals reach it. The general
+        ``in_deadlock`` flag is deliberately excluded too: it also fires for a job legitimately draining
+        through the post-inference safety/submit tail during a queue lull.
         """
-        return self.in_queue_deadlock
+        if not self.in_queue_deadlock:
+            return False
+        reference = time.time() if now is None else now
+        return (reference - self.queue_deadlock_started_at) >= _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS
 
 
 class MessageDispatcher:

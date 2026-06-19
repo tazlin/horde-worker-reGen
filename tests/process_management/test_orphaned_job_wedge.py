@@ -174,6 +174,9 @@ async def test_detected_deadlock_escalates_to_recovery_wedge() -> None:
     await track_popped_job_async(pm._job_tracker, job)
 
     pm.detect_deadlock()
+    # The deadlock has persisted past the structural-wedge window (a genuine stuck queue, not the
+    # transient all-idle gap between jobs), so it is visible to the recovery supervisor.
+    pm._message_dispatcher._last_queue_deadlock_detected_time = time.time() - 60
 
     assert pm._message_dispatcher.get_deadlock_snapshot().has_active_deadlock() is True
     assert pm._assess_wedge() is True
@@ -239,6 +242,9 @@ async def test_give_up_reissues_head_when_pool_healthy_but_queue_wedged() -> Non
     await track_popped_job_async(pm._job_tracker, head_job)
 
     pm.detect_deadlock()
+    # Sustain the queue deadlock past the structural-wedge window: this head is genuinely unservable,
+    # not the transient all-idle gap while the scheduler preloads the next model.
+    pm._message_dispatcher._last_queue_deadlock_detected_time = time.time() - 60
     assert pm._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge() is True
     assert pm._is_inference_capacity_available() is True
     assert len(pm._job_tracker.jobs_pending_inference) == 1

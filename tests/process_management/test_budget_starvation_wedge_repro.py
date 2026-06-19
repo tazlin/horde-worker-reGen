@@ -15,6 +15,7 @@ health, affinity, queue contents) are not the cause.
 
 from __future__ import annotations
 
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -177,12 +178,13 @@ class TestWedgeManifestsAsStructuralQueueDeadlock:
     """The budget-starved head state is exactly what the queue-deadlock detector flags as a wedge."""
 
     async def test_idle_pool_with_unresident_head_is_a_structural_wedge(self) -> None:
-        """The deferred-head state produces the 'queue deadlock without a model causing it' signature.
+        """The permanently-deferred-head state produces a sustained 'queue deadlock' wedge signature.
 
         With every inference process idle, pending work whose model is resident on none of them, and
-        no recent pop, the detector cannot attribute the deadlock to a loaded model and flags a
-        structural queue wedge. That is the signal save-our-ship reads to fault the head, which is how
-        a permanently-deferred preload turns into faulted jobs and the consecutive-failure cooldown.
+        no recent pop, the detector flags a queue deadlock. A permanently-deferred preload keeps that
+        deadlock set indefinitely, so once it outlasts the normal model-load / churn window it reads as
+        a structural wedge: the signal save-our-ship uses to fault the head. (A merely transient
+        all-idle gap, by contrast, is not yet structural; see ``test_transient_wedge_giveup_repro``.)
         """
         proc_sd15 = make_mock_process_info(1, model_name=_RESIDENT_SD15, state=HordeProcessState.WAITING_FOR_JOB)
         proc_sdxl = make_mock_process_info(2, model_name=_RESIDENT_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
@@ -208,5 +210,7 @@ class TestWedgeManifestsAsStructuralQueueDeadlock:
         # The head model is named as the deadlock model, but it is resident on no process: the
         # "without a model causing it" branch (no loaded model can explain the stall).
         assert dispatcher._queue_deadlock_model == _HEAD_MODEL
+        # A permanent budget defer keeps the deadlock set indefinitely; once sustained it is structural.
+        dispatcher._last_queue_deadlock_detected_time = time.time() - 60
         snapshot = dispatcher.get_deadlock_snapshot()
         assert snapshot.indicates_structural_wedge() is True
