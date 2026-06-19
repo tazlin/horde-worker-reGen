@@ -176,6 +176,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.stats_output_frequency = 20.0
     bd.process_timeout = 120
     bd.inference_step_timeout = 60
+    bd.inference_first_step_timeout = 120
     bd.max_inference_attempts = 2
     bd.preload_timeout = 120
     bd.download_timeout = 120

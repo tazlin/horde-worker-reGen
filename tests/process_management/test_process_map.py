@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -190,3 +191,43 @@ class TestSamplingProgressReset:
         assert proc.last_current_step is None
         assert proc.last_total_steps is None
         assert proc.last_iterations_per_second is None
+
+
+class TestFirstStepTimeout:
+    """The first sampling step gets a longer grace than a steady step.
+
+    Before any step is emitted (``last_current_step is None``) the slot is doing one-time pre-sampling
+    work (streaming a large model's components through VRAM, the initial encode) that is legitimately far
+    slower than a steady step. The generous first-step timeout governs that window so a slow cold start is
+    not mistaken for a hang; the tighter per-step timeout applies once a step has been observed.
+    """
+
+    _PER_STEP = 15
+    _FIRST_STEP = 90
+
+    def _starting_proc(self, *, elapsed: float, current_step: int | None) -> ProcessMap:
+        """A slot in INFERENCE_STARTING whose last progress was ``elapsed`` seconds ago."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        proc.last_current_step = current_step
+        proc.last_heartbeat_timestamp = time.time() - elapsed
+        return ProcessMap({0: proc})
+
+    def test_slow_first_step_is_not_killed_before_first_step_timeout(self) -> None:
+        """Pre-first-step, an elapsed time past the per-step timeout but under the first-step one is fine."""
+        process_map = self._starting_proc(elapsed=self._PER_STEP + 10, current_step=None)
+        assert process_map.is_stuck_on_inference(0, self._PER_STEP, self._FIRST_STEP) is False
+
+    def test_first_step_is_killed_past_first_step_timeout(self) -> None:
+        """A genuine pre-first-step hang past the generous first-step timeout is still caught."""
+        process_map = self._starting_proc(elapsed=self._FIRST_STEP + 5, current_step=None)
+        assert process_map.is_stuck_on_inference(0, self._PER_STEP, self._FIRST_STEP) is True
+
+    def test_after_first_step_the_tighter_per_step_timeout_applies(self) -> None:
+        """Once a step has been observed, the tight per-step timeout governs subsequent steps."""
+        process_map = self._starting_proc(elapsed=self._PER_STEP + 10, current_step=3)
+        assert process_map.is_stuck_on_inference(0, self._PER_STEP, self._FIRST_STEP) is True
+
+    def test_omitting_first_step_timeout_preserves_per_step_behaviour(self) -> None:
+        """With no first-step timeout supplied the pre-first-step window uses the per-step timeout."""
+        process_map = self._starting_proc(elapsed=self._PER_STEP + 10, current_step=None)
+        assert process_map.is_stuck_on_inference(0, self._PER_STEP) is True

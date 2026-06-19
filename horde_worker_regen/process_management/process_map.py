@@ -330,6 +330,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self,
         process_id: int,
         inference_step_timeout: int,
+        first_step_timeout: int | None = None,
     ) -> bool:
         """Return true if a process is in inference but has shown no progress within the timeout.
 
@@ -341,12 +342,23 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         silent. It also catches a slot wedged *before* its first step (hung at 0%, having never
         emitted an INFERENCE_STEP): the old heartbeat-type and ``percent_complete < 1`` gates gave
         that case a free pass, which is exactly the 0%-hang gap this overhaul closes.
+
+        The first sampling step is special: before it arrives (``last_current_step is None``, cleared at
+        every job boundary) the slot is still doing one-time pre-sampling work (streaming a large model's
+        components through VRAM, the initial prompt encode) that is legitimately far slower than a
+        steady step. When a ``first_step_timeout`` is supplied it governs that pre-first-step window so a
+        slow cold start is not mistaken for a hang; the tighter per-step timeout applies once at least one
+        step has been observed.
         """
         process_info = self[process_id]
         if process_info.last_process_state != HordeProcessState.INFERENCE_STARTING:
             return False
 
-        return (time.time() - process_info.last_heartbeat_timestamp) > inference_step_timeout
+        timeout = inference_step_timeout
+        if first_step_timeout is not None and process_info.last_current_step is None:
+            timeout = max(inference_step_timeout, first_step_timeout)
+
+        return (time.time() - process_info.last_heartbeat_timestamp) > timeout
 
     def get_capable_processes(self, capability: WorkerCapability) -> list[HordeProcessInfo]:
         """Return all processes declaring the given capability.

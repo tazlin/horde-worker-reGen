@@ -141,6 +141,13 @@ class TrackedJob:
     """Whether this job has already spent its one degraded (isolated) retry for a resource failure."""
     needs_degraded_dispatch: bool = False
     """Set when this job's next dispatch should run degraded/isolated (consumed by the scheduler)."""
+    admitted_over_budget: bool = False
+    """Set when the scheduler admitted this job despite the VRAM budget judging it does not fit.
+
+    Such a job was knowingly over-committed onto a contended device, so a crash/hang of its slot is a
+    resource failure even though the dead slot leaves no message to classify. Carrying the signal on the
+    job lets the fault path route it to the bounded degraded/isolated retry instead of a plain
+    re-dispatch onto another equally-over-committed slot, which would only kill a second process."""
 
 
 @dataclass(frozen=True)
@@ -694,6 +701,22 @@ class JobTracker:
         if tracked is not None:
             tracked.needs_degraded_dispatch = False
 
+    def is_admitted_over_budget(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether this job was admitted against the VRAM budget's verdict (a peek; does not consume)."""
+        tracked = self._tracked_for(job)
+        return tracked is not None and tracked.admitted_over_budget
+
+    def mark_admitted_over_budget(self, job: ImageGenerateJobPopResponse) -> None:
+        """Record that the scheduler admitted this job despite the VRAM budget judging it unfit.
+
+        A subsequent slot crash/hang on this job is then treated as a resource failure (see
+        :attr:`TrackedJob.admitted_over_budget`), earning the bounded degraded/isolated retry rather
+        than a plain re-dispatch onto another over-committed slot.
+        """
+        tracked = self._tracked_for(job)
+        if tracked is not None:
+            tracked.admitted_over_budget = True
+
     async def handle_job_fault(
         self,
         faulted_job: ImageGenerateJobPopResponse,
@@ -759,6 +782,13 @@ class JobTracker:
         if process_info is not None:
             logger.error(f"Job {faulted_job.id_} faulted due to process {process_info.process_id} crashing")
 
+        # A slot that crashed/hung while running a job the scheduler knowingly over-committed (admitted
+        # against the VRAM budget's verdict) is a resource failure even though the dead slot left no
+        # message to classify. Fold that signal in so such a job earns the bounded degraded/isolated
+        # retry (which clears the device for it) rather than a plain re-dispatch onto another
+        # over-committed slot that would only kill a second process.
+        resource_failure = is_resource_failure or tracked.admitted_over_budget
+
         # A job with no pop timestamp was never formally queued (registered late, e.g. mid-flight), so it
         # has no pending-inference position to return to; such a job is always faulted terminally.
         can_retry = (
@@ -766,14 +796,14 @@ class JobTracker:
         )
 
         if can_retry and self._set_stage(tracked, JobStage.PENDING_INFERENCE):
-            degraded = is_resource_failure and not tracked.degraded_retry_used
+            degraded = resource_failure and not tracked.degraded_retry_used
             if degraded:
                 tracked.degraded_retry_used = True
                 tracked.needs_degraded_dispatch = True
             logger.warning(
                 f"Job {faulted_job.id_} inference attempt "
                 f"{tracked.inference_attempts}/{self._max_inference_attempts} failed"
-                f"{' (resource/OOM)' if is_resource_failure else ''}; requeuing for "
+                f"{' (resource/OOM)' if resource_failure else ''}; requeuing for "
                 f"{'a degraded, isolated' if degraded else 'another'} attempt.",
             )
             return InferenceFailureResolution.RETRY_DEGRADED if degraded else InferenceFailureResolution.RETRY
@@ -781,7 +811,7 @@ class JobTracker:
         # Terminal fault: out of attempts, not retryable, or the requeue transition was refused.
         tracked.job_info.fault_job()
         tracked.job_info.time_to_generate = process_timeout
-        self._record_fault_diagnostics(tracked, is_resource_failure=is_resource_failure)
+        self._record_fault_diagnostics(tracked, is_resource_failure=resource_failure)
 
         if self._set_stage(tracked, JobStage.PENDING_SUBMIT):
             # A crash/timeout-faulted job never produces an inference RESULT message, so the

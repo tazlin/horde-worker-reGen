@@ -478,18 +478,26 @@ class InferenceScheduler:
                             under_pressure=True,
                             for_head_of_queue=True,
                         )
-                    # Reclamation is exhausted when nothing more could be freed: the device cannot fit the
-                    # head's predicted peak + reserve even with every idle resident copy evicted, because
-                    # the irreducible floor (each process's CUDA context, plus safety-on-GPU) sits above
-                    # the threshold. On a small-VRAM device a heavy job's burden estimate plus the reserve
-                    # can exceed achievable free VRAM, so deferring would starve the head forever, wedge the
-                    # queue, and the head would be faulted anyway. Admit it best-effort instead when no live
-                    # job holds the device.
+                    # Reclamation is exhausted when nothing more could be freed: the predicted peak + reserve
+                    # exceeds achievable free VRAM even with every idle resident copy evicted. The burden
+                    # estimate is a deliberately conservative single-resident-peak figure, but a large
+                    # combined checkpoint (text encoder + diffusion weights + VAE in one file) is streamed
+                    # through VRAM component-by-component by the backend, so its true peak is the largest
+                    # single component, well under the summed estimate. A head-of-queue job must therefore
+                    # be given the device rather than deferred forever (which would wedge the queue and
+                    # fault the head anyway). Admit it best-effort when no live job holds the device, after
+                    # also reclaiming system RAM from idle residents: a heavy head loads its checkpoint
+                    # through RAM first, so admitting it onto a RAM-pressured host is a likely load-time
+                    # fault. Tag it so a crash/hang of its over-committed slot is classified as a resource
+                    # failure (earning the bounded, isolated retry) instead of a plain re-dispatch onto
+                    # another equally over-committed slot.
                     if not (is_head_blocker and not freed and no_live_resource_consumer):
                         return False
+                    self.unload_models(under_pressure=True, for_head_of_queue=True)
+                    self._job_tracker.mark_admitted_over_budget(job)
                     logger.opt(ansi=True).warning(
                         f"<fg #f0beff>VRAM budget cannot fit head-of-queue model {job.model} even after reclaiming "
-                        "all idle VRAM, and no live job holds the device; admitting it best-effort rather than "
+                        "all idle VRAM/RAM, and no live job holds the device; admitting it best-effort rather than "
                         "wedging the queue.</>",
                     )
                 else:

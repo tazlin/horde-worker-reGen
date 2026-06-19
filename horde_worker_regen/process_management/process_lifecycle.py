@@ -1241,10 +1241,16 @@ class ProcessLifecycleManager:
         if self._recently_recovered:
             return any_replaced
 
+        # The first sampling step (which trails the cold model-load/encode work) gets a longer grace than
+        # a steady step; is_stuck_on_inference floors this at the per-step timeout, so a config value
+        # below it is harmless.
+        first_step_timeout = bridge_data.inference_first_step_timeout
+
         for process_info in list(self._process_map.values()):
             if self._process_map.is_stuck_on_inference(
                 process_info.process_id,
                 bridge_data.inference_step_timeout,
+                first_step_timeout,
             ):
                 logger.error(f"{process_info} seems to be stuck mid inference, replacing it")
                 self._action_ledger.record(

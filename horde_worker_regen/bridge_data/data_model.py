@@ -273,8 +273,19 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     preload_timeout: int = Field(default=80, ge=15)
     """The maximum amount of time to allow a model to load before it is killed"""
-    inference_step_timeout: int = Field(default=15, ge=15, le=30)
-    """The maximum amount of time to allow a single inference step to run before the process is killed"""
+    inference_step_timeout: int = Field(default=20, ge=15, le=60)
+    """The maximum wall-clock time a single sampling step may make no progress before the slot is killed
+    as hung. Kept short so a true hang is caught quickly, but not so short that a momentarily slow step
+    on a busy device is mistaken for one."""
+    inference_first_step_timeout: int = Field(default=90, ge=15, le=600)
+    """The grace for a job's *first* sampling step, which also covers the cold work that precedes it.
+
+    Before the first step a slot may be streaming a large combined checkpoint's components through VRAM
+    (loading and running the text encoder, then loading the diffusion weights) and doing the initial
+    prompt encode, none of which emit a step. That one-time work is legitimately far longer than a
+    steady-state step, so the pre-first-step window uses this generous timeout and only falls back to the
+    tighter ``inference_step_timeout`` once sampling progress has been observed. The watchdog floors the
+    effective first-step grace at ``inference_step_timeout``, so a value below it has no effect."""
 
     max_inference_attempts: int = Field(default=2, ge=1, le=5)
     """How many times a single job may be dispatched to inference before it is reported faulted.

@@ -40,6 +40,7 @@ def _make_plm(*, process_map: ProcessMap | None = None) -> ProcessLifecycleManag
     bridge_data.very_high_memory_mode = False
     bridge_data.process_timeout = 300
     bridge_data.inference_step_timeout = 15
+    bridge_data.inference_first_step_timeout = 90
     bridge_data.preload_timeout = 80
     bridge_data.download_timeout = 120
     bridge_data.post_process_timeout = 60
