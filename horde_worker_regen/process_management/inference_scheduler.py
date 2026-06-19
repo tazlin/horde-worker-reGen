@@ -344,6 +344,13 @@ class InferenceScheduler:
         if loaded_models == pending_models:
             return False
 
+        # The first queued job not already in progress is the head of the queue. Only when *its* model
+        # is the one that cannot be loaded may the budget gate escalate to evicting another queued
+        # model (see the budget-defer branches below); a later job whose turn has not come never
+        # displaces a resident head.
+        in_progress_jobs = self._job_tracker.jobs_in_progress
+        head_job = next((j for j in self._job_tracker.jobs_pending_inference if j not in in_progress_jobs), None)
+
         for job in self._job_tracker.jobs_pending_inference:
             if job.model is None:
                 raise ValueError(f"job.model is None ({job})")
@@ -435,6 +442,8 @@ class InferenceScheduler:
             if self._budget_active():
                 baseline = self._model_metadata.get_baseline(job.model)
 
+                is_head_blocker = head_job is not None and job is head_job
+
                 vram_verdict = self._vram_budget.check_job(job, baseline, self._measured_free_vram_mb())
                 if not vram_verdict.fits:
                     if not self._vram_budget_defer_notified:
@@ -443,7 +452,16 @@ class InferenceScheduler:
                             "Reclaiming idle VRAM.</>",
                         )
                         self._vram_budget_defer_notified = True
-                    self.unload_models_from_vram(available_process, under_pressure=True)
+                    freed = self.unload_models_from_vram(available_process, under_pressure=True)
+                    if not freed and is_head_blocker:
+                        # Gentle reclaim found nothing to free because every idle resident copy is
+                        # another queued job's model. The head of the queue must still make progress,
+                        # so escalate and reclaim one of them to give the head room.
+                        self.unload_models_from_vram(
+                            available_process,
+                            under_pressure=True,
+                            for_head_of_queue=True,
+                        )
                     return False
                 self._vram_budget_defer_notified = False
 
@@ -456,7 +474,10 @@ class InferenceScheduler:
                         )
                         self._ram_budget_defer_notified = True
                     if not self.unload_models(under_pressure=True):
-                        self._replace_stale_ram_unload_process()
+                        # Gentle reclaim freed nothing; for the head of the queue, escalate to reclaim a
+                        # queued model's RAM before falling back to cycling an allocator-stuck idle slot.
+                        if not (is_head_blocker and self.unload_models(under_pressure=True, for_head_of_queue=True)):
+                            self._replace_stale_ram_unload_process()
                     return False
                 self._ram_budget_defer_notified = False
 
@@ -605,14 +626,31 @@ class InferenceScheduler:
                     logger.debug(f"Job {job.id_} not found in jobs_in_progress.")
 
         if process_with_model is None:
-            if (
-                self._preload_delay_notified
-                or self._horde_model_map.is_model_loading(next_job.model)
-                or information_only
-            ):
+            # The head's model is not resident. If it is forecast to load (a preload is already on the
+            # way), let a later already-resident job bypass it so the GPU is not idle while the head
+            # loads; this reduces churn versus evicting to run the head right now. If it is NOT forecast
+            # to load, do not bypass: fall through so the head is the one that gets a process (and the
+            # budget gate makes room for it), rather than being starved behind perpetual bypassers.
+            if self._is_model_forecast_to_load(next_job.model):
+                for candidate_job in next_n_jobs:
+                    if candidate_job.model is None or candidate_job.model == next_job.model:
+                        continue
+                    candidate_process = self._process_map.get_process_by_horde_model_name(candidate_job.model)
+                    if candidate_process is not None and candidate_process.can_accept_job():
+                        line_skip = LineSkip(displaced_job=next_job)
+                        next_job = candidate_job
+                        process_with_model = candidate_process
+                        break
+
+            if process_with_model is None:
+                if (
+                    self._preload_delay_notified
+                    or self._horde_model_map.is_model_loading(next_job.model)
+                    or information_only
+                ):
+                    return None
+                await handle_process_missing(next_job)
                 return None
-            await handle_process_missing(next_job)
-            return None
 
         candidate_job_size = 25
 
@@ -667,16 +705,14 @@ class InferenceScheduler:
         return next_job_and_process
 
     async def start_inference(self) -> bool:
-        """Start inference for the next job in jobs_pending_inference, if possible."""
-        if self._state.shutting_down:
-            # During graceful shutdown, never start a NEW job. The drain grace is sized when shutdown is
-            # armed; a job started afterward cannot finish within it and would be faulted and SIGTERM'd
-            # mid-flight (wasted GPU work plus a fault reported to the horde for work that nearly
-            # succeeded). Already-in-flight jobs keep draining; not-yet-started ones are left for the
-            # shutdown manager to fault-report so the horde reissues them promptly. Mirrors the same
-            # shutting_down gate already on preload_models.
-            return False
+        """Start inference for the next job in jobs_pending_inference, if possible.
 
+        During graceful shutdown the worker keeps draining the queue it already popped rather than
+        faulting it: the job popper stops accepting NEW jobs once shutdown is armed, so the only jobs
+        that can dispatch here are ones accepted before the stop. They are given a chance to finish,
+        bounded by the per-job-scaled shutdown grace and the force-kill backstop; whatever genuinely
+        cannot finish in time is still fault-reported so the horde reissues it promptly.
+        """
         next_job_and_process = await self.get_next_job_and_process()
 
         if next_job_and_process is None:
@@ -866,6 +902,27 @@ class InferenceScheduler:
         wanted.update(j.model for j in self._job_tracker.jobs_in_progress if j.model is not None)
         return wanted
 
+    def _is_model_forecast_to_load(self, model_name: str | None) -> bool:
+        """Whether ``model_name`` is already on track to become resident soon.
+
+        True when the model map marks it loading, or an inference process is currently preloading it or
+        already holds it preloaded. In that case the job needing it will get a process shortly, so a
+        later already-resident job may bypass it to keep the GPU fed rather than the worker idling until
+        the load completes. When the model is *not* forecast to load, no bypass is allowed so the budget
+        gate's room-making runs and that job makes progress instead of being starved behind bypassers.
+        """
+        if model_name is None:
+            return False
+        if self._horde_model_map.is_model_loading(model_name):
+            return True
+        return any(
+            process.process_type == HordeProcessType.INFERENCE
+            and process.loaded_horde_model_name == model_name
+            and process.last_process_state
+            in (HordeProcessState.PRELOADING_MODEL, HordeProcessState.PRELOADED_MODEL)
+            for process in self._process_map.values()
+        )
+
     def _refresh_model_demand(self) -> None:
         """Stamp the current time against every model with live demand (pending/in-progress job).
 
@@ -931,12 +988,21 @@ class InferenceScheduler:
         process_with_model: HordeProcessInfo,
         *,
         under_pressure: bool = False,
-    ) -> None:
+        for_head_of_queue: bool = False,
+    ) -> bool:
         """Unload models from VRAM from processes that are not running a job.
 
         ``under_pressure`` (set by the VRAM budget when the next job does not fit) drops residency
         protection and the single-model hold-back so the coldest idle resident copy is reclaimed,
         while still never touching an in-progress or next-up model.
+
+        ``for_head_of_queue`` is the last-resort escalation when the head-of-queue job cannot be loaded
+        and gentle reclaim freed nothing because every idle resident copy is another *queued* job's
+        model: it additionally overrides the next-up guard so the head can be given room. It never
+        evicts an in-progress (live) model.
+
+        Returns True if an idle resident model's unload was issued (room is on the way), False if there
+        was nothing to reclaim.
         """
         bridge_data = self._runtime_config.bridge_data
         wanted_models = self._compute_wanted_models()
@@ -948,6 +1014,7 @@ class InferenceScheduler:
 
         in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
 
+        unloaded_any = False
         for process_info in self._process_map.values():
             if process_info.process_id == process_with_model.process_id:
                 continue
@@ -966,10 +1033,10 @@ class InferenceScheduler:
                 if process_info.loaded_horde_model_name in in_progress_models:
                     continue
 
-                if process_info.loaded_horde_model_name == next_model:
+                if process_info.loaded_horde_model_name == next_model and not for_head_of_queue:
                     continue
 
-                if self._residency_protects_from_unload(
+                if not for_head_of_queue and self._residency_protects_from_unload(
                     process_info.loaded_horde_model_name,
                     wanted_models,
                     vram=True,
@@ -990,6 +1057,7 @@ class InferenceScheduler:
                     )
                     process_info.last_job_referenced = None
                     process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+                    unloaded_any = True
             else:
                 logger.debug(f"Unloading all models from VRAM on process {process_info.process_id}")
                 if (
@@ -1001,6 +1069,8 @@ class InferenceScheduler:
                     and not self._state.shutting_down
                 ):
                     self._process_lifecycle._replace_inference_process(process_info)
+
+        return unloaded_any
 
     def unload_from_ram(self, process_id: int) -> None:
         """Unload models from a process."""
@@ -1078,12 +1148,17 @@ class InferenceScheduler:
 
         return next_n_models
 
-    def unload_models(self, *, under_pressure: bool = False) -> bool:
+    def unload_models(self, *, under_pressure: bool = False, for_head_of_queue: bool = False) -> bool:
         """Unload one idle model from RAM that is no longer needed; return True if one was unloaded.
 
         ``under_pressure`` (set by the RAM budget when the next job's RAM cost does not fit available
         system memory) drops the RAM residency grace so an idle resident copy is reclaimed rather than
         held, the guard against resident-in-RAM weights forcing the OS to page.
+
+        ``for_head_of_queue`` is the last-resort escalation when the head-of-queue job cannot be loaded
+        and gentle reclaim freed nothing because every idle resident copy is another *queued* job's
+        model: it additionally overrides the still-needed-by-a-pending-job guard so the head can be
+        given room. It never evicts an in-progress (live) model.
         """
         bridge_data = self._runtime_config.bridge_data
 
@@ -1098,6 +1173,7 @@ class InferenceScheduler:
             return False
 
         wanted_models = self._compute_wanted_models()
+        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
 
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
@@ -1117,14 +1193,19 @@ class InferenceScheduler:
                 if model_info is not None and model_info.horde_model_load_state == ModelLoadState.IN_USE:
                     continue
 
-                models_still_needed = {
-                    job.model
-                    for job in (*self._job_tracker.jobs_pending_inference, *self._job_tracker.jobs_in_progress)
-                }
-                if process_info.loaded_horde_model_name in models_still_needed:
+                # Live (in-progress) work is never evicted, even when making room for the head. Pending
+                # (merely queued) models are protected too in the normal path, but the head-of-queue
+                # escalation may reclaim one of them since the head has priority for room.
+                if process_info.loaded_horde_model_name in in_progress_models:
                     continue
+                if not for_head_of_queue:
+                    pending_models = {
+                        job.model for job in self._job_tracker.jobs_pending_inference if job.model is not None
+                    }
+                    if process_info.loaded_horde_model_name in pending_models:
+                        continue
 
-                if self._residency_protects_from_unload(
+                if not for_head_of_queue and self._residency_protects_from_unload(
                     process_info.loaded_horde_model_name,
                     wanted_models,
                     vram=False,

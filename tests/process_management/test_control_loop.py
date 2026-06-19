@@ -63,6 +63,31 @@ class TestControlLoopTick:
 
         assert await process_manager._control_loop_tick() is False
 
+    async def test_shutdown_keeps_inference_processes_up_while_queue_remains(self) -> None:
+        """During a drain, inference processes are not ended while queued inference work remains.
+
+        The popper has already stopped accepting new work, so the queued jobs are given a chance to
+        finish; ending the processes out from under them would fault work that could still complete.
+        """
+        process_manager = _make_tickable_manager()
+        process_manager._state.shutting_down = True
+        process_manager._process_lifecycle.end_inference_processes = Mock()  # type: ignore[method-assign]
+
+        await track_popped_job_async(process_manager._job_tracker, make_mock_job())
+        assert len(process_manager._job_tracker.jobs_pending_inference) == 1
+
+        assert await process_manager._control_loop_tick() is True
+        process_manager._process_lifecycle.end_inference_processes.assert_not_called()
+
+    async def test_shutdown_ends_inference_processes_once_queue_drained(self) -> None:
+        """Once no inference job remains pending or in progress, the drain winds the processes down."""
+        process_manager = _make_tickable_manager()
+        process_manager._state.shutting_down = True
+        process_manager._process_lifecycle.end_inference_processes = Mock()  # type: ignore[method-assign]
+
+        await process_manager._control_loop_tick()
+        process_manager._process_lifecycle.end_inference_processes.assert_called()
+
     async def test_tick_dispatches_pending_safety_check(self) -> None:
         """A tick should send a job pending safety check to an available safety process."""
         process_manager = _make_tickable_manager()

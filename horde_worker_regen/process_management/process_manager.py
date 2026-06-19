@@ -1155,7 +1155,16 @@ class HordeWorkerProcessManager:
             # (no live process for pending work) to a soft reset and finally to giving up cleanly.
             self._run_recovery_supervisor()
 
-            if self._state.shutting_down and not self._state.last_pop_recently():
+            # During graceful shutdown, keep the inference processes up until the queue the worker
+            # already accepted has drained, so those jobs get a chance to finish (the popper has
+            # already stopped accepting new work). Only wind the processes down once no inference job
+            # remains pending or in progress; the submitter and safety pools keep draining the tail.
+            if (
+                self._state.shutting_down
+                and not self._state.last_pop_recently()
+                and len(self._job_tracker.jobs_pending_inference) == 0
+                and len(self._job_tracker.jobs_in_progress) == 0
+            ):
                 self._process_lifecycle.end_inference_processes()
 
             if self.is_time_for_shutdown():

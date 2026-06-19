@@ -216,6 +216,40 @@ class TestGetNextJobAndProcess:
         inference_scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
         assert await inference_scheduler.get_next_job_and_process() is None
 
+    async def test_forecast_head_lets_resident_job_bypass(self) -> None:
+        """When the head's model is forecast to load, a later resident-model job bypasses it."""
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+        hmm = HordeModelMap(root={})
+        hmm.update_entry(horde_model_name="big_a", load_state=ModelLoadState.LOADING, process_id=1)
+
+        job_tracker = JobTracker()
+        head_job = make_job_pop_response("big_a")
+        bypass_job = make_job_pop_response("resident_b")
+        await track_popped_job_async(job_tracker, head_job)
+        await track_popped_job_async(job_tracker, bypass_job)
+
+        sched = _make_inference_scheduler(process_map=process_map, horde_model_map=hmm, job_tracker=job_tracker)
+        result = await sched.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is bypass_job
+        assert result.process_with_model is holder
+        assert result.line_skip is not None
+        assert result.line_skip.displaced_job is head_job
+
+    async def test_non_forecast_head_does_not_bypass(self) -> None:
+        """When the head's model is not forecast to load, no bypass occurs so the head gets priority."""
+        holder = make_mock_process_info(1, model_name="resident_b", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: holder})
+
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("big_a"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("resident_b"))
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        assert await sched.get_next_job_and_process() is None
+
     async def test_max_concurrent_reached_returns_none(self) -> None:
         """get_next_job_and_process should return None if the maximum number of concurrent jobs is reached."""
         process_info = make_mock_process_info(
@@ -343,12 +377,12 @@ class TestStartInference:
         assert result is True
         assert job not in job_tracker.jobs_in_progress
 
-    async def test_no_new_dispatch_during_shutdown(self) -> None:
-        """Once shutdown is requested, start_inference must not start a new job.
+    async def test_resident_job_dispatches_during_shutdown(self) -> None:
+        """During graceful shutdown, an already-queued job whose model is resident still dispatches.
 
-        A job started during the drain cannot finish within the shutdown grace (sized when shutdown is
-        armed) and would be faulted and SIGTERM'd mid-flight, wasting GPU work and reporting a fault for
-        work that nearly succeeded. The job is left pending for the shutdown manager to fault-report.
+        The popper stops accepting new work once shutdown is armed, so the only jobs that can start
+        here were accepted before the stop. They are given a chance to finish (bounded by the shutdown
+        grace and the force-kill backstop) rather than being faulted without ever running.
         """
         process_info = make_mock_process_info(
             0,
@@ -378,9 +412,9 @@ class TestStartInference:
         )
 
         result = await inference_scheduler.start_inference()
-        assert result is False
-        assert job not in job_tracker.jobs_in_progress
-        assert process_info.last_control_flag != HordeControlFlag.START_INFERENCE
+        assert result is True
+        assert job in job_tracker.jobs_in_progress
+        assert process_info.last_control_flag == HordeControlFlag.START_INFERENCE
 
 
 class TestUnloadModels:
@@ -506,6 +540,60 @@ class TestUnloadModels:
             process_info,
             intentional_reclaim=True,
         )
+
+
+class TestHeadOfQueueMakeRoom:
+    """The head-of-queue job must keep making progress: when its model cannot be loaded and only
+
+    other queued jobs' models are idle-resident, the budget gate escalates to evict one of them so
+    the head gets room, rather than starving the whole worker behind an un-loadable head.
+    """
+
+    async def _scheduler_with_head_blocked(self) -> tuple[InferenceScheduler, "Mock"]:
+        """A model-less preload slot, a slot holding a *queued* model, and a non-resident head job."""
+        target = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        holder = make_mock_process_info(1, model_name="queued_b", state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: target, 1: holder})
+
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("big_a"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("queued_b"))
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker, max_inference=2)
+        return sched, holder
+
+    async def test_ram_escalation_overrides_pending_guard(self) -> None:
+        """Gentle RAM reclaim spares a still-queued model; the head escalation may reclaim it."""
+        sched, holder = await self._scheduler_with_head_blocked()
+
+        assert sched.unload_models(under_pressure=True) is False
+        assert sched.unload_models(under_pressure=True, for_head_of_queue=True) is True
+
+    async def test_vram_escalation_overrides_next_model_guard_and_reports(self) -> None:
+        """Gentle VRAM reclaim spares the next-up model; the head escalation reclaims it and reports."""
+        sched, holder = await self._scheduler_with_head_blocked()
+        target = sched._process_map[0]
+
+        assert sched.unload_models_from_vram(target, under_pressure=True) is False
+        assert holder.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+        assert sched.unload_models_from_vram(target, under_pressure=True, for_head_of_queue=True) is True
+        assert holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+    async def test_preload_makes_room_for_head_instead_of_wedging(self) -> None:
+        """When the head model does not fit VRAM and only queued models are resident, preload evicts one."""
+        sched, holder = await self._scheduler_with_head_blocked()
+
+        sched._budget_active = Mock(return_value=True)  # type: ignore[method-assign]
+        sched._measured_free_vram_mb = Mock(return_value=1000.0)  # type: ignore[method-assign]
+        sched._vram_budget = Mock()
+        sched._vram_budget.check_job.return_value = Mock(fits=False, reason=Mock(return_value="does not fit"))
+
+        sched.preload_models()
+
+        # The head's blocker triggered the escalation: the only idle resident copy (another queued
+        # job's model) was unloaded from VRAM to give the head room, so the worker does not wedge.
+        assert holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
 
 class TestSpeculativeDispatchCap:
