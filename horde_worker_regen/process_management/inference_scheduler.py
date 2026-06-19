@@ -454,6 +454,11 @@ class InferenceScheduler:
             # (overriding residency under pressure) and defer this preload rather than over-committing.
             if self._budget_active():
                 baseline = self._model_metadata.get_baseline(job.model)
+                # A single model loaded onto an otherwise-idle GPU cannot reintroduce the multi-process
+                # over-commit the budget guards against; the over-commit case is several *concurrent*
+                # resident models. So when no job is in-flight (holding the device), a starved head may be
+                # admitted best-effort rather than deferred forever (see the branches below).
+                no_live_resource_consumer = len(self._job_tracker.jobs_in_progress) == 0
 
                 vram_verdict = self._vram_budget.check_job(job, baseline, self._measured_free_vram_mb())
                 if not vram_verdict.fits:
@@ -468,29 +473,58 @@ class InferenceScheduler:
                         # Gentle reclaim found nothing to free because every idle resident copy is
                         # another queued job's model. The head of the queue must still make progress,
                         # so escalate and reclaim one of them to give the head room.
-                        self.unload_models_from_vram(
+                        freed = self.unload_models_from_vram(
                             available_process,
                             under_pressure=True,
                             for_head_of_queue=True,
                         )
-                    return False
-                self._vram_budget_defer_notified = False
+                    # Reclamation is exhausted when nothing more could be freed: the device cannot fit the
+                    # head's predicted peak + reserve even with every idle resident copy evicted, because
+                    # the irreducible floor (each process's CUDA context, plus safety-on-GPU) sits above
+                    # the threshold. On a small-VRAM device a heavy job's burden estimate plus the reserve
+                    # can exceed achievable free VRAM, so deferring would starve the head forever, wedge the
+                    # queue, and the head would be faulted anyway. Admit it best-effort instead when no live
+                    # job holds the device.
+                    if not (is_head_blocker and not freed and no_live_resource_consumer):
+                        return False
+                    logger.opt(ansi=True).warning(
+                        f"<fg #f0beff>VRAM budget cannot fit head-of-queue model {job.model} even after reclaiming "
+                        "all idle VRAM, and no live job holds the device; admitting it best-effort rather than "
+                        "wedging the queue.</>",
+                    )
+                else:
+                    self._vram_budget_defer_notified = False
 
-                ram_verdict = self._ram_budget.check_job(job, baseline, self._measured_available_ram_mb())
-                if not ram_verdict.fits:
-                    if not self._ram_budget_defer_notified:
-                        logger.opt(ansi=True).warning(
-                            f"<fg #f0beff>RAM budget deferring preload of {job.model}: {ram_verdict.reason()}. "
-                            "Reclaiming idle RAM.</>",
-                        )
-                        self._ram_budget_defer_notified = True
-                    if not self.unload_models(under_pressure=True):
-                        # Gentle reclaim freed nothing; for the head of the queue, escalate to reclaim a
-                        # queued model's RAM before falling back to cycling an allocator-stuck idle slot.
-                        if not (is_head_blocker and self.unload_models(under_pressure=True, for_head_of_queue=True)):
-                            self._replace_stale_ram_unload_process()
-                    return False
-                self._ram_budget_defer_notified = False
+                    ram_verdict = self._ram_budget.check_job(job, baseline, self._measured_available_ram_mb())
+                    if not ram_verdict.fits:
+                        if not self._ram_budget_defer_notified:
+                            logger.opt(ansi=True).warning(
+                                f"<fg #f0beff>RAM budget deferring preload of {job.model}: {ram_verdict.reason()}. "
+                                "Reclaiming idle RAM.</>",
+                            )
+                            self._ram_budget_defer_notified = True
+                        reclaimed = self.unload_models(under_pressure=True)
+                        if not reclaimed and is_head_blocker:
+                            # Gentle reclaim freed nothing; for the head of the queue, escalate to reclaim a
+                            # queued model's RAM before falling back to cycling an allocator-stuck idle slot.
+                            reclaimed = self.unload_models(under_pressure=True, for_head_of_queue=True)
+                        if not reclaimed:
+                            cycled = self._replace_stale_ram_unload_process()
+                            # Cycling a stuck idle slot reclaims RAM by restarting it, so wait for that.
+                            # Only when even cycling finds nothing to reclaim (and no live job holds RAM)
+                            # is the head truly unservable by waiting; admit it best-effort then, mirroring
+                            # the VRAM branch, rather than starving it.
+                            if not (is_head_blocker and not cycled and no_live_resource_consumer):
+                                return False
+                            logger.opt(ansi=True).warning(
+                                f"<fg #f0beff>RAM budget cannot fit head-of-queue model {job.model} even after "
+                                "reclaiming all idle RAM, and no live job holds memory; admitting it best-effort "
+                                "rather than wedging the queue.</>",
+                            )
+                        else:
+                            return False
+                    else:
+                        self._ram_budget_defer_notified = False
 
             self._preload_delay_notified = False
             logger.debug(f"Preloading model {job.model} on process {available_process.process_id}")
