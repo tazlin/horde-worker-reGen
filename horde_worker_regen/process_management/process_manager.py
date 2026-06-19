@@ -951,7 +951,7 @@ class HordeWorkerProcessManager:
         (``high_memory_mode``/``very_high_memory_mode``) are combined with a model set or queue depth
         that can over-commit the device, the operator is told up front that the budget will evict
         resident models under measured pressure (so any eviction churn they see later is expected and
-        the fix is to reduce the model set or disable the mode). The runtime budget is the actual
+        the remedy is to reduce the model set or disable the mode). The runtime budget is the actual
         enforcement; this only surfaces the posture.
         """
         if not self.bridge_data.enable_vram_budget:
@@ -1574,11 +1574,15 @@ class HordeWorkerProcessManager:
         if self._state.shutting_down:
             return False
         structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
-        if structural_queue_wedge and self._inference_scheduler.whole_card_residency_grace_active():
-            # The queue is deliberately held while a whole-card residency establishes (idle siblings
-            # stopping, the safety process cycling off-GPU, ~11GB of weights loading). That is the worker
-            # doing exactly the right thing, not a wedge, so do not let it soft-reset the pools mid-setup.
-            # The grace is bounded, so a residency that genuinely never loads still trips the supervisor.
+        if structural_queue_wedge and (
+            self._inference_scheduler.whole_card_residency_grace_active()
+            or self._inference_scheduler.heavy_head_load_grace_active()
+        ):
+            # The queue is deliberately held while a heavy head loads: either a whole-card residency
+            # establishing (idle siblings stopping, the safety process cycling off-GPU, ~11GB of weights
+            # loading) or a streams-even-alone head admitted best-effort off that path. Both are the worker
+            # doing the right thing, not a wedge, so do not let it soft-reset the pools mid-load. Both graces
+            # are bounded, so a load that genuinely never completes still trips the supervisor.
             structural_queue_wedge = False
         return (
             self._is_inference_pool_unrecoverable()

@@ -2,8 +2,8 @@
 
 The worker spawns several inference processes that each load models into the *same* GPU
 independently. Without a shared accountant, nothing stops their combined resident footprint from
-exceeding device VRAM, which is the multi-process over-commit that produced the observed live OOM
-(several processes resident, ~277 MiB free, death during tiled VAE decode).
+exceeding device VRAM: a multi-process over-commit that drives the device out of memory once a
+transient spike (a tiled VAE decode, say) lands with several models resident and little free VRAM left.
 
 This module predicts a job's peak VRAM from hordelib's per-job burden estimate
 (:func:`hordelib.api.estimate_job_burden`, the same estimate the benchmark pre-flight trusts) and
@@ -166,18 +166,57 @@ class StreamForecast:
     """Device total VRAM (MB), or None when unknown. Kept so the forecast can size a partial teardown."""
     per_process_overhead_mb: float = 0.0
     """Per-process runtime/context VRAM (MB). Kept so the forecast can size a partial teardown."""
+    base_reserve_mb: float | None = None
+    """The bounded inference-reserve floor (ComfyUI ``minimum_inference_memory`` / the configured floor).
+
+    Sizes the decisions about the persistent *weight* footprint (``fits_alone``, ``streams_unavoidably``,
+    and the weight-headroom gate), as distinct from the activation-inclusive ``reserve_mb`` that sizes the
+    co-resident streaming check and the teardown *depth*. Folding the conservative, batch-and-resolution
+    scaled activation peak into every fit decision conflates a transient activation spike with the persistent
+    footprint: it can flip a moderate-weight model into claiming the whole card, or push a model whose weights
+    fit alone marginally past free-if-alone so it falsely reads as streaming-unavoidable. Keeping the weight
+    decisions on this bounded floor holds them independent of the activation estimate. None falls back to
+    ``reserve_mb`` so a directly-constructed forecast keeps its prior single-reserve behavior."""
 
     @property
     def known(self) -> bool:
         """Whether enough is known (weight estimate and a current measurement) to forecast at all."""
         return self.weights_mb is not None and self.free_now_mb is not None
 
-    def _fits(self, free_mb: float | None) -> bool:
-        """Whether the weights plus the reserve fit within ``free_mb`` (None capacity admits)."""
+    @property
+    def _effective_base_reserve(self) -> float:
+        """The bounded weight-footprint reserve, falling back to ``reserve_mb`` when unset."""
+        return self.base_reserve_mb if self.base_reserve_mb is not None else self.reserve_mb
+
+    def _fits(self, free_mb: float | None, reserve_mb: float) -> bool:
+        """Whether the weights plus ``reserve_mb`` fit within ``free_mb`` (None capacity admits)."""
         if not self.known or free_mb is None:
             return True
         assert self.weights_mb is not None
-        return (free_mb - self.weights_mb) >= self.reserve_mb
+        return (free_mb - self.weights_mb) >= reserve_mb
+
+    def _fits_peak(self, free_mb: float | None) -> bool:
+        """Whether the weights plus the activation-inclusive reserve fit (the co-resident streaming test)."""
+        return self._fits(free_mb, self.reserve_mb)
+
+    def _fits_weights(self, free_mb: float | None) -> bool:
+        """Whether the persistent weight footprint plus the bounded floor fits (the residency test)."""
+        return self._fits(free_mb, self._effective_base_reserve)
+
+    @property
+    def _weights_dominant(self) -> bool:
+        """Whether the model is too heavy to co-reside with even one sibling context (a whole-card model).
+
+        Tearing down sibling *processes* only reclaims their fixed ~1GB CUDA contexts, so it helps a model
+        whose own weights-plus-activations leave no room for another context, not one whose large estimate is
+        a transient activation spike. The gate is keyed on the activation-inclusive peak against the ceiling
+        of sole-occupancy-plus-one-sibling-context (``total - 2*overhead``): a model that cannot fit even
+        there genuinely needs the card. When total VRAM or the per-process overhead is unknown (a
+        directly-constructed forecast) it defaults True, preserving the prior, more eager behavior.
+        """
+        if self.total_vram_mb is None or self.per_process_overhead_mb <= 0:
+            return True
+        return not self._fits_peak(self.total_vram_mb - 2 * self.per_process_overhead_mb)
 
     @property
     def fits_coresident(self) -> bool:
@@ -189,36 +228,55 @@ class StreamForecast:
         allocated) from admitting a heavy model that then collapses free VRAM as those contexts appear.
         Unknown cost or a cold start admits (True) so the forecast never blocks a load on a guess.
         """
-        return self._fits(self.free_now_mb) and self._fits(self.free_after_model_evict_mb)
+        return self._fits_peak(self.free_now_mb) and self._fits_peak(self.free_after_model_evict_mb)
 
     @property
     def fits_after_model_evict(self) -> bool:
         """True when evicting sibling *models* (their contexts remaining) leaves enough headroom."""
-        return self._fits(self.free_after_model_evict_mb)
+        return self._fits_peak(self.free_after_model_evict_mb)
 
     @property
     def fits_alone(self) -> bool:
-        """True when sole residency (siblings stopped, contexts reclaimed) avoids streaming."""
-        return self._fits(self.free_if_alone_mb)
+        """True when sole residency (siblings stopped) fits the persistent weight footprint.
+
+        Keyed on the bounded weight reserve, not the activation-inclusive peak: a model whose *weights* fit
+        the card alone is servable via whole-card residency (it loads with the bounded inference reserve free
+        and runs, slowly at high resolution, under the over-budget step grace). Sizing this on the conservative
+        activation peak instead can push a model whose weights fit alone marginally past free-if-alone, so it
+        falsely reads as streaming-unavoidable and skips the clean whole-card path.
+        """
+        return self._fits_weights(self.free_if_alone_mb)
 
     @property
     def needs_exclusive_residency(self) -> bool:
-        """Streams if co-resident but fits alone: the scheduler should give it the whole card."""
-        return self.known and not self.fits_coresident and self.fits_alone
+        """Streams co-resident, fits alone, and is weight-dominant: the scheduler should give it the whole card.
+
+        The ``_weights_dominant`` gate is what distinguishes a genuine whole-card model (Flux: heavy weights
+        leave no room for a sibling context) from a moderate-weight model with a large transient activation
+        estimate (SDXL at a big batch/resolution: it can co-reside, so it must reclaim a sibling *model*
+        through the normal budget path, not claim the device and tear down sibling *processes*).
+        """
+        return self.known and not self.fits_coresident and self.fits_alone and self._weights_dominant
 
     @property
     def requires_sibling_teardown(self) -> bool:
-        """The model cannot fit even after sibling models are evicted, but fits with the card to itself.
+        """The model cannot fit even after sibling models are evicted, fits alone, and is weight-dominant.
 
         When True, dropping the siblings' resident models is not enough: their fixed per-process contexts
         themselves over-commit the device, so the scheduler must *stop* idle sibling processes to reclaim
         that VRAM (a context is only freed by the process exiting, never by emptying the allocator cache).
+        Gated on ``_weights_dominant`` so only a genuinely card-filling model triggers a process teardown.
         """
-        return self.known and not self.fits_after_model_evict and self.fits_alone
+        return self.known and not self.fits_after_model_evict and self.fits_alone and self._weights_dominant
 
     @property
     def streams_unavoidably(self) -> bool:
-        """Streams even with the whole device to itself (e.g. fp16 weights on a too-small card)."""
+        """Streams even with the whole device to itself (e.g. fp16 weights on a too-small card).
+
+        Weight-based (via ``fits_alone``): only a model whose persistent weights overflow the card alone is
+        truly unservable. A heavy-activation model whose weights fit alone is not unavoidable, it just needs
+        sole residency.
+        """
         return self.known and not self.fits_alone
 
     def max_resident_processes(self) -> int | None:
@@ -249,11 +307,13 @@ class StreamForecast:
         after_evict = f"{self.free_after_model_evict_mb:.0f}" if self.free_after_model_evict_mb is not None else "?"
         alone = f"{self.free_if_alone_mb:.0f}" if self.free_if_alone_mb is not None else "?"
         if not self.fits_alone:
-            verdict = "streams even alone"
+            verdict = "weights overflow the card alone: streams unavoidably"
         elif self.requires_sibling_teardown:
-            verdict = "needs sibling processes stopped (their contexts over-commit the card)"
+            verdict = "weight-dominant: needs idle sibling processes stopped (their contexts over-commit the card)"
+        elif self.needs_exclusive_residency:
+            verdict = "weight-dominant: needs sole residency (evict sibling models)"
         else:
-            verdict = "evicting sibling models avoids streaming"
+            verdict = "activation peak only (not weight-dominant): co-resident after evicting a sibling model"
         return (
             f"weights ~{self.weights_mb:.0f} MB + {self.reserve_mb:.0f} MB reserve exceed "
             f"{self.free_now_mb:.0f} MB free (after model evict: {after_evict} MB, alone: {alone} MB): {verdict}"
@@ -427,6 +487,7 @@ def forecast_weight_streaming(
     return StreamForecast(
         weights_mb=weights_mb,
         reserve_mb=reserve_mb,
+        base_reserve_mb=base_reserve_mb,
         free_now_mb=free_now_mb,
         free_if_alone_mb=free_if_alone_mb,
         free_after_model_evict_mb=free_after_model_evict_mb,
@@ -604,7 +665,7 @@ class RamBudget:
 
     The RAM analogue of :class:`VramBudget`. ``high_memory_mode`` keeps model weights resident in
     system RAM as well as VRAM; with several processes that can exhaust RAM and force the OS to page
-    to disk (observed in the live run as a worker paging out under load), which collapses throughput.
+    to disk, which collapses throughput.
     The available-RAM figure is system-wide (it already reflects every process), so like the VRAM
     budget this needs no per-process bookkeeping.
     """

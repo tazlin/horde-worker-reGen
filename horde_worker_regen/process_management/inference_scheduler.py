@@ -90,16 +90,24 @@ _WHOLE_CARD_RESTORE_GRACE_SECONDS = 60.0
 """How long after a whole-card residency is *restored* the recovery supervisor keeps ignoring a queue
 wedge. Restoring respawns the torn-down sibling inference processes and cycles the safety process back
 on-GPU, each a ~20s spawn during which the queue is briefly unservable. Without this grace that churn
-looks like a structural wedge and soft-resets the pools (observed), which then cascades into further
-whole-card churn and more resets. Covers the respawn window; bounded so a genuine post-restore wedge
-still trips the supervisor."""
+looks like a structural wedge and soft-resets the pools, which then cascades into further whole-card
+churn and more resets. Covers the respawn window; bounded so a genuine post-restore wedge still trips
+the supervisor."""
+
+_HEAVY_HEAD_LOAD_GRACE_SECONDS = 120.0
+"""How long after a heavy head is admitted best-effort (the over-budget exclusive path, taken when a
+model streams even with the whole card to itself, e.g. an fp16 checkpoint on a small device) the recovery
+supervisor keeps ignoring a queue wedge. Such a head bypasses the whole-card branch, so it is not covered
+by ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS``, yet its multi-gigabyte load equally holds the queue and must
+not be mistaken for a structural wedge that faults the never-run backlog. Bounded so a head that genuinely
+never loads still trips the supervisor."""
 
 _SCHEDULER_DIAGNOSTIC_REPEAT_SECONDS = 30.0
 """Minimum cadence for unchanged high-frequency scheduler diagnostics.
 
 These diagnostics are useful when reconstructing residency and performance behavior, but they sit inside
-the scheduler's fast polling loop. Log immediately when the observed decision state changes, otherwise emit
-only periodic reminders with a suppressed-repeat count.
+the scheduler's fast polling loop. Log immediately when the decision state changes, otherwise emit only
+periodic reminders with a suppressed-repeat count.
 """
 
 _SCHEDULER_DIAGNOSTIC_MB_BUCKET = 256.0
@@ -224,6 +232,10 @@ class InferenceScheduler:
         # snapshot can show the hard numbers (weights, reserve, free-if-alone) without re-running it.
         # None when no residency is held.
         self._whole_card_forecast: StreamForecast | None = None
+        # When a heavy head was last admitted best-effort off the whole-card path (the over-budget exclusive
+        # branch, for a model that streams even alone). Its load equally holds the queue, so this bounds a
+        # wedge grace that the whole-card establishment grace does not cover. 0.0 when none is loading.
+        self._heavy_head_admitted_at: float = 0.0
         # Head-of-queue starvation backstop. Tracks the id of the job currently at the head of the queue
         # and when it first became budget-deferred onto an idle device, so a head that the budget gate
         # cannot fit (reclamation structurally exhausted) is force-admitted before the sustained-wedge
@@ -403,9 +415,9 @@ class InferenceScheduler:
     def _log_overbudget_admit(self, job: ImageGenerateJobPopResponse) -> None:
         """Log a best-effort over-budget admit with the residency/measurement picture (live diagnostics).
 
-        Captures, in one line a future live run can grep, the model admitted against the budget, whether
-        it runs exclusively, its prior over-budget fault streak, and the per-slot residency + device-wide
-        free VRAM at admit time (the over-commit signature: e.g. another slot resident while this loads).
+        Captures, in one greppable line, the model admitted against the budget, whether it runs
+        exclusively, its prior over-budget fault streak, and the per-slot residency + device-wide free
+        VRAM at admit time (the over-commit signature: e.g. another slot resident while this loads).
         """
         exclusive = self._runtime_config.bridge_data.overbudget_exclusive_mode
         fault_count = self._job_tracker.get_model_overbudget_fault_count(job.model)
@@ -471,7 +483,7 @@ class InferenceScheduler:
         # Count the safety context only when safety is *actually* on the GPU right now: once a whole-card
         # job has paused it off-GPU, its context is freed, so continuing to charge it would keep the
         # structural floor (free_after_model_evict) below the model's demand forever and the whole-card
-        # branch would defer the model every tick without ever loading it (an observed live wedge).
+        # branch would defer the model every tick without ever loading it.
         safety_on_gpu = self._runtime_config.bridge_data.safety_on_gpu and (
             not self._process_lifecycle.is_safety_gpu_paused
         )
@@ -554,6 +566,19 @@ class InferenceScheduler:
             and (now - self._whole_card_restore_at) < _WHOLE_CARD_RESTORE_GRACE_SECONDS
         )
         return establishing or restoring
+
+    def heavy_head_load_grace_active(self) -> bool:
+        """Whether a heavy head admitted off the whole-card path is still inside its bounded load window.
+
+        A model that streams even with the whole card to itself never enters the whole-card branch, so
+        ``whole_card_residency_grace_active`` does not cover it; but its multi-gigabyte load holds the queue
+        just the same. While true the recovery supervisor must not treat that deliberate hold as a structural
+        wedge and give up the never-run backlog. Bounded by ``_HEAVY_HEAD_LOAD_GRACE_SECONDS`` so a head that
+        genuinely never loads still trips the supervisor. Public: read by the process manager's wedge assessment.
+        """
+        if self._heavy_head_admitted_at == 0.0:
+            return False
+        return (time.time() - self._heavy_head_admitted_at) < _HEAVY_HEAD_LOAD_GRACE_SECONDS
 
     def whole_card_residency_state(self) -> WholeCardResidencyState:
         """Return a read-only view of the whole-card residency posture, for the status snapshot/TUI.
@@ -866,8 +891,8 @@ class InferenceScheduler:
                 continue
 
             # An exclusively-admitted over-budget job has the whole device; do not stage another model's
-            # weights concurrently (the second resident load is exactly what spilled the live run's Flux
-            # job to system RAM). The exclusive job's own preload is still allowed through.
+            # weights concurrently (a second resident load is exactly what spills the exclusive job's
+            # weights to system RAM). The exclusive job's own preload is still allowed through.
             if self._job_tracker.has_exclusive_job_in_progress() and not self._job_tracker.is_admitted_exclusive(
                 job,
             ):
@@ -995,7 +1020,7 @@ class InferenceScheduler:
                 # stream even with the whole card to themselves (streams_unavoidably) fall through to the
                 # best-effort admit below.
                 forecast = self._forecast_streaming(job, baseline)
-                # Trace the forecast for every budget-gated load so a live run shows the residency dynamics
+                # Trace the forecast for every budget-gated load so the logs show the residency dynamics
                 # (the numbers behind a stream/no-stream decision), not just the action taken. Kept at DEBUG
                 # because it can be per-pending-job per-tick; unchanged observations are coalesced by
                 # _log_stream_forecast, while decision or headroom changes still log immediately.
@@ -1027,6 +1052,10 @@ class InferenceScheduler:
                 )
                 if force_admit_starved_head:
                     self._log_head_starvation_force_admit(job)
+                    if not self._job_tracker.is_admitted_over_budget(job):
+                        # First admit of this heavy head: open the bounded load grace so the supervisor does
+                        # not read its multi-gigabyte load as a structural wedge (see heavy_head_load_grace_active).
+                        self._heavy_head_admitted_at = time.time()
                     self._job_tracker.mark_admitted_over_budget(job)
                     if self._runtime_config.bridge_data.overbudget_exclusive_mode:
                         self._job_tracker.mark_admitted_exclusive(job)
@@ -1082,9 +1111,13 @@ class InferenceScheduler:
                         self._unservable_admit_notified.pop(job.model, None)
 
                         self.unload_models(under_pressure=True, for_head_of_queue=True)
+                        if not self._job_tracker.is_admitted_over_budget(job):
+                            # First admit of this heavy head: open the bounded load grace (see
+                            # heavy_head_load_grace_active) so its load is not mistaken for a structural wedge.
+                            self._heavy_head_admitted_at = time.time()
                         self._job_tracker.mark_admitted_over_budget(job)
-                        # Exclusive-first: the live storm came from a *second* process loading another model
-                        # while the over-budget job sampled, pushing free VRAM to ~0 and spilling its weights to
+                        # Exclusive-first: contention arises when a *second* process loads another model while
+                        # the over-budget job samples, pushing free VRAM to ~0 and spilling its weights to
                         # system RAM. Flag the job exclusive so the scheduler suppresses concurrent pre-staging
                         # and dispatch for its duration, leaving the device un-contended so it can complete
                         # (slowly, under the over-budget step grace) instead of being killed as a hang.
