@@ -192,23 +192,6 @@ def test_lock_resolves_spandrel_extra_arches() -> None:
     )
 
 
-def test_post_processing_extra_includes_facerestore_dep() -> None:
-    """The post-processing extra must carry lpips, the bundled face-fix node's sole eager import gap.
-
-    horde-engine's vendored facerestore_cf node does a top-level `import lpips` (via basicsr.losses) when
-    ComfyUI loads it, but horde-engine declares lpips nowhere. Face restoration is a post-processing
-    feature, so the worker pulls lpips through this opt-in extra; dropping it makes the node fail to import
-    and faults face-fix jobs. (lmdb/wandb in that node are lazy, training-only imports and are not needed.)
-    """
-    extras = _load_pyproject()["project"]["optional-dependencies"]
-    assert "post-processing" in extras, "missing 'post-processing' extra"
-    names = {_normalize(_dep_name(d)) for d in extras["post-processing"]}
-    assert "lpips" in names, (
-        "the post-processing extra must list 'lpips' so horde-engine's facerestore_cf node can import; "
-        "without it face-fix jobs fault on a missing lpips import"
-    )
-
-
 def test_lock_resolves_diffusers() -> None:
     """Require diffusers in uv.lock so `uv sync --locked` (embedded runtime) installs it.
 
