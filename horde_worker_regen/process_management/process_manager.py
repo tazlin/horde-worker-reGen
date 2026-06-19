@@ -1471,16 +1471,19 @@ class HordeWorkerProcessManager:
         """Whether the worker structurally cannot make progress (the SOS/save-our-ship trigger).
 
         Keyed on the crash-loop signals (every inference slot quarantined, or the safety pool
-        crash-looping with no healthy process), detected scheduler deadlocks, plus a recurring
-        orphaned-job storm, not on transient capacity gaps. A merely slow, busy, replacing, or
-        model-loading worker trips none of these, so a healthy worker is never wedged.
+        crash-looping with no healthy process), a sustained *queue* deadlock (pending inference work with
+        every process idle), plus a recurring orphaned-job storm, not on transient capacity gaps. A merely
+        slow, busy, replacing, or model-loading worker trips none of these, so a healthy worker is never
+        wedged. Note the *general* deadlock flag is intentionally not a wedge signal: it also fires for a
+        job draining through the safety/submit tail during a queue lull (see
+        ``DeadlockSnapshot.indicates_structural_wedge``).
         """
         if self._state.shutting_down:
             return False
         return (
             self._is_inference_pool_unrecoverable()
             or self._is_safety_pool_unrecoverable()
-            or self._message_dispatcher.get_deadlock_snapshot().has_active_deadlock()
+            or self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
             or self._orphan_wedge_active()
         )
 

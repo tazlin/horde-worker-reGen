@@ -10,9 +10,13 @@ This module verifies the configuration *before* any processes spawn:
 1. A local check (no network): names must not be the reserved defaults, and the alchemist name must
    differ from the dreamer name when alchemy is enabled.
 2. A network check: each enabled name must be either unregistered (a brand-new worker, the normal
-   first-run case) or already owned by the configured API key. Per the project's chosen policy this
-    hard-fails on *any* failure, including the API being unreachable (after a small bounded retry),
-   so the worker never silently runs under a name the horde will reject.
+   first-run case) or already owned by the configured API key. Ownership is accepted on *either* the
+   worker id appearing in the account's worker_ids OR the worker's owner matching the authenticated
+   username, because the user-details worker_ids list can lag or omit a worker the account genuinely
+   owns (right after a fresh registration, or once an idle worker is pruned from the list while still
+   findable by name). Per the project's chosen policy this hard-fails on *any* failure, including the
+   API being unreachable (after a small bounded retry), so the worker never silently runs under a
+   name the horde will reject.
 """
 
 from __future__ import annotations
@@ -91,20 +95,20 @@ def _verify_worker_names_owned(bridge_data: reGenBridgeData) -> None:
     last_error: Exception | None = None
     for attempt in range(_OWNERSHIP_CHECK_ATTEMPTS):
         try:
-            owned_worker_ids = _fetch_owned_worker_ids(bridge_data.api_key)
+            owned_worker_ids, account_username = _fetch_account_identity(bridge_data.api_key)
             simple_client = AIHordeAPISimpleClient()
             for name in names:
                 worker = _lookup_worker(simple_client, name, bridge_data.api_key)
                 if worker is None:
                     logger.info(f"Worker name {name!r} is not yet registered; it will be created on first pop.")
                     continue
-                if str(worker.id_) not in owned_worker_ids:
+                if not _worker_is_owned_by_account(worker, owned_worker_ids, account_username):
                     raise WorkerNameConfigError(
                         f"Worker name {name!r} is already registered to another account "
                         f"(owner: {worker.owner or 'unknown'}). Worker names are unique horde-wide; "
                         "choose a different name in bridgeData.yaml.",
                     )
-                logger.debug(f"Worker name {name!r} is owned by this API key ({worker.id_}).")
+                logger.debug(f"Worker name {name!r} is owned by this account ({worker.id_}).")
             return
         except WorkerNameConfigError:
             raise  # A definitive verdict, not a transient error; do not retry.
@@ -124,13 +128,40 @@ def _verify_worker_names_owned(bridge_data: reGenBridgeData) -> None:
     )
 
 
-def _fetch_owned_worker_ids(api_key: str) -> set[str]:
-    """Return the set of worker IDs owned by the account behind ``api_key``."""
+def _fetch_account_identity(api_key: str) -> tuple[set[str], str | None]:
+    """Return the worker IDs and username for the account behind ``api_key``.
+
+    The username is returned alongside the ids so the ownership check can fall back to an owner-name
+    match when ``worker_ids`` does not yet (or no longer) list a worker the account actually owns.
+    """
     with AIHordeAPIClientSession() as session:
         response = session.submit_request(FindUserRequest(apikey=api_key), UserDetailsResponse)
     if isinstance(response, RequestErrorResponse):
         raise RuntimeError(f"find_user returned an error: {response.message}")
-    return {str(worker_id) for worker_id in (response.worker_ids or [])}
+    worker_ids = {str(worker_id) for worker_id in (response.worker_ids or [])}
+    return worker_ids, response.username
+
+
+def _worker_is_owned_by_account(
+    worker: WorkerDetailItem,
+    owned_worker_ids: set[str],
+    account_username: str | None,
+) -> bool:
+    """Whether a registered ``worker`` belongs to the authenticated account.
+
+    Ownership is accepted on *either* signal: the worker id appears in the account's ``worker_ids``,
+    or the worker's ``owner`` matches the authenticated ``username``. The owner-name match is the
+    robust fallback: ``worker_ids`` can lag or omit a worker the account genuinely owns (a freshly
+    registered worker, or an idle one pruned from the list while still findable by name), and relying
+    on it alone falsely rejected an owned worker as "another account", refusing to start. Usernames
+    are unique horde-wide (they carry a discriminator), so an owner/username match is a safe
+    same-account signal.
+    """
+    if str(worker.id_) in owned_worker_ids:
+        return True
+    owner = (worker.owner or "").strip().lower()
+    username = (account_username or "").strip().lower()
+    return bool(owner) and owner == username
 
 
 def _lookup_worker(

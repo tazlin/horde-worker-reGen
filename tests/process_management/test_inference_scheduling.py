@@ -343,6 +343,45 @@ class TestStartInference:
         assert result is True
         assert job not in job_tracker.jobs_in_progress
 
+    async def test_no_new_dispatch_during_shutdown(self) -> None:
+        """Once shutdown is requested, start_inference must not start a new job.
+
+        A job started during the drain cannot finish within the shutdown grace (sized when shutdown is
+        armed) and would be faulted and SIGTERM'd mid-flight, wasting GPU work and reporting a fault for
+        work that nearly succeeded. The job is left pending for the shutdown manager to fault-report.
+        """
+        process_info = make_mock_process_info(
+            0,
+            model_name="stable_diffusion",
+            state=HordeProcessState.PRELOADED_MODEL,
+        )
+        process_map = ProcessMap({0: process_info})
+        horde_model_map = HordeModelMap(root={})
+        job_tracker = JobTracker()
+
+        job = make_job_pop_response("stable_diffusion")
+        await track_popped_job_async(job_tracker, job)
+        horde_model_map.update_entry(
+            horde_model_name="stable_diffusion",
+            load_state=ModelLoadState.LOADED_IN_RAM,
+            process_id=0,
+        )
+
+        state = WorkerState()
+        state.initiate_shutdown()
+
+        inference_scheduler = _make_inference_scheduler(
+            state=state,
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+        )
+
+        result = await inference_scheduler.start_inference()
+        assert result is False
+        assert job not in job_tracker.jobs_in_progress
+        assert process_info.last_control_flag != HordeControlFlag.START_INFERENCE
+
 
 class TestUnloadModels:
     """Tests for unload_models and related methods."""
@@ -461,7 +500,12 @@ class TestUnloadModels:
         inference_scheduler = _make_inference_scheduler(process_map=process_map)
 
         assert inference_scheduler._replace_stale_ram_unload_process() is True
-        inference_scheduler._process_lifecycle._replace_inference_process.assert_called_once_with(process_info)
+        # The cycle is a deliberate RAM reclaim of a healthy idle slot, so it must go through the
+        # intentional-reclaim path and not be laundered as a crash/hang recovery.
+        inference_scheduler._process_lifecycle._replace_inference_process.assert_called_once_with(
+            process_info,
+            intentional_reclaim=True,
+        )
 
 
 class TestSpeculativeDispatchCap:

@@ -918,13 +918,27 @@ class ProcessLifecycleManager:
         self._initiate_safety_replacement()
         self._replace_all_safety_process()
 
-    def _replace_inference_process(self, process_info: HordeProcessInfo) -> None:
+    def _replace_inference_process(
+        self,
+        process_info: HordeProcessInfo,
+        *,
+        intentional_reclaim: bool = False,
+    ) -> None:
         """Replace an inference process (because it crashed, hung, or timed out).
 
         Frees any shared GPU/disk primitives the dead child may still hold (state-independently; see
         ``_release_held_primitives``), faults its in-flight job, then either respawns the slot or, if
         the slot has been replaced too many times in a short window, quarantines it (crash-loop
         circuit breaker) so a permanently-broken slot cannot spin in an unbounded respawn loop.
+
+        Args:
+            process_info: The slot to replace.
+            intentional_reclaim: When True, this is a *deliberate* cycle of a healthy idle slot to return
+                allocator-retained RAM to the OS, not a crash or hang. The crash bookkeeping is then
+                skipped: it is not logged as a recovery, not counted in ``_num_process_recoveries``, and
+                not fed to the crash-loop / start-failure breakers (which would otherwise quarantine a
+                perfectly healthy slot under sustained RAM pressure, since reclaim-cycles of one slot can
+                exceed ``CRASH_LOOP_MAX_REPLACEMENTS`` within the window).
         """
         bridge_data = self._runtime_config.bridge_data
         logger.debug(f"Replacing {process_info}")
@@ -968,6 +982,30 @@ class ProcessLifecycleManager:
                 process_timeout=bridge_data.process_timeout,
                 retryable=True,
             )
+
+        if intentional_reclaim:
+            # A healthy idle slot is being cycled solely to return RAM to the OS: the in-process model
+            # unload already freed the model, but the allocator keeps the pages, so only a respawn
+            # actually reclaims them. This is not a crash/hang, so it skips the recovery diagnostics,
+            # the process_recoveries count, and the crash-loop / start-failure breakers entirely.
+            logger.info(
+                f"Cycling idle process {process_info.process_id} to reclaim "
+                f"{process_info.ram_usage_bytes} bytes of unreleased RAM.",
+            )
+            self._action_ledger.record(
+                LedgerEventType.PROCESS_REPLACED,
+                process_id=process_info.process_id,
+                os_pid=process_info.os_pid,
+                launch_identifier=process_info.process_launch_identifier,
+                reason="idle process cycled to reclaim RAM",
+                detail={
+                    "last_state": process_info.last_process_state.name,
+                    "ram_usage_bytes": process_info.ram_usage_bytes,
+                },
+            )
+            self._end_inference_process(process_info)
+            self._start_inference_process(process_info.process_id)
+            return
 
         replacements_in_window = self._record_slot_recovery(process_info.process_id)
         consecutive_start_failures = self._record_start_failure(process_info)

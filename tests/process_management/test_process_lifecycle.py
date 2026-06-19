@@ -144,6 +144,48 @@ def test_reset_recovery_counter_zeroes_count_but_keeps_crash_loop_history() -> N
     assert plm._slot_recovery_history == {1: [pytest.approx(plm._slot_recovery_history[1][0])]}
 
 
+def test_intentional_reclaim_is_not_counted_as_a_crash_recovery() -> None:
+    """Cycling a healthy idle slot to reclaim RAM must not feed the crash bookkeeping.
+
+    The RAM budget cycles an idle, model-less process to return allocator-retained RAM to the OS. That
+    is a deliberate reclaim, not a crash or hang, so it must not bump ``process_recoveries`` or the
+    per-slot crash-loop history; otherwise sustained RAM pressure (3 reclaim-cycles of one slot within
+    the window) would spuriously quarantine a perfectly healthy slot.
+    """
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+
+    idle = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+    idle.ram_usage_bytes = 5 * 1024 * 1024 * 1024
+    plm._process_map[1] = idle
+
+    plm._replace_inference_process(idle, intentional_reclaim=True)
+
+    assert plm._num_process_recoveries == 0
+    assert plm._slot_recovery_history.get(1, []) == []
+    plm._start_inference_process.assert_called_once_with(1)
+
+
+def test_crash_replacement_still_counts_as_a_recovery() -> None:
+    """The ordinary (crash/hang) replacement path must still record a recovery and crash-loop history.
+
+    Guards the intentional-reclaim carve-out against over-reach: a real crash replacement keeps feeding
+    the breakers it always did.
+    """
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+
+    crashed = make_mock_process_info(1, model_name=None, state=HordeProcessState.INFERENCE_STARTING)
+    plm._process_map[1] = crashed
+
+    plm._replace_inference_process(crashed)
+
+    assert plm._num_process_recoveries == 1
+    assert len(plm._slot_recovery_history.get(1, [])) == 1
+
+
 def test_get_processes_with_model_for_queued_job_empty() -> None:
     """If there are no processes or no jobs pending inference, the result should be empty."""
     plm = _make_plm()

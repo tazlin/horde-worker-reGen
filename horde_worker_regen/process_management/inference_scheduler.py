@@ -299,10 +299,14 @@ class InferenceScheduler:
                 continue
 
             logger.warning(
-                f"RAM unload did not release process {process_info.process_id}'s resident memory "
-                f"({process_info.ram_usage_bytes} bytes); replacing the idle process.",
+                f"Idle process {process_info.process_id} still holds {process_info.ram_usage_bytes} bytes "
+                "after a RAM unload (the allocator retains the freed model's pages); cycling it to return "
+                "the RAM to the OS.",
             )
-            self._process_lifecycle._replace_inference_process(process_info)
+            # A deliberate reclaim of a healthy idle slot, not a crash/hang: keep it out of the crash
+            # bookkeeping (recovery count + crash-loop breaker) so sustained RAM pressure cannot
+            # quarantine a perfectly healthy slot.
+            self._process_lifecycle._replace_inference_process(process_info, intentional_reclaim=True)
             return True
 
         return False
@@ -664,6 +668,15 @@ class InferenceScheduler:
 
     async def start_inference(self) -> bool:
         """Start inference for the next job in jobs_pending_inference, if possible."""
+        if self._state.shutting_down:
+            # During graceful shutdown, never start a NEW job. The drain grace is sized when shutdown is
+            # armed; a job started afterward cannot finish within it and would be faulted and SIGTERM'd
+            # mid-flight (wasted GPU work plus a fault reported to the horde for work that nearly
+            # succeeded). Already-in-flight jobs keep draining; not-yet-started ones are left for the
+            # shutdown manager to fault-report so the horde reissues them promptly. Mirrors the same
+            # shutting_down gate already on preload_models.
+            return False
+
         next_job_and_process = await self.get_next_job_and_process()
 
         if next_job_and_process is None:

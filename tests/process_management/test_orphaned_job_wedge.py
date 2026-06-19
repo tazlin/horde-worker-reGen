@@ -179,6 +179,35 @@ async def test_detected_deadlock_escalates_to_recovery_wedge() -> None:
     assert pm._assess_wedge() is True
 
 
+async def test_safety_tail_during_lull_is_not_a_wedge() -> None:
+    """A job draining through the safety/submit tail during a queue lull must not trip the wedge.
+
+    With the inference queue empty and the last job sitting in PENDING_SAFETY_CHECK, every process is idle
+    so the *general* deadlock detector fires (a tracked job exists, nothing is busy). That benign state
+    must not feed the wedge assessment (which would cycle healthy processes into a reduced-concurrency
+    limp-by). It is not a *queue* deadlock (no pending inference work), so it must read as not-wedged.
+    """
+    pm = make_testable_process_manager()
+    pm._state.last_job_pop_time = time.time() - 60
+
+    idle_inference = make_mock_process_info(1, state=HordeProcessState.WAITING_FOR_JOB)
+    pm._process_map[1] = idle_inference
+
+    safety_pending = Mock()
+    safety_pending.sdk_api_job_info = make_job_pop_response(model="stable_diffusion")
+    await pm._job_tracker.queue_for_safety(safety_pending)
+
+    assert len(pm._job_tracker.jobs_pending_safety_check) == 1
+    assert len(pm._job_tracker.jobs_pending_inference) == 0
+
+    pm.detect_deadlock()
+
+    snapshot = pm._message_dispatcher.get_deadlock_snapshot()
+    assert snapshot.has_active_deadlock() is True  # the loose detector still flags it (diagnostics)
+    assert snapshot.indicates_structural_wedge() is False  # but it is not a structural wedge
+    assert pm._assess_wedge() is False
+
+
 def test_stale_orphan_punts_age_out_of_the_wedge_window() -> None:
     """Punts older than the window do not count, so a long-ago blip is not treated as an active wedge."""
     pm = make_testable_process_manager()

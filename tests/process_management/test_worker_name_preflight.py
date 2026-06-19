@@ -86,17 +86,38 @@ class TestOwnershipCheck:
 
     def test_owned_worker_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A registered worker whose id is owned by this API key passes."""
-        worker = Mock(id_="worker-123", name="Unique Dreamer", owner="me")
-        monkeypatch.setattr(worker_identity, "_fetch_owned_worker_ids", lambda api_key: {"worker-123"})
+        worker = Mock(id_="worker-123", name="Unique Dreamer", owner="Me#1")
+        monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: ({"worker-123"}, "Me#1"))
         monkeypatch.setattr(worker_identity, "_lookup_worker", lambda client, name, api_key: worker)
         monkeypatch.setattr(worker_identity, "AIHordeAPISimpleClient", lambda: Mock())
 
         verify_worker_identity(_bridge_data(dreamer="Unique Dreamer"))
 
+    def test_owned_by_owner_name_passes_when_id_missing_from_worker_ids(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A worker owned by this account must pass even when worker_ids does not list its id.
+
+        Regression for the false "another account" rejection: the user-details worker_ids list lagged
+        behind a freshly-registered/idle worker, so an owned worker (owner == authenticated username)
+        was rejected and the worker refused to start. The owner-name match is the robust fallback.
+        """
+        worker = Mock(id_="alch-9", name="My Alchemist", owner="Tazlin#6572")
+        monkeypatch.setattr(
+            worker_identity,
+            "_fetch_account_identity",
+            lambda api_key: ({"some-other-id"}, "Tazlin#6572"),
+        )
+        monkeypatch.setattr(worker_identity, "_lookup_worker", lambda client, name, api_key: worker)
+        monkeypatch.setattr(worker_identity, "AIHordeAPISimpleClient", lambda: Mock())
+
+        verify_worker_identity(_bridge_data(dreamer="My Alchemist"))
+
     def test_foreign_worker_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A registered worker owned by a different account hard-fails."""
-        worker = Mock(id_="someone-else", name="Unique Dreamer", owner="#999")
-        monkeypatch.setattr(worker_identity, "_fetch_owned_worker_ids", lambda api_key: {"mine-1"})
+        """A registered worker owned by a different account hard-fails (id absent and owner differs)."""
+        worker = Mock(id_="someone-else", name="Unique Dreamer", owner="Someone#999")
+        monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: ({"mine-1"}, "Me#1"))
         monkeypatch.setattr(worker_identity, "_lookup_worker", lambda client, name, api_key: worker)
         monkeypatch.setattr(worker_identity, "AIHordeAPISimpleClient", lambda: Mock())
 
@@ -105,7 +126,7 @@ class TestOwnershipCheck:
 
     def test_unregistered_worker_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A name not yet registered is the normal first-run case and passes."""
-        monkeypatch.setattr(worker_identity, "_fetch_owned_worker_ids", lambda api_key: set())
+        monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: (set(), "Me#1"))
         monkeypatch.setattr(worker_identity, "_lookup_worker", lambda client, name, api_key: None)
         monkeypatch.setattr(worker_identity, "AIHordeAPISimpleClient", lambda: Mock())
 
@@ -114,10 +135,10 @@ class TestOwnershipCheck:
     def test_network_failure_hard_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An unreachable API hard-fails the check after exhausting retries."""
 
-        def _boom(api_key: str) -> set[str]:
+        def _boom(api_key: str) -> tuple[set[str], str | None]:
             raise RuntimeError("network down")
 
-        monkeypatch.setattr(worker_identity, "_fetch_owned_worker_ids", _boom)
+        monkeypatch.setattr(worker_identity, "_fetch_account_identity", _boom)
         monkeypatch.setattr(worker_identity, "_OWNERSHIP_CHECK_RETRY_DELAY_SECONDS", 0.0)
 
         with pytest.raises(WorkerNameConfigError, match="Could not verify"):
@@ -127,11 +148,11 @@ class TestOwnershipCheck:
         """With dry_run_skip_api set, the network ownership check is skipped entirely."""
         calls = {"count": 0}
 
-        def _boom(api_key: str) -> set[str]:
+        def _boom(api_key: str) -> tuple[set[str], str | None]:
             calls["count"] += 1
             raise RuntimeError("should not be called when API is skipped")
 
-        monkeypatch.setattr(worker_identity, "_fetch_owned_worker_ids", _boom)
+        monkeypatch.setattr(worker_identity, "_fetch_account_identity", _boom)
 
         verify_worker_identity(_bridge_data(dreamer="Unique Dreamer", dry_run_skip_api=True))
         assert calls["count"] == 0

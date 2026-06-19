@@ -60,8 +60,20 @@ class DeadlockSnapshot:
     queue_deadlock_process_id: int | None
 
     def has_active_deadlock(self) -> bool:
-        """Return whether any deadlock detector is currently active."""
+        """Return whether any deadlock detector is currently active (diagnostics-grade)."""
         return self.in_deadlock or self.in_queue_deadlock
+
+    def indicates_structural_wedge(self) -> bool:
+        """Return whether the deadlock state is a genuine, recoverable inference-pool wedge.
+
+        Only the *queue* deadlock qualifies: pending inference work exists, every process is idle, and
+        the model is already loaded (or unspecified), so a soft reset is the right remedy. The general
+        ``in_deadlock`` flag is deliberately excluded: it also fires for any tracked job while no process
+        is busy, which includes a job legitimately draining through the post-inference safety/submit tail
+        during a queue lull. Treating that benign tail as a wedge would needlessly cycle healthy processes
+        and limp the worker's concurrency, so it must not drive the save-our-ship reset.
+        """
+        return self.in_queue_deadlock
 
 
 class MessageDispatcher:
