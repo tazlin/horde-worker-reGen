@@ -73,9 +73,7 @@ class TestExpandOfferedForms:
         assert "4x_AnimeSharp" in offered
         assert "GFPGAN" in offered
         assert "CodeFormers" in offered
-        assert "strip_background" not in offered, (
-            "strip_background is not currently offered by default, so being here would be a surprise"
-        )
+        assert "strip_background" in offered
         assert "BACKEND_DEFAULT" not in offered
 
     def test_caption_offered_with_opt_in(self) -> None:
@@ -278,9 +276,16 @@ class TestAlchemyHeadroomEstimator:
 
 
 class _StubState:
-    def __init__(self, *, shutting_down: bool = False, supervisor_paused: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        shutting_down: bool = False,
+        supervisor_paused: bool = False,
+        self_throttle_paused: bool = False,
+    ) -> None:
         self.shutting_down = shutting_down
         self.supervisor_paused = supervisor_paused
+        self.self_throttle_paused = self_throttle_paused
 
 
 class _StubRuntimeConfig:
