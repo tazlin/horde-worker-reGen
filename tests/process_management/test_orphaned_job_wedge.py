@@ -1,4 +1,4 @@
-"""Regression probes for the 2026-06-18 overnight wedge.
+"""Regression probes for an observed wedge.
 
 An inference slot hung mid-job and was replaced, but the replacement faulted the *wrong* job (the
 first process in the map holding any in-flight job, not the job the dying slot was actually running).

@@ -1,4 +1,4 @@
-"""Regression probes for the 20260618 soak wedge: process death during PRELOAD is never recovered.
+"""Regression probes for the an observed soak wedge: process death during PRELOAD is never recovered.
 
 A fellow dev's RTX 4090 ``horde-benchmark ramp`` soak level completed 0 jobs in 656s then was killed
 by the level watchdog. An inference child exited *during model preload* and reported ``PROCESS_ENDED``

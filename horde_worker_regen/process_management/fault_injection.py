@@ -39,7 +39,7 @@ class FaultKind(enum.StrEnum):
 
 
 # Tag prefix the fake stamps onto a faulted result's ``info`` so the main process (and tests) can
-# recognise an injected resource failure. Phase 4's failure classifier keys on this in fake mode.
+# recognise an injected resource failure. Fake mode keys to this.
 FAULT_INFO_PREFIX = "injected-fault:"
 
 

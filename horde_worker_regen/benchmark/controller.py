@@ -340,8 +340,14 @@ class _WarmSessionDriver:
         self._thread.join(timeout=10.0)
 
 
-def detect_machine_info() -> MachineInfo:
-    """Best-effort hardware detection (no-op on machines without torch/CUDA)."""
+def detect_machine_info(*, probe_devices: bool = True) -> MachineInfo:
+    """Best-effort hardware detection (no-op on machines without torch/CUDA).
+
+    RAM is always read (cheap, via psutil). GPU enumeration is skipped when ``probe_devices`` is False:
+    it runs out-of-process (see :func:`accelerator_probe.probe_accelerators`) to keep this caller
+    torch-free, but that subprocess loads torch and is pointless in fake/dry-run mode, which never touches
+    the GPU. Real and plan paths leave it on so the report and fit verdicts see the actual device.
+    """
     info = MachineInfo()
     try:
         import psutil
@@ -349,6 +355,8 @@ def detect_machine_info() -> MachineInfo:
         info.total_ram_bytes = psutil.virtual_memory().total
     except Exception:  # noqa: BLE001 - purely informational
         pass
+    if not probe_devices:
+        return info
     try:
         from horde_worker_regen.utils.accelerator_probe import probe_accelerators
 
@@ -438,7 +446,11 @@ class BenchmarkController:
     def run(self) -> BenchmarkReport:
         """Run the ramp and return (and persist) the full report."""
         self._out_dir.mkdir(parents=True, exist_ok=True)
-        machine = self._machine if self._machine is not None else detect_machine_info()
+        machine = (
+            self._machine
+            if self._machine is not None
+            else detect_machine_info(probe_devices=self._process_mode == "real")
+        )
         self._warn_about_huge_tiers(machine)
         self._emit_ramp_started(machine)
         self._emit_ramp_plan(machine)
