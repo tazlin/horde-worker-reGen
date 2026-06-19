@@ -28,6 +28,26 @@ class TestGpuUtilizationSampler:
         assert sampler.mean_percent() is None
         assert sampler.busy_fraction() is None
 
+    def test_windowed_query_uses_only_recent_samples(self) -> None:
+        """A windowed mean/busy considers only samples from the last N seconds (the live rolling view)."""
+        sampler = GpuUtilizationSampler(busy_threshold_percent=50)
+        now = time.time()
+        # Two recent busy samples, one recent idle, and an old busy one that the window must exclude.
+        sampler._timeline.extend(  # noqa: SLF001 - injecting the timestamped series directly
+            [(now - 1.0, 100), (now - 2.0, 100), (now - 3.0, 0), (now - 500.0, 100)],
+        )
+        assert sampler.mean_percent(window_seconds=10.0) == (100 + 100 + 0) / 3
+        assert sampler.busy_fraction(window_seconds=10.0) == 2 / 3
+        # The whole-run figure (no window) reads the separate sample buffer, untouched here.
+        assert sampler.mean_percent() is None
+
+    def test_buffers_are_bounded(self) -> None:
+        """A long-lived worker cannot grow the sample buffers without bound."""
+        sampler = GpuUtilizationSampler(max_samples=5, read_utilization=lambda: 50)
+        for _ in range(20):
+            sampler._samples.append(50)  # noqa: SLF001 - exercising the cap directly
+        assert sampler.sample_count == 5
+
     def test_background_sampling_with_injected_reader(self) -> None:
         """A run between start() and stop() collects samples from the injected reader."""
         sampler = GpuUtilizationSampler(interval_seconds=0.002, read_utilization=lambda: 80)

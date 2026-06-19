@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -60,6 +61,7 @@ class GpuUtilizationSampler:
         interval_seconds: float = 0.1,
         busy_threshold_percent: int = 5,
         read_utilization: Callable[[], int | None] | None = None,
+        max_samples: int = 100_000,
     ) -> None:
         """Initialize the sampler.
 
@@ -71,15 +73,18 @@ class GpuUtilizationSampler:
                 GPU was doing *anything*; ``mean_percent`` remains the duty-cycle headline.
             read_utilization: Override the utilization reader (for tests). When None, a backend-agnostic
                 reader is created at ``start()``; if no telemetry is available the sampler no-ops.
+            max_samples: Cap on retained samples so a long-lived worker (sampling for days) cannot grow
+                the buffers without bound. The benchmark runs only for a level, so this never bites there;
+                in the worker it bounds memory while still covering any rolling window the logs query.
         """
         self._device_index = device_index
         self._interval = interval_seconds
         self._busy_threshold = busy_threshold_percent
         self._read = read_utilization
 
-        self._samples: list[int] = []
-        self._timeline: list[tuple[float, int]] = []
-        """``(epoch_seconds, util_percent)`` per sample, for offline correlation with spans."""
+        self._samples: deque[int] = deque(maxlen=max_samples)
+        self._timeline: deque[tuple[float, int]] = deque(maxlen=max_samples)
+        """``(epoch_seconds, util_percent)`` per sample, for rolling-window queries and offline correlation."""
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -109,21 +114,35 @@ class GpuUtilizationSampler:
 
     @property
     def sample_count(self) -> int:
-        """The number of utilization samples collected."""
+        """The number of utilization samples currently retained."""
         return len(self._samples)
 
-    def mean_percent(self) -> float | None:
-        """Return the average GPU core utilization across the run (the duty cycle), or None without samples."""
-        if not self._samples:
-            return None
-        return sum(self._samples) / len(self._samples)
+    def _windowed_values(self, window_seconds: float | None) -> list[int]:
+        """Utilization values from the last ``window_seconds`` (whole buffer when None)."""
+        if window_seconds is None:
+            return list(self._samples)
+        cutoff = time.time() - window_seconds
+        return [value for timestamp, value in self._timeline if timestamp >= cutoff]
 
-    def busy_fraction(self) -> float | None:
-        """Return the fraction of samples at or above the busy threshold, or None without samples."""
-        if not self._samples:
+    def mean_percent(self, window_seconds: float | None = None) -> float | None:
+        """Average GPU core utilization (the duty cycle), over the whole run or the last window.
+
+        Args:
+            window_seconds: When given, average only samples from the last this-many seconds (for a
+                live rolling figure); when None, average the whole retained run (the benchmark's use).
+        """
+        values = self._windowed_values(window_seconds)
+        if not values:
             return None
-        busy = sum(1 for sample in self._samples if sample >= self._busy_threshold)
-        return busy / len(self._samples)
+        return sum(values) / len(values)
+
+    def busy_fraction(self, window_seconds: float | None = None) -> float | None:
+        """Fraction of samples at or above the busy threshold, over the whole run or the last window."""
+        values = self._windowed_values(window_seconds)
+        if not values:
+            return None
+        busy = sum(1 for value in values if value >= self._busy_threshold)
+        return busy / len(values)
 
     def timeline(self) -> list[tuple[float, int]]:
         """Return the collected ``(epoch_seconds, util_percent)`` samples, in order."""

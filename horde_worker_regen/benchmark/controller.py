@@ -78,6 +78,7 @@ from horde_worker_regen.benchmark.requirements import (
     requirement_skip_reason,
 )
 from horde_worker_regen.benchmark.soak import build_validation_level
+from horde_worker_regen.process_management.duty_cycle import format_phase_gaps
 from horde_worker_regen.process_management.owned_process_registry import kill_process_tree
 from horde_worker_regen.process_management.worker_entry_points import WORKER_LOG_VERBOSITY_ENV
 
@@ -384,6 +385,7 @@ class BenchmarkController:
         skip_downloads: bool = False,
         validate: bool = False,
         soak_seconds: float = 300.0,
+        strict_duty_cycle: bool = False,
         progress_sink: ProgressSink | None = None,
         warm: bool = False,
         verbose: bool = False,
@@ -402,6 +404,9 @@ class BenchmarkController:
             skip_downloads: Skip levels that require network access.
             validate: After the ramp, soak the synthesized config under sustained load.
             soak_seconds: How long each per-tier validation soak runs.
+            strict_duty_cycle: Promote the soak's GPU duty-cycle target from an advisory to a hard
+                pass/fail gate (for enforcing the 90% number on a reference machine). Off by default,
+                so a baseline soak reports the shortfall with attribution instead of failing on it.
             progress_sink: Where to emit structured progress events; defaults to discarding them.
             warm: Run fixed-scenario levels against a single warm worker reused across the ramp
                 (one child-process startup instead of one per level). Soak/validation levels still
@@ -427,6 +432,7 @@ class BenchmarkController:
         self._skip_downloads = skip_downloads
         self._validate = validate
         self._soak_seconds = soak_seconds
+        self._strict_duty_cycle = strict_duty_cycle
         self._sink = progress_sink if progress_sink is not None else NullProgressSink()
         self._warm = warm
         self._verbose = verbose
@@ -646,6 +652,8 @@ class BenchmarkController:
                 gpu_busy_percent=stats.gpu_utilization_mean_percent if stats is not None else None,
                 vram_used_high_water_mb=stats.vram_used_high_water_mb if stats is not None else None,
                 num_findings=len(report.findings),
+                gpu_duty_gap_summary=(format_phase_gaps(stats.phase_breakdown_seconds) if stats is not None else ""),
+                no_jobs_available_seconds=(stats.time_spent_no_jobs_available if stats is not None else None),
             ),
         )
 
@@ -677,7 +685,12 @@ class BenchmarkController:
             model_pool, pool_skip_reason = self._plan_soak_models(tier, suggested, machine)
             if pool_skip_reason is not None:
                 logger.warning(f"Skipping validation V-{tier}-soak: {pool_skip_reason}")
-                placeholder = build_validation_level(suggested, tier, soak_seconds=self._soak_seconds)
+                placeholder = build_validation_level(
+                    suggested,
+                    tier,
+                    soak_seconds=self._soak_seconds,
+                    strict_duty_cycle=self._strict_duty_cycle,
+                )
                 self._emit_level_started(placeholder, level_index=0, num_levels=0)
                 skipped_report = LevelReport(
                     level=placeholder,
@@ -688,7 +701,13 @@ class BenchmarkController:
                 validation_reports.append(skipped_report)
                 continue
 
-            level = build_validation_level(suggested, tier, soak_seconds=self._soak_seconds, model_pool=model_pool)
+            level = build_validation_level(
+                suggested,
+                tier,
+                soak_seconds=self._soak_seconds,
+                strict_duty_cycle=self._strict_duty_cycle,
+                model_pool=model_pool,
+            )
             self._emit_level_started(level, level_index=0, num_levels=0)
             report = self._resolve_level_report(level, machine)
             self._emit_level_finished(report)
@@ -1142,6 +1161,8 @@ class BenchmarkController:
                 phase=live.phase,
                 process_summary=live.process_summary,
                 num_process_recoveries=live.num_process_recoveries,
+                gpu_duty_gap_summary=live.gpu_duty_gap_summary,
+                no_jobs_available_seconds=live.no_jobs_available_seconds,
             ),
         )
         return signature

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from horde_worker_regen.process_management.duty_cycle import format_phase_gaps
+
 
 class LevelCriteria(BaseModel):
     """The stability requirements a level must meet to pass."""
@@ -42,12 +44,11 @@ class LevelCriteria(BaseModel):
     """Advisory GPU duty-cycle target. If the measured mean utilization is below this, the
     level is flagged (but not failed) as leaving GPU uptime on the table. None disables it."""
     min_gpu_duty_cycle_percent: float | None = None
-    """The duty-cycle metric of record (soak headline gate). The measured mean NVML GPU core
-    utilization — the fraction of wall-clock the GPU has work running under sustained load —
-    must reach at least this percent or the level fails. This is the number the whole uptime
-    effort drives toward; a baseline soak is *expected* to miss it until the residency/overlap
-    levers land. None disables the gate (ramp levels leave it off; the soak sets it). Distinct
-    from ``target_gpu_utilization_percent``, which only advises."""
+    """Opt-in hard gate on the measured mean NVML GPU core utilization: below this percent the level
+    fails. Off by default (None), because a baseline soak is *expected* to miss the 90% north-star until
+    the residency/overlap levers land, so failing on it would just cry wolf. The soak instead advises via
+    ``target_gpu_utilization_percent`` and reports the full attribution; set this (``--strict-duty``)
+    only when enforcing the target on a reference machine."""
     expect_vram_residency: bool = False
     """When True (a residency soak: ``--highvram`` + a worker VRAM budget), models should stay
     resident across jobs, so post-warm-up RAM->VRAM reloads should be ~0. Any such reload is
@@ -103,6 +104,9 @@ class LevelStats(BaseModel):
     phase_breakdown_seconds: dict[str, float] = {}
     """Median per-job seconds in each pipeline phase (queue_wait, disk_load, vram_load,
     sampling, vae, other_inference, safety, submit) — a "where the time goes" view."""
+    time_spent_no_jobs_available: float | None = None
+    """Seconds in the run the worker idled because the horde offered no jobs. Lets a low duty cycle be
+    split into demand-limited idle (this) versus worker-side hand-off gaps. None when not measured."""
 
 
 class LevelVerdict(BaseModel):
@@ -113,6 +117,26 @@ class LevelVerdict(BaseModel):
     """Why the level failed (empty when passed)."""
     advisories: list[str] = Field(default_factory=list)
     """Non-fatal observations (e.g. slow downloads)."""
+
+
+def _duty_cycle_attribution(stats: LevelStats) -> str:
+    """A short parenthetical attributing a low duty cycle, or "" when nothing is attributable.
+
+    Turns the headline "the GPU idled" into something actionable by naming the biggest worker-side
+    per-job gaps and separating out demand-limited idle (the horde had no work), so an operator reads
+    *where* the uptime went straight from the verdict.
+    """
+    parts: list[str] = []
+    gaps = format_phase_gaps(stats.phase_breakdown_seconds)
+    if gaps:
+        parts.append(f"biggest worker-side gaps: {gaps}")
+    if stats.time_spent_no_jobs_available:
+        parts.append(
+            f"~{stats.time_spent_no_jobs_available:.0f}s with no jobs available (horde demand, not the worker)",
+        )
+    if stats.span_derived_busy_ratio is not None:
+        parts.append(f"GPU-touching phases ~{stats.span_derived_busy_ratio:.0%} of a typical job's wall")
+    return f" ({'; '.join(parts)})" if parts else ""
 
 
 def evaluate_level(
@@ -185,7 +209,8 @@ def evaluate_level(
         if stats.gpu_utilization_mean_percent < criteria.target_gpu_utilization_percent:
             advisories.append(
                 f"GPU duty cycle {stats.gpu_utilization_mean_percent:.0f}% is below the "
-                f"{criteria.target_gpu_utilization_percent:.0f}% target — the GPU idled between jobs; "
+                f"{criteria.target_gpu_utilization_percent:.0f}% target — the GPU idled between jobs"
+                f"{_duty_cycle_attribution(stats)}; "
                 "see the uptime levers (post-processing overlap, queue depth, thread count)",
             )
         else:
@@ -199,7 +224,7 @@ def evaluate_level(
             reasons.append(
                 f"GPU duty cycle {stats.gpu_utilization_mean_percent:.0f}% is below the "
                 f"{criteria.min_gpu_duty_cycle_percent:.0f}% floor — the GPU idled between jobs "
-                "under sustained load",
+                f"under sustained load{_duty_cycle_attribution(stats)}",
             )
         else:
             advisories.append(

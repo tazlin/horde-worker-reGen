@@ -123,10 +123,18 @@ class TestBuildValidationLevel:
         assert level.criteria.min_its_retention == 0.85
         assert level.criteria.gate_its_against_baseline is False
         assert level.criteria.min_completed_jobs >= 1
-        # The duty-cycle metric of record gates the soak.
-        assert level.criteria.min_gpu_duty_cycle_percent == 90.0
+        # Duty cycle is an advisory by default: the 90% target is reported, not a hard gate.
+        assert level.criteria.target_gpu_utilization_percent == 90.0
+        assert level.criteria.min_gpu_duty_cycle_percent is None
         # Timeout must comfortably exceed the soak period.
         assert level.timeout_seconds > 120.0
+
+    def test_strict_duty_cycle_promotes_target_to_gate(self) -> None:
+        """``strict_duty_cycle`` makes the 90% target a hard pass/fail gate for reference-machine runs."""
+        suggested = SuggestedBridgeData(max_threads=2, queue_size=2, models_to_load=["Deliberate"])
+        level = build_validation_level(suggested, BenchTier.SD15, soak_seconds=120.0, strict_duty_cycle=True)
+        assert level.criteria.target_gpu_utilization_percent == 90.0
+        assert level.criteria.min_gpu_duty_cycle_percent == 90.0
 
     def test_model_pool_loads_all_models(self) -> None:
         """A multi-model validation level loads every pool model and spreads the soak over them."""

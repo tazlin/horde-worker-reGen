@@ -71,6 +71,13 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Duration of each per-tier validation soak (minutes).",
     )
     ramp.add_argument(
+        "--strict-duty",
+        action="store_true",
+        help="Fail a validation soak whose GPU duty cycle misses the 90%% target (a hard gate). Off by "
+        "default: the soak reports the shortfall with attribution but passes on stability and throughput. "
+        "Use when enforcing the duty-cycle target on a reference machine.",
+    )
+    ramp.add_argument(
         "--warm",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -595,6 +602,7 @@ def _run_ramp(args: argparse.Namespace) -> int:
         skip_downloads=args.skip_downloads,
         validate=not args.no_validate,
         soak_seconds=args.soak_minutes * 60.0,
+        strict_duty_cycle=args.strict_duty,
         progress_sink=progress_sink,
         warm=args.warm,
         verbose=args.verbose,

@@ -23,14 +23,21 @@ from pydantic import BaseModel, Field
 from horde_worker_regen.benchmark.criteria import LevelStats
 from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage, BenchTier, FindingKind, LevelOutcome
 from horde_worker_regen.benchmark.ladder import BENCH_TIER_MODELS, RampLevel
+from horde_worker_regen.process_management.duty_cycle import (
+    PHASE_ORDER,
+    phase_breakdown,
+    span_derived_busy_ratio,
+)
 from horde_worker_regen.process_management.run_metrics import JobMetricsRecord, RunMetricsSnapshot
 
-BENCHMARK_REPORT_SCHEMA_VERSION = 3
+BENCHMARK_REPORT_SCHEMA_VERSION = 4
 """Bumped when the report schema changes incompatibly; stamped into every report for later reads.
 
 v2 added :class:`WorkerCapabilities` and the conservative-recommendation rationale alongside the
 existing ``suggested_bridge_data``. v3 adds per-setting :class:`SuggestionDecision` provenance (the
-basis behind every suggested value); older reports parse with an empty ``decisions`` list.
+basis behind every suggested value); older reports parse with an empty ``decisions`` list. v4 adds
+``LevelStats.time_spent_no_jobs_available`` and makes the soak's GPU duty cycle an advisory rather
+than a hard gate; older reports parse with that field None.
 """
 
 _FAILED_OUTCOMES = frozenset({LevelOutcome.FAILED, LevelOutcome.CRASHED, LevelOutcome.CRASHED_HANG})
@@ -294,90 +301,6 @@ def _its_retention(jobs: list[JobMetricsRecord]) -> float | None:
     return second_half / first_half
 
 
-_PHASE_ORDER = [
-    "queue_wait",
-    "disk_load",
-    "vram_load",
-    "sampling",
-    "vae",
-    "other_inference",
-    "safety",
-    "submit",
-]
-
-
-def _median(values: list[float]) -> float | None:
-    return statistics.median(values) if values else None
-
-
-def _phase_breakdown(jobs: list[JobMetricsRecord]) -> dict[str, float]:
-    """Median per-job seconds in each pipeline phase, to show where a typical job's time goes.
-
-    Built from worker stage timestamps (queue_wait/inference/safety/submit) and the child's
-    phase metrics (disk->RAM, RAM->VRAM, sampling, VAE); ``other_inference`` is the inference
-    time not otherwise accounted for (graph build, prompt encode, image encode, IPC).
-    """
-    samples: dict[str, list[float]] = {phase: [] for phase in _PHASE_ORDER}
-
-    for job in jobs:
-        if job.is_alchemy:
-            continue
-        stamps = job.stage_timestamps or {}
-        if job.queue_wait_seconds is not None:
-            samples["queue_wait"].append(job.queue_wait_seconds)
-
-        inference_start = stamps.get("INFERENCE_IN_PROGRESS")
-        inference_end = stamps.get("PENDING_SAFETY_CHECK")
-        submit_ready = stamps.get("PENDING_SUBMIT")
-        finalized = stamps.get("FINALIZED")
-
-        if submit_ready is not None and finalized is not None:
-            samples["submit"].append(max(0.0, finalized - submit_ready))
-        if inference_end is not None and submit_ready is not None:
-            samples["safety"].append(max(0.0, submit_ready - inference_end))
-
-        pm = job.phase_metrics
-        if pm is None or inference_start is None or inference_end is None:
-            continue
-        inference_total = max(0.0, inference_end - inference_start)
-
-        disk_load = sum(m.duration_seconds for m in pm.model_loads if m.phase == "disk_to_ram")
-        vram_load = sum(m.duration_seconds for m in pm.model_loads if m.phase == "ram_to_vram")
-        sampling = pm.sampling.duration_seconds if pm.sampling is not None else 0.0
-        # Only the VAE-decode phase belongs in the vae bucket. Summing all of phase_seconds
-        # (clip_encode plus pipeline_setup/validate/execute/finalize) folded the whole ComfyUI
-        # execution into "vae" (pipeline_execute alone covers most of the job) which mislabelled
-        # nearly every job as VAE-bound and zeroed other_inference. The residual subtraction below
-        # already attributes that overhead (graph build, prompt encode, IPC) to other_inference.
-        vae = (pm.phase_seconds or {}).get("vae_decode", 0.0)
-        other = max(0.0, inference_total - disk_load - vram_load - sampling - vae)
-
-        samples["disk_load"].append(disk_load)
-        samples["vram_load"].append(vram_load)
-        samples["sampling"].append(sampling)
-        samples["vae"].append(vae)
-        samples["other_inference"].append(other)
-
-    return {phase: median for phase in _PHASE_ORDER if (median := _median(samples[phase])) is not None}
-
-
-_GPU_BUSY_PHASES = ("vram_load", "sampling", "vae")
-
-
-def _span_derived_busy_ratio(breakdown: dict[str, float]) -> float | None:
-    """GPU-touching phases (vram_load + sampling + vae) ÷ the whole per-job wall, or None.
-
-    A phase-attributed duty-cycle proxy that needs no tracing backend: it says what share of a
-    typical job's lifecycle is actual GPU work versus idle hand-off (queue_wait, disk_load,
-    other_inference, safety, submit). The NVML mean is still the headline; this explains it.
-    """
-    total = sum(breakdown.values())
-    if total <= 0:
-        return None
-    busy = sum(breakdown.get(phase, 0.0) for phase in _GPU_BUSY_PHASES)
-    return busy / total
-
-
 def _post_warmup_vram_reloads(jobs: list[JobMetricsRecord]) -> int | None:
     """RAM->VRAM reloads across image jobs after the first completed one (warm-up excluded).
 
@@ -439,7 +362,7 @@ def compute_level_stats(result: LevelRunResult, *, total_vram_mb: int | None = N
         min(metrics.disk_min_free_bytes.values()) if metrics is not None and metrics.disk_min_free_bytes else None
     )
 
-    phase_breakdown = _phase_breakdown(metrics.jobs) if metrics is not None else {}
+    level_phase_breakdown = phase_breakdown(metrics.jobs) if metrics is not None else {}
 
     return LevelStats(
         num_jobs_expected=harness.num_jobs_expected,
@@ -456,7 +379,7 @@ def compute_level_stats(result: LevelRunResult, *, total_vram_mb: int | None = N
         its_retention_fraction=_its_retention(metrics.jobs) if metrics is not None else None,
         gpu_utilization_mean_percent=metrics.gpu_utilization_mean_percent if metrics is not None else None,
         gpu_utilization_busy_fraction=metrics.gpu_utilization_busy_fraction if metrics is not None else None,
-        span_derived_busy_ratio=_span_derived_busy_ratio(phase_breakdown),
+        span_derived_busy_ratio=span_derived_busy_ratio(level_phase_breakdown),
         post_warmup_vram_reloads=(_post_warmup_vram_reloads(metrics.jobs) if metrics is not None else None),
         vram_used_high_water_mb=vram_high_water,
         total_vram_mb=total_vram_mb,
@@ -466,7 +389,8 @@ def compute_level_stats(result: LevelRunResult, *, total_vram_mb: int | None = N
         model_load_vram_seconds_median=statistics.median(vram_loads) if vram_loads else None,
         queue_wait_seconds_p95=_percentile(queue_waits, 0.95),
         e2e_seconds_p95=_percentile(e2es, 0.95),
-        phase_breakdown_seconds=phase_breakdown,
+        phase_breakdown_seconds=level_phase_breakdown,
+        time_spent_no_jobs_available=metrics.time_spent_no_jobs_available if metrics is not None else None,
     )
 
 
@@ -1124,12 +1048,19 @@ def render_markdown(report: BenchmarkReport) -> str:
             lines.append("")
             lines.append("| Phase | Seconds | % of total |")
             lines.append("|---|---|---|")
-            for phase in _PHASE_ORDER:
+            for phase in PHASE_ORDER:
                 if phase not in breakdown:
                     continue
                 seconds = breakdown[phase]
                 pct = (seconds / total * 100) if total > 0 else 0.0
                 lines.append(f"| {phase} | {seconds:.3f} | {pct:.0f}% |")
+            no_jobs = level_report.stats.time_spent_no_jobs_available  # type: ignore[union-attr]
+            if no_jobs:
+                lines.append("")
+                lines.append(
+                    f"Plus ~{no_jobs:.0f}s of the run with no jobs available (horde demand, not the worker): "
+                    "demand-limited idle, separate from the per-job gaps above.",
+                )
             lines.append("")
 
     lines.append("## Remediation queue")

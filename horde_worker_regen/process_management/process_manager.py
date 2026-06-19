@@ -55,6 +55,7 @@ from horde_worker_regen.process_management.action_ledger import ActionLedger, Le
 from horde_worker_regen.process_management.alchemy_popper import DEFAULT_ALCHEMY_FORMS, AlchemyCoordinator
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.duty_cycle import DutyCycleSummary, summarize_duty_cycle
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
@@ -105,6 +106,7 @@ from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.reporting.status_reporter import StatusReporter
 from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
+from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
 
@@ -654,6 +656,14 @@ class HordeWorkerProcessManager:
         )
 
         self._run_metrics = WorkerRunMetrics()
+
+        # Measure real GPU core uptime (the duty cycle) for the whole worker session, not just the
+        # benchmark. A coarse 1s poll is plenty for the rolling-window trend and threshold logs and
+        # is far cheaper than the benchmark's 0.1s sampler. It no-ops on CPU/fake/non-NVIDIA backends
+        # (no telemetry -> no thread), so creating it here is always safe.
+        self._gpu_sampler = GpuUtilizationSampler(interval_seconds=1.0)
+        self._last_duty_cycle_log_time = 0.0
+        self._last_no_jobs_seconds_at_duty_log = 0.0
 
         # Expected-time-to-complete model: seeds from the last benchmark's per-tier reference it/s and
         # self-calibrates from this worker's own jobs, so a "slow" job becomes measurable rather than
@@ -1246,6 +1256,7 @@ class HordeWorkerProcessManager:
 
         self._maybe_refresh_references()
         self.print_status_method()
+        self._maybe_log_duty_cycle()
         self._sample_disk_space()
         self._publish_supervisor_snapshot()
 
@@ -1664,6 +1675,7 @@ class HordeWorkerProcessManager:
 
     async def _process_control_loop(self) -> None:
         self._download_wait_started = time.time()
+        self._gpu_sampler.start()
         if self._enable_background_downloads:
             self._process_lifecycle.start_download_process()
             # Both the safety and inference processes are started lazily once their required models are on
@@ -1711,6 +1723,7 @@ class HordeWorkerProcessManager:
             self._process_lifecycle.replace_hung_processes()
             await asyncio.sleep(0.2)
 
+        self._gpu_sampler.stop()
         self._process_lifecycle.end_inference_processes(force=True)
         self._process_lifecycle.end_safety_processes()
         self._process_lifecycle.end_download_process()
@@ -1836,6 +1849,106 @@ class HordeWorkerProcessManager:
         if self._enable_background_downloads and not self._inference_processes_started:
             return "waiting for model download / disk scan", process_summary
         return "starting worker processes", process_summary
+
+    _DUTY_CYCLE_SNAPSHOT_WINDOW_SECONDS = 60.0
+    """Rolling window for the duty-cycle figure published to the TUI/insights (recent, lightly smoothed)."""
+
+    _DUTY_CYCLE_REPORT_INTERVAL_SECONDS = 180.0
+    """How often the duty-cycle health line is logged, and the window each report covers, so the NVML
+    mean, the per-job attribution, and the no-jobs share all describe the same elapsed period."""
+
+    _DUTY_CYCLE_TARGET_PERCENT = 90.0
+    """The duty cycle the worker drives toward on a reference machine; below it leaves uptime on the table."""
+
+    _DUTY_CYCLE_WARN_PERCENT = 75.0
+    """At or above this (but below target) the shortfall is noted at INFO; below it escalates to WARNING."""
+
+    def _maybe_log_duty_cycle(self) -> None:
+        """Periodically log GPU duty cycle and, when it is low, where the wall-clock went.
+
+        The number is the same one the TUI shows; the value added here is the *attribution* on the same
+        line (per-job queue/safety/submit/model-load gaps plus a demand-vs-efficiency split), so an
+        operator grepping ``GPU duty cycle`` across many workers' logs can see *why* uptime dropped with
+        no tracing backend. Throttled, and quiet (DEBUG) when the worker is healthy; a worker the horde
+        simply left idle is reported as demand-limited, never as a worker fault.
+        """
+        now = time.time()
+
+        # Seed the baseline on the first call so the first real report measures a known interval.
+        if self._last_duty_cycle_log_time == 0.0:
+            self._last_duty_cycle_log_time = now
+            self._last_no_jobs_seconds_at_duty_log = self._job_popper.time_spent_no_jobs_available
+            return
+
+        window_seconds = now - self._last_duty_cycle_log_time
+        if window_seconds < self._DUTY_CYCLE_REPORT_INTERVAL_SECONDS:
+            return
+
+        nvml_mean = self._gpu_sampler.mean_percent(window_seconds=window_seconds)
+        nvml_busy = self._gpu_sampler.busy_fraction(window_seconds=window_seconds)
+
+        metrics = self.get_run_metrics_snapshot()
+        window_start = self._last_duty_cycle_log_time
+        jobs_in_window = [
+            job for job in metrics.jobs if (job.stage_timestamps.get("FINALIZED") or 0.0) >= window_start
+        ]
+
+        no_jobs_total = self._job_popper.time_spent_no_jobs_available
+        no_jobs_in_window = max(0.0, no_jobs_total - self._last_no_jobs_seconds_at_duty_log)
+
+        # Advance the window before logging so a quiet report never widens the next one's denominator.
+        self._last_duty_cycle_log_time = now
+        self._last_no_jobs_seconds_at_duty_log = no_jobs_total
+
+        summary = summarize_duty_cycle(
+            jobs_in_window,
+            window_seconds=window_seconds,
+            time_spent_no_jobs_available=no_jobs_in_window,
+            nvml_mean_percent=nvml_mean,
+            nvml_busy_fraction=nvml_busy,
+        )
+        self._log_duty_cycle_summary(summary, metrics.process_state_summary)
+
+    def _log_duty_cycle_summary(self, summary: DutyCycleSummary, process_state_summary: str) -> None:
+        """Emit one structured ``GPU duty cycle`` line for ``summary`` at a severity matched to the cause."""
+        duty = summary.effective_duty_percent()
+        if duty is None:
+            return  # Nothing measured this window (no GPU telemetry and no completed jobs to attribute).
+
+        # A worker the horde left without work is not inefficient; never alarm for demand-limited idle.
+        demand_limited = summary.completed_jobs == 0 and summary.is_demand_limited()
+
+        busy_str = f"{summary.nvml_busy_fraction:.0%}" if summary.nvml_busy_fraction is not None else "n/a"
+        head = (
+            f"GPU duty cycle {duty:.0f}% over last {summary.window_seconds:.0f}s "
+            f"(target {self._DUTY_CYCLE_TARGET_PERCENT:.0f}%, source={summary.headline_source()}, busy={busy_str})"
+        )
+
+        explanation_parts: list[str] = []
+        if summary.no_jobs_available_fraction:
+            explanation_parts.append(
+                f"{summary.no_jobs_available_fraction:.0%} of the window had no jobs available "
+                "(horde demand, not the worker)",
+            )
+        gaps = summary.format_gap_summary()
+        if gaps:
+            explanation_parts.append(f"biggest worker-side gaps: {gaps}")
+        explanation = "; ".join(explanation_parts) if explanation_parts else "no per-job attribution yet"
+
+        context = (
+            f"jobs: {summary.completed_jobs} done | {len(self._job_tracker.jobs_pending_inference)} pending | "
+            f"{len(self._job_tracker.jobs_in_progress)} in-flight; processes: {process_state_summary or 'n/a'}"
+        )
+        message = f"{head}. {explanation}. {context}"
+
+        if demand_limited:
+            logger.info(message)
+        elif duty >= self._DUTY_CYCLE_TARGET_PERCENT:
+            logger.debug(message)
+        elif duty >= self._DUTY_CYCLE_WARN_PERCENT:
+            logger.info(message)
+        else:
+            logger.warning(message)
 
     def print_status_method(self) -> None:
         """Print the status of the worker if it's time to do so."""
@@ -2259,8 +2372,13 @@ class HordeWorkerProcessManager:
             kudos_per_hour=kudos_per_hour,
             kudos_this_session=kudos_session,
             active_models=active_models,
-            gpu_utilization_mean_percent=run_metrics.gpu_utilization_mean_percent,
-            gpu_utilization_busy_fraction=run_metrics.gpu_utilization_busy_fraction,
+            gpu_utilization_mean_percent=(
+                self._gpu_sampler.mean_percent(window_seconds=self._DUTY_CYCLE_SNAPSHOT_WINDOW_SECONDS)
+            ),
+            gpu_utilization_busy_fraction=(
+                self._gpu_sampler.busy_fraction(window_seconds=self._DUTY_CYCLE_SNAPSHOT_WINDOW_SECONDS)
+            ),
+            gpu_utilization_samples=self._gpu_sampler.sample_count,
             vram_high_water_mb_per_process=run_metrics.vram_used_high_water_mb_per_process,
             ram_high_water_mb_per_process=run_metrics.ram_used_high_water_mb_per_process,
             disk_free_bytes=dict(self._disk_monitor.current_free_bytes),

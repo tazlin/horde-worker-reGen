@@ -12,11 +12,11 @@ from horde_worker_regen.benchmark.report import (
     LevelReport,
     LevelRunResult,
     _post_warmup_vram_reloads,
-    _span_derived_busy_ratio,
     compute_level_stats,
     render_markdown,
     synthesize_bridge_data,
 )
+from horde_worker_regen.process_management.duty_cycle import span_derived_busy_ratio as _span_derived_busy_ratio
 from horde_worker_regen.process_management.run_metrics import JobMetricsRecord, RunMetricsSnapshot
 
 

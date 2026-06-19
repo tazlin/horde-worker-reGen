@@ -23,18 +23,22 @@ from typing import TYPE_CHECKING, Annotated, Literal
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
+from horde_worker_regen.process_management.duty_cycle import format_phase_gaps, phase_breakdown
+
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
 
 PROGRESS_FILENAME = "progress.jsonl"
 """The progress event log written into a run's output directory."""
 
-BENCHMARK_PROGRESS_PROTOCOL_VERSION = 3
+BENCHMARK_PROGRESS_PROTOCOL_VERSION = 4
 """Bumped when the event schema changes incompatibly; stamped into every event and checked by readers.
 
 v2 added ``RAMP_PLANNED`` (the per-level resource-requirements plan). v3 adds
-``RampFinished.suggestion_decisions`` (per-setting recommendation provenance). Readers tolerate unknown
-kinds and unknown fields default in, so an older reader simply ignores the additions.
+``RampFinished.suggestion_decisions`` (per-setting recommendation provenance). v4 adds the live
+duty-cycle attribution (``gpu_duty_gap_summary`` + ``no_jobs_available_seconds``) to the level
+progress/finished events. Readers tolerate unknown kinds and unknown fields default in, so an older
+reader simply ignores the additions.
 """
 
 
@@ -203,6 +207,11 @@ class LevelProgress(BenchmarkProgressEvent):
     num_process_recoveries: int = 0
     """Cumulative child-process restarts so far; a non-zero value during startup is the visible tell of
     a respawn storm (rather than a merely slow level)."""
+    gpu_duty_gap_summary: str = ""
+    """The biggest worker-side per-job gaps so far (e.g. "model load (disk) 1.8s/job, safety 0.9s/job"),
+    so a tailing view can show *where* a low live duty cycle is going. Empty until jobs are attributed."""
+    no_jobs_available_seconds: float | None = None
+    """Seconds so far the worker idled with no jobs available (demand-limited idle, not inefficiency)."""
 
 
 class LevelFinished(BenchmarkProgressEvent):
@@ -217,6 +226,10 @@ class LevelFinished(BenchmarkProgressEvent):
     gpu_busy_percent: float | None = None
     vram_used_high_water_mb: int | None = None
     num_findings: int = 0
+    gpu_duty_gap_summary: str = ""
+    """The biggest worker-side per-job gaps over the level, for a "where the duty cycle went" line."""
+    no_jobs_available_seconds: float | None = None
+    """Seconds the worker idled with no jobs available over the level (demand-limited idle)."""
 
 
 class SuggestionDecisionRow(BaseModel):
@@ -288,6 +301,10 @@ class LevelLiveSnapshot(BaseModel):
     """Compact per-process state line; see :class:`LevelProgress.process_summary`."""
     num_process_recoveries: int = 0
     """Cumulative child-process restarts; see :class:`LevelProgress.num_process_recoveries`."""
+    gpu_duty_gap_summary: str = ""
+    """Biggest worker-side per-job gaps so far; see :class:`LevelProgress.gpu_duty_gap_summary`."""
+    no_jobs_available_seconds: float | None = None
+    """Demand-limited idle so far; see :class:`LevelProgress.no_jobs_available_seconds`."""
 
     @classmethod
     def from_run_metrics(cls, metrics: RunMetricsSnapshot, elapsed_seconds: float) -> LevelLiveSnapshot:
@@ -321,6 +338,8 @@ class LevelLiveSnapshot(BaseModel):
             phase=metrics.phase,
             process_summary=metrics.process_state_summary,
             num_process_recoveries=metrics.num_process_recoveries,
+            gpu_duty_gap_summary=format_phase_gaps(phase_breakdown(jobs)),
+            no_jobs_available_seconds=metrics.time_spent_no_jobs_available,
         )
 
 

@@ -508,6 +508,8 @@ class WorkerStateSnapshot(BaseModel):
 
     gpu_utilization_mean_percent: float | None = None
     gpu_utilization_busy_fraction: float | None = None
+    gpu_utilization_samples: int = 0
+    """How many GPU-utilization samples back the figures above (0 = unmeasured, e.g. no NVML)."""
 
     vram_high_water_mb_per_process: dict[int, int] = Field(default_factory=dict)
     ram_high_water_mb_per_process: dict[int, int] = Field(default_factory=dict)
