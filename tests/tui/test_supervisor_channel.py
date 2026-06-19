@@ -125,6 +125,49 @@ def test_process_snapshot_from_process_info() -> None:
     assert snapshot.last_process_state == "WAITING_FOR_JOB"
     assert snapshot.current_job_id == "job-9"
     assert snapshot.loaded_horde_model_baseline == "stable_diffusion_1"
+    # An idle process carries no current-job resolution/steps.
+    assert snapshot.current_job_width is None
+    assert snapshot.current_job_height is None
+    assert snapshot.current_job_steps is None
+
+
+def test_process_snapshot_carries_busy_job_resolution() -> None:
+    """A busy process surfaces the active job's resolution and step count for the dashboards."""
+    info = _fake_process_info()
+    info.is_process_busy = lambda: True
+    info.batch_amount = 4
+    info.last_job_referenced = SimpleNamespace(
+        id_=SimpleNamespace(root="job-9"),
+        payload=SimpleNamespace(
+            width=832,
+            height=1216,
+            ddim_steps=28,
+            loras=[],
+            tis=[],
+            control_type=None,
+            post_processing=[],
+            hires_fix=False,
+            workflow=None,
+        ),
+    )
+    snapshot = ProcessSnapshot.from_process_info(info)  # type: ignore[arg-type]
+    assert snapshot.current_job_width == 832
+    assert snapshot.current_job_height == 1216
+    assert snapshot.current_job_steps == 28
+    assert snapshot.batch_amount == 4
+
+
+def test_snapshot_roundtrip_preserves_new_pipeline_and_job_fields() -> None:
+    """The new pipeline-tail count and per-job resolution survive a JSON round-trip."""
+    snapshot = _make_snapshot()
+    snapshot.jobs_pending_submit = 3
+    snapshot.processes[0].current_job_width = 1024
+    snapshot.processes[0].current_job_height = 1024
+    snapshot.processes[0].current_job_steps = 30
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+    assert restored.jobs_pending_submit == 3
+    assert restored.processes[0].current_job_width == 1024
+    assert restored.processes[0].current_job_steps == 30
 
 
 def _recv_first(parent: object, frame_type: type, *, timeout: float = 3.0) -> object | None:

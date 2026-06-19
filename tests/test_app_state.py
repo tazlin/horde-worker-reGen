@@ -149,6 +149,28 @@ def test_set_auto_start_worker_round_trips_and_preserves_fields(tmp_path: Path) 
     assert store.load().auto_start_worker is False
 
 
+def test_detailed_info_defaults_off(tmp_path: Path) -> None:
+    """A fresh state has detailed-info off, so the dashboard starts lean."""
+    assert _store(tmp_path).load().detailed_info is False
+
+
+def test_set_detailed_info_round_trips_and_preserves_fields(tmp_path: Path) -> None:
+    """Toggling detailed-info persists and does not clobber other recorded state."""
+    store = _store(tmp_path)
+    store.record_worker_started(worker_version="12.0.0")
+    store.set_auto_start_worker(True)
+
+    store.set_detailed_info(True)
+
+    state = store.load()
+    assert state.detailed_info is True
+    assert state.auto_start_worker is True
+    assert state.worker_version_last_ran == "12.0.0"
+
+    store.set_detailed_info(False)
+    assert store.load().detailed_info is False
+
+
 def test_setup_complete_defaults_off(tmp_path: Path) -> None:
     """A fresh state has setup-complete off, so a new install runs the wizard."""
     assert _store(tmp_path).load().setup_complete is False

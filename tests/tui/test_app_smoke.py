@@ -55,6 +55,13 @@ async def test_app_boots_renders_and_cycles_tabs(tmp_path: Path) -> None:
             snapshot = supervisor.latest_snapshot
             report = derive(snapshot, supervisor.status, time.time() - snapshot.timestamp)
             assert report.phase in _LIVE_PHASES, f"unexpected phase {report.phase}"
+
+            # The F6 detail toggle flips, renders the detailed views without error, and persists.
+            assert app._detailed_info is False
+            app.action_toggle_detailed_info()
+            await pilot.pause()
+            assert app._detailed_info is True
+            assert store.load().detailed_info is True
     finally:
         supervisor.stop(timeout=10.0)
     assert not supervisor.is_alive()

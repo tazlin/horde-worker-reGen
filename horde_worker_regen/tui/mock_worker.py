@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import random
 import time
+from collections import deque
 
 from horde_worker_regen.process_management.supervisor_channel import (
     CurrentDownloadStatus,
@@ -18,7 +19,10 @@ from horde_worker_regen.process_management.supervisor_channel import (
     DownloadPhase,
     DownloadPlanSummary,
     DownloadStatusSnapshot,
+    JobFeatureSummary,
+    JobQueueEntry,
     ProcessSnapshot,
+    RecentJobRecord,
     SupervisorChannel,
     SupervisorCommand,
     WorkerConfigSummary,
@@ -29,6 +33,16 @@ from horde_worker_regen.run_worker import WorkerLaunchOptions
 _TICK_SECONDS = 0.5
 
 _MOCK_MODELS = ["AlbedoBase XL (SDXL)", "Deliberate", "Flux.1-Schnell fp8 (Compact)"]
+
+# A pool of believable job shapes (width, height, steps, batch) so the resolution/batch columns and the
+# queue/pipeline visualizations have varied, realistic content under --process-mode fake.
+_MOCK_JOB_SHAPES: list[tuple[int, int, int, int]] = [
+    (1024, 1024, 30, 1),
+    (832, 1216, 28, 1),
+    (512, 768, 25, 4),
+    (1152, 896, 32, 2),
+    (768, 768, 20, 1),
+]
 
 # One-time warm-up, then the repeating steady-state job cycle (name, duration seconds).
 _WARMUP_PHASES: list[tuple[str, float]] = [
@@ -68,7 +82,7 @@ class _MockProcess:
         self._phase_started = time.monotonic()
         self._fraction = 0.0
         self.model = random.choice(_MOCK_MODELS)
-        self.total_steps = 30
+        self.width, self.height, self.total_steps, self.batch = random.choice(_MOCK_JOB_SHAPES)
         self.step = 0
         self.its = 0.0
         self.vram_mb = 1800
@@ -125,6 +139,7 @@ class _MockProcess:
         self._phase_started = now
         if completed:
             self.model = random.choice(_MOCK_MODELS)
+            self.width, self.height, self.total_steps, self.batch = random.choice(_MOCK_JOB_SHAPES)
             self.num_jobs_completed += 1
         return completed
 
@@ -155,6 +170,10 @@ class _MockProcess:
             ram_usage_bytes=self.ram_bytes,
             vram_usage_mb=self.vram_mb,
             total_vram_mb=24000,
+            batch_amount=self.batch if self.is_busy else 1,
+            current_job_width=self.width if self.is_busy else None,
+            current_job_height=self.height if self.is_busy else None,
+            current_job_steps=self.total_steps if self.is_busy else None,
             last_iterations_per_second=self.its if sampling else None,
             last_current_step=self.step if sampling else None,
             last_total_steps=self.total_steps if sampling else None,
@@ -297,6 +316,7 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
     jobs_popped = 0
     kudos_session = 0.0
     session_start = time.time()
+    recent_jobs: deque[RecentJobRecord] = deque(maxlen=25)
 
     config = WorkerConfigSummary(
         dreamer_name=os.getenv("AIWORKER_DREAMER_WORKER_NAME") or options.worker_name or "Mock Dreamer",
@@ -332,8 +352,21 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
                 jobs_popped += 1
                 kudos_session += random.uniform(8.0, 28.0)
                 safety.on_job_checked()
-                if random.random() < 0.04:
+                faulted = random.random() < 0.04
+                if faulted:
                     jobs_faulted += 1
+                recent_jobs.append(
+                    RecentJobRecord(
+                        job_id=f"mock-{jobs_submitted}",
+                        faulted=faulted,
+                        queue_wait_seconds=random.uniform(0.1, 3.0),
+                        e2e_seconds=random.uniform(3.5, 9.0),
+                        model_name=process.model,
+                        steps=process.total_steps,
+                        width=process.width,
+                        height=process.height,
+                    ),
+                )
 
         elapsed = time.time() - session_start
         blip = elapsed > _WARMUP_GRACE and (int(elapsed) % _BLIP_PERIOD) < _BLIP_LENGTH
@@ -341,6 +374,21 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
         horde_maintenance = elapsed > _WARMUP_GRACE and (int(elapsed) % _MAINTENANCE_PERIOD) < _MAINTENANCE_LENGTH
         last_pop = max((p.last_inference_started for p in processes), default=0.0)
         session_hours = max(elapsed / 3600.0, 1e-6)
+
+        # A small, slowly-rotating synthetic queue so the pipeline strip and "Up next" lane have content.
+        queue_depth = 0 if no_work else (int(elapsed) // 3) % 5
+        pending_jobs = [
+            JobQueueEntry(
+                job_id=f"mock-queued-{index}",
+                model=_MOCK_MODELS[index % len(_MOCK_MODELS)],
+                steps=shape[2],
+                width=shape[0],
+                height=shape[1],
+                features=JobFeatureSummary(loras=1) if index % 2 else None,
+            )
+            for index, shape in enumerate(_MOCK_JOB_SHAPES[:queue_depth])
+        ]
+        sampling_count = sum(1 for p in processes if p.state == "INFERENCE_STARTING")
 
         snapshot = WorkerStateSnapshot(
             session_start_time=session_start,
@@ -360,8 +408,12 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
             last_pop_skipped_reasons=dict(_MOCK_SKIP_REASONS) if no_work else {},
             api_messages=["Simulated network issue; the worker is retrying."] if blip else [],
             pending_megapixelsteps=random.randint(0, 12),
-            jobs_pending_inference=sum(1 for p in processes if p.state == "PRELOADING_MODEL"),
-            jobs_in_progress=sum(1 for p in processes if p.state == "INFERENCE_STARTING"),
+            jobs_pending_inference=len(pending_jobs),
+            jobs_in_progress=sampling_count,
+            jobs_pending_safety_check=sum(1 for p in processes if p.state == "INFERENCE_COMPLETE"),
+            jobs_pending_submit=(int(elapsed) // 2) % 3,
+            pending_jobs=pending_jobs,
+            recent_jobs=list(recent_jobs),
             kudos_per_hour=kudos_session / session_hours if kudos_session else None,
             kudos_this_session=kudos_session,
             active_models=sorted({p.model for p in processes if p.is_busy}),

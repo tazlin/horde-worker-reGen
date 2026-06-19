@@ -2098,6 +2098,7 @@ class HordeWorkerProcessManager:
             jobs_in_progress=len(self._job_tracker.jobs_in_progress),
             jobs_pending_safety_check=len(self._job_tracker.jobs_pending_safety_check),
             jobs_being_safety_checked=len(self._job_tracker.jobs_being_safety_checked),
+            jobs_pending_submit=len(self._job_tracker.jobs_pending_submit),
             time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
             kudos_per_hour=kudos_per_hour,
             kudos_this_session=kudos_session,

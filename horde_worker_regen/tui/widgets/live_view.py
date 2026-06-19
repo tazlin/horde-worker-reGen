@@ -66,12 +66,19 @@ class LiveView(VerticalScroll):
         """Hold a single Static that renders all process panels."""
         yield Static(id="live-body")
 
-    def update_snapshot(self, snapshot: WorkerStateSnapshot, snapshot_age: float | None = None) -> None:
+    def update_snapshot(
+        self,
+        snapshot: WorkerStateSnapshot,
+        snapshot_age: float | None = None,
+        *,
+        detailed: bool = False,
+    ) -> None:
         """Rebuild the process panels from a worker-state snapshot.
 
         ``snapshot_age`` (seconds since the snapshot was produced) drives the staleness banner: a frozen
         or dead worker keeps showing its last frame, so when the data is old we say so explicitly rather
-        than let confident-but-stale numbers mislead the operator.
+        than let confident-but-stale numbers mislead the operator. ``detailed`` reveals the more
+        technical rows (raw job ID, heartbeat age/type) that the F6 toggle gates.
         """
         body = self.query_one("#live-body", Static)
         if not snapshot.processes:
@@ -79,7 +86,9 @@ class LiveView(VerticalScroll):
             return
 
         stale = snapshot_age is not None and snapshot_age > _STALE_AFTER_SECONDS
-        panels = [self._render_process_panel(process, stale=stale) for process in snapshot.processes]
+        panels = [
+            self._render_process_panel(process, stale=stale, detailed=detailed) for process in snapshot.processes
+        ]
         if stale:
             banner = Text(
                 f"⚠ Live data is {snapshot_age:.0f}s old; the worker may be busy, hung, or restarting.",
@@ -89,7 +98,13 @@ class LiveView(VerticalScroll):
         else:
             body.update(Group(*panels))
 
-    def _render_process_panel(self, process: ProcessSnapshot, *, stale: bool = False) -> RenderableType:
+    def _render_process_panel(
+        self,
+        process: ProcessSnapshot,
+        *,
+        stale: bool = False,
+        detailed: bool = False,
+    ) -> RenderableType:
         """Render one process as a bordered panel with progress and resource detail."""
         state_colour = "grey50" if stale else self._state_colour(process.last_process_state)
         heartbeat_age = time.time() - process.last_heartbeat_timestamp if process.last_heartbeat_timestamp else None
@@ -103,7 +118,12 @@ class LiveView(VerticalScroll):
         body.add_row("Model", shorten(process.loaded_horde_model_name, 40))
         if process.loaded_horde_model_baseline:
             body.add_row("Baseline", process.loaded_horde_model_baseline)
-        if process.current_job_id:
+        if process.current_job_width and process.current_job_height:
+            size = f"{process.current_job_width}×{process.current_job_height}"
+            if process.batch_amount > 1:
+                size += f"   (batch ×{process.batch_amount})"
+            body.add_row("Resolution", size)
+        if detailed and process.current_job_id:
             body.add_row("Job", process.current_job_id)
 
         if process.current_job_features is not None and not process.current_job_features.is_empty():
@@ -139,7 +159,13 @@ class LiveView(VerticalScroll):
             "RAM",
             f"{human_mb(process.ram_usage_bytes / 1024 / 1024)}   (peak {human_mb(process.ram_used_high_water_mb)})",
         )
-        body.add_row("Heartbeat", self._heartbeat_text(heartbeat_age, process.is_alive, process.last_process_state))
+        if detailed:
+            body.add_row(
+                "Heartbeat",
+                self._heartbeat_text(heartbeat_age, process.is_alive, process.last_process_state),
+            )
+            if process.is_busy:
+                body.add_row("HB type", process.last_heartbeat_type.replace("_", " ").title())
         # A running tally so a healthy-but-quiet process (the safety process especially, whose checks
         # are each over in milliseconds) visibly does work rather than looking parked.
         work_label = "Checked" if process.process_type == "SAFETY" else "Completed"

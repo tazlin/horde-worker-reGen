@@ -711,7 +711,8 @@ class BenchmarkView(VerticalScroll):
     def _jobs_cell(level: LevelState) -> RenderableType:
         """The Jobs row: a filled progress bar when the job count is known, else a bare counter.
 
-        A bar gives an at-a-glance sense of how far through the level we are, which a raw ``3/8`` does not."""
+        A bar gives an at-a-glance sense of how far through the level we are, which a raw ``3/8`` does not.
+        """
         suffix = Text(f"  ({level.jobs_faulted} faulted)", style="red") if level.jobs_faulted else Text("")
         if not level.jobs_expected:
             return Text.assemble((str(level.jobs_completed), "white"), suffix)

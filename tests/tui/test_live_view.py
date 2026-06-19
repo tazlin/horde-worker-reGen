@@ -54,6 +54,25 @@ def test_active_process_shows_sampling_row() -> None:
     assert "30/30 steps" in text
 
 
+def test_resolution_row_shows_by_default_and_job_id_is_gated() -> None:
+    """Resolution/batch show without the detail toggle; the raw job ID and heartbeat are gated."""
+    process = _process("INFERENCE_STARTING")
+    process.current_job_width = 832
+    process.current_job_height = 1216
+    process.batch_amount = 2
+    process.current_job_id = "job-xyz"
+
+    lean = _render(LiveView()._render_process_panel(process))
+    assert "832×1216" in lean
+    assert "batch ×2" in lean
+    assert "job-xyz" not in lean
+    assert "Heartbeat" not in lean
+
+    detailed = _render(LiveView()._render_process_panel(process, detailed=True))
+    assert "job-xyz" in detailed
+    assert "Heartbeat" in detailed
+
+
 class _RecordingBody:
     """Stands in for the live-body Static, capturing the renderable handed to update()."""
 

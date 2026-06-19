@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 
 from rich.console import Group
 from rich.panel import Panel
@@ -12,17 +13,29 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Static
 
-from horde_worker_regen.process_management.supervisor_channel import WorkerStateSnapshot
+from horde_worker_regen.process_management.supervisor_channel import (
+    JobQueueEntry,
+    ProcessSnapshot,
+    WorkerStateSnapshot,
+)
 from horde_worker_regen.tui.formatters import (
     format_its,
     format_percent,
     human_duration,
     human_mb,
     label_state,
+    mini_bar,
     shorten,
+    sparkline,
 )
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, summarize_skips
 from horde_worker_regen.tui.widgets.common import StatCard
+
+_TREND_HISTORY = 60
+"""How many recent frames of GPU-duty / kudos-per-hour history the momentum sparklines retain."""
+
+_SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "INFERENCE_POST_PROCESSING", "ALCHEMY_STARTING"})
+"""States with a live sampling step/it-s; outside these the snapshot's step numbers are last-job residue."""
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SERVING_PULSE = ("dark_green", "green", "green3", "bright_green", "green3", "green")
@@ -41,6 +54,12 @@ _STATIC_GLYPHS: dict[WorkerPhase, str] = {
 class OverviewView(VerticalScroll):
     """A dashboard led by a living status hero and a health checklist."""
 
+    def __init__(self) -> None:
+        """Set up the view, including the client-side trend history for the momentum sparklines."""
+        super().__init__()
+        self._gpu_duty_history: deque[float] = deque(maxlen=_TREND_HISTORY)
+        self._kudos_history: deque[float] = deque(maxlen=_TREND_HISTORY)
+
     def compose(self) -> ComposeResult:
         """Lay out the hero, health checklist, stat cards, and detail tables."""
         yield Static(id="overview-hero")
@@ -52,6 +71,8 @@ class OverviewView(VerticalScroll):
             yield StatCard("GPU duty", card_id="ov-gpu")
             yield StatCard("Kudos / hr", card_id="ov-kudos")
             yield StatCard("Processes", card_id="ov-processes")
+        yield Static(id="overview-pipeline")
+        yield Static(id="overview-momentum")
         yield Static(id="overview-worker")
         yield Static(id="overview-alchemy")
         yield Static(id="overview-processes")
@@ -64,17 +85,29 @@ class OverviewView(VerticalScroll):
         snapshot: WorkerStateSnapshot | None,
         *,
         frame: int,
+        detailed: bool = False,
     ) -> None:
         """Refresh the hero/health from the report and the metrics from the snapshot (if any)."""
         self.query_one("#overview-hero", Static).update(self._render_hero(report, snapshot, frame))
         self.query_one("#overview-health", Static).update(self._render_health(report))
         if snapshot is not None:
             self._update_cards(snapshot)
+            self._record_trends(snapshot)
+            self.query_one("#overview-pipeline", Static).update(self._render_pipeline_strip(snapshot))
+            self.query_one("#overview-momentum", Static).update(self._render_momentum(snapshot))
             self.query_one("#overview-worker", Static).update(self._render_worker_table(snapshot))
             self.query_one("#overview-alchemy", Static).update(self._render_alchemy_panel(snapshot))
-            self.query_one("#overview-processes", Static).update(self._render_process_table(snapshot))
+            processes_table = self._render_process_table(snapshot, detailed=detailed)
+            self.query_one("#overview-processes", Static).update(processes_table)
             self.query_one("#overview-queue", Static).update(self._render_queue_table(snapshot))
             self.query_one("#overview-recent", Static).update(self._render_recent_jobs(snapshot))
+
+    def _record_trends(self, snapshot: WorkerStateSnapshot) -> None:
+        """Append this frame's GPU-duty and kudos/hr to the bounded sparkline history buffers."""
+        if snapshot.gpu_utilization_mean_percent is not None:
+            self._gpu_duty_history.append(snapshot.gpu_utilization_mean_percent)
+        if snapshot.kudos_per_hour is not None:
+            self._kudos_history.append(snapshot.kudos_per_hour)
 
     def _hero_glyph(self, report: HealthReport, frame: int) -> Text:
         """A status glyph that pulses/spins for in-progress or attention states."""
@@ -283,8 +316,88 @@ class OverviewView(VerticalScroll):
         border = "green" if total_active > 0 else ("yellow" if not config.alchemy_concurrent else "grey37")
         return Panel(table, title="Alchemy", title_align="left", border_style=border, padding=(0, 1))
 
-    def _render_process_table(self, snapshot: WorkerStateSnapshot) -> Table:
-        """Build a compact per-process summary table with stable column widths."""
+    _PIPELINE_BAR_WIDTH = 8
+    """Maximum block-bar width (chars) for one job-pipeline stage; bars scale to the busiest stage."""
+
+    @staticmethod
+    def _stage_segment(label: str, count: int, peak: int) -> Text:
+        """Render one labelled pipeline stage: name, a count-proportional bar, and the count."""
+        colour = "green" if count > 0 else "grey50"
+        if peak > 0 and count > 0:
+            width = max(1, round(count / peak * OverviewView._PIPELINE_BAR_WIDTH))
+            bar = mini_bar(count / peak, width)
+        else:
+            bar = "·"
+        return Text.assemble((f"{label} ", "bold"), (bar + " ", colour), (str(count), f"bold {colour}"))
+
+    def _render_pipeline_strip(self, snapshot: WorkerStateSnapshot) -> Panel:
+        """Render the job lifecycle as a labelled flow: what is queued, in-flight, and finishing.
+
+        The first stages are live in-flight queues (they scale together against the busiest stage);
+        the trailing "Submitted" is the session running total, shown plainly so a cumulative figure is
+        not mistaken for a backlog.
+        """
+        queue = snapshot.jobs_pending_inference
+        inference = snapshot.jobs_in_progress
+        safety = snapshot.jobs_pending_safety_check + snapshot.jobs_being_safety_checked
+        submit = snapshot.jobs_pending_submit
+        peak = max(queue, inference, safety, submit, 1)
+
+        arrow = Text(" ▶ ", style="grey50")
+        flow = Text.assemble(
+            self._stage_segment("Queue", queue, peak),
+            arrow,
+            self._stage_segment("Inference", inference, peak),
+            arrow,
+            self._stage_segment("Safety", safety, peak),
+            arrow,
+            self._stage_segment("Submit", submit, peak),
+            ("    ", ""),
+            (f"✓ {snapshot.num_jobs_submitted:,} submitted", "grey62"),
+        )
+        rows: list[Text] = [flow]
+
+        if snapshot.config.alchemist:
+            alch_peak = max(
+                snapshot.alchemy_forms_pending,
+                snapshot.alchemy_forms_in_flight,
+                snapshot.alchemy_forms_awaiting_submit,
+                1,
+            )
+            rows.append(
+                Text.assemble(
+                    self._stage_segment("Alchemy pending", snapshot.alchemy_forms_pending, alch_peak),
+                    arrow,
+                    self._stage_segment("active", snapshot.alchemy_forms_in_flight, alch_peak),
+                    arrow,
+                    self._stage_segment("submit", snapshot.alchemy_forms_awaiting_submit, alch_peak),
+                    ("    ", ""),
+                    (f"✓ {snapshot.alchemy_total_submitted:,} submitted", "grey62"),
+                ),
+            )
+
+        border = "green" if (queue or inference or safety or submit) else "grey37"
+        return Panel(Group(*rows), title="Job pipeline", title_align="left", border_style=border, padding=(0, 1))
+
+    def _render_momentum(self, snapshot: WorkerStateSnapshot) -> Panel:
+        """Render compact sparklines of recent GPU-duty and kudos/hr so momentum is visible."""
+        gpu_now = format_percent(snapshot.gpu_utilization_mean_percent)
+        kudos_now = "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"
+
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(justify="right", style="bold cyan", no_wrap=True)
+        grid.add_column(no_wrap=True)
+        grid.add_column(justify="right", no_wrap=True)
+        grid.add_row("GPU duty", Text(sparkline(self._gpu_duty_history) or "…", style="green"), gpu_now)
+        grid.add_row("Kudos/hr", Text(sparkline(self._kudos_history) or "…", style="yellow"), kudos_now)
+        return Panel(grid, title="Momentum", title_align="left", border_style="grey37", padding=(0, 1))
+
+    def _render_process_table(self, snapshot: WorkerStateSnapshot, *, detailed: bool = False) -> Table:
+        """Build a compact per-process summary table with stable column widths.
+
+        ``detailed`` appends the more technical columns (per-job steps, heartbeat age and type) that
+        the F6 toggle reveals; the default view stays lean. Resolution/batch (Size) show either way.
+        """
         table = Table(
             title="Processes",
             title_style="bold",
@@ -295,23 +408,27 @@ class OverviewView(VerticalScroll):
         table.add_column("ID", justify="right", width=3)
         table.add_column("Type", width=9)
         table.add_column("State", width=14)
-        table.add_column("Model", min_width=22, max_width=28, no_wrap=True)
-        table.add_column("Features", min_width=14, no_wrap=True)
-        table.add_column("Step", justify="right", width=9)
+        table.add_column("Model", min_width=18, max_width=24, no_wrap=True)
+        table.add_column("Features", min_width=12, no_wrap=True)
+        table.add_column("Size", justify="right", width=12, no_wrap=True)
+        table.add_column("Progress", width=16, no_wrap=True)
         table.add_column("it/s", justify="right", width=7)
         table.add_column("VRAM", justify="right", min_width=12)
         table.add_column("Done", justify="right", width=5)
+        if detailed:
+            table.add_column("Steps", justify="right", width=6)
+            table.add_column("Heartbeat", justify="right", width=10)
+            table.add_column("HB type", width=12, no_wrap=True)
 
         if not snapshot.processes:
-            table.add_row("-", "-", "waiting for first snapshot", "-", "-", "-", "-", "-", "-")
+            placeholder = ["-", "-", "waiting for first snapshot", "-", "-", "-", "-", "-", "-", "-"]
+            if detailed:
+                placeholder += ["-", "-", "-"]
+            table.add_row(*placeholder)
             return table
 
+        now = time.time()
         for process in snapshot.processes:
-            step = (
-                f"{process.last_current_step}/{process.last_total_steps}"
-                if process.last_current_step is not None and process.last_total_steps
-                else "-"
-            )
             vram = (
                 f"{human_mb(process.vram_usage_mb)} / {human_mb(process.total_vram_mb)}"
                 if process.total_vram_mb
@@ -323,18 +440,58 @@ class OverviewView(VerticalScroll):
                 if process.current_job_features is not None and not process.current_job_features.is_empty()
                 else "-"
             )
-            table.add_row(
+            cells: list[str | Text] = [
                 str(process.process_id),
                 process.process_type.title(),
                 Text(state_label, style=self._state_style(process.last_process_state)),
-                shorten(process.loaded_horde_model_name, 26),
+                shorten(process.loaded_horde_model_name, 22),
                 features_text,
-                step,
+                self._size_cell(process),
+                self._progress_cell(process),
                 format_its(process.last_iterations_per_second),
                 vram,
                 f"{process.num_jobs_completed:,}",
-            )
+            ]
+            if detailed:
+                heartbeat_age = now - process.last_heartbeat_timestamp if process.last_heartbeat_timestamp else None
+                cells += [
+                    str(process.current_job_steps) if process.current_job_steps else "-",
+                    self._heartbeat_cell(heartbeat_age, process.is_alive),
+                    process.last_heartbeat_type.replace("_", " ").title() if process.is_busy else "-",
+                ]
+            table.add_row(*cells)
         return table
+
+    @staticmethod
+    def _size_cell(process: ProcessSnapshot) -> str:
+        """Render the active job's resolution and batch (e.g. ``768×1024 ×2``), or a dash when idle."""
+        if not (process.current_job_width and process.current_job_height):
+            return "-"
+        size = f"{process.current_job_width}×{process.current_job_height}"
+        return f"{size} ×{process.batch_amount}" if process.batch_amount > 1 else size
+
+    @staticmethod
+    def _progress_cell(process: ProcessSnapshot) -> Text:
+        """Render an inline sampling progress bar with step counts, or a dash when not sampling."""
+        if process.last_process_state not in _SAMPLING_STATES or not process.last_total_steps:
+            return Text("-", style="grey50")
+        current = process.last_current_step or 0
+        fraction = current / process.last_total_steps
+        colour = "green" if fraction >= 0.999 else "cyan"
+        return Text.assemble(
+            (mini_bar(fraction, 8), colour),
+            (f" {current}/{process.last_total_steps}", "grey62"),
+        )
+
+    @staticmethod
+    def _heartbeat_cell(age: float | None, is_alive: bool) -> Text:
+        """Render heartbeat freshness coloured by staleness (shared thresholds with the live view)."""
+        if not is_alive:
+            return Text("not alive", style="bold red")
+        if age is None:
+            return Text("-", style="grey62")
+        colour = "green" if age < 5 else ("yellow" if age < 15 else "red")
+        return Text(f"{age:.1f}s", style=colour)
 
     @staticmethod
     def _state_style(state: str) -> str:
@@ -375,7 +532,35 @@ class OverviewView(VerticalScroll):
                     size,
                 )
 
-        return Panel(table, title="Queue", title_align="left", border_style="grey37", padding=(0, 1))
+        lane = OverviewView._render_queue_lane(snapshot)
+        body = Group(lane, Text(""), table) if lane is not None else table
+        return Panel(body, title="Queue", title_align="left", border_style="grey37", padding=(0, 1))
+
+    @staticmethod
+    def _render_queue_lane(snapshot: WorkerStateSnapshot) -> Text | None:
+        """Render upcoming jobs as cost-scaled blocks so a busy queue visibly "looks" busy.
+
+        Each block's width scales with the job's relative cost (``width×height×steps``) so larger jobs
+        read as heavier. Returns None when the queue is empty (the table already says so).
+        """
+        if not snapshot.pending_jobs:
+            return None
+
+        def cost(entry: JobQueueEntry) -> int:
+            return (entry.width or 0) * (entry.height or 0) * (entry.steps or 1)
+
+        peak = max((cost(entry) for entry in snapshot.pending_jobs), default=0)
+        lane = Text.assemble(("Up next  ", "bold"))
+        for entry in snapshot.pending_jobs:
+            width = max(1, round(cost(entry) / peak * 6)) if peak > 0 else 1
+            label = (
+                f"{entry.width}²"
+                if entry.width and entry.width == entry.height
+                else (f"{entry.width}×{entry.height}" if entry.width and entry.height else "?")
+            )
+            lane.append("▮" * width, style="cyan")
+            lane.append(f"{label} ", style="grey62")
+        return lane
 
     @staticmethod
     def _render_recent_jobs(snapshot: WorkerStateSnapshot) -> Panel:

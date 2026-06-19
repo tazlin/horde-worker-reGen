@@ -132,6 +132,9 @@ class WorkerAppState(BaseModel):
     """Whether the guided first-run wizard has been satisfied at least once. Defaults False so a brand-new
     install runs the wizard; an existing, already-configured install is marked complete on first launch
     without ever showing it (see the wizard's incomplete-setup detection)."""
+    detailed_info: bool = False
+    """Whether the dashboard shows the extra technical columns/rows (heartbeat age/type, raw job IDs,
+    per-job steps). Off by default for a lean overview; the operator opts in via F6."""
     worker_version_last_ran: str | None = None
     onboarding: OnboardingState = Field(default_factory=OnboardingState)
     last_worker_run: WorkerRunRecord | None = None
@@ -306,6 +309,12 @@ class AppStateStore:
         """Persist whether the guided first-run wizard has been satisfied."""
         state = self.load()
         state.setup_complete = complete
+        self.save(state)
+
+    def set_detailed_info(self, enabled: bool) -> None:
+        """Persist whether the dashboard shows the extra technical columns/rows (F6 toggle)."""
+        state = self.load()
+        state.detailed_info = enabled
         self.save(state)
 
     # endregion

@@ -92,6 +92,7 @@ class HordeWorkerTUI(App[None]):
         ("f3", "start_stop_worker", "Start/Stop"),
         ("f4", "toggle_autostart", "Auto-start"),
         ("f5", "reload_config", "Reload config"),
+        ("f6", "toggle_detailed_info", "Detailed info"),
         ("f7", "toggle_download_pause", "Pause downloads"),
         ("f8", "show_benchmark", "Benchmark"),
         ("f9", "restart_worker", "Restart worker"),
@@ -117,6 +118,7 @@ class HordeWorkerTUI(App[None]):
         self._frame = 0
         self._last_benchmark_status = BenchmarkSupervisorStatus.IDLE
         self._pending_benchmark_options = BenchmarkOptions()
+        self._detailed_info = self._app_state_store.load().detailed_info
 
     def compose(self) -> ComposeResult:
         """Lay out the header, status bar, tabbed views, and footer."""
@@ -294,13 +296,18 @@ class HordeWorkerTUI(App[None]):
         report = derive(snapshot, self._supervisor.status, liveness_age, offline_checks=offline_checks)
         try:
             self._update_status_bar(report, snapshot)
-            self.query_one(OverviewView).update_view(report, snapshot, frame=self._frame)
+            self.query_one(OverviewView).update_view(
+                report,
+                snapshot,
+                frame=self._frame,
+                detailed=self._detailed_info,
+            )
             self.query_one(DownloadsView).update_view(snapshot)
             self.query_one(ConfigEditorView).update_worker_models(
                 snapshot.active_models if snapshot is not None else [],
             )
             if snapshot is not None:
-                self.query_one(LiveView).update_snapshot(snapshot, snapshot_age)
+                self.query_one(LiveView).update_snapshot(snapshot, snapshot_age, detailed=self._detailed_info)
                 self.query_one(InsightsView).update_snapshot(snapshot)
             self.query_one(BenchmarkView).update_view(
                 self._benchmark_supervisor.run_state,
@@ -385,6 +392,14 @@ class HordeWorkerTUI(App[None]):
             HealthStatus.WARN: "yellow",
             HealthStatus.ERROR: "red",
         }[severity]
+
+    def action_toggle_detailed_info(self) -> None:
+        """Toggle (and persist) the dashboard's extra technical columns/rows, then refresh now."""
+        self._detailed_info = not self._detailed_info
+        with contextlib.suppress(Exception):
+            self._app_state_store.set_detailed_info(self._detailed_info)
+        self.notify("Detailed info on." if self._detailed_info else "Detailed info off.")
+        self._tick()
 
     def action_toggle_pause(self) -> None:
         """Pause or resume the worker depending on its current state."""

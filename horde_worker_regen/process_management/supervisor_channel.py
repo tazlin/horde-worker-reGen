@@ -167,6 +167,11 @@ class ProcessSnapshot(BaseModel):
     total_vram_mb: int = 0
     batch_amount: int = 1
 
+    current_job_width: int | None = None
+    current_job_height: int | None = None
+    current_job_steps: int | None = None
+    """The active job's resolution and step count (None when idle); surfaced as ``W×H`` / steps."""
+
     last_iterations_per_second: float | None = None
     last_current_step: int | None = None
     last_total_steps: int | None = None
@@ -188,10 +193,16 @@ class ProcessSnapshot(BaseModel):
         baseline = info.loaded_horde_model_baseline
 
         features: JobFeatureSummary | None = None
+        current_job_width: int | None = None
+        current_job_height: int | None = None
+        current_job_steps: int | None = None
         if info.is_process_busy() and job is not None:
             candidate = JobFeatureSummary.from_payload(job.payload)
             if not candidate.is_empty():
                 features = candidate
+            current_job_width = job.payload.width
+            current_job_height = job.payload.height
+            current_job_steps = job.payload.ddim_steps
 
         return cls(
             process_id=info.process_id,
@@ -211,6 +222,9 @@ class ProcessSnapshot(BaseModel):
             vram_usage_mb=info.vram_usage_mb,
             total_vram_mb=info.total_vram_mb,
             batch_amount=info.batch_amount,
+            current_job_width=current_job_width,
+            current_job_height=current_job_height,
+            current_job_steps=current_job_steps,
             last_iterations_per_second=info.last_iterations_per_second,
             last_current_step=info.last_current_step,
             last_total_steps=info.last_total_steps,
@@ -427,6 +441,8 @@ class WorkerStateSnapshot(BaseModel):
     jobs_in_progress: int = 0
     jobs_pending_safety_check: int = 0
     jobs_being_safety_checked: int = 0
+    jobs_pending_submit: int = 0
+    """Jobs that have cleared safety and are queued for API submission (the pipeline's tail stage)."""
     time_spent_no_jobs_available: float = 0.0
 
     kudos_per_hour: float | None = None

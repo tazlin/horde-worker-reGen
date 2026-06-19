@@ -54,7 +54,6 @@ def load_image_models() -> list[ModelInfo]:
     Imports ``horde_model_reference`` lazily so the TUI does not pay for it at startup. Returns an
     alphabetical list; raises on failure so the caller can surface a clear message.
     """
-    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
     from horde_model_reference.model_reference_manager import ModelReferenceManager, PrefetchStrategy
 
     async def ensure_model_reference_manager_initialized() -> ModelReferenceManager:
@@ -158,7 +157,6 @@ def _query_beta_records(
 
     try:
         from horde_model_reference import PENDING_SOURCE_ID
-
         from hordelib.beta_models import beta_source_for, build_pending_provider
 
         if manager.get_provider(PENDING_SOURCE_ID) is None:
