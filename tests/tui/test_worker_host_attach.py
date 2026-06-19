@@ -15,7 +15,8 @@ from collections.abc import Callable
 import pytest
 
 from horde_worker_regen.run_worker import WorkerLaunchOptions
-from horde_worker_regen.tui.attach import AttachedWorkerSupervisor
+from horde_worker_regen.tui import socket_protocol as sp
+from horde_worker_regen.tui.attach import AttachedWorkerSupervisor, SupervisorStatus
 from horde_worker_regen.tui.worker_host import WorkerHost
 from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupervisor
 
@@ -37,6 +38,43 @@ def _free_port() -> int:
     port = probe.getsockname()[1]
     probe.close()
     return port
+
+
+def test_attach_status_frame_populates_liveness() -> None:
+    """A running status frame carries the host's loop liveness; stopped/restarting frames clear it.
+
+    Regression: app._tick reads supervisor.last_liveness_wall_time on every tick; the attach client must
+    expose and update it (it raised AttributeError before), and must drop the host's stale liveness while
+    stopped/restarting so it cannot age into a false UNRESPONSIVE.
+    """
+    client = AttachedWorkerSupervisor(("127.0.0.1", _free_port()), mode=WorkerProcessMode.FAKE)
+    try:
+        assert client.last_liveness_wall_time is None  # the attribute exists before any frame arrives
+
+        client._apply(
+            sp.status_message(
+                status=SupervisorStatus.RUNNING.value,
+                restart_attempts=0,
+                mode=WorkerProcessMode.FAKE.value,
+                worker_running=True,
+                last_liveness_wall_time=12345.0,
+            ),
+        )
+        assert client.last_liveness_wall_time == 12345.0
+
+        # A stopped frame drops liveness even if the host still reports a stale value.
+        client._apply(
+            sp.status_message(
+                status=SupervisorStatus.STOPPED.value,
+                restart_attempts=0,
+                mode=WorkerProcessMode.FAKE.value,
+                worker_running=False,
+                last_liveness_wall_time=12345.0,
+            ),
+        )
+        assert client.last_liveness_wall_time is None
+    finally:
+        client.close()
 
 
 @pytest.mark.e2e

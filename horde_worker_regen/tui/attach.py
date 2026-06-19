@@ -37,6 +37,8 @@ class SupervisorLike(Protocol):
     """The supervisor surface the TUI depends on, satisfied by both the owning and attach supervisors."""
 
     latest_snapshot: WorkerStateSnapshot | None
+    last_liveness_wall_time: float | None
+    """Wall-clock time of the worker loop's last liveness signal, or None if it never reported one."""
 
     @property
     def status(self) -> SupervisorStatus:
@@ -103,6 +105,7 @@ class AttachedWorkerSupervisor:
         self._reconnect_backoff = reconnect_backoff
 
         self.latest_snapshot: WorkerStateSnapshot | None = None
+        self.last_liveness_wall_time: float | None = None
         self._status = SupervisorStatus.STOPPED
         self._restart_attempts = 0
         self._worker_running = False
@@ -275,6 +278,7 @@ class AttachedWorkerSupervisor:
         self._worker_running = False
         # Drop the last frame so a dropped connection does not age into a false UNRESPONSIVE.
         self.latest_snapshot = None
+        self.last_liveness_wall_time = None
 
     def _apply(self, message: dict[str, object]) -> None:
         """Update local state from a host frame (snapshot or status; hello is ignored)."""
@@ -294,6 +298,7 @@ class AttachedWorkerSupervisor:
                 # cannot age into a false UNRESPONSIVE on this attached session.
                 if self._status in (SupervisorStatus.STOPPED, SupervisorStatus.RESTARTING):
                     self.latest_snapshot = None
+                    self.last_liveness_wall_time = None
         restart_attempts = message.get("restart_attempts", 0)
         self._restart_attempts = restart_attempts if isinstance(restart_attempts, int) else 0
         self._worker_running = bool(message.get("worker_running", False))
@@ -301,5 +306,11 @@ class AttachedWorkerSupervisor:
         if isinstance(mode_value, str):
             with contextlib.suppress(ValueError):
                 self._mode = WorkerProcessMode(mode_value)
+        # Ignore the host's (stale) liveness while stopped/restarting, mirroring the snapshot drop above,
+        # so it cannot age into a false UNRESPONSIVE on this attached session.
+        if self._status not in (SupervisorStatus.STOPPED, SupervisorStatus.RESTARTING):
+            liveness_wall_time = message.get("last_liveness_wall_time")
+            if isinstance(liveness_wall_time, int | float):
+                self.last_liveness_wall_time = float(liveness_wall_time)
 
     # endregion

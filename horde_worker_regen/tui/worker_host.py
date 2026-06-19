@@ -225,6 +225,7 @@ class WorkerHost:
             restart_attempts=self._supervisor.restart_attempts,
             mode=self._supervisor.mode.value,
             worker_running=self._supervisor.is_alive(),
+            last_liveness_wall_time=self._supervisor.last_liveness_wall_time,
         )
 
     def _broadcast(self) -> None:

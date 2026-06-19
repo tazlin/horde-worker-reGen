@@ -107,7 +107,14 @@ def snapshot_message(snapshot: WorkerStateSnapshot) -> dict[str, Any]:
     return {"type": MSG_SNAPSHOT, "snapshot": snapshot.model_dump(mode="json")}
 
 
-def status_message(*, status: str, restart_attempts: int, mode: str, worker_running: bool) -> dict[str, Any]:
+def status_message(
+    *,
+    status: str,
+    restart_attempts: int,
+    mode: str,
+    worker_running: bool,
+    last_liveness_wall_time: float | None = None,
+) -> dict[str, Any]:
     """Wrap the host's supervisor status for the wire."""
     return {
         "type": MSG_STATUS,
@@ -115,6 +122,7 @@ def status_message(*, status: str, restart_attempts: int, mode: str, worker_runn
         "restart_attempts": restart_attempts,
         "mode": mode,
         "worker_running": worker_running,
+        "last_liveness_wall_time": last_liveness_wall_time,
     }
 
 
