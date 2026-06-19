@@ -204,6 +204,51 @@ class TestDetectDeadlock:
         message_dispatcher.detect_deadlock()
         assert message_dispatcher._in_deadlock is True
 
+    async def test_sustained_queue_deadlock_throttles_verbose_dump(self) -> None:
+        """A sustained wedge must not dump the full deadlock diagnostics on every control-loop tick.
+
+        The verbose ``_print_deadlock_info`` dump (process map, model map, per-stage counts) is useful
+        once, but the recurring "still detected" branches re-emitted it every ~0.5s tick for the whole
+        duration of a wedge, flooding the log with thousands of identical lines. It must be throttled to
+        at most once per detail-log interval regardless of how many ticks run.
+        """
+        state = WorkerState(last_job_pop_time=time.time() - 60)
+        process_info = make_mock_process_info(
+            0,
+            model_name="stable_diffusion",
+            state=HordeProcessState.WAITING_FOR_JOB,
+        )
+        process_map = ProcessMap({0: process_info})
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job(model="stable_diffusion"))
+
+        message_dispatcher = _make_message_dispatcher(state=state, process_map=process_map, job_tracker=job_tracker)
+        # Pre-arm both detectors into their *recurring* (already-detected, past-timeout) branches so each
+        # tick takes the spammy "still detected" path rather than a one-off initial detection.
+        message_dispatcher._in_queue_deadlock = True
+        message_dispatcher._last_queue_deadlock_detected_time = time.time() - 35
+        message_dispatcher._queue_deadlock_model = "stable_diffusion"
+        message_dispatcher._queue_deadlock_process_id = 0
+        message_dispatcher._in_deadlock = True
+        message_dispatcher._last_deadlock_detected_time = time.time() - 12
+
+        dump_calls = 0
+        original_dump = message_dispatcher._print_deadlock_info
+
+        def _counting_dump() -> None:
+            nonlocal dump_calls
+            dump_calls += 1
+            original_dump()
+
+        message_dispatcher._print_deadlock_info = _counting_dump  # type: ignore[method-assign]
+
+        for _ in range(10):
+            message_dispatcher.detect_deadlock()
+
+        # Ten ticks of a continuous wedge must collapse to a single verbose dump, not ten (or twenty).
+        assert dump_calls == 1
+        assert message_dispatcher._in_queue_deadlock is True
+
     async def test_memory_report_does_not_clear_deadlock_signal(self) -> None:
         """Passive child messages should not mask an active deadlock episode."""
         process_info = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)

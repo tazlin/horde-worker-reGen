@@ -216,3 +216,34 @@ def test_stale_orphan_punts_age_out_of_the_wedge_window() -> None:
 
     assert pm._orphan_wedge_active() is False
     assert pm._orphan_punt_history == []  # pruned as a side effect
+
+
+async def test_give_up_reissues_head_when_pool_healthy_but_queue_wedged() -> None:
+    """Give-up must reissue a head the scheduler structurally cannot serve, even with a healthy pool.
+
+    The save-our-ship give-up only faulted pending jobs when inference capacity was *unavailable*. A
+    worker whose pool is perfectly healthy (idle processes) but whose scheduler is structurally wedged
+    (pending inference work, every process idle, no progress) therefore faulted nothing and spun
+    forever, until a manual shutdown faulted the stuck jobs. A sustained *queue* deadlock with capacity
+    available must still reissue the unservable head so the horde reassigns it and the queue unblocks.
+    """
+    pm = make_testable_process_manager()
+    pm._state.last_job_pop_time = time.time() - 60
+
+    # A healthy, idle inference process: capacity IS available (so the old give-up faulted nothing).
+    idle_inference = make_mock_process_info(0, model_name="resident", state=HordeProcessState.WAITING_FOR_JOB)
+    pm._process_map[0] = idle_inference
+
+    # A pending head whose model is not resident and that the scheduler cannot place; nothing in flight.
+    head_job = make_job_pop_response(model="unschedulable")
+    await track_popped_job_async(pm._job_tracker, head_job)
+
+    pm.detect_deadlock()
+    assert pm._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge() is True
+    assert pm._is_inference_capacity_available() is True
+    assert len(pm._job_tracker.jobs_pending_inference) == 1
+
+    pm._give_up_on_wedged_jobs()
+
+    # The head was reissued (faulted to PENDING_SUBMIT) rather than left to spin behind a healthy pool.
+    assert len(pm._job_tracker.jobs_pending_inference) == 0

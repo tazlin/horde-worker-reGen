@@ -99,6 +99,12 @@ class MessageDispatcher:
     _last_queue_deadlock_detected_time: float = 0.0
     _queue_deadlock_model: str | None = None
     _queue_deadlock_process_id: int | None = None
+    _last_deadlock_detail_log_time: float = 0.0
+
+    _DEADLOCK_DETAIL_LOG_INTERVAL_SECONDS = 30.0
+    """How often the verbose deadlock dump (process/model maps, per-stage counts) may be emitted while a
+    wedge persists. The recurring "still detected" branches run every control-loop tick, so without this
+    throttle a sustained wedge floods the log with thousands of identical dumps."""
 
     def __init__(
         self,
@@ -638,19 +644,31 @@ class MessageDispatcher:
             queue_deadlock_process_id=self._queue_deadlock_process_id,
         )
 
+    def _print_deadlock_info(self) -> None:
+        """Dump the current job/process/model state for a deadlock post-mortem (verbose; throttled)."""
+        logger.debug(f"Jobs in queue: {len(self._job_tracker.jobs_pending_inference)}")
+        logger.debug(f"Jobs in progress: {len(self._job_tracker.jobs_in_progress)}")
+        logger.debug(f"Jobs pending safety check: {len(self._job_tracker.jobs_pending_safety_check)}")
+        logger.debug(f"Jobs being safety checked: {len(self._job_tracker.jobs_being_safety_checked)}")
+        logger.debug(f"Jobs completed: {len(self._job_tracker.jobs_pending_submit)}")
+        logger.debug(f"Jobs faulted: {self._job_tracker.num_jobs_faulted}")
+        logger.debug(f"horde_model_map: {self._horde_model_map}")
+        logger.debug(f"process_map: {self._process_map}")
+
+    def _should_log_deadlock_detail(self) -> bool:
+        """Whether the recurring verbose deadlock dump may be emitted now (throttled per interval).
+
+        The detection-state timestamps mean "first detected" and must stay intact for the snapshot, so a
+        separate clock gates the spammy "still detected" dumps to at most once per interval.
+        """
+        now = time.time()
+        if (now - self._last_deadlock_detail_log_time) >= self._DEADLOCK_DETAIL_LOG_INTERVAL_SECONDS:
+            self._last_deadlock_detail_log_time = now
+            return True
+        return False
+
     def detect_deadlock(self) -> None:
         """Detect if there are jobs in the queue but no processes doing anything."""
-
-        def _print_deadlock_info() -> None:
-            logger.debug(f"Jobs in queue: {len(self._job_tracker.jobs_pending_inference)}")
-            logger.debug(f"Jobs in progress: {len(self._job_tracker.jobs_in_progress)}")
-            logger.debug(f"Jobs pending safety check: {len(self._job_tracker.jobs_pending_safety_check)}")
-            logger.debug(f"Jobs being safety checked: {len(self._job_tracker.jobs_being_safety_checked)}")
-            logger.debug(f"Jobs completed: {len(self._job_tracker.jobs_pending_submit)}")
-            logger.debug(f"Jobs faulted: {self._job_tracker.num_jobs_faulted}")
-            logger.debug(f"horde_model_map: {self._horde_model_map}")
-            logger.debug(f"process_map: {self._process_map}")
-
         if self._state.last_pop_recently():
             if self._in_deadlock or self._in_queue_deadlock:
                 logger.debug("Deadlock cleared after recent job pop.")
@@ -692,7 +710,7 @@ class MessageDispatcher:
                     break
             else:
                 logger.debug("Queue deadlock detected without a model causing it.")
-                _print_deadlock_info()
+                self._print_deadlock_info()
                 self._in_queue_deadlock = True
                 self._last_queue_deadlock_detected_time = time.time()
                 self._queue_deadlock_model = self._job_tracker.jobs_pending_inference[0].model
@@ -703,13 +721,16 @@ class MessageDispatcher:
                 self._last_queue_deadlock_detected_time = time.time()
                 return
 
-            logger.debug("Queue deadlock still detected after 30 seconds.")
-            _print_deadlock_info()
+            # The detector revisits this branch every tick for the life of the wedge; throttle the
+            # verbose dump so a sustained deadlock does not flood the log with identical state.
+            if self._should_log_deadlock_detail():
+                logger.debug("Queue deadlock still detected after 30 seconds.")
+                self._print_deadlock_info()
 
-            if self._queue_deadlock_model is not None:
-                logger.debug(f"Model causing deadlock: {self._queue_deadlock_model}")
-            else:
-                logger.warning("Queue deadlock detected but no model causing it.")
+                if self._queue_deadlock_model is not None:
+                    logger.debug(f"Model causing deadlock: {self._queue_deadlock_model}")
+                else:
+                    logger.warning("Queue deadlock detected but no model causing it.")
 
             # Keep the flag set so the recovery supervisor can act on a sustained deadlock.
 
@@ -723,10 +744,12 @@ class MessageDispatcher:
             self._last_deadlock_detected_time = time.time()
             self._in_deadlock = True
             logger.debug("Deadlock detected")
-            _print_deadlock_info()
+            self._print_deadlock_info()
         elif self._in_deadlock and (self._last_deadlock_detected_time + 10) < time.time() and deadlock_condition:
-            logger.debug("Deadlock still detected after 10 seconds.")
-            _print_deadlock_info()
+            # Recurring every tick while the deadlock persists; share the same throttle as the queue dump.
+            if self._should_log_deadlock_detail():
+                logger.debug("Deadlock still detected after 10 seconds.")
+                self._print_deadlock_info()
         elif self._in_deadlock and not deadlock_condition:
             logger.debug("Deadlock cleared.")
             self._in_deadlock = False

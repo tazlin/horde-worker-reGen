@@ -596,6 +596,81 @@ class TestHeadOfQueueMakeRoom:
         assert holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
 
+class TestHeadOfQueueNotWedgedByAffinity:
+    """A non-resident head-of-queue job must always be able to claim a slot.
+
+    Model->process affinity is provisioned against the inference-process *ceiling*
+    (``max_inference_processes`` = queue_size + concurrency), not the count of running processes. With
+    more resident models than running processes, affinity wrongly concludes every model has a home and
+    pins every idle slot, so a genuinely-queued head whose model is not resident gets no process and the
+    whole worker wedges (every process idle, jobs queued). The head must be given room regardless, and
+    this make-room must not be gated on the VRAM/RAM budget being active.
+    """
+
+    async def test_head_displaces_undemanded_resident_when_affinity_pins_all(self) -> None:
+        """The head preloads by displacing an idle resident model no queued job needs, sparing demanded ones."""
+        # Two running inference processes, both holding a resident model; no empty slot. One model is
+        # still demanded by queued jobs (``demanded``), the other is idle slack nothing queued needs.
+        demanded = make_mock_process_info(0, model_name="demanded", state=HordeProcessState.WAITING_FOR_JOB)
+        undemanded = make_mock_process_info(1, model_name="idle_slack", state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: demanded, 1: undemanded})
+
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("head_non_resident"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("demanded"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("demanded"))
+
+        # Ceiling (3) exceeds the running process count (2), which is exactly what wrongly activates
+        # affinity and pins both slots in the field.
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker, max_inference=3)
+        assert sched._budget_active() is False
+
+        assert sched.preload_models() is True
+        # The head displaced the *undemanded* resident, preserving the demanded one for its queued jobs.
+        assert undemanded.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        assert demanded.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+
+    async def test_head_makes_room_without_budget_when_only_queued_models_resident(self) -> None:
+        """With the budget gate inactive and every idle slot holding a queued model, the head still gets room."""
+        holder_b = make_mock_process_info(0, model_name="queued_b", state=HordeProcessState.WAITING_FOR_JOB)
+        holder_c = make_mock_process_info(1, model_name="queued_c", state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: holder_b, 1: holder_c})
+
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("head_a"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("queued_b"))
+        await track_popped_job_async(job_tracker, make_job_pop_response("queued_c"))
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker, max_inference=3)
+        assert sched._budget_active() is False
+
+        # The head is non-resident and the budget is off, so the previous budget-gated escalation never
+        # ran; the worker must still make room (displace a queued model) rather than wedge.
+        assert sched.preload_models() is True
+        assert (
+            holder_b.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+            or holder_c.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        )
+
+    async def test_head_room_never_displaces_in_progress_work(self) -> None:
+        """The head-room fallback must never evict a slot whose model is running a job."""
+        live = make_mock_process_info(0, model_name="live_model", state=HordeProcessState.INFERENCE_STARTING)
+        idle_resident = make_mock_process_info(1, model_name="idle_model", state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: live, 1: idle_resident})
+
+        job_tracker = JobTracker()
+        # The live model has an in-progress job; the head is a different, non-resident model.
+        live_job = make_job_pop_response("live_model")
+        await mark_job_in_progress_async(job_tracker, live_job)
+        await track_popped_job_async(job_tracker, make_job_pop_response("head_non_resident"))
+
+        sched = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker, max_inference=3)
+
+        sched.preload_models()
+        # Only the idle resident is a legal displacement target; the live slot is untouched.
+        assert live.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+
+
 class TestSpeculativeDispatchCap:
     """Tests for _max_jobs_in_progress_allowed (lease-gated speculative pre-staging)."""
 

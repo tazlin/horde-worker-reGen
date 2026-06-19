@@ -358,6 +358,8 @@ class InferenceScheduler:
             if job.model in loaded_models:
                 continue
 
+            is_head_blocker = head_job is not None and job is head_job
+
             processes_with_model_for_queued_job: list[int] = (
                 self._process_lifecycle.get_processes_with_model_for_queued_job()
             )
@@ -394,6 +396,17 @@ class InferenceScheduler:
             available_process = self._process_map.get_first_available_inference_process(
                 disallowed_processes=processes_with_model_for_queued_job,
             )
+
+            if available_process is None and is_head_blocker:
+                # The head of the queue could not get a slot because affinity (or the queued-model
+                # guard) protected every idle process. Affinity is provisioned against the
+                # inference-process *ceiling*, so with more resident models than running processes it
+                # can pin every slot and starve a genuinely-queued head, wedging the whole worker. The
+                # head must make progress regardless of whether the measured budget is active, so fall
+                # back to a displacement target that spares live work and prefers an idle resident model
+                # no queued job needs. This is the budget-independent counterpart to the budget-gated
+                # make-room escalation further below.
+                available_process = self._select_head_room_process()
 
             if available_process is None:
                 return False
@@ -441,8 +454,6 @@ class InferenceScheduler:
             # (overriding residency under pressure) and defer this preload rather than over-committing.
             if self._budget_active():
                 baseline = self._model_metadata.get_baseline(job.model)
-
-                is_head_blocker = head_job is not None and job is head_job
 
                 vram_verdict = self._vram_budget.check_job(job, baseline, self._measured_free_vram_mb())
                 if not vram_verdict.fits:
@@ -534,6 +545,39 @@ class InferenceScheduler:
             return True
 
         return False
+
+    def _select_head_room_process(self) -> HordeProcessInfo | None:
+        """Pick an idle inference process to free for a starved head-of-queue job, or None.
+
+        Used when the normal preload picker found no slot because affinity (provisioned against the
+        inference-process ceiling) or the queued-model guard protected every idle process. The head must
+        still make progress, so this deliberately overrides those guards. It never returns a process
+        running live work (only ``can_accept_job()`` slots, and never one whose model is in progress) and
+        prefers the cheapest displacement: an empty slot, then one holding a resident model no pending or
+        in-progress job needs, then, as a last resort, one holding a merely-queued model.
+        """
+        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
+        pending_models = {job.model for job in self._job_tracker.jobs_pending_inference if job.model is not None}
+
+        candidates = [
+            process_info
+            for process_info in self._process_map.values()
+            if process_info.process_type == HordeProcessType.INFERENCE
+            and process_info.can_accept_job()
+            and process_info.loaded_horde_model_name not in in_progress_models
+        ]
+        if not candidates:
+            return None
+
+        def _displacement_cost(process_info: HordeProcessInfo) -> int:
+            model_name = process_info.loaded_horde_model_name
+            if model_name is None:
+                return 0
+            if model_name not in pending_models:
+                return 1
+            return 2
+
+        return min(candidates, key=_displacement_cost)
 
     async def get_next_job_and_process(
         self,

@@ -1542,7 +1542,13 @@ class HordeWorkerProcessManager:
         hanging. A worker whose pools later recover never reaches here (the episode closes first).
         """
         faulted = 0
-        if not self._is_inference_capacity_available():
+        # Reissue stuck pending work when the pool cannot serve it, OR when the pool is healthy but the
+        # scheduler is structurally wedged (a sustained queue deadlock: pending inference work with every
+        # process idle and no progress). The latter is the "healthy pool, starved scheduler" wedge: the
+        # capacity check alone would fault nothing and let the worker spin forever, so the structural
+        # queue-deadlock signal must also reissue the head so the horde reassigns it and the queue unblocks.
+        structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
+        if not self._is_inference_capacity_available() or structural_queue_wedge:
             for job in list(self._job_tracker.jobs_pending_inference):
                 if job not in self._job_tracker.jobs_in_progress:
                     self._job_tracker.handle_job_fault_now(job, retryable=False)
