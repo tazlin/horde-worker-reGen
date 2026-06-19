@@ -75,6 +75,33 @@ def _make_inference_scheduler(
     )
 
 
+class TestSchedulerDiagnosticThrottle:
+    """Tests for high-frequency scheduler diagnostic coalescing."""
+
+    def test_unchanged_diagnostic_is_suppressed_until_interval(self) -> None:
+        """Repeated identical scheduler diagnostics should be coalesced within the cadence window."""
+        scheduler = _make_inference_scheduler()
+
+        assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("same",)) == 0
+        assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("same",)) is None
+        assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("same",)) is None
+
+        state_key, emitted_at, suppressed_count = scheduler._scheduler_diagnostic_log_state["diagnostic"]
+        scheduler._scheduler_diagnostic_log_state["diagnostic"] = (state_key, emitted_at - 31.0, suppressed_count)
+
+        assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("same",)) == 2
+        assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("same",)) is None
+
+    def test_changed_diagnostic_logs_immediately(self) -> None:
+        """A semantic scheduler diagnostic change should bypass the cadence limit."""
+        scheduler = _make_inference_scheduler()
+
+        assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("old",)) == 0
+        assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("old",)) is None
+
+        assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("new",)) == 1
+
+
 class TestPreloadModels:
     """Tests for preload_models."""
 

@@ -94,6 +94,17 @@ looks like a structural wedge and soft-resets the pools (observed), which then c
 whole-card churn and more resets. Covers the respawn window; bounded so a genuine post-restore wedge
 still trips the supervisor."""
 
+_SCHEDULER_DIAGNOSTIC_REPEAT_SECONDS = 30.0
+"""Minimum cadence for unchanged high-frequency scheduler diagnostics.
+
+These diagnostics are useful when reconstructing residency and performance behavior, but they sit inside
+the scheduler's fast polling loop. Log immediately when the observed decision state changes, otherwise emit
+only periodic reminders with a suppressed-repeat count.
+"""
+
+_SCHEDULER_DIAGNOSTIC_MB_BUCKET = 256.0
+"""Bucket size for deciding whether memory telemetry changed enough to re-log a scheduler diagnostic."""
+
 
 class InferenceScheduler:
     """Owns model preloading, inference start, and model unloading logic."""
@@ -120,6 +131,7 @@ class InferenceScheduler:
     _ram_budget: RamBudget
     _vram_budget_defer_notified: bool
     _ram_budget_defer_notified: bool
+    _scheduler_diagnostic_log_state: dict[str, tuple[tuple[object, ...], float, int]]
 
     def __init__(
         self,
@@ -186,6 +198,7 @@ class InferenceScheduler:
         self._ram_budget = RamBudget(reserve_mb=_DEFAULT_RAM_RESERVE_MB)
         self._vram_budget_defer_notified = False
         self._ram_budget_defer_notified = False
+        self._scheduler_diagnostic_log_state = {}
         # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
         self._unservable_admit_notified: dict[str, bool] = {}
         # Startup-measured per-process VRAM overhead (one torch/CUDA context, no model), set by the manager
@@ -250,6 +263,105 @@ class InferenceScheduler:
         if signature is None:
             return None
         return self._performance_model.expected_sampling_seconds(signature)
+
+    def _diagnostic_mb_bucket(self, value: float | None) -> int | None:
+        """Bucket memory telemetry so harmless measurement jitter does not spam diagnostics."""
+        if value is None:
+            return None
+        return round(value / _SCHEDULER_DIAGNOSTIC_MB_BUCKET)
+
+    def _scheduler_diagnostic_suppressed_count(
+        self,
+        name: str,
+        state_key: tuple[object, ...],
+    ) -> int | None:
+        """Return suppressed-repeat count when a high-frequency diagnostic should be emitted.
+
+        The first observation logs, a semantic state change logs immediately, and an unchanged observation
+        logs periodically. ``None`` means "do not emit this time".
+        """
+        now = time.time()
+        previous = self._scheduler_diagnostic_log_state.get(name)
+        if previous is None:
+            self._scheduler_diagnostic_log_state[name] = (state_key, now, 0)
+            return 0
+
+        previous_key, previous_emit, suppressed_count = previous
+        if previous_key != state_key:
+            self._scheduler_diagnostic_log_state[name] = (state_key, now, 0)
+            return suppressed_count
+
+        if (now - previous_emit) >= _SCHEDULER_DIAGNOSTIC_REPEAT_SECONDS:
+            self._scheduler_diagnostic_log_state[name] = (state_key, now, 0)
+            return suppressed_count
+
+        self._scheduler_diagnostic_log_state[name] = (previous_key, previous_emit, suppressed_count + 1)
+        return None
+
+    def _suppressed_suffix(self, suppressed_count: int) -> str:
+        """Return a compact suffix for diagnostics that skipped unchanged loop repeats."""
+        if suppressed_count <= 0:
+            return ""
+        return f" (suppressed {suppressed_count} unchanged repeats)"
+
+    def _log_stream_forecast(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast) -> None:
+        """Log the stream forecast when its decision or materially-relevant measurements change."""
+        if not forecast.known:
+            return
+
+        job_id = str(job.id_) if job.id_ is not None else None
+        state_key = (
+            job.model,
+            job_id,
+            self._diagnostic_mb_bucket(forecast.weights_mb),
+            self._diagnostic_mb_bucket(forecast.reserve_mb),
+            self._diagnostic_mb_bucket(forecast.free_now_mb),
+            self._diagnostic_mb_bucket(forecast.free_after_model_evict_mb),
+            self._diagnostic_mb_bucket(forecast.free_if_alone_mb),
+            self._process_map.num_loaded_inference_processes(),
+            self._diagnostic_mb_bucket(self._per_process_overhead_mb()),
+            forecast.fits_coresident,
+            forecast.needs_exclusive_residency,
+            forecast.requires_sibling_teardown,
+            forecast.streams_unavoidably,
+        )
+        suppressed_count = self._scheduler_diagnostic_suppressed_count(f"stream_forecast:{job_id}", state_key)
+        if suppressed_count is None:
+            return
+
+        logger.debug(
+            f"Stream forecast for {job.model}: {forecast.reason()} "
+            f"[free_now={forecast.free_now_mb}, after_model_evict={forecast.free_after_model_evict_mb}, "
+            f"alone={forecast.free_if_alone_mb}, live_procs="
+            f"{self._process_map.num_loaded_inference_processes()}, "
+            f"overhead/proc={self._per_process_overhead_mb():.0f}MB] -> "
+            f"coresident={forecast.fits_coresident}, "
+            f"needs_exclusive={forecast.needs_exclusive_residency}, "
+            f"needs_teardown={forecast.requires_sibling_teardown}, "
+            f"streams_unavoidably={forecast.streams_unavoidably}"
+            f"{self._suppressed_suffix(suppressed_count)}",
+        )
+
+    def _log_next_models_for_vram_unload(
+        self,
+        next_n_models: list[str],
+        *,
+        under_pressure: bool,
+        for_head_of_queue: bool,
+    ) -> None:
+        """Log the unload guard's next-model view without repeating it every reclaim attempt."""
+        in_progress_models = tuple(sorted(str(job.model) for job in self._job_tracker.jobs_in_progress))
+        state_key = (
+            tuple(next_n_models),
+            in_progress_models,
+            under_pressure,
+            for_head_of_queue,
+            self._max_inference_processes,
+        )
+        suppressed_count = self._scheduler_diagnostic_suppressed_count("vram_unload_next_models", state_key)
+        if suppressed_count is None:
+            return
+        logger.debug(f"Next n models: {next_n_models}{self._suppressed_suffix(suppressed_count)}")
 
     def _budget_active(self) -> bool:
         """Whether the measured VRAM/RAM budget gates preload/dispatch this cycle.
@@ -885,19 +997,9 @@ class InferenceScheduler:
                 forecast = self._forecast_streaming(job, baseline)
                 # Trace the forecast for every budget-gated load so a live run shows the residency dynamics
                 # (the numbers behind a stream/no-stream decision), not just the action taken. Kept at DEBUG
-                # because it is per-pending-job per-tick; the actions below log at WARNING/INFO.
-                if forecast.known:
-                    logger.debug(
-                        f"Stream forecast for {job.model}: {forecast.reason()} "
-                        f"[free_now={forecast.free_now_mb}, after_model_evict={forecast.free_after_model_evict_mb}, "
-                        f"alone={forecast.free_if_alone_mb}, live_procs="
-                        f"{self._process_map.num_loaded_inference_processes()}, "
-                        f"overhead/proc={self._per_process_overhead_mb():.0f}MB] -> "
-                        f"coresident={forecast.fits_coresident}, "
-                        f"needs_exclusive={forecast.needs_exclusive_residency}, "
-                        f"needs_teardown={forecast.requires_sibling_teardown}, "
-                        f"streams_unavoidably={forecast.streams_unavoidably}",
-                    )
+                # because it can be per-pending-job per-tick; unchanged observations are coalesced by
+                # _log_stream_forecast, while decision or headroom changes still log immediately.
+                self._log_stream_forecast(job, forecast)
                 if self._whole_card_residency_enabled() and forecast.needs_exclusive_residency:
                     first_time = not self._job_tracker.is_admitted_exclusive(job)
                     self._job_tracker.mark_admitted_exclusive(job)
@@ -1294,6 +1396,9 @@ class InferenceScheduler:
                     logger.debug(f"Job {job.id_} not found in jobs_in_progress.")
 
         if process_with_model is None:
+            if next_job.model is None:
+                raise ValueError(f"next_job.model is None ({next_job})")
+
             # The head's model is not resident. If it is forecast to load (a preload is already on the
             # way), let a later already-resident job bypass it so the GPU is not idle while the head
             # loads; this reduces churn versus evicting to run the head right now. If it is NOT forecast
@@ -1311,9 +1416,13 @@ class InferenceScheduler:
                         break
 
             if process_with_model is None:
+                next_job_model = next_job.model
+                if next_job_model is None:
+                    raise ValueError(f"next_job.model is None ({next_job})")
+
                 if (
                     self._preload_delay_notified
-                    or self._horde_model_map.is_model_loading(next_job.model)
+                    or self._horde_model_map.is_model_loading(next_job_model)
                     or information_only
                 ):
                     return None
@@ -1649,7 +1758,11 @@ class InferenceScheduler:
         bridge_data = self._runtime_config.bridge_data
         wanted_models = self._compute_wanted_models()
         next_n_models = list(self.get_next_n_models(self._max_inference_processes))
-        logger.debug(f"Next n models: {next_n_models}")
+        self._log_next_models_for_vram_unload(
+            next_n_models,
+            under_pressure=under_pressure,
+            for_head_of_queue=for_head_of_queue,
+        )
         next_model = None
         if len(next_n_models) > 0:
             next_model = next_n_models.pop()
