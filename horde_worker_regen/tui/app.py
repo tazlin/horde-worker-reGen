@@ -26,6 +26,7 @@ from horde_worker_regen import __version__
 from horde_worker_regen.app_state import (
     AppStateStore,
     OnboardingChoice,
+    OverviewViewMode,
     benchmark_status_summary,
     should_prompt_onboarding,
 )
@@ -79,9 +80,6 @@ class HordeWorkerTUI(App[None]):
         height: 1fr;
         padding: 1 1;
     }
-    #overview-cards {
-        height: 6;
-    }
     #overview-worker, #overview-processes {
         margin-top: 1;
     }
@@ -92,7 +90,7 @@ class HordeWorkerTUI(App[None]):
         ("f3", "start_stop_worker", "Start/Stop"),
         ("f4", "toggle_autostart", "Auto-start"),
         ("f5", "reload_config", "Reload config"),
-        ("f6", "toggle_detailed_info", "Detailed info"),
+        ("f6", "cycle_view_mode", "View mode"),
         ("f7", "toggle_download_pause", "Pause downloads"),
         ("f8", "show_benchmark", "Benchmark"),
         ("f9", "restart_worker", "Restart worker"),
@@ -118,7 +116,7 @@ class HordeWorkerTUI(App[None]):
         self._frame = 0
         self._last_benchmark_status = BenchmarkSupervisorStatus.IDLE
         self._pending_benchmark_options = BenchmarkOptions()
-        self._detailed_info = self._app_state_store.load().detailed_info
+        self._view_mode = self._app_state_store.load().overview_view_mode
 
     def compose(self) -> ComposeResult:
         """Lay out the header, status bar, tabbed views, and footer."""
@@ -300,14 +298,18 @@ class HordeWorkerTUI(App[None]):
                 report,
                 snapshot,
                 frame=self._frame,
-                detailed=self._detailed_info,
+                mode=self._view_mode,
             )
             self.query_one(DownloadsView).update_view(snapshot)
             self.query_one(ConfigEditorView).update_worker_models(
                 snapshot.active_models if snapshot is not None else [],
             )
             if snapshot is not None:
-                self.query_one(LiveView).update_snapshot(snapshot, snapshot_age, detailed=self._detailed_info)
+                self.query_one(LiveView).update_snapshot(
+                    snapshot,
+                    snapshot_age,
+                    detailed=self._view_mode is OverviewViewMode.DETAILS,
+                )
                 self.query_one(InsightsView).update_snapshot(snapshot)
             self.query_one(BenchmarkView).update_view(
                 self._benchmark_supervisor.run_state,
@@ -393,12 +395,22 @@ class HordeWorkerTUI(App[None]):
             HealthStatus.ERROR: "red",
         }[severity]
 
-    def action_toggle_detailed_info(self) -> None:
-        """Toggle (and persist) the dashboard's extra technical columns/rows, then refresh now."""
-        self._detailed_info = not self._detailed_info
+    _VIEW_MODE_CYCLE = (OverviewViewMode.NORMAL, OverviewViewMode.DETAILS, OverviewViewMode.THIN)
+    """The order F6 steps through: the lean redesign, the verbose detail view, then the thin bar."""
+
+    _VIEW_MODE_NOTICE = {
+        OverviewViewMode.NORMAL: "View: normal.",
+        OverviewViewMode.DETAILS: "View: details (worker, alchemy, queue, recent jobs, extra columns).",
+        OverviewViewMode.THIN: "View: thin (compact status bar).",
+    }
+
+    def action_cycle_view_mode(self) -> None:
+        """Cycle (and persist) the Overview density: normal -> details -> thin, then refresh now."""
+        index = self._VIEW_MODE_CYCLE.index(self._view_mode) if self._view_mode in self._VIEW_MODE_CYCLE else 0
+        self._view_mode = self._VIEW_MODE_CYCLE[(index + 1) % len(self._VIEW_MODE_CYCLE)]
         with contextlib.suppress(Exception):
-            self._app_state_store.set_detailed_info(self._detailed_info)
-        self.notify("Detailed info on." if self._detailed_info else "Detailed info off.")
+            self._app_state_store.set_view_mode(self._view_mode)
+        self.notify(self._VIEW_MODE_NOTICE[self._view_mode])
         self._tick()
 
     def action_toggle_pause(self) -> None:

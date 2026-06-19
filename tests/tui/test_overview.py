@@ -117,16 +117,46 @@ def test_queue_lane_renders_upcoming_blocks() -> None:
     assert "1024²" in text
 
 
-def test_momentum_sparklines_track_recorded_trends() -> None:
-    """Recorded GPU-duty/kudos history renders as a non-empty sparkline panel."""
+def test_trends_panel_shows_value_direction_and_window() -> None:
+    """Recorded GPU-duty/kudos/job history renders the kudos, jobs, and GPU-duty trend rows."""
     view = OverviewView()
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
         gpu_utilization_mean_percent=70.0,
+        gpu_utilization_busy_fraction=0.7,
         kudos_per_hour=12000.0,
+        num_jobs_submitted=42,
     )
-    for percent in (40.0, 55.0, 80.0):
+    for percent, kudos in ((40.0, 8000.0), (55.0, 10000.0), (80.0, 12000.0)):
         snapshot.gpu_utilization_mean_percent = percent
+        snapshot.kudos_per_hour = kudos
         view._record_trends(snapshot)
-    text = _render(view._render_momentum(snapshot))
-    assert "GPU duty" in text and "Kudos/hr" in text
+    text = _render(view._render_trends(snapshot))
+    assert "Kudos/hr" in text and "Jobs/hr" in text and "GPU duty" in text
+    assert "42 done" in text
+
+
+def test_compact_bar_summarizes_worker_in_one_line() -> None:
+    """The thin compact bar carries the phase, kudos, GPU duty, and pipeline counts."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process()],
+        gpu_utilization_mean_percent=87.0,
+        gpu_utilization_busy_fraction=0.87,
+        kudos_per_hour=1240.0,
+        num_jobs_submitted=1284,
+        jobs_pending_inference=6,
+        jobs_in_progress=2,
+    )
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+    text = _render(OverviewView()._render_compact_bar(report, snapshot, frame=0))
+    assert "1,284 done" in text
+    assert "1,240" in text
+    assert "gpu 87%" in text
+
+
+def test_compact_bar_handles_missing_snapshot() -> None:
+    """With no snapshot yet, the compact bar still states the phase and headline without raising."""
+    report = derive(None, SupervisorStatus.STOPPED, None)
+    text = _render(OverviewView()._render_compact_bar(report, None, frame=0))
+    assert report.phase.value.upper() in text

@@ -10,9 +10,10 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import VerticalScroll
 from textual.widgets import Static
 
+from horde_worker_regen.app_state import OverviewViewMode
 from horde_worker_regen.process_management.supervisor_channel import (
     JobQueueEntry,
     ProcessSnapshot,
@@ -29,10 +30,15 @@ from horde_worker_regen.tui.formatters import (
     sparkline,
 )
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, summarize_skips
-from horde_worker_regen.tui.widgets.common import StatCard
 
-_TREND_HISTORY = 60
-"""How many recent frames of GPU-duty / kudos-per-hour history the momentum sparklines retain."""
+_TREND_HISTORY = 180
+"""How many trend samples (GPU-duty / kudos-per-hour / job counts) the Trends region retains."""
+
+_TREND_SAMPLE_INTERVAL = 1.0
+"""Minimum wall-clock seconds between recorded trend samples, so the window spans minutes not frames."""
+
+_TREND_SPARK_WIDTH = 40
+"""Maximum number of recent samples drawn in a Trends sparkline, keeping the line terminal-friendly."""
 
 _SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "INFERENCE_POST_PROCESSING", "ALCHEMY_STARTING"})
 """States with a live sampling step/it-s; outside these the snapshot's step numbers are last-job residue."""
@@ -55,29 +61,47 @@ class OverviewView(VerticalScroll):
     """A dashboard led by a living status hero and a health checklist."""
 
     def __init__(self) -> None:
-        """Set up the view, including the client-side trend history for the momentum sparklines."""
+        """Set up the view, including the client-side trend history for the Trends sparklines."""
         super().__init__()
         self._gpu_duty_history: deque[float] = deque(maxlen=_TREND_HISTORY)
         self._kudos_history: deque[float] = deque(maxlen=_TREND_HISTORY)
+        self._jobs_history: deque[tuple[float, int]] = deque(maxlen=_TREND_HISTORY)
+        self._last_trend_sample = 0.0
 
     def compose(self) -> ComposeResult:
-        """Lay out the hero, health checklist, stat cards, and detail tables."""
+        """Lay out the compact bar plus the hero, health, trends, pipeline, and detail tables.
+
+        Only one set is visible at a time: ``update_view`` toggles each node's ``display`` from the
+        active :class:`OverviewViewMode` (thin shows only the compact bar; the worker/alchemy/queue/
+        recent statics appear only in details mode).
+        """
+        yield Static(id="overview-thin")
         yield Static(id="overview-hero")
         yield Static(id="overview-health")
-        with Horizontal(id="overview-cards"):
-            yield StatCard("Jobs submitted", card_id="ov-submitted")
-            yield StatCard("Jobs faulted", card_id="ov-faulted")
-            yield StatCard("Alchemy", card_id="ov-alchemy")
-            yield StatCard("GPU duty", card_id="ov-gpu")
-            yield StatCard("Kudos / hr", card_id="ov-kudos")
-            yield StatCard("Processes", card_id="ov-processes")
+        yield Static(id="overview-trends")
         yield Static(id="overview-pipeline")
-        yield Static(id="overview-momentum")
+        yield Static(id="overview-processes")
         yield Static(id="overview-worker")
         yield Static(id="overview-alchemy")
-        yield Static(id="overview-processes")
         yield Static(id="overview-queue")
         yield Static(id="overview-recent")
+
+    _NORMAL_NODE_IDS = (
+        "#overview-hero",
+        "#overview-health",
+        "#overview-trends",
+        "#overview-pipeline",
+        "#overview-processes",
+    )
+    """Statics shown in normal (and details) mode, hidden in thin mode."""
+
+    _DETAIL_NODE_IDS = (
+        "#overview-worker",
+        "#overview-alchemy",
+        "#overview-queue",
+        "#overview-recent",
+    )
+    """Statics shown only in details mode (the demoted panels)."""
 
     def update_view(
         self,
@@ -85,29 +109,54 @@ class OverviewView(VerticalScroll):
         snapshot: WorkerStateSnapshot | None,
         *,
         frame: int,
-        detailed: bool = False,
+        mode: OverviewViewMode = OverviewViewMode.NORMAL,
     ) -> None:
-        """Refresh the hero/health from the report and the metrics from the snapshot (if any)."""
+        """Refresh the visible regions for the active view ``mode`` from the report and snapshot."""
+        thin = mode is OverviewViewMode.THIN
+        detailed = mode is OverviewViewMode.DETAILS
+
+        self.query_one("#overview-thin", Static).display = thin
+        for node_id in self._NORMAL_NODE_IDS:
+            self.query_one(node_id, Static).display = not thin
+        for node_id in self._DETAIL_NODE_IDS:
+            self.query_one(node_id, Static).display = detailed
+
+        if snapshot is not None:
+            self._maybe_record_trends(snapshot)
+
+        if thin:
+            self.query_one("#overview-thin", Static).update(self._render_compact_bar(report, snapshot, frame))
+            return
+
         self.query_one("#overview-hero", Static).update(self._render_hero(report, snapshot, frame))
         self.query_one("#overview-health", Static).update(self._render_health(report))
         if snapshot is not None:
-            self._update_cards(snapshot)
-            self._record_trends(snapshot)
+            self.query_one("#overview-trends", Static).update(self._render_trends(snapshot))
             self.query_one("#overview-pipeline", Static).update(self._render_pipeline_strip(snapshot))
-            self.query_one("#overview-momentum", Static).update(self._render_momentum(snapshot))
-            self.query_one("#overview-worker", Static).update(self._render_worker_table(snapshot))
-            self.query_one("#overview-alchemy", Static).update(self._render_alchemy_panel(snapshot))
-            processes_table = self._render_process_table(snapshot, detailed=detailed)
-            self.query_one("#overview-processes", Static).update(processes_table)
-            self.query_one("#overview-queue", Static).update(self._render_queue_table(snapshot))
-            self.query_one("#overview-recent", Static).update(self._render_recent_jobs(snapshot))
+            self.query_one("#overview-processes", Static).update(
+                self._render_process_table(snapshot, detailed=detailed),
+            )
+            if detailed:
+                self.query_one("#overview-worker", Static).update(self._render_worker_table(snapshot))
+                self.query_one("#overview-alchemy", Static).update(self._render_alchemy_panel(snapshot))
+                self.query_one("#overview-queue", Static).update(self._render_queue_table(snapshot))
+                self.query_one("#overview-recent", Static).update(self._render_recent_jobs(snapshot))
+
+    def _maybe_record_trends(self, snapshot: WorkerStateSnapshot) -> None:
+        """Record a trend sample at most once per :data:`_TREND_SAMPLE_INTERVAL` of wall-clock time."""
+        now = time.time()
+        if now - self._last_trend_sample < _TREND_SAMPLE_INTERVAL:
+            return
+        self._last_trend_sample = now
+        self._record_trends(snapshot)
 
     def _record_trends(self, snapshot: WorkerStateSnapshot) -> None:
-        """Append this frame's GPU-duty and kudos/hr to the bounded sparkline history buffers."""
+        """Append one sample of GPU-duty, kudos/hr, and the cumulative job counter to the buffers."""
         if snapshot.gpu_utilization_mean_percent is not None:
             self._gpu_duty_history.append(snapshot.gpu_utilization_mean_percent)
         if snapshot.kudos_per_hour is not None:
             self._kudos_history.append(snapshot.kudos_per_hour)
+        self._jobs_history.append((time.time(), snapshot.num_jobs_submitted))
 
     def _hero_glyph(self, report: HealthReport, frame: int) -> Text:
         """A status glyph that pulses/spins for in-progress or attention states."""
@@ -133,6 +182,7 @@ class OverviewView(VerticalScroll):
         body: list[Text] = [Text(report.detail, style="grey70")]
 
         if snapshot is not None:
+            body.append(self._headline_metrics_line(snapshot))
             body.append(self._activity_line(snapshot))
             why_no_work = summarize_skips(snapshot.last_pop_skipped_reasons)
             if why_no_work:
@@ -149,6 +199,22 @@ class OverviewView(VerticalScroll):
 
         border = "red" if report.severity is HealthStatus.ERROR else report.severity.colour
         return Panel(Group(*body), title=title, title_align="left", border_style=border, padding=(0, 1))
+
+    @staticmethod
+    def _headline_metrics_line(snapshot: WorkerStateSnapshot) -> Text:
+        """The session totals the dropped stat cards used to carry: submitted, kudos/hr, faulted."""
+        kudos = "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"
+        faulted_colour = "red" if snapshot.num_jobs_faulted else "grey70"
+        return Text.assemble(
+            (f"{snapshot.num_jobs_submitted:,}", "bold"),
+            (" jobs submitted", "grey50"),
+            ("   ·   ", "grey37"),
+            (kudos, "bold cyan"),
+            (" kudos/hr", "grey50"),
+            ("   ·   ", "grey37"),
+            (f"{snapshot.num_jobs_faulted:,}", faulted_colour),
+            (" faulted", "grey50"),
+        )
 
     @staticmethod
     def _activity_line(snapshot: WorkerStateSnapshot) -> Text:
@@ -185,27 +251,6 @@ class OverviewView(VerticalScroll):
                 Text(check.detail, style="grey70"),
             )
         return Panel(table, title="Health", title_align="left", border_style="grey37", padding=(0, 1))
-
-    def _update_cards(self, snapshot: WorkerStateSnapshot) -> None:
-        """Refresh the headline stat cards from a snapshot."""
-        self.query_one("#ov-submitted", StatCard).update_value(str(snapshot.num_jobs_submitted))
-        self.query_one("#ov-faulted", StatCard).update_value(str(snapshot.num_jobs_faulted))
-        # Alchemy card: show in-flight / total submitted, or "off" when not configured
-        if snapshot.config.alchemist:
-            total_active = (
-                snapshot.alchemy_forms_pending
-                + snapshot.alchemy_forms_in_flight
-                + snapshot.alchemy_forms_awaiting_submit
-            )
-            alchemy_val = f"{total_active} active / {snapshot.alchemy_total_submitted} done"
-        else:
-            alchemy_val = "off"
-        self.query_one("#ov-alchemy", StatCard).update_value(alchemy_val)
-        self.query_one("#ov-gpu", StatCard).update_value(format_percent(snapshot.gpu_utilization_mean_percent))
-        kudos = "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"
-        self.query_one("#ov-kudos", StatCard).update_value(kudos)
-        alive = sum(1 for process in snapshot.processes if process.is_alive)
-        self.query_one("#ov-processes", StatCard).update_value(f"{alive} / {len(snapshot.processes)}")
 
     def _render_worker_table(self, snapshot: WorkerStateSnapshot) -> Table:
         """Build a key/value table of worker identity and configuration."""
@@ -379,18 +424,160 @@ class OverviewView(VerticalScroll):
         border = "green" if (queue or inference or safety or submit) else "grey37"
         return Panel(Group(*rows), title="Job pipeline", title_align="left", border_style=border, padding=(0, 1))
 
-    def _render_momentum(self, snapshot: WorkerStateSnapshot) -> Panel:
-        """Render compact sparklines of recent GPU-duty and kudos/hr so momentum is visible."""
-        gpu_now = format_percent(snapshot.gpu_utilization_mean_percent)
-        kudos_now = "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"
+    @staticmethod
+    def _trend_arrow(series: list[float]) -> Text:
+        """A direction marker comparing the latest sample to the window start, with a percent delta.
+
+        A short or flat series reads as steady rather than asserting a trend the data cannot support.
+        """
+        if len(series) < 2 or series[0] == 0:
+            return Text("→", style="grey50")
+        change = (series[-1] - series[0]) / abs(series[0])
+        if change > 0.02:
+            return Text(f"▲ {abs(change) * 100:.0f}%", style="green")
+        if change < -0.02:
+            return Text(f"▼ {abs(change) * 100:.0f}%", style="red")
+        return Text("→", style="grey50")
+
+    def _jobs_per_hour(self) -> tuple[float | None, list[float]]:
+        """Derive a jobs/hr rate and a per-sample jobs-completed series from the job-count history.
+
+        Returns ``(rate, deltas)``: ``rate`` is None until two samples span a positive interval; the
+        ``deltas`` series is the jobs finished between consecutive samples (the sparkline's signal).
+        """
+        samples = list(self._jobs_history)
+        if len(samples) < 2:
+            return None, []
+        deltas = [float(max(0, b[1] - a[1])) for a, b in zip(samples, samples[1:], strict=False)]
+        elapsed = samples[-1][0] - samples[0][0]
+        completed = samples[-1][1] - samples[0][1]
+        rate = (completed / elapsed * 3600.0) if elapsed > 0 else None
+        return rate, deltas
+
+    def _render_trends(self, snapshot: WorkerStateSnapshot) -> Panel:
+        """Render recent kudos/hr, jobs/hr, and GPU-duty trends: a value, direction, and sparkline.
+
+        Replaces the old momentum gauge, whose self-scaled sparklines carried neither a reference
+        value nor a window. Here each row pairs a current figure with a direction marker against the
+        window start, and the GPU row adds a duty bar so "how much of the time it is working" reads
+        at a glance alongside the over-time shape.
+        """
+        kudos_series = list(self._kudos_history)[-_TREND_SPARK_WIDTH:]
+        gpu_series = list(self._gpu_duty_history)[-_TREND_SPARK_WIDTH:]
+        rate, jobs_deltas = self._jobs_per_hour()
+        jobs_deltas = jobs_deltas[-_TREND_SPARK_WIDTH:]
 
         grid = Table.grid(padding=(0, 2))
         grid.add_column(justify="right", style="bold cyan", no_wrap=True)
-        grid.add_column(no_wrap=True)
         grid.add_column(justify="right", no_wrap=True)
-        grid.add_row("GPU duty", Text(sparkline(self._gpu_duty_history) or "…", style="green"), gpu_now)
-        grid.add_row("Kudos/hr", Text(sparkline(self._kudos_history) or "…", style="yellow"), kudos_now)
-        return Panel(grid, title="Momentum", title_align="left", border_style="grey37", padding=(0, 1))
+        grid.add_column(no_wrap=True)
+        grid.add_column(no_wrap=True)
+        grid.add_column(style="grey50", no_wrap=True)
+
+        kudos_now = "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"
+        kudos_peak = f"peak {max(kudos_series):,.0f}" if kudos_series else ""
+        grid.add_row(
+            "Kudos/hr",
+            kudos_now,
+            self._trend_arrow(kudos_series),
+            Text(sparkline(kudos_series) or "…", style="cyan"),
+            kudos_peak,
+        )
+
+        jobs_now = "-" if rate is None else f"{rate:,.0f}"
+        grid.add_row(
+            "Jobs/hr",
+            jobs_now,
+            self._trend_arrow(jobs_deltas),
+            Text(sparkline(jobs_deltas) or "…", style="green"),
+            f"{snapshot.num_jobs_submitted:,} done",
+        )
+
+        busy_fraction = snapshot.gpu_utilization_busy_fraction
+        if busy_fraction is None and snapshot.gpu_utilization_mean_percent is not None:
+            busy_fraction = snapshot.gpu_utilization_mean_percent / 100.0
+        duty_bar = Text(mini_bar(busy_fraction, 12), style="green") if busy_fraction is not None else Text("…")
+        grid.add_row(
+            "GPU duty",
+            format_percent(snapshot.gpu_utilization_mean_percent),
+            duty_bar,
+            Text(sparkline(gpu_series) or "…", style="green"),
+            "busy" if busy_fraction and busy_fraction > 0.5 else "idle",
+        )
+
+        window = self._trend_window_label()
+        return Panel(
+            grid,
+            title="Trends",
+            title_align="left",
+            subtitle=Text(window, style="grey50"),
+            subtitle_align="right",
+            border_style="grey37",
+            padding=(0, 1),
+        )
+
+    def _trend_window_label(self) -> str:
+        """Describe the span the trend buffers currently cover (e.g. ``last 3m 20s``)."""
+        samples = list(self._jobs_history)
+        if len(samples) < 2:
+            return "warming up"
+        return f"last {human_duration(samples[-1][0] - samples[0][0])}"
+
+    def _render_compact_bar(
+        self,
+        report: HealthReport,
+        snapshot: WorkerStateSnapshot | None,
+        frame: int,
+    ) -> Panel:
+        """Render the whole worker as one dense status line (the thin, tmux-style view).
+
+        Reuses the hero glyph and the same report/snapshot the full dashboard draws from, so the bar
+        always agrees with the larger views. With no snapshot yet it states the phase and headline.
+        """
+        sep = ("   ·   ", "grey37")
+        parts: list[Text | tuple[str, str]] = [
+            self._hero_glyph(report, frame),
+            (" ", ""),
+            (report.phase.value.upper(), f"bold {report.severity.colour}"),
+        ]
+        if snapshot is None:
+            parts += [sep, (report.headline, "grey70")]
+            return Panel(Text.assemble(*parts), border_style=report.severity.colour, padding=(0, 1))
+
+        kudos = "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"
+        busy_fraction = snapshot.gpu_utilization_busy_fraction
+        if busy_fraction is None and snapshot.gpu_utilization_mean_percent is not None:
+            busy_fraction = snapshot.gpu_utilization_mean_percent / 100.0
+        alive = sum(1 for process in snapshot.processes if process.is_alive)
+        safety = snapshot.jobs_pending_safety_check + snapshot.jobs_being_safety_checked
+        age = time.time() - snapshot.timestamp if snapshot.timestamp else None
+
+        line = Text.assemble(*parts)
+        line.append_text(Text.assemble(sep, (f"{snapshot.num_jobs_submitted:,}", "bold"), (" done", "grey50")))
+        line.append_text(Text.assemble(sep, (kudos, "bold cyan"), ("/h ", "grey50")))
+        line.append_text(self._trend_arrow(list(self._kudos_history)[-_TREND_SPARK_WIDTH:]))
+        gpu_pct = format_percent(snapshot.gpu_utilization_mean_percent)
+        line.append_text(Text.assemble((" gpu ", "grey50"), (gpu_pct, "")))
+        if busy_fraction is not None:
+            line.append_text(Text(" " + mini_bar(busy_fraction, 8), style="green"))
+        line.append_text(
+            Text.assemble(
+                sep,
+                ("q", "grey50"),
+                (str(snapshot.jobs_pending_inference), "cyan"),
+                ("▸inf", "grey50"),
+                (str(snapshot.jobs_in_progress), "green"),
+                ("▸saf", "grey50"),
+                (str(safety), "grey70"),
+                ("▸sub", "grey50"),
+                (str(snapshot.jobs_pending_submit), "cyan"),
+            ),
+        )
+        total_procs = len(snapshot.processes)
+        procs_colour = "green" if alive == total_procs else "yellow"
+        line.append_text(Text.assemble(sep, ("procs ", "grey50"), (f"{alive}/{total_procs}", procs_colour)))
+        line.append_text(Text.assemble(sep, ("⌚ ", "grey50"), (f"{human_duration(age)} ago", "grey70")))
+        return Panel(line, border_style=report.severity.colour, padding=(0, 1))
 
     def _render_process_table(self, snapshot: WorkerStateSnapshot, *, detailed: bool = False) -> Table:
         """Build a compact per-process summary table with stable column widths.

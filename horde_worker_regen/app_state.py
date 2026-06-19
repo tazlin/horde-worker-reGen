@@ -53,6 +53,17 @@ class KnownGoodSource(enum.StrEnum):
     """The configuration ran a worker session for long enough without failing out."""
 
 
+class OverviewViewMode(enum.StrEnum):
+    """How densely the Overview tab renders; cycled by the F6 view-mode toggle."""
+
+    NORMAL = "normal"
+    """The lean redesign: enriched hero, health, trends, pipeline, and a lean processes table."""
+    DETAILS = "details"
+    """Normal plus the demoted panels (worker config, alchemy, queue, recent jobs) and extra columns."""
+    THIN = "thin"
+    """A single compact status bar only; the rest of the dashboard is hidden."""
+
+
 class OnboardingChoice(enum.StrEnum):
     """The user's response to the first-run benchmark prompt."""
 
@@ -133,8 +144,11 @@ class WorkerAppState(BaseModel):
     install runs the wizard; an existing, already-configured install is marked complete on first launch
     without ever showing it (see the wizard's incomplete-setup detection)."""
     detailed_info: bool = False
-    """Whether the dashboard shows the extra technical columns/rows (heartbeat age/type, raw job IDs,
-    per-job steps). Off by default for a lean overview; the operator opts in via F6."""
+    """Deprecated: superseded by ``overview_view_mode``. Retained only so an older persisted state can
+    be migrated (a stored ``detailed_info: true`` maps to the ``details`` view mode on load)."""
+    overview_view_mode: OverviewViewMode = OverviewViewMode.NORMAL
+    """How densely the Overview tab renders. The F6 toggle cycles normal -> details -> thin; the
+    redesigned lean overview is the default, with the older verbose dashboard behind ``details``."""
     worker_version_last_ran: str | None = None
     onboarding: OnboardingState = Field(default_factory=OnboardingState)
     last_worker_run: WorkerRunRecord | None = None
@@ -255,10 +269,14 @@ class AppStateStore:
         if not self._path.exists():
             return WorkerAppState()
         try:
-            return WorkerAppState.model_validate_json(self._path.read_text(encoding="utf-8"))
+            state = WorkerAppState.model_validate_json(self._path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as read_error:
             logger.debug(f"Could not read app state at {self._path} ({read_error}); using a fresh state.")
             return WorkerAppState()
+        # Migrate a pre-view-mode state: a stored detailed_info flag maps onto the new view mode.
+        if state.overview_view_mode is OverviewViewMode.NORMAL and state.detailed_info:
+            state.overview_view_mode = OverviewViewMode.DETAILS
+        return state
 
     def save(self, state: WorkerAppState) -> None:
         """Persist ``state`` atomically, creating the state directory on first write."""
@@ -311,10 +329,10 @@ class AppStateStore:
         state.setup_complete = complete
         self.save(state)
 
-    def set_detailed_info(self, enabled: bool) -> None:
-        """Persist whether the dashboard shows the extra technical columns/rows (F6 toggle)."""
+    def set_view_mode(self, mode: OverviewViewMode) -> None:
+        """Persist the Overview tab's density (the F6 view-mode toggle)."""
         state = self.load()
-        state.detailed_info = enabled
+        state.overview_view_mode = mode
         self.save(state)
 
     # endregion
@@ -329,6 +347,7 @@ __all__ = [
     "KnownGoodSource",
     "OnboardingChoice",
     "OnboardingState",
+    "OverviewViewMode",
     "WorkerAppState",
     "WorkerRunRecord",
     "benchmark_status_summary",

@@ -14,6 +14,7 @@ from horde_worker_regen.app_state import (
     KnownGoodSource,
     OnboardingChoice,
     OnboardingState,
+    OverviewViewMode,
     WorkerAppState,
     WorkerRunRecord,
     benchmark_status_summary,
@@ -149,26 +150,35 @@ def test_set_auto_start_worker_round_trips_and_preserves_fields(tmp_path: Path) 
     assert store.load().auto_start_worker is False
 
 
-def test_detailed_info_defaults_off(tmp_path: Path) -> None:
-    """A fresh state has detailed-info off, so the dashboard starts lean."""
-    assert _store(tmp_path).load().detailed_info is False
+def test_view_mode_defaults_to_normal(tmp_path: Path) -> None:
+    """A fresh state opens in the lean normal overview."""
+    assert _store(tmp_path).load().overview_view_mode is OverviewViewMode.NORMAL
 
 
-def test_set_detailed_info_round_trips_and_preserves_fields(tmp_path: Path) -> None:
-    """Toggling detailed-info persists and does not clobber other recorded state."""
+def test_set_view_mode_round_trips_and_preserves_fields(tmp_path: Path) -> None:
+    """Setting the view mode persists and does not clobber other recorded state."""
     store = _store(tmp_path)
     store.record_worker_started(worker_version="12.0.0")
     store.set_auto_start_worker(True)
 
-    store.set_detailed_info(True)
+    store.set_view_mode(OverviewViewMode.THIN)
 
     state = store.load()
-    assert state.detailed_info is True
+    assert state.overview_view_mode is OverviewViewMode.THIN
     assert state.auto_start_worker is True
     assert state.worker_version_last_ran == "12.0.0"
 
-    store.set_detailed_info(False)
-    assert store.load().detailed_info is False
+    store.set_view_mode(OverviewViewMode.NORMAL)
+    assert store.load().overview_view_mode is OverviewViewMode.NORMAL
+
+
+def test_legacy_detailed_info_migrates_to_details_view(tmp_path: Path) -> None:
+    """A pre-view-mode state file with detailed_info set loads as the details view mode."""
+    store = _store(tmp_path)
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text('{"detailed_info": true}', encoding="utf-8")
+
+    assert store.load().overview_view_mode is OverviewViewMode.DETAILS
 
 
 def test_setup_complete_defaults_off(tmp_path: Path) -> None:

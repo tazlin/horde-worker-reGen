@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from textual.widgets import TabbedContent
 
-from horde_worker_regen.app_state import AppStateStore
+from horde_worker_regen.app_state import AppStateStore, OverviewViewMode
 from horde_worker_regen.process_management.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.app import HordeWorkerTUI
@@ -56,12 +56,19 @@ async def test_app_boots_renders_and_cycles_tabs(tmp_path: Path) -> None:
             report = derive(snapshot, supervisor.status, time.time() - snapshot.timestamp)
             assert report.phase in _LIVE_PHASES, f"unexpected phase {report.phase}"
 
-            # The F6 detail toggle flips, renders the detailed views without error, and persists.
-            assert app._detailed_info is False
-            app.action_toggle_detailed_info()
+            # The F6 view-mode toggle cycles normal -> details -> thin, renders each without error,
+            # and persists the active mode.
+            assert app._view_mode is OverviewViewMode.NORMAL
+            app.action_cycle_view_mode()
             await pilot.pause()
-            assert app._detailed_info is True
-            assert store.load().detailed_info is True
+            assert app._view_mode is OverviewViewMode.DETAILS
+            assert store.load().overview_view_mode is OverviewViewMode.DETAILS
+            app.action_cycle_view_mode()
+            await pilot.pause()
+            assert app._view_mode is OverviewViewMode.THIN
+            app.action_cycle_view_mode()
+            await pilot.pause()
+            assert app._view_mode is OverviewViewMode.NORMAL
     finally:
         supervisor.stop(timeout=10.0)
     assert not supervisor.is_alive()
