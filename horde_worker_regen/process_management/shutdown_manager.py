@@ -15,13 +15,13 @@ from horde_worker_regen.process_management.process_lifecycle import ProcessLifec
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
-_SHUTDOWN_GRACE_BASE_SECONDS = 2.0
+_SHUTDOWN_GRACE_BASE_SECONDS = 20.0
 """Minimum grace before the force-kill backstop fires, regardless of outstanding work."""
 
-_SHUTDOWN_GRACE_PER_JOB_SECONDS = 4.0
+_SHUTDOWN_GRACE_PER_JOB_SECONDS = 40.0
 """Extra grace granted per outstanding job (any stage), so in-flight work can drain before a kill."""
 
-MAX_SHUTDOWN_GRACE_SECONDS = 90.0
+MAX_SHUTDOWN_GRACE_SECONDS = 120.0
 """Hard ceiling on the drain grace: long enough for an in-flight inference + safety + submit, but
 the backstop must never block forever. The TUI's stop timeout is kept above this (see
 ``tui.worker_launcher.GRACEFUL_STOP_TIMEOUT_SECONDS``)."""
