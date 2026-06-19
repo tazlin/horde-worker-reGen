@@ -1,13 +1,19 @@
 """Background GPU core-utilization sampling for the benchmark.
 
 The benchmark measures *sampling rate* (it/s) while a job is on the GPU, but that says
-nothing about how much of the wall clock the GPU is actually busy — the gaps *between*
+nothing about how much of the wall clock the GPU is actually busy -- the gaps *between*
 jobs (VAE decode, post-processing, encode, IPC hand-off, scheduling latency) are exactly
-where uptime is lost. This sampler polls NVML for the device's core-utilization percentage
-on a background thread for the duration of a run, so the report can state a GPU duty cycle.
+where uptime is lost. This sampler polls the device's core-utilization percentage on a
+background thread for the duration of a run, so the report can state a GPU duty cycle.
 
-It degrades gracefully: if NVML (``pynvml``) is unavailable, the sampler simply collects no
-samples and reports ``None``, so fake/CPU runs and CI are unaffected.
+Utilization is read through hordelib's backend-agnostic accelerator helper
+(:func:`hordelib.utils.torch_memory.get_accelerator_utilization_percent`), which returns the figure
+for whatever backend can report it (NVIDIA via NVML today) and ``None`` elsewhere. It is imported from
+that torch-free submodule rather than the ``hordelib.api`` facade so merely importing this module pulls
+no torch. The worker itself never touches NVML/``pynvml`` directly, so it makes no NVIDIA assumption.
+
+It degrades gracefully: when no backend telemetry is available the sampler collects no
+samples and reports ``None``, so CPU/fake runs, non-NVIDIA backends, and CI are unaffected.
 """
 
 from __future__ import annotations
@@ -15,32 +21,32 @@ from __future__ import annotations
 import json
 import threading
 import time
-import warnings
 from collections.abc import Callable
 from pathlib import Path
 
 from loguru import logger
 
 
-def _make_nvml_reader(device_index: int) -> Callable[[], int | None] | None:
-    """Return a callable that reads device core-utilization %, or None if NVML is unavailable."""
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")  # silence pynvml's deprecation FutureWarning
-            import pynvml
+def _make_utilization_reader(device_index: int) -> Callable[[], int | None] | None:
+    """Return a callable reading device core-utilization %, or None when no telemetry source exists.
 
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
-    except Exception as e:  # noqa: BLE001 - any NVML failure means "no GPU telemetry", not a crash
-        logger.debug(f"GPU utilization sampling unavailable (NVML init failed: {e})")
+    Delegates to hordelib's backend-agnostic API so this works on whatever backend reports utilization and
+    yields no sampler elsewhere. Probes once: a backend (or machine) with no utilization source returns
+    ``None`` here, so the caller skips sampling entirely rather than spinning a thread that only collects
+    ``None``.
+    """
+    try:
+        from hordelib.utils.torch_memory import get_accelerator_utilization_percent
+    except Exception as import_error:  # noqa: BLE001 - "no telemetry" is expected off-GPU, not a crash
+        logger.debug(f"GPU utilization sampling unavailable (hordelib import failed: {import_error})")
         return None
 
     def _read() -> int | None:
-        try:
-            return int(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
-        except Exception:  # noqa: BLE001
-            return None
+        return get_accelerator_utilization_percent(device_index)
 
+    if _read() is None:
+        logger.debug("GPU utilization sampling unavailable (no backend telemetry for this device)")
+        return None
     return _read
 
 
@@ -58,19 +64,18 @@ class GpuUtilizationSampler:
         """Initialize the sampler.
 
         Args:
-            device_index: Which CUDA device to watch.
+            device_index: Which device to watch.
             interval_seconds: How often to poll utilization.
             busy_threshold_percent: Utilization at or above which a sample counts as "busy".
                 Defaults low (5%) so ``busy_fraction`` measures the fraction of wall-clock the
                 GPU was doing *anything*; ``mean_percent`` remains the duty-cycle headline.
-            read_utilization: Override the utilization reader (for tests). When None, an NVML
-                reader is created at ``start()``; if NVML is unavailable the sampler no-ops.
+            read_utilization: Override the utilization reader (for tests). When None, a backend-agnostic
+                reader is created at ``start()``; if no telemetry is available the sampler no-ops.
         """
         self._device_index = device_index
         self._interval = interval_seconds
         self._busy_threshold = busy_threshold_percent
         self._read = read_utilization
-        self._owns_reader = read_utilization is None
 
         self._samples: list[int] = []
         self._timeline: list[tuple[float, int]] = []
@@ -79,9 +84,9 @@ class GpuUtilizationSampler:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        """Begin sampling on a background thread (a no-op if no GPU telemetry is available)."""
+        """Begin sampling on a background thread (a no-op when no GPU telemetry is available)."""
         if self._read is None:
-            self._read = _make_nvml_reader(self._device_index)
+            self._read = _make_utilization_reader(self._device_index)
         if self._read is None:
             return
         self._thread = threading.Thread(target=self._loop, name="gpu-util-sampler", daemon=True)
@@ -96,46 +101,37 @@ class GpuUtilizationSampler:
                 self._timeline.append((time.time(), value))
 
     def stop(self) -> None:
-        """Stop sampling and release NVML."""
+        """Stop sampling. NVML's lifecycle is owned by hordelib, so there is nothing to release here."""
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
-        if self._owns_reader and self._read is not None:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                try:
-                    import pynvml
-
-                    pynvml.nvmlShutdown()
-                except Exception:  # noqa: BLE001
-                    pass
 
     @property
     def sample_count(self) -> int:
-        """How many utilization samples were collected."""
+        """The number of utilization samples collected."""
         return len(self._samples)
 
     def mean_percent(self) -> float | None:
-        """Average GPU core utilization across the run (the duty cycle), or None without samples."""
+        """Return the average GPU core utilization across the run (the duty cycle), or None without samples."""
         if not self._samples:
             return None
         return sum(self._samples) / len(self._samples)
 
     def busy_fraction(self) -> float | None:
-        """Fraction of samples at or above the busy threshold, or None without samples."""
+        """Return the fraction of samples at or above the busy threshold, or None without samples."""
         if not self._samples:
             return None
         busy = sum(1 for sample in self._samples if sample >= self._busy_threshold)
         return busy / len(self._samples)
 
     def timeline(self) -> list[tuple[float, int]]:
-        """The collected ``(epoch_seconds, util_percent)`` samples, in order."""
+        """Return the collected ``(epoch_seconds, util_percent)`` samples, in order."""
         return list(self._timeline)
 
     def dump_timeline(self, path: str | Path) -> None:
         """Write the timestamped utilization series to ``path`` as JSON (diagnostics)."""
         try:
             Path(path).write_text(json.dumps(self._timeline), encoding="utf-8")
-        except OSError as e:  # noqa: BLE001 - a diagnostics dump must never break a run
-            logger.debug(f"Could not write GPU utilization timeline to {path}: {e}")
+        except OSError as write_error:  # noqa: BLE001 - a diagnostics dump must never break a run
+            logger.debug(f"Could not write GPU utilization timeline to {path}: {write_error}")

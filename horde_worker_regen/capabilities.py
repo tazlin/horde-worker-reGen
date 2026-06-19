@@ -9,7 +9,7 @@ packages live in ``horde-engine`` extras, re-exported as the worker's ``controln
 classifier, ESRGAN upscalers, CodeFormer/GFPGAN face-fixers, LoRA, img2img) is pure PyTorch and runs
 on every backend.
 
-This module reads hordelib's typed capability registry (``hordelib.api.available_features``) and
+This module reads hordelib's typed capability registry (``hordelib.feature_requirements``) and
 coerces the loaded bridge data so the worker never advertises a feature it cannot actually run: a job
 that requested it would otherwise fault. Image-generation post-processing is one atomic switch
 (``allow_post_processing``): the AI Horde API has no per-job way to accept upscale/face-fix while
@@ -18,8 +18,10 @@ the upscalers/face-fixers themselves would run. Alchemy forms are enumerated per
 ``strip_background`` alone is dropped (see :func:`strip_background_available`) and the pure-torch
 forms stay on offer.
 
-hordelib is imported lazily inside the probe so importing this module (and the process manager) stays
-cheap and does not require hordelib, preserving the no-GPU/no-network dry-run test path.
+hordelib is imported lazily inside each probe, and from its torch-free ``feature_requirements`` submodule
+rather than the ``hordelib.api`` facade (which would drag torch into the orchestrator). So importing this
+module (and the process manager) stays cheap, requires no torch, and preserves the no-GPU/no-network
+dry-run test path.
 """
 
 from __future__ import annotations
@@ -55,7 +57,7 @@ def _worker_extra_for_feature() -> dict[str, str]:
     its own name, so a newly gated feature is still named usefully in install hints before an alias is
     added. Cached because hordelib's registry does not change during a run.
     """
-    from hordelib.api import get_feature_requirement_registry
+    from hordelib.feature_requirements import get_feature_requirement_registry
 
     return {
         requirement.feature.value: _HORDE_ENGINE_EXTRA_TO_WORKER_EXTRA.get(requirement.extra, requirement.extra)
@@ -72,7 +74,7 @@ def _available_features() -> frozenset[FEATURE_KIND]:
     treating every gated feature as unavailable is the safe reading.
     """
     try:
-        from hordelib.api import available_features
+        from hordelib.feature_requirements import available_features
     except Exception as exc:  # pragma: no cover - hordelib is a hard dependency in practice
         logger.debug("Could not import hordelib to probe feature availability; assuming none: {}", exc)
         return frozenset()
@@ -106,7 +108,7 @@ def controlnet_install_hint() -> str:
 
 def _install_hint(feature: FEATURE_KIND) -> str:
     """Build an actionable "install this extra" fragment naming the missing packages for *feature*."""
-    from hordelib.api import missing_packages
+    from hordelib.feature_requirements import missing_packages
 
     missing = missing_packages(feature)
     extra = _worker_extra_for_feature().get(feature.value, feature.value)

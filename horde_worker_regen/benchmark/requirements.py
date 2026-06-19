@@ -150,7 +150,7 @@ def models_disk_plan(model_names: list[str]) -> DownloadPlan | None:
 def _estimate_vram_mb(level: RampLevel) -> int | None:
     """Estimate the level's heaviest-job VRAM via the hordelib burden registry, or None on error."""
     try:
-        from hordelib.api import estimate_job_burden
+        from hordelib.feature_impact import estimate_job_burden
 
         burden = estimate_job_burden(
             baseline=level.baseline_hordelib,
@@ -169,7 +169,7 @@ def _tier_download_bytes(tier: BenchTier) -> int | None:
     if tier not in HUGE_TIERS:
         return None
     try:
-        from hordelib.api import estimate_job_burden
+        from hordelib.feature_impact import estimate_job_burden
 
         from horde_worker_regen.benchmark.ladder import _TIER_BASELINES, _TIER_RESOLUTIONS
 
@@ -209,7 +209,7 @@ def controlnet_annotators_present() -> bool | None:
     so a surface treats an unknown as "do not claim missing" rather than nagging spuriously.
     """
     try:
-        from hordelib.api import controlnet_annotators_present as _present
+        from hordelib.preload import controlnet_annotators_present as _present
 
         return _present()
     except Exception as e:  # noqa: BLE001 - presence is best-effort; fail open to "unknown"
@@ -222,7 +222,7 @@ def _controlnet_annotator_bytes(control_types: list[str]) -> int:
     if not control_types:
         return 0
     try:
-        from hordelib.api import controlnet_annotator_download_bytes
+        from hordelib.pipeline.constants import controlnet_annotator_download_bytes
 
         return controlnet_annotator_download_bytes(control_types)
     except Exception as e:  # noqa: BLE001 - sizing is informational; fail open to 0

@@ -287,7 +287,9 @@ def _prepare_runtime(options: WorkerLaunchOptions, *, supervised: bool = False) 
     AIWORKER_LIMITED_CONSOLE_MESSAGES = os.getenv("AIWORKER_LIMITED_CONSOLE_MESSAGES")
 
     logger.remove()
-    from hordelib.api import HordeLog
+    # From the torch-free ``utils.logger`` submodule, not the ``hordelib.api`` facade: this runs in the
+    # long-lived main/orchestrator process, and the facade would drag torch (~500MB) into it at startup.
+    from hordelib.utils.logger import HordeLog
 
     target_verbosity = options.verbosity
 

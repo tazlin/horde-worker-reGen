@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import sys
 import time
 
-from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
+import pytest
+
+from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler, _make_utilization_reader
 
 
 class TestGpuUtilizationSampler:
@@ -40,3 +43,49 @@ class TestGpuUtilizationSampler:
         sampler = GpuUtilizationSampler(read_utilization=None)
         sampler.stop()  # must not raise
         assert sampler.mean_percent() is None
+
+
+class TestUtilizationReaderDelegatesToHordelib:
+    """The reader consults hordelib's backend-agnostic utilization helper, with no direct NVML in the worker.
+
+    It imports from the torch-free ``hordelib.utils.torch_memory`` submodule (not the ``hordelib.api``
+    facade), so merely building a sampler never drags torch into the importing process.
+    """
+
+    def test_reader_uses_torch_memory_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When hordelib reports a percentage, the built reader returns it for the requested device."""
+        import hordelib.utils.torch_memory as torch_memory
+
+        seen: dict[str, int] = {}
+
+        def fake_utilization(index: int = 0) -> int | None:
+            seen["index"] = index
+            return 42
+
+        monkeypatch.setattr(torch_memory, "get_accelerator_utilization_percent", fake_utilization, raising=False)
+
+        reader = _make_utilization_reader(3)
+        assert reader is not None
+        assert reader() == 42
+        assert seen["index"] == 3
+
+    def test_reader_is_none_when_no_backend_telemetry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When hordelib reports None (non-NVIDIA / no telemetry), the sampler builds no reader (no-op)."""
+        import hordelib.utils.torch_memory as torch_memory
+
+        monkeypatch.setattr(
+            torch_memory,
+            "get_accelerator_utilization_percent",
+            lambda index=0: None,
+            raising=False,
+        )
+        assert _make_utilization_reader(0) is None
+
+    def test_reader_is_none_when_helper_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hordelib too old to expose the helper degrades gracefully to no sampling, never a crash."""
+        import hordelib.utils.torch_memory as torch_memory
+
+        monkeypatch.delattr(torch_memory, "get_accelerator_utilization_percent", raising=False)
+        # Ensure the lazy `from hordelib.utils.torch_memory import ...` re-resolves against the patched module.
+        monkeypatch.setitem(sys.modules, "hordelib.utils.torch_memory", torch_memory)
+        assert _make_utilization_reader(0) is None

@@ -350,9 +350,9 @@ def detect_machine_info() -> MachineInfo:
     except Exception:  # noqa: BLE001 - purely informational
         pass
     try:
-        from hordelib.api import enumerate_accelerators
+        from horde_worker_regen.utils.accelerator_probe import probe_accelerators
 
-        accelerators = enumerate_accelerators()
+        accelerators = probe_accelerators()
         if accelerators:
             primary = accelerators[0]
             info.gpu_name = primary.name
@@ -439,7 +439,6 @@ class BenchmarkController:
         """Run the ramp and return (and persist) the full report."""
         self._out_dir.mkdir(parents=True, exist_ok=True)
         machine = self._machine if self._machine is not None else detect_machine_info()
-        self._prewarm_inference_imports()
         self._warn_about_huge_tiers(machine)
         self._emit_ramp_started(machine)
         self._emit_ramp_plan(machine)
@@ -717,7 +716,7 @@ class BenchmarkController:
             return full_pool[:desired], None
 
         try:
-            from hordelib.api import estimate_job_burden
+            from hordelib.feature_impact import estimate_job_burden
 
             resolution = _TIER_RESOLUTIONS[tier]
             burden = estimate_job_burden(
@@ -813,7 +812,7 @@ class BenchmarkController:
     def _tier_burden(tier: BenchTier) -> BurdenEstimate | None:
         """Return the hordelib burden estimate for a tier's baseline, or None when unavailable."""
         try:
-            from hordelib.api import estimate_job_burden
+            from hordelib.feature_impact import estimate_job_burden
 
             resolution = _TIER_RESOLUTIONS[tier]
             return estimate_job_burden(baseline=_TIER_BASELINES[tier], width=resolution, height=resolution, batch=1)
@@ -866,24 +865,6 @@ class BenchmarkController:
                     models.add(job.model)
             ceiling = max(ceiling, _override_int(level, "max_threads", 1))
         return sorted(models), ceiling
-
-    def _prewarm_inference_imports(self) -> None:
-        """Import the hordelib burden API once, up front, so no individual level pays the cold import.
-
-        ``estimate_job_burden`` (used by the per-level VRAM pre-flight) lives in ``hordelib.api``, whose
-        first import pulls in torch and is tens of seconds cold. Machine detection usually pays this
-        already, but doing it here under timing guarantees the per-level hot path is warm and surfaces the
-        cost in the log rather than burying it inside the first level's otherwise-silent pre-flight.
-        """
-        if self._process_mode != "real":
-            return
-        start = time.monotonic()
-        try:
-            import hordelib.api  # noqa: F401 - imported for its side effect of warming the module cache
-        except Exception as e:  # noqa: BLE001 - prewarm is best-effort; per-level guards already fail open
-            logger.debug(f"Could not pre-warm hordelib inference imports: {e}")
-            return
-        logger.info(f"Pre-warmed hordelib inference imports in {time.monotonic() - start:.1f}s")
 
     def _maybe_start_warm_driver(self, machine: MachineInfo) -> None:
         """Bring up the shared warm worker, if warm mode is enabled and any level needs it."""

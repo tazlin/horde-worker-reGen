@@ -296,7 +296,7 @@ def _controlnet_annotator_row(control_types: list[str], *, on_disk: bool = False
     from horde_worker_regen.benchmark.download_progress import DownloadModelRow
 
     try:
-        from hordelib.api import controlnet_annotator_download_bytes
+        from hordelib.pipeline.constants import controlnet_annotator_download_bytes
 
         size = controlnet_annotator_download_bytes(control_types)
     except Exception as e:  # noqa: BLE001 - sizing is informational; show the row without a size
