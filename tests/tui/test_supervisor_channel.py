@@ -15,6 +15,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
     SupervisorCommand,
     SupervisorControlMessage,
     WorkerConfigSummary,
+    WorkerLivenessFrame,
     WorkerStateSnapshot,
 )
 
@@ -126,6 +127,17 @@ def test_process_snapshot_from_process_info() -> None:
     assert snapshot.loaded_horde_model_baseline == "stable_diffusion_1"
 
 
+def _recv_first(parent: object, frame_type: type, *, timeout: float = 3.0) -> object | None:
+    """Drain the pipe until a frame of ``frame_type`` arrives (liveness frames are interleaved now)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if parent.poll(0.1):  # type: ignore[attr-defined]
+            message = parent.recv()  # type: ignore[attr-defined]
+            if isinstance(message, frame_type):
+                return message
+    return None
+
+
 def test_channel_sends_snapshot_without_blocking_and_receives_commands() -> None:
     """The threaded channel delivers snapshots and drains commands over a real in-process pipe."""
     parent, child = multiprocessing.Pipe(duplex=True)
@@ -133,12 +145,7 @@ def test_channel_sends_snapshot_without_blocking_and_receives_commands() -> None
     try:
         assert channel.send_snapshot(_make_snapshot()) is True
 
-        deadline = time.time() + 3.0
-        received: WorkerStateSnapshot | None = None
-        while time.time() < deadline:
-            if parent.poll(0.1):
-                received = parent.recv()
-                break
+        received = _recv_first(parent, WorkerStateSnapshot)
         assert isinstance(received, WorkerStateSnapshot)
         assert received.num_jobs_submitted == 7
 
@@ -154,3 +161,51 @@ def test_channel_sends_snapshot_without_blocking_and_receives_commands() -> None
         channel.close()
         parent.close()
         child.close()
+
+
+def test_channel_emits_liveness_frames_without_any_snapshot() -> None:
+    """The channel heartbeats a liveness frame on its own cadence even when no snapshot is ever queued."""
+    parent, child = multiprocessing.Pipe(duplex=True)
+    channel = SupervisorChannel(child)  # pyrefly: ignore
+    try:
+        frame = _recv_first(parent, WorkerLivenessFrame)
+        assert isinstance(frame, WorkerLivenessFrame)
+        assert frame.protocol_version == SUPERVISOR_PROTOCOL_VERSION
+        assert frame.loop_alive_wall_time > 0.0
+    finally:
+        channel.close()
+        parent.close()
+        child.close()
+
+
+def test_note_alive_advances_the_carried_loop_time() -> None:
+    """``note_alive`` advances the ``loop_alive_wall_time`` carried by subsequent liveness frames."""
+    parent, child = multiprocessing.Pipe(duplex=True)
+    channel = SupervisorChannel(child)  # pyrefly: ignore
+    try:
+        first = _recv_first(parent, WorkerLivenessFrame)
+        assert isinstance(first, WorkerLivenessFrame)
+
+        time.sleep(0.05)
+        channel.note_alive()
+        later = _recv_first(parent, WorkerLivenessFrame, timeout=4.0)
+        assert isinstance(later, WorkerLivenessFrame)
+        assert later.loop_alive_wall_time > first.loop_alive_wall_time
+    finally:
+        channel.close()
+        parent.close()
+        child.close()
+
+
+def test_closed_channel_emits_no_liveness_frame() -> None:
+    """A channel whose pipe has died stops emitting frames rather than spinning on a dead connection."""
+    parent, child = multiprocessing.Pipe(duplex=True)
+    channel = SupervisorChannel(child)  # pyrefly: ignore
+    # Kill the consumer end so the next send fails and the channel marks itself closed.
+    parent.close()
+    deadline = time.time() + 3.0
+    while not channel.closed and time.time() < deadline:
+        time.sleep(0.05)
+    assert channel.closed is True
+    channel.close()
+    child.close()

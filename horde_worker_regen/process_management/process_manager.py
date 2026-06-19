@@ -1108,6 +1108,9 @@ class HordeWorkerProcessManager:
         if self.stable_diffusion_reference is None:
             raise ValueError("stable_diffusion_reference is None; cannot run the control loop")
 
+        if self._supervisor is not None:
+            self._supervisor.note_alive()
+
         with logger.catch(reraise=True):
             await self._sleep(self._loop_interval)
 

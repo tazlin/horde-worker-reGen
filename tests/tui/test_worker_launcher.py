@@ -8,7 +8,11 @@ import time
 import pytest
 from loguru import logger
 
-from horde_worker_regen.process_management.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
+from horde_worker_regen.process_management.supervisor_channel import (
+    WorkerConfigSummary,
+    WorkerLivenessFrame,
+    WorkerStateSnapshot,
+)
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.worker_launcher import (
     SupervisorStatus,
@@ -83,6 +87,42 @@ class _FakeCtx:
         self.process_count += 1
         self.last_process = _FakeProcess()
         return self.last_process
+
+
+class _ScriptedConn:
+    """A pipe stand-in that yields a fixed list of frames once, then stays empty."""
+
+    def __init__(self, frames: list[object]) -> None:
+        self._frames = list(frames)
+        self.closed = False
+
+    def poll(self, timeout: float | None = None) -> bool:
+        return bool(self._frames)
+
+    def recv(self) -> object:
+        return self._frames.pop(0)
+
+    def send(self, obj: object) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_drain_records_liveness_and_marks_running_without_a_snapshot() -> None:
+    """A liveness frame alone refreshes last_liveness_wall_time and confirms the worker is RUNNING."""
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(), mode=WorkerProcessMode.FAKE, ctx=ctx)  # type: ignore[arg-type]
+    supervisor.start()
+    assert ctx.last_process is not None  # keep the process alive so is_alive() is True
+
+    supervisor._connection = _ScriptedConn([WorkerLivenessFrame(loop_alive_wall_time=12345.0)])  # type: ignore[assignment]
+    snapshots = supervisor.drain_snapshots()
+
+    assert snapshots == []  # a liveness frame is not a snapshot
+    assert supervisor.latest_snapshot is None  # content unchanged
+    assert supervisor.last_liveness_wall_time == 12345.0
+    assert supervisor.status is SupervisorStatus.RUNNING
 
 
 def test_restart_on_crash_relaunches() -> None:

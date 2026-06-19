@@ -1060,6 +1060,16 @@ class HordeInferenceProcess(HordeProcess):
                         seamless_tiling_enabled=message.sdk_api_job_info.payload.tiling,
                         job_info=message.sdk_api_job_info,
                     )
+                else:
+                    # The model is already resident, so the scheduler dispatched inference without a
+                    # fresh preload. The aux-model (LoRA/TI) download lives inside preload_model, so
+                    # without this call those per-job downloads fall through to a lazy fetch inside
+                    # basic_inference while the slot reads INFERENCE_STARTING. A slow CivitAI download
+                    # there emits no step heartbeat, so the parent's inference_step_timeout watchdog
+                    # mistakes it for a hang and kills the process. download_aux_models runs under the
+                    # heartbeat-protected DOWNLOADING_AUX_MODEL path and is idempotent (a no-op when
+                    # the loras are already on disk or the job has none).
+                    self.download_aux_models(message.sdk_api_job_info)
 
                 if message.horde_model_name != self._active_model_name:
                     error_message = f"Received START_INFERENCE control message for model {message.horde_model_name} "

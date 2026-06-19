@@ -29,6 +29,7 @@ from loguru import logger
 from horde_worker_regen.process_management.supervisor_channel import (
     SupervisorCommand,
     SupervisorControlMessage,
+    WorkerLivenessFrame,
     WorkerStateSnapshot,
 )
 from horde_worker_regen.run_worker import WorkerLaunchOptions
@@ -176,6 +177,11 @@ class WorkerSupervisor:
         self._last_spawn_time = 0.0
 
         self.latest_snapshot: WorkerStateSnapshot | None = None
+        self.last_liveness_wall_time: float | None = None
+        """Worker wall-clock time of the control loop's most recent tick (from a ``WorkerLivenessFrame``).
+
+        Drives the TUI's responsiveness verdict independently of full-snapshot freshness; None until the
+        first frame of either kind arrives."""
         self.on_snapshot: Callable[[WorkerStateSnapshot], None] | None = None
         self.on_status_change: Callable[[SupervisorStatus], None] | None = None
 
@@ -243,8 +249,14 @@ class WorkerSupervisor:
                 self.on_status_change(status)
 
     def drain_snapshots(self) -> list[WorkerStateSnapshot]:
-        """Return all snapshots currently waiting on the pipe, without blocking (the read seam)."""
+        """Return all snapshots currently waiting on the pipe, without blocking (the read seam).
+
+        Liveness frames (:class:`WorkerLivenessFrame`) are consumed here too: they refresh
+        :attr:`last_liveness_wall_time` and confirm the worker is up, but are not returned (the caller
+        renders from snapshots).
+        """
         snapshots: list[WorkerStateSnapshot] = []
+        got_any_frame = False
         connection = self._connection
         if connection is None:
             return snapshots
@@ -253,19 +265,28 @@ class WorkerSupervisor:
                 message = connection.recv()
                 if isinstance(message, WorkerStateSnapshot):
                     snapshots.append(message)
+                    got_any_frame = True
+                elif isinstance(message, WorkerLivenessFrame):
+                    self.last_liveness_wall_time = message.loop_alive_wall_time
+                    got_any_frame = True
         except (EOFError, OSError):
             # Pipe closed (child exiting); tick() will observe the dead process and react.
             pass
 
+        if got_any_frame:
+            self._note_frame_received()
         if snapshots:
             self.latest_snapshot = snapshots[-1]
-            if self.is_alive():
-                self._set_status(SupervisorStatus.RUNNING)
-            if time.time() - self._last_spawn_time > _HEALTHY_UPTIME_SECONDS:
-                self._restart_attempts = 0
             if self.on_snapshot is not None:
                 self.on_snapshot(snapshots[-1])
         return snapshots
+
+    def _note_frame_received(self) -> None:
+        """Shared bookkeeping for any frame from the worker: it is alive, so refresh liveness/status."""
+        if self.is_alive():
+            self._set_status(SupervisorStatus.RUNNING)
+        if time.time() - self._last_spawn_time > _HEALTHY_UPTIME_SECONDS:
+            self._restart_attempts = 0
 
     def send_command(self, command: SupervisorControlMessage) -> bool:
         """Send a control command to the worker. Returns ``False`` if the pipe is unusable (the write seam)."""

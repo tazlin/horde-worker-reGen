@@ -283,9 +283,15 @@ class HordeWorkerTUI(App[None]):
         self._benchmark_supervisor.tick()
         self._frame += 1
         snapshot = self._supervisor.latest_snapshot
-        snapshot_age = (time.time() - snapshot.timestamp) if snapshot is not None else None
+        now = time.time()
+        snapshot_age = (now - snapshot.timestamp) if snapshot is not None else None
+        # Judge responsiveness on liveness (the loop's last tick), not on full-snapshot freshness:
+        # a coalesced or briefly-failing snapshot build must not read as "unresponsive". Fall back to
+        # snapshot age for an older worker that never sends liveness frames.
+        liveness_wall_time = self._supervisor.last_liveness_wall_time
+        liveness_age = (now - liveness_wall_time) if liveness_wall_time is not None else snapshot_age
         offline_checks = build_offline_checks(self._config_path) if snapshot is None else None
-        report = derive(snapshot, self._supervisor.status, snapshot_age, offline_checks=offline_checks)
+        report = derive(snapshot, self._supervisor.status, liveness_age, offline_checks=offline_checks)
         try:
             self._update_status_bar(report, snapshot)
             self.query_one(OverviewView).update_view(report, snapshot, frame=self._frame)

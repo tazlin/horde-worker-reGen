@@ -313,6 +313,7 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
     )
 
     while True:
+        channel.note_alive()
         for command in channel.drain_commands():
             if command.command in (SupervisorCommand.PAUSE, SupervisorCommand.DRAIN):
                 paused = True

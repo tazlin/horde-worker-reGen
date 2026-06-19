@@ -28,13 +28,15 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.process_info import HordeProcessInfo
     from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
 
-SUPERVISOR_PROTOCOL_VERSION = 3
+SUPERVISOR_PROTOCOL_VERSION = 4
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
 last-pop no-jobs/skip-reason fields.
 v3 added alchemy config/runtime fields, ``pending_jobs``, ``JobFeatureSummary``, and extended
 ``RecentJobRecord`` with model name and feature data.
+v4 added the lightweight :class:`WorkerLivenessFrame`, emitted on its own cadence so the supervisor
+can judge worker liveness independently of full-snapshot production.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -355,6 +357,21 @@ class DownloadPlanSummary(BaseModel):
     """False when some configured models lack size metadata, so the byte totals are a lower bound."""
 
 
+class WorkerLivenessFrame(BaseModel):
+    """A tiny liveness heartbeat, emitted on its own cadence independent of full-snapshot production.
+
+    The supervisor judges worker responsiveness from :attr:`loop_alive_wall_time` (the wall-clock time
+    the worker's control loop last started a tick) rather than from the age of the last full
+    :class:`WorkerStateSnapshot`. This decouples "is the loop making progress?" from "what is the rich
+    state?": a snapshot that briefly fails to build (or is coalesced away) no longer looks like a stall,
+    while a genuinely wedged loop reports an accurate, growing liveness age.
+    """
+
+    protocol_version: int = SUPERVISOR_PROTOCOL_VERSION
+    loop_alive_wall_time: float = 0.0
+    """Worker wall-clock time (``time.time()``) the control loop last began a tick."""
+
+
 class WorkerStateSnapshot(BaseModel):
     """One frame of worker state pushed from the worker to its supervisor over the pipe.
 
@@ -502,6 +519,9 @@ class SupervisorChannel:
     the control loop never touch the connection concurrently.
     """
 
+    _LIVENESS_INTERVAL = 1.0
+    """How often the sender thread emits a :class:`WorkerLivenessFrame` (seconds)."""
+
     def __init__(self, connection: Connection) -> None:
         """Wrap the worker-side pipe connection and start the snapshot sender thread."""
         self._connection = connection
@@ -510,12 +530,21 @@ class SupervisorChannel:
         self._latest: WorkerStateSnapshot | None = None
         self._pending = threading.Event()
         self._stop = threading.Event()
+        self._loop_alive_wall_time = time.time()
+        """Updated by :meth:`note_alive` from the control loop; read by the sender thread. A single
+        float shared one-writer/one-reader (atomic under the GIL), so no lock is needed; a stale read
+        only means a slightly older liveness timestamp, which is harmless."""
+        self._last_liveness_monotonic = 0.0
         self._sender = threading.Thread(
             target=self._send_loop,
             name="supervisor-snapshot-sender",
             daemon=True,
         )
         self._sender.start()
+
+    def note_alive(self) -> None:
+        """Record that the control loop just advanced (call once per tick). Never blocks."""
+        self._loop_alive_wall_time = time.time()
 
     def send_snapshot(self, snapshot: WorkerStateSnapshot) -> bool:
         """Hand the latest snapshot to the sender thread. Never blocks; returns False once closed."""
@@ -526,22 +555,40 @@ class SupervisorChannel:
         return True
 
     def _send_loop(self) -> None:
-        """Send the freshest snapshot whenever one is pending (may block on a slow consumer; that's fine)."""
+        """Send the freshest snapshot when one is pending and emit liveness frames on their own cadence.
+
+        Either send may block on a slow consumer; that is fine, because this runs on a daemon thread and
+        never touches the worker's control loop.
+        """
         while not self._stop.is_set():
-            if not self._pending.wait(timeout=0.5):
+            got_pending = self._pending.wait(timeout=self._LIVENESS_INTERVAL)
+
+            now = time.monotonic()
+            if now - self._last_liveness_monotonic >= self._LIVENESS_INTERVAL:
+                self._last_liveness_monotonic = now
+                if not self._send_frame(WorkerLivenessFrame(loop_alive_wall_time=self._loop_alive_wall_time)):
+                    return
+
+            if not got_pending:
                 continue
             self._pending.clear()
             snapshot = self._latest
             if snapshot is None:
                 continue
-            with self._lock:
-                if self._closed:
-                    return
-                try:
-                    self._connection.send(snapshot)
-                except Exception:
-                    self._closed = True
-                    return
+            if not self._send_frame(snapshot):
+                return
+
+    def _send_frame(self, frame: WorkerStateSnapshot | WorkerLivenessFrame) -> bool:
+        """Send one frame under the connection lock. Returns False once the channel is closed/dead."""
+        with self._lock:
+            if self._closed:
+                return False
+            try:
+                self._connection.send(frame)
+            except Exception:
+                self._closed = True
+                return False
+        return True
 
     def drain_commands(self) -> list[SupervisorControlMessage]:
         """Return all control messages currently waiting, without blocking (skips if a send is in progress)."""

@@ -10,6 +10,7 @@ import pytest
 from textual.widgets import TabbedContent
 
 from horde_worker_regen.app_state import AppStateStore
+from horde_worker_regen.process_management.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.health import WorkerPhase, derive
@@ -57,6 +58,45 @@ async def test_app_boots_renders_and_cycles_tabs(tmp_path: Path) -> None:
     finally:
         supervisor.stop(timeout=10.0)
     assert not supervisor.is_alive()
+
+
+async def test_tick_judges_responsiveness_on_liveness_not_snapshot_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh liveness frame keeps the worker responsive even when the last full snapshot is old.
+
+    Regression guard for the liveness/snapshot decoupling: ``_tick`` must feed ``derive`` the liveness
+    age (loop progress), not the snapshot age (data freshness), so a coalesced or briefly-failing
+    snapshot build cannot read as UNRESPONSIVE.
+    """
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(worker_name="LivenessApp"), mode=WorkerProcessMode.FAKE)
+    app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
+
+    now = time.time()
+    stale_snapshot = WorkerStateSnapshot(config=WorkerConfigSummary(dreamer_name="L", worker_version="12.0.0"))
+    stale_snapshot.timestamp = now - 100.0  # far past any staleness budget
+    supervisor.latest_snapshot = stale_snapshot
+
+    captured: list[float | None] = []
+
+    def _recording_derive(snapshot: object, status: object, age: float | None, **kwargs: object) -> object:
+        captured.append(age)
+        return derive(snapshot, status, age, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("horde_worker_regen.tui.app.derive", _recording_derive)
+
+    async with app.run_test(size=(120, 40)):
+        # Fresh liveness despite the 100s-old snapshot: the age fed to derive must reflect liveness.
+        supervisor.last_liveness_wall_time = time.time()
+        app._tick()
+        assert captured, "derive was not called"
+        assert captured[-1] is not None and captured[-1] < 5.0
+
+        # With no liveness frame ever seen, it falls back to the (old) snapshot age and reads as stale.
+        supervisor.last_liveness_wall_time = None
+        app._tick()
+        assert captured[-1] is not None and captured[-1] > 90.0
 
 
 async def test_wizard_start_focuses_downloads_tab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

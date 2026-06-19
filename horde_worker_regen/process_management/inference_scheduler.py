@@ -1097,10 +1097,11 @@ class InferenceScheduler:
                 if self._horde_model_map.is_model_loading(process_info.loaded_horde_model_name):
                     continue
 
-                if (
-                    self._horde_model_map.root[process_info.loaded_horde_model_name].horde_model_load_state
-                    == ModelLoadState.IN_USE
-                ):
+                # The map entry can be expired out from under a still-set loaded_horde_model_name (the
+                # stale-loading sweep, or a dead process's entries): a missing entry is not IN_USE, so a
+                # raw [] index here would crash the control loop. Treat absence as "free to reclaim".
+                model_info = self._horde_model_map.root.get(process_info.loaded_horde_model_name)
+                if model_info is not None and model_info.horde_model_load_state == ModelLoadState.IN_USE:
                     continue
 
                 models_still_needed = {

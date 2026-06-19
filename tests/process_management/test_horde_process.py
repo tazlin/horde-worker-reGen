@@ -8,14 +8,20 @@ import time
 from typing import override
 from unittest.mock import Mock
 
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
+
 from horde_worker_regen.process_management.horde_process import HordeProcess
+from horde_worker_regen.process_management.inference_process import HordeInferenceProcess
 from horde_worker_regen.process_management.messages import (
     HordeControlFlag,
     HordeControlMessage,
     HordeHeartbeatType,
+    HordeInferenceControlMessage,
     HordeProcessHeartbeatMessage,
     HordeProcessState,
 )
+
+from .conftest import make_job_pop_response
 
 
 class _StubProcess(HordeProcess):
@@ -144,3 +150,48 @@ def test_control_messages_are_handled_in_order_from_the_inbox() -> None:
         assert proc._end_process is True
     finally:
         proc._control_reader_stop.set()
+
+
+def _make_inference_proc_for_start(active_model: str) -> HordeInferenceProcess:
+    """Build a bare HordeInferenceProcess wired only for the START_INFERENCE handler path.
+
+    A real construction spins up HordeLib/SharedModelManager; the START_INFERENCE branch only
+    touches a handful of methods, so we mock those and pre-set the already-resident model.
+    """
+    proc = object.__new__(HordeInferenceProcess)
+    proc._active_model_name = active_model
+    proc.preload_model = Mock()  # pyrefly: ignore
+    proc.download_aux_models = Mock()  # pyrefly: ignore
+    proc.on_horde_model_state_change = Mock()  # pyrefly: ignore
+    proc.start_inference = Mock(return_value=[object()])  # pyrefly: ignore
+    proc.send_inference_result_message = Mock()  # pyrefly: ignore
+    return proc
+
+
+def test_start_inference_for_resident_model_still_downloads_aux_models() -> None:
+    """A job reusing an already-loaded model must still fetch its LoRAs before inference.
+
+    When the base model is already resident the scheduler dispatches inference without a fresh preload,
+    so the only heartbeat-protected aux download (inside ``preload_model``) is skipped. The job's
+    LoRAs then download lazily inside ``basic_inference`` while the slot reads INFERENCE_STARTING,
+    which the parent's ``inference_step_timeout`` watchdog mistakes for a hang and kills. The handler must run the
+    aux download itself in that case.
+    """
+    model = "CyberRealistic Pony"
+    proc = _make_inference_proc_for_start(model)
+
+    job = make_job_pop_response(
+        model=model,
+        loras=[LorasPayloadEntry(name="2498503", model=0.9, clip=1.0, is_version=True)],
+    )
+    message = HordeInferenceControlMessage(
+        control_flag=HordeControlFlag.START_INFERENCE,
+        horde_model_name=model,
+        sdk_api_job_info=job,
+    )
+
+    proc._receive_and_handle_control_message(message)
+
+    proc.preload_model.assert_not_called()  # pyrefly: ignore
+    proc.download_aux_models.assert_called_once_with(job)  # pyrefly: ignore
+    proc.start_inference.assert_called_once()  # pyrefly: ignore

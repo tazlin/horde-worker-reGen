@@ -382,6 +382,36 @@ class TestUnloadModels:
         inference_scheduler = _make_inference_scheduler(job_tracker=job_tracker)
         assert inference_scheduler.unload_models() is False
 
+    async def test_unload_models_survives_stale_loaded_model_absent_from_map(self) -> None:
+        """A slot referencing a model the map no longer tracks must not crash the control loop.
+
+        The model map can expire an entry (the stale-loading sweep in ``_expire_stale_model_map_entries``,
+        or ``expire_entries_for_process`` when a process dies) while the owning ``process_info`` still
+        reports it as ``loaded_horde_model_name``. ``unload_models`` indexed the map with a raw ``[]`` and
+        raised ``KeyError``, which propagated out of ``_control_loop_tick`` and abended the main process
+        (observed mid aux-model/LoRA download). It must tolerate the divergence instead.
+        """
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("other_model"))
+
+        # Idle slot still claims a model that is NOT in the (empty) model map: the divergence.
+        process_info = make_mock_process_info(
+            0,
+            model_name="NeverEnding Dream",
+            state=HordeProcessState.WAITING_FOR_JOB,
+        )
+        process_map = ProcessMap({0: process_info})
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=HordeModelMap(root={}),
+            job_tracker=job_tracker,
+        )
+
+        # Must not raise KeyError; the stale idle slot is reclaimable (under_pressure bypasses the
+        # residency grace so the outcome is deterministic).
+        assert scheduler.unload_models(under_pressure=True) is True
+
     async def test_get_next_n_models_returns_correct(self) -> None:
         """get_next_n_models should return a list of unique model names for the next n pending inference jobs."""
         job_tracker = JobTracker()

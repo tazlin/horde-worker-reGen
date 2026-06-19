@@ -45,6 +45,17 @@ class TestControlLoopTick:
 
         assert await process_manager._control_loop_tick() is True
 
+    async def test_tick_marks_the_supervisor_alive(self) -> None:
+        """Each tick stamps liveness so the TUI judges responsiveness on loop progress, not snapshots."""
+        process_manager = _make_tickable_manager()
+        supervisor = Mock()
+        supervisor.drain_commands.return_value = []
+        supervisor.send_snapshot.return_value = True
+        process_manager._supervisor = supervisor  # type: ignore[assignment]
+
+        assert await process_manager._control_loop_tick() is True
+        supervisor.note_alive.assert_called()
+
     async def test_tick_requests_shutdown_when_ready(self) -> None:
         """When shutting down with no jobs and no processes, the tick should ask to stop."""
         process_manager = _make_tickable_manager()
