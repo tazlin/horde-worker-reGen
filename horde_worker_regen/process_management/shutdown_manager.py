@@ -142,7 +142,7 @@ class ShutdownManager:
                     # Shutting down: drain to a terminal fault so the horde reissues promptly; do not requeue.
                     self._job_tracker.handle_job_fault_now(job, retryable=False)
                 except Exception as fault_error:
-                    logger.error(f"Failed to fault outstanding job {getattr(job, 'id_', '?')}: {fault_error}")
+                    logger.error(f"Failed to fault outstanding job {job.id_ or '?'}: {fault_error}")
 
             report_deadline = time.monotonic() + _FAULT_REPORT_GRACE_SECONDS
             while time.monotonic() < report_deadline:

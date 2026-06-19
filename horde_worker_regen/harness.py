@@ -30,7 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
-from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
 from horde_model_reference.model_reference_manager import ModelReferenceManager
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api import GENERATION_STATE
@@ -325,11 +325,31 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
 
 def build_harness_model_reference(
     scenario: list[ImageGenerateJobPopResponse],
+    reference_manager: ModelReferenceManager | None = None,
 ) -> dict[str, ImageGenerationModelRecord]:
-    """Build a minimal but real model reference covering every model in the scenario."""
+    """Build a model reference covering every model in the scenario.
+
+    When a real reference manager is supplied, each scenario model resolves to its actual record
+    (and therefore its real baseline, e.g. flux_1 for Flux rather than a blanket stable_diffusion_1).
+    This matters for real-process benchmarks: the worker derives every VRAM/RAM burden estimate from
+    the baseline, so a stubbed stable_diffusion_1 would make a heavy model (Flux) look like a small
+    SD1.5 checkpoint and silently mask the very residency dynamics a real run is meant to exercise.
+    Models genuinely absent from the real reference (synthetic test-only names) fall back to a minimal
+    stable_diffusion_1 record so fake-process scenarios keep working without a populated reference.
+    """
+    real_reference: dict[str, ImageGenerationModelRecord] = {}
+    if reference_manager is not None:
+        resolved = reference_manager.get_model_reference(MODEL_REFERENCE_CATEGORY.image_generation)
+        if isinstance(resolved, dict):
+            real_reference = resolved
+
     reference: dict[str, ImageGenerationModelRecord] = {}
     for job in scenario:
         if job.model is None or job.model in reference:
+            continue
+        real_record = real_reference.get(job.model)
+        if real_record is not None:
+            reference[job.model] = real_record
             continue
         reference[job.model] = ImageGenerationModelRecord(
             name=job.model,
@@ -433,7 +453,7 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
         horde_model_reference_manager=config.horde_model_reference_manager,
         system_resources=system_resources,
         skip_api_init=True,
-        stable_diffusion_reference=build_harness_model_reference(scenario),
+        stable_diffusion_reference=build_harness_model_reference(scenario, config.horde_model_reference_manager),
         process_entry_points=entry_points,
         canned_job_source=canned_job_source,
         canned_alchemy_source=canned_alchemy_source,
@@ -821,17 +841,35 @@ def _all_inference_processes_dead(manager: HordeWorkerProcessManager) -> bool:
     return all(not info.mp_process.is_alive() for info in inference)
 
 
-def _warm_model_reference(model_names: list[str]) -> dict[str, ImageGenerationModelRecord]:
-    """Build a minimal model reference covering every model the warm session may run."""
-    return {
-        name: ImageGenerationModelRecord(
+def _warm_model_reference(
+    model_names: list[str],
+    reference_manager: ModelReferenceManager | None = None,
+) -> dict[str, ImageGenerationModelRecord]:
+    """Build a model reference covering every model the warm session may run.
+
+    As with build_harness_model_reference, a supplied reference manager resolves real records (and
+    real baselines) so a real warm benchmark exercises production VRAM/RAM dynamics; absent models
+    fall back to a minimal stable_diffusion_1 record.
+    """
+    real_reference: dict[str, ImageGenerationModelRecord] = {}
+    if reference_manager is not None:
+        resolved = reference_manager.get_model_reference(MODEL_REFERENCE_CATEGORY.image_generation)
+        if isinstance(resolved, dict):
+            real_reference = resolved
+
+    reference: dict[str, ImageGenerationModelRecord] = {}
+    for name in model_names:
+        real_record = real_reference.get(name)
+        if real_record is not None:
+            reference[name] = real_record
+            continue
+        reference[name] = ImageGenerationModelRecord(
             name=name,
             baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
             nsfw=False,
             description="warm benchmark session model record",
         )
-        for name in model_names
-    }
+    return reference
 
 
 def _build_warm_bridge_data(
@@ -937,7 +975,7 @@ class WarmHarnessSession:
         system_resources = _build_harness_system_resources() if self._process_mode != "real" else None
         # Inject a minimal reference covering every level's models in all modes (mirrors
         # build_harness_process_manager); the real model load on disk uses hordelib's own reference.
-        reference = _warm_model_reference(self._model_names)
+        reference = _warm_model_reference(self._model_names, self._horde_model_reference_manager)
         return HordeWorkerProcessManager(
             ctx=multiprocessing.get_context("spawn"),
             bridge_data=_build_warm_bridge_data(

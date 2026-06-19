@@ -7,6 +7,7 @@ from rich.console import Console
 from horde_worker_regen.process_management.supervisor_channel import (
     JobQueueEntry,
     ProcessSnapshot,
+    WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -160,3 +161,98 @@ def test_compact_bar_handles_missing_snapshot() -> None:
     report = derive(None, SupervisorStatus.STOPPED, None)
     text = _render(OverviewView()._render_compact_bar(report, None, frame=0))
     assert report.phase.value.upper() in text
+
+
+def _active_residency(**overrides: object) -> WholeCardResidencyStatus:
+    """An active whole-card residency for Flux on a 16GB card (2 siblings paused, safety off-GPU)."""
+    base: dict[str, object] = {
+        "possible": True,
+        "enabled": True,
+        "safety_off_gpu_enabled": True,
+        "cooldown_seconds": 45,
+        "per_process_overhead_mb": 1288,
+        "total_vram_mb": 16375,
+        "active": True,
+        "model": "Flux.1-dev",
+        "phase": "establishing",
+        "safety_paused": True,
+        "processes_now": 1,
+        "processes_target": 1,
+        "processes_max": 3,
+        "cooldown_remaining_seconds": 40.0,
+        "weights_mb": 11500,
+        "reserve_mb": 3700,
+        "free_now_mb": 57,
+        "free_if_alone_mb": 15087,
+        "max_resident_processes": 1,
+    }
+    base.update(overrides)
+    return WholeCardResidencyStatus(**base)  # type: ignore[arg-type]
+
+
+def _flux_holder_process() -> ProcessSnapshot:
+    """The single inference process holding the whole-card Flux model."""
+    return ProcessSnapshot(
+        process_id=0,
+        process_type="INFERENCE",
+        last_process_state="INFERENCE_STARTING",
+        is_alive=True,
+        is_busy=True,
+        loaded_horde_model_name="Flux.1-dev",
+        vram_usage_mb=14000,
+        total_vram_mb=16375,
+    )
+
+
+def test_hero_shows_whole_card_residency_banner_when_active() -> None:
+    """An active residency adds a hero line naming the model, the reduced processes, and why."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_flux_holder_process()],
+        worker_registered=True,
+        whole_card_residency=_active_residency(),
+    )
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    hero = _render(OverviewView()._render_hero(report, snapshot, frame=0))
+
+    assert "whole-card residency" in hero
+    assert "Flux.1-dev" in hero
+    assert "sole use of the GPU" in hero
+    assert "safety off-GPU" in hero
+
+
+def test_process_table_marks_holder_and_explains_paused_siblings() -> None:
+    """The Processes table tags the holder row and captions why the sibling rows are gone."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_flux_holder_process()],
+        whole_card_residency=_active_residency(),
+    )
+
+    text = _render(OverviewView()._render_process_table(snapshot))
+
+    assert "★" in text
+    assert "Whole-card residency" in text
+    assert "2 idle inference processes paused" in text
+    assert "safety off-GPU" in text
+
+
+def test_residency_panel_shows_forecast_numbers_when_active() -> None:
+    """The details-only residency panel surfaces the hard forecast numbers behind the decision."""
+    text = _render(OverviewView._render_residency_panel(_active_residency()))
+
+    assert "Whole-card residency" in text
+    assert "Weights" in text
+    assert "establishing" in text
+    assert "Restores in" in text
+
+
+def test_residency_panel_armed_when_only_possible() -> None:
+    """When the feature can engage but is not active, the panel shows the armed posture, not live rows."""
+    text = _render(
+        OverviewView._render_residency_panel(_active_residency(active=False, possible=True, model=None)),
+    )
+
+    assert "armed" in text
+    assert "Weights" not in text

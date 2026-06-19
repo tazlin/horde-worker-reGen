@@ -148,6 +148,12 @@ class TrackedJob:
     resource failure even though the dead slot leaves no message to classify. Carrying the signal on the
     job lets the fault path route it to the bounded degraded/isolated retry instead of a plain
     re-dispatch onto another equally-over-committed slot, which would only kill a second process."""
+    admitted_exclusive: bool = False
+    """Set with ``admitted_over_budget`` when ``overbudget_exclusive_mode`` is on: this heavy job must run
+    with the device to itself. While such a job is pending or in progress the scheduler suppresses
+    concurrent pre-staging/dispatch of other models so a second resident model cannot push free VRAM to ~0
+    and spill this job's weights to system RAM (the live storm's mechanism). It also earns a per-step hang
+    grace (``overbudget_step_timeout``) so its legitimately slow steps are not killed as a hang."""
 
 
 @dataclass(frozen=True)
@@ -194,6 +200,14 @@ class JobTracker:
         self._sequence_counter = 0
         self._finalize_observer: Callable[[TrackedJob, HordeJobInfo], None] | None = None
 
+        # Circuit-breaker / self-throttle bookkeeping (raw counts + timestamps; the scheduler and process
+        # manager apply the configured thresholds). A model the device genuinely cannot run faults every
+        # attempt no matter how it is isolated; tracked here so the worker can stop popping/admitting it
+        # before the horde server forces maintenance for "dropping too many jobs".
+        self._model_overbudget_fault_counts: dict[str, int] = {}
+        self._model_last_overbudget_fault_time: dict[str, float] = {}
+        self._recent_resource_fault_times: list[float] = []
+
         # Defaults to one attempt (no retry: the pre-resiliency behaviour) so a directly-constructed
         # tracker faults terminally; the worker opts into bounded retry via set_retry_policy().
         self._max_inference_attempts = 1
@@ -201,6 +215,50 @@ class JobTracker:
     def set_retry_policy(self, max_inference_attempts: int) -> None:
         """Set how many inference attempts a job may have before it is reported faulted (clamped to >= 1)."""
         self._max_inference_attempts = max(1, max_inference_attempts)
+
+    # region circuit-breaker / self-throttle accounting
+
+    _RESOURCE_FAULT_RETENTION_SECONDS = 3600.0
+    """How long resource-fault timestamps are retained for the self-throttle window query."""
+
+    def _record_resource_fault(self, model: str | None) -> None:
+        """Record a terminal resource/OOM fault (per-model streak + global timestamp for self-throttle)."""
+        now = time.time()
+        self._recent_resource_fault_times.append(now)
+        cutoff = now - self._RESOURCE_FAULT_RETENTION_SECONDS
+        self._recent_resource_fault_times = [t for t in self._recent_resource_fault_times if t >= cutoff]
+        if model is None:
+            return
+        self._model_overbudget_fault_counts[model] = self._model_overbudget_fault_counts.get(model, 0) + 1
+        self._model_last_overbudget_fault_time[model] = now
+
+    def record_model_inference_success(self, model: str | None) -> None:
+        """Clear a model's over-budget fault streak after it successfully produces an inference result."""
+        if model is None:
+            return
+        if self._model_overbudget_fault_counts.pop(model, None) is not None:
+            logger.debug(f"Model {model} produced a result; clearing its over-budget fault streak.")
+        self._model_last_overbudget_fault_time.pop(model, None)
+
+    def get_model_overbudget_fault_count(self, model: str | None) -> int:
+        """Return the consecutive terminal over-budget fault count for ``model`` (0 if none)."""
+        if model is None:
+            return 0
+        return self._model_overbudget_fault_counts.get(model, 0)
+
+    def model_last_overbudget_fault_time(self, model: str | None) -> float | None:
+        """Return the wall-clock time of ``model``'s last terminal over-budget fault, or None."""
+        if model is None:
+            return None
+        return self._model_last_overbudget_fault_time.get(model)
+
+    def count_recent_resource_faults(self, window_seconds: float, now: float | None = None) -> int:
+        """Return how many terminal resource/OOM faults occurred within the last ``window_seconds``."""
+        current = time.time() if now is None else now
+        cutoff = current - window_seconds
+        return sum(1 for t in self._recent_resource_fault_times if t >= cutoff)
+
+    # endregion
 
     def set_finalize_observer(self, observer: Callable[[TrackedJob, HordeJobInfo], None]) -> None:
         """Register a callback invoked with each job's final tracked state at finalize time.
@@ -541,6 +599,9 @@ class JobTracker:
             )
             return
         tracked.job_info = job_info
+        # Inference produced a result: this model can run here, so clear any over-budget fault streak that
+        # may have flagged it locally unservable.
+        self.record_model_inference_success(job_info.sdk_api_job_info.model)
 
     async def queue_for_submit(self, job_info: HordeJobInfo) -> None:
         """Queue a job for submission."""
@@ -717,6 +778,34 @@ class JobTracker:
         if tracked is not None:
             tracked.admitted_over_budget = True
 
+    def mark_admitted_exclusive(self, job: ImageGenerateJobPopResponse) -> None:
+        """Record that this over-budget job must run with the device to itself.
+
+        See :attr:`TrackedJob.admitted_exclusive` for what exclusivity suppresses.
+        """
+        tracked = self._tracked_for(job)
+        if tracked is not None:
+            tracked.admitted_exclusive = True
+
+    def is_admitted_exclusive(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether this job was admitted to run exclusively (over-budget, device to itself)."""
+        tracked = self._tracked_for(job)
+        return tracked is not None and tracked.admitted_exclusive
+
+    def has_exclusive_job_in_progress(self) -> bool:
+        """Whether an exclusively-admitted over-budget job is pending or in progress.
+
+        While true, the scheduler must not stage or dispatch another model: the exclusive job needs the
+        whole device. Covers ``PENDING_INFERENCE`` and ``INFERENCE_IN_PROGRESS`` (so suppression spans
+        from admit through completion, including degraded retries); a terminal fault or success moves the
+        job out of those stages, naturally clearing the flag's effect.
+        """
+        return any(
+            tracked.admitted_exclusive
+            and tracked.stage in (JobStage.PENDING_INFERENCE, JobStage.INFERENCE_IN_PROGRESS)
+            for tracked in self._jobs.values()
+        )
+
     async def handle_job_fault(
         self,
         faulted_job: ImageGenerateJobPopResponse,
@@ -812,6 +901,13 @@ class JobTracker:
         tracked.job_info.fault_job()
         tracked.job_info.time_to_generate = process_timeout
         self._record_fault_diagnostics(tracked, is_resource_failure=resource_failure)
+
+        # A terminal resource fault feeds the circuit-breaker (per-model "locally unservable" streak) and
+        # the self-throttle backstop. A model the device cannot run faults every attempt no matter how it
+        # is isolated, so without this the worker keeps popping and dropping it until the horde server
+        # forces maintenance; the scheduler/manager read these counters to stop the bleeding first.
+        if resource_failure:
+            self._record_resource_fault(faulted_job.model)
 
         if self._set_stage(tracked, JobStage.PENDING_SUBMIT):
             # A crash/timeout-faulted job never produces an inference RESULT message, so the

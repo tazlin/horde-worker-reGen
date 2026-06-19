@@ -11,8 +11,12 @@ from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
+from typing import TYPE_CHECKING
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
 from horde_worker_regen.consts import VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
@@ -184,6 +188,15 @@ class ProcessLifecycleManager:
         self._num_slowdown_events = 0
         self._safety_processes_should_be_replaced = False
         self._safety_processes_ending = False
+        # Runtime override forcing the safety process off-GPU (cpu_only) even when safety_on_gpu is configured.
+        # Set while a whole-card (single-residency) job claims the device, so the safety process's CUDA
+        # context (only reclaimable by the process exiting) is freed for the heavy model. Restored after.
+        self._safety_gpu_paused = False
+        # Marks the *next* safety-pool rebuild as an intentional whole-card pause/restore cycle, so its
+        # completion is not counted as a crash recovery and does not feed the safety crash-loop breaker.
+        # Without this, repeated whole-card jobs cycling safety off/on read as a safety crash loop and trip
+        # save-our-ship. Mirrors the intentional_reclaim path for inference RAM reclaim.
+        self._safety_replacement_intentional = False
         self._recently_recovered = False
         self._hung_processes_detected = False
         self._hung_processes_detected_time = 0.0
@@ -341,7 +354,9 @@ class ProcessLifecycleManager:
             pid = self._process_map.num_safety_processes()
             pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
 
-            cpu_only = not bridge_data.safety_on_gpu
+            # The runtime pause overrides the configured placement: while a whole-card job holds the device,
+            # the safety process must come up off-GPU so it does not re-take a CUDA context.
+            cpu_only = (not bridge_data.safety_on_gpu) or self._safety_gpu_paused
 
             process = self._new_process(
                 target=self._entry_points.safety_entry_point,
@@ -594,7 +609,7 @@ class ProcessLifecycleManager:
                     logger.debug("Scale down: no idle inference process available to stop right now")
                     break
                 self._end_inference_process(victim)
-                self._process_map.pop(victim.process_id, None)
+                self._process_map.retire_process(victim, "inference scale-down")
                 logger.info(f"Scaled down: stopped inference process {victim.process_id}")
 
         return self._process_map.num_loaded_inference_processes()
@@ -648,7 +663,9 @@ class ProcessLifecycleManager:
                 logger.debug(f"Process {process_info.process_id} control channel vanished")
         try:
             process_info.mp_process.join(timeout=1)
-            process_info.mp_process.kill()
+            if process_info.mp_process.is_alive():
+                process_info.mp_process.kill()
+                process_info.mp_process.join(timeout=1)
         except Exception as e:
             logger.error(f"Failed to kill process {process_info.process_id}: {e}")
 
@@ -679,6 +696,47 @@ class ProcessLifecycleManager:
         self._forget_owned(process_info)
 
         logger.info(f"Ended safety process {process_info.process_id}")
+
+    @property
+    def is_safety_gpu_paused(self) -> bool:
+        """Whether the safety process is being forced off-GPU for a whole-card job."""
+        return self._safety_gpu_paused
+
+    def pause_safety_on_gpu(self) -> bool:
+        """Move the safety process off-GPU (cpu_only) so its CUDA context frees for a whole-card model.
+
+        A no-op (returns False) when safety is not configured on-GPU or is already paused. Otherwise sets
+        the override and triggers the existing safety-replacement state machine, which ends the on-GPU
+        safety process and brings a cpu_only one up over the next few control-loop ticks. Reusing that
+        machinery (rather than ad-hoc end/spawn) keeps the churn on the tested recovery path.
+
+        Returns:
+            True if a pause was initiated, False if it was already paused or not applicable.
+        """
+        if not self._runtime_config.bridge_data.safety_on_gpu or self._safety_gpu_paused:
+            return False
+        self._safety_gpu_paused = True
+        self._safety_replacement_intentional = True
+        self._initiate_safety_replacement()
+        logger.info("Whole-card residency: moving the safety process off-GPU to free its VRAM context.")
+        return True
+
+    def restore_safety_on_gpu(self) -> bool:
+        """Bring the safety process back on-GPU after a whole-card job has released the device.
+
+        A no-op (returns False) when not currently paused. Clears the override and triggers a replacement so
+        the safety process comes back up on its configured (GPU) placement.
+
+        Returns:
+            True if a restore was initiated, False if it was not paused.
+        """
+        if not self._safety_gpu_paused:
+            return False
+        self._safety_gpu_paused = False
+        self._safety_replacement_intentional = True
+        self._initiate_safety_replacement()
+        logger.info("Whole-card residency complete: restoring the safety process to the GPU.")
+        return True
 
     def _initiate_safety_replacement(self) -> None:
         """Flag the safety pool for replacement so the control loop's state machine restarts it.
@@ -754,8 +812,14 @@ class ProcessLifecycleManager:
             self.start_safety_processes()
             self._safety_processes_ending = False
             self._safety_processes_should_be_replaced = False
-            self._num_process_recoveries += 1
-            self._record_safety_recovery()
+            if self._safety_replacement_intentional:
+                # A deliberate whole-card pause/restore cycle, not a crash: keep it out of the recovery
+                # count and the crash-loop breaker so a burst of whole-card jobs is not mistaken for a
+                # safety crash loop (which would trip save-our-ship).
+                self._safety_replacement_intentional = False
+            else:
+                self._num_process_recoveries += 1
+                self._record_safety_recovery()
 
     def _record_safety_recovery(self) -> None:
         """Record that the safety pool was just rebuilt, pruning the history to the crash-loop window."""
@@ -870,7 +934,7 @@ class ProcessLifecycleManager:
         """
         self._quarantined_inference_slots.add(process_info.process_id)
         self._num_slots_quarantined += 1
-        self._process_map.pop(process_info.process_id, None)
+        self._process_map.retire_process(process_info, f"inference slot quarantined: {reason}")
         self._action_ledger.record(
             LedgerEventType.PROCESS_QUARANTINED,
             process_id=process_info.process_id,
@@ -1054,12 +1118,8 @@ class ProcessLifecycleManager:
         """Get the processes that have the model for any queued job."""
         processes_with_model_for_queued_job: list[int] = []
 
-        queued_models = {
-            job.model for job in self._job_tracker.jobs_pending_inference if getattr(job, "model", None) is not None
-        }
-        in_progress_models = {
-            job.model for job in self._job_tracker.jobs_in_progress if getattr(job, "model", None) is not None
-        }
+        queued_models = {job.model for job in self._job_tracker.jobs_pending_inference if job.model is not None}
+        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress if job.model is not None}
 
         for p in self._process_map.values():
             if (
@@ -1175,9 +1235,13 @@ class ProcessLifecycleManager:
             )
             if level >= 2:
                 self._num_slowdown_events += 1
+                # Include the residency snapshot: a slowdown this severe on a small-VRAM card is usually
+                # the over-commit thrash (weights spilling to system RAM), so capturing which models were
+                # resident and the device-wide free VRAM at this moment is the key live diagnostic.
                 logger.warning(
                     f"Inference on process {process_info.process_id} is {ratio:.1f}x its expected sampling time "
-                    f"({elapsed:.0f}s vs ~{expected:.0f}s); watching for a hang.",
+                    f"({elapsed:.0f}s vs ~{expected:.0f}s); watching for a hang. "
+                    f"{self._process_map.residency_snapshot()}",
                 )
                 self._action_ledger.record(
                     LedgerEventType.SLOWDOWN_DETECTED,
@@ -1193,6 +1257,26 @@ class ProcessLifecycleManager:
                     f"Inference on process {process_info.process_id} is running slower than expected "
                     f"({ratio:.1f}x ~{expected:.0f}s); not yet a concern.",
                 )
+
+    def _effective_inference_step_timeout(self, bridge_data: reGenBridgeData, process_info: HordeProcessInfo) -> int:
+        """Per-step hang timeout for a slot, widened for an over-budget job admitted to run slowly.
+
+        A job admitted *against* the VRAM budget (a best-effort head-of-queue admit, possibly exclusive)
+        can stream weights through VRAM each sampling step, so its steps are legitimately far slower than a
+        normal step; killing such a slow-but-progressing job and dropping it is what produced the live drop
+        storm. When the slot's current job was admitted over budget, use ``overbudget_step_timeout`` (floored
+        at ``inference_step_timeout``) so it is given time to finish instead of being mistaken for a hang.
+        """
+        base = bridge_data.inference_step_timeout
+        job = process_info.last_job_referenced
+        if job is None:
+            return base
+        if not (self._job_tracker.is_admitted_over_budget(job) or self._job_tracker.is_admitted_exclusive(job)):
+            return base
+        overbudget = bridge_data.overbudget_step_timeout
+        if not isinstance(overbudget, int) or isinstance(overbudget, bool):
+            return base
+        return max(base, overbudget)
 
     def replace_hung_processes(self) -> bool:
         """Replaces processes that haven't checked in since `process_timeout` seconds in bridgeData."""
@@ -1249,7 +1333,7 @@ class ProcessLifecycleManager:
         for process_info in list(self._process_map.values()):
             if self._process_map.is_stuck_on_inference(
                 process_info.process_id,
-                bridge_data.inference_step_timeout,
+                self._effective_inference_step_timeout(bridge_data, process_info),
                 first_step_timeout,
             ):
                 logger.error(f"{process_info} seems to be stuck mid inference, replacing it")

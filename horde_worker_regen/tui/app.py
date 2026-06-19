@@ -94,6 +94,7 @@ class HordeWorkerTUI(App[None]):
         ("f7", "toggle_download_pause", "Pause downloads"),
         ("f8", "show_benchmark", "Benchmark"),
         ("f9", "restart_worker", "Restart worker"),
+        ("m", "toggle_server_maintenance", "Maintenance (horde)"),
         ("ctrl+q", "quit", "Quit"),
         ("ctrl+c", "quit", "Quit"),
     ]
@@ -414,7 +415,13 @@ class HordeWorkerTUI(App[None]):
         self._tick()
 
     def action_toggle_pause(self) -> None:
-        """Pause or resume the worker depending on its current state."""
+        """Pause or resume the worker (a *local* pop-pause) depending on its current state.
+
+        This is the local pause: in-flight jobs finish, no new ones are popped. It does not by itself
+        change the worker's server-side maintenance on the horde; the worker clears that on resume only
+        when its ``remove_maintenance_on_init`` config is set. Use the Maintenance (horde) key for an
+        explicit server-side toggle.
+        """
         snapshot = self._supervisor.latest_snapshot
         if snapshot is not None and snapshot.maintenance_mode:
             self._supervisor.request_resume()
@@ -422,6 +429,24 @@ class HordeWorkerTUI(App[None]):
         else:
             self._supervisor.request_pause()
             self.notify("Pause requested (in-flight jobs will finish).")
+
+    def action_toggle_server_maintenance(self) -> None:
+        """Toggle the worker's server-side (horde) maintenance flag via the horde API.
+
+        Distinct from F2 (local pause): this asks the horde itself to stop (or resume) sending the worker
+        jobs, matching the maintenance the job-pop response reports. The current state is taken from the
+        polled worker-details flag.
+        """
+        snapshot = self._supervisor.latest_snapshot
+        currently_in_maintenance = snapshot is not None and snapshot.worker_details_maintenance
+        enable = not currently_in_maintenance
+        sent = self._supervisor.request_set_server_maintenance(enable)
+        if not sent:
+            self.notify("Worker not running; maintenance change not sent.")
+        elif enable:
+            self.notify("Requested horde maintenance ON (worker stops receiving jobs).")
+        else:
+            self.notify("Requested horde maintenance OFF (worker receives jobs again).")
 
     def action_start_stop_worker(self) -> None:
         """Start the worker if stopped, or gracefully stop it (without quitting) if running."""

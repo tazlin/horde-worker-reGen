@@ -506,6 +506,7 @@ class HordeInferenceProcess(HordeProcess):
     _current_job_inference_steps_complete: bool = False
     _vae_lock_was_acquired: bool = False
     _inference_slot_released: bool = False
+    _post_processing_memory_report_sent: bool = False
 
     _last_job_inference_rate: str | None = None
     _last_inference_error: str | None = None
@@ -513,6 +514,11 @@ class HordeInferenceProcess(HordeProcess):
 
     Surfaced as the faulted result's ``info`` so the main process can both log a real reason (previously
     a faulted result carried only the empty rate string) and classify a resource/OOM failure for retry."""
+
+    def _send_inference_memory_report(self) -> None:
+        """Send an inference-path VRAM report and reset the periodic report throttle."""
+        self._last_periodic_memory_report_time = time.time()
+        self.send_memory_report_message(include_vram=True)
 
     def _release_inference_slot(self) -> None:
         """Release this job's sampling-concurrency slot, at most once per job.
@@ -555,6 +561,9 @@ class HordeInferenceProcess(HordeProcess):
             )
             self._in_post_processing = True
             self._release_inference_slot()
+            if not self._post_processing_memory_report_sent:
+                self._post_processing_memory_report_sent = True
+                self._send_inference_memory_report()
 
         if self._current_job_inference_steps_complete:
             if not self._vae_lock_was_acquired:
@@ -565,8 +574,10 @@ class HordeInferenceProcess(HordeProcess):
                 self._vae_decode_semaphore.acquire()
                 log_free_ram()
                 logger.debug("Acquired VAE decode semaphore")
+                self._send_inference_memory_report()
 
             self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+            self._maybe_send_periodic_memory_report()
             return
 
         if progress_report.comfyui_progress is not None and progress_report.comfyui_progress.current_step == (
@@ -574,6 +585,7 @@ class HordeInferenceProcess(HordeProcess):
         ):
             self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
             self._current_job_inference_steps_complete = True
+            self._send_inference_memory_report()
             logger.debug("Current job inference steps complete")
         elif progress_report.comfyui_progress is not None and progress_report.comfyui_progress.current_step > 0:
             warning = None
@@ -612,6 +624,8 @@ class HordeInferenceProcess(HordeProcess):
             )
         else:
             self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+
+        self._maybe_send_periodic_memory_report()
 
     def _send_job_metrics_message(self, job_id: str, *, is_alchemy: bool = False) -> None:
         """Snapshot hordelib's per-job metrics and forward them to the main process.
@@ -696,6 +710,7 @@ class HordeInferenceProcess(HordeProcess):
         self._current_job_inference_steps_complete = False
         self._inference_slot_released = False
         self._vae_lock_was_acquired = False
+        self._post_processing_memory_report_sent = False
         self._last_job_inference_rate = None
         self._last_inference_error = None
 

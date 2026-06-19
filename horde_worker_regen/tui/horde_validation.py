@@ -61,8 +61,8 @@ def verify_api_key(api_key: str) -> AdvisoryResult:
     except Exception:  # noqa: BLE001 - any failure means "could not check", not "invalid"
         return AdvisoryResult(AdvisoryStatus.UNKNOWN)
     if isinstance(response, RequestErrorResponse):
-        return AdvisoryResult(AdvisoryStatus.PROBLEM, str(getattr(response, "message", "") or "rejected"))
-    username = str(getattr(response, "username", "") or "")
+        return AdvisoryResult(AdvisoryStatus.PROBLEM, response.message)
+    username = str(response.username or "")
     return AdvisoryResult(AdvisoryStatus.OK, username)
 
 

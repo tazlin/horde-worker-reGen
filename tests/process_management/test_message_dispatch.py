@@ -13,6 +13,7 @@ from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.messages import (
+    HordeHeartbeatType,
     HordeInferenceResultMessage,
     HordeProcessHeartbeatMessage,
     HordeProcessMemoryMessage,
@@ -75,6 +76,12 @@ def _enqueue(message_dispatcher: MessageDispatcher, message: object) -> None:
     """Helper to enqueue a single message into the dispatcher's mock queue."""
     message_dispatcher._process_message_queue.empty.side_effect = [False, True]
     message_dispatcher._process_message_queue.get.return_value = message
+
+
+def _enqueue_many(message_dispatcher: MessageDispatcher, messages: list[object]) -> None:
+    """Helper to enqueue multiple messages into the dispatcher's mock queue."""
+    message_dispatcher._process_message_queue.empty.side_effect = [False] * len(messages) + [True]
+    message_dispatcher._process_message_queue.get.side_effect = messages
 
 
 class TestReceiveAndHandleProcessMessages:
@@ -190,19 +197,131 @@ class TestReceiveAndHandleProcessMessages:
         _enqueue(message_dispatcher, msg)
         await message_dispatcher.receive_and_handle_process_messages()
 
-    async def test_unknown_process_id_raises(self) -> None:
-        """If a message is received for an unknown process ID, a ValueError should be raised."""
+    async def test_unknown_process_id_is_dropped_not_fatal(self) -> None:
+        """A message from a process the map no longer knows must be dropped, never crash the worker.
+
+        This is the regression for the whole-card teardown total-death: scale_inference_processes
+        pops a stopped slot from the map, but its already-queued terminal messages (PROCESS_ENDING,
+        a final memory report) still arrive. When the retired-launch tombstone does not cover them
+        (older launch id, or pruned by TTL), the dispatcher used to raise ValueError, which killed the
+        control loop and took the whole worker down over a stale status update.
+        """
         message_dispatcher = _make_dispatcher()
 
         msg = Mock(spec=HordeProcessStateChangeMessage)
         msg.process_id = 99
         msg.process_launch_identifier = 0
-        msg.process_state = HordeProcessState.WAITING_FOR_JOB
+        msg.process_state = HordeProcessState.PROCESS_ENDING
         msg.info = "state change"
 
         _enqueue(message_dispatcher, msg)
-        with pytest.raises(ValueError, match="unknown process"):
-            await message_dispatcher.receive_and_handle_process_messages()
+        # Must not raise; the message is simply dropped.
+        await message_dispatcher.receive_and_handle_process_messages()
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            HordeProcessStateChangeMessage(
+                process_id=1,
+                process_launch_identifier=7,
+                process_state=HordeProcessState.PROCESS_ENDING,
+                info="ending",
+            ),
+            HordeProcessStateChangeMessage(
+                process_id=1,
+                process_launch_identifier=7,
+                process_state=HordeProcessState.PROCESS_ENDED,
+                info="ended",
+            ),
+            HordeProcessHeartbeatMessage(
+                process_id=1,
+                process_launch_identifier=7,
+                heartbeat_type=HordeHeartbeatType.OTHER,
+                info="heartbeat",
+            ),
+            HordeProcessMemoryMessage(
+                process_id=1,
+                process_launch_identifier=7,
+                ram_usage_bytes=1024,
+                vram_usage_mb=2048,
+                vram_total_mb=4096,
+                info="memory",
+            ),
+        ],
+    )
+    async def test_late_liveness_from_retired_launch_is_ignored(
+        self,
+        message: HordeProcessStateChangeMessage | HordeProcessHeartbeatMessage | HordeProcessMemoryMessage,
+    ) -> None:
+        """Late terminal/liveness messages from an intentionally retired launch must not crash."""
+        retired = make_mock_process_info(1)
+        retired.process_launch_identifier = 7
+        process_map = ProcessMap({1: retired})
+        process_map.retire_process(retired, "test retirement")
+        process_map.on_memory_report = Mock()
+        process_map.on_heartbeat = Mock()
+        process_map.on_process_ending = Mock()
+
+        message_dispatcher = _make_dispatcher(process_map=process_map)
+        _enqueue(message_dispatcher, message)
+
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        process_map.on_memory_report.assert_not_called()
+        process_map.on_heartbeat.assert_not_called()
+        process_map.on_process_ending.assert_not_called()
+
+    async def test_result_from_retired_launch_is_warned_and_ignored(self) -> None:
+        """A retired idle slot should not produce results; warn, but do not crash the parent."""
+        retired = make_mock_process_info(1)
+        retired.process_launch_identifier = 7
+        process_map = ProcessMap({1: retired})
+        process_map.retire_process(retired, "test retirement")
+
+        message_dispatcher = _make_dispatcher(process_map=process_map)
+        msg = Mock(spec=HordeInferenceResultMessage)
+        msg.process_id = 1
+        msg.process_launch_identifier = 7
+        msg.info = "late result"
+
+        _enqueue(message_dispatcher, msg)
+        await message_dispatcher.receive_and_handle_process_messages()
+
+    async def test_retired_launch_for_reused_process_id_does_not_mutate_current_process(self) -> None:
+        """A stale launch id is ignored even when its logical process id has already been reused."""
+        old = make_mock_process_info(1)
+        old.process_launch_identifier = 7
+        process_map = ProcessMap({1: old})
+        process_map.retire_process(old, "scale-down")
+
+        current = make_mock_process_info(1)
+        current.process_launch_identifier = 8
+        process_map[1] = current
+        message_dispatcher = _make_dispatcher(process_map=process_map)
+
+        stale_memory = HordeProcessMemoryMessage(
+            process_id=1,
+            process_launch_identifier=7,
+            ram_usage_bytes=1024,
+            vram_usage_mb=2048,
+            vram_total_mb=4096,
+            info="stale memory",
+        )
+        current_memory = HordeProcessMemoryMessage(
+            process_id=1,
+            process_launch_identifier=8,
+            ram_usage_bytes=32,
+            vram_usage_mb=64,
+            vram_total_mb=128,
+            info="current memory",
+        )
+
+        _enqueue_many(message_dispatcher, [stale_memory, current_memory])
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert current.ram_usage_bytes == 32
+        assert current.vram_usage_mb == 64
+        assert current.total_vram_mb == 128
 
     async def test_process_ending_calls_on_process_ending(self) -> None:
         """When a process is ending, the process map's on_process_ending callback is called."""

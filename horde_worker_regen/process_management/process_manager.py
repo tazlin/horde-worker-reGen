@@ -95,6 +95,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
     SupervisorChannel,
     SupervisorCommand,
     SupervisorControlMessage,
+    WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -119,29 +120,44 @@ class SystemResources:
 
     total_ram_bytes: int
     device_map: TorchDeviceMap
+    per_process_overhead_mb: int = 0
+    """Approx. VRAM (MB) one inference process consumes for its torch/CUDA context with no model loaded,
+    measured by the accelerator probe on the idle device. The streaming forecast subtracts this from total
+    VRAM to estimate the free achievable under sole residency. 0 when unmeasured."""
 
     @classmethod
     def detect(cls) -> SystemResources:
         """Detect system resources via psutil and hordelib's backend-agnostic accelerator inventory.
 
-        Device discovery goes through ``enumerate_accelerators`` rather than ``torch.cuda`` directly so
-        every ComfyUI-supported backend (CUDA/ROCm, Intel XPU, Apple MPS, DirectML, CPU) populates the
-        device map; a bare ``torch.cuda.device_count()`` loop would yield no devices on non-CUDA backends.
+        Device discovery goes through the out-of-process accelerator probe rather than ``torch.cuda``
+        directly, for two reasons. It stays backend-agnostic (every ComfyUI-supported backend -- CUDA/ROCm,
+        Intel XPU, Apple MPS, DirectML, CPU -- populates the device map; a bare ``torch.cuda.device_count()``
+        loop would yield no devices on non-CUDA backends). And it keeps this process torch-free: detect()
+        runs in the long-lived orchestrator, enumerating accelerators loads torch (~500MB), so
+        :func:`probe_accelerators` pays that cost in a short-lived subprocess that frees it on exit.
         """
         import psutil
-        from hordelib.api import enumerate_accelerators
+
+        from horde_worker_regen.utils.accelerator_probe import probe_accelerators
 
         total_ram = psutil.virtual_memory().total
 
+        accelerators = probe_accelerators()
         device_map = TorchDeviceMap(root={})
-        for accelerator in enumerate_accelerators():
+        for accelerator in accelerators:
             device_map.root[accelerator.index] = TorchDeviceInfo(
                 device_name=accelerator.name,
                 device_index=accelerator.index,
                 total_memory=accelerator.total_vram_mb * 1024 * 1024,
             )
 
-        return cls(total_ram_bytes=total_ram, device_map=device_map)
+        per_process_overhead_mb = max((a.runtime_overhead_mb for a in accelerators), default=0)
+
+        return cls(
+            total_ram_bytes=total_ram,
+            device_map=device_map,
+            per_process_overhead_mb=per_process_overhead_mb,
+        )
 
 
 def _resolve_inference_concurrency(
@@ -642,7 +658,7 @@ class HordeWorkerProcessManager:
         # Expected-time-to-complete model: seeds from the last benchmark's per-tier reference it/s and
         # self-calibrates from this worker's own jobs, so a "slow" job becomes measurable rather than
         # guessed. Disabled-to-memory under test (no app-state read, no benchmark import, no perf file);
-        # the model is unit-tested directly. Phase 4 consumes its expected_sampling_seconds.
+        # the model is unit-tested directly.
         self._performance_model = self._build_performance_model()
 
         self._message_dispatcher.set_metrics_handlers(
@@ -689,6 +705,9 @@ class HordeWorkerProcessManager:
             lru=self._lru,
             performance_model=self._performance_model,
         )
+        # Feed the startup-measured per-process VRAM overhead to the scheduler's streaming forecast, so it
+        # can estimate the free VRAM achievable under sole residency (total - one process's context).
+        self._inference_scheduler.set_measured_per_process_overhead_mb(system_resources.per_process_overhead_mb)
 
         # Save-our-ship: escalates a worker that has stopped making progress on accepted work from an
         # in-place soft reset (rebuild pools, limp-by) to giving up cleanly on jobs it cannot serve, so
@@ -771,8 +790,47 @@ class HordeWorkerProcessManager:
                 logger.error(e)
                 time.sleep(5)
 
-    def remove_maintenance(self) -> None:
-        """Removes the maintenance from the named worker."""
+    def _apply_self_maintenance_throttle(self) -> None:
+        """Local-pause popping when resource/OOM faults approach the horde's server-side drop tolerance.
+
+        A backstop above the per-model circuit-breaker: if terminal resource faults across all models
+        accumulate fast enough within the configured window, enter a worker-initiated local pop-pause
+        (in-flight jobs finish) for a cooldown, so the worker stops the bleeding on its own terms before
+        the horde forces it into maintenance for "dropping too many jobs". Auto-resumes after the cooldown.
+        """
+        now = time.time()
+        if self._state.self_throttle_paused:
+            if now >= self._state.self_throttle_paused_until:
+                self._state.self_throttle_paused = False
+                self._state.self_throttle_paused_until = 0.0
+                logger.info("Self-throttle cooldown elapsed; resuming job pops.")
+            return
+
+        threshold = self.bridge_data.self_maintenance_fault_threshold
+        if threshold <= 0:
+            return
+        window = self.bridge_data.self_maintenance_window_seconds
+        recent = self._job_tracker.count_recent_resource_faults(window, now=now)
+        if recent < threshold:
+            return
+        cooldown = self.bridge_data.self_maintenance_cooldown_seconds
+        self._state.self_throttle_paused = True
+        self._state.self_throttle_paused_until = now + cooldown
+        logger.warning(
+            f"Self-throttle engaged: {recent} resource/OOM faults in the last {window:.0f}s (threshold "
+            f"{threshold}); pausing job pops locally for {cooldown:.0f}s so the horde does not force the "
+            "worker into maintenance. In-flight jobs will finish.",
+        )
+
+    def set_maintenance(self, enabled: bool) -> None:
+        """Set the named worker's *server-side* maintenance flag via the horde API (blocking).
+
+        ``enabled=True`` puts the worker into maintenance on the horde (it stops being sent jobs);
+        ``enabled=False`` clears it. This is the true horde-side "maintenance mode" the job-pop response
+        signals, distinct from the local pop-pause (:attr:`WorkerState.supervisor_paused`). Runs a
+        blocking API call, so live callers from the control loop must invoke it off-loop (see
+        :meth:`_apply_supervisor_command`).
+        """
         simple_client = AIHordeAPISimpleClient()
         worker_details: SingleWorkerDetailsResponse = simple_client.worker_details_by_name(
             worker_name=self.bridge_data.dreamer_worker_name,
@@ -780,21 +838,36 @@ class HordeWorkerProcessManager:
         if worker_details is None:
             logger.debug(
                 f"Worker with name {self.bridge_data.dreamer_worker_name} "
-                "does not appear to exist already to remove maintenance.",
+                f"does not appear to exist yet to set maintenance={enabled}.",
             )
             return
         modify_worker_request = ModifyWorkerRequest(
             apikey=self.bridge_data.api_key,
             worker_id=worker_details.id_,
-            maintenance=False,
+            maintenance=enabled,
         )
 
         simple_client.worker_modify(modify_worker_request)
 
+        verb = "placed into" if enabled else "removed from"
         logger.debug(
             f"Ensured worker with name {self.bridge_data.dreamer_worker_name} "
-            f"({worker_details.id_}) is removed from maintenance.",
+            f"({worker_details.id_}) is {verb} maintenance.",
         )
+
+    def remove_maintenance(self) -> None:
+        """Remove the server-side maintenance from the named worker.
+
+        Thin convenience wrapper over :meth:`set_maintenance` (``set_maintenance(False)``).
+        """
+        self.set_maintenance(False)
+
+    def _set_server_maintenance_safe(self, enabled: bool) -> None:
+        """Best-effort off-loop ``set_maintenance`` for the supervisor toggle; never raises into the thread."""
+        try:
+            self.set_maintenance(enabled)
+        except Exception as e:
+            logger.warning(f"Failed to set server-side maintenance={enabled}: {type(e).__name__} {e}")
 
     def enable_performance_mode(self) -> None:
         """Enable performance mode."""
@@ -871,7 +944,7 @@ class HordeWorkerProcessManager:
         the fix is to reduce the model set or disable the mode). The runtime budget is the actual
         enforcement; this only surfaces the posture.
         """
-        if not getattr(self.bridge_data, "enable_vram_budget", False):
+        if not self.bridge_data.enable_vram_budget:
             logger.warning(
                 "VRAM/RAM budget is disabled (enable_vram_budget=false): the worker will not guard "
                 "against multiple inference processes over-committing the GPU. Not recommended on a "
@@ -1117,6 +1190,7 @@ class HordeWorkerProcessManager:
             await self.receive_and_handle_process_messages()
             self._maybe_start_safety_processes()
             self._maybe_start_inference_processes()
+            self._apply_self_maintenance_throttle()
             self.detect_deadlock()
 
             if len(self._job_tracker.jobs_pending_safety_check) > 0:
@@ -1148,7 +1222,7 @@ class HordeWorkerProcessManager:
             self._process_lifecycle._replace_all_safety_process()
 
             # Backstop the per-slot recovery: punt any job left in-progress with no owning live slot
-            # before it can wedge the head of the queue (the 2026-06-18 overnight wedge).
+            # before it can wedge the head of the queue.
             self._reconcile_orphaned_in_progress_jobs()
 
             # Save-our-ship: above the per-slot recovery, escalate a worker that is wedged as a whole
@@ -1419,8 +1493,7 @@ class HordeWorkerProcessManager:
 
         Per-slot recovery faults the job of the slot it replaces, but a mis-association, a lost result,
         or a requeue race can still leave a *different* job marked in-progress with no owning slot. No
-        result will ever arrive for it, so it pins the head of the queue forever (the 2026-06-18
-        overnight wedge: one orphaned job stalled all image inference for 6.5h). This watchdog is the
+        result will ever arrive for it, so it pins the head of the queue forever . This watchdog is the
         backstop: an in-progress job that no live slot has referenced for ``_ORPHAN_IN_PROGRESS_GRACE``
         seconds is faulted (retryable, so it requeues or, once attempts are exhausted, is reported
         faulted and drains). Recurring orphans feed the wedge escalation so the worker limps by.
@@ -1489,10 +1562,17 @@ class HordeWorkerProcessManager:
         """
         if self._state.shutting_down:
             return False
+        structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
+        if structural_queue_wedge and self._inference_scheduler.whole_card_residency_grace_active():
+            # The queue is deliberately held while a whole-card residency establishes (idle siblings
+            # stopping, the safety process cycling off-GPU, ~11GB of weights loading). That is the worker
+            # doing exactly the right thing, not a wedge, so do not let it soft-reset the pools mid-setup.
+            # The grace is bounded, so a residency that genuinely never loads still trips the supervisor.
+            structural_queue_wedge = False
         return (
             self._is_inference_pool_unrecoverable()
             or self._is_safety_pool_unrecoverable()
-            or self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
+            or structural_queue_wedge
             or self._orphan_wedge_active()
         )
 
@@ -1833,6 +1913,16 @@ class HordeWorkerProcessManager:
             case SupervisorCommand.RESUME:
                 self._state.supervisor_paused = False
                 logger.info("Supervisor requested resume: job popping re-enabled.")
+                # An operator resume may also lift any horde-side maintenance the worker is in, but only
+                # when the operator opted into that via remove_maintenance_on_init; otherwise a local
+                # resume must never silently clear server-side maintenance (use the explicit toggle).
+                if self.bridge_data.remove_maintenance_on_init:
+                    threading.Thread(
+                        target=self._set_server_maintenance_safe,
+                        args=(False,),
+                        name="resume-clear-maintenance",
+                        daemon=True,
+                    ).start()
             case SupervisorCommand.RESTART_PROCESS:
                 if command.process_id is None:
                     logger.warning("RESTART_PROCESS supervisor command missing process_id; ignoring.")
@@ -1859,6 +1949,19 @@ class HordeWorkerProcessManager:
                 limit_label = "unlimited" if rate == 0 else f"{rate} KB/s"
                 logger.info(f"Supervisor set download rate limit to {limit_label}.")
                 self._process_lifecycle.set_download_controls(rate_limit_kbps=rate)
+            case SupervisorCommand.SET_SERVER_MAINTENANCE:
+                enabled = bool(command.server_maintenance_enabled)
+                logger.warning(
+                    f"Supervisor requested server-side maintenance {'ON' if enabled else 'OFF'} (horde API).",
+                )
+                # The horde API call is blocking; run it off the control loop so a slow or unreachable
+                # horde can never stall the worker's tick.
+                threading.Thread(
+                    target=self._set_server_maintenance_safe,
+                    args=(enabled,),
+                    name="set-server-maintenance",
+                    daemon=True,
+                ).start()
             case SupervisorCommand.SHUTDOWN:
                 logger.warning("Supervisor requested shutdown.")
                 # Graceful first: drain in-flight work via the normal shutdown path; the
@@ -2030,6 +2133,36 @@ class HordeWorkerProcessManager:
             )
         return entries
 
+    @staticmethod
+    def _to_int_mb(value: float | None) -> int | None:
+        """Round an MB figure to a whole MB for the wire, preserving None."""
+        return int(round(value)) if value is not None else None
+
+    def _whole_card_residency_status(self) -> WholeCardResidencyStatus:
+        """Project the scheduler's whole-card residency state onto the wire model (MB rounded to int)."""
+        state = self._inference_scheduler.whole_card_residency_state()
+        return WholeCardResidencyStatus(
+            possible=state.possible,
+            enabled=state.enabled,
+            safety_off_gpu_enabled=state.safety_off_gpu_enabled,
+            cooldown_seconds=int(round(state.cooldown_seconds)),
+            per_process_overhead_mb=int(round(state.per_process_overhead_mb)),
+            total_vram_mb=int(round(state.total_vram_mb)) if state.total_vram_mb else 0,
+            active=state.active,
+            model=state.model,
+            phase=state.phase,
+            safety_paused=state.safety_paused,
+            processes_now=state.processes_now,
+            processes_target=state.processes_target,
+            processes_max=state.processes_max,
+            cooldown_remaining_seconds=state.cooldown_remaining_seconds,
+            weights_mb=self._to_int_mb(state.weights_mb),
+            reserve_mb=self._to_int_mb(state.reserve_mb),
+            free_now_mb=self._to_int_mb(state.free_now_mb),
+            free_if_alone_mb=self._to_int_mb(state.free_if_alone_mb),
+            max_resident_processes=state.max_resident_processes,
+        )
+
     def _build_worker_state_snapshot(self) -> WorkerStateSnapshot:
         """Assemble current worker state for the supervisor pipe (mirrors what StatusReporter prints)."""
         import horde_worker_regen
@@ -2091,7 +2224,12 @@ class HordeWorkerProcessManager:
         return WorkerStateSnapshot(
             session_start_time=self.session_start_time,
             shutting_down=self._state.shutting_down,
-            maintenance_mode=self._state.last_pop_maintenance_mode or self._state.supervisor_paused,
+            maintenance_mode=(
+                self._state.last_pop_maintenance_mode
+                or self._state.supervisor_paused
+                or self._state.self_throttle_paused
+            ),
+            self_throttle_paused=self._state.self_throttle_paused,
             worker_details_maintenance=self._worker_details_maintenance,
             worker_details_paused=self._worker_details_paused,
             too_many_consecutive_failed_jobs=self._state.too_many_consecutive_failed_jobs,
@@ -2140,6 +2278,7 @@ class HordeWorkerProcessManager:
             alchemy_total_submitted=self._alchemy_coordinator.num_forms_submitted,
             alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
             pending_jobs=self._build_pending_jobs_list(),
+            whole_card_residency=self._whole_card_residency_status(),
         )
 
     def build_run_record(self) -> WorkerRunRecord:

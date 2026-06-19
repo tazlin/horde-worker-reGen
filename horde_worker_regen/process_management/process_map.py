@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import override
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -73,6 +75,23 @@ unexpected transition is logged but never refused. Divergence here usually means
 parent's optimistic bookkeeping and the child's reality have drifted apart.
 """
 
+_RETIRED_LAUNCH_TTL_SECONDS = 300.0
+"""How long intentionally retired process launches are kept for late IPC-message matching."""
+
+_MAX_RETIRED_LAUNCHES = 256
+"""Hard cap for the retired-launch tombstone registry."""
+
+
+@dataclass(frozen=True)
+class RetiredProcessLaunch:
+    """A bounded tombstone for an intentionally retired child-process launch."""
+
+    process_id: int
+    process_launch_identifier: int
+    process_type: HordeProcessType
+    reason: str
+    retired_at: float
+
 
 class ProcessMap(dict[int, HordeProcessInfo]):
     """A mapping of process IDs to HordeProcessInfo objects.
@@ -86,6 +105,70 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def __init__(
+        self,
+        initial: Mapping[int, HordeProcessInfo] | Iterable[tuple[int, HordeProcessInfo]] | None = None,
+    ) -> None:
+        """Initialize the process map and its retired-launch tombstone registry."""
+        super().__init__()
+        if initial is not None:
+            self.update(initial)
+        self._retired_launches: dict[tuple[int, int], RetiredProcessLaunch] = {}
+
+    def retire_process(self, process_info: HordeProcessInfo, reason: str) -> HordeProcessInfo | None:
+        """Remove a process from the active map and remember its launch for late IPC messages.
+
+        Args:
+            process_info: The process launch being intentionally removed from active scheduling state.
+            reason: Short reason recorded with the tombstone for diagnostics.
+
+        Returns:
+            The removed process info, or None if the active map no longer contains that process id.
+        """
+        self._prune_retired_launches()
+        key = (process_info.process_id, process_info.process_launch_identifier)
+        self._retired_launches[key] = RetiredProcessLaunch(
+            process_id=process_info.process_id,
+            process_launch_identifier=process_info.process_launch_identifier,
+            process_type=process_info.process_type,
+            reason=reason,
+            retired_at=time.time(),
+        )
+        self._prune_retired_launches()
+        return self.pop(process_info.process_id, None)
+
+    def get_retired_launch(
+        self,
+        process_id: int,
+        process_launch_identifier: int,
+    ) -> RetiredProcessLaunch | None:
+        """Return the retired launch matching this exact process id and launch id, if still retained."""
+        self._prune_retired_launches()
+        return self._retired_launches.get((process_id, process_launch_identifier))
+
+    def is_retired_launch(self, process_id: int, process_launch_identifier: int) -> bool:
+        """Return whether the given process id/launch id pair was intentionally retired."""
+        return self.get_retired_launch(process_id, process_launch_identifier) is not None
+
+    def _prune_retired_launches(self) -> None:
+        """Prune expired tombstones and enforce the registry size cap."""
+        now = time.time()
+        expired_keys = [
+            key
+            for key, retired in self._retired_launches.items()
+            if now - retired.retired_at > _RETIRED_LAUNCH_TTL_SECONDS
+        ]
+        for key in expired_keys:
+            self._retired_launches.pop(key, None)
+
+        overflow = len(self._retired_launches) - _MAX_RETIRED_LAUNCHES
+        if overflow <= 0:
+            return
+
+        oldest_keys = sorted(self._retired_launches, key=lambda key: self._retired_launches[key].retired_at)
+        for key in oldest_keys[:overflow]:
+            self._retired_launches.pop(key, None)
 
     def on_heartbeat(
         self,
@@ -317,14 +400,14 @@ class ProcessMap(dict[int, HordeProcessInfo]):
 
     def delete_safety_processes(self) -> None:
         """Clear all safety processes."""
-        ids_to_delete = []
+        processes_to_delete = []
         for p in self.values():
             if p.process_type == HordeProcessType.SAFETY:
-                ids_to_delete.append(p.process_id)
+                processes_to_delete.append(p)
 
-        for process_id in ids_to_delete:
-            logger.debug(f"Deleting safety process {process_id} from process map")
-            self.pop(process_id)
+        for process_info in processes_to_delete:
+            logger.debug(f"Deleting safety process {process_info.process_id} from process map")
+            self.retire_process(process_info, "safety process replacement")
 
     def is_stuck_on_inference(
         self,
@@ -411,6 +494,41 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         if not free_values:
             return None
         return float(min(free_values))
+
+    def get_reported_total_vram_mb(self) -> float | None:
+        """Return the device's total VRAM (MB) as reported by inference processes, or None.
+
+        Children report ``total_vram_mb`` (``torch_total``); workers are typically single-GPU, so the max
+        across reporting processes is the device total. None until a process has reported (cold start, or a
+        CPU-only deployment). Used by the streaming forecast to derive ComfyUI's inference reserve and the
+        free VRAM achievable under sole residency.
+        """
+        totals = [
+            p.total_vram_mb
+            for p in self.values()
+            if p.process_type == HordeProcessType.INFERENCE and p.total_vram_mb > 0
+        ]
+        if not totals:
+            return None
+        return float(max(totals))
+
+    def residency_snapshot(self) -> str:
+        """One-line 'which model is resident on which inference slot' summary, for over-commit diagnostics.
+
+        ``vram_usage_mb`` from the memory reports is *device-wide* used (children compute
+        ``torch_total - torch_free``), not a per-slot figure, so this reports the per-slot resident model
+        and state plus the single device-wide free VRAM. Logged when an over-commit is admitted or a
+        slowdown is graded, so a live log shows the residency at the moment free VRAM ran out.
+        """
+        parts: list[str] = []
+        for process_id, process_info in sorted(self.items()):
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            model = process_info.loaded_horde_model_name or "-"
+            parts.append(f"#{process_id}:{model}[{process_info.last_process_state.name}]")
+        free = self.get_free_vram_mb()
+        free_str = f"{free:.0f}" if free is not None else "?"
+        return f"slots=[{', '.join(parts) if parts else 'none'}] device_free_vram={free_str}MB"
 
     def num_inference_processes(self) -> int:
         """Return the number of inference processes."""

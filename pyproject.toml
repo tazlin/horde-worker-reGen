@@ -28,12 +28,13 @@ dependencies = [
     "certifi",
     "horde_sdk~=0.20.6",
     "horde_safety~=0.3.0",
-    # Requires horde-engine (hordelib) 3.2.5+: it declares torchvision as a range so the worker's cuXXX
-    # build extras resolve the latest torch (2.12.0 today) for the chosen wheel index, no longer pulls
-    # torchaudio as a hard dep, and exposes the optional-feature extras + capability registry
-    # (hordelib.api.available_features) that the worker's `post-processing`/`controlnet` extras and the
-    # config coercion in horde_worker_regen/capabilities.py depend on.
-    "horde_engine[layerdiffuse,upscale-extra]>=3.2.10,<4.0.0",
+    # Requires horde-engine (hordelib) 3.2.11+: in addition to the 3.2.5+ feature set (torchvision range,
+    # no hard torchaudio dep, optional-feature extras + capability registry consumed by
+    # horde_worker_regen/capabilities.py), 3.2.11 adds the torch-free VRAM-planning helpers
+    # (hordelib.vram_planning.compute_inference_reserve_mb / compute_weight_budget_mb) and the runtime
+    # weight-streaming telemetry (get_loaded_weights_offloaded_mb) the worker's streaming forecast and
+    # whole-card exclusive residency depend on.
+    "horde_engine[layerdiffuse,upscale-extra]>=3.3.0,<4.0.0",
     "horde_model_reference>=5.3.0,<6.0.0",
     "python-dotenv",
     "ruamel.yaml",

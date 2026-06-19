@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.pop_throttler import (
     PopThrottler,
 )
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.resource_budget import is_model_locally_unservable_for
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.source_image_downloader import SourceImageDownloader
 from horde_worker_regen.process_management.worker_state import WorkerState
@@ -106,6 +107,17 @@ def _select_models_for_pop(
     }
     if len(models_to_remove) > 0:
         models = models.difference(models_to_remove)
+
+    # Hold back models the device has shown it genuinely cannot run. A model that faults every
+    # over-budget attempt would otherwise be popped only to be dropped, and a steady drop stream trips
+    # the horde's "dropping too many jobs" maintenance guard. Shares the scheduler's best-effort-admit
+    # breaker policy so popping and admitting agree on which models are locally unservable.
+    held_back = {
+        model for model in models if is_model_locally_unservable_for(bridge_data, job_tracker, model)
+    }
+    if held_back:
+        logger.debug(f"Not popping models held back as locally unservable: {sorted(held_back)}")
+        models = models.difference(held_back)
 
     if bridge_data.custom_models is not None and len(bridge_data.custom_models) > 0:
         logger.debug("Custom models are enabled, adding them to the list of models to pop")
@@ -401,7 +413,7 @@ class JobPopper:
             self._state.last_pop_no_jobs_available = False
             return
 
-        if self._state.supervisor_paused:
+        if self._state.supervisor_paused or self._state.self_throttle_paused:
             self._state.last_pop_no_jobs_available = False
             return
 

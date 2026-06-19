@@ -431,6 +431,95 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """Available system RAM (MB) the budget keeps in reserve so resident-in-RAM models do not force
     the OS to page to disk. Only used when `enable_vram_budget` is true."""
 
+    vram_per_process_overhead_mb: int = Field(default=0, ge=0)
+    """Per-process VRAM (MB) one inference process consumes for its torch/CUDA context with no model loaded.
+
+    The streaming forecast subtracts this from total VRAM to estimate the free achievable under sole
+    residency (so it can tell a model that only streams because of co-resident siblings from one that
+    streams even alone). 0 (the default) auto-detects the value via the startup accelerator probe; set a
+    positive value to override the measurement. Only used when `enable_vram_budget` is true."""
+
+    overbudget_exclusive_mode: bool = Field(default=True)
+    """Run a model admitted *against* the VRAM budget (a best-effort head-of-queue admit) with the device
+    to itself.
+
+    When the budget cannot fit a head-of-queue model even after reclaiming every idle resident copy, the
+    scheduler admits it best-effort rather than wedging the queue. On a small-VRAM card a heavy model
+    (e.g. a Flux combined checkpoint) admitted this way only fits if nothing else is resident: a second
+    process loading another model concurrently pushes free VRAM to ~0 and the heavy model's weights spill
+    to system RAM over PCIe, collapsing its step rate (~50-80x) until the step-timeout watchdog kills it.
+    When true (the default), such a job evicts every other resident model first and suppresses concurrent
+    pre-staging/dispatch for its duration, so it runs on an un-contended device. Only used when
+    `enable_vram_budget` is true."""
+
+    whole_card_exclusive_residency: bool = Field(default=True)
+    """Give a model whose weights need most of the device sole residency *before* it streams, not after a fault.
+
+    The streaming forecast (weights vs ComfyUI's inference reserve) flags a model that would offload weights
+    to host RAM if loaded alongside the currently-resident models but fits cleanly with the card to itself.
+    When true (the default), the scheduler proactively evicts the other processes' resident models, returns
+    their freed VRAM to the driver, and suppresses prefetch into sibling slots for its duration, so the model
+    loads fully resident and samples at full speed instead of streaming weights and being hang-graded. This
+    is the preventative form of `overbudget_exclusive_mode`, which only reacts once a model has already been
+    admitted over budget. Only used when `enable_vram_budget` is true."""
+
+    whole_card_residency_safety_off_gpu: bool = Field(default=True)
+    """Move the safety process off-GPU while a whole-card model holds the device.
+
+    A model that needs near-sole residency (e.g. Flux on a 16GB card) only fits without streaming if the
+    safety process's CUDA context (~1GB, reclaimable only by the process exiting) is also freed. When true
+    (the default), the scheduler pauses safety-on-GPU for the duration of a whole-card job and restores it
+    after. Costs a brief safety-process restart at each end of a whole-card residency burst (batched by
+    `whole_card_residency_cooldown_seconds`). Only used when `enable_vram_budget` and `safety_on_gpu` are
+    both true."""
+
+    whole_card_residency_cooldown_seconds: int = Field(default=45, ge=0, le=600)
+    """How long to hold a whole-card residency in place after its last heavy job drains, before restoring
+    the torn-down sibling processes and the safety process to the GPU.
+
+    A whole-card residency event is disruptive (it stops idle inference processes and cycles the safety
+    process), so back-to-back heavy jobs should reuse one residency rather than each triggering a fresh
+    teardown/restore. During the cooldown the worker stays in single-residency mode, so a subsequent
+    whole-card job runs immediately with no churn and refreshes the cooldown. Only after this many seconds
+    with no whole-card job pending or in progress does the worker restore full concurrency. 0 restores
+    immediately (maximum responsiveness, maximum churn). Only used when `enable_vram_budget` is true."""
+
+    overbudget_step_timeout: int = Field(default=120, ge=15, le=600)
+    """Per-step hang timeout (seconds) granted to a job admitted *against* the VRAM budget.
+
+    A best-effort over-budget admit of a heavy model can stream weights through VRAM each step, so even
+    on an un-contended device its steps are legitimately far slower than `inference_step_timeout`. Killing
+    such a slow-but-progressing job and dropping it is what produced the live drop storm; this generous
+    per-step grace lets it complete (slowly) instead. Applied to every step of an over-budget job (not
+    only its first), floored at `inference_step_timeout`. Only used when `enable_vram_budget` is true."""
+
+    unservable_model_fault_threshold: int = Field(default=3, ge=0, le=20)
+    """Consecutive over-budget terminal faults for one model before it is treated as locally unservable.
+
+    A model the device genuinely cannot run will fault every attempt no matter how it is isolated; left
+    unchecked the worker keeps popping and dropping it, and the horde server forces the worker into
+    maintenance for "dropping too many jobs". After this many consecutive over-budget faults for a model,
+    the worker stops popping and best-effort-admitting it for `unservable_model_cooldown_seconds`, so the
+    bleeding stops. A successful generation of the model resets its counter. 0 disables the breaker."""
+
+    unservable_model_cooldown_seconds: int = Field(default=900, ge=0)
+    """How long a model flagged locally unservable is held back before the worker tries it again."""
+
+    self_maintenance_fault_threshold: int = Field(default=6, ge=0)
+    """Terminal resource/OOM faults within `self_maintenance_window_seconds` before the worker
+    self-throttles.
+
+    A backstop above the per-model breaker: if resource faults across *all* models accumulate fast enough
+    to risk the horde's server-side "dropping too many jobs" guard, the worker proactively enters a local
+    pop-pause for `self_maintenance_cooldown_seconds` (in-flight jobs finish) so it stops the bleeding on
+    its own terms before the server forces maintenance. 0 disables the backstop."""
+
+    self_maintenance_window_seconds: int = Field(default=600, ge=1)
+    """Rolling window (seconds) over which resource/OOM faults are counted for the self-throttle backstop."""
+
+    self_maintenance_cooldown_seconds: int = Field(default=300, ge=0)
+    """How long the worker holds its self-imposed local pop-pause before resuming after a self-throttle."""
+
     dry_run_skip_inference: bool = Field(default=False)
     """Skip real GPU inference and return a dummy 1x1 image instead."""
 

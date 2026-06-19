@@ -314,7 +314,7 @@ class AlchemyCoordinator:
             return False
         if self._state.shutting_down:
             return False
-        if self._state.supervisor_paused:
+        if self._state.supervisor_paused or self._state.self_throttle_paused:
             return False
         if len(self._pending_forms) + len(self._in_flight) >= max(bridge_data.queue_size, 1):
             return False

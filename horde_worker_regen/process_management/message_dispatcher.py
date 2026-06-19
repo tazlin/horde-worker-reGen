@@ -201,34 +201,46 @@ class MessageDispatcher:
                     self._on_download_availability(message)
                 continue
 
+            if not isinstance(message, HordeProcessMessage):
+                raise ValueError(f"Received a message that is not a HordeProcessMessage: {message}")
+
+            if self._should_ignore_retired_launch_message(message):
+                continue
+
+            if message.process_id not in self._process_map:
+                # A late IPC message from a process the map no longer knows. This is expected after an
+                # intentional scale-down (whole-card residency teardown, RAM-reclaim cycling): the slot is
+                # popped from the map, yet its already-queued terminal messages (PROCESS_ENDING, a final
+                # memory report) still arrive. The retired-launch tombstone above normally absorbs these,
+                # but it is keyed on the exact launch id and bounded by a TTL, so a message from an older
+                # launch, or one arriving after the tombstone is pruned, can slip through. Dropping it is
+                # always safe (the process is gone); raising here would crash the control loop and take the
+                # whole worker down over a stale status update, which is exactly the fragility that stopping
+                # processes mid-session must not introduce.
+                logger.warning(
+                    f"Ignoring message from process {message.process_id} that is no longer in the process map "
+                    f"(launch {message.process_launch_identifier}); it was most likely intentionally stopped: "
+                    f"{type(message).__name__}",
+                )
+                continue
+
+            known_launch_identifier = self._process_map[message.process_id].process_launch_identifier
+
+            if message.process_launch_identifier != known_launch_identifier:
+                logger.error(
+                    f"Received a message from process {message.process_id} with launch identifier "
+                    f"{message.process_launch_identifier}, but expected {known_launch_identifier}",
+                )
+                logger.error("This is probably due to a process being replaced. Ignoring.")
+                logger.error(f"Message: {message}")
+                continue
+
             if isinstance(message, HordeProcessHeartbeatMessage):
                 self._handle_heartbeat(message)
             else:
                 logger.debug(
                     f"Received {type(message).__name__} from process {message.process_id}: {message.info}",
                 )
-
-            if not isinstance(message, HordeProcessMessage):
-                raise ValueError(f"Received a message that is not a HordeProcessMessage: {message}")
-            if message.process_id not in self._process_map:
-                raise ValueError(f"Received a message from an unknown process: {message}")
-
-            known_launch_identifier = self._process_map[message.process_id].process_launch_identifier
-
-            if message.process_launch_identifier != known_launch_identifier:
-                if self._process_map[message.process_id].last_process_state != HordeProcessState.PROCESS_STARTING:
-                    logger.error(
-                        f"Received a message from process {message.process_id} with launch identifier "
-                        f"{message.process_launch_identifier}, but expected {known_launch_identifier}",
-                    )
-                    logger.error("This is probably due to a process being replaced. Ignoring.")
-                    logger.error(f"Message: {message}")
-                else:
-                    logger.debug(
-                        f"Received a message from process {message.process_id} with launch identifier "
-                        f"{message.process_launch_identifier}, but expected {known_launch_identifier}",
-                    )
-                continue
 
             if isinstance(message, HordeProcessMemoryMessage):
                 self._handle_memory_report(message)
@@ -267,6 +279,50 @@ class MessageDispatcher:
                     self._on_alchemy_result(message)
                 else:
                     logger.error(f"Received alchemy result with no handler registered: {message.form_id}")
+
+    def _should_ignore_retired_launch_message(self, message: HordeProcessMessage) -> bool:
+        """Return true when a message belongs to an intentionally retired launch."""
+        retired_launch = self._process_map.get_retired_launch(
+            message.process_id,
+            message.process_launch_identifier,
+        )
+        if retired_launch is None:
+            return False
+
+        if isinstance(
+            message,
+            (HordeInferenceResultMessage, HordeSafetyResultMessage, HordeAlchemyResultMessage),
+        ):
+            logger.warning(
+                f"Ignoring result message from retired {retired_launch.process_type.name.lower()} process "
+                f"{message.process_id} launch {message.process_launch_identifier} "
+                f"({retired_launch.reason}): {type(message).__name__}",
+            )
+            return True
+
+        if self._is_late_retired_liveness_message(message):
+            logger.debug(
+                f"Ignoring late {type(message).__name__} from retired "
+                f"{retired_launch.process_type.name.lower()} process {message.process_id} "
+                f"launch {message.process_launch_identifier} ({retired_launch.reason})",
+            )
+            return True
+
+        logger.warning(
+            f"Ignoring unexpected {type(message).__name__} from retired "
+            f"{retired_launch.process_type.name.lower()} process {message.process_id} "
+            f"launch {message.process_launch_identifier} ({retired_launch.reason})",
+        )
+        return True
+
+    def _is_late_retired_liveness_message(self, message: HordeProcessMessage) -> bool:
+        """Return true for stale terminal/liveness messages expected after intentional retirement."""
+        if isinstance(message, (HordeProcessHeartbeatMessage, HordeProcessMemoryMessage)):
+            return True
+        return isinstance(message, HordeProcessStateChangeMessage) and message.process_state in (
+            HordeProcessState.PROCESS_ENDING,
+            HordeProcessState.PROCESS_ENDED,
+        )
 
     def _record_completed_job(self, process_id: int) -> None:
         """Bump the producing process's completed-work counter (inference, safety check, or alchemy form).
@@ -362,9 +418,18 @@ class MessageDispatcher:
 
     async def _handle_aux_model_state_change(self, message: HordeAuxModelStateChangeMessage) -> None:
         """Handle an auxiliary model state change message (e.g., LoRa downloads)."""
+        job_info = message.sdk_api_job_info
+        job_context = ""
+        if job_info is not None:
+            lora_count = len(job_info.payload.loras or [])
+            ti_count = len(getattr(job_info.payload, "tis", None) or [])
+            job_context = (
+                f" for job {str(job_info.id_)[:8]} (model={job_info.model}, loras={lora_count}, tis={ti_count})"
+            )
+
         if message.process_state == HordeProcessState.DOWNLOADING_AUX_MODEL:
             logger.opt(ansi=True).info(
-                f"<fg #7b7d7d>Process {message.process_id} is downloading extra models (LoRas, etc.)</>",
+                f"<fg #7b7d7d>Process {message.process_id} is downloading extra models{job_context}</>",
             )
             self._process_map.on_last_job_reference_change(
                 process_id=message.process_id,
@@ -374,7 +439,8 @@ class MessageDispatcher:
         if message.process_state == HordeProcessState.DOWNLOAD_AUX_COMPLETE:
             logger.opt(ansi=True).info(
                 "<fg #7b7d7d>"
-                f"Process {message.process_id} finished downloading extra models in {message.time_elapsed}"
+                f"Process {message.process_id} finished downloading extra models{job_context} "
+                f"in {message.time_elapsed}"
                 "</>",
             )
             if message.sdk_api_job_info not in self._job_tracker.jobs_lookup:

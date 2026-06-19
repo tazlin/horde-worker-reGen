@@ -8,6 +8,7 @@ import pytest
 
 from horde_worker_regen.process_management.supervisor_channel import (
     ProcessSnapshot,
+    WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -165,6 +166,49 @@ def test_worker_details_maintenance_is_paused_and_names_the_horde() -> None:
     )
     assert report.phase is WorkerPhase.PAUSED
     assert "horde" in report.detail.lower()
+
+
+def _residency_check(report: object) -> object | None:
+    """Return the Residency health check from a report, or None if it was not added."""
+    return next((check for check in report.checks if check.name == "Residency"), None)  # type: ignore[attr-defined]
+
+
+def test_residency_check_heads_up_when_possible() -> None:
+    """When whole-card residency can engage, an INFO heads-up appears so a later teardown is no surprise."""
+    report = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            whole_card_residency=WholeCardResidencyStatus(possible=True),
+        ),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    residency = _residency_check(report)
+    assert residency is not None
+    assert residency.status is HealthStatus.INFO  # type: ignore[attr-defined]
+    assert "sole use of the GPU" in residency.detail  # type: ignore[attr-defined]
+
+
+def test_residency_check_names_model_when_active() -> None:
+    """An active residency names the model holding the card, still as a low-key INFO note."""
+    report = derive(
+        _snapshot(
+            processes=[_process("INFERENCE_STARTING")],
+            whole_card_residency=WholeCardResidencyStatus(active=True, model="Flux.1-dev"),
+        ),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    residency = _residency_check(report)
+    assert residency is not None
+    assert residency.status is HealthStatus.INFO  # type: ignore[attr-defined]
+    assert "Flux.1-dev" in residency.detail  # type: ignore[attr-defined]
+
+
+def test_no_residency_check_when_not_applicable() -> None:
+    """Workers the feature never applies to keep the checklist quiet (no Residency row)."""
+    report = derive(_snapshot(processes=[_process("WAITING_FOR_JOB")]), SupervisorStatus.RUNNING, 0.5)
+    assert _residency_check(report) is None
 
 
 def test_short_term_no_jobs_is_ready_with_skip_reasons() -> None:

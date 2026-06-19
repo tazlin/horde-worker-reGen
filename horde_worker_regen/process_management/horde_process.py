@@ -112,10 +112,18 @@ class HordeProcess(abc.ABC):
     """The last process state that was sent to the main process."""
 
     def get_vram_usage_mb(self) -> int:
-        """Return the MB of VRAM used on the GPU."""
-        from hordelib.api import get_torch_free_vram_mb, get_torch_total_vram_mb
+        """Return the MB of VRAM used on the GPU.
 
-        return get_torch_total_vram_mb() - get_torch_free_vram_mb()
+        Uses device-wide free (mem_get_info) rather than comfy's get_free_memory: the latter adds back
+        this process's reclaimable torch cache, so total - comfy_free under-counts usage and over-states
+        free. The parent's VRAM budget and the whole-card streaming forecast are built from these reports,
+        so an inflated free here is exactly what lets the scheduler admit a heavy model co-resident that
+        then streams. Device-wide free also correctly attributes VRAM held by other (including leaked)
+        processes, which the per-process comfy number hides.
+        """
+        from hordelib.api import get_torch_device_free_vram_mb, get_torch_total_vram_mb
+
+        return get_torch_total_vram_mb() - get_torch_device_free_vram_mb()
 
     def get_vram_total_mb(self) -> int:
         """Return the total MB of VRAM available on the GPU."""

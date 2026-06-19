@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import enum
 import multiprocessing
 import queue
+import sys
 import time
-from typing import override
+from types import ModuleType, SimpleNamespace
+from typing import Any, cast, override
 from unittest.mock import Mock
 
+import pytest
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
 from horde_worker_regen.process_management.horde_process import HordeProcess
@@ -89,7 +93,7 @@ def test_idle_heartbeat_is_throttled() -> None:
     proc.process_message_queue.put.assert_not_called()  # pyrefly: ignore
 
 
-def _make_piped_stub() -> tuple[_StubProcess, object]:
+def _make_piped_stub() -> tuple[_StubProcess, Any]:
     """Build a stub wired to a real duplex pipe; returns the stub and the parent's send end."""
     parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
     proc = _StubProcess(
@@ -195,3 +199,88 @@ def test_start_inference_for_resident_model_still_downloads_aux_models() -> None
     proc.preload_model.assert_not_called()  # pyrefly: ignore
     proc.download_aux_models.assert_called_once_with(job)  # pyrefly: ignore
     proc.start_inference.assert_called_once()  # pyrefly: ignore
+
+
+class _FakeProgressState(enum.Enum):
+    progress = enum.auto()
+    post_processing = enum.auto()
+
+
+class _FakeComfyUIProgressUnit(enum.Enum):
+    ITERATIONS_PER_SECOND = enum.auto()
+    SECONDS_PER_ITERATION = enum.auto()
+
+
+def _install_fake_hordelib_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Install the small hordelib.api surface progress_callback imports."""
+    fake_api = ModuleType("hordelib.api")
+    fake_api.__dict__["ComfyUIProgressUnit"] = _FakeComfyUIProgressUnit
+    fake_api.__dict__["ProgressState"] = _FakeProgressState
+    fake_api.__dict__["log_free_ram"] = Mock()
+    fake_hordelib = ModuleType("hordelib")
+    fake_hordelib.__dict__["api"] = fake_api
+    monkeypatch.setitem(sys.modules, "hordelib", fake_hordelib)
+    monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
+
+
+def _make_inference_proc_for_progress() -> HordeInferenceProcess:
+    """Build a bare HordeInferenceProcess with only progress-callback collaborators."""
+    proc = object.__new__(HordeInferenceProcess)
+    proc._active_model_name = "test-model"
+    proc._current_job_inference_steps_complete = False
+    proc._in_post_processing = False
+    proc._post_processing_memory_report_sent = False
+    proc._vae_lock_was_acquired = False
+    proc._last_periodic_memory_report_time = 0.0
+    proc._memory_report_interval = 5.0
+    proc._start_inference_time = time.time()
+    proc._release_inference_slot = Mock()  # pyrefly: ignore
+    proc.send_process_state_change_message = Mock()  # pyrefly: ignore
+    proc.send_heartbeat_message = Mock()  # pyrefly: ignore
+    proc.send_memory_report_message = Mock(return_value=True)  # pyrefly: ignore
+    return proc
+
+
+def _progress_report(*, step: int = 1, total: int = 20) -> SimpleNamespace:
+    """Return a fake hordelib progress report carrying one ComfyUI step."""
+    return SimpleNamespace(
+        hordelib_progress_state=_FakeProgressState.progress,
+        comfyui_progress=SimpleNamespace(
+            current_step=step,
+            total_steps=total,
+            rate=8.0,
+            rate_unit=_FakeComfyUIProgressUnit.ITERATIONS_PER_SECOND,
+            percent=round(step / total * 100),
+        ),
+    )
+
+
+def test_progress_callback_emits_periodic_vram_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mid-inference progress callback refreshes VRAM when the report interval has elapsed."""
+    _install_fake_hordelib_api(monkeypatch)
+    proc = _make_inference_proc_for_progress()
+
+    proc.progress_callback(cast(Any, _progress_report(step=3)))
+
+    cast(Mock, proc.send_memory_report_message).assert_called_once_with(include_vram=True)
+
+
+def test_progress_callback_throttles_vram_reports(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Repeated progress callbacks inside the interval must not poll VRAM every step."""
+    _install_fake_hordelib_api(monkeypatch)
+    proc = _make_inference_proc_for_progress()
+
+    proc.progress_callback(cast(Any, _progress_report(step=3)))
+    proc.progress_callback(cast(Any, _progress_report(step=4)))
+
+    cast(Mock, proc.send_memory_report_message).assert_called_once_with(include_vram=True)
+
+
+def test_sampling_complete_emits_one_boundary_vram_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sampling-complete boundary sends a fresh report and resets the periodic throttle."""
+    _install_fake_hordelib_api(monkeypatch)
+    proc = _make_inference_proc_for_progress()
+
+    proc.progress_callback(cast(Any, _progress_report(step=20, total=20)))
+
+    cast(Mock, proc.send_memory_report_message).assert_called_once_with(include_vram=True)

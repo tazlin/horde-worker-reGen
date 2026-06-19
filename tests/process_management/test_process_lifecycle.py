@@ -249,6 +249,68 @@ def test_safety_processes_should_be_replaced_property() -> None:
     assert plm.safety_processes_should_be_replaced is True
 
 
+def test_pause_and_restore_safety_on_gpu_toggles_override_and_arms_replacement() -> None:
+    """Pausing safety-on-GPU sets the cpu_only override and arms a replacement; restoring clears it.
+
+    This is how a whole-card (single-residency) job frees the safety process's CUDA context: a context is
+    only reclaimed by the process exiting, so the safety process is cycled to come back up off-GPU.
+    """
+    plm = _make_plm()
+    plm._runtime_config.bridge_data.safety_on_gpu = True
+
+    assert plm.is_safety_gpu_paused is False
+    assert plm.pause_safety_on_gpu() is True
+    assert plm.is_safety_gpu_paused is True
+    # The existing safety-replacement state machine was armed (so the on-GPU process is cycled off-GPU)...
+    assert plm.safety_processes_should_be_replaced is True
+    # ...and the cycle is marked intentional so its completion is not counted as a crash recovery.
+    assert plm._safety_replacement_intentional is True
+    # Idempotent: a second pause does nothing.
+    assert plm.pause_safety_on_gpu() is False
+
+    assert plm.restore_safety_on_gpu() is True
+    assert plm.is_safety_gpu_paused is False
+    assert plm._safety_replacement_intentional is True
+    # Idempotent: restoring when not paused does nothing.
+    assert plm.restore_safety_on_gpu() is False
+
+
+def test_pause_safety_on_gpu_is_noop_when_safety_not_on_gpu() -> None:
+    """With safety not configured on-GPU there is no context to free, so the pause is a no-op."""
+    plm = _make_plm()  # _make_plm defaults safety_on_gpu to False
+    assert plm.pause_safety_on_gpu() is False
+    assert plm.is_safety_gpu_paused is False
+
+
+def test_intentional_safety_cycle_not_counted_as_recovery() -> None:
+    """A whole-card safety pause/restore cycle completing must not bump recoveries or the crash-loop breaker.
+
+    Otherwise a burst of whole-card jobs cycling safety off/on reads as a safety crash loop and trips
+    save-our-ship (the observed instability after the overflow fix).
+    """
+    plm = _make_plm()
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]  # avoid spawning a real process on completion
+
+    # Drive the replacement state machine to its completion branch with the intentional flag set.
+    plm._safety_replacement_intentional = True
+    plm._safety_processes_should_be_replaced = True
+    plm._safety_processes_ending = True  # already in the ending phase; map is empty so it completes now
+    before = plm._num_process_recoveries
+
+    plm._replace_all_safety_process()
+
+    assert plm._num_process_recoveries == before  # not counted as a recovery
+    assert plm._safety_recovery_history == []  # crash-loop breaker not fed
+    assert plm._safety_replacement_intentional is False  # consumed
+
+    # A crash-driven rebuild (flag clear) DOES count.
+    plm._safety_processes_should_be_replaced = True
+    plm._safety_processes_ending = True
+    plm._replace_all_safety_process()
+    assert plm._num_process_recoveries == before + 1
+    assert len(plm._safety_recovery_history) == 1
+
+
 def _patch_spawn_with_stub(plm: ProcessLifecycleManager) -> None:
     """Replace real process spawning with a stub that adds an idle mock process to the map."""
 
@@ -294,9 +356,14 @@ def test_scale_down_stops_idle_processes() -> None:
     plm = _make_plm()
     _patch_spawn_with_stub(plm)
     plm.scale_inference_processes(2)
+    retired_process = plm._process_map[0]
 
     assert plm.scale_inference_processes(1) == 1
     assert plm._process_map.num_inference_processes() == 1
+    assert plm._process_map.is_retired_launch(
+        retired_process.process_id,
+        retired_process.process_launch_identifier,
+    )
 
 
 def test_scale_down_never_kills_busy_processes() -> None:

@@ -276,11 +276,19 @@ def summarize_skips(skipped_reasons: dict[str, int], *, limit: int = 4) -> str:
 
 
 def _maintenance_detail(snapshot: WorkerStateSnapshot) -> str:
-    """Explain a paused/maintenance worker, naming the horde as the source when it is."""
+    """Explain a paused/maintenance worker, naming the source (horde-forced, self-throttle, or local)."""
     if snapshot.worker_details_maintenance or snapshot.worker_details_paused:
         what = "maintenance" if snapshot.worker_details_maintenance else "paused"
-        return f"The horde has this worker set to {what}; it will not be given new jobs. In-flight jobs finish."
-    return "Not popping new jobs (maintenance mode). In-flight jobs will finish."
+        return (
+            f"The horde has this worker set to {what} (server-side); it will not be given new jobs until "
+            "cleared. In-flight jobs finish. Press the Maintenance (horde) key to toggle it."
+        )
+    if snapshot.self_throttle_paused:
+        return (
+            "The worker paused itself: too many resource/OOM faults recently, so it backed off to avoid the "
+            "horde forcing maintenance. It will resume automatically after a cooldown. In-flight jobs finish."
+        )
+    return "Not popping new jobs (locally paused). In-flight jobs will finish."
 
 
 def _is_warming_up(snapshot: WorkerStateSnapshot) -> bool:
@@ -337,6 +345,9 @@ def _build_checks(snapshot: WorkerStateSnapshot, snapshot_age: float | None) -> 
         checks.append(HealthCheck("Models", HealthStatus.INFO, "No model loaded yet"))
 
     checks.append(_gpu_check(snapshot))
+    residency_check = _residency_check(snapshot)
+    if residency_check is not None:
+        checks.append(residency_check)
     checks.append(_disk_check(snapshot))
 
     if snapshot.too_many_consecutive_failed_jobs:
@@ -364,6 +375,27 @@ def _build_checks(snapshot: WorkerStateSnapshot, snapshot_age: float | None) -> 
         checks.append(HealthCheck("Responsiveness", status, f"Last update {human_duration(snapshot_age)} ago"))
 
     return checks
+
+
+def _residency_check(snapshot: WorkerStateSnapshot) -> HealthCheck | None:
+    """An informational note that whole-card single residency can engage, or is engaged right now.
+
+    Surfaced so an operator who later sees inference-process rows disappear (the residency teardown)
+    is not led to think the worker has broken: it is a deliberate, configured behaviour for very heavy
+    models. Returns None when the feature cannot engage under the current config, so the checklist stays
+    quiet on workers it never applies to.
+    """
+    residency = snapshot.whole_card_residency
+    if residency.active:
+        model = residency.model or "a heavy model"
+        return HealthCheck("Residency", HealthStatus.INFO, f"{model} has sole use of the GPU (intentional)")
+    if residency.possible:
+        return HealthCheck(
+            "Residency",
+            HealthStatus.INFO,
+            "Heavy models (e.g. Flux) may briefly get sole use of the GPU; idle processes pause by design",
+        )
+    return None
 
 
 def _gpu_check(snapshot: WorkerStateSnapshot) -> HealthCheck:

@@ -17,6 +17,7 @@ from horde_worker_regen.app_state import OverviewViewMode
 from horde_worker_regen.process_management.supervisor_channel import (
     JobQueueEntry,
     ProcessSnapshot,
+    WholeCardResidencyStatus,
     WorkerStateSnapshot,
 )
 from horde_worker_regen.tui.formatters import (
@@ -81,6 +82,7 @@ class OverviewView(VerticalScroll):
         yield Static(id="overview-trends")
         yield Static(id="overview-pipeline")
         yield Static(id="overview-processes")
+        yield Static(id="overview-residency")
         yield Static(id="overview-worker")
         yield Static(id="overview-alchemy")
         yield Static(id="overview-queue")
@@ -121,6 +123,12 @@ class OverviewView(VerticalScroll):
         for node_id in self._DETAIL_NODE_IDS:
             self.query_one(node_id, Static).display = detailed
 
+        # The residency detail is details-only AND only when the feature applies, so the panel never
+        # clutters the detailed view on hardware/configs that never engage whole-card residency.
+        residency = snapshot.whole_card_residency if snapshot is not None else None
+        show_residency = detailed and residency is not None and (residency.active or residency.possible)
+        self.query_one("#overview-residency", Static).display = show_residency
+
         if snapshot is not None:
             self._maybe_record_trends(snapshot)
 
@@ -141,6 +149,10 @@ class OverviewView(VerticalScroll):
                 self.query_one("#overview-alchemy", Static).update(self._render_alchemy_panel(snapshot))
                 self.query_one("#overview-queue", Static).update(self._render_queue_table(snapshot))
                 self.query_one("#overview-recent", Static).update(self._render_recent_jobs(snapshot))
+                if show_residency:
+                    self.query_one("#overview-residency", Static).update(
+                        self._render_residency_panel(snapshot.whole_card_residency),
+                    )
 
     def _maybe_record_trends(self, snapshot: WorkerStateSnapshot) -> None:
         """Record a trend sample at most once per :data:`_TREND_SAMPLE_INTERVAL` of wall-clock time."""
@@ -194,6 +206,8 @@ class OverviewView(VerticalScroll):
                         style="yellow",
                     )
                 )
+            if snapshot.whole_card_residency.active:
+                body.append(self._residency_banner(snapshot.whole_card_residency))
             for message in snapshot.api_messages[:3]:
                 body.append(Text.assemble(("✉ ", "cyan"), (message, "italic cyan")))
 
@@ -234,6 +248,129 @@ class OverviewView(VerticalScroll):
             (str(snapshot.jobs_in_progress), "grey70"),
             ("  ·  queued ", "grey50"),
             (str(snapshot.jobs_pending_inference), "grey70"),
+        )
+
+    @staticmethod
+    def _residency_banner(residency: WholeCardResidencyStatus) -> Text:
+        """A hero line explaining an active whole-card residency: what is happening, why, and by how much.
+
+        Reassures the operator that the disappeared inference rows and cycled safety process are a
+        deliberate response to a very heavy model, not a fault.
+        """
+        model = residency.model or "a heavy model"
+        line = Text.assemble(
+            ("♦ whole-card residency: ", "bold #f0beff"),
+            (model, "bold #f0beff"),
+            (" has sole use of the GPU", "#f0beff"),
+        )
+        line.append(
+            f" — running {residency.processes_now}/{residency.processes_max} inference processes",
+            style="grey70",
+        )
+        if residency.safety_paused:
+            line.append(", safety off-GPU", style="grey70")
+        if residency.weights_mb and residency.total_vram_mb:
+            line.append(
+                f"; needs ~{human_mb(residency.weights_mb)} of {human_mb(residency.total_vram_mb)} for weights",
+                style="grey70",
+            )
+        if residency.phase == "establishing":
+            line.append(" (establishing…)", style="italic yellow")
+        else:
+            line.append(" (intentional for very heavy models)", style="italic grey50")
+        return line
+
+    @staticmethod
+    def _residency_caption(residency: WholeCardResidencyStatus) -> str | None:
+        """A one-line caption for the process table naming what residency paused, or None when inactive.
+
+        Answers "where did my process rows go?" right at the table whose rows the teardown removed.
+        """
+        if not residency.active:
+            return None
+        model = residency.model or "a heavy model"
+        clauses: list[str] = []
+        paused = max(0, residency.processes_max - residency.processes_now)
+        if paused:
+            plural = "process" if paused == 1 else "processes"
+            clauses.append(f"{paused} idle inference {plural} paused")
+        if residency.safety_paused:
+            clauses.append("safety off-GPU")
+        if not clauses:
+            return f"Whole-card residency: {model} has sole use of the GPU (intentional)"
+        return f"Whole-card residency: {' + '.join(clauses)} for {model} (intentional)"
+
+    @staticmethod
+    def _render_residency_panel(residency: WholeCardResidencyStatus) -> Panel:
+        """Render the whole-card residency posture and, when active, the live forecast numbers.
+
+        A details-only panel: the operationally-relevant config, plus while a residency is held the hard
+        VRAM figures behind the decision (weights, the per-step reserve, the free achievable alone) that
+        are a hair too technical for the normal view.
+        """
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(justify="right", style="bold cyan", no_wrap=True)
+        grid.add_column()
+        grid.add_column(justify="right", style="bold cyan", no_wrap=True)
+        grid.add_column()
+
+        grid.add_row(
+            "Enabled",
+            "yes" if residency.enabled else "no",
+            "Safety off-GPU",
+            "yes" if residency.safety_off_gpu_enabled else "no",
+        )
+        overhead = human_mb(residency.per_process_overhead_mb) if residency.per_process_overhead_mb else "auto"
+        grid.add_row("Cooldown", f"{residency.cooldown_seconds}s", "Per-process overhead", overhead)
+        grid.add_row(
+            "Total VRAM",
+            human_mb(residency.total_vram_mb) if residency.total_vram_mb else "-",
+            "",
+            "",
+        )
+
+        if residency.active:
+            grid.add_row(
+                "Phase",
+                Text(residency.phase or "-", style="#f0beff"),
+                "Model",
+                residency.model or "-",
+            )
+            grid.add_row(
+                "Processes",
+                f"{residency.processes_now} / {residency.processes_target} (of {residency.processes_max})",
+                "Safety paused",
+                "yes" if residency.safety_paused else "no",
+            )
+            grid.add_row("Weights", human_mb(residency.weights_mb), "Step reserve", human_mb(residency.reserve_mb))
+            grid.add_row(
+                "Free at load",
+                human_mb(residency.free_now_mb),
+                "Free if alone",
+                human_mb(residency.free_if_alone_mb),
+            )
+            max_resident = str(residency.max_resident_processes) if residency.max_resident_processes else "-"
+            cooldown_left = (
+                human_duration(residency.cooldown_remaining_seconds)
+                if residency.cooldown_remaining_seconds is not None
+                else "-"
+            )
+            grid.add_row("Max co-resident", max_resident, "Restores in", cooldown_left)
+
+        border = "#f0beff" if residency.active else "grey37"
+        subtitle = (
+            Text("armed; engages for very heavy models", style="grey50")
+            if not residency.active and residency.possible
+            else None
+        )
+        return Panel(
+            grid,
+            title="Whole-card residency",
+            title_align="left",
+            subtitle=subtitle,
+            subtitle_align="right",
+            border_style=border,
+            padding=(0, 1),
         )
 
     def _render_health(self, report: HealthReport) -> Panel:
@@ -600,7 +737,7 @@ class OverviewView(VerticalScroll):
         table.add_column("Size", justify="right", width=12, no_wrap=True)
         table.add_column("Progress", width=16, no_wrap=True)
         table.add_column("it/s", justify="right", width=7)
-        table.add_column("VRAM", justify="right", min_width=12)
+        table.add_column("GPU VRAM", justify="right", min_width=12)
         table.add_column("Done", justify="right", width=5)
         if detailed:
             table.add_column("Steps", justify="right", width=6)
@@ -615,13 +752,19 @@ class OverviewView(VerticalScroll):
             return table
 
         now = time.time()
+        residency = snapshot.whole_card_residency
         for process in snapshot.processes:
             vram = (
                 f"{human_mb(process.vram_usage_mb)} / {human_mb(process.total_vram_mb)}"
                 if process.total_vram_mb
                 else human_mb(process.vram_usage_mb)
             )
-            state_label = label_state(process.last_process_state)
+            state_cell = Text(
+                label_state(process.last_process_state), style=self._state_style(process.last_process_state)
+            )
+            if residency.active and residency.model and process.loaded_horde_model_name == residency.model:
+                # Mark the slot holding the whole-card model so the ★ reads against the residency caption.
+                state_cell.append(" ★", style="#f0beff")
             features_text = (
                 ", ".join(process.current_job_features.as_tags())
                 if process.current_job_features is not None and not process.current_job_features.is_empty()
@@ -630,7 +773,7 @@ class OverviewView(VerticalScroll):
             cells: list[str | Text] = [
                 str(process.process_id),
                 process.process_type.title(),
-                Text(state_label, style=self._state_style(process.last_process_state)),
+                state_cell,
                 shorten(process.loaded_horde_model_name, 22),
                 features_text,
                 self._size_cell(process),
@@ -647,6 +790,11 @@ class OverviewView(VerticalScroll):
                     process.last_heartbeat_type.replace("_", " ").title() if process.is_busy else "-",
                 ]
             table.add_row(*cells)
+
+        caption = self._residency_caption(residency)
+        if caption is not None:
+            table.caption = caption
+            table.caption_style = "italic #f0beff"
         return table
 
     @staticmethod

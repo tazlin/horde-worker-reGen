@@ -417,8 +417,13 @@ post_process_timeout: 60
 # Maximum time (seconds) to allow a model to load from disk into VRAM before the process is killed.
 preload_timeout: 80
 
-# Maximum time (seconds) to allow a single inference step before the process is killed.
-inference_step_timeout: 15
+# Maximum time (seconds) a single sampling step may make no progress before the process is killed as hung.
+inference_step_timeout: 20
+
+# Maximum time (seconds) for a job's first sampling step, which also covers the cold work preceding it
+# (streaming a large model's components through VRAM, the initial prompt encode). This is legitimately
+# far longer than a steady step; raise it if heavy models (e.g. Flux) are killed during their first step.
+inference_first_step_timeout: 90
 
 # Maximum time (seconds) to allow an auxiliary model (LoRA, etc.) to download before it is killed.
 download_timeout: 121
@@ -473,6 +478,51 @@ vram_reserve_mb: 2048
 # Available system RAM (MB) the budget keeps in reserve so resident-in-RAM models do not force
 # the OS to page to disk. Only used when enable_vram_budget is true.
 ram_reserve_mb: 4096
+
+# Run a model admitted *against* the VRAM budget (a best-effort head-of-queue admit) with the device
+# to itself. On a small-VRAM card a heavy model (e.g. a Flux combined checkpoint) only fits if nothing
+# else is resident; running it exclusively (evicting other residents, suppressing concurrent staging)
+# stops its weights spilling to system RAM and being killed as a hang. Only used with enable_vram_budget.
+overbudget_exclusive_mode: true
+
+# Give a model whose weights+activations need most of the card sole residency *before* it streams. On a
+# small-VRAM card (e.g. Flux on 16GB) the scheduler stops idle inference processes (their fixed CUDA
+# contexts, ~1GB each, only freed by the process exiting) and evicts other residents so the heavy model
+# loads fully resident and samples at full speed instead of spilling activations to system RAM. Only used
+# with enable_vram_budget.
+whole_card_exclusive_residency: true
+
+# When a whole-card model claims the device, also move the safety process off-GPU (cpu_only) for the
+# job's duration, freeing its ~1GB CUDA context. On a 16GB card this is what lets Flux fit without
+# streaming. Restored after. Only used with enable_vram_budget and safety_on_gpu.
+whole_card_residency_safety_off_gpu: true
+
+# How long to hold a whole-card residency in place after its last heavy job drains, before restoring full
+# concurrency and safety-on-GPU. A whole-card event is disruptive (stops processes, cycles safety), so a
+# burst of heavy jobs should reuse one residency rather than each churning a teardown/restore. During the
+# cooldown the worker stays in single-residency mode, so a follow-on heavy job runs immediately with no
+# churn. 0 restores immediately (most responsive, most churn). Only used with enable_vram_budget.
+whole_card_residency_cooldown_seconds: 45
+
+# Per-step hang timeout (seconds) for a job admitted against the VRAM budget. Such a heavy job can
+# stream weights through VRAM each step, so its steps are legitimately far slower than a normal step;
+# this generous grace lets it complete instead of being killed. Floored at inference_step_timeout.
+overbudget_step_timeout: 120
+
+# Consecutive over-budget terminal faults for one model before it is treated as locally unservable and
+# held back (not popped, not admitted) for unservable_model_cooldown_seconds, so the worker stops
+# dropping jobs it cannot run faster than the horde tolerates. A successful generation resets it. 0 = off.
+unservable_model_fault_threshold: 3
+
+# How long a model flagged locally unservable is held back before the worker tries it again.
+unservable_model_cooldown_seconds: 900
+
+# Backstop above the per-model breaker: terminal resource/OOM faults across all models within
+# self_maintenance_window_seconds before the worker pauses popping itself (in-flight jobs finish) for
+# self_maintenance_cooldown_seconds, so it never trips the horde's "dropping too many jobs" guard. 0 = off.
+self_maintenance_fault_threshold: 6
+self_maintenance_window_seconds: 600
+self_maintenance_cooldown_seconds: 300
 
 #############################
 ## Model Downloads         ##

@@ -6,6 +6,7 @@ import time
 from unittest.mock import Mock
 
 import pytest
+from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
@@ -309,6 +310,101 @@ class TestGetNextJobAndProcess:
         assert await inference_scheduler.get_next_job_and_process() is None
 
 
+class TestAuxDownloadLineSkip:
+    """Tests for modest resident jobs bypassing a head job blocked on aux downloads."""
+
+    async def _make_scheduler(
+        self,
+        *,
+        candidate_job: ImageGenerateJobPopResponse | None = None,
+        candidate_process_state: HordeProcessState = HordeProcessState.PRELOADED_MODEL,
+        exclusive_active_job: bool = False,
+        bridge_data: Mock | None = None,
+    ) -> tuple[InferenceScheduler, JobTracker, ImageGenerateJobPopResponse, ImageGenerateJobPopResponse]:
+        """Create a queue where the head job's model is busy downloading aux models."""
+        blocked_process = make_mock_process_info(
+            0,
+            model_name="blocked_model",
+            state=HordeProcessState.DOWNLOADING_AUX_MODEL,
+        )
+        candidate_process = make_mock_process_info(
+            1,
+            model_name="small_model",
+            state=candidate_process_state,
+        )
+        process_map = ProcessMap({0: blocked_process, 1: candidate_process})
+        job_tracker = JobTracker()
+
+        active_aux_job = make_job_pop_response("blocked_model")
+        await track_popped_job_async(job_tracker, active_aux_job)
+        await mark_job_in_progress_async(job_tracker, active_aux_job)
+        if exclusive_active_job:
+            job_tracker.mark_admitted_exclusive(active_aux_job)
+
+        blocked_head_job = make_job_pop_response("blocked_model")
+        await track_popped_job_async(job_tracker, blocked_head_job)
+
+        if candidate_job is None:
+            candidate_job = make_job_pop_response("small_model")
+        await track_popped_job_async(job_tracker, candidate_job)
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            bridge_data=bridge_data,
+            max_concurrent=1,
+            max_inference=2,
+        )
+        return scheduler, job_tracker, blocked_head_job, candidate_job
+
+    async def test_modest_resident_job_bypasses_aux_download_cap(self) -> None:
+        """A small resident job can dispatch while the capped slot is only downloading aux models."""
+        scheduler, job_tracker, blocked_head_job, candidate_job = await self._make_scheduler()
+
+        result = await scheduler.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is candidate_job
+        assert result.process_with_model.process_id == 1
+        assert result.line_skip is not None
+        assert result.line_skip.displaced_job is blocked_head_job
+
+        assert await scheduler.start_inference() is True
+        assert candidate_job in job_tracker.jobs_in_progress
+
+    async def test_aux_download_cap_bypass_rejects_oversized_candidate(self) -> None:
+        """The cap bypass still enforces the performance-mode eMPS threshold."""
+        large_candidate = make_job_pop_response("small_model", width=1024, height=1024, ddim_steps=100)
+        bridge_data = make_mock_bridge_data(high_performance_mode=True)
+        scheduler, _, _, _ = await self._make_scheduler(candidate_job=large_candidate, bridge_data=bridge_data)
+
+        assert await scheduler.get_next_job_and_process() is None
+
+    async def test_aux_download_cap_bypass_rejects_lora_candidate(self) -> None:
+        """A bypass candidate that also needs LoRA work must not jump the line."""
+        lora_candidate = make_job_pop_response(
+            "small_model",
+            loras=[LorasPayloadEntry(name="line-skip-test-lora")],
+        )
+        scheduler, _, _, _ = await self._make_scheduler(candidate_job=lora_candidate)
+
+        assert await scheduler.get_next_job_and_process() is None
+
+    async def test_aux_download_cap_bypass_requires_ready_candidate_process(self) -> None:
+        """The resident candidate's process must be able to accept work."""
+        scheduler, _, _, _ = await self._make_scheduler(
+            candidate_process_state=HordeProcessState.INFERENCE_STARTING,
+        )
+
+        assert await scheduler.get_next_job_and_process() is None
+
+    async def test_aux_download_cap_bypass_respects_exclusive_in_progress_job(self) -> None:
+        """Exclusive jobs keep full-device isolation even when the head slot is downloading aux models."""
+        scheduler, _, _, _ = await self._make_scheduler(exclusive_active_job=True)
+
+        assert await scheduler.get_next_job_and_process() is None
+
+
 class TestStartInference:
     """Tests for start_inference."""
 
@@ -543,13 +639,13 @@ class TestUnloadModels:
 
 
 class TestHeadOfQueueMakeRoom:
-    """The head-of-queue job must keep making progress: when its model cannot be loaded and only
+    """The head-of-queue job must keep making progress.
 
     other queued jobs' models are idle-resident, the budget gate escalates to evict one of them so
     the head gets room, rather than starving the whole worker behind an un-loadable head.
     """
 
-    async def _scheduler_with_head_blocked(self) -> tuple[InferenceScheduler, "Mock"]:
+    async def _scheduler_with_head_blocked(self) -> tuple[InferenceScheduler, Mock]:
         """A model-less preload slot, a slot holding a *queued* model, and a non-resident head job."""
         target = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         holder = make_mock_process_info(1, model_name="queued_b", state=HordeProcessState.WAITING_FOR_JOB)

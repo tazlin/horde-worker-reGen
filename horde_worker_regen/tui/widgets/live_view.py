@@ -151,7 +151,7 @@ class LiveView(VerticalScroll):
             body.add_row("Working", Text(working_label + "…", style="yellow"))
 
         body.add_row(
-            "VRAM",
+            "GPU VRAM",
             f"{human_mb(process.vram_usage_mb)} / {human_mb(process.total_vram_mb)}"
             f"   (peak {human_mb(process.vram_used_high_water_mb)})",
         )

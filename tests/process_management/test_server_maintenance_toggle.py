@@ -8,7 +8,8 @@ command and a TUI key. An operator resume (F2) additionally clears server mainte
 
 from __future__ import annotations
 
-import threading
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -17,6 +18,29 @@ from horde_worker_regen.process_management import process_manager as process_man
 from horde_worker_regen.process_management.supervisor_channel import SupervisorCommand, SupervisorControlMessage
 
 from .conftest import make_testable_process_manager
+
+
+class _InlineThread:
+    """A ``threading.Thread`` stand-in that runs its target inline on ``start()``.
+
+    The supervisor handler dispatches the (blocking) horde maintenance call off the control loop on a
+    daemon thread; tests patch this in so that dispatch is synchronous and deterministic, with no real
+    background threads to race the assertions.
+    """
+
+    def __init__(self, *, target: Callable[..., Any], args: tuple[Any, ...] = (), **_kwargs: Any) -> None:
+        """Capture the target and positional args, ignoring thread-only kwargs (name/daemon)."""
+        self._target = target
+        self._args = args
+
+    def start(self) -> None:
+        """Run the captured target synchronously."""
+        self._target(*self._args)
+
+
+def _run_off_loop_inline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the supervisor handler's off-loop thread dispatch run inline for deterministic assertions."""
+    monkeypatch.setattr(process_manager_module.threading, "Thread", _InlineThread)
 
 
 class TestSetMaintenanceApiCall:
@@ -59,14 +83,10 @@ class TestSupervisorMaintenanceCommand:
     def test_command_dispatches_set_maintenance(self, enabled: bool, monkeypatch: pytest.MonkeyPatch) -> None:
         """The command runs ``_set_server_maintenance_safe(enabled)`` on a background thread."""
         manager = make_testable_process_manager()
-        recorded: dict[str, object] = {}
-        done = threading.Event()
+        _run_off_loop_inline(monkeypatch)
+        recorded: list[bool] = []
+        monkeypatch.setattr(manager, "_set_server_maintenance_safe", lambda value: recorded.append(value))
 
-        def fake_safe(value: bool) -> None:
-            recorded["enabled"] = value
-            done.set()
-
-        monkeypatch.setattr(manager, "_set_server_maintenance_safe", fake_safe)
         manager._apply_supervisor_command(
             SupervisorControlMessage(
                 command=SupervisorCommand.SET_SERVER_MAINTENANCE,
@@ -74,8 +94,7 @@ class TestSupervisorMaintenanceCommand:
             ),
         )
 
-        assert done.wait(timeout=2.0), "off-loop maintenance call was not made"
-        assert recorded["enabled"] is enabled
+        assert recorded == [enabled]
 
 
 class TestResumeClearsMaintenanceOnlyWhenConfigured:
@@ -85,18 +104,13 @@ class TestResumeClearsMaintenanceOnlyWhenConfigured:
         """With the flag on, a resume also clears horde-side maintenance (off-loop)."""
         manager = make_testable_process_manager(remove_maintenance_on_init=True)
         manager._state.supervisor_paused = True
+        _run_off_loop_inline(monkeypatch)
         recorded: list[bool] = []
-        done = threading.Event()
-        monkeypatch.setattr(
-            manager,
-            "_set_server_maintenance_safe",
-            lambda value: (recorded.append(value), done.set()),
-        )
+        monkeypatch.setattr(manager, "_set_server_maintenance_safe", lambda value: recorded.append(value))
 
         manager._apply_supervisor_command(SupervisorControlMessage(command=SupervisorCommand.RESUME))
 
         assert manager._state.supervisor_paused is False
-        assert done.wait(timeout=2.0)
         assert recorded == [False]
 
     def test_resume_does_not_clear_when_flag_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:

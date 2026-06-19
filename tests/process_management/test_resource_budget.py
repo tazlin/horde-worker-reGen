@@ -128,6 +128,96 @@ class TestPreloadBudgetGate:
         # ...and the idle resident model was evicted to reclaim VRAM (residency overridden under pressure).
         assert resident.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
+    async def test_starved_head_force_admitted_before_wedge(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A head the budget can never satisfy is force-admitted once it has starved past the horizon.
+
+        Regression for an observed save-our-ship catastrophe: after a whole-card teardown/restore left
+        idle processes holding allocator-stranded RAM, the head-of-queue model failed the RAM budget and no
+        reclaim path could free room, so it was deferred indefinitely until the recovery supervisor soft-reset
+        every pool and faulted the backlog. The starvation backstop must force-admit the head onto the idle
+        device first. Here ``unload_models`` always reports reclaiming something, so the existing best-effort
+        admit never fires (the gate defers every tick); only the time-based backstop can break the wedge.
+        """
+        import time as _time
+
+        from horde_worker_regen.process_management import inference_scheduler as _sched_mod
+
+        monkeypatch.setattr(resource_budget, "predict_job_vram_mb", lambda job, baseline: 1000.0)
+        monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 50000.0)
+
+        spare = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        spare.total_vram_mb = 16000
+        spare.vram_usage_mb = 1000  # ample free VRAM, so only the RAM gate defers
+        process_map = ProcessMap({0: spare})
+
+        job_tracker = JobTracker()
+        job = make_job_pop_response("model_a")
+        await track_popped_job_async(job_tracker, job)
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            bridge_data=_budget_bridge_data(),
+            max_concurrent=2,
+            max_inference=2,
+        )
+        monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
+        # Reclaim always "succeeds", so the RAM branch defers every tick and the existing best-effort
+        # admit (which requires reclaim to be exhausted) never triggers -- a perpetual wedge.
+        monkeypatch.setattr(scheduler, "unload_models", lambda *a, **k: True)
+
+        # First tick: the head cannot be admitted and the wedge begins; the starvation clock starts.
+        assert scheduler.preload_models() is False
+        assert spare.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+        assert scheduler._head_starvation_job_id == str(job.id_)
+
+        # Backdate the clock past the force-admit horizon to simulate a sustained wedge.
+        scheduler._head_starvation_since = _time.time() - (_sched_mod._HEAD_STARVATION_FORCE_ADMIT_SECONDS + 1.0)
+
+        # Next tick: the head is force-admitted best-effort instead of wedging into save-our-ship.
+        assert scheduler.preload_models() is True
+        assert spare.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        assert job_tracker._tracked_for(job).admitted_over_budget is True
+
+    async def test_starved_head_clock_resets_when_live_job_holds_device(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The starvation clock must not run while a live job holds the device (head is merely queued).
+
+        Otherwise the backstop would force a second concurrent heavy load and reintroduce the very
+        over-commit the budget guards against.
+        """
+        monkeypatch.setattr(resource_budget, "predict_job_vram_mb", lambda job, baseline: 1000.0)
+        monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 50000.0)
+
+        spare = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        spare.total_vram_mb = 16000
+        spare.vram_usage_mb = 1000
+        busy = make_mock_process_info(1, model_name="model_b", state=HordeProcessState.INFERENCE_STARTING)
+        process_map = ProcessMap({0: spare, 1: busy})
+
+        job_tracker = JobTracker()
+        live = make_job_pop_response("model_b")
+        await track_popped_job_async(job_tracker, live)
+        await job_tracker.mark_inference_started(live)
+        head = make_job_pop_response("model_a")
+        await track_popped_job_async(job_tracker, head)
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            bridge_data=_budget_bridge_data(),
+            max_concurrent=2,
+            max_inference=2,
+        )
+        monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
+
+        scheduler._update_head_starvation_timer(head)
+        # A live job holds the device, so the head's clock must not be running.
+        assert scheduler._head_starvation_job_id is None
+        assert scheduler._head_starved_seconds(head) == 0.0
+
     async def test_preload_proceeds_when_within_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """With ample free VRAM and RAM the budget admits and the preload is sent."""
         monkeypatch.setattr(resource_budget, "predict_job_vram_mb", lambda job, baseline: 4000.0)

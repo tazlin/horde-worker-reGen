@@ -32,11 +32,29 @@ import json
 import sys
 
 try:
-    from hordelib.utils.torch_memory import enumerate_accelerators
+    from hordelib.utils.torch_memory import (
+        enumerate_accelerators,
+        get_torch_free_vram_mb,
+        get_torch_total_vram_mb,
+    )
 
+    _accelerators = enumerate_accelerators()
+    # Right after enumeration (which initialises the backend) the only device allocation is this fresh
+    # process's runtime/CUDA context, with no model loaded, so total-free approximates the per-process
+    # VRAM overhead on an idle device -- the term the streaming forecast subtracts from total VRAM to get
+    # the free achievable under sole residency.
+    try:
+        _overhead_mb = max(0, int(get_torch_total_vram_mb()) - int(get_torch_free_vram_mb()))
+    except BaseException:
+        _overhead_mb = 0
     _payload = [
-        {{"index": int(a.index), "name": str(a.name), "total_vram_mb": int(a.total_vram_mb)}}
-        for a in enumerate_accelerators()
+        {{
+            "index": int(a.index),
+            "name": str(a.name),
+            "total_vram_mb": int(a.total_vram_mb),
+            "runtime_overhead_mb": _overhead_mb,
+        }}
+        for a in _accelerators
     ]
 except BaseException as exc:  # noqa: BLE001 - any failure means "no devices"; report and exit non-zero
     print("ACCEL_PROBE_ERR:" + repr(exc), file=sys.stderr)
@@ -52,6 +70,9 @@ class ProbedAccelerator(BaseModel):
     index: int
     name: str
     total_vram_mb: int
+    runtime_overhead_mb: int = 0
+    """Approx. per-process VRAM (MB) a fresh torch process consumes for its context, measured on the idle
+    device at probe time. Defaults to 0 for probes/serialisations that predate this field."""
 
 
 def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelerator]:

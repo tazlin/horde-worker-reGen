@@ -386,6 +386,58 @@ class WorkerLivenessFrame(BaseModel):
     """Worker wall-clock time (``time.time()``) the control loop last began a tick."""
 
 
+class WholeCardResidencyStatus(BaseModel):
+    """Whole-card exclusive-residency posture: whether it can engage, and live detail when it has.
+
+    Whole-card residency stops idle sibling inference processes (and may move the safety process off-GPU)
+    to give a very heavy model sole use of the device, so its weights stay resident instead of streaming
+    from host RAM. From the dashboard that looks like processes vanishing for no reason; these fields let
+    the TUI explain it. ``possible`` is the config/topology heads-up (it *could* engage); the rest is the
+    live detail of a residency currently held. MB figures are device VRAM rounded to whole MB.
+    """
+
+    possible: bool = False
+    """The feature could engage under the current config and process topology (operator heads-up)."""
+    enabled: bool = False
+    """The ``whole_card_exclusive_residency`` config flag is on."""
+    safety_off_gpu_enabled: bool = False
+    """A whole-card job would also move the safety process off-GPU (config + safety on-GPU)."""
+    cooldown_seconds: int = 0
+    """Configured seconds a residency is held after its last heavy job drains, before restoring."""
+    per_process_overhead_mb: int = 0
+    """Per-process CUDA-context VRAM the forecast assumes (configured override, else startup-measured)."""
+    total_vram_mb: int = 0
+    """Device total VRAM (MB), 0 before any process has reported."""
+
+    active: bool = False
+    """A whole-card residency is currently held."""
+    model: str | None = None
+    """The model holding sole residency, when active."""
+    phase: str = ""
+    """``establishing`` (siblings stopping, model loading) or ``holding`` (serving) while active."""
+    safety_paused: bool = False
+    """The safety process is currently paused off-GPU for this residency."""
+    processes_now: int = 0
+    """Loaded inference processes right now (after any teardown)."""
+    processes_target: int = 0
+    """Inference processes the residency targets (the forecast's max-resident count)."""
+    processes_max: int = 0
+    """The normal inference-process ceiling, so the paused count is ``processes_max - processes_now``."""
+    cooldown_remaining_seconds: float | None = None
+    """Seconds left before the residency restores once its jobs drained, or None when not active."""
+
+    weights_mb: int | None = None
+    """Resident weight footprint of the residency model (detail view)."""
+    reserve_mb: int | None = None
+    """Free-VRAM headroom the forecast required, the activation working set (detail view)."""
+    free_now_mb: int | None = None
+    """Measured device-wide free VRAM at establishment (detail view)."""
+    free_if_alone_mb: int | None = None
+    """Free VRAM achievable with sole residency (detail view)."""
+    max_resident_processes: int | None = None
+    """The forecast's largest co-resident process count that still avoids streaming."""
+
+
 class WorkerStateSnapshot(BaseModel):
     """One frame of worker state pushed from the worker to its supervisor over the pipe.
 
@@ -400,7 +452,11 @@ class WorkerStateSnapshot(BaseModel):
 
     shutting_down: bool = False
     maintenance_mode: bool = False
-    """Maintenance: the local pop loop hit maintenance, or the operator paused the worker locally."""
+    """Maintenance: the local pop loop hit maintenance, the operator paused the worker locally, or the
+    worker self-throttled (see ``self_throttle_paused``)."""
+    self_throttle_paused: bool = False
+    """The worker paused popping itself: resource/OOM faults accumulated fast enough that it backed off to
+    avoid the horde forcing maintenance for "dropping too many jobs"."""
     worker_details_maintenance: bool = False
     """The horde's worker-details API reports this worker in maintenance (polled, advisory)."""
     worker_details_paused: bool = False
@@ -481,6 +537,9 @@ class WorkerStateSnapshot(BaseModel):
     pending_jobs: list[JobQueueEntry] = Field(default_factory=list)
     """Pending-inference jobs (capped at :data:`PENDING_JOBS_IN_SNAPSHOT`), oldest first."""
 
+    whole_card_residency: WholeCardResidencyStatus = Field(default_factory=WholeCardResidencyStatus)
+    """Whole-card exclusive-residency posture: whether it can engage, and live detail when it has."""
+
 
 class SupervisorCommand(enum.Enum):
     """A control action the supervisor asks the worker to take, drained each loop tick."""
@@ -503,6 +562,12 @@ class SupervisorCommand(enum.Enum):
     """Resume held background model downloads."""
     SET_DOWNLOAD_RATE_LIMIT = enum.auto()
     """Set the background-download bandwidth cap in KB/s (0 or None clears the cap)."""
+    SET_SERVER_MAINTENANCE = enum.auto()
+    """Set the worker's *server-side* maintenance flag on the horde (``server_maintenance_enabled``).
+
+    Distinct from :attr:`PAUSE`/:attr:`RESUME` (the local pop-pause): this calls the horde API so the
+    horde itself stops (or resumes) sending the worker jobs, matching the maintenance the job-pop response
+    reports."""
     SHUTDOWN = enum.auto()
     """Begin a graceful, timed shutdown of the worker."""
 
@@ -520,6 +585,8 @@ class SupervisorControlMessage(BaseModel):
     """The new running inference-process count, for :attr:`SupervisorCommand.SET_CONCURRENCY`."""
     download_rate_limit_kbps: int | None = None
     """The new download bandwidth cap in KB/s, for :attr:`SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT`."""
+    server_maintenance_enabled: bool | None = None
+    """The desired server-side maintenance state, for :attr:`SupervisorCommand.SET_SERVER_MAINTENANCE`."""
 
 
 class SupervisorChannel:

@@ -33,6 +33,15 @@ class WorkerState:
     supervisor_paused: bool = False
     """Local pause requested by a supervising frontend (TUI). Stops new job/alchemy pops; in-flight work finishes."""
 
+    self_throttle_paused: bool = False
+    """Worker-initiated local pop-pause: the self-throttle backstop engaged because resource/OOM faults
+    accumulated fast enough to risk the horde forcing the worker into maintenance. Stops new pops (in-flight
+    work finishes) until the cooldown elapses. Kept separate from ``supervisor_paused`` so the worker's own
+    throttle never clobbers (or is clobbered by) an operator's manual pause."""
+
+    self_throttle_paused_until: float = 0.0
+    """Wall-clock time the self-throttle pop-pause auto-resumes; 0 when not throttling."""
+
     consecutive_failed_jobs: int = 0
     too_many_consecutive_failed_jobs: bool = False
     too_many_consecutive_failed_jobs_time: float = 0.0

@@ -429,6 +429,15 @@ class WorkerSupervisor:
             ),
         )
 
+    def request_set_server_maintenance(self, enabled: bool) -> bool:
+        """Ask the worker to set its server-side (horde) maintenance flag on or off."""
+        return self.send_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_SERVER_MAINTENANCE,
+                server_maintenance_enabled=enabled,
+            ),
+        )
+
     # endregion
 
     def request_graceful_stop(self, *, timeout: float = GRACEFUL_STOP_TIMEOUT_SECONDS) -> None:
