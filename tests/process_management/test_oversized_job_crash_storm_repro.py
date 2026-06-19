@@ -134,7 +134,11 @@ class TestSchedulerTagsOverBudgetAdmit:
         later crash of its over-committed slot takes the isolated degraded retry rather than a plain
         re-dispatch.
         """
-        monkeypatch.setattr(resource_budget, "predict_job_vram_mb", lambda job, baseline: _HEAVY_SDXL_PREDICTED_VRAM_MB)
+        monkeypatch.setattr(
+            resource_budget,
+            "predict_job_vram_mb",
+            lambda job, baseline: _HEAVY_SDXL_PREDICTED_VRAM_MB,
+        )
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 1000.0)
 
         scheduler, _process_map, job_tracker, proc_sd15, proc_sdxl = _build_wedged_scheduler(
