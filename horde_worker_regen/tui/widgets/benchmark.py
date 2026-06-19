@@ -540,7 +540,11 @@ class BenchmarkView(VerticalScroll):
 
         body: RenderableType = table
         needs_models = any(row.num_models_missing for row in rows)
-        needs_annotators = any(row.requires_controlnet and row.controlnet_annotator_bytes > 0 for row in rows)
+        # Only nag when annotators are confirmed absent on disk (present is False); a static ROM size is
+        # not evidence they are missing. Unknown presence stays silent (the level pre-warms before timing).
+        needs_annotators = any(
+            row.requires_controlnet and row.controlnet_annotators_present is False for row in rows
+        )
         if needs_models or needs_annotators:
             what = "models" if needs_models and not needs_annotators else "models or controlnet annotators"
             banner = Text(
@@ -564,6 +568,8 @@ class BenchmarkView(VerticalScroll):
         size = f"~{row.controlnet_annotator_bytes / 1024**3:.1f}G" if row.controlnet_annotator_bytes > 0 else ""
         if row.controlnet_installed is False:
             return Text(f"missing {size}".rstrip(), style="red")
+        if row.controlnet_annotators_present:
+            return Text("ok", style="green")
         return Text(size or "ok", style="green" if not size else "")
 
     def _update_buttons(self, status: BenchmarkSupervisorStatus, run_state: BenchmarkRunState) -> None:

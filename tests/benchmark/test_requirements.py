@@ -180,15 +180,36 @@ def _sd15_controlnet_level() -> RampLevel:
 def test_controlnet_level_surfaces_installed_and_annotator_size(monkeypatch: pytest.MonkeyPatch) -> None:
     """A controlnet level reports requires_controlnet, the installed flag, and a non-zero annotator ROM."""
     monkeypatch.setattr(requirements_mod, "controlnet_installed", lambda: True)
+    monkeypatch.setattr(requirements_mod, "controlnet_annotators_present", lambda: True)
     monkeypatch.setattr(requirements_mod, "_controlnet_annotator_bytes", lambda control_types: 800 * 1024**2)
 
     req = compute_level_requirements(_sd15_controlnet_level(), present_resolver=_present)
 
     assert req.requires_controlnet is True
     assert req.controlnet_installed is True
+    assert req.controlnet_annotators_present is True
     assert req.controlnet_annotator_bytes == 800 * 1024**2
     assert req.controlnet_install_hint == ""
     assert "controlnet" in req.features
+
+
+def test_controlnet_annotator_presence_probed_only_when_extra_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Annotator presence is meaningful only with the extra: absent extra leaves ``present`` as None.
+
+    Without onnxruntime the annotators are never fetched, so probing on-disk presence would just nag for
+    something the worker cannot use anyway; the install gate is what a surface should show instead.
+    """
+    monkeypatch.setattr(requirements_mod, "controlnet_installed", lambda: False)
+
+    def _should_not_be_called() -> bool | None:
+        raise AssertionError("annotator presence must not be probed when the controlnet extra is absent")
+
+    monkeypatch.setattr(requirements_mod, "controlnet_annotators_present", _should_not_be_called)
+
+    req = compute_level_requirements(_sd15_controlnet_level(), present_resolver=_present)
+
+    assert req.controlnet_installed is False
+    assert req.controlnet_annotators_present is None
 
 
 def test_non_controlnet_level_has_no_controlnet_requirement(monkeypatch: pytest.MonkeyPatch) -> None:

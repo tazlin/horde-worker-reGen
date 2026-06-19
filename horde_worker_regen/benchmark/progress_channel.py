@@ -111,6 +111,9 @@ class LevelPlanRow(BaseModel):
     """True when the level exercises a classic controlnet preprocessor."""
     controlnet_installed: bool | None = None
     """Whether the controlnet extra is installed, or None when undeterminable."""
+    controlnet_annotators_present: bool | None = None
+    """Whether the annotator checkpoints are already on disk, or None when undeterminable (drives the
+    "download annotators first" prompt: shown only when this is ``False``)."""
     controlnet_annotator_bytes: int = 0
     """ROM annotator-checkpoint download size for the level's control types (separate from model bytes)."""
     features: list[str] = Field(default_factory=list)

@@ -134,6 +134,7 @@ def _plan_row(req: LevelRequirements, verdict: str | None) -> LevelPlanRow:
         requires_civitai_key=req.requires_civitai_key,
         requires_controlnet=req.requires_controlnet,
         controlnet_installed=req.controlnet_installed,
+        controlnet_annotators_present=req.controlnet_annotators_present,
         controlnet_annotator_bytes=req.controlnet_annotator_bytes,
         features=req.features,
         will_run=verdict is None,

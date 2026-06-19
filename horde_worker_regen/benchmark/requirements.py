@@ -83,6 +83,12 @@ class LevelRequirements(BaseModel):
     """True when a job exercises a classic controlnet preprocessor (has a ``control_type``)."""
     controlnet_installed: bool | None = None
     """Whether the controlnet extra (onnxruntime annotators) is installed, or None when undeterminable."""
+    controlnet_annotators_present: bool | None = None
+    """Whether the annotator checkpoints are already downloaded on disk, or None when undeterminable.
+
+    Distinct from :attr:`controlnet_installed` (the onnxruntime *package*): the annotator *weights* are
+    fetched lazily on first use, so a worker with the extra installed can still be missing them. Drives
+    whether a surface should prompt to pre-download them (only when this is ``False``)."""
     controlnet_annotator_bytes: int = 0
     """ROM annotator-checkpoint download size for the level's control types (0 when not a controlnet level).
 
@@ -195,6 +201,22 @@ def controlnet_installed() -> bool | None:
         return None
 
 
+def controlnet_annotators_present() -> bool | None:
+    """Whether the controlnet annotator checkpoints are already downloaded, or None when undeterminable.
+
+    Thin wrapper over hordelib's on-disk marker check (import-safe, no ``initialise``/GPU needed). Fails
+    open (None) when the engine is too old to expose the check or the marker directory cannot be resolved,
+    so a surface treats an unknown as "do not claim missing" rather than nagging spuriously.
+    """
+    try:
+        from hordelib.api import controlnet_annotators_present as _present
+
+        return _present()
+    except Exception as e:  # noqa: BLE001 - presence is best-effort; fail open to "unknown"
+        logger.debug(f"Could not determine controlnet annotator presence: {e}")
+        return None
+
+
 def _controlnet_annotator_bytes(control_types: list[str]) -> int:
     """ROM annotator-download size for *control_types* via hordelib, or 0 when unavailable/none."""
     if not control_types:
@@ -255,6 +277,9 @@ def compute_level_requirements(
     control_types = _level_control_types(level)
     requires_controlnet = bool(control_types)
     cn_installed = controlnet_installed() if requires_controlnet else None
+    # Only meaningful when the extra is present: without onnxruntime the annotators are never fetched, so
+    # "present" stays None (the install gate, not the download gate, is what a surface should surface).
+    cn_annotators_present = controlnet_annotators_present() if requires_controlnet and cn_installed else None
     cn_install_hint = ""
     if requires_controlnet and cn_installed is False:
         try:
@@ -303,6 +328,7 @@ def compute_level_requirements(
         requires_civitai_key=requires_civitai_key,
         requires_controlnet=requires_controlnet,
         controlnet_installed=cn_installed,
+        controlnet_annotators_present=cn_annotators_present,
         controlnet_annotator_bytes=_controlnet_annotator_bytes(control_types),
         controlnet_install_hint=cn_install_hint,
         features=_level_features(level),
@@ -391,6 +417,7 @@ __all__ = [
     "MissingModel",
     "civitai_token_available",
     "compute_level_requirements",
+    "controlnet_annotators_present",
     "controlnet_installed",
     "model_present_on_disk",
     "models_disk_plan",

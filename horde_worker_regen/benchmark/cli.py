@@ -285,8 +285,12 @@ def _ladder_control_types(ladder: list[RampLevel]) -> list[str]:
     return sorted({job.control_type for level in ladder for job in level.scenario.image_jobs if job.control_type})
 
 
-def _controlnet_annotator_row(control_types: list[str]) -> DownloadModelRow | None:
-    """Build the synthetic annotator plan row (ROM size) for *control_types*, or None when none apply."""
+def _controlnet_annotator_row(control_types: list[str], *, on_disk: bool = False) -> DownloadModelRow | None:
+    """Build the synthetic annotator plan row (ROM size) for *control_types*, or None when none apply.
+
+    ``on_disk`` reflects whether the annotator checkpoints are already downloaded, so the plan shows them
+    as present rather than always implying a pending fetch.
+    """
     if not control_types:
         return None
     from horde_worker_regen.benchmark.download_progress import DownloadModelRow
@@ -298,7 +302,12 @@ def _controlnet_annotator_row(control_types: list[str]) -> DownloadModelRow | No
     except Exception as e:  # noqa: BLE001 - sizing is informational; show the row without a size
         logger.debug(f"Could not size controlnet annotators: {e}")
         size = None
-    return DownloadModelRow(name="ControlNet annotators", size_bytes=size or None, target_path="(annotator cache)")
+    return DownloadModelRow(
+        name="ControlNet annotators",
+        size_bytes=size or None,
+        on_disk=on_disk,
+        target_path="(annotator cache)",
+    )
 
 
 def _download_controlnet_annotators(*, directml: int | None) -> bool:
@@ -388,10 +397,16 @@ def _run_download(args: argparse.Namespace) -> int:
     # as an explicit plan row (ROM size) and fetch them too, so a controlnet level does not cold-load the
     # annotator mid-run (the cause of the spurious step-timeout recovery the benchmark used to mask).
     control_types = _ladder_control_types(ladder)
-    from horde_worker_regen.benchmark.requirements import controlnet_installed
+    from horde_worker_regen.benchmark.requirements import controlnet_annotators_present, controlnet_installed
 
     cn_installed = controlnet_installed() if control_types else None
-    annotator_row = _controlnet_annotator_row(control_types) if cn_installed is not False else None
+    # Presence is only meaningful with the extra installed (the annotators are never fetched otherwise).
+    annotators_present = controlnet_annotators_present() if control_types and cn_installed else None
+    annotator_row = (
+        _controlnet_annotator_row(control_types, on_disk=annotators_present is True)
+        if cn_installed is not False
+        else None
+    )
 
     def emit(event: DownloadEvent) -> None:
         if json_progress:
@@ -408,7 +423,10 @@ def _run_download(args: argparse.Namespace) -> int:
             )
             for info in plan.models
         ]
-        annotator_bytes = annotator_row.size_bytes or 0 if annotator_row is not None else 0
+        # Only count annotator bytes as "to download" when they are not already on disk.
+        annotator_bytes = (
+            annotator_row.size_bytes or 0 if annotator_row is not None and not annotator_row.on_disk else 0
+        )
         if annotator_row is not None:
             rows.append(annotator_row)
         emit(
@@ -446,7 +464,10 @@ def _run_download(args: argparse.Namespace) -> int:
                 f"annotators were skipped: {controlnet_install_hint()}",
             )
 
-    fetch_annotators = bool(control_types) and cn_installed is not False
+    # Fetch annotators only when the extra is present and they are not already on disk. ``preload_annotators``
+    # is idempotent, but skipping the (slow) hordelib.initialise + verify when they are confirmed present
+    # is what lets "all required models already on disk" be reported truthfully.
+    fetch_annotators = bool(control_types) and cn_installed is not False and annotators_present is not True
 
     if not missing and not fetch_annotators:
         logger.success("All required models are already on disk; nothing to download.")

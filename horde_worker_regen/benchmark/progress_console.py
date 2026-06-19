@@ -122,6 +122,8 @@ def _format_controlnet(row: LevelPlanRow) -> str:
     size = f"~{row.controlnet_annotator_bytes / 1024**3:.1f}G" if row.controlnet_annotator_bytes > 0 else ""
     if row.controlnet_installed is False:
         return f"MISSING {size}".rstrip()
+    if row.controlnet_annotators_present:
+        return "ok"
     return size or "ok"
 
 
@@ -158,7 +160,10 @@ def format_plan_table(rows: list[LevelPlanRow]) -> str:
     lines = ["Resource plan (verdicts reflect the detected machine):", _line(header)]
     lines.extend(_line(cells) for cells in body)
     needs_models = any(row.num_models_missing for row in rows)
-    needs_annotators = any(row.requires_controlnet and row.controlnet_annotator_bytes > 0 for row in rows)
+    # Only nag when the annotators are confirmed absent on disk (present is False). A static ROM size > 0
+    # is not evidence they are missing; keying off it nagged on every controlnet run even once they were
+    # downloaded. Unknown presence (None) stays silent: the level still pre-warms before the timed run.
+    needs_annotators = any(row.requires_controlnet and row.controlnet_annotators_present is False for row in rows)
     if needs_models or needs_annotators:
         what = "models" if needs_models and not needs_annotators else "models/controlnet annotators"
         lines.append(

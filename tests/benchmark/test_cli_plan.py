@@ -40,7 +40,7 @@ def test_plan_subcommand_emits_one_row_per_level(
 
 
 def test_plan_table_renders_controlnet_column() -> None:
-    """The text plan table shows a CN column (size / MISSING) and prompts to download annotators."""
+    """The text plan table shows a CN column (size / MISSING) and prompts to download absent annotators."""
     from horde_worker_regen.benchmark.progress_channel import LevelPlanRow
     from horde_worker_regen.benchmark.progress_console import format_plan_table
 
@@ -49,6 +49,7 @@ def test_plan_table_renders_controlnet_column() -> None:
             level_id="C-sd15-controlnet",
             requires_controlnet=True,
             controlnet_installed=True,
+            controlnet_annotators_present=False,  # extra installed but the weights are not on disk yet
             controlnet_annotator_bytes=800 * 1024**2,
             will_run=True,
         ),
@@ -68,6 +69,31 @@ def test_plan_table_renders_controlnet_column() -> None:
     assert "MISSING" in table
     assert "~0.8G" in table
     assert "controlnet annotators" in table
+
+
+def test_plan_table_omits_annotator_prompt_when_already_downloaded() -> None:
+    """A controlnet level whose annotators are already on disk does NOT nag to download them.
+
+    Reproduces the always-on prompt: the banner used to key off ``controlnet_annotator_bytes > 0`` (a
+    static ROM constant) and so fired for every controlnet level even when the weights were present.
+    """
+    from horde_worker_regen.benchmark.progress_channel import LevelPlanRow
+    from horde_worker_regen.benchmark.progress_console import format_plan_table
+
+    rows = [
+        LevelPlanRow(
+            level_id="C-sd15-controlnet",
+            requires_controlnet=True,
+            controlnet_installed=True,
+            controlnet_annotators_present=True,  # already downloaded (the on-disk marker is present)
+            controlnet_annotator_bytes=800 * 1024**2,
+            will_run=True,
+        ),
+    ]
+
+    table = format_plan_table(rows)
+
+    assert "controlnet annotators" not in table
 
 
 def test_plan_subcommand_honours_exclude_axis(
