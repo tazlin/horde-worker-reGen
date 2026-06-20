@@ -194,6 +194,14 @@ purge_loras_on_download: false
 # Number of gigabytes of LoRas to keep cached. Minimum is 10GB.
 max_lora_cache_size: 10
 
+# Keep at least this many gigabytes free on the disk holding the LoRa cache.
+# The on-demand LoRa cache is bounded by `max_lora_cache_size`, but a shared disk or other data can
+# still push it toward full (where downloads start failing). Below this floor the worker shrinks the
+# cache and evicts least-recently-used LoRas to make room for new ones; if it still can't clear the
+# floor it stops offering LoRas (with a prominent warning) until disk space is freed. Set to 0 to
+# disable this safety floor.
+min_lora_disk_free_gb: 1
+
 # Set to true if your worker is extraordinarily slow (below 0.1 mps/s).
 # Users can choose to skip it when requesting generations, but job timeout and request expiry timeout are tripled.
 extra_slow_worker: false

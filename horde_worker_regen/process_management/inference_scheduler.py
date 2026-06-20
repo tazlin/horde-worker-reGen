@@ -1290,7 +1290,17 @@ class InferenceScheduler:
                 self._log_stream_forecast(job, forecast)
                 whole_card_terminal = False
                 early_prestage = False
-                if self._whole_card_residency_enabled() and forecast.needs_exclusive_residency:
+                # A model needs the teardown path either because it is weight-dominant (needs sole residency)
+                # or because the live sibling *process contexts* have squeezed its bounded weights off the card
+                # though it co-resides once the process count is reduced (needs_process_count_reduction -- the
+                # soak's blind spot, where a moderate SDXL head was deferred until the starvation backstop
+                # force-admitted it into an OOM). Both are served by the same machinery: establish residency,
+                # stop idle siblings down to max_resident_processes (sole residency for the former, a partial
+                # reduction for the latter), and admit once the weights fit. The process-count-reduction case is
+                # held exclusive through the teardown so a second model cannot re-fill the card mid-reduction;
+                # the residency cooldown then restores concurrency.
+                needs_teardown_path = forecast.needs_exclusive_residency or forecast.needs_process_count_reduction
+                if self._whole_card_residency_enabled() and needs_teardown_path:
                     first_time = not self._job_tracker.is_admitted_exclusive(job)
                     self._job_tracker.mark_admitted_exclusive(job)
                     if self._should_prestage_whole_card_head(job, baseline, forecast, available_process):

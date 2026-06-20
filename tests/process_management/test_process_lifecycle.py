@@ -311,6 +311,30 @@ def test_intentional_safety_cycle_not_counted_as_recovery() -> None:
     assert len(plm._safety_recovery_history) == 1
 
 
+def test_soft_reset_safety_rebuild_not_counted_as_recovery() -> None:
+    """A Save-our-ship soft reset rebuilding the (healthy) safety pool must not bump recoveries.
+
+    The soft reset rebuilds both pools to give a wedged worker a clean start; the safety pool is usually
+    healthy collateral, so counting its deliberate rebuild double-counts a single wedge (two process
+    recoveries from one soft reset, when only the inference slot was actually wedged). Like the inference
+    rebuild, it is a supervised rebuild: it clears the safety crash-loop history and is not a crash
+    recovery.
+    """
+    plm = _make_plm()
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
+    plm.end_safety_processes = Mock()  # type: ignore[method-assign]
+    plm._safety_recovery_history = [time.time()]  # stale history a deliberate rebuild must clear
+    before = plm._num_process_recoveries
+
+    plm.rebuild_safety_pool(reason="soft reset #1")
+    # Drive the replacement state machine to completion (empty map => it finishes on the next tick).
+    plm._replace_all_safety_process()
+
+    assert plm._num_process_recoveries == before  # the deliberate rebuild is not a crash recovery
+    assert plm._safety_recovery_history == []  # crash-loop breaker reset, mirroring rebuild_inference_pool
+    assert plm._safety_replacement_intentional is False  # consumed
+
+
 def test_end_safety_processes_stops_starting_process_and_marks_intent() -> None:
     """Shutdown must send END_PROCESS even if safety has not reached WAITING_FOR_JOB yet."""
     safety = make_mock_process_info(

@@ -283,6 +283,33 @@ class StreamForecast:
         return self.known and not self.fits_after_model_evict and self.fits_alone and self._weights_dominant
 
     @property
+    def needs_process_count_reduction(self) -> bool:
+        """A moderate-weight model whose bounded weights are squeezed off the card by the *live* sibling
+        process contexts, yet which fits once the process count is reduced: the over-commit is cured by
+        stopping idle sibling processes, distinct from the sole residency a weight-dominant model needs.
+
+        This is the soak's blind spot (db0 062026-02): four ~4 GB CUDA contexts on a 24 GB card leave under
+        4 GB free even with every sibling model evicted -- below an SDXL checkpoint's ~4.9 GB of weights -- so
+        the model literally cannot load until a sibling *process* stops. ``_weights_dominant`` (and therefore
+        ``needs_exclusive_residency`` / ``requires_sibling_teardown``) miss it: their self-plus-one-sibling
+        ceiling judges the moderate weights "not card-filling", so no teardown is triggered and the head is
+        deferred until the starvation backstop force-admits it into an OOM.
+
+        Keyed on the *bounded weight* footprint (``_fits_weights``), not the activation-inclusive peak, so a
+        transient activation spike whose weights still fit after model eviction is left co-resident rather than
+        needlessly cutting concurrency. Topology-aware through ``free_after_model_evict_mb`` (the live-context
+        floor). Excludes the weight-dominant sole-residency case (``needs_exclusive_residency``) and
+        ``streams_unavoidably`` (no teardown helps, via ``fits_alone``): when True the remedy is reducing the
+        process count to ``max_resident_processes``, where the model co-resides.
+        """
+        return (
+            self.known
+            and not self._fits_weights(self.free_after_model_evict_mb)
+            and self.fits_alone
+            and not self.needs_exclusive_residency
+        )
+
+    @property
     def streams_unavoidably(self) -> bool:
         """Streams even with the whole device to itself (e.g. fp16 weights on a too-small card).
 

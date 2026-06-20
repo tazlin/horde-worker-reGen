@@ -93,6 +93,47 @@ def test_idle_heartbeat_is_throttled() -> None:
     proc.process_message_queue.put.assert_not_called()  # pyrefly: ignore
 
 
+def test_heartbeat_type_change_sent_immediately_within_interval() -> None:
+    """A heartbeat whose type changed must be sent at once, even inside the throttle window.
+
+    Per the docstring, the throttle suppresses only repeated *same-type* heartbeats; a type change is
+    a meaningful transition (e.g. INFERENCE_STEP -> OTHER when a job hands off to a blocking aux-model
+    drain) and must reach the parent so its view of the slot stays accurate. The inverted condition did
+    the opposite: it dropped the transition and let same-type spam through.
+    """
+    proc = _make_stub()
+    proc._last_heartbeat_type = HordeHeartbeatType.INFERENCE_STEP
+    proc._last_heartbeat_time = time.time()  # squarely inside the 1s throttle window
+
+    proc.send_heartbeat_message(HordeHeartbeatType.OTHER)
+
+    assert proc.process_message_queue.put.call_count == 1  # pyrefly: ignore
+    sent = proc.process_message_queue.put.call_args[0][0]  # pyrefly: ignore
+    assert sent.heartbeat_type is HordeHeartbeatType.OTHER
+
+
+def test_same_type_heartbeat_throttled_within_interval() -> None:
+    """A repeated same-type heartbeat inside the window is throttled (the actual intent of the gate)."""
+    proc = _make_stub()
+    proc._last_heartbeat_type = HordeHeartbeatType.OTHER
+    proc._last_heartbeat_time = time.time()
+
+    proc.send_heartbeat_message(HordeHeartbeatType.OTHER)
+
+    proc.process_message_queue.put.assert_not_called()  # pyrefly: ignore
+
+
+def test_same_type_heartbeat_sent_after_interval() -> None:
+    """Once the throttle window has elapsed, even a same-type heartbeat is sent again."""
+    proc = _make_stub()
+    proc._last_heartbeat_type = HordeHeartbeatType.OTHER
+    proc._last_heartbeat_time = time.time() - (proc._heartbeat_limit_interval_seconds + 1.0)
+
+    proc.send_heartbeat_message(HordeHeartbeatType.OTHER)
+
+    assert proc.process_message_queue.put.call_count == 1  # pyrefly: ignore
+
+
 def _make_piped_stub() -> tuple[_StubProcess, Any]:
     """Build a stub wired to a real duplex pipe; returns the stub and the parent's send end."""
     parent_conn, child_conn = multiprocessing.Pipe(duplex=True)

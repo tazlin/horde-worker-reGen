@@ -254,9 +254,11 @@ class HordeProcess(abc.ABC):
         """Send a heartbeat message to the main process, indicating that the process is still alive.
 
         Note that this will only send a heartbeat message if the last heartbeat was sent more than
-        `_heartbeat_limit_interval_seconds` ago or if the heartbeat type has changed.
+        `_heartbeat_limit_interval_seconds` ago or if the heartbeat type has changed. A type change is
+        always forwarded immediately (it is a meaningful transition); only repeated same-type heartbeats
+        inside the window are throttled.
         """
-        if (heartbeat_type != self._last_heartbeat_type) and (
+        if (heartbeat_type == self._last_heartbeat_type) and (
             time.time() - self._last_heartbeat_time
         ) < self._heartbeat_limit_interval_seconds:
             return

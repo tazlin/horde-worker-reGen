@@ -12,6 +12,17 @@ The signal we have to classify on is the faulted result's ``info`` string. Real 
 the originating exception summary (see ``inference_process.send_inference_result_message``); the chaos
 harness tags an injected out-of-memory fault with its own marker. This module recognizes both. It is
 deliberately dependency-free and substring-based so it cannot itself raise on a surprising message.
+
+A subtlety the multi-process worker exposed: under VRAM over-commit the *driver* OOM is often caught and
+swallowed by ComfyUI ("Got an OOM, unloading all loaded models"), so the pipeline yields no output node
+and hordelib raises a generic ``Pipeline failed to run - no images were produced`` instead. The torch
+"CUDA out of memory" wording never reaches us; the only surface signal is "no images were produced".
+That phrasing is therefore treated as a resource-class failure too: on a worker running concurrent
+inference processes, a pipeline that produced nothing is, in practice, the visible end of an OOM that was
+handled out of view. The cost of a rare false positive is bounded (one device-clearing isolated retry,
+and the per-model breaker only trips when a model produces no images on *every* attempt, since a single
+success resets its streak), while the benefit is that the over-budget breaker and self-throttle backstops
+finally see the storm instead of leaving it to the disruptive save-our-ship soft reset.
 """
 
 from __future__ import annotations
@@ -24,11 +35,15 @@ _RESOURCE_FAILURE_MARKERS: tuple[str, ...] = (
     "hip out of memory",
     "cublas",
     "injected-fault:oom",
+    "no images were produced",
 )
 """Lower-cased substrings that mark a faulted result as a recoverable resource (VRAM/RAM) failure.
 
-Covers torch CUDA/cuBLAS allocator messages, the AMD/HIP equivalent, and the chaos harness's injected
-out-of-memory marker (``FAULT_INFO_PREFIX`` + ``FaultKind.OOM`` in ``fault_injection``)."""
+Covers torch CUDA/cuBLAS allocator messages, the AMD/HIP equivalent, the chaos harness's injected
+out-of-memory marker (``FAULT_INFO_PREFIX`` + ``FaultKind.OOM`` in ``fault_injection``), and the
+swallowed-OOM surface form (hordelib's ``no images were produced`` when ComfyUI caught the driver OOM and
+the pipeline yielded no output node) -- see the module docstring for why the empty-result case is folded
+in on a multi-process worker."""
 
 
 def is_resource_failure(info: str | None) -> bool:

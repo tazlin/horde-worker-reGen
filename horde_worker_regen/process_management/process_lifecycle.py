@@ -972,8 +972,19 @@ class ProcessLifecycleManager:
         )
 
     def rebuild_safety_pool(self, *, reason: str) -> None:
-        """Force the safety pool to be rebuilt (arm + replace), used by the recovery supervisor's soft reset."""
+        """Force the safety pool to be rebuilt (arm + replace), used by the recovery supervisor's soft reset.
+
+        This is a deliberate, supervised rebuild (the soft reset cycles *both* pools to give a wedged
+        worker a clean start), not a safety crash. So, mirroring ``rebuild_inference_pool``, it clears the
+        safety crash-loop history and marks the replacement intentional: the rebuilt safety pool is not
+        counted as a process recovery and does not feed the safety crash-loop breaker. Otherwise a single
+        soft reset whose wedge was the *inference* pool double-counts as two recoveries (the healthy safety
+        pool being collateral), and the soft reset could be re-triggered immediately by its own stale
+        safety history.
+        """
         logger.error(f"Soft reset: rebuilding safety pool ({reason}).")
+        self._safety_recovery_history.clear()
+        self._safety_replacement_intentional = True
         self._initiate_safety_replacement()
         self._replace_all_safety_process()
 

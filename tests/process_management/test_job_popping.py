@@ -963,6 +963,27 @@ class TestApiJobPopFullFlow:
         assert mock_req_cls.call_args.kwargs["allow_lora"] is False
 
     @_full_flow_patches
+    async def test_allow_lora_false_when_disk_exhausted(self, mock_req_cls: Mock) -> None:
+        """An unrecoverable LoRA-cache disk shortfall suppresses LoRA advertisement."""
+        availability = ModelAvailability()
+        availability.update(
+            present={"stable_diffusion"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            status=DownloadStatusSnapshot(phase=DownloadPhase.IDLE),
+        )
+        popper = self._make_ready_popper(
+            api_response=make_job_pop_response(),
+            state=WorkerState(last_job_pop_time=0.0, lora_disk_exhausted=True),
+            model_availability=availability,
+        )
+
+        await popper.api_job_pop()
+
+        assert mock_req_cls.call_args.kwargs["allow_lora"] is False
+
+    @_full_flow_patches
     async def test_allow_lora_false_when_disabled_in_config(self, mock_req_cls: Mock) -> None:
         """The temporary gate cannot enable LoRA when the user disabled it."""
         availability = ModelAvailability()
