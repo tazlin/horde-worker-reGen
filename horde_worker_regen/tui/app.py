@@ -67,6 +67,16 @@ class HordeWorkerTUI(App[None]):
     """A Textual dashboard that owns and visualises the reGen worker."""
 
     TITLE = "AI Horde Worker"
+
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (100, "-normal"), (150, "-wide")]
+    """Width bands Textual stamps onto the Screen as classes, mirroring the table column tiers.
+
+    These drive only *layout* rules in the CSS below (e.g. reclaiming side padding on a cramped terminal).
+    Panel show/hide stays in Python because it depends on the F6 view intent, which CSS cannot see; and an
+    inline ``display`` set per tick from Python would in any case win over a CSS ``display`` rule. The
+    within-table column shedding that actually fixes the wide tables is done in ``responsive.py``.
+    """
+
     CSS = """
     #status-bar {
         height: 1;
@@ -79,6 +89,16 @@ class HordeWorkerTUI(App[None]):
     OverviewView, LiveView, InsightsView, ConfigEditorView, LogsView, BenchmarkView, DownloadsView {
         height: 1fr;
         padding: 1 1;
+    }
+    /* On a cramped terminal, drop the horizontal padding so the tables get those columns back. */
+    Screen.-narrow OverviewView,
+    Screen.-narrow LiveView,
+    Screen.-narrow InsightsView,
+    Screen.-narrow ConfigEditorView,
+    Screen.-narrow LogsView,
+    Screen.-narrow BenchmarkView,
+    Screen.-narrow DownloadsView {
+        padding: 1 0;
     }
     #overview-worker, #overview-processes {
         margin-top: 1;

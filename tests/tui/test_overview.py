@@ -16,9 +16,9 @@ from horde_worker_regen.tui.widgets.overview import OverviewView
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
 
-def _render(renderable: object) -> str:
-    """Render a Rich renderable to plain text."""
-    console = Console(width=160)
+def _render(renderable: object, width: int = 160) -> str:
+    """Render a Rich renderable to plain text at the given console width."""
+    console = Console(width=width)
     with console.capture() as capture:
         console.print(renderable)
     return capture.get()
@@ -81,14 +81,63 @@ def test_process_table_shows_resolution_and_batch_by_default() -> None:
 
 
 def test_process_table_detailed_adds_technical_columns() -> None:
-    """The F6 detail view reveals per-job steps and heartbeat columns."""
+    """The F6 detail view reveals per-job steps and heartbeat columns when the terminal is wide enough."""
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
         processes=[_busy_process()],
     )
-    text = _render(OverviewView()._render_process_table(snapshot, detailed=True))
+    table = OverviewView()._render_process_table(snapshot, detailed=True, available_width=200)
+    text = _render(table, width=200)
     assert "HB type" in text
     assert "Steps" in text
+
+
+def test_process_table_sheds_to_essentials_on_narrow_terminal() -> None:
+    """At 80 columns the table keeps the essentials and sheds the richer columns to fit."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process()],
+    )
+    text = _render(OverviewView()._render_process_table(snapshot, available_width=80))
+    # Essentials survive...
+    assert "State" in text and "Progress" in text
+    # ...while the normal/wide columns and their data are shed to fit.
+    assert "Model" not in text
+    assert "GPU VRAM" not in text
+    assert "832×1216" not in text
+
+
+def test_process_table_clamps_details_intent_to_width() -> None:
+    """Requesting details on a too-narrow terminal sheds the diagnostic columns (width clamps intent)."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process()],
+    )
+    text = _render(OverviewView()._render_process_table(snapshot, detailed=True, available_width=120))
+    assert "HB type" not in text
+
+
+def test_process_table_caption_hints_at_hidden_columns() -> None:
+    """When width clamps below the wanted density, the caption names the hidden count and the width to reveal."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process()],
+    )
+    text = _render(OverviewView()._render_process_table(snapshot, available_width=100))
+    assert "more columns" in text
+    assert "cols wide" in text
+
+
+def test_process_table_residency_caption_wins_over_shed_hint() -> None:
+    """An active whole-card residency caption takes the caption slot even when columns are also shed."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_flux_holder_process()],
+        whole_card_residency=_active_residency(),
+    )
+    text = _render(OverviewView()._render_process_table(snapshot, available_width=100))
+    assert "Whole-card residency" in text
+    assert "more columns" not in text
 
 
 def test_process_table_shows_job_id_and_baseline() -> None:
@@ -121,6 +170,27 @@ def test_queue_table_shows_job_id_and_baseline() -> None:
     text = _render(OverviewView()._render_queue_table(snapshot))
     assert "9c2b07d4" in text
     assert "SD1.5" in text
+
+
+def test_queue_table_sheds_wide_columns_when_cramped() -> None:
+    """A cramped queue keeps job id and model but sheds the wide columns, hinting at the clamp."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        pending_jobs=[
+            JobQueueEntry(
+                job_id="9c2b07d4-aaaa-bbbb-cccc-ddddeeeeffff",
+                model="Deliberate",
+                baseline="stable_diffusion_1",
+                steps=30,
+                width=1024,
+                height=1024,
+            ),
+        ],
+    )
+    text = _render(OverviewView()._render_queue_table(snapshot, available_width=48), width=48)
+    assert "9c2b07d4" in text
+    assert "Steps" not in text
+    assert "more column" in text
 
 
 def test_recent_jobs_table_shows_baseline_size_and_timings() -> None:

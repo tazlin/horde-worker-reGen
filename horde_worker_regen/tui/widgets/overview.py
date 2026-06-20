@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from dataclasses import dataclass
 
 from rich.console import Group
 from rich.panel import Panel
@@ -17,6 +18,7 @@ from horde_worker_regen.app_state import OverviewViewMode
 from horde_worker_regen.process_management.supervisor_channel import (
     JobQueueEntry,
     ProcessSnapshot,
+    RecentJobRecord,
     WholeCardResidencyStatus,
     WorkerStateSnapshot,
 )
@@ -33,6 +35,15 @@ from horde_worker_regen.tui.formatters import (
     sparkline,
 )
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, summarize_skips
+from horde_worker_regen.tui.responsive import (
+    ColumnSpec,
+    DensityTier,
+    add_columns,
+    intent_ceiling,
+    placeholder_row,
+    select_columns,
+    shed_hint,
+)
 
 _TREND_HISTORY = 180
 """How many trend samples (GPU-duty / kudos-per-hour / job counts) the Trends region retains."""
@@ -138,19 +149,27 @@ class OverviewView(VerticalScroll):
             self.query_one("#overview-thin", Static).update(self._render_compact_bar(report, snapshot, frame))
             return
 
+        # The laid-out content width drives column shedding; it is 0 before the first layout pass, where
+        # None disables shedding so the very first frame shows the full table rather than collapsing it.
+        width = self.content_size.width or None
+
         self.query_one("#overview-hero", Static).update(self._render_hero(report, snapshot, frame))
         self.query_one("#overview-health", Static).update(self._render_health(report))
         if snapshot is not None:
             self.query_one("#overview-trends", Static).update(self._render_trends(snapshot))
             self.query_one("#overview-pipeline", Static).update(self._render_pipeline_strip(snapshot))
             self.query_one("#overview-processes", Static).update(
-                self._render_process_table(snapshot, detailed=detailed),
+                self._render_process_table(snapshot, detailed=detailed, available_width=width),
             )
             if detailed:
                 self.query_one("#overview-worker", Static).update(self._render_worker_table(snapshot))
                 self.query_one("#overview-alchemy", Static).update(self._render_alchemy_panel(snapshot))
-                self.query_one("#overview-queue", Static).update(self._render_queue_table(snapshot))
-                self.query_one("#overview-recent", Static).update(self._render_recent_jobs(snapshot))
+                self.query_one("#overview-queue", Static).update(
+                    self._render_queue_table(snapshot, available_width=width),
+                )
+                self.query_one("#overview-recent", Static).update(
+                    self._render_recent_jobs(snapshot, available_width=width),
+                )
                 if show_residency:
                     self.query_one("#overview-residency", Static).update(
                         self._render_residency_panel(snapshot.whole_card_residency),
@@ -718,15 +737,28 @@ class OverviewView(VerticalScroll):
         line.append_text(Text.assemble(sep, ("⌚ ", "grey50"), (f"{human_duration(age)} ago", "grey70")))
         return Panel(line, border_style=report.severity.colour, padding=(0, 1))
 
-    def _render_process_table(self, snapshot: WorkerStateSnapshot, *, detailed: bool = False) -> Table:
-        """Build a compact per-process summary table with stable column widths.
+    def _render_process_table(
+        self,
+        snapshot: WorkerStateSnapshot,
+        *,
+        detailed: bool = False,
+        available_width: int | None = None,
+    ) -> Table:
+        """Build a per-process summary table whose columns shed to fit ``available_width``.
 
         Every row names the slot's active job by its colour-coded id and the loaded model's baseline, so
         one job can be followed across the dashboard (the same colour appears in the queue, recent-jobs
-        and live views). ``detailed`` appends the more technical columns (RAM, per-job steps, heartbeat
-        age and type) that the F6 toggle reveals; the default view stays lean. Resolution/batch (Size)
-        and the job/baseline columns show either way.
+        and live views). The columns are tagged by :class:`DensityTier`: the essentials always show, the
+        richer columns drop first on a narrow terminal, and the F6 details view's diagnostic columns (per-
+        job steps, heartbeat age and type) appear only when both that intent and the width allow. With no
+        width known (``None``) nothing sheds. When the width clamps below what was wanted, the caption
+        says so, unless a whole-card residency note has already claimed it.
         """
+        layout = select_columns(
+            _PROCESS_COLUMNS,
+            ceiling=intent_ceiling(detailed),
+            available_width=available_width,
+        )
         table = Table(
             title="Processes",
             title_style="bold",
@@ -734,77 +766,54 @@ class OverviewView(VerticalScroll):
             border_style="grey37",
             header_style="bold",
         )
-        table.add_column("ID", justify="right", width=3)
-        table.add_column("Type", width=9)
-        table.add_column("State", width=12, no_wrap=True)
-        table.add_column("Job", width=8, no_wrap=True)
-        table.add_column("Model", min_width=14, max_width=22, no_wrap=True)
-        table.add_column("Baseline", width=8, no_wrap=True)
-        table.add_column("Features", min_width=10, no_wrap=True)
-        table.add_column("Size", justify="right", width=11, no_wrap=True)
-        table.add_column("Progress", width=12, no_wrap=True)
-        table.add_column("it/s", justify="right", width=6)
-        table.add_column("GPU VRAM", justify="right", min_width=15, no_wrap=True)
-        table.add_column("Done", justify="right", width=5)
-        if detailed:
-            table.add_column("Steps", justify="right", width=6)
-            table.add_column("Heartbeat", justify="right", width=9)
-            table.add_column("HB type", width=11, no_wrap=True)
+        add_columns(table, layout.columns)
 
         if not snapshot.processes:
-            placeholder = ["-", "-", "waiting for first snapshot", "-", "-", "-", "-", "-", "-", "-", "-", "-"]
-            if detailed:
-                placeholder += ["-", "-", "-"]
-            table.add_row(*placeholder)
+            table.add_row(*placeholder_row(layout.columns, "State", "waiting for first snapshot"))
             return table
 
         now = time.time()
         residency = snapshot.whole_card_residency
         for process in snapshot.processes:
-            vram = (
-                f"{human_mb(process.vram_usage_mb)} / {human_mb(process.total_vram_mb)}"
-                if process.total_vram_mb
-                else human_mb(process.vram_usage_mb)
-            )
-            state_cell = Text(
-                label_state(process.last_process_state), style=self._state_style(process.last_process_state)
-            )
-            if residency.active and residency.model and process.loaded_horde_model_name == residency.model:
-                # Mark the slot holding the whole-card model so the ★ reads against the residency caption.
-                state_cell.append(" ★", style="#f0beff")
-            features_text = (
-                ", ".join(process.current_job_features.as_tags())
-                if process.current_job_features is not None and not process.current_job_features.is_empty()
-                else "-"
-            )
-            cells: list[str | Text] = [
-                str(process.process_id),
-                process.process_type.title(),
-                state_cell,
-                job_id_text(process.current_job_id),
-                shorten(process.loaded_horde_model_name, 22),
-                short_baseline(process.loaded_horde_model_baseline),
-                features_text,
-                self._size_cell(process),
-                self._progress_cell(process),
-                format_its(process.last_iterations_per_second),
-                vram,
-                f"{process.num_jobs_completed:,}",
-            ]
-            if detailed:
-                heartbeat_age = now - process.last_heartbeat_timestamp if process.last_heartbeat_timestamp else None
-                cells += [
-                    str(process.current_job_steps) if process.current_job_steps else "-",
-                    self._heartbeat_cell(heartbeat_age, process.is_alive),
-                    process.last_heartbeat_type.replace("_", " ").title() if process.is_busy else "-",
-                ]
-            table.add_row(*cells)
+            row = _ProcessRow(process=process, now=now, residency=residency)
+            table.add_row(*[spec.render(row) for spec in layout.columns])
 
         caption = self._residency_caption(residency)
         if caption is not None:
             table.caption = caption
             table.caption_style = "italic #f0beff"
+        elif (hint := shed_hint(layout)) is not None:
+            table.caption = hint
+            table.caption_style = "italic grey50"
         return table
+
+    @staticmethod
+    def _process_state_cell(row: _ProcessRow) -> Text:
+        """The State cell: the labelled state, marked with a ★ when this slot holds the whole-card model."""
+        process = row.process
+        cell = Text(
+            label_state(process.last_process_state),
+            style=OverviewView._state_style(process.last_process_state),
+        )
+        residency = row.residency
+        if residency.active and residency.model and process.loaded_horde_model_name == residency.model:
+            cell.append(" ★", style="#f0beff")
+        return cell
+
+    @staticmethod
+    def _vram_cell(process: ProcessSnapshot) -> str:
+        """The GPU VRAM cell: used / total when total is known, else just the used figure."""
+        if process.total_vram_mb:
+            return f"{human_mb(process.vram_usage_mb)} / {human_mb(process.total_vram_mb)}"
+        return human_mb(process.vram_usage_mb)
+
+    @staticmethod
+    def _features_cell(process: ProcessSnapshot) -> str:
+        """The Features cell: the active job's feature tags, or a dash when none apply."""
+        features = process.current_job_features
+        if features is not None and not features.is_empty():
+            return ", ".join(features.as_tags())
+        return "-"
 
     @staticmethod
     def _size_cell(process: ProcessSnapshot) -> str:
@@ -849,8 +858,9 @@ class OverviewView(VerticalScroll):
         return "yellow"
 
     @staticmethod
-    def _render_queue_table(snapshot: WorkerStateSnapshot) -> Panel:
-        """Render a table of pending-inference jobs."""
+    def _render_queue_table(snapshot: WorkerStateSnapshot, *, available_width: int | None = None) -> Panel:
+        """Render a table of pending-inference jobs, shedding columns to fit ``available_width``."""
+        layout = select_columns(_QUEUE_COLUMNS, ceiling=DensityTier.WIDE, available_width=available_width)
         table = Table(
             title="",
             expand=True,
@@ -858,31 +868,26 @@ class OverviewView(VerticalScroll):
             header_style="bold",
             show_header=True,
         )
-        table.add_column("Job", width=8, no_wrap=True)
-        table.add_column("Model", min_width=20, no_wrap=True)
-        table.add_column("Baseline", width=8, no_wrap=True)
-        table.add_column("Features")
-        table.add_column("Steps", justify="right", width=6)
-        table.add_column("Size", justify="right", width=10)
+        add_columns(table, layout.columns)
 
         if not snapshot.pending_jobs:
-            table.add_row("", Text("queue empty", style="grey50"), "", "", "", "")
+            table.add_row(*placeholder_row(layout.columns, "Model", "queue empty"))
         else:
             for entry in snapshot.pending_jobs:
-                features_text = ", ".join(entry.features.as_tags()) if entry.features is not None else "-"
-                size = f"{entry.width}×{entry.height}" if entry.width and entry.height else "-"
-                table.add_row(
-                    job_id_text(entry.job_id),
-                    shorten(entry.model, 28),
-                    short_baseline(entry.baseline),
-                    features_text,
-                    str(entry.steps) if entry.steps else "-",
-                    size,
-                )
+                table.add_row(*[spec.render(entry) for spec in layout.columns])
 
         lane = OverviewView._render_queue_lane(snapshot)
         body = Group(lane, Text(""), table) if lane is not None else table
-        return Panel(body, title="Queue", title_align="left", border_style="grey37", padding=(0, 1))
+        subtitle = shed_hint(layout)
+        return Panel(
+            body,
+            title="Queue",
+            title_align="left",
+            subtitle=Text(subtitle, style="grey50") if subtitle else None,
+            subtitle_align="right",
+            border_style="grey37",
+            padding=(0, 1),
+        )
 
     @staticmethod
     def _render_queue_lane(snapshot: WorkerStateSnapshot) -> Text | None:
@@ -911,8 +916,9 @@ class OverviewView(VerticalScroll):
         return lane
 
     @staticmethod
-    def _render_recent_jobs(snapshot: WorkerStateSnapshot) -> Panel:
-        """Render a table of recently completed jobs (newest first, last 8)."""
+    def _render_recent_jobs(snapshot: WorkerStateSnapshot, *, available_width: int | None = None) -> Panel:
+        """Render a table of recently completed jobs (newest first, last 8), shedding to fit the width."""
+        layout = select_columns(_RECENT_COLUMNS, ceiling=DensityTier.WIDE, available_width=available_width)
         table = Table(
             title="",
             expand=True,
@@ -920,44 +926,200 @@ class OverviewView(VerticalScroll):
             header_style="bold",
             show_header=True,
         )
-        table.add_column("", width=2)
-        table.add_column("Job", width=8, no_wrap=True)
-        table.add_column("Model / type", min_width=18, no_wrap=True)
-        table.add_column("Baseline", width=8, no_wrap=True)
-        table.add_column("Features")
-        table.add_column("Steps", justify="right", width=6)
-        table.add_column("Size", justify="right", width=10)
-        table.add_column("Queue", justify="right", width=7)
-        table.add_column("Safety", justify="right", width=7)
-        table.add_column("E2E", justify="right", width=8)
+        add_columns(table, layout.columns)
 
         recent = list(reversed(snapshot.recent_jobs[-8:]))
-
         if not recent:
-            empty = ["", "", Text("no completed jobs yet", style="grey50"), "", "", "", "", "", "", ""]
-            table.add_row(*empty)
+            table.add_row(*placeholder_row(layout.columns, "Model / type", "no completed jobs yet"))
         else:
             for job in recent:
-                glyph = Text("✗", style="red") if job.faulted else Text("✓", style="green")
+                table.add_row(*[spec.render(job) for spec in layout.columns])
 
-                if job.is_alchemy:
-                    model_text = Text("alchemy", style="grey62")
-                else:
-                    model_text = Text(shorten(job.model_name, 24) if job.model_name else "?", style="")
+        subtitle = shed_hint(layout)
+        return Panel(
+            table,
+            title="Recent jobs",
+            title_align="left",
+            subtitle=Text(subtitle, style="grey50") if subtitle else None,
+            subtitle_align="right",
+            border_style="grey37",
+            padding=(0, 1),
+        )
 
-                features_text = ", ".join(job.features.as_tags()) if job.features is not None else "-"
-                size = f"{job.width}×{job.height}" if job.width and job.height else "-"
-                table.add_row(
-                    glyph,
-                    job_id_text(job.job_id),
-                    model_text,
-                    short_baseline(job.baseline),
-                    features_text,
-                    str(job.steps) if job.steps else "-",
-                    size,
-                    human_duration(job.queue_wait_seconds) if job.queue_wait_seconds is not None else "-",
-                    human_duration(job.safety_seconds) if job.safety_seconds is not None else "-",
-                    human_duration(job.e2e_seconds) if job.e2e_seconds is not None else "-",
-                )
+    @staticmethod
+    def _recent_model_cell(job: RecentJobRecord) -> Text:
+        """The Model/type cell: ``alchemy`` for alchemy jobs, else the (shortened) model name."""
+        if job.is_alchemy:
+            return Text("alchemy", style="grey62")
+        return Text(shorten(job.model_name, 24) if job.model_name else "?", style="")
 
-        return Panel(table, title="Recent jobs", title_align="left", border_style="grey37", padding=(0, 1))
+
+@dataclass(frozen=True)
+class _ProcessRow:
+    """One process-table row paired with the render-time context its cells need.
+
+    Bundling the snapshot-wide ``now`` and ``residency`` with the per-process snapshot lets every process
+    column be a plain ``ColumnSpec[_ProcessRow]`` whose render takes a single argument.
+    """
+
+    process: ProcessSnapshot
+    now: float
+    residency: WholeCardResidencyStatus
+
+
+def _heartbeat_age(row: _ProcessRow) -> float | None:
+    """Seconds since the process last sent a heartbeat, or None when it never has."""
+    timestamp = row.process.last_heartbeat_timestamp
+    return row.now - timestamp if timestamp else None
+
+
+_PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
+    ColumnSpec("ID", DensityTier.ESSENTIAL, lambda r: str(r.process.process_id), justify="right", width=3),
+    ColumnSpec("Type", DensityTier.ESSENTIAL, lambda r: r.process.process_type.title(), width=9),
+    ColumnSpec("State", DensityTier.ESSENTIAL, OverviewView._process_state_cell, width=12, no_wrap=True),
+    ColumnSpec("Job", DensityTier.ESSENTIAL, lambda r: job_id_text(r.process.current_job_id), width=8, no_wrap=True),
+    ColumnSpec(
+        "Progress",
+        DensityTier.ESSENTIAL,
+        lambda r: OverviewView._progress_cell(r.process),
+        width=12,
+        no_wrap=True,
+    ),
+    ColumnSpec(
+        "Model",
+        DensityTier.NORMAL,
+        lambda r: shorten(r.process.loaded_horde_model_name, 22),
+        min_width=14,
+        max_width=22,
+        no_wrap=True,
+    ),
+    ColumnSpec(
+        "Baseline",
+        DensityTier.NORMAL,
+        lambda r: short_baseline(r.process.loaded_horde_model_baseline),
+        width=8,
+        no_wrap=True,
+    ),
+    ColumnSpec("Done", DensityTier.NORMAL, lambda r: f"{r.process.num_jobs_completed:,}", justify="right", width=5),
+    ColumnSpec(
+        "Features",
+        DensityTier.WIDE,
+        lambda r: OverviewView._features_cell(r.process),
+        min_width=10,
+        no_wrap=True,
+    ),
+    ColumnSpec(
+        "Size",
+        DensityTier.WIDE,
+        lambda r: OverviewView._size_cell(r.process),
+        justify="right",
+        width=11,
+        no_wrap=True,
+    ),
+    ColumnSpec(
+        "it/s",
+        DensityTier.WIDE,
+        lambda r: format_its(r.process.last_iterations_per_second),
+        justify="right",
+        width=6,
+    ),
+    ColumnSpec(
+        "GPU VRAM",
+        DensityTier.WIDE,
+        lambda r: OverviewView._vram_cell(r.process),
+        justify="right",
+        min_width=15,
+        no_wrap=True,
+    ),
+    ColumnSpec(
+        "Steps",
+        DensityTier.DETAILS,
+        lambda r: str(r.process.current_job_steps) if r.process.current_job_steps else "-",
+        justify="right",
+        width=6,
+    ),
+    ColumnSpec(
+        "Heartbeat",
+        DensityTier.DETAILS,
+        lambda r: OverviewView._heartbeat_cell(_heartbeat_age(r), r.process.is_alive),
+        justify="right",
+        width=9,
+    ),
+    ColumnSpec(
+        "HB type",
+        DensityTier.DETAILS,
+        lambda r: r.process.last_heartbeat_type.replace("_", " ").title() if r.process.is_busy else "-",
+        width=11,
+        no_wrap=True,
+    ),
+]
+"""The process table's columns, tagged by the density tier at which each appears."""
+
+
+def _entry_features(entry: JobQueueEntry) -> str:
+    """Comma-joined feature tags for a queued job, or a dash when it carries none."""
+    return ", ".join(entry.features.as_tags()) if entry.features is not None else "-"
+
+
+def _entry_size(entry: JobQueueEntry) -> str:
+    """A queued job's ``width×height``, or a dash when its dimensions are unknown."""
+    return f"{entry.width}×{entry.height}" if entry.width and entry.height else "-"
+
+
+_QUEUE_COLUMNS: list[ColumnSpec[JobQueueEntry]] = [
+    ColumnSpec("Job", DensityTier.ESSENTIAL, lambda e: job_id_text(e.job_id), width=8, no_wrap=True),
+    ColumnSpec("Model", DensityTier.ESSENTIAL, lambda e: shorten(e.model, 28), min_width=20, no_wrap=True),
+    ColumnSpec("Baseline", DensityTier.NORMAL, lambda e: short_baseline(e.baseline), width=8, no_wrap=True),
+    ColumnSpec("Size", DensityTier.NORMAL, _entry_size, justify="right", width=10),
+    ColumnSpec("Features", DensityTier.WIDE, _entry_features, min_width=10),
+    ColumnSpec("Steps", DensityTier.WIDE, lambda e: str(e.steps) if e.steps else "-", justify="right", width=6),
+]
+"""The pending-jobs queue table's columns, tagged by density tier."""
+
+
+def _recent_features(job: RecentJobRecord) -> str:
+    """Comma-joined feature tags for a completed job, or a dash when it carries none."""
+    return ", ".join(job.features.as_tags()) if job.features is not None else "-"
+
+
+def _recent_size(job: RecentJobRecord) -> str:
+    """A completed job's ``width×height``, or a dash when its dimensions are unknown."""
+    return f"{job.width}×{job.height}" if job.width and job.height else "-"
+
+
+_RECENT_COLUMNS: list[ColumnSpec[RecentJobRecord]] = [
+    ColumnSpec(
+        "",
+        DensityTier.ESSENTIAL,
+        lambda j: Text("✗", style="red") if j.faulted else Text("✓", style="green"),
+        width=2,
+    ),
+    ColumnSpec("Job", DensityTier.ESSENTIAL, lambda j: job_id_text(j.job_id), width=8, no_wrap=True),
+    ColumnSpec("Model / type", DensityTier.ESSENTIAL, OverviewView._recent_model_cell, min_width=18, no_wrap=True),
+    ColumnSpec("Baseline", DensityTier.NORMAL, lambda j: short_baseline(j.baseline), width=8, no_wrap=True),
+    ColumnSpec("Size", DensityTier.NORMAL, _recent_size, justify="right", width=10),
+    ColumnSpec(
+        "E2E",
+        DensityTier.NORMAL,
+        lambda j: human_duration(j.e2e_seconds) if j.e2e_seconds is not None else "-",
+        justify="right",
+        width=8,
+    ),
+    ColumnSpec("Features", DensityTier.WIDE, _recent_features, min_width=10),
+    ColumnSpec("Steps", DensityTier.WIDE, lambda j: str(j.steps) if j.steps else "-", justify="right", width=6),
+    ColumnSpec(
+        "Queue",
+        DensityTier.WIDE,
+        lambda j: human_duration(j.queue_wait_seconds) if j.queue_wait_seconds is not None else "-",
+        justify="right",
+        width=7,
+    ),
+    ColumnSpec(
+        "Safety",
+        DensityTier.WIDE,
+        lambda j: human_duration(j.safety_seconds) if j.safety_seconds is not None else "-",
+        justify="right",
+        width=7,
+    ),
+]
+"""The recent-jobs table's columns, tagged by density tier."""
