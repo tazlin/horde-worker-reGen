@@ -4,6 +4,7 @@
     - [The layered recovery model](#the-layered-recovery-model)
     - [Layer 1: bounded and degraded job retry](#layer-1-bounded-and-degraded-job-retry)
     - [Layer 2: slot replacement and crash-loop quarantine](#layer-2-slot-replacement-and-crash-loop-quarantine)
+    - [Stranded in-progress jobs](#stranded-in-progress-jobs)
     - [Layer 3: save-our-ship (SOS) escalation](#layer-3-save-our-ship-sos-escalation)
     - [The action ledger](#the-action-ledger)
     - [The owned-PID registry](#the-owned-pid-registry)
@@ -63,9 +64,10 @@ raise on a surprising message.
 
 A single crashed or hung slot is handled by the
 [`ProcessLifecycleManager`](process_lifecycle.md#process-replacement): the dead
-process is removed from `ProcessMap`, its model ownership is cleared, any
-in-flight job is faulted into Layer 1, and a replacement is spawned with a fresh
-`process_launch_identifier`.
+process is removed from `ProcessMap`, its model ownership is cleared, the job
+**that slot was running** (taken from its own `last_job_referenced`, never by
+scanning the map for the first in-flight job) is faulted into Layer 1, and a
+replacement is spawned with a fresh `process_launch_identifier`.
 
 A slot that **crash-loops** (repeatedly dies shortly after being replaced) is
 *quarantined* rather than respawned forever: the lifecycle manager tracks
@@ -73,6 +75,49 @@ A slot that **crash-loops** (repeatedly dies shortly after being replaced) is
 always OOMs on load, say) stops consuming respawn churn. A merely slow,
 replacing, or model-loading slot is **not** quarantined; only repeated fast
 crashes trip the breaker.
+
+## Stranded in-progress jobs
+
+Per-slot replacement faults the job of the slot it replaces, but a job can still
+end up marked `in_progress` with nothing left to move it on: its
+`HordeInferenceResultMessage` can be **lost** (dropped by the launch-identifier
+guard while the slot was being replaced), or it can be mis-associated by a
+requeue race. No result will ever arrive for such a job, so it would pin the head
+of the queue and count against the concurrent-job cap forever. Two independent
+backstops guarantee the [no-loss invariant](job_lifecycle.md#pipeline-invariants)
+holds anyway:
+
+- **Prompt detector** (`MessageDispatcher._reap_lost_inference_result`): the
+  moment a slot reports it is back to `WAITING_FOR_JOB` *from an inference-active
+  state* while still referencing a job that is still `in_progress`, the result must
+  have been lost. Because results and state changes share one ordered message
+  stream, a real result is always processed *before* the idle transition, so this
+  cannot misfire on a normally completed job. The job is released retryably
+  (Layer 1) the tick the loss becomes observable. The slot is alive, so this is
+  **not** treated as a process crash. The "from an inference-active state"
+  qualifier is essential: `last_job_referenced` and the in-progress mark are
+  stamped by the scheduler the instant it *dispatches* a job, before the child has
+  acknowledged it, so a slot can carry a freshly dispatched job while it is still
+  draining state messages from *before* the dispatch (the idle it reports after
+  unloading the previous model to free VRAM, say). Reaping on that idle would fault
+  a job that never ran, a window that widens on slower disks and larger models, so
+  only a return to idle from a state where inference actually ran can mean a result
+  was lost. The periodic watchdog below covers the remaining shapes.
+- **Periodic watchdog** (`HordeWorkerProcessManager._reconcile_orphaned_in_progress_jobs`):
+  each control-loop tick, any `in_progress` job that **no live slot is actively
+  working** is punted (retryably) once it has been un-owned for a short grace
+  window. The grace rides out the brief dispatch race between marking a job
+  in-progress and the slot reporting `INFERENCE_STARTING`. The key subtlety is
+  *ownership*: a slot only owns its job while it cannot accept new work. An
+  **idle** slot (`can_accept_job()` is true) whose `last_job_referenced` still
+  points at the job does **not** shield it, because that reference is retained
+  across completion and is not a "currently running" flag. Treating a stale idle
+  reference as ownership is what previously let a single stranded job wedge the
+  whole worker.
+
+A *recurring* storm of orphan punts means something upstream keeps stranding jobs
+(a flaky GPU, say); that feeds the wedge assessment below so SOS can limp the
+worker by rather than punting forever.
 
 ## Layer 3: save-our-ship (SOS) escalation
 
@@ -87,11 +132,15 @@ manager-side **actions**:
   Keeping it pure (it takes a wedge boolean and a clock) makes the escalation
   timing unit-testable with a fake clock.
 - `HordeWorkerProcessManager` owns the wedge **assessment** and the **actions**.
-  `_assess_wedge()` decides the worker is wedged only on definitive signals (every
-  inference slot quarantined, or the safety pool crash-looping with no healthy
-  process). A busy, slow, replacing, or model-loading worker is never wedged.
-  `_run_recovery_supervisor()` runs each control-loop tick and applies the
-  returned action.
+  `_assess_wedge()` decides the worker is wedged only on definitive signals: every
+  inference slot quarantined, the safety pool crash-looping with no healthy
+  process, a **sustained** structural queue deadlock (pending inference work with
+  every process idle, held long enough to rule out the transient all-idle gap
+  between jobs), or a recurring [orphaned-job](#stranded-in-progress-jobs) punt
+  storm. A busy, slow, replacing, or model-loading worker is never wedged, and a
+  queue deliberately held while a heavy model establishes whole-card residency is
+  excused by a bounded grace. `_run_recovery_supervisor()` runs each control-loop
+  tick and applies the returned action.
 
 The escalation, in order:
 

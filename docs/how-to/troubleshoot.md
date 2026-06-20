@@ -11,6 +11,7 @@ maintainer directly, as we cannot guarantee your API key is not present in them.
 | Problem | Fix |
 |---------|-----|
 | Download failures | Check disk space and your internet connection. |
+| LoRAs stopped being served ("lora OFF (disk full)") | The LoRA cache disk fell below its free-space floor (`min_lora_disk_free_gb`, default 1 GB) and evicting cached LoRAs could not clear it, so the worker stopped offering LoRA jobs. Free disk space (or move the cache to a larger volume); LoRA support resumes automatically. The LoRA cache itself is bounded by `max_lora_cache_size` (GB). See [the LoRA cache and its disk floor](../explanation/performance_and_backpressure.md#the-lora-cache-and-its-disk-floor). |
 | Antivirus blocks downloads (`CRYPT_E_NO_REVOCATION_CHECK`) | Some antivirus (for example Avast) interferes with downloads. Temporarily disable it. |
 | "Path too long" or file-not-found during install (Windows) | Use a short install path (the default already is). If it persists, opt in to system-wide long-path support: set `$env:HORDE_WORKER_ENABLE_LONG_PATHS=1` before installing. This changes an HKLM setting and needs administrator rights. |
 | SmartScreen "Windows protected your PC" | The installer is not code-signed yet. Click **More info**, then **Run anyway**. `winget install` avoids the prompt. |

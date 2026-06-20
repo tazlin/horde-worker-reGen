@@ -86,8 +86,13 @@ When a process dies unexpectedly (crash, OOM kill, hung timeout):
 1. The old process entry is removed from `ProcessMap`.
 2. Any model ownership entries in `HordeModelMap` tied to that process are
    cleared.
-3. If inference was in progress on that process, the job is faulted via
-   `JobTracker.handle_job_fault_now`; it skips straight to `PENDING_SUBMIT`.
+3. If inference was in progress on that process, the job **that slot was running**
+   (its own `last_job_referenced`) is faulted via `JobTracker.handle_job_fault_now`
+   as *retryable*: it returns to `PENDING_INFERENCE` for a fresh attempt while any
+   remain, and only skips to `PENDING_SUBMIT` once the attempt budget is exhausted
+   (see [Layer 1](resilience_and_recovery.md#layer-1-bounded-and-degraded-job-retry)).
+   A job left stranded in progress despite this (e.g. a lost result) is caught by
+   the [orphaned-job backstops](resilience_and_recovery.md#stranded-in-progress-jobs).
 4. A new process is started with a fresh `process_launch_identifier`.
 5. The `process_launch_identifier` bump ensures any stale messages from the dead
    process (still in the IPC queue) are discarded.

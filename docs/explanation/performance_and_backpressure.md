@@ -22,7 +22,8 @@ worker stable under load.
 
 ## The pop gauntlet
 
-Before `JobPopper` makes any network call, it runs a series of gates:
+Before [`JobPopper`][horde_worker_regen.process_management.job_popper.JobPopper] makes any network
+call, it runs a series of gates:
 
 1. **Shutdown check**: if `WorkerState.shutting_down`, skip.
 2. **Consecutive failure backoff**: if ≥ 3 consecutive failures, pause for
@@ -53,8 +54,10 @@ model is treated as present. See
 ## Megapixelstep backpressure
 
 "Megapixelsteps" are a rough measure of GPU work:
-`width × height × steps / 1,000,000`. The job tracker sums the megapixelsteps of
-pending jobs; when that sum exceeds a threshold, `PopThrottler` pauses popping
+`width × height × steps / 1,000,000`. The
+[`JobTracker`][horde_worker_regen.process_management.job_tracker.JobTracker] sums the megapixelsteps of
+pending jobs; when that sum exceeds a threshold,
+[`PopThrottler`][horde_worker_regen.process_management.pop_throttler.PopThrottler] pauses popping
 until the backlog drains. The threshold is **not** a config field; it is
 derived from the active performance mode: `15` (normal), `60`
 (`moderate_performance_mode`), or `80` (`high_performance_mode`). How long
@@ -69,11 +72,20 @@ When the worker has more configured models than inference processes, every new
 job might require unloading one model and loading another. On slow disks, model
 loading can take minutes, during which the GPU is idle.
 
-Model stickiness (`horde_model_stickiness` in bridge config, 0.0-1.0) is the
-probability that the pop request will only ask for models currently loaded in
-VRAM. A sticky worker stays "locked" to its loaded models, trading job variety
-for throughput. Stickiness automatically disengages when no jobs are available
-for the loaded models.
+Model stickiness (0.0-1.0) is the probability that a pop request will only ask
+for models currently loaded in VRAM. A sticky worker stays "locked" to its
+loaded models, trading job variety for throughput, and automatically disengages
+when no jobs are available for the loaded models.
+
+The `bridgeData.yaml` key is **`model_stickiness`**. (The field is read
+internally as `horde_model_stickiness`, but that is the *alias*, not the YAML
+key: because the config model accepts unknown extras, writing
+`horde_model_stickiness:` is silently ignored and the value stays `0.0`.) In
+practice this is mainly a slow-disk lever: on a card with a fast disk and diverse
+demand it gives little or no throughput gain, because reload churn already
+overlaps across the spare inference processes. See
+[GPU duty cycle → Tuning levers](duty-cycle.md#tuning-levers-and-what-they-cannot-do)
+for the measured analysis.
 
 ## Pop-rate throttling
 
@@ -102,13 +114,14 @@ queue_size + 1 + (max_threads - 1)
 The `+ 1` accounts for the fact that one job can be "in flight" during the pop
 itself (not yet recorded in the tracker). The `+ (max_threads - 1)` accounts for
 jobs that are in `INFERENCE_IN_PROGRESS` but also still counted in
-`PENDING_INFERENCE` (the dual-presence rule). Without this headroom, the queue
-would appear full when it still has capacity.
+`PENDING_INFERENCE` (the [dual-presence
+rule](job_state_machine.md#the-stage-dual-presence-rule)). Without this headroom,
+the queue would appear full when it still has capacity.
 
 ## Inference scheduling priorities
 
-`InferenceScheduler.run_scheduling_cycle` runs every 200 ms and makes decisions
-in this order:
+[`InferenceScheduler`][horde_worker_regen.process_management.inference_scheduler.InferenceScheduler]'s
+`run_scheduling_cycle` runs every 200 ms and makes decisions in this order:
 
 1. **Preload models**: for the first pending job whose model isn't loaded, pick
    a free process and send `PRELOAD_MODEL`, subject to the
@@ -231,8 +244,10 @@ recovery so it cannot be counted as either used or free.
 
 ## Alchemy backpressure
 
-When `alchemist: true`, `AlchemyCoordinator` runs its own pop loop (≈ every 1 s,
-popping at most every 4 s) independent of the image pop gauntlet. Because alchemy
+When `alchemist: true`,
+[`AlchemyCoordinator`][horde_worker_regen.process_management.alchemy_popper.AlchemyCoordinator] runs
+its own pop loop (≈ every 1 s, popping at most every 4 s) independent of the image pop gauntlet.
+Because alchemy
 shares the inference and safety processes with image work, it has its own gating
 so it never starves image jobs:
 
@@ -241,23 +256,81 @@ so it never starves image jobs:
 - **Spare-lane gate**: in concurrent mode (`alchemy_allow_concurrent: true`), a
   graph form pops only when an inference lane is idle beyond what the undispatched
   image queue needs. Image jobs always win contention for a process.
-- **VRAM-headroom gate**: a graph form pops only when free VRAM exceeds
-  `alchemy_vram_headroom_mb`. An `AlchemyHeadroomEstimator` tracks the rolling
-  median VRAM cost of recent forms and raises the requirement toward it; free VRAM
-  is read from the worker's per-process memory reports. With no VRAM telemetry yet
-  (cold start / CPU-only), it falls back to backfill.
+- **VRAM-headroom gate**: a form pops only when *effective* free VRAM exceeds
+  `alchemy_vram_headroom_mb`, where effective free is the measured device-wide free
+  VRAM minus everything the shared
+  [`CommittedReserveLedger`][horde_worker_regen.process_management.resource_budget.CommittedReserveLedger]
+  records as already committed by in-flight image and alchemy work. Image generation
+  reads the same combined figure, so the two flows cannot independently admit against
+  the same free VRAM. An `AlchemyHeadroomEstimator` tracks the rolling median VRAM cost
+  of recent forms and raises the requirement toward it; free VRAM is read from the
+  worker's per-process memory reports. With no VRAM telemetry yet (cold start /
+  CPU-only), it falls back to backfill.
+- **RAM-headroom gate**: in `high_memory_mode` (where graph forms keep weights
+  resident in system RAM), a form also pops only when effective available RAM clears
+  `alchemy_ram_headroom_mb`, keeping alchemy from pushing a memory-resident worker
+  into paging. Outside `high_memory_mode`, or when RAM cannot be read, this gate does
+  not apply.
 - **Backfill fallback**: with `alchemy_allow_concurrent: false`, all of the above
   collapses to the legacy rule: pop only when the image queue is fully drained.
 
+Each in-flight form's shared-ledger reserve is charged by what it actually allocates:
+a graph form reserves the predicted VRAM cost (and, in `high_memory_mode`, an
+`alchemy_ram_headroom_mb` RAM hold for its resident weights), while a CLIP form runs on
+the safety process's already-resident model and reserves nothing, so it never holds image
+generation back. The reserve is reconciled to the in-flight set each cycle. A form whose
+process dies hard before reporting a result (so no faulted result is ever sent) is detected
+by the lost-form reaper (its owning process launch is no longer active) and dropped, so its
+reserve is released rather than leaking and starving image generation.
+
 Periods where only alchemy forms are in flight do **not** count as "idle" for the
 no-jobs-available accounting (`WorkerState.alchemy_forms_in_flight` gates it).
+
+## The LoRA cache and its disk floor
+
+When `allow_lora: true`, the worker downloads CivitAI LoRAs on demand into a size-bounded local
+cache (hordelib's `LoraModelManager`). Two independent bounds keep that cache from filling the disk:
+
+- **Byte budget** (`max_lora_cache_size`, in GB): the primary bound. Ad-hoc LoRAs beyond it are
+  evicted least-recently-used. This is the figure you tune for steady-state cache size. (Internally
+  it reaches the manager as the megabyte env var `AIWORKER_LORA_CACHE_SIZE`.)
+- **Free-space floor** (`min_lora_disk_free_gb`, default 1 GB): a safety net for when the byte budget
+  is not enough on its own, e.g. a cache volume shared with other data, or weights larger than
+  expected. Below the floor, every weight write risks an `ENOSPC` that can take co-located worker
+  data down with it, so the worker treats the floor as a hard constraint.
+
+The floor is enforced in two places, split across the processes that can act on it:
+
+- **In the inference process** (which owns the live LoRA manager),
+  [`constrain_lora_cache_to_disk`][horde_worker_regen.process_management.lora_disk_guard.constrain_lora_cache_to_disk]
+  runs before each LoRA-bearing job: it shrinks the effective ad-hoc budget to fit free space and
+  evicts least-recently-used ad-hoc LoRAs until the floor is clear, *making room for the job's
+  LoRAs*. It relies only on measured free space and LRU eviction, so it self-limits correctly even
+  if the byte-budget arithmetic is off.
+- **In the main process** (which has no LoRA manager),
+  [`is_lora_disk_exhausted`][horde_worker_regen.process_management.lora_disk_guard.is_lora_disk_exhausted]
+  decides whether to stop advertising LoRA support at all. Crucially, it suppresses LoRAs **only**
+  when evicting every ad-hoc LoRA (read from the persisted `lora.json`) still would not clear the
+  floor, so a *recoverable* shortfall is left to the inference-side eviction rather than latching the
+  worker out of LoRA work. When the shortfall is structural (non-LoRA data filling the disk), it sets
+  `WorkerState.lora_disk_exhausted`, which folds into `effective_allow_lora` so new pops stop
+  advertising LoRA support, and the TUI's health panel raises a prominent "LoRA disabled: disk full"
+  alert. Both clear automatically once free space recovers above the floor.
+
+This division means a tight-but-recoverable disk quietly trims the cache and keeps serving LoRAs,
+while a genuinely full disk stops the worker accepting LoRA jobs it could not fulfil, instead of
+crashing on a failed write.
 
 ## See also
 
 - [Bridge Configuration](bridge_config.md): the config fields that drive
   throttling behavior
+- [GPU duty cycle](duty-cycle.md): how the reload churn and hand-off gaps from
+  this page show up as measured GPU idle, and the tuning levers
 - [Job Lifecycle](job_lifecycle.md): where popping and scheduling fit in the
   pipeline
+- [Job State Machine](job_state_machine.md): the stages and the dual-presence
+  rule the queue accounting depends on
 - [Process Lifecycle](process_lifecycle.md): model preloading lifecycle
 - [`PopThrottler`][horde_worker_regen.process_management.pop_throttler.PopThrottler]
 - [`InferenceScheduler`][horde_worker_regen.process_management.inference_scheduler.InferenceScheduler]

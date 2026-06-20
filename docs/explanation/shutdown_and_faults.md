@@ -8,7 +8,9 @@
     - [Fault propagation](#fault-propagation)
     - [Consecutive failure backoff](#consecutive-failure-backoff)
     - [Deadlock detection](#deadlock-detection)
+    - [Worker-wide recovery](#worker-wide-recovery)
     - [The `.abort` file](#the-abort-file)
+    - [See also](#see-also)
 
 The worker must never lose a job, even during a crash, a SIGINT, or a hung
 process. This page explains how shutdown coordination, fault propagation, and
@@ -25,46 +27,57 @@ There are two termination paths:
 
 ### Graceful shutdown sequence
 
-1. `WorkerState.initiate_shutdown()` sets `shutting_down = True`.
-2. `JobPopper` sees the flag and stops popping new jobs.
-3. `InferenceScheduler` stops dispatching new inference jobs.
-4. `SafetyOrchestrator` stops dispatching new safety checks.
-5. `AlchemyCoordinator` stops its pop/dispatch/submit loop (it checks the
-   shutdown manager each iteration).
-6. `JobSubmitter` continues submitting pending results.
+1. [`WorkerState`][horde_worker_regen.process_management.worker_state.WorkerState]'s
+   `initiate_shutdown()` sets `shutting_down = True`.
+2. [`JobPopper`][horde_worker_regen.process_management.job_popper.JobPopper] sees the flag and stops
+   popping new jobs.
+3. [`InferenceScheduler`][horde_worker_regen.process_management.inference_scheduler.InferenceScheduler]
+   stops dispatching new inference jobs.
+4. [`SafetyOrchestrator`][horde_worker_regen.process_management.safety_orchestrator.SafetyOrchestrator]
+   stops dispatching new safety checks.
+5. [`AlchemyCoordinator`][horde_worker_regen.process_management.alchemy_popper.AlchemyCoordinator]
+   stops its pop/dispatch/submit loop (it checks the shutdown manager each iteration).
+6. [`JobSubmitter`][horde_worker_regen.process_management.job_submitter.JobSubmitter] continues
+   submitting pending results.
 7. When all jobs are finalized (all stage collections empty), the main loop
    exits.
-8. If jobs don't drain within a grace period, `start_timed_shutdown()`
-   force-kills all processes.
+8. If jobs don't drain within a grace period (scaled by the amount of
+   outstanding work, then hard-capped), any still-outstanding jobs are faulted so
+   the still-running submitter reports them and the horde reissues them
+   immediately, and only then are all processes force-killed. This keeps the
+   no-loss invariant even when a drain cannot finish in time.
 
 ### Abort sequence
 
-1. `JobTracker._purge_jobs()` clears all job collections (jobs are lost).
-2. `ProcessLifecycleManager._hard_kill_processes()` kills all children
-   immediately.
+1. [`JobTracker`][horde_worker_regen.process_management.job_tracker.JobTracker]'s `_purge_jobs()`
+   clears all job collections (jobs are lost).
+2. [`ProcessLifecycleManager`][horde_worker_regen.process_management.process_lifecycle.ProcessLifecycleManager]'s
+   `_hard_kill_processes()` kills all children immediately.
 3. `start_timed_shutdown()` launches a background thread that `sys.exit(1)`
    after a grace period; a last-resort measure if the main loop is stuck.
 
 ## Signal handling
 
-`ShutdownManager.signal_handler` is registered for `SIGINT` and `SIGTERM`. The
-first two signals initiate graceful shutdown. The third signal triggers an
-immediate `sys.exit(1)`. This gives the operator a way to escalate: Ctrl+C once
-for graceful, three times for "I mean it."
+[`ShutdownManager`][horde_worker_regen.process_management.shutdown_manager.ShutdownManager]'s
+`signal_handler` is registered for `SIGINT` and `SIGTERM`. The first two signals (counted together,
+either signal) initiate graceful shutdown. The third triggers an immediate `sys.exit(1)`. This gives
+the operator a way to escalate: Ctrl+C once for graceful, three times for "I mean it."
 
 ## Fault propagation
 
 Jobs can fault at any stage. The fault-propagation chain is:
 
-1. **Source image download failure** → `SourceImageDownloader` records a
-   `GenMetadataEntry` fault keyed by `GenerationID`. The job still proceeds to
-   inference (with a placeholder/missing image).
-2. **Inference failure** (child crash, OOM, model error) →
-   `JobTracker.handle_job_fault` resolves it: the job is **requeued for another
-   attempt** if it has any of its `max_inference_attempts` budget left (a
-   resource/OOM fault gets one degraded, isolated retry), and only reported
-   faulted to the API once attempts are exhausted. See
-   [Resilience and Recovery → bounded and degraded job retry](resilience_and_recovery.md#layer-1-bounded-and-degraded-job-retry).
+1. **Source image download failure** →
+   [`SourceImageDownloader`][horde_worker_regen.process_management.source_image_downloader.SourceImageDownloader]
+   records a `GenMetadataEntry` fault keyed by `GenerationID`. The job still proceeds to inference
+   (with a placeholder/missing image).
+2. **Inference failure** (child crash, OOM, model error) → `JobTracker.handle_job_fault` resolves it
+   into an [`InferenceFailureResolution`][horde_worker_regen.process_management.job_tracker.InferenceFailureResolution]:
+   the job is **requeued for another attempt** if it has any of its `max_inference_attempts` budget left
+   (a resource/OOM fault gets one degraded, isolated retry), and only reported faulted to the API once
+   attempts are exhausted. See
+   [Resilience and Recovery → bounded and degraded job retry](resilience_and_recovery.md#layer-1-bounded-and-degraded-job-retry)
+   and the [fault stage moves](job_state_machine.md#job-faults).
 3. **Safety evaluation failure** (classifier crash, missing fields) →
    `SafetyOrchestrator` faults the job terminally and queues it for submit
    (re-running inference cannot help a post-inference failure).
@@ -93,9 +106,10 @@ Two independent mechanisms guard against the worker getting stuck:
 1. **Hung-process recovery**: heartbeat- and timeout-based detection in
    `ProcessLifecycleManager` that actually _replaces_ stuck processes (see
    [Process Lifecycle](process_lifecycle.md#hung-process-detection)).
-2. **Deadlock diagnostics**: `MessageDispatcher.detect_deadlock` inspects
-   job/process state and logs when all inference processes are idle while jobs
-   are still pending inference, or when jobs are tracked but no process is busy.
+2. **Deadlock diagnostics**:
+   [`MessageDispatcher`][horde_worker_regen.process_management.message_dispatcher.MessageDispatcher]'s
+   `detect_deadlock` inspects job/process state and logs when all inference processes are idle while
+   jobs are still pending inference, or when jobs are tracked but no process is busy.
    These checks are purely informational: they emit diagnostics after a short
    grace period and do **not** kill or replace anything.
 

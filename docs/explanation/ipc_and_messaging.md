@@ -9,10 +9,11 @@
     - [Model load states](#model-load-states)
     - [The optimistic-send pattern](#the-optimistic-send-pattern)
     - [Discarding stale messages](#discarding-stale-messages)
+    - [See also](#see-also)
 
 The worker's parent process and its children communicate through a two-channel
-IPC system. Understanding the message types and the optimistic-send pattern is
-essential for debugging state drift between parent and child.
+IPC (Inter-Process Communication) system. Understanding the message types and the 
+optimistic-send pattern is essential for debugging state drift between parent and child.
 
 ## The two channels
 
@@ -163,10 +164,17 @@ match, the message is discarded with a debug log. This handles the race where a
 killed process's messages are still in the queue when its replacement is already
 running.
 
+When the discarded message is an inference *result*, the job it belonged to would
+be left marked in-progress with no completion signal. That case is not silently
+lost: it is recovered by the
+[orphaned-job backstops](resilience_and_recovery.md#stranded-in-progress-jobs).
+
 ## See also
 
 - [Process Lifecycle](process_lifecycle.md): how process replacement bumps the
   launch identifier
+- [Resilience and Recovery](resilience_and_recovery.md#stranded-in-progress-jobs):
+  how a job whose result was discarded here is recovered
 - [Architecture](architecture.md): overview of the IPC channel topology
 - [`HordeProcessState`][horde_worker_regen.process_management.messages.HordeProcessState]
 - [`ModelLoadState`][horde_worker_regen.process_management.messages.ModelLoadState]

@@ -33,6 +33,30 @@ classification. Alchemy runs on a separate pop→dispatch→submit loop
 that reuses the same child processes the image pipeline already owns; it does not
 have its own process pool. See [Bridge Configuration](bridge_config.md#alchemy).
 
+## Workloads (flows)
+
+Image generation and alchemy are two **workload flows** the worker orchestrates over one shared pool
+of child processes ([`WorkloadKind`][horde_worker_regen.process_management.workload_flow.WorkloadKind];
+audio and video generation are the intended next flows). Each flow is its own pop→dispatch→submit
+loop. What they share is threefold:
+
+- **The process pool**, routed by capability rather than by process type: each process declares a
+  [`WorkerCapability`][horde_worker_regen.process_management.horde_process.WorkerCapability]
+  (inference processes serve `IMAGE_GEN` and `ALCHEMY_GRAPH`; the safety process serves `SAFETY_EVAL`
+  and `ALCHEMY_CLIP`), and work is dispatched to the first process declaring the capability it needs.
+- **One resource budget.** A single
+  [`CommittedReserveLedger`][horde_worker_regen.process_management.resource_budget.CommittedReserveLedger]
+  records the VRAM (and RAM) each flow has admitted but not yet allocated, so every admission gate
+  subtracts the *same* combined figure. This is what stops image generation and alchemy independently
+  admitting work against the same free VRAM and over-committing the device. Admission is two layers: a
+  *fairness* layer (image work wins contended lanes; alchemy backfills or takes only spare lanes) sits
+  above a *capacity* layer (the shared budget) that decides whether the device can physically hold the
+  work at all.
+
+The image pipeline's [`JobTracker`][horde_worker_regen.process_management.job_tracker.JobTracker] still
+owns image-generation job state; the flow abstraction is the seam a future audio/video flow plugs into
+rather than a replacement for it.
+
 ## Why multiple processes?
 
 AI generation inference is VRAM-heavy and stateful. ComfyUI, which is used
