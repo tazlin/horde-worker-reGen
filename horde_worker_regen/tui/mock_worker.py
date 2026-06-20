@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import random
 import time
+import uuid
 from collections import deque
 
 from horde_worker_regen.process_management.supervisor_channel import (
@@ -33,6 +34,22 @@ from horde_worker_regen.run_worker import WorkerLaunchOptions
 _TICK_SECONDS = 0.5
 
 _MOCK_MODELS = ["AlbedoBase XL (SDXL)", "Deliberate", "Flux.1-Schnell fp8 (Compact)"]
+
+_MOCK_BASELINES = {
+    "AlbedoBase XL (SDXL)": "stable_diffusion_xl",
+    "Deliberate": "stable_diffusion_1",
+    "Flux.1-Schnell fp8 (Compact)": "flux_1",
+}
+"""Per-model baselines so the fake worker exercises the Baseline columns with varied, realistic values."""
+
+
+def _mock_job_id() -> str:
+    """A UUID-style job id so the deterministic job-id colouring has representative input under fake mode."""
+    return str(uuid.uuid4())
+
+
+_MOCK_QUEUE_JOB_IDS = [_mock_job_id() for _ in range(8)]
+"""Stable per-slot queue ids so a queued job keeps one colour across ticks instead of flickering."""
 
 # A pool of believable job shapes (width, height, steps, batch) so the resolution/batch columns and the
 # queue/pipeline visualizations have varied, realistic content under --process-mode fake.
@@ -82,6 +99,7 @@ class _MockProcess:
         self._phase_started = time.monotonic()
         self._fraction = 0.0
         self.model = random.choice(_MOCK_MODELS)
+        self.job_id = _mock_job_id()
         self.width, self.height, self.total_steps, self.batch = random.choice(_MOCK_JOB_SHAPES)
         self.step = 0
         self.its = 0.0
@@ -104,6 +122,7 @@ class _MockProcess:
         self.its = 0.0
         self.vram_mb = 0
         self.model = random.choice(_MOCK_MODELS)
+        self.job_id = _mock_job_id()
 
     def tick(self, *, paused: bool) -> bool:
         """Advance the lifecycle. Returns True when a steady-state job just completed."""
@@ -139,6 +158,7 @@ class _MockProcess:
         self._phase_started = now
         if completed:
             self.model = random.choice(_MOCK_MODELS)
+            self.job_id = _mock_job_id()
             self.width, self.height, self.total_steps, self.batch = random.choice(_MOCK_JOB_SHAPES)
             self.num_jobs_completed += 1
         return completed
@@ -162,8 +182,8 @@ class _MockProcess:
             is_alive=True,
             is_busy=self.is_busy,
             loaded_horde_model_name=self.model if self.is_busy else None,
-            loaded_horde_model_baseline="stable_diffusion_xl",
-            current_job_id=f"mock-{self.process_id}-{int(self._phase_started)}" if sampling else None,
+            loaded_horde_model_baseline=_MOCK_BASELINES.get(self.model) if self.is_busy else None,
+            current_job_id=self.job_id if sampling else None,
             last_heartbeat_timestamp=time.time(),
             last_heartbeat_type="INFERENCE_STEP" if sampling else "OTHER",
             last_heartbeat_percent_complete=percent,
@@ -357,11 +377,13 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
                     jobs_faulted += 1
                 recent_jobs.append(
                     RecentJobRecord(
-                        job_id=f"mock-{jobs_submitted}",
+                        job_id=process.job_id,
                         faulted=faulted,
                         queue_wait_seconds=random.uniform(0.1, 3.0),
                         e2e_seconds=random.uniform(3.5, 9.0),
+                        safety_seconds=random.uniform(0.05, 0.4),
                         model_name=process.model,
+                        baseline=_MOCK_BASELINES.get(process.model),
                         steps=process.total_steps,
                         width=process.width,
                         height=process.height,
@@ -379,8 +401,9 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
         queue_depth = 0 if no_work else (int(elapsed) // 3) % 5
         pending_jobs = [
             JobQueueEntry(
-                job_id=f"mock-queued-{index}",
+                job_id=_MOCK_QUEUE_JOB_IDS[index % len(_MOCK_QUEUE_JOB_IDS)],
                 model=_MOCK_MODELS[index % len(_MOCK_MODELS)],
+                baseline=_MOCK_BASELINES.get(_MOCK_MODELS[index % len(_MOCK_MODELS)]),
                 steps=shape[2],
                 width=shape[0],
                 height=shape[1],

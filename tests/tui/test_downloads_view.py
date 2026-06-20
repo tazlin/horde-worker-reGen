@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from rich.console import Console
+
 from horde_worker_regen.process_management.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadFailure,
@@ -10,6 +12,13 @@ from horde_worker_regen.process_management.supervisor_channel import (
     DownloadStatusSnapshot,
 )
 from horde_worker_regen.tui.widgets.downloads import DownloadsView
+
+
+def _render(renderable: object) -> str:
+    console = Console(width=160)
+    with console.capture() as capture:
+        console.print(renderable)
+    return capture.get()
 
 
 def _plan(num_present: int, num_to_download: int) -> DownloadPlanSummary:
@@ -57,3 +66,19 @@ def test_readiness_counts_failures_as_not_ready() -> None:
 def test_readiness_all_present() -> None:
     """When everything is on disk and nothing is queued, all models are ready."""
     assert DownloadsView._readiness(_plan(num_present=3, num_to_download=0), DownloadStatusSnapshot()) == (3, 3)
+
+
+def test_compact_plan_summarizes_presence_and_fit() -> None:
+    """The thin-view disk plan collapses presence, to-fetch, and fit onto one line."""
+    plan = DownloadPlanSummary(num_present=38, num_to_download=6, fits=True)
+    text = _render(DownloadsView()._render_plan_compact(plan))
+    assert "38" in text and "on disk" in text
+    assert "6" in text and "to fetch" in text
+    assert "fits on disk" in text
+
+
+def test_compact_plan_flags_over_budget() -> None:
+    """When the plan does not fit, the compact line states the shortfall instead of 'fits'."""
+    plan = DownloadPlanSummary(num_present=10, num_to_download=4, fits=False, shortfall_bytes=360 * 1024**3)
+    text = _render(DownloadsView()._render_plan_compact(plan))
+    assert "OVER BUDGET" in text

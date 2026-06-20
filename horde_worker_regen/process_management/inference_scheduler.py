@@ -566,6 +566,7 @@ class InferenceScheduler:
         self,
         job: ImageGenerateJobPopResponse,
         baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        forecast: StreamForecast,
         available_process: HordeProcessInfo,
     ) -> bool:
         """Whether a whole-card head should be pre-loaded into a spare's RAM while a live job holds the device.
@@ -580,9 +581,9 @@ class InferenceScheduler:
           loads immediately, with nothing to overlap);
         - the head is not already resident or loading somewhere (nothing left to pre-stage);
         - there is an idle spare to hand the preload to (never the live job's own process); and
-        - system RAM can hold the head alongside the in-flight job -- the operator's "assuming the RAM can
-          support it". Forcing a second multi-GB checkpoint onto a RAM-pressured host would page and collapse
-          throughput, so a RAM shortfall falls back to the prior claim-the-card-and-wait behavior.
+        - system RAM can hold the head's *weights* alongside the in-flight job -- the operator's "assuming the
+          RAM can support it" (see :meth:`_prestage_weights_fit_ram`). A RAM shortfall falls back to the prior
+          claim-the-card-and-wait behavior.
         """
         if len(self._job_tracker.jobs_in_progress) == 0:
             return False
@@ -590,8 +591,34 @@ class InferenceScheduler:
             return False
         if available_process.is_process_busy():
             return False
-        ram_verdict = self._ram_budget.check_job(job, baseline, self._measured_available_ram_mb())
-        return ram_verdict.fits
+        return self._prestage_weights_fit_ram(job, baseline, forecast)
+
+    def _prestage_weights_fit_ram(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        forecast: StreamForecast,
+    ) -> bool:
+        """Whether system RAM can hold the head's *weights* alongside the in-flight job.
+
+        A RAM preload materialises only the model's weights on the CPU offload device; the activation working
+        set that inflates the full :func:`predict_job_ram_mb` burden lives in VRAM at sampling time, not in
+        RAM. Gating the pre-stage on that full burden over-rejects a head whose weights comfortably fit (a Flux
+        fp8 head's ~11.5GB of weights versus its ~24GB activation-inclusive estimate), which is what forces the
+        worker to tear every idle sibling down instead of staging. Worse, the establish path it then falls back
+        to loads those same weights into RAM with no hard gate at all, so the burden gate held the pre-stage to
+        a stricter standard than the path it defers to. So gate on the weight footprint (the forecast's
+        ``weights_mb``, the persistent RAM cost of a preload) plus the configured RAM reserve.
+
+        When the weight estimate is unavailable (it should not be once ``needs_exclusive_residency`` is True,
+        which requires known weights) fall back to the conservative full-burden RAM budget, so a head whose
+        footprint cannot be sized is never force-staged onto a RAM-pressured host.
+        """
+        available_ram_mb = self._measured_available_ram_mb()
+        weights_mb = forecast.weights_mb
+        if weights_mb is None:
+            return self._ram_budget.check_job(job, baseline, available_ram_mb).fits
+        return available_ram_mb >= float(weights_mb) + self._ram_budget.reserve_mb
 
     def _begin_whole_card_residency(
         self,
@@ -1231,7 +1258,7 @@ class InferenceScheduler:
                 if self._whole_card_residency_enabled() and forecast.needs_exclusive_residency:
                     first_time = not self._job_tracker.is_admitted_exclusive(job)
                     self._job_tracker.mark_admitted_exclusive(job)
-                    if self._should_prestage_whole_card_head(job, baseline, available_process):
+                    if self._should_prestage_whole_card_head(job, baseline, forecast, available_process):
                         # A live job still holds the device, so the card cannot be claimed yet, but the heavy
                         # head's weights can begin loading into a spare process's RAM right now: preload_model is
                         # a RAM-only load (the weights move to VRAM at sampling time), so it does not contend with

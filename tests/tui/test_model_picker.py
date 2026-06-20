@@ -48,9 +48,12 @@ def test_flags_for_beta_model() -> None:
     """A beta (pending-queue) model is flagged, leading the flag string."""
     beta_model = ModelInfo("Qwen-Image", "qwen_image", nsfw=False, inpainting=False, is_beta=True)
     assert ModelPickerModal._flags_for(beta_model) == "beta"
-    assert ModelPickerModal._flags_for(
-        ModelInfo("Qwen NSFW", "qwen_image", nsfw=True, inpainting=False, is_beta=True),
-    ) == "beta nsfw"
+    assert (
+        ModelPickerModal._flags_for(
+            ModelInfo("Qwen NSFW", "qwen_image", nsfw=True, inpainting=False, is_beta=True),
+        )
+        == "beta nsfw"
+    )
 
 
 def test_detail_for_shows_beta_source() -> None:

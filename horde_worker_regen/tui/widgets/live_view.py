@@ -13,7 +13,14 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from horde_worker_regen.process_management.supervisor_channel import ProcessSnapshot, WorkerStateSnapshot
-from horde_worker_regen.tui.formatters import STATE_LABELS, format_its, human_mb, label_state, shorten
+from horde_worker_regen.tui.formatters import (
+    STATE_LABELS,
+    format_its,
+    human_mb,
+    job_id_text,
+    label_state,
+    shorten,
+)
 
 _BAR_WIDTH = 36
 
@@ -124,7 +131,13 @@ class LiveView(VerticalScroll):
                 size += f"   (batch ×{process.batch_amount})"
             body.add_row("Resolution", size)
         if detailed and process.current_job_id:
-            body.add_row("Job", process.current_job_id)
+            # The first UUID group is colour-coded (matching the overview tables) so the same job is
+            # recognisable at a glance across views; the remainder stays dim so the full id is still here.
+            job_cell = job_id_text(process.current_job_id)
+            remainder = process.current_job_id[len(job_cell.plain) :]
+            if remainder:
+                job_cell.append(remainder, style="grey50")
+            body.add_row("Job", job_cell)
 
         if process.current_job_features is not None and not process.current_job_features.is_empty():
             body.add_row("Features", ", ".join(process.current_job_features.as_tags()))

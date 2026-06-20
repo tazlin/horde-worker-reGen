@@ -17,13 +17,18 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.widgets import Button, Collapsible, Input, Label, Static, Switch
 
 from horde_worker_regen import __version__
-from horde_worker_regen.app_state import AppStateStore, BenchmarkAvailability, benchmark_status_summary
+from horde_worker_regen.app_state import (
+    AppStateStore,
+    BenchmarkAvailability,
+    OverviewViewMode,
+    benchmark_status_summary,
+)
 from horde_worker_regen.benchmark.enums import BenchAxis, BenchTier
 from horde_worker_regen.benchmark.progress_channel import LevelPlanRow, decode_plan_rows
 from horde_worker_regen.tui.benchmark_launcher import (
@@ -177,6 +182,9 @@ class BenchmarkView(VerticalScroll):
     BenchmarkView .benchmark-body {
         padding: 1 1;
     }
+    BenchmarkView #benchmark-setup {
+        height: auto;
+    }
     """
 
     class RunRequested(Message):
@@ -217,78 +225,81 @@ class BenchmarkView(VerticalScroll):
             yield Button("Cancel", id="benchmark-cancel", variant="warning")
             yield Button("Apply suggested config", id="benchmark-apply", variant="primary")
             yield Button("Restore last-known-good", id="benchmark-restore", variant="default")
-        yield Static(self._guided_steps(), id="benchmark-steps", classes="benchmark-body")
-        yield Label("Model tiers", classes="adv-group")
-        yield Static(
-            Text(
-                "Model families to benchmark, in order. sd15/sdxl are the common path; flux/qwen are very "
-                "large and auto-skip if they do not fit this machine.",
-                style="grey50",
-            ),
-            classes="adv-section-help",
-        )
-        for tier_toggle in _TIER_TOGGLES:
-            yield self._switch_row(
-                tier_toggle.label,
-                _tier_switch_id(tier_toggle.tier),
-                default=tier_toggle.default,
-                help_text=tier_toggle.help_text,
-            )
-        with Collapsible(title="Advanced options", collapsed=True, id="benchmark-advanced"):
-            yield self._number_row(
-                "Soak (min)",
-                "benchmark-soak",
-                "5",
-                "How long the post-ramp sustained-load soak runs.",
-            )
-            yield self._switch_row(
-                "Validate",
-                "benchmark-validate",
-                default=True,
-                help_text="Run the post-ramp soak that proves the suggested config holds under load.",
-            )
-            yield self._switch_row(
-                "Downloads",
-                "benchmark-downloads",
-                default=False,
-                help_text="Include the level that fetches a lora from CivitAI (needs network + a token).",
-            )
+        # The setup chrome (steps, tiers, advanced, persisted status) is wrapped so the thin density mode
+        # can collapse it to just the live run / result body, leaving the action bar and result in view.
+        with Vertical(id="benchmark-setup"):
+            yield Static(self._guided_steps(), id="benchmark-steps", classes="benchmark-body")
+            yield Label("Model tiers", classes="adv-group")
             yield Static(
                 Text(
-                    "Capabilities to measure. Each is separate: turn off any you do not run, and only its "
-                    "levels are skipped.",
+                    "Model families to benchmark, in order. sd15/sdxl are the common path; flux/qwen are very "
+                    "large and auto-skip if they do not fit this machine.",
                     style="grey50",
                 ),
                 classes="adv-section-help",
             )
-            for group_name, toggles in _AXIS_GROUPS:
-                yield Label(group_name, classes="adv-group")
-                for toggle in toggles:
-                    yield self._switch_row(
-                        toggle.label,
-                        _axis_switch_id(toggle.axis),
-                        default=True,
-                        help_text=toggle.help_text,
-                    )
-            yield self._switch_row(
-                "Warm worker",
-                "benchmark-warm",
-                default=True,
-                help_text="Reuse one warm worker across levels (faster). Off isolates each level.",
-            )
-            yield self._switch_row(
-                "Force",
-                "benchmark-force",
-                default=False,
-                help_text="Attempt levels that do not fit this machine (insufficient VRAM/disk) or lack a token.",
-            )
-            yield self._switch_row(
-                "Verbose",
-                "benchmark-verbose",
-                default=False,
-                help_text="Write extra per-process detail to the run's console.log.",
-            )
-        yield Static(self._app_state_summary, id="benchmark-status", classes="benchmark-body")
+            for tier_toggle in _TIER_TOGGLES:
+                yield self._switch_row(
+                    tier_toggle.label,
+                    _tier_switch_id(tier_toggle.tier),
+                    default=tier_toggle.default,
+                    help_text=tier_toggle.help_text,
+                )
+            with Collapsible(title="Advanced options", collapsed=True, id="benchmark-advanced"):
+                yield self._number_row(
+                    "Soak (min)",
+                    "benchmark-soak",
+                    "5",
+                    "How long the post-ramp sustained-load soak runs.",
+                )
+                yield self._switch_row(
+                    "Validate",
+                    "benchmark-validate",
+                    default=True,
+                    help_text="Run the post-ramp soak that proves the suggested config holds under load.",
+                )
+                yield self._switch_row(
+                    "Downloads",
+                    "benchmark-downloads",
+                    default=False,
+                    help_text="Include the level that fetches a lora from CivitAI (needs network + a token).",
+                )
+                yield Static(
+                    Text(
+                        "Capabilities to measure. Each is separate: turn off any you do not run, and only its "
+                        "levels are skipped.",
+                        style="grey50",
+                    ),
+                    classes="adv-section-help",
+                )
+                for group_name, toggles in _AXIS_GROUPS:
+                    yield Label(group_name, classes="adv-group")
+                    for toggle in toggles:
+                        yield self._switch_row(
+                            toggle.label,
+                            _axis_switch_id(toggle.axis),
+                            default=True,
+                            help_text=toggle.help_text,
+                        )
+                yield self._switch_row(
+                    "Warm worker",
+                    "benchmark-warm",
+                    default=True,
+                    help_text="Reuse one warm worker across levels (faster). Off isolates each level.",
+                )
+                yield self._switch_row(
+                    "Force",
+                    "benchmark-force",
+                    default=False,
+                    help_text="Attempt levels that do not fit this machine (insufficient VRAM/disk) or lack a token.",
+                )
+                yield self._switch_row(
+                    "Verbose",
+                    "benchmark-verbose",
+                    default=False,
+                    help_text="Write extra per-process detail to the run's console.log.",
+                )
+            yield Static(self._app_state_summary, id="benchmark-status", classes="benchmark-body")
         yield Static(id="benchmark-plan", classes="benchmark-body")
         yield Static(id="benchmark-body", classes="benchmark-body")
 
@@ -355,12 +366,25 @@ class BenchmarkView(VerticalScroll):
         with contextlib.suppress(NoMatches):
             self.query_one("#benchmark-status", Static).update(self._app_state_summary)
 
-    def update_view(self, run_state: BenchmarkRunState, status: BenchmarkSupervisorStatus, *, frame: int = 0) -> None:
+    def update_view(
+        self,
+        run_state: BenchmarkRunState,
+        status: BenchmarkSupervisorStatus,
+        *,
+        frame: int = 0,
+        mode: OverviewViewMode = OverviewViewMode.NORMAL,
+    ) -> None:
         """Refresh the action buttons, the plan pane, and the body panel from the supervisor's latest state.
 
         ``frame`` is the app's monotonically increasing tick counter, used only to animate the spinner so
         a running level reads as live even when its metrics have not changed since the last sample.
+
+        ``mode`` follows the shared F6 density contract: thin collapses the setup chrome (guided steps,
+        tier toggles, advanced options, persisted status) so only the action bar and the live run / result
+        remain; normal and detailed keep the full launch pad (detailed never shows less than normal).
         """
+        with contextlib.suppress(NoMatches):
+            self.query_one("#benchmark-setup", Vertical).display = mode is not OverviewViewMode.THIN
         self._update_buttons(status, run_state)
         self.query_one("#benchmark-body", Static).update(self._render_body(run_state, status, frame))
         # A run's RampPlanned event overrides any idle preview with the authoritative plan; an empty
@@ -542,9 +566,7 @@ class BenchmarkView(VerticalScroll):
         needs_models = any(row.num_models_missing for row in rows)
         # Only nag when annotators are confirmed absent on disk (present is False); a static ROM size is
         # not evidence they are missing. Unknown presence stays silent (the level pre-warms before timing).
-        needs_annotators = any(
-            row.requires_controlnet and row.controlnet_annotators_present is False for row in rows
-        )
+        needs_annotators = any(row.requires_controlnet and row.controlnet_annotators_present is False for row in rows)
         if needs_models or needs_annotators:
             what = "models" if needs_models and not needs_annotators else "models or controlnet annotators"
             banner = Text(

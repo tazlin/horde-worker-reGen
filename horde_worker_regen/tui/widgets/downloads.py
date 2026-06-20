@@ -18,6 +18,7 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
 from textual.widgets import Button, Input, Static
 
+from horde_worker_regen.app_state import OverviewViewMode
 from horde_worker_regen.process_management.supervisor_channel import (
     DownloadPhase,
     DownloadPlanSummary,
@@ -96,15 +97,32 @@ class DownloadsView(VerticalScroll):
         yield Static(id="downloads-queue")
         yield Static(id="downloads-failures")
 
-    def update_view(self, snapshot: WorkerStateSnapshot | None) -> None:
-        """Refresh every panel from the latest snapshot (tolerant of missing download data)."""
+    def update_view(
+        self,
+        snapshot: WorkerStateSnapshot | None,
+        *,
+        mode: OverviewViewMode = OverviewViewMode.NORMAL,
+    ) -> None:
+        """Refresh every panel from the latest snapshot (tolerant of missing download data).
+
+        ``mode`` follows the shared F6 density contract. Thin collapses the page to "what is fetching
+        right now plus whether it fits", hiding the queue and failure panels; normal and detailed both
+        show the full plan, queue and failures (detailed never shows *less* than normal).
+        """
         downloads = snapshot.downloads if snapshot is not None else None
         plan = snapshot.download_plan if snapshot is not None else None
+        thin = mode is OverviewViewMode.THIN
+
+        self.query_one("#downloads-queue", Static).display = not thin
+        self.query_one("#downloads-failures", Static).display = not thin
 
         self._paused = downloads.paused if downloads is not None else False
         self.query_one("#downloads-pause", Button).label = "Resume downloads" if self._paused else "Pause downloads"
         self.query_one("#downloads-banner", Static).update(self._render_banner(downloads, plan))
-        self.query_one("#downloads-plan", Static).update(self._render_plan(plan, downloads))
+        if thin:
+            self.query_one("#downloads-plan", Static).update(self._render_plan_compact(plan))
+        else:
+            self.query_one("#downloads-plan", Static).update(self._render_plan(plan, downloads))
         self.query_one("#downloads-current", Static).update(self._render_current(downloads))
         self.query_one("#downloads-queue", Static).update(self._render_queue(downloads))
         self.query_one("#downloads-failures", Static).update(self._render_failures(downloads))
@@ -237,6 +255,32 @@ class DownloadsView(VerticalScroll):
             )
 
         return Panel(table, title="Disk plan", title_align="left", border_style="grey37", padding=(0, 1))
+
+    def _render_plan_compact(self, plan: DownloadPlanSummary | None) -> Panel:
+        """Render the disk plan as one dense line for the thin view: present, to-download, and fit."""
+        if plan is None:
+            body: RenderableType = Text("Disk plan not available yet (model reference still loading).", style="grey50")
+            return Panel(body, title="Disk plan", title_align="left", border_style="grey37", padding=(0, 1))
+
+        fit = (
+            Text("fits on disk", style="green")
+            if plan.fits
+            else Text(f"OVER BUDGET by {human_bytes(plan.shortfall_bytes)}", style="bold red")
+        )
+        line = Text.assemble(
+            (f"{plan.num_present}", "bold"),
+            (" on disk", "grey50"),
+            ("  ·  ", "grey37"),
+            (f"{plan.num_to_download}", "bold"),
+            (" to fetch ", "grey50"),
+            (f"({human_bytes(plan.to_download_bytes)})", "grey62"),
+            ("  ·  free ", "grey50"),
+            (human_bytes(plan.free_disk_bytes), "grey62"),
+            ("  ·  ", "grey37"),
+        )
+        line.append_text(fit)
+        border = "green" if plan.fits else "red"
+        return Panel(line, title="Disk plan", title_align="left", border_style=border, padding=(0, 1))
 
     def _render_current(self, downloads: DownloadStatusSnapshot | None) -> Panel:
         """Render the in-progress download with its feature, target, progress bar, speed, and ETA."""

@@ -33,6 +33,8 @@ def _busy_process() -> ProcessSnapshot:
         is_alive=True,
         is_busy=True,
         loaded_horde_model_name="AlbedoBase XL",
+        loaded_horde_model_baseline="stable_diffusion_xl",
+        current_job_id="7f3a1c9e-4b2c-4d6e-8a1f-0c2b07d49abc",
         batch_amount=2,
         current_job_width=832,
         current_job_height=1216,
@@ -87,6 +89,65 @@ def test_process_table_detailed_adds_technical_columns() -> None:
     text = _render(OverviewView()._render_process_table(snapshot, detailed=True))
     assert "HB type" in text
     assert "Steps" in text
+
+
+def test_process_table_shows_job_id_and_baseline() -> None:
+    """The process table names the active job (colour-coded id prefix) and the model's baseline."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process()],
+    )
+    text = _render(OverviewView()._render_process_table(snapshot))
+    # The colour-coded id shows its first UUID group, and the baseline its compact label.
+    assert "7f3a1c9e" in text
+    assert "SDXL" in text
+
+
+def test_queue_table_shows_job_id_and_baseline() -> None:
+    """The queue table carries each pending job's id prefix and resolved baseline."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        pending_jobs=[
+            JobQueueEntry(
+                job_id="9c2b07d4-aaaa-bbbb-cccc-ddddeeeeffff",
+                model="Deliberate",
+                baseline="stable_diffusion_1",
+                steps=30,
+                width=1024,
+                height=1024,
+            ),
+        ],
+    )
+    text = _render(OverviewView()._render_queue_table(snapshot))
+    assert "9c2b07d4" in text
+    assert "SD1.5" in text
+
+
+def test_recent_jobs_table_shows_baseline_size_and_timings() -> None:
+    """Recent jobs surface baseline, size, and the queue/safety/E2E timings (favouring more data)."""
+    from horde_worker_regen.process_management.supervisor_channel import RecentJobRecord
+
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        recent_jobs=[
+            RecentJobRecord(
+                job_id="5d11aa22-1234-5678-9abc-def012345678",
+                faulted=False,
+                queue_wait_seconds=1.2,
+                safety_seconds=0.3,
+                e2e_seconds=2.4,
+                model_name="Deliberate",
+                baseline="stable_diffusion_1",
+                steps=30,
+                width=768,
+                height=1024,
+            ),
+        ],
+    )
+    text = _render(OverviewView()._render_recent_jobs(snapshot))
+    assert "5d11aa22" in text
+    assert "SD1.5" in text
+    assert "768×1024" in text
 
 
 def test_pipeline_strip_shows_lifecycle_stages() -> None:

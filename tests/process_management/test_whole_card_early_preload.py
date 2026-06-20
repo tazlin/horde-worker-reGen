@@ -262,6 +262,115 @@ class TestResidencyConvergesAfterDrain:
         scheduler._process_lifecycle.scale_inference_processes.assert_called_with(1)
 
 
+def _live_log_overlap_scheduler(
+    *,
+    available_ram_mb: float,
+) -> tuple[InferenceScheduler, JobTracker, list[HordeProcessInfo]]:
+    """Faithful recreation of the live-log condition (bridge.log active session, ~11:58 / ~12:00).
+
+    The state at the moment the worker chose to tear all siblings down instead of pre-staging:
+
+    - process 1 is mid-inference on an SDXL-class checkpoint (``INFERENCE_STARTING``), device-free ~9329 MB
+      (its memory report read ``vram: 7046``);
+    - processes 2/3/4 are idle and **model-free** (bare ~1288 MB CUDA context each, ~1GB RSS);
+    - the queue is ``[SDXL(in-progress), SDXL(pending, head), Flux(pending)]`` -- Flux is **not** the head,
+      it sits behind another already-resident SDXL job;
+    - the box has 64GB RAM but one process already holds ~25GB RSS, so available RAM is well under Flux's
+      conservative ``predict_job_ram_mb`` burden (~24GB) plus the 4GB reserve.
+
+    Under those numbers the pre-stage RAM gate (which keyed on the full activation-inclusive burden) declined
+    and the worker fell back to the kill-them-all establish path -- the regression these tests pin.
+    """
+    busy = make_mock_process_info(1, model_name=_RESIDENT_SDXL, state=HordeProcessState.INFERENCE_STARTING)
+    busy.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+    busy.vram_usage_mb = _DEVICE_TOTAL_VRAM_MB - 9329.0  # device-free 9329, matching the logged forecast
+    idle: list[HordeProcessInfo] = [
+        make_mock_process_info(pid, model_name=None, state=HordeProcessState.WAITING_FOR_JOB) for pid in (2, 3, 4)
+    ]
+    for proc in idle:
+        proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+        proc.vram_usage_mb = _PER_PROCESS_OVERHEAD_MB
+    process_map = ProcessMap({proc.process_id: proc for proc in (busy, *idle)})
+
+    job_tracker = JobTracker()
+    scheduler = _make_inference_scheduler(
+        process_map=process_map,
+        job_tracker=job_tracker,
+        bridge_data=_overlap_bridge_data(),
+        max_concurrent=1,
+        max_inference=4,
+    )
+    scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=4)
+    scheduler._process_lifecycle.pause_safety_on_gpu = Mock(return_value=True)
+    scheduler._process_lifecycle.is_safety_gpu_paused = False
+    scheduler._measured_available_ram_mb = lambda: available_ram_mb  # type: ignore[method-assign]
+    return scheduler, job_tracker, idle
+
+
+class TestLiveLogRamGateRegression:
+    """The live regression: a heavy head's conservative RAM *burden* over-rejected the RAM-only pre-stage.
+
+    Reproduces the active-session bridge.log: a Flux head behind an in-flight SDXL job, idle model-free
+    siblings, and a 64GB box whose available RAM sat below Flux's ~24GB activation-inclusive ``predict_job_ram_mb``
+    burden plus the reserve. A RAM preload only materialises the model's *weights* (~11.5GB), so gating on the
+    full burden wrongly refused to stage and the worker tore every idle sibling down instead.
+    """
+
+    async def test_prestages_when_weights_fit_even_though_full_burden_does_not(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """RED before the fix: at 25GB free the burden gate (24+4=28GB) rejects, so it kills all siblings.
+
+        The head's weights (~11.5GB) plus the reserve (4GB) fit comfortably in the 25GB available, so the
+        weights-based gate must pre-stage; the worker must not fall back to the teardown path.
+        """
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 14000.0)
+        # The conservative activation-inclusive RAM burden the live worker saw for Flux fp8.
+        monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 24000.0)
+
+        scheduler, job_tracker, idle = _live_log_overlap_scheduler(available_ram_mb=25000.0)
+        sdxl_in_progress = make_job_pop_response(_RESIDENT_SDXL)
+        await track_popped_job_async(job_tracker, sdxl_in_progress)
+        await mark_job_in_progress_async(job_tracker, sdxl_in_progress)
+        sdxl_head = make_job_pop_response(_RESIDENT_SDXL)
+        await track_popped_job_async(job_tracker, sdxl_head)
+        flux = make_job_pop_response(_FLUX_MODEL, width=1024, height=1024)
+        await track_popped_job_async(job_tracker, flux)
+
+        admitted = scheduler.preload_models()
+
+        assert admitted is True
+        assert len(_idle_preloading_flux(idle)) == 1, "Flux must be staged into a spare's RAM (weights fit)"
+        assert scheduler._process_lifecycle.scale_inference_processes.called is False, (
+            "the worker must not tear the idle siblings down when the head can be pre-staged"
+        )
+
+    async def test_falls_back_to_teardown_when_even_weights_do_not_fit_ram(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Guard: when RAM cannot hold even the weights, decline the pre-stage and use the establish path."""
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 14000.0)
+        monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 24000.0)
+
+        # Below the weights (~11.5GB) + reserve (4GB): a RAM preload genuinely would not fit.
+        scheduler, job_tracker, idle = _live_log_overlap_scheduler(available_ram_mb=14000.0)
+        sdxl_in_progress = make_job_pop_response(_RESIDENT_SDXL)
+        await track_popped_job_async(job_tracker, sdxl_in_progress)
+        await mark_job_in_progress_async(job_tracker, sdxl_in_progress)
+        sdxl_head = make_job_pop_response(_RESIDENT_SDXL)
+        await track_popped_job_async(job_tracker, sdxl_head)
+        flux = make_job_pop_response(_FLUX_MODEL, width=1024, height=1024)
+        await track_popped_job_async(job_tracker, flux)
+
+        scheduler.preload_models()
+
+        assert _idle_preloading_flux(idle) == [], "must not stage when the weights cannot fit RAM"
+
+
 def _staged_flux_scheduler(
     *,
     num_processes: int,

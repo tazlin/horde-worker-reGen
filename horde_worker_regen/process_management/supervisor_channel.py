@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.process_info import HordeProcessInfo
     from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
 
-SUPERVISOR_PROTOCOL_VERSION = 4
+SUPERVISOR_PROTOCOL_VERSION = 5
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -37,6 +37,8 @@ v3 added alchemy config/runtime fields, ``pending_jobs``, ``JobFeatureSummary``,
 ``RecentJobRecord`` with model name and feature data.
 v4 added the lightweight :class:`WorkerLivenessFrame`, emitted on its own cadence so the supervisor
 can judge worker liveness independently of full-snapshot production.
+v5 added the resolved model ``baseline`` to ``JobQueueEntry`` and ``RecentJobRecord`` so the queue and
+recent-jobs tables can show a model's baseline alongside its name.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -97,6 +99,8 @@ class JobQueueEntry(BaseModel):
 
     job_id: str
     model: str
+    baseline: str | None = None
+    """The model's image baseline (e.g. ``stable_diffusion_xl``); None when it could not be resolved."""
     steps: int | None = None
     width: int | None = None
     height: int | None = None
@@ -249,14 +253,20 @@ class RecentJobRecord(BaseModel):
     e2e_seconds: float | None = None
     safety_seconds: float | None = None
     model_name: str | None = None
+    baseline: str | None = None
+    """The model's image baseline (e.g. ``stable_diffusion_xl``); None when it could not be resolved."""
     steps: int | None = None
     width: int | None = None
     height: int | None = None
     features: JobFeatureSummary | None = None
 
     @classmethod
-    def from_metrics_record(cls, record: JobMetricsRecord) -> RecentJobRecord:
-        """Project a worker-side ``JobMetricsRecord`` into the lean wire form."""
+    def from_metrics_record(cls, record: JobMetricsRecord, baseline: str | None = None) -> RecentJobRecord:
+        """Project a worker-side ``JobMetricsRecord`` into the lean wire form.
+
+        ``baseline`` is resolved by the caller (the process manager, which owns the model metadata) since
+        ``JobMetricsRecord`` does not itself carry one.
+        """
         features: JobFeatureSummary | None = None
         has_features = bool(
             record.loras_count
@@ -281,6 +291,7 @@ class RecentJobRecord(BaseModel):
             e2e_seconds=record.e2e_seconds,
             safety_seconds=record.safety_seconds,
             model_name=record.model_name,
+            baseline=baseline,
             steps=record.steps,
             width=record.width,
             height=record.height,

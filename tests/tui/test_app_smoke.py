@@ -74,6 +74,65 @@ async def test_app_boots_renders_and_cycles_tabs(tmp_path: Path) -> None:
     assert not supervisor.is_alive()
 
 
+@pytest.mark.e2e
+async def test_view_mode_density_propagates_to_every_tab(tmp_path: Path) -> None:
+    """F6 density is app-wide: thin trims Downloads/Logs/Config/Benchmark; details restores them."""
+    from textual.widgets import Static
+
+    from horde_worker_regen.tui.config_form import CONFIG_SUBTABS
+    from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
+    from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, _subtab_id
+    from horde_worker_regen.tui.widgets.downloads import DownloadsView
+    from horde_worker_regen.tui.widgets.logs import LogsView
+
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    store.set_auto_start_worker(True)
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(worker_name="DensityApp"), mode=WorkerProcessMode.FAKE)
+    app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
+    essentials_id = _subtab_id(CONFIG_SUBTABS[0][0])
+    advanced_id = _subtab_id(CONFIG_SUBTABS[-1][0])
+    try:
+        async with app.run_test(size=(160, 48)) as pilot:
+            for _ in range(8):
+                app._tick()
+                await pilot.pause()
+                await asyncio.sleep(0.1)
+
+            downloads = app.query_one(DownloadsView)
+            logs = app.query_one(LogsView)
+            config = app.query_one(ConfigEditorView)
+            benchmark = app.query_one(BenchmarkView)
+            from textual.widgets import TabbedContent as _TC
+
+            cfg_tabs = config.query_one("#config-subtabs", _TC)
+
+            # Normal: everything visible.
+            assert downloads.query_one("#downloads-queue", Static).display is True
+            assert logs.query_one("#log-controls").display is True
+            assert benchmark.query_one("#benchmark-setup").display is True
+
+            # Thin: the trimmed essentials.
+            app._view_mode = OverviewViewMode.THIN
+            app._tick()
+            await pilot.pause()
+            assert downloads.query_one("#downloads-queue", Static).display is False
+            assert logs.query_one("#log-controls").display is False
+            assert benchmark.query_one("#benchmark-setup").display is False
+            assert cfg_tabs.active == essentials_id
+            assert cfg_tabs.get_tab(advanced_id).display is False
+
+            # Details: the fullest view (the log tally appears; all config sub-tabs return).
+            app._view_mode = OverviewViewMode.DETAILS
+            app._tick()
+            await pilot.pause()
+            assert logs.query_one("#log-tally").display is True
+            assert benchmark.query_one("#benchmark-setup").display is True
+            assert cfg_tabs.get_tab(advanced_id).display is True
+    finally:
+        supervisor.stop(timeout=10.0)
+    assert not supervisor.is_alive()
+
+
 async def test_tick_judges_responsiveness_on_liveness_not_snapshot_age(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

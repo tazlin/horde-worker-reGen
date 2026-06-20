@@ -4,8 +4,88 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from rich.text import Text
+
 _SPARK_TICKS = "▁▂▃▄▅▆▇█"
 """Eight-level block glyphs, low to high, for compact trend sparklines."""
+
+_JOB_ID_PALETTE: tuple[str, ...] = (
+    "#5aa2ff",
+    "#56d364",
+    "#e3b341",
+    "#b283f0",
+    "#5ec8d8",
+    "#f0883e",
+    "#db61a2",
+    "#6cb6ff",
+    "#aada6c",
+    "#f4a3a3",
+    "#7ee787",
+    "#d2a8ff",
+)
+"""Bright, terminal-readable hues a job id is deterministically mapped onto.
+
+Chosen for legibility on the dark TUI background and for being visually distinct from each other, so two
+jobs in flight at once almost always read as two different colours across every table that names them.
+"""
+
+_BASELINE_LABELS: dict[str, str] = {
+    "stable_diffusion_1": "SD1.5",
+    "stable_diffusion_2_512": "SD2",
+    "stable_diffusion_2_768": "SD2",
+    "stable_diffusion_xl": "SDXL",
+    "stable_cascade": "Cascade",
+    "flux_1": "Flux",
+    "qwen_image": "Qwen",
+}
+"""Compact labels for the known image baselines, so a Baseline column stays narrow."""
+
+
+def short_baseline(baseline: str | None) -> str:
+    """Abbreviate a model baseline (e.g. ``stable_diffusion_xl`` -> ``SDXL``), or a dash when unknown.
+
+    Unknown baselines fall back to a cleaned-up form of the raw name rather than being dropped, so a new
+    baseline the table does not yet special-case still reads as something rather than blank.
+    """
+    if not baseline:
+        return "-"
+    if baseline in _BASELINE_LABELS:
+        return _BASELINE_LABELS[baseline]
+    return baseline.replace("stable_diffusion", "SD").replace("_", " ").strip()
+
+
+def short_job_id(job_id: str | None, length: int = 8) -> str:
+    """Return the first group of a job's UUID (the human-scannable prefix), or a dash when absent."""
+    if not job_id:
+        return "-"
+    first_group = job_id.split("-", 1)[0]
+    return first_group[:length] if first_group else "-"
+
+
+def job_id_color(job_id: str | None) -> str:
+    """Deterministically map a job id onto a palette colour, keyed on its first UUID group.
+
+    The first group of a v4 UUID is eight hex digits, plenty of entropy to spread ids across the palette
+    while staying stable: the same job is always the same colour everywhere it appears (process table,
+    queue, recent jobs, live view), which is what lets the operator follow one job across the dashboard.
+    Non-UUID ids fall back to a character-sum so they still colour rather than error.
+    """
+    if not job_id:
+        return "grey50"
+    first_group = job_id.split("-", 1)[0]
+    try:
+        index = int(first_group, 16)
+    except ValueError:
+        index = sum(ord(character) for character in first_group)
+    return _JOB_ID_PALETTE[index % len(_JOB_ID_PALETTE)]
+
+
+def job_id_text(job_id: str | None, length: int = 8) -> Text:
+    """Render a job id's prefix in its deterministic colour, ready to drop into any table cell."""
+    if not job_id:
+        return Text("-", style="grey50")
+    return Text(short_job_id(job_id, length), style=job_id_color(job_id))
+
 
 STATE_LABELS: dict[str, str] = {
     "PROCESS_STARTING": "Starting",

@@ -301,8 +301,11 @@ class HordeWorkerTUI(App[None]):
                 frame=self._frame,
                 mode=self._view_mode,
             )
-            self.query_one(DownloadsView).update_view(snapshot)
-            self.query_one(ConfigEditorView).update_worker_models(
+            self.query_one(DownloadsView).update_view(snapshot, mode=self._view_mode)
+            self.query_one(LogsView).set_view_mode(self._view_mode)
+            config_editor = self.query_one(ConfigEditorView)
+            config_editor.set_view_mode(self._view_mode)
+            config_editor.update_worker_models(
                 snapshot.active_models if snapshot is not None else [],
             )
             if snapshot is not None:
@@ -316,6 +319,7 @@ class HordeWorkerTUI(App[None]):
                 self._benchmark_supervisor.run_state,
                 self._benchmark_supervisor.status,
                 frame=self._frame,
+                mode=self._view_mode,
             )
         except NoMatches:
             # The refresh interval can fire during mount or teardown; skip until the DOM is ready.
@@ -400,13 +404,17 @@ class HordeWorkerTUI(App[None]):
     """The order F6 steps through: the lean redesign, the verbose detail view, then the thin bar."""
 
     _VIEW_MODE_NOTICE = {
-        OverviewViewMode.NORMAL: "View: normal.",
-        OverviewViewMode.DETAILS: "View: details (worker, alchemy, queue, recent jobs, extra columns).",
-        OverviewViewMode.THIN: "View: thin (compact status bar).",
+        OverviewViewMode.NORMAL: "View: normal (the everyday density, across all tabs).",
+        OverviewViewMode.DETAILS: "View: details (every diagnostic: extra columns, log tally, all config sub-tabs).",
+        OverviewViewMode.THIN: "View: thin (essentials only: status bar, slim downloads, bare log, Essentials).",
     }
 
     def action_cycle_view_mode(self) -> None:
-        """Cycle (and persist) the Overview density: normal -> details -> thin, then refresh now."""
+        """Cycle (and persist) the shared density mode: normal -> details -> thin, then refresh now.
+
+        The mode is app-wide: every tab that honours the density contract (Overview, Live, Downloads,
+        Logs, Config, Benchmark) reads the same setting, so one F6 press re-densifies the whole dashboard.
+        """
         index = self._VIEW_MODE_CYCLE.index(self._view_mode) if self._view_mode in self._VIEW_MODE_CYCLE else 0
         self._view_mode = self._VIEW_MODE_CYCLE[(index + 1) % len(self._VIEW_MODE_CYCLE)]
         with contextlib.suppress(Exception):

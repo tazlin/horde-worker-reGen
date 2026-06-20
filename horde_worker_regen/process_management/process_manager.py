@@ -2264,6 +2264,20 @@ class HordeWorkerProcessManager:
         self._download_plan_computed = True
         return self._download_plan_summary
 
+    def _safe_model_baseline(self, model_name: str | None) -> str | None:
+        """Resolve a model's baseline as a plain string for the wire, swallowing lookup misses.
+
+        The metadata may not know a model (custom checkpoints, a reference that has not loaded yet), so a
+        miss yields None rather than failing snapshot assembly, which must never raise on the control loop.
+        """
+        if not model_name:
+            return None
+        try:
+            baseline = self.get_model_baseline(model_name)
+        except Exception:
+            return None
+        return str(baseline) if baseline is not None else None
+
     def _build_pending_jobs_list(self) -> list[JobQueueEntry]:
         """Build a capped list of pending-inference jobs for the overview queue display."""
         entries: list[JobQueueEntry] = []
@@ -2271,10 +2285,12 @@ class HordeWorkerProcessManager:
             payload = api_job.payload
             candidate = JobFeatureSummary.from_payload(payload)
             features = candidate if not candidate.is_empty() else None
+            model_name = str(api_job.model) if api_job.model is not None else "?"
             entries.append(
                 JobQueueEntry(
                     job_id=str(api_job.id_.root) if api_job.id_ is not None else "",
-                    model=str(api_job.model) if api_job.model is not None else "?",
+                    model=model_name,
+                    baseline=self._safe_model_baseline(model_name),
                     steps=payload.ddim_steps,
                     width=payload.width,
                     height=payload.height,
@@ -2420,7 +2436,8 @@ class HordeWorkerProcessManager:
             ram_high_water_mb_per_process=run_metrics.ram_used_high_water_mb_per_process,
             disk_free_bytes=dict(self._disk_monitor.current_free_bytes),
             recent_jobs=[
-                RecentJobRecord.from_metrics_record(job) for job in run_metrics.jobs[-RECENT_JOBS_IN_SNAPSHOT:]
+                RecentJobRecord.from_metrics_record(job, baseline=self._safe_model_baseline(job.model_name))
+                for job in run_metrics.jobs[-RECENT_JOBS_IN_SNAPSHOT:]
             ],
             downloads=self._model_availability.status,
             download_plan=self._get_download_plan_summary(),

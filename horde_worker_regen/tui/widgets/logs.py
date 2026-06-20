@@ -7,8 +7,9 @@ from pathlib import Path
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Input, RichLog, Select
+from textual.widgets import Input, RichLog, Select, Static
 
+from horde_worker_regen.app_state import OverviewViewMode
 from horde_worker_regen.tui.log_tailer import BridgeLog, LogFollower, discover_bridge_logs_grouped
 
 _LEVEL_RANK: dict[str, int] = {
@@ -60,7 +61,21 @@ class LogsView(Vertical):
     LogsView #log-output {
         border: round $foreground 20%;
     }
+    LogsView #log-tally {
+        height: 1;
+        padding: 0 1;
+    }
     """
+
+    _LEVEL_TALLY_STYLE: dict[str, str] = {
+        "INFO": "white",
+        "SUCCESS": "green",
+        "DEBUG": "grey62",
+        "WARNING": "yellow",
+        "ERROR": "bold red",
+        "CRITICAL": "bold white on red",
+    }
+    """The levels summarized in the detailed-view tally, in display order."""
 
     def __init__(self) -> None:
         """Initialize follower and filter state."""
@@ -76,6 +91,9 @@ class LogsView(Vertical):
         """Set while mutating the selects programmatically so their Changed events are ignored."""
         self._min_rank = 0
         self._search = ""
+        self._mode = OverviewViewMode.NORMAL
+        self._level_counts: dict[str, int] = {}
+        """Running per-level line counts for the detailed-view tally (the shape of the run)."""
 
     def compose(self) -> ComposeResult:
         """Lay out the process/history/level/search controls and the log output."""
@@ -89,10 +107,12 @@ class LogsView(Vertical):
                 id="log-level",
             )
             yield Input(placeholder="filter text…", id="log-search")
+        yield Static(id="log-tally")
         yield RichLog(id="log-output", highlight=False, markup=False, wrap=False, max_lines=5000)
 
     def on_mount(self) -> None:
         """Discover log files and begin polling."""
+        self.query_one("#log-tally", Static).display = False
         self._refresh(select_first=True)
         self.set_interval(0.5, self._poll)
 
@@ -178,9 +198,44 @@ class LogsView(Vertical):
         """Begin following a new file, clearing the view and re-priming the tail."""
         self._current_path = path
         self._follower = LogFollower(path)
+        self._level_counts = {}
         log = self.query_one("#log-output", RichLog)
         log.clear()
         log.write(Text(f"── following {path} ──", style="italic grey62"))
+
+    def set_view_mode(self, mode: OverviewViewMode) -> None:
+        """Apply the shared F6 density contract to the log view.
+
+        Thin is the bare stream (the filter controls are hidden so the whole pane is log). Normal keeps
+        the full filter set. Detailed adds a per-level tally above the stream so the shape of the run is
+        legible before reading a line; the controls stay visible (detailed never shows less than normal).
+        """
+        if mode is self._mode:
+            return
+        self._mode = mode
+        self.query_one("#log-controls", Horizontal).display = mode is not OverviewViewMode.THIN
+        self.query_one("#log-tally", Static).display = mode is OverviewViewMode.DETAILS
+        if mode is OverviewViewMode.DETAILS:
+            self._render_tally()
+
+    def _render_tally(self) -> None:
+        """Refresh the per-level line-count tally shown in the detailed view."""
+        tally = self.query_one("#log-tally", Static)
+        if not self._level_counts:
+            tally.update(Text("no lines yet", style="grey50"))
+            return
+        text = Text()
+        first = True
+        for level, style in self._LEVEL_TALLY_STYLE.items():
+            count = self._level_counts.get(level, 0)
+            if not count:
+                continue
+            if not first:
+                text.append("   ·   ", style="grey37")
+            first = False
+            text.append(f"{count:,}", style=f"bold {style}")
+            text.append(f" {level}", style="grey50")
+        tally.update(text if text.plain else Text("no levelled lines yet", style="grey50"))
 
     def on_select_changed(self, event: Select.Changed) -> None:
         """Handle process/history/level selection changes (ignoring programmatic updates)."""
@@ -222,10 +277,18 @@ class LogsView(Vertical):
             styled = self._style_line(line)
             if styled is not None:
                 log.write(styled)
+        if self._mode is OverviewViewMode.DETAILS:
+            self._render_tally()
 
     def _style_line(self, line: str) -> Text | None:
-        """Apply level and search filters, returning a styled line or None to drop it."""
+        """Apply level and search filters, returning a styled line or None to drop it.
+
+        Every parsed level is tallied (before the filters are applied) so the detailed-view level tally
+        reflects the whole run's shape, not just the lines the current filter happens to show.
+        """
         level = self._parse_level(line)
+        if level is not None:
+            self._level_counts[level] = self._level_counts.get(level, 0) + 1
         if self._min_rank and level is not None and _LEVEL_RANK.get(level, 0) < self._min_rank:
             return None
         if self._search and self._search not in line.lower():

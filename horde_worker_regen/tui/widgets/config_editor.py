@@ -10,6 +10,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Button, Checkbox, Input, Label, Rule, Static, Switch, TabbedContent, TabPane, TextArea
 
+from horde_worker_regen.app_state import OverviewViewMode
 from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
     CONFIG_SUBTABS,
@@ -32,7 +33,7 @@ _MODELS_SECTION = "Models"
 
 
 def _subtab_id(label: str) -> str:
-    """A DOM-safe TabPane id derived from a sub-tab label (e.g. ``LoRA/Alchemy`` -> ``cfgtab-lora-alchemy``)."""
+    """A DOM-safe TabPane id derived from a sub-tab label (e.g. ``Alchemy`` -> ``cfgtab-alchemy``)."""
     slug = "".join(char if char.isalnum() else "-" for char in label.lower())
     return f"cfgtab-{slug.strip('-')}"
 
@@ -106,6 +107,7 @@ class ConfigEditorView(Vertical):
         super().__init__()
         self._config_path = config_path
         self._data = load_config(config_path)
+        self._mode = OverviewViewMode.NORMAL
 
     def compose(self) -> ComposeResult:
         """Lay out the pinned action bar and status line, then the grouped fields in sub-tabs."""
@@ -220,6 +222,29 @@ class ConfigEditorView(Vertical):
             self._save()
         elif event.button.id in ("config-apply", "config-restart") and self._save():
             self.post_message(self.ApplyRequested(restart=event.button.id == "config-restart"))
+
+    def set_view_mode(self, mode: OverviewViewMode) -> None:
+        """Apply the shared F6 density contract to the config sub-tabs.
+
+        Thin narrows the editor to Essentials (the four fields a worker needs to register), so a quick
+        glance is not buried under every advanced sub-tab. Normal and detailed expose all sub-tabs
+        (detailed never hides anything normal shows); the action bar and restart markers stay pinned.
+        """
+        if mode is self._mode:
+            return
+        self._mode = mode
+        thin = mode is OverviewViewMode.THIN
+        essentials_id = _subtab_id(CONFIG_SUBTABS[0][0])
+        with contextlib.suppress(Exception):
+            tabs = self.query_one("#config-subtabs", TabbedContent)
+            for label, _sections in CONFIG_SUBTABS:
+                tab_id = _subtab_id(label)
+                if thin and tab_id != essentials_id:
+                    tabs.hide_tab(tab_id)
+                else:
+                    tabs.show_tab(tab_id)
+            if thin:
+                tabs.active = essentials_id
 
     def update_worker_models(self, active_models: list[str]) -> None:
         """Forward the running worker's currently-loaded model list to the model panel (best-effort)."""

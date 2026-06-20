@@ -105,7 +105,10 @@ CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Models", ("Models",)),
     ("Performance", ("Throughput", "Memory & performance")),
     ("Content", ("Content & safety", "Features")),
-    ("LoRA/Alchemy", ("LoRA", "Alchemist")),
+    # LoRA and Alchemy are logically distinct concerns (one is an image-job feature, the other a separate
+    # worker role), so each gets its own sub-tab rather than sharing a crowded combined page.
+    ("LoRA", ("LoRA",)),
+    ("Alchemy", ("Alchemist",)),
     ("Advanced", ("Other",)),
 )
 
@@ -115,6 +118,8 @@ SECTION_GUIDANCE: dict[str, str] = {
     "Models": "Edit the load/skip rules below; the panel previews exactly which models will load and "
     "their disk cost. Press Resolve to expand 'top N' / 'bottom N' commands (needs usage stats).",
     "LoRA": "Allowing LoRA downloads them on demand; set a civitai_api_token for resources that require it.",
+    "Alchemist": "Alchemy is a separate worker role (interrogation / post-processing), distinct from LoRA. "
+    "Enabling it serves alchemy jobs alongside (or instead of) image generation.",
 }
 
 # Curated against bridgeData_template.yaml key names (note: dreamer_name, allow_painting, cache_home).

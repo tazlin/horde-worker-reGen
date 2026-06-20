@@ -89,6 +89,29 @@ def test_recent_job_record_without_features() -> None:
     assert lean.steps == 20
 
 
+def test_recent_job_record_carries_caller_supplied_baseline() -> None:
+    """The process manager resolves a baseline the metrics record lacks; the projection carries it."""
+    from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
+
+    record = JobMetricsRecord(job_id="b", model_name="AlbedoBase XL", e2e_seconds=2.0)
+    lean = RecentJobRecord.from_metrics_record(record, baseline="stable_diffusion_xl")
+    assert lean.baseline == "stable_diffusion_xl"
+    # Absent a resolved baseline, the field is simply None (never raises).
+    assert RecentJobRecord.from_metrics_record(record).baseline is None
+
+
+def test_queue_and_recent_baseline_survive_json_roundtrip() -> None:
+    """The new baseline field on queue and recent records round-trips over the wire."""
+    from horde_worker_regen.process_management.supervisor_channel import JobQueueEntry
+
+    snapshot = _make_snapshot()
+    snapshot.pending_jobs = [JobQueueEntry(job_id="q", model="Deliberate", baseline="stable_diffusion_1")]
+    snapshot.recent_jobs = [RecentJobRecord(job_id="r", model_name="AlbedoBase XL", baseline="stable_diffusion_xl")]
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+    assert restored.pending_jobs[0].baseline == "stable_diffusion_1"
+    assert restored.recent_jobs[0].baseline == "stable_diffusion_xl"
+
+
 def _fake_process_info() -> SimpleNamespace:
     """A duck-typed stand-in for HordeProcessInfo (only the attributes ProcessSnapshot reads)."""
     return SimpleNamespace(

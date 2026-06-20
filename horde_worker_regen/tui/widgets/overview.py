@@ -25,8 +25,10 @@ from horde_worker_regen.tui.formatters import (
     format_percent,
     human_duration,
     human_mb,
+    job_id_text,
     label_state,
     mini_bar,
+    short_baseline,
     shorten,
     sparkline,
 )
@@ -719,8 +721,11 @@ class OverviewView(VerticalScroll):
     def _render_process_table(self, snapshot: WorkerStateSnapshot, *, detailed: bool = False) -> Table:
         """Build a compact per-process summary table with stable column widths.
 
-        ``detailed`` appends the more technical columns (per-job steps, heartbeat age and type) that
-        the F6 toggle reveals; the default view stays lean. Resolution/batch (Size) show either way.
+        Every row names the slot's active job by its colour-coded id and the loaded model's baseline, so
+        one job can be followed across the dashboard (the same colour appears in the queue, recent-jobs
+        and live views). ``detailed`` appends the more technical columns (RAM, per-job steps, heartbeat
+        age and type) that the F6 toggle reveals; the default view stays lean. Resolution/batch (Size)
+        and the job/baseline columns show either way.
         """
         table = Table(
             title="Processes",
@@ -731,21 +736,23 @@ class OverviewView(VerticalScroll):
         )
         table.add_column("ID", justify="right", width=3)
         table.add_column("Type", width=9)
-        table.add_column("State", width=14)
-        table.add_column("Model", min_width=18, max_width=24, no_wrap=True)
-        table.add_column("Features", min_width=12, no_wrap=True)
-        table.add_column("Size", justify="right", width=12, no_wrap=True)
-        table.add_column("Progress", width=16, no_wrap=True)
-        table.add_column("it/s", justify="right", width=7)
-        table.add_column("GPU VRAM", justify="right", min_width=12)
+        table.add_column("State", width=12, no_wrap=True)
+        table.add_column("Job", width=8, no_wrap=True)
+        table.add_column("Model", min_width=14, max_width=22, no_wrap=True)
+        table.add_column("Baseline", width=8, no_wrap=True)
+        table.add_column("Features", min_width=10, no_wrap=True)
+        table.add_column("Size", justify="right", width=11, no_wrap=True)
+        table.add_column("Progress", width=12, no_wrap=True)
+        table.add_column("it/s", justify="right", width=6)
+        table.add_column("GPU VRAM", justify="right", min_width=15, no_wrap=True)
         table.add_column("Done", justify="right", width=5)
         if detailed:
             table.add_column("Steps", justify="right", width=6)
-            table.add_column("Heartbeat", justify="right", width=10)
-            table.add_column("HB type", width=12, no_wrap=True)
+            table.add_column("Heartbeat", justify="right", width=9)
+            table.add_column("HB type", width=11, no_wrap=True)
 
         if not snapshot.processes:
-            placeholder = ["-", "-", "waiting for first snapshot", "-", "-", "-", "-", "-", "-", "-"]
+            placeholder = ["-", "-", "waiting for first snapshot", "-", "-", "-", "-", "-", "-", "-", "-", "-"]
             if detailed:
                 placeholder += ["-", "-", "-"]
             table.add_row(*placeholder)
@@ -774,7 +781,9 @@ class OverviewView(VerticalScroll):
                 str(process.process_id),
                 process.process_type.title(),
                 state_cell,
+                job_id_text(process.current_job_id),
                 shorten(process.loaded_horde_model_name, 22),
+                short_baseline(process.loaded_horde_model_baseline),
                 features_text,
                 self._size_cell(process),
                 self._progress_cell(process),
@@ -849,19 +858,23 @@ class OverviewView(VerticalScroll):
             header_style="bold",
             show_header=True,
         )
+        table.add_column("Job", width=8, no_wrap=True)
         table.add_column("Model", min_width=20, no_wrap=True)
+        table.add_column("Baseline", width=8, no_wrap=True)
         table.add_column("Features")
         table.add_column("Steps", justify="right", width=6)
         table.add_column("Size", justify="right", width=10)
 
         if not snapshot.pending_jobs:
-            table.add_row(Text("queue empty", style="grey50"), "", "", "")
+            table.add_row("", Text("queue empty", style="grey50"), "", "", "", "")
         else:
             for entry in snapshot.pending_jobs:
                 features_text = ", ".join(entry.features.as_tags()) if entry.features is not None else "-"
                 size = f"{entry.width}×{entry.height}" if entry.width and entry.height else "-"
                 table.add_row(
+                    job_id_text(entry.job_id),
                     shorten(entry.model, 28),
+                    short_baseline(entry.baseline),
                     features_text,
                     str(entry.steps) if entry.steps else "-",
                     size,
@@ -908,15 +921,21 @@ class OverviewView(VerticalScroll):
             show_header=True,
         )
         table.add_column("", width=2)
+        table.add_column("Job", width=8, no_wrap=True)
         table.add_column("Model / type", min_width=18, no_wrap=True)
+        table.add_column("Baseline", width=8, no_wrap=True)
         table.add_column("Features")
         table.add_column("Steps", justify="right", width=6)
+        table.add_column("Size", justify="right", width=10)
+        table.add_column("Queue", justify="right", width=7)
+        table.add_column("Safety", justify="right", width=7)
         table.add_column("E2E", justify="right", width=8)
 
         recent = list(reversed(snapshot.recent_jobs[-8:]))
 
         if not recent:
-            table.add_row("", Text("no completed jobs yet", style="grey50"), "", "", "")
+            empty = ["", "", Text("no completed jobs yet", style="grey50"), "", "", "", "", "", "", ""]
+            table.add_row(*empty)
         else:
             for job in recent:
                 glyph = Text("✗", style="red") if job.faulted else Text("✓", style="green")
@@ -927,13 +946,18 @@ class OverviewView(VerticalScroll):
                     model_text = Text(shorten(job.model_name, 24) if job.model_name else "?", style="")
 
                 features_text = ", ".join(job.features.as_tags()) if job.features is not None else "-"
-                e2e = human_duration(job.e2e_seconds) if job.e2e_seconds is not None else "-"
+                size = f"{job.width}×{job.height}" if job.width and job.height else "-"
                 table.add_row(
                     glyph,
+                    job_id_text(job.job_id),
                     model_text,
+                    short_baseline(job.baseline),
                     features_text,
                     str(job.steps) if job.steps else "-",
-                    e2e,
+                    size,
+                    human_duration(job.queue_wait_seconds) if job.queue_wait_seconds is not None else "-",
+                    human_duration(job.safety_seconds) if job.safety_seconds is not None else "-",
+                    human_duration(job.e2e_seconds) if job.e2e_seconds is not None else "-",
                 )
 
         return Panel(table, title="Recent jobs", title_align="left", border_style="grey37", padding=(0, 1))
