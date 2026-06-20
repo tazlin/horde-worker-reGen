@@ -18,10 +18,10 @@ ARG DEBIAN_FRONTEND=noninteractive
 ENV APP_HOME=/horde-worker-reGen
 
 # libgl1 is needed by opencv/inference; ca-certificates lets uv reach the PyTorch wheel index.
-# No git or curl: the immutable image neither clones nor self-updates, and runtime_version.py
-# degrades cleanly to the plain release version when no .git is present.
+# git is needed by hordelib's git-based dependency resolution, and it's generally useful to have in the image for debugging.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+    git \ 
     libgl1 \
     ca-certificates && \
     apt-get clean && \

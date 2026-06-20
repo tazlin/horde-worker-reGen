@@ -24,6 +24,7 @@ ENV APP_HOME=/horde-worker-reGen
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+    git \
     ninja-build \
     rocm \
     ca-certificates && \
