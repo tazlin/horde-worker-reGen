@@ -100,6 +100,7 @@ horde-worker = "horde_worker_regen.tui.app:main"
 horde-worker-web = "horde_worker_regen.tui.web:main"
 horde-worker-host = "horde_worker_regen.tui.worker_host:main"
 horde-benchmark = "horde_worker_regen.benchmark.cli:main"
+horde-duty-report = "horde_worker_regen.analysis.duty_log_report:main"
 
 [dependency-groups]
 dev = [
@@ -241,6 +242,8 @@ extend-exclude = ["conda", "model-stats.py", "amd_go_fast.py"]
 "run_worker.py" = ["E402"]
 "benchmark/runner.py" = ["E402"]
 "convert_config_to_env.py" = ["E402"]
+# Verbatim bridge.log lines under test must match the real (long) log format exactly.
+"test_duty_log_report.py" = ["E501"]
 
 
 [tool.ruff.lint.pydocstyle]

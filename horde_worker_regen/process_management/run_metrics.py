@@ -10,7 +10,7 @@ crash events, and headline counters into one :class:`RunMetricsSnapshot`.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from pydantic import BaseModel, Field
@@ -28,6 +28,19 @@ from horde_worker_regen.telemetry_spans import (
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.job_models import HordeJobInfo
     from horde_worker_regen.process_management.job_tracker import TrackedJob
+
+ChurnKind = Literal["model_swap", "vram_eviction", "process_cycle"]
+"""A between-jobs reload/respawn event whose frequency erodes duty cycle.
+
+``model_swap``: a preload that displaced a *different* model already resident on that process (the
+prior model's load work is thrown away). ``vram_eviction``: an idle resident model was unloaded from
+VRAM to make room. ``process_cycle``: a healthy idle inference process was deliberately restarted to
+reclaim allocator-stranded RAM. None are faults; their *rate* is the churn signal.
+"""
+
+_CHURN_EVENT_RETENTION_SECONDS = 3600.0
+"""Drop churn timestamps older than this so the lists stay bounded on a long-running worker. Far wider
+than the duty-cycle report window, so every report's lookback is fully covered."""
 
 
 class JobMetricsRecord(BaseModel):
@@ -87,6 +100,11 @@ class RunMetricsSnapshot(BaseModel):
     """Fraction of GPU samples at or above the busy threshold, when measured."""
     gpu_utilization_samples: int = 0
     """How many GPU-utilization samples backed the figures above."""
+    churn_event_times: dict[ChurnKind, list[float]] = Field(default_factory=dict)
+    """Epoch timestamps of each between-jobs reload/respawn event, keyed by :data:`ChurnKind`.
+
+    Raw timestamps (not pre-counted) so a consumer can attribute churn to the same window it measures
+    duty over, exactly as it filters ``jobs`` by ``FINALIZED``. Retained for the last hour."""
     phase: str = ""
     """Human-readable description of what the worker was doing at snapshot time (e.g. "initializing
     inference process", "waiting for first job", "running inference"). Drives benchmark live progress
@@ -111,6 +129,11 @@ class WorkerRunMetrics:
         self._vram_high_water_per_process: dict[int, int] = {}
         self._ram_high_water_per_process: dict[int, int] = {}
         self._crash_events: list[ProcessCrashRecord] = []
+        self._churn_event_times: dict[ChurnKind, list[float]] = {
+            "model_swap": [],
+            "vram_eviction": [],
+            "process_cycle": [],
+        }
 
     def reset(self) -> None:
         """Clear all aggregated metrics, e.g. at a benchmark level boundary on a warm worker."""
@@ -120,6 +143,21 @@ class WorkerRunMetrics:
         self._vram_high_water_per_process.clear()
         self._ram_high_water_per_process.clear()
         self._crash_events.clear()
+        for times in self._churn_event_times.values():
+            times.clear()
+
+    def record_churn(self, kind: ChurnKind) -> None:
+        """Record one between-jobs reload/respawn event (see :data:`ChurnKind`), pruning stale entries.
+
+        Wired as the scheduler's churn observer; safe to call from the control loop. Pruning here (not
+        on read) keeps the lists bounded without a separate timer.
+        """
+        now = time.time()
+        times = self._churn_event_times[kind]
+        times.append(now)
+        cutoff = now - _CHURN_EVENT_RETENTION_SECONDS
+        if times and times[0] < cutoff:
+            self._churn_event_times[kind] = [t for t in times if t >= cutoff]
 
     def on_job_metrics(self, message: HordeJobMetricsMessage) -> None:
         """Handle a per-job metrics message from a child process."""
@@ -252,6 +290,7 @@ class WorkerRunMetrics:
             num_job_slowdowns=num_job_slowdowns,
             time_spent_no_jobs_available=time_spent_no_jobs_available,
             process_crash_events=list(self._crash_events),
+            churn_event_times={kind: list(times) for kind, times in self._churn_event_times.items()},
             phase=phase,
             process_state_summary=process_state_summary,
         )

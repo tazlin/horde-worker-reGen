@@ -27,29 +27,60 @@ if TYPE_CHECKING:
 
 PHASE_ORDER = [
     "queue_wait",
+    "model_unload",
     "disk_load",
     "vram_load",
     "sampling",
     "vae",
+    "encode",
+    "graph_overhead",
     "other_inference",
     "safety",
     "submit",
 ]
 """The pipeline phases a job's wall time is attributed to, in lifecycle order."""
 
-GPU_BUSY_PHASES = ("vram_load", "sampling", "vae")
+GPU_BUSY_PHASES = ("vram_load", "sampling", "vae", "encode")
 """Phases that put the GPU core to work. Everything else is idle hand-off the worker can shrink."""
 
-_EFFICIENCY_GAP_PHASES = ("queue_wait", "disk_load", "other_inference", "safety", "submit")
+_EFFICIENCY_GAP_PHASES = (
+    "queue_wait",
+    "model_unload",
+    "disk_load",
+    "graph_overhead",
+    "other_inference",
+    "safety",
+    "submit",
+)
 """Non-GPU phases inside a job's lifecycle, ranked to name the biggest worker-side time sinks."""
+
+# hordelib phase_seconds keys folded into the named buckets below, peeled out of the old catch-all
+# ``other_inference`` residual so the breakdown names encode and graph framing instead of hiding them.
+# Absent on older engines (the keys simply do not appear), in which case the buckets are omitted and
+# ``other_inference`` retains that time exactly as before.
+_ENCODE_KEYS = ("clip_encode", "vae_encode")
+"""GPU encode phases (prompt CLIP encode and, for img2img, VAE encode)."""
+
+_GRAPH_OVERHEAD_KEYS = ("pipeline_setup", "pipeline_validate", "pipeline_finalize")
+"""ComfyUI graph framing around execution: build/validate the prompt graph, then tear down."""
+
+_CHURN_LABELS = {
+    "model_swap": "model swaps",
+    "vram_eviction": "VRAM evictions",
+    "process_cycle": "process cycles",
+}
+"""Human-friendly names for the between-jobs reload/respawn churn counts shown on the duty line."""
 
 _PHASE_LABELS = {
     "queue_wait": "queue wait",
+    "model_unload": "model unload (eviction)",
     "disk_load": "model load (disk)",
     "vram_load": "model load (VRAM)",
     "sampling": "sampling",
     "vae": "VAE decode",
-    "other_inference": "graph/encode/IPC",
+    "encode": "prompt/image encode",
+    "graph_overhead": "graph build/teardown",
+    "other_inference": "node/IPC overhead",
     "safety": "safety",
     "submit": "submit",
 }
@@ -100,25 +131,39 @@ def phase_breakdown(jobs: list[JobMetricsRecord]) -> dict[str, float]:
         # execution into "vae" (pipeline_execute alone covers most of the job) which mislabelled
         # nearly every job as VAE-bound and zeroed other_inference. The residual subtraction below
         # already attributes that overhead (graph build, prompt encode, IPC) to other_inference.
-        vae = (pm.phase_seconds or {}).get("vae_decode", 0.0)
-        other = max(0.0, inference_total - disk_load - vram_load - sampling - vae)
+        phase_seconds = pm.phase_seconds or {}
+        vae = phase_seconds.get("vae_decode", 0.0)
+        encode = sum(phase_seconds.get(key, 0.0) for key in _ENCODE_KEYS)
+        graph_overhead = sum(phase_seconds.get(key, 0.0) for key in _GRAPH_OVERHEAD_KEYS)
+        other = max(0.0, inference_total - disk_load - vram_load - sampling - vae - encode - graph_overhead)
 
         samples["disk_load"].append(disk_load)
         samples["vram_load"].append(vram_load)
         samples["sampling"].append(sampling)
         samples["vae"].append(vae)
+        # Only contribute encode/graph_overhead when the engine actually reported them; otherwise the
+        # bucket stays absent (median over an empty list -> dropped) and ``other_inference`` keeps the
+        # time, preserving behaviour against engines that predate these phase_seconds keys.
+        if any(key in phase_seconds for key in _ENCODE_KEYS):
+            samples["encode"].append(encode)
+        if any(key in phase_seconds for key in _GRAPH_OVERHEAD_KEYS):
+            samples["graph_overhead"].append(graph_overhead)
         samples["other_inference"].append(other)
+        # Between-jobs VRAM eviction cost (engine-reported). It happens outside this job's inference
+        # window, so it is surfaced as its own worker-side gap, never subtracted from the residual.
+        if "model_unload" in phase_seconds:
+            samples["model_unload"].append(phase_seconds["model_unload"])
 
     return {phase: value for phase in PHASE_ORDER if (value := median(samples[phase])) is not None}
 
 
 def span_derived_busy_ratio(breakdown: dict[str, float]) -> float | None:
-    """GPU-touching phases (vram_load + sampling + vae) / the whole per-job wall, or None.
+    """GPU-touching phases (vram_load + sampling + vae + encode) / the whole per-job wall, or None.
 
     A phase-attributed duty-cycle proxy that needs no tracing backend: it says what share of a
     typical job's lifecycle is actual GPU work versus idle hand-off (queue_wait, disk_load,
-    other_inference, safety, submit). The NVML mean is still the headline; this explains it, and on
-    backends with no NVML telemetry it stands in as the duty-cycle estimate.
+    graph_overhead, other_inference, safety, submit). The NVML mean is still the headline; this
+    explains it, and on backends with no NVML telemetry it stands in as the duty-cycle estimate.
     """
     total = sum(breakdown.values())
     if total <= 0:
@@ -159,6 +204,10 @@ class DutyCycleSummary(BaseModel):
     """Wall time in the window the worker sat idle because the horde offered no jobs."""
     no_jobs_available_fraction: float | None = None
     """``no_jobs_available_seconds`` as a fraction of the window, or None when the window is unknown."""
+    churn_counts: dict[str, int] = {}
+    """Count of each between-jobs reload/respawn event in the window, keyed by churn kind. The *rate*
+    of these (model swaps, VRAM evictions, process cycles) is what inflates queue_wait, so naming them
+    on the duty line points the operator at the reload churn behind a low duty cycle."""
 
     def effective_duty_percent(self) -> float | None:
         """The duty-cycle number to compare against thresholds: NVML mean, else the phase proxy."""
@@ -188,6 +237,19 @@ class DutyCycleSummary(BaseModel):
         """Render the top worker-side gaps as ``"model load (disk) 1.8s/job, safety 0.9s/job"``."""
         return format_phase_gaps(self.phase_breakdown_seconds, limit=limit)
 
+    def format_churn_summary(self) -> str:
+        """Render non-zero churn as ``"23 model swaps, 18 VRAM evictions"`` (largest first), or "".
+
+        The biggest reload/respawn driver leads, so the operator sees what to suppress (e.g. enable
+        residency) first. Empty when no churn occurred in the window.
+        """
+        items = sorted(
+            ((kind, count) for kind, count in self.churn_counts.items() if count > 0),
+            key=lambda entry: entry[1],
+            reverse=True,
+        )
+        return ", ".join(f"{count} {_CHURN_LABELS.get(kind, kind)}" for kind, count in items)
+
 
 def summarize_duty_cycle(
     jobs: list[JobMetricsRecord],
@@ -196,14 +258,15 @@ def summarize_duty_cycle(
     time_spent_no_jobs_available: float = 0.0,
     nvml_mean_percent: float | None = None,
     nvml_busy_fraction: float | None = None,
+    churn_counts: dict[str, int] | None = None,
 ) -> DutyCycleSummary:
     """Distill duty cycle and idle attribution for ``jobs`` observed over ``window_seconds``.
 
     ``jobs`` are the per-job records that fall in the window (the caller filters a live worker's
     accumulating list; the benchmark passes a level's whole set). ``time_spent_no_jobs_available``
-    is the demand-limited idle attributable to this window, and ``nvml_*`` are the measured GPU
-    figures when a backend can report them (None otherwise, in which case the phase proxy carries
-    the headline).
+    is the demand-limited idle attributable to this window, ``nvml_*`` are the measured GPU figures
+    when a backend can report them (None otherwise, in which case the phase proxy carries the
+    headline), and ``churn_counts`` is the per-window count of each reload/respawn event.
     """
     breakdown = phase_breakdown(jobs)
     completed = sum(1 for job in jobs if not job.is_alchemy and not job.faulted)
@@ -221,6 +284,7 @@ def summarize_duty_cycle(
         span_derived_busy_ratio=span_derived_busy_ratio(breakdown),
         no_jobs_available_seconds=time_spent_no_jobs_available,
         no_jobs_available_fraction=no_jobs_fraction,
+        churn_counts=dict(churn_counts or {}),
     )
 
 

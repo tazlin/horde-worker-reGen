@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
+from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.job_models import HordeJobInfo
 from horde_worker_regen.process_management.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.job_tracker import JobTracker
@@ -121,6 +122,12 @@ class TestIsTimeForShutdown:
         shutdown_manager = _make_shutdown_manager(state=state, job_tracker=job_tracker)
         assert shutdown_manager.is_time_for_shutdown() is False
 
+    def test_alchemy_forms_in_flight_returns_false(self) -> None:
+        """Alchemy work should prevent shutdown while it drains."""
+        state = WorkerState(shutting_down=True, alchemy_forms_in_flight=1)
+        shutdown_manager = _make_shutdown_manager(state=state)
+        assert shutdown_manager.is_time_for_shutdown() is False
+
     def test_all_processes_ending_returns_true(self) -> None:
         """If all processes are ending, is_time_for_shutdown should return True."""
         state = WorkerState(shutting_down=True)
@@ -134,6 +141,23 @@ class TestIsTimeForShutdown:
         """If there are no processes, is_time_for_shutdown should return True."""
         state = WorkerState(shutting_down=True)
         shutdown_manager = _make_shutdown_manager(state=state)
+        assert shutdown_manager.is_time_for_shutdown() is True
+
+    def test_live_safety_process_blocks_shutdown_until_ending(self) -> None:
+        """A safety process must be told to end before shutdown is considered complete."""
+        state = WorkerState(shutting_down=True)
+        safety = make_mock_process_info(
+            0,
+            model_name=None,
+            state=HordeProcessState.PROCESS_STARTING,
+            process_type=HordeProcessType.SAFETY,
+        )
+        process_map = ProcessMap({0: safety})
+        shutdown_manager = _make_shutdown_manager(state=state, process_map=process_map)
+
+        assert shutdown_manager.is_time_for_shutdown() is False
+
+        process_map.on_process_ending(0)
         assert shutdown_manager.is_time_for_shutdown() is True
 
 

@@ -682,20 +682,15 @@ class ProcessLifecycleManager:
 
     def end_safety_processes(self) -> None:
         """End any safety processes above the configured limit, or all of them if shutting down."""
-        process_info = self._process_map.get_first_available_safety_process()
+        for process_info in self._process_map.get_stoppable_safety_processes():
+            # Mark the end as supervisor-intended before sending the command so the crash reaper does not
+            # treat the child's expected exit as a safety-pool crash.
+            process_info.end_intended = True
+            process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
+            self._process_map.on_process_ending(process_id=process_info.process_id)
+            self._forget_owned(process_info)
 
-        if process_info is None:
-            return
-
-        # Do not re-target a safety process that is already ending.
-        if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
-            return
-
-        process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
-        self._process_map.on_process_ending(process_id=process_info.process_id)
-        self._forget_owned(process_info)
-
-        logger.info(f"Ended safety process {process_info.process_id}")
+            logger.info(f"Ended safety process {process_info.process_id}")
 
     @property
     def is_safety_gpu_paused(self) -> bool:

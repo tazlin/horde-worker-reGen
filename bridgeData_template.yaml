@@ -439,8 +439,9 @@ minutes_allowed_without_jobs: 30
 
 # Percent chance (0.0 to 1.0) that the currently loaded models will be favored when popping a job.
 # Higher values keep the same model loaded longer, reducing model switches at the cost of throughput.
-# In config files this field is `model_stickiness` (without the horde_ prefix).
-horde_model_stickiness: 0.0
+# NOTE: the config key is `model_stickiness` (the model field is horde_model_stickiness, but its bind
+# alias is model_stickiness). Using `horde_model_stickiness:` here is silently ignored (stays 0.0).
+model_stickiness: 0.0
 
 #############################
 ## GPU Sampling Lease      ##

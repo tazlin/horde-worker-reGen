@@ -718,6 +718,9 @@ class HordeWorkerProcessManager:
         # Feed the startup-measured per-process VRAM overhead to the scheduler's streaming forecast, so it
         # can estimate the free VRAM achievable under sole residency (total - one process's context).
         self._inference_scheduler.set_measured_per_process_overhead_mb(system_resources.per_process_overhead_mb)
+        # Attribute between-jobs reload/respawn churn (model swaps, VRAM evictions, process cycles) into
+        # the run metrics so the periodic duty-cycle line can name it alongside the per-job phase gaps.
+        self._inference_scheduler.set_churn_observer(self._run_metrics.record_churn)
 
         # Save-our-ship: escalates a worker that has stopped making progress on accepted work from an
         # in-place soft reset (rebuild pools, limp-by) to giving up cleanly on jobs it cannot serve, so
@@ -1242,7 +1245,9 @@ class HordeWorkerProcessManager:
             # During graceful shutdown, keep the inference processes up until the queue the worker
             # already accepted has drained, so those jobs get a chance to finish (the popper has
             # already stopped accepting new work). Only wind the processes down once no inference job
-            # remains pending or in progress; the submitter and safety pools keep draining the tail.
+            # remains pending or in progress. Once the safety queue is also drained, wind down the safety
+            # pool too; otherwise an idle or still-starting safety child can outlive the control loop and
+            # only be killed by the timed-shutdown backstop.
             if (
                 self._state.shutting_down
                 and not self._state.last_pop_recently()
@@ -1250,6 +1255,14 @@ class HordeWorkerProcessManager:
                 and len(self._job_tracker.jobs_in_progress) == 0
             ):
                 self._process_lifecycle.end_inference_processes()
+                if (
+                    len(self._job_tracker.jobs_pending_safety_check) == 0
+                    and len(self._job_tracker.jobs_being_safety_checked) == 0
+                    and self._alchemy_coordinator.num_forms_pending == 0
+                    and self._alchemy_coordinator.num_forms_in_flight == 0
+                    and self._alchemy_coordinator.num_forms_awaiting_submit == 0
+                ):
+                    self._process_lifecycle.end_safety_processes()
 
             if self.is_time_for_shutdown():
                 return False
@@ -1488,11 +1501,22 @@ class HordeWorkerProcessManager:
     """Orphan punts within the window that escalate to the save-our-ship wedge path (soft reset/limp-by)."""
 
     def _inference_slot_owns_job(self, job_id: GenerationID) -> bool:
-        """Whether some live inference slot is currently working on (references) the given job."""
+        """Whether some live inference slot is currently working on (references) the given job.
+
+        ``last_job_referenced`` is not cleared when a job completes or its slot returns to idle, so a
+        reference match alone is not ownership: an idle slot (one that ``can_accept_job``) carrying a
+        stale reference will never produce a result for the job. Counting such a slot as the owner lets
+        a job whose result was lost (e.g. dropped by the launch-identifier guard during a recovery
+        storm) sit in progress forever, shielded from the orphaned-job watchdog, until it wedges the
+        whole worker. A slot only owns the job while it is genuinely processing it, i.e. it is not
+        available for new work.
+        """
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
                 continue
             if not process_info.is_process_alive():
+                continue
+            if process_info.can_accept_job():
                 continue
             referenced = process_info.last_job_referenced
             if referenced is not None and referenced.id_ == job_id:
@@ -1900,6 +1924,11 @@ class HordeWorkerProcessManager:
         no_jobs_total = self._job_popper.time_spent_no_jobs_available
         no_jobs_in_window = max(0.0, no_jobs_total - self._last_no_jobs_seconds_at_duty_log)
 
+        churn_counts: dict[str, int] = {
+            kind: sum(1 for stamp in times if stamp >= window_start)
+            for kind, times in metrics.churn_event_times.items()
+        }
+
         # Advance the window before logging so a quiet report never widens the next one's denominator.
         self._last_duty_cycle_log_time = now
         self._last_no_jobs_seconds_at_duty_log = no_jobs_total
@@ -1910,6 +1939,7 @@ class HordeWorkerProcessManager:
             time_spent_no_jobs_available=no_jobs_in_window,
             nvml_mean_percent=nvml_mean,
             nvml_busy_fraction=nvml_busy,
+            churn_counts=churn_counts,
         )
         self._log_duty_cycle_summary(summary, metrics.process_state_summary)
 
@@ -1937,6 +1967,9 @@ class HordeWorkerProcessManager:
         gaps = summary.format_gap_summary()
         if gaps:
             explanation_parts.append(f"biggest worker-side gaps: {gaps}")
+        churn = summary.format_churn_summary()
+        if churn:
+            explanation_parts.append(f"reload churn: {churn}")
         explanation = "; ".join(explanation_parts) if explanation_parts else "no per-job attribution yet"
 
         context = (

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 import psutil
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -41,6 +42,7 @@ from horde_worker_regen.process_management.resource_budget import (
     is_model_locally_unservable_for,
     predict_job_post_processing_vram_mb,
 )
+from horde_worker_regen.process_management.run_metrics import ChurnKind
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.telemetry_spans import span_preload_model
@@ -193,6 +195,9 @@ class InferenceScheduler:
         self._max_inference_processes = max_inference_processes
         self._lru = lru
         self._performance_model = performance_model
+        # Optional sink for between-jobs reload/respawn events, set by the manager to
+        # WorkerRunMetrics.record_churn. None in unit tests that drive the scheduler directly.
+        self._churn_observer: Callable[[ChurnKind], None] | None = None
 
         self._preload_delay_notified = False
         self._model_recently_missing = False
@@ -244,6 +249,15 @@ class InferenceScheduler:
         # job takes the device. See _HEAD_STARVATION_FORCE_ADMIT_SECONDS.
         self._head_starvation_job_id: str | None = None
         self._head_starvation_since: float = 0.0
+
+    def set_churn_observer(self, observer: Callable[[ChurnKind], None]) -> None:
+        """Register the sink for between-jobs reload/respawn events (see :data:`ChurnKind`)."""
+        self._churn_observer = observer
+
+    def _record_churn(self, kind: ChurnKind) -> None:
+        """Report one churn event to the observer if one is registered (no-op otherwise)."""
+        if self._churn_observer is not None:
+            self._churn_observer(kind)
 
     @property
     def _max_concurrent_inference_processes(self) -> int:
@@ -547,6 +561,110 @@ class InferenceScheduler:
                 f"siblings/safety would force the driver to stream activations to host RAM and run several "
                 f"times slower. {self._process_map.residency_snapshot()}</>",
             )
+
+    def _should_prestage_whole_card_head(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        available_process: HordeProcessInfo,
+    ) -> bool:
+        """Whether a whole-card head should be pre-loaded into a spare's RAM while a live job holds the device.
+
+        ``preload_model`` is a RAM-only load (the weights reach VRAM only at sampling), so a heavy head can
+        load into an idle process's RAM concurrently with the in-flight job, and be ready to sample the
+        instant the device frees, rather than its multi-GB disk->RAM load only starting after the drain.
+
+        Pre-staging is worthwhile only when:
+
+        - a live job actually holds the device (otherwise the normal whole-card path claims the idle card and
+          loads immediately, with nothing to overlap);
+        - the head is not already resident or loading somewhere (nothing left to pre-stage);
+        - there is an idle spare to hand the preload to (never the live job's own process); and
+        - system RAM can hold the head alongside the in-flight job -- the operator's "assuming the RAM can
+          support it". Forcing a second multi-GB checkpoint onto a RAM-pressured host would page and collapse
+          throughput, so a RAM shortfall falls back to the prior claim-the-card-and-wait behavior.
+        """
+        if len(self._job_tracker.jobs_in_progress) == 0:
+            return False
+        if self._is_model_forecast_to_load(job.model):
+            return False
+        if available_process.is_process_busy():
+            return False
+        ram_verdict = self._ram_budget.check_job(job, baseline, self._measured_available_ram_mb())
+        return ram_verdict.fits
+
+    def _begin_whole_card_residency(
+        self,
+        job: ImageGenerateJobPopResponse,
+        forecast: StreamForecast,
+        *,
+        announce: bool,
+    ) -> None:
+        """Record a whole-card residency for a head being pre-staged into RAM, without claiming the card yet.
+
+        The device cannot be claimed while a live job holds it, but the heavy head's weights can load into a
+        spare's RAM now. This sets the same residency bookkeeping :meth:`_establish_whole_card_residency` does
+        (so the cooldown, the restore, and the recovery-supervisor wedge grace all cover the pre-stage load and
+        the convergence that follows), minus the process teardown and safety pause -- those are deferred to
+        :meth:`_converge_whole_card_residency`, which runs once the head is staged and the device frees.
+        """
+        if announce or self._whole_card_established_at == 0.0:
+            self._whole_card_established_at = time.time()
+        self._sibling_teardown_for_model = job.model
+        self._whole_card_forecast = forecast
+        self._whole_card_cooldown_until = time.time() + self._whole_card_cooldown_seconds()
+        if announce:
+            logger.opt(ansi=True).info(
+                f"<fg #f0beff>Pre-staging whole-card head {job.model} into a spare process's RAM while the "
+                f"in-flight job finishes; the device will be reserved for it (idle siblings stopped"
+                f"{' and safety moved off-GPU' if self._whole_card_safety_off_gpu_enabled() else ''}) once it "
+                f"frees, so its weights are loaded before it samples instead of after. "
+                f"{self._process_map.residency_snapshot()}</>",
+            )
+
+    def _converge_whole_card_residency(self) -> None:
+        """Collapse an in-progress whole-card residency to sole VRAM residency once its model is staged.
+
+        Driven each scheduling cycle while a residency is held. A pre-staged head is loaded into RAM before
+        the device is claimed (see :meth:`_begin_whole_card_residency`); stopping idle siblings before the head
+        is actually resident on a process could kill the very spare the pre-stage wants to use, so this waits
+        until the head is resident or loading on a process. From then on that process is the queued-model holder
+        ``scale_inference_processes`` spares, so reducing the live inference-process count to the forecast's
+        target stops the *other* idle siblings (and the former busy process once its job drains) to reclaim
+        their CUDA contexts, and safety is moved off-GPU, leaving the staged head the whole card when it samples.
+        A no-op until a residency is held and its model is staged; idempotent at the target.
+        """
+        model = self._sibling_teardown_for_model
+        if model is None:
+            return
+        if not self._is_model_forecast_to_load(model):
+            return
+        forecast = self._whole_card_forecast
+        target = (forecast.max_resident_processes() or 1) if forecast is not None else 1
+        if self._process_map.num_loaded_inference_processes() > target:
+            self._process_lifecycle.scale_inference_processes(target)
+        if self._whole_card_safety_off_gpu_enabled() and not self._process_lifecycle.is_safety_gpu_paused:
+            self._process_lifecycle.pause_safety_on_gpu()
+
+    def _prestaged_whole_card_not_ready(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether ``job`` must wait for its in-progress whole-card residency to claim the card before sampling.
+
+        A pre-staged whole-card head is loaded into RAM (see :meth:`_begin_whole_card_residency`) before the
+        device is reserved, so dispatching it would commit its weights to VRAM while idle siblings (or the
+        just-drained busy process) still hold their CUDA contexts, forcing the first step to stream. This
+        returns True until the residency has converged -- the live inference-process count is at the forecast's
+        target, safety is off-GPU if this residency needs it, and the card has drained enough to load the
+        weights (the same :meth:`_whole_card_teardown_exhausted` gate the non-pre-staged path loads under).
+
+        Returns False for any job that is not the currently-held residency's model, so ordinary dispatch -- and
+        the non-pre-staged whole-card path, which only preloads once already at sole residency -- is unaffected.
+        """
+        model = self._sibling_teardown_for_model
+        if model is None or job.model != model:
+            return False
+        baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
+        forecast = self._forecast_streaming(job, baseline)
+        return not self._whole_card_teardown_exhausted(forecast)
 
     def _whole_card_teardown_exhausted(self, forecast: StreamForecast) -> bool:
         """Whether a whole-card residency has done all it can and the head can now load best-effort.
@@ -918,6 +1036,7 @@ class InferenceScheduler:
             # bookkeeping (recovery count + crash-loop breaker) so sustained RAM pressure cannot
             # quarantine a perfectly healthy slot.
             self._process_lifecycle._replace_inference_process(process_info, intentional_reclaim=True)
+            self._record_churn("process_cycle")
             return True
 
         return False
@@ -930,6 +1049,7 @@ class InferenceScheduler:
         """
         bridge_data = self._runtime_config.bridge_data
         self._restore_siblings_after_whole_card()
+        self._converge_whole_card_residency()
         self._expire_stale_model_map_entries()
         loaded_models = {process.loaded_horde_model_name for process in self._process_map.values()}
         loaded_models = loaded_models.union(
@@ -1107,27 +1227,41 @@ class InferenceScheduler:
                 # _log_stream_forecast, while decision or headroom changes still log immediately.
                 self._log_stream_forecast(job, forecast)
                 whole_card_terminal = False
+                early_prestage = False
                 if self._whole_card_residency_enabled() and forecast.needs_exclusive_residency:
                     first_time = not self._job_tracker.is_admitted_exclusive(job)
                     self._job_tracker.mark_admitted_exclusive(job)
-                    # Claim the device: stop idle siblings to the model's max-resident count and, on the very
-                    # edge, move safety off-GPU too. Announces (once) why, for the operator. Held through the
-                    # cooldown so a burst of heavy jobs reuses one residency instead of churning per job.
-                    self._establish_whole_card_residency(job, forecast, announce=first_time)
-                    # Evict the idle resident models on the *other* processes (sparing the slot that will load
-                    # this model, and never a live in-progress model) so their VRAM returns to the driver. A
-                    # live sibling is left to drain; the preload simply waits until the device is clear.
-                    self.unload_models_from_vram(available_process, under_pressure=True, for_head_of_queue=True)
-                    if not self._whole_card_teardown_exhausted(forecast):
-                        # Still tearing down idle siblings, cycling safety off-GPU, or waiting for their freed
-                        # VRAM to drain: defer and let a later tick re-evaluate against the reduced topology.
-                        return False
-                    # Teardown is structurally exhausted (already at the target process count, safety settled)
-                    # yet the activation-inclusive peak still overflows even sole residency, so co-residency can
-                    # never be reached. The weights DO fit alone (fits_weights_now), so fall through to the
-                    # best-effort admit and load onto the now-cleared card, where it samples slowly under the
-                    # over-budget step grace, instead of deferring every tick until the supervisor soft-resets.
-                    whole_card_terminal = True
+                    if self._should_prestage_whole_card_head(job, baseline, available_process):
+                        # A live job still holds the device, so the card cannot be claimed yet, but the heavy
+                        # head's weights can begin loading into a spare process's RAM right now: preload_model is
+                        # a RAM-only load (the weights move to VRAM at sampling time), so it does not contend with
+                        # the in-flight job's VRAM. Record the residency and fall through to the preload send;
+                        # _converge_whole_card_residency then collapses the live process count to sole VRAM
+                        # residency (stopping idle siblings, then the former busy process once its job drains)
+                        # before the staged model samples. RAM-gated so a second multi-GB checkpoint is never
+                        # forced onto a RAM-pressured host. This is the load-ASAP win: the heavy disk->RAM load
+                        # overlaps the in-flight job instead of waiting for the device to drain first.
+                        self._begin_whole_card_residency(job, forecast, announce=first_time)
+                        early_prestage = True
+                    else:
+                        # Claim the device: stop idle siblings to the model's max-resident count and, on the very
+                        # edge, move safety off-GPU too. Announces (once) why, for the operator. Held through the
+                        # cooldown so a burst of heavy jobs reuses one residency instead of churning per job.
+                        self._establish_whole_card_residency(job, forecast, announce=first_time)
+                        # Evict the idle resident models on the *other* processes (sparing the slot that will load
+                        # this model, and never a live in-progress model) so their VRAM returns to the driver. A
+                        # live sibling is left to drain; the preload simply waits until the device is clear.
+                        self.unload_models_from_vram(available_process, under_pressure=True, for_head_of_queue=True)
+                        if not self._whole_card_teardown_exhausted(forecast):
+                            # Still tearing down idle siblings, cycling safety off-GPU, or waiting for their freed
+                            # VRAM to drain: defer and let a later tick re-evaluate against the reduced topology.
+                            return False
+                        # Teardown is structurally exhausted (already at the target process count, safety settled)
+                        # yet the activation-inclusive peak still overflows even sole residency, so co-residency
+                        # can never be reached. The weights DO fit alone (fits_weights_now), so fall through to the
+                        # best-effort admit and load onto the now-cleared card, where it samples slowly under the
+                        # over-budget step grace, instead of deferring every tick until the supervisor soft-resets.
+                        whole_card_terminal = True
 
                 # Head-of-queue starvation backstop (see _HEAD_STARVATION_FORCE_ADMIT_SECONDS): once the head
                 # has been budget-deferred on an otherwise-idle device past the wedge horizon, stop deferring
@@ -1139,9 +1273,16 @@ class InferenceScheduler:
                 # plain over-budget head that the verdicts keep rejecting (e.g. a head failing the RAM budget
                 # against allocator-stranded idle RAM that no reclaim path can return).
                 force_admit_starved_head = (
-                    is_head_blocker and self._head_starved_seconds(job) >= _HEAD_STARVATION_FORCE_ADMIT_SECONDS
+                    not early_prestage
+                    and is_head_blocker
+                    and self._head_starved_seconds(job) >= _HEAD_STARVATION_FORCE_ADMIT_SECONDS
                 )
-                if whole_card_terminal or force_admit_starved_head:
+                if early_prestage:
+                    # A RAM-only pre-stage of a whole-card head: the VRAM budget deliberately does not fit it
+                    # co-resident (that is *why* it gets the whole card), so skip the VRAM/RAM verdict and fall
+                    # through to the preload send. The RAM fit was already checked in the pre-stage decision.
+                    pass
+                elif whole_card_terminal or force_admit_starved_head:
                     if whole_card_terminal:
                         self._log_whole_card_terminal_admit(job)
                     else:
@@ -1271,6 +1412,12 @@ class InferenceScheduler:
             will_load_loras = job.payload.loras is not None and len(job.payload.loras) > 0
             seamless_tiling_enabled = job.payload.tiling is not None and job.payload.tiling
 
+            # A swap is a preload that displaces a *different* model already resident on this process;
+            # that prior model's load work is thrown away. A fresh slot (None) or re-preload of the same
+            # model is not churn. Captured before the send so the process's prior model is still readable.
+            prior_model = available_process.loaded_horde_model_name
+            is_model_swap = prior_model is not None and prior_model != job.model
+
             with span_preload_model(model_name=job.model, process_id=available_process.process_id):
                 preload_sent = available_process.safe_send_message(
                     HordePreloadInferenceModelMessage(
@@ -1284,6 +1431,8 @@ class InferenceScheduler:
 
             if preload_sent:
                 available_process.last_control_flag = HordeControlFlag.PRELOAD_MODEL
+                if is_model_swap:
+                    self._record_churn("model_swap")
                 self._process_lifecycle.action_ledger.record(
                     LedgerEventType.PRELOAD_REQUESTED,
                     process_id=available_process.process_id,
@@ -1611,6 +1760,14 @@ class InferenceScheduler:
             # A degraded retry (after a resource/OOM failure) runs in isolation to minimise VRAM
             # pressure: defer it until no other job is sampling. It keeps its head-of-queue position, so
             # it dispatches as soon as the in-flight jobs drain rather than being starved.
+            return False
+
+        if self._prestaged_whole_card_not_ready(next_job):
+            # The head was pre-staged into RAM while another job held the device; sampling commits its
+            # weights to VRAM, so it must wait for the residency to finish collapsing to sole residency
+            # (idle siblings stopped, safety off-GPU, the card drained) before it starts. Otherwise a
+            # lingering sibling context would force its first step to stream over the bus. It keeps its
+            # head-of-queue position, so it dispatches the moment the residency converges.
             return False
 
         if next_job_and_process.line_skip is not None:
@@ -1945,6 +2102,7 @@ class InferenceScheduler:
                     process_info.last_job_referenced = None
                     process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
                     unloaded_any = True
+                    self._record_churn("vram_eviction")
             else:
                 logger.debug(f"Unloading all models from VRAM on process {process_info.process_id}")
                 if (

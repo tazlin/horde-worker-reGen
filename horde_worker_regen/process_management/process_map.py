@@ -417,9 +417,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     ) -> bool:
         """Return true if a process is in inference but has shown no progress within the timeout.
 
-        ``last_heartbeat_timestamp`` is reset the moment a job is dispatched to the slot (see
-        ``on_last_job_reference_change``) and again on every INFERENCE_STEP, so the wall-clock gap
-        since it is the time spent in inference with no sampling progress. Measuring that gap live
+        ``last_heartbeat_timestamp`` advances on every heartbeat the slot emits (including the
+        PRELOAD_MODEL heartbeats it sends while staged in ``PRELOADED_MODEL``) and on every
+        INFERENCE_STEP, so once the slot enters ``INFERENCE_STARTING`` the wall-clock gap since it is the
+        time the slot has gone silent with no sampling progress. Measuring that gap live
         (rather than the previously-used ``last_heartbeat_delta``, which freezes at its last computed
         value the instant heartbeats stop arriving) catches a true hang where the child simply goes
         silent. It also catches a slot wedged *before* its first step (hung at 0%, having never
@@ -551,10 +552,17 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         return count
 
     def num_available_inference_processes(self) -> int:
-        """Return the number of inference processes that are available to accept jobs."""
+        """Return the number of inference processes that can actually accept a job.
+
+        Keyed on ``can_accept_job()`` (the same predicate the scheduler dispatches against), not on the
+        looser ``not is_process_busy()``. The two disagree at the edges: ``not is_process_busy()`` counts
+        a dead, ending, failed, or just-unloaded slot (none of which can take a job) as available, and
+        omits a ``PRELOADED_MODEL`` slot (which can). Reporting those as capacity is the phantom-capacity
+        trap, so this mirrors ``can_accept_job()`` exactly.
+        """
         count = 0
         for p in self.values():
-            if p.process_type == HordeProcessType.INFERENCE and not p.is_process_busy():
+            if p.process_type == HordeProcessType.INFERENCE and p.can_accept_job():
                 count += 1
         return count
 
@@ -695,6 +703,20 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             if p.process_type == HordeProcessType.SAFETY and p.last_process_state == HordeProcessState.WAITING_FOR_JOB:
                 return p
         return None
+
+    def get_stoppable_safety_processes(self) -> list[HordeProcessInfo]:
+        """Return safety processes that can be sent an end command.
+
+        This is deliberately broader than ``get_first_available_safety_process``. Dispatch and job-popping
+        need a safety process that can accept work; lifecycle teardown needs any live safety process that
+        has not already entered its terminal shutdown states.
+        """
+        return [
+            p
+            for p in self.values()
+            if p.process_type == HordeProcessType.SAFETY
+            and p.last_process_state not in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED)
+        ]
 
     def get_process_by_horde_model_name(self, horde_model_name: str) -> HordeProcessInfo | None:
         """Return the process that has the given horde model loaded, or None if there is none."""

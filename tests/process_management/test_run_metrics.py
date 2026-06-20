@@ -184,3 +184,24 @@ class TestAggregates:
         assert snapshot.num_job_slowdowns == 2
         assert snapshot.time_spent_no_jobs_available == 3.5
         assert snapshot.disk_min_free_bytes == {"C:/": 123}
+
+    def test_churn_events_recorded_with_timestamps(self) -> None:
+        """Each churn kind records a timestamp the snapshot exposes for per-window counting."""
+        metrics = WorkerRunMetrics()
+        before = time.time()
+        metrics.record_churn("model_swap")
+        metrics.record_churn("model_swap")
+        metrics.record_churn("vram_eviction")
+
+        churn = metrics.snapshot().churn_event_times
+        assert len(churn["model_swap"]) == 2
+        assert len(churn["vram_eviction"]) == 1
+        assert churn["process_cycle"] == []
+        assert all(stamp >= before for stamp in churn["model_swap"])
+
+    def test_reset_clears_churn_events(self) -> None:
+        """A benchmark-level reset clears churn history alongside the other aggregates."""
+        metrics = WorkerRunMetrics()
+        metrics.record_churn("process_cycle")
+        metrics.reset()
+        assert metrics.snapshot().churn_event_times["process_cycle"] == []

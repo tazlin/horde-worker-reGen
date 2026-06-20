@@ -47,6 +47,20 @@ from horde_worker_regen.telemetry_spans import (
 
 _excludes_for_job_dump = {"source_image", "source_mask", "extra_source_images", "r2_upload"}
 
+_INFERENCE_ACTIVE_STATES = frozenset(
+    {
+        HordeProcessState.INFERENCE_STARTING,
+        HordeProcessState.INFERENCE_POST_PROCESSING,
+        HordeProcessState.INFERENCE_COMPLETE,
+        HordeProcessState.INFERENCE_FAILED,
+    },
+)
+"""Slot states from which a return to idle means a job actually ran (so a missing result was lost).
+
+Used by the lost-result reap to exclude the dispatch window: a slot transitioning to idle from a
+teardown/preload path is carrying a job the scheduler only just stamped onto it, which it has not run
+yet, so there is no result to have lost."""
+
 _MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS = 20.0
 """How long a queue deadlock must persist continuously before it counts as a structural wedge.
 
@@ -376,6 +390,10 @@ class MessageDispatcher:
         if self._process_map[message.process_id].last_process_state == message.process_state:
             return
 
+        # Captured before the slot's state is advanced below; the lost-result reap needs the state the
+        # slot is transitioning *from* to tell a post-inference idle from the dispatch window.
+        previous_state = self._process_map[message.process_id].last_process_state
+
         self._process_map.on_process_state_change(
             process_id=message.process_id,
             new_state=message.process_state,
@@ -416,13 +434,70 @@ class MessageDispatcher:
             )
             self._process_map.on_model_ram_clear(process_id=message.process_id)
 
+        if message.process_state == HordeProcessState.WAITING_FOR_JOB:
+            self._reap_lost_inference_result(message.process_id, previous_state=previous_state)
+
+    def _reap_lost_inference_result(self, process_id: int, *, previous_state: HordeProcessState) -> None:
+        """Release a job left in progress after its slot returned to idle without a result.
+
+        Inference results and process-state changes share one ordered message stream, and a completing
+        job's result is always enqueued before the slot's transition back to ``WAITING_FOR_JOB``. So once
+        that transition is processed, a job the slot still references that is *still* marked in progress
+        can only mean its result never arrived (e.g. it was dropped by the launch-identifier guard while
+        the slot was being replaced). No result will ever move that job on, so it would otherwise sit in
+        progress, count against the concurrent-job cap, and wedge dispatch. Releasing it here (retryable,
+        so it requeues) recovers the moment the loss is detectable. The periodic orphaned-job watchdog
+        remains the backstop for losses where even this transition never arrives (e.g. the slot is
+        replaced outright before reporting idle).
+
+        That reasoning only holds for a slot returning to idle *after* running the job. ``last_job_referenced``
+        and the in-progress mark are stamped by the scheduler the instant it dispatches a job, before the
+        child acknowledges it, so a slot can carry a freshly dispatched job while it is still draining
+        state messages from *before* the dispatch: the ``WAITING_FOR_JOB`` it reports after unloading the
+        previous model to free VRAM, for example. Reading that stale idle report against the optimistically
+        stamped job would fault a job that never ran (a window that widens on slower disks/model swaps). The
+        slot's prior state is the discriminator: only a return to idle from an inference-active state can
+        mean a result was produced and then lost. A return from a teardown/preload path is the dispatch
+        window, so the job is left for the slot to take up.
+        """
+        if previous_state not in _INFERENCE_ACTIVE_STATES:
+            return
+        process_info = self._process_map.get(process_id)
+        if process_info is None:
+            return
+        job = process_info.last_job_referenced
+        if job is None or job not in self._job_tracker.jobs_in_progress:
+            return
+
+        job_id = str(job.id_) if job.id_ is not None else None
+        logger.error(
+            f"Process {process_id} returned to idle while job {job_id} was still in progress; its inference "
+            "result was lost. Releasing the job so it can be retried.",
+        )
+        self._action_ledger.record(
+            LedgerEventType.INFERENCE_FAULTED,
+            process_id=process_id,
+            os_pid=process_info.os_pid,
+            launch_identifier=process_info.process_launch_identifier,
+            job_id=job_id,
+            reason="inference result lost (slot returned to idle with job still in progress)",
+        )
+        # Deliberately not passed as a process crash: the slot is alive and idle, only the result was
+        # lost, so this takes the ordinary bounded retry (requeue while attempts remain, else fault and
+        # report so the horde reissues) rather than the crash path.
+        self._job_tracker.handle_job_fault_now(
+            faulted_job=job,
+            process_timeout=self._runtime_config.bridge_data.process_timeout,
+            retryable=True,
+        )
+
     async def _handle_aux_model_state_change(self, message: HordeAuxModelStateChangeMessage) -> None:
         """Handle an auxiliary model state change message (e.g., LoRa downloads)."""
         job_info = message.sdk_api_job_info
         job_context = ""
         if job_info is not None:
             lora_count = len(job_info.payload.loras or [])
-            ti_count = len(getattr(job_info.payload, "tis", None) or [])
+            ti_count = len(job_info.payload.tis or [])
             job_context = (
                 f" for job {str(job_info.id_)[:8]} (model={job_info.model}, loras={lora_count}, tis={ti_count})"
             )

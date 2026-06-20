@@ -209,6 +209,17 @@ class ShutdownManager:
             return False
         if len(self._job_tracker.jobs_pending_inference) > 0:
             return False
+        if self._state.alchemy_forms_in_flight > 0:
+            return False
+
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.SAFETY:
+                continue
+            if process_info.last_process_state not in (
+                HordeProcessState.PROCESS_ENDING,
+                HordeProcessState.PROCESS_ENDED,
+            ):
+                return False
 
         # If no inference processes exist at all (e.g. before any have started),
         # Python's all([]) returns True — this is intentional: with no processes

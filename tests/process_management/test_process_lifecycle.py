@@ -11,7 +11,7 @@ import pytest
 
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
@@ -311,6 +311,27 @@ def test_intentional_safety_cycle_not_counted_as_recovery() -> None:
     assert len(plm._safety_recovery_history) == 1
 
 
+def test_end_safety_processes_stops_starting_process_and_marks_intent() -> None:
+    """Shutdown must send END_PROCESS even if safety has not reached WAITING_FOR_JOB yet."""
+    safety = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.PROCESS_STARTING,
+        process_type=HordeProcessType.SAFETY,
+    )
+    plm = _make_plm(process_map=ProcessMap({0: safety}))
+
+    assert safety.end_intended is False
+
+    plm.end_safety_processes()
+
+    assert safety.end_intended is True
+    assert safety.last_process_state == HordeProcessState.PROCESS_ENDING
+    safety.pipe_connection.send.assert_called_once()  # type: ignore[attr-defined]
+    sent = safety.pipe_connection.send.call_args.args[0]  # pyrefly: ignore
+    assert sent.control_flag == HordeControlFlag.END_PROCESS
+
+
 def _patch_spawn_with_stub(plm: ProcessLifecycleManager) -> None:
     """Replace real process spawning with a stub that adds an idle mock process to the map."""
 
@@ -511,7 +532,7 @@ def test_reap_if_crashed_recovers_unintended_ended_process() -> None:
 
     crashed = make_mock_process_info(3, model_name=None, state=HordeProcessState.PROCESS_ENDED)
     crashed.mp_process.is_alive.return_value = False
-    crashed.mp_process.exitcode = 0
+    crashed.mp_process.exitcode = 0  # pyrefly: ignore
     plm._process_map[3] = crashed
     assert crashed.end_intended is False
 

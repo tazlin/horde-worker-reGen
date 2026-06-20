@@ -87,6 +87,23 @@ class TestLogDutyCycleSummary:
         assert messages  # something was logged
         assert all(level == "DEBUG" for level, _ in messages)
 
+    def test_churn_named_on_the_line_when_present(self) -> None:
+        """When reload/respawn churn occurred in the window, the duty line names it alongside the gaps."""
+        manager = make_testable_process_manager()
+        summary = summarize_duty_cycle(
+            [_job_with_gaps()],
+            window_seconds=180.0,
+            nvml_mean_percent=60.0,
+            churn_counts={"vram_eviction": 18, "model_swap": 23, "process_cycle": 0},
+        )
+        messages, handler_id = _capture_logs()
+        try:
+            manager._log_duty_cycle_summary(summary, "inf#0=WAITING_FOR_JOB")
+        finally:
+            logger.remove(handler_id)
+        text = " ".join(message for _, message in messages)
+        assert "reload churn: 23 model swaps, 18 VRAM evictions" in text
+
     def test_demand_limited_is_info_and_blames_the_horde(self) -> None:
         """A worker the horde left idle reads as demand-limited at INFO, never as a worker fault."""
         manager = make_testable_process_manager()
@@ -142,6 +159,30 @@ class TestMaybeLogDutyCycle:
             logger.remove(handler_id)
 
         assert any("GPU duty cycle 60%" in message for _, message in messages)
+
+    def test_churn_observer_is_wired_and_counted_in_window(self) -> None:
+        """The scheduler's churn observer feeds run metrics, and the duty line counts in-window churn."""
+        manager = make_testable_process_manager()
+        # The manager wires the scheduler's churn observer to the run-metrics recorder at construction.
+        assert manager._inference_scheduler._churn_observer == manager._run_metrics.record_churn
+
+        now = time.time()
+        manager._gpu_sampler._timeline.extend([(now - 1.0, 60), (now - 2.0, 60), (now - 3.0, 60)])
+        manager._run_metrics._jobs.append(_job_with_gaps(finalized_at=now - 10.0))
+        manager._last_duty_cycle_log_time = now - 200.0
+        manager._last_no_jobs_seconds_at_duty_log = 0.0
+        manager._inference_scheduler._record_churn("vram_eviction")
+        manager._inference_scheduler._record_churn("vram_eviction")
+        manager._inference_scheduler._record_churn("model_swap")
+
+        messages, handler_id = _capture_logs()
+        try:
+            manager._maybe_log_duty_cycle()
+        finally:
+            logger.remove(handler_id)
+
+        text = " ".join(message for _, message in messages)
+        assert "reload churn: 2 VRAM evictions, 1 model swaps" in text
 
 
 class TestSnapshotPopulatesDutyCycle:

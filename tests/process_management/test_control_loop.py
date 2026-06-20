@@ -11,7 +11,7 @@ import uuid
 from unittest.mock import Mock
 
 from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 
 from .conftest import (
@@ -87,6 +87,43 @@ class TestControlLoopTick:
 
         await process_manager._control_loop_tick()
         process_manager._process_lifecycle.end_inference_processes.assert_called()
+
+    async def test_shutdown_ends_starting_safety_process_once_safety_queue_drained(self) -> None:
+        """A shutdown tick should send END_PROCESS to safety even if it is still starting."""
+        process_manager = _make_tickable_manager()
+        process_manager._state.shutting_down = True
+        safety_proc = make_mock_process_info(
+            10,
+            model_name=None,
+            state=HordeProcessState.PROCESS_STARTING,
+            process_type=HordeProcessType.SAFETY,
+        )
+        process_manager._process_map.update({10: safety_proc})
+
+        assert await process_manager._control_loop_tick() is False
+
+        assert safety_proc.end_intended is True
+        safety_proc.pipe_connection.send.assert_called_once()  # type: ignore[attr-defined]
+        sent = safety_proc.pipe_connection.send.call_args.args[0]  # pyrefly: ignore
+        assert sent.control_flag == HordeControlFlag.END_PROCESS
+
+    async def test_shutdown_keeps_safety_process_up_while_alchemy_form_is_pending(self) -> None:
+        """CLIP alchemy uses safety, so safety must not stop until alchemy drains too."""
+        process_manager = _make_tickable_manager()
+        process_manager._state.shutting_down = True
+        safety_proc = make_mock_process_info(
+            10,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.SAFETY,
+        )
+        process_manager._process_map.update({10: safety_proc})
+        process_manager._alchemy_coordinator._pending_forms.append(Mock())  # pyrefly: ignore[private-usage]
+
+        assert await process_manager._control_loop_tick() is True
+
+        assert safety_proc.end_intended is False
+        safety_proc.pipe_connection.send.assert_not_called()  # type: ignore[attr-defined]
 
     async def test_tick_dispatches_pending_safety_check(self) -> None:
         """A tick should send a job pending safety check to an available safety process."""

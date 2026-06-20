@@ -73,6 +73,46 @@ class TestPhaseBreakdownAndGaps:
         alchemy = JobMetricsRecord(job_id="x", is_alchemy=True)
         assert phase_breakdown([alchemy]) == {}
 
+    def test_encode_and_graph_overhead_peeled_out_of_residual(self) -> None:
+        """When the engine reports clip/vae-encode and pipeline framing, they become named buckets.
+
+        The same 12.5s inference window now also carries clip_encode 0.8 + vae_encode 0.2 (encode 1.0)
+        and pipeline_setup 0.3 + pipeline_validate 0.1 + pipeline_finalize 0.2 (graph_overhead 0.6),
+        so ``other_inference`` shrinks from 1.2 to 1.2 - 1.0 - 0.6 floored at 0.
+        """
+        job = _phase_rich_job()
+        assert job.phase_metrics is not None
+        job.phase_metrics.phase_seconds = {
+            "vae_decode": 0.0,
+            "clip_encode": 0.8,
+            "vae_encode": 0.2,
+            "pipeline_setup": 0.3,
+            "pipeline_validate": 0.1,
+            "pipeline_finalize": 0.2,
+        }
+        breakdown = phase_breakdown([job])
+        assert round(breakdown["encode"], 3) == 1.0
+        assert round(breakdown["graph_overhead"], 3) == 0.6
+        # 12.5 - disk(4.2) - vram(1.1) - sampling(6.0) - vae(0) - encode(1.0) - graph(0.6) = -0.4 -> 0.
+        assert breakdown["other_inference"] == 0.0
+
+    def test_encode_and_graph_overhead_absent_on_older_engines(self) -> None:
+        """With no encode/pipeline phase_seconds, the new buckets are omitted and other_inference is unchanged."""
+        breakdown = phase_breakdown([_phase_rich_job()])
+        assert "encode" not in breakdown
+        assert "graph_overhead" not in breakdown
+        assert round(breakdown["other_inference"], 3) == 1.2
+
+    def test_model_unload_surfaced_without_touching_the_residual(self) -> None:
+        """Engine-reported model_unload (a between-jobs eviction) is its own gap, not part of other_inference."""
+        job = _phase_rich_job()
+        assert job.phase_metrics is not None
+        job.phase_metrics.phase_seconds = {"model_unload": 0.9}
+        breakdown = phase_breakdown([job])
+        assert breakdown["model_unload"] == 0.9
+        # other_inference is unchanged from the no-phase-seconds case: unload is outside the window.
+        assert round(breakdown["other_inference"], 3) == 1.2
+
 
 class TestSummarizeDutyCycle:
     """The headline figure and the demand-limited vs efficiency-limited idle split."""
@@ -127,6 +167,21 @@ class TestSummarizeDutyCycle:
         assert summary.effective_duty_percent() is None
         assert summary.headline_source() == "none"
         assert summary.format_gap_summary() == ""
+
+    def test_churn_summary_lists_nonzero_counts_biggest_first(self) -> None:
+        """Reload/respawn churn renders largest-first with friendly labels, omitting zeros."""
+        summary = summarize_duty_cycle(
+            [],
+            window_seconds=180.0,
+            nvml_mean_percent=50.0,
+            churn_counts={"vram_eviction": 18, "model_swap": 23, "process_cycle": 0},
+        )
+        assert summary.format_churn_summary() == "23 model swaps, 18 VRAM evictions"
+
+    def test_churn_summary_empty_when_no_churn(self) -> None:
+        """No churn in the window renders as an empty string (nothing to append to the duty line)."""
+        summary = summarize_duty_cycle([], window_seconds=180.0, nvml_mean_percent=90.0)
+        assert summary.format_churn_summary() == ""
 
 
 def test_window_uses_wall_clock_safely() -> None:
