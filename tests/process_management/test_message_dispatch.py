@@ -548,7 +548,10 @@ class TestHandleAuxModelStateChange:
 
         message_dispatcher = _make_dispatcher(process_map=process_map)
 
-        job = Mock()
+        # A real pop response, not a bare Mock: the handler reads typed payload fields (loras/tis) to
+        # build its log context, so a Mock whose payload attributes are auto-created Mocks would not
+        # exercise the real path.
+        job = make_job_pop_response(model="stable_diffusion")
 
         await message_dispatcher._handle_aux_model_state_change(
             Mock(
