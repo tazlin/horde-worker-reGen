@@ -532,6 +532,11 @@ class WorkerStateSnapshot(BaseModel):
     """The one-time disk implications of the configured models (None when not computed)."""
     lora_pops_blocked_by_downloads: bool = False
     """Configured LoRA support is temporarily suppressed because background downloads are active."""
+    lora_pops_blocked_by_disk: bool = False
+    """Configured LoRA support is suppressed because the LoRA cache volume is below its free-space floor.
+
+    Unlike the transient download block, this persists until disk space recovers; the TUI surfaces it
+    prominently because, left unaddressed, it stops the worker from serving any LoRA jobs."""
 
     recent_jobs: list[RecentJobRecord] = Field(default_factory=list)
     """The most recent finished-job records, newest last (capped)."""

@@ -1107,7 +1107,7 @@ wheels = [
 
 [[package]]
 name = "horde-engine"
-version = "3.3.3"
+version = "3.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1173,9 +1173,9 @@ dependencies = [
     { name = "yapf" },
     { name = "yarl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2e/40/58d36ceee74dadf622f5681a2c43565357b80dcf85d207ddf1a4a0f0dd5f/horde_engine-3.3.3.tar.gz", hash = "sha256:60a2a4d0c58d1dc56ba617678b69315d935d95ee6c088d195e2d109c085e705e", size = 381413, upload-time = "2026-06-20T19:55:48.951Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3d/d7/eb456d8d5e16f271455b1d81a8a539b0dfc2cd37b7360d60cd60982efe30/horde_engine-3.4.0.tar.gz", hash = "sha256:39eb4a29e7dabcdba16196c5b44abfdb2ea56c0843b9a751f5f0826abc67e1bf", size = 383915, upload-time = "2026-06-20T23:02:35.025Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9b/e4/1988b36d924a0d59bab6c3577c14c2350bfe0390fae69535668ada40773c/horde_engine-3.3.3-py3-none-any.whl", hash = "sha256:3fed68e7d115fe80a9d2a1bac8c1a81568b67b08516eae937ceffddd2ebce981", size = 489077, upload-time = "2026-06-20T19:55:46.952Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/cc/83b1043500844539c43aed7018462311a37934749c8e8fd8bcf6f31e14ca/horde_engine-3.4.0-py3-none-any.whl", hash = "sha256:4c02c9d803870648807a68a1a83f09584971ae98a962d4d2301b432846b5cce1", size = 491279, upload-time = "2026-06-20T23:02:33.082Z" },
 ]
 
 [package.optional-dependencies]
@@ -1364,7 +1364,7 @@ requires-dist = [
     { name = "babel" },
     { name = "certifi" },
     { name = "horde-engine", extras = ["controlnet"], marker = "extra == 'controlnet'" },
-    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=3.3.3,<4.0.0" },
+    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=3.4.0,<4.0.0" },
     { name = "horde-engine", extras = ["rembg"], marker = "extra == 'post-processing'" },
     { name = "horde-model-reference", specifier = ">=5.3.0,<6.0.0" },
     { name = "horde-safety", specifier = "~=0.3.0" },

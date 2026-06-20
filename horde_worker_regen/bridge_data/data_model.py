@@ -241,6 +241,16 @@ class reGenBridgeData(CombinedHordeBridgeData):
     )
     """The API token for CivitAI, used for downloading LoRas and login-required models."""
 
+    min_lora_disk_free_gb: float = Field(default=1.0, ge=0.0)
+    """Keep at least this many gigabytes free on the LoRA cache volume.
+
+    The ad-hoc LoRA cache is downloaded on demand and bounded by ``max_lora_cache_size``, but a
+    mis-set budget or a volume shared with other data can still drive it toward a full disk (where
+    every weight write fails with ENOSPC). Below this free-space floor the worker shrinks the
+    effective cache to fit and evicts least-recently-used ad-hoc LoRAs to make room; if even that
+    cannot clear the floor it stops offering LoRAs (see ``effective_allow_lora``). Set to 0 to
+    disable the floor. Propagated to the LoRA manager as ``AIWORKER_LORA_MIN_DISK_FREE_MB``."""
+
     unload_models_from_vram_often: bool = Field(default=True)
     """If true, models will be unloaded from VRAM more often."""
 
@@ -696,8 +706,13 @@ class reGenBridgeData(CombinedHordeBridgeData):
         if self.CIVIT_API_TOKEN is not None:
             os.environ["CIVIT_API_TOKEN"] = self.CIVIT_API_TOKEN
 
+        # AIWORKER_LORA_CACHE_SIZE is consumed by hordelib in megabytes; max_lora_cache_size is gigabytes.
         if self.max_lora_cache_size and os.getenv("AIWORKER_LORA_CACHE_SIZE") is None:
             os.environ["AIWORKER_LORA_CACHE_SIZE"] = str(self.max_lora_cache_size * 1024)
+
+        # The LoRA disk-space floor reaches the manager (in any worker subprocess) in megabytes.
+        if os.getenv("AIWORKER_LORA_MIN_DISK_FREE_MB") is None:
+            os.environ["AIWORKER_LORA_MIN_DISK_FREE_MB"] = str(round(self.min_lora_disk_free_gb * 1024))
 
         if self.load_large_models:
             os.environ["AI_HORDE_MODEL_META_LARGE_MODELS"] = "1"

@@ -62,6 +62,11 @@ from horde_worker_regen.process_management.inference_scheduler import InferenceS
 from horde_worker_regen.process_management.job_popper import JobPopper
 from horde_worker_regen.process_management.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.job_tracker import JobTracker
+from horde_worker_regen.process_management.lora_disk_guard import (
+    free_mb,
+    is_lora_disk_exhausted,
+    read_evictable_adhoc_mb,
+)
 from horde_worker_regen.process_management.lru_cache import LRUCache
 from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.messages import (
@@ -682,6 +687,7 @@ class HordeWorkerProcessManager:
 
         self._disk_monitor = DiskSpaceMonitor(self._disk_paths_to_monitor())
         self._last_disk_sample_time = 0.0
+        self._lora_paths = self._resolve_lora_paths()
 
         self._supervisor = SupervisorChannel(supervisor_connection) if supervisor_connection is not None else None
         self._last_supervisor_publish_time = 0.0
@@ -1789,12 +1795,63 @@ class HordeWorkerProcessManager:
             paths.append(Path(cache_home))
         return paths
 
+    @staticmethod
+    def _resolve_lora_paths() -> tuple[Path, Path] | None:
+        """Return ``(lora_reference_json, lora_volume_dir)`` for disk-floor checks, or ``None``.
+
+        Resolved from ``horde_model_reference`` (torch-free), so the main process can read the
+        persisted ad-hoc cache size and sample the cache volume without importing the inference stack.
+        """
+        try:
+            from horde_model_reference import horde_model_reference_paths
+
+            legacy_path = Path(horde_model_reference_paths.legacy_path)
+        except Exception as resolve_error:  # noqa: BLE001 - the disk floor is best-effort
+            logger.warning(f"Could not resolve LoRA reference path for disk-floor checks: {resolve_error}")
+            return None
+        return legacy_path / "lora.json", legacy_path
+
     def _sample_disk_space(self) -> None:
         """Sample disk free space at most every `_DISK_SAMPLE_INTERVAL_SECONDS`."""
         if time.time() - self._last_disk_sample_time < self._DISK_SAMPLE_INTERVAL_SECONDS:
             return
         self._last_disk_sample_time = time.time()
         self._disk_monitor.sample()
+        self._evaluate_lora_disk_exhaustion()
+
+    def _evaluate_lora_disk_exhaustion(self) -> None:
+        """Update ``lora_disk_exhausted`` from free space vs. the floor and the evictable ad-hoc cache.
+
+        LoRAs are disabled only when the volume is below its floor *and* evicting every ad-hoc LoRA
+        still would not clear it, so a recoverable shortfall is left to the inference-side eviction
+        (which runs per LoRA job) rather than latching the worker out of LoRA work. Transitions are
+        logged prominently because, left unaddressed, this stops the worker serving any LoRA jobs.
+        """
+        floor_mb = self.bridge_data.min_lora_disk_free_gb * 1024
+        if self._lora_paths is None or not self.bridge_data.allow_lora or floor_mb <= 0:
+            self._state.lora_disk_exhausted = False
+            return
+
+        reference_path, volume_dir = self._lora_paths
+        free_mb_value = free_mb(volume_dir)
+        if free_mb_value is None:
+            return  # Keep the prior verdict when the volume can't be sampled.
+
+        evictable_mb = read_evictable_adhoc_mb(reference_path)
+        exhausted = is_lora_disk_exhausted(
+            free_mb_value=free_mb_value,
+            floor_mb=floor_mb,
+            evictable_adhoc_mb=evictable_mb,
+        )
+        if exhausted and not self._state.lora_disk_exhausted:
+            logger.warning(
+                f"LoRA cache volume is critically low ({free_mb_value / 1024:.1f} GB free, floor "
+                f"{floor_mb / 1024:.1f} GB) and evicting all ad-hoc LoRAs ({evictable_mb / 1024:.1f} GB) "
+                "cannot clear it. Suppressing LoRA support until disk space is freed.",
+            )
+        elif not exhausted and self._state.lora_disk_exhausted:
+            logger.success("LoRA cache volume recovered above its free-space floor; resuming LoRA support.")
+        self._state.lora_disk_exhausted = exhausted
 
     def _build_performance_model(self) -> PerformanceModel:
         """Construct the performance model, seeding from the last benchmark report when one exists.
@@ -2378,7 +2435,11 @@ class HordeWorkerProcessManager:
             safety_on_gpu=bridge_data.safety_on_gpu,
             allow_img2img=bridge_data.allow_img2img,
             allow_lora=bridge_data.allow_lora,
-            effective_allow_lora=bridge_data.allow_lora and not self._model_availability.background_download_active,
+            effective_allow_lora=(
+                bridge_data.allow_lora
+                and not self._model_availability.background_download_active
+                and not self._state.lora_disk_exhausted
+            ),
             allow_controlnet=bridge_data.allow_controlnet,
             allow_sdxl_controlnet=bridge_data.allow_sdxl_controlnet,
             allow_post_processing=bridge_data.allow_post_processing,
@@ -2452,6 +2513,7 @@ class HordeWorkerProcessManager:
             lora_pops_blocked_by_downloads=(
                 bridge_data.allow_lora and self._model_availability.background_download_active
             ),
+            lora_pops_blocked_by_disk=(bridge_data.allow_lora and self._state.lora_disk_exhausted),
             alchemy_forms_pending=self._alchemy_coordinator.num_forms_pending,
             alchemy_forms_in_flight=self._alchemy_coordinator.num_forms_in_flight,
             alchemy_forms_awaiting_submit=self._alchemy_coordinator.num_forms_awaiting_submit,

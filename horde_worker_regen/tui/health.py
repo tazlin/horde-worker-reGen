@@ -349,6 +349,14 @@ def _build_checks(snapshot: WorkerStateSnapshot, snapshot_age: float | None) -> 
     if residency_check is not None:
         checks.append(residency_check)
     checks.append(_disk_check(snapshot))
+    if snapshot.lora_pops_blocked_by_disk:
+        checks.append(
+            HealthCheck(
+                "LoRA",
+                HealthStatus.ERROR,
+                "Disabled: LoRA cache disk is full and cannot be cleared. Free disk space to restore.",
+            )
+        )
 
     if snapshot.too_many_consecutive_failed_jobs:
         checks.append(

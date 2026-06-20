@@ -6,12 +6,18 @@ import base64
 import contextlib
 import gc
 import io
+import os
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 
 from horde_worker_regen.consts import BASE_LORA_DOWNLOAD_TIMEOUT, EXTRA_LORA_DOWNLOAD_TIMEOUT
+from horde_worker_regen.process_management.lora_disk_guard import (
+    configured_lora_budget_mb_from_env,
+    constrain_lora_cache_to_disk,
+    lora_disk_floor_mb_from_env,
+)
 
 try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
@@ -367,40 +373,55 @@ class HordeInferenceProcess(HordeProcess):
                 logger.info("No auxiliary models to download")
                 return None
 
-            try:
-                lora_manager.load_model_database()
-                lora_manager.reset_adhoc_cache()
-            except Exception as e:
-                logger.error(f"Failed to reset adhoc loras: {type(e).__name__} {e}")
+            # Publish the busy state and start the liveness heartbeat *before* any blocking drain. Both
+            # the in-flight-download drains below (``reset_adhoc_cache`` and the already-available-LoRA
+            # ``wait_for_downloads``) are unbounded and can stall indefinitely on a wedged background
+            # download (e.g. one retrying ENOSPC on a full disk). Until the parent has seen
+            # DOWNLOADING_AUX_MODEL it still reads this slot as WAITING_FOR_JOB (``can_accept_job``), so
+            # the orphaned-job watchdog punts the in-progress job; without a heartbeat the same stall
+            # reads as a hung process. Either verdict escalates to a Save-our-ship soft reset (an
+            # observed disk-full recovery storm). Starting both signals up front keeps the slot visibly
+            # busy-and-alive for the whole aux phase, however long a drain blocks.
+            self.send_aux_model_message(
+                process_state=HordeProcessState.DOWNLOADING_AUX_MODEL,
+                info="Resolving auxiliary models",
+                time_elapsed=0.0,
+                job_info=job_info,
+            )
+            self.send_heartbeat_message(HordeHeartbeatType.OTHER)
+            aux_heartbeat_stop, aux_heartbeat_thread = self._start_aux_download_heartbeat_thread()
 
-            time_to_wait_for_downloads = 0
-            aux_heartbeat_stop: threading.Event | None = None
-            aux_heartbeat_thread: threading.Thread | None = None
             performed_a_download = False
-
             try:
+                try:
+                    lora_manager.load_model_database()
+                    lora_manager.reset_adhoc_cache()
+                except Exception as e:
+                    logger.error(f"Failed to reset adhoc loras: {type(e).__name__} {e}")
+
+                # Make room before fetching: shrink the cache to fit free space and evict
+                # least-recently-used ad-hoc LoRAs so this job's LoRAs can be written without
+                # pushing the volume past its floor (and into ENOSPC failures).
+                self._enforce_lora_disk_floor(lora_manager)
+
+                time_to_wait_for_downloads = 0
                 for lora_entry in loras:
-                    # Already on disk — nothing to fetch, but still drain any in-flight downloads.
+                    # Already on disk — nothing to fetch, but still drain any in-flight downloads. Bound
+                    # the drain by at least the base LoRA budget: a bare 0 (the accumulator's value before
+                    # any fetch this job) reaches the manager as "wait forever", which a wedged background
+                    # download (e.g. one retrying a full disk) would turn into an unbounded stall.
                     if lora_manager.is_model_available(lora_entry.name):
                         logger.info(f"Model {lora_entry.name} already downloaded")
                         try:
-                            lora_manager.wait_for_downloads(time_to_wait_for_downloads)
+                            lora_manager.wait_for_downloads(
+                                max(time_to_wait_for_downloads, BASE_LORA_DOWNLOAD_TIMEOUT)
+                            )
                         except Exception as e:
                             logger.error(f"Failed to wait for downloads: {type(e).__name__} {e}")
                         continue
 
                     # --- Model needs downloading ---
-                    if not performed_a_download:
-                        self.send_aux_model_message(
-                            process_state=HordeProcessState.DOWNLOADING_AUX_MODEL,
-                            info="Downloading auxiliary models",
-                            time_elapsed=0.0,
-                            job_info=job_info,
-                        )
-                        self.send_heartbeat_message(HordeHeartbeatType.OTHER)
-                        aux_heartbeat_stop, aux_heartbeat_thread = self._start_aux_download_heartbeat_thread()
-                        performed_a_download = True
-
+                    performed_a_download = True
                     lora_manager.fetch_adhoc_lora(lora_entry.name, timeout=None, is_version=lora_entry.is_version)
                     time_to_wait_for_downloads = (
                         BASE_LORA_DOWNLOAD_TIMEOUT
@@ -412,10 +433,8 @@ class HordeInferenceProcess(HordeProcess):
                     except Exception as e:
                         logger.error(f"Failed to wait for downloads: {type(e).__name__} {e}")
             finally:
-                if aux_heartbeat_stop is not None:
-                    aux_heartbeat_stop.set()
-                if aux_heartbeat_thread is not None:
-                    aux_heartbeat_thread.join(timeout=1.0)
+                aux_heartbeat_stop.set()
+                aux_heartbeat_thread.join(timeout=1.0)
 
             time_elapsed = round(time.time() - time_start, 2)
             lora_manager.save_reference_to_disk()
@@ -447,6 +466,41 @@ class HordeInferenceProcess(HordeProcess):
             self._aux_model_lock.release()
         except ValueError:
             pass
+
+    def _enforce_lora_disk_floor(self, lora_manager: object) -> None:
+        """Constrain the ad-hoc LoRA cache to the disk floor before fetching this job's LoRAs.
+
+        Shrinks the effective ad-hoc budget to fit free space and evicts least-recently-used ad-hoc
+        LoRAs to make room. When even evicting everything cannot clear the floor, the surplus is
+        non-LoRA data: a prominent warning is logged and new LoRA downloads will be skipped (the main
+        process independently stops advertising LoRA support once it sees the same unsolvable state).
+        """
+        floor_mb = lora_disk_floor_mb_from_env(os.getenv)
+        if floor_mb <= 0:
+            return
+        configured_budget_mb = configured_lora_budget_mb_from_env(os.getenv)
+        try:
+            result = constrain_lora_cache_to_disk(
+                lora_manager,  # type: ignore[arg-type]  # structural LoraCacheManager; avoids a hordelib import here
+                floor_mb=floor_mb,
+                configured_budget_mb=configured_budget_mb,
+            )
+        except Exception as guard_error:  # noqa: BLE001 - the guard must never break the download path
+            logger.error(f"LoRA disk guard failed: {type(guard_error).__name__} {guard_error}")
+            return
+
+        if result.acted:
+            logger.info(
+                f"LoRA disk guard: free {result.free_mb_before:.0f} -> {result.free_mb_after:.0f} MB "
+                f"(floor {floor_mb:.0f} MB), evicted {result.evicted_count} ad-hoc LoRA(s), "
+                f"ad-hoc budget {result.budget_mb_before} -> {result.budget_mb_after} MB",
+            )
+        if not result.solved and result.free_mb_after is not None:
+            logger.warning(
+                "LoRA cache volume is below its free-space floor and eviction could not clear it "
+                f"({result.free_mb_after:.0f} MB free < {floor_mb:.0f} MB floor). New LoRA downloads "
+                "will be skipped until disk space is freed.",
+            )
 
     @logger.catch(reraise=True)
     def preload_model(

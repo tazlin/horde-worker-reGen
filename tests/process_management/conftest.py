@@ -211,6 +211,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.extra_slow_worker = False
     bd.limit_max_steps = False
     bd.allow_lora = True
+    bd.min_lora_disk_free_gb = 1.0
     bd.alchemist = False
     bd.alchemy_allow_concurrent = True
     bd.alchemy_max_concurrency = 1

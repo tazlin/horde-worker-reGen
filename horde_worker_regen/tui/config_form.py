@@ -365,6 +365,18 @@ CONFIG_FIELDS: list[ConfigField] = [
         unit="GB",
     ),
     ConfigField(
+        "min_lora_disk_free_gb",
+        "Min LoRA disk free",
+        FieldKind.INT,
+        "LoRA",
+        "Keep at least this many GB free on the LoRA cache disk. Below it, the worker evicts old "
+        "LoRAs to make room and stops offering LoRAs if it still can't clear the floor. 0 disables.",
+        minimum=0,
+        maximum=512,
+        unit="GB",
+        explicit_default=1.0,
+    ),
+    ConfigField(
         "purge_loras_on_download",
         "Purge unknown LoRAs",
         FieldKind.BOOL,

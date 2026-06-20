@@ -457,7 +457,9 @@ class OverviewView(VerticalScroll):
         if config.allow_img2img:
             flags.append("img2img")
         if config.allow_lora:
-            if snapshot.lora_pops_blocked_by_downloads or config.effective_allow_lora is False:
+            if snapshot.lora_pops_blocked_by_disk:
+                flags.append("lora OFF (disk full)")
+            elif snapshot.lora_pops_blocked_by_downloads or config.effective_allow_lora is False:
                 flags.append("lora paused")
             else:
                 flags.append("lora")

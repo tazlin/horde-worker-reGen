@@ -284,6 +284,8 @@ class JobPopper:
         """Return whether this pop should advertise LoRA support."""
         if not bridge_data.allow_lora:
             return False
+        if self._state.lora_disk_exhausted:
+            return False
         return not (self._model_availability is not None and self._model_availability.background_download_active)
 
     def _is_hungry(self, bridge_data: reGenBridgeData) -> bool:

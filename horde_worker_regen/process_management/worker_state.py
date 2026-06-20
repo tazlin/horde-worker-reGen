@@ -42,6 +42,14 @@ class WorkerState:
     self_throttle_paused_until: float = 0.0
     """Wall-clock time the self-throttle pop-pause auto-resumes; 0 when not throttling."""
 
+    lora_disk_exhausted: bool = False
+    """The LoRA cache volume is below its free-space floor and eviction could not clear it.
+
+    Set by the main loop's disk check after the ad-hoc cache has had a chance to evict to make room.
+    While true the worker stops advertising LoRA support on job pops (see the job popper's
+    ``_effective_allow_lora``) so it isn't handed jobs whose LoRAs it cannot download, and the TUI
+    surfaces a prominent warning. Cleared automatically once free space recovers above the floor."""
+
     consecutive_failed_jobs: int = 0
     too_many_consecutive_failed_jobs: bool = False
     too_many_consecutive_failed_jobs_time: float = 0.0

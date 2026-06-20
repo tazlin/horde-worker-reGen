@@ -72,17 +72,27 @@ def load_env_vars_from_config() -> None:  # FIXME: there is a dynamic way to do 
     if "max_lora_cache_size" in config:
         if os.getenv("AIWORKER_LORA_CACHE_SIZE") is None:
             try:
-                int(config["max_lora_cache_size"])
+                cache_size_gb = int(config["max_lora_cache_size"])
             except ValueError as e:
                 raise ValueError(
                     "max_lora_cache_size must be an integer, but is not.",
                 ) from e
-            os.environ["AIWORKER_LORA_CACHE_SIZE"] = str(config["max_lora_cache_size"])
+            # max_lora_cache_size is gigabytes; hordelib reads AIWORKER_LORA_CACHE_SIZE as megabytes.
+            # This must match data_model.py's load_env_vars conversion so the two paths agree.
+            os.environ["AIWORKER_LORA_CACHE_SIZE"] = str(cache_size_gb * 1024)
         else:
             print(
                 "AIWORKER_LORA_CACHE_SIZE environment variable already set. "
                 "This will override the value for `max_lora_cache_size` in the config file.",
             )
+    if "min_lora_disk_free_gb" in config and os.getenv("AIWORKER_LORA_MIN_DISK_FREE_MB") is None:
+        try:
+            min_free_gb = float(config["min_lora_disk_free_gb"])
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                "min_lora_disk_free_gb must be a number, but is not.",
+            ) from e
+        os.environ["AIWORKER_LORA_MIN_DISK_FREE_MB"] = str(round(min_free_gb * 1024))
     if "civitai_api_token" in config:
         if os.getenv("CIVIT_API_TOKEN") is None:
             os.environ["CIVIT_API_TOKEN"] = config["civitai_api_token"]
