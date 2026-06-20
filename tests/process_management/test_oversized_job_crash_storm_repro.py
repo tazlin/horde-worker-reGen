@@ -136,7 +136,7 @@ class TestSchedulerTagsOverBudgetAdmit:
         """
         monkeypatch.setattr(
             resource_budget,
-            "predict_job_vram_mb",
+            "predict_job_sampling_vram_mb",
             lambda job, baseline: _HEAVY_SDXL_PREDICTED_VRAM_MB,
         )
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 1000.0)

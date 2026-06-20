@@ -248,6 +248,19 @@ class StreamForecast:
         return self._fits_weights(self.free_if_alone_mb)
 
     @property
+    def fits_weights_now(self) -> bool:
+        """True when the persistent weights + bounded floor fit the *measured* free VRAM right now.
+
+        The load-safety gate for a whole-card terminal admit: ``fits_alone`` proves the weights *can* fit at
+        sole residency (against the structural ``free_if_alone`` ceiling), but a teardown frees the siblings'
+        VRAM asynchronously, so the measurement can still read low for a tick or two after their processes
+        stop. This is the same weight-headroom test against the live ``free_now``, so it only reads True once
+        the device has actually drained enough that loading the weights will not itself fault. Unknown cost or
+        a cold start (no measurement) reads False here, deferring the terminal admit until a real reading.
+        """
+        return self.known and self._fits_weights(self.free_now_mb)
+
+    @property
     def needs_exclusive_residency(self) -> bool:
         """Streams co-resident, fits alone, and is weight-dominant: the scheduler should give it the whole card.
 
@@ -433,6 +446,7 @@ def forecast_weight_streaming(
     configured_reserve_floor_mb: float,
     reserve_vram_gb: float | None = None,
     num_extra_resident_contexts: int = 0,
+    post_processing_reserve_mb: float = 0.0,
 ) -> StreamForecast:
     """Return a :class:`StreamForecast` for loading ``job``'s model given the device's measured state.
 
@@ -458,18 +472,33 @@ def forecast_weight_streaming(
         configured_reserve_floor_mb,
         reserve_vram_gb=reserve_vram_gb,
     )
-    # The reserve must cover the model's *activation working set*, not a flat constant. ComfyUI's own
-    # minimum_inference_memory (and the configured floor) is sized for an SD1.5/SDXL step; a heavy or
-    # high-resolution model (Flux at 1024^2) needs several GB of attention activations per step, far above
-    # that. Underestimating it is exactly what lets the forecast judge a model "fits" when its sampling step
-    # then drives free VRAM to zero and the driver spills activations to host RAM. The activation-inclusive
-    # peak (predict_job_vram_mb, which scales with resolution and batch) minus the resident weights is the
-    # real per-step headroom to keep free, so fold it into the reserve.
-    peak_mb = predict_job_vram_mb(job, baseline)
+    # The reserve must cover the model's *sampling-phase activation working set*, not a flat constant.
+    # ComfyUI's own minimum_inference_memory (and the configured floor) is sized for an SD1.5/SDXL step; a
+    # heavy or high-resolution model (Flux at 1024^2) needs several GB of attention activations per sampling
+    # step, far above that. Underestimating it is exactly what lets the forecast judge a model "fits" when its
+    # sampling step then drives free VRAM to zero and the driver spills activations to host RAM. The
+    # sampling-phase peak (predict_job_sampling_vram_mb, which scales with resolution and batch) minus the
+    # resident weights is the real per-step headroom to keep free, so fold it into the reserve. The
+    # post-processing activation (upscaler/face-fixer) is deliberately excluded here: it runs *after* sampling
+    # on the already-resident model, temporally disjoint from weight residency, so charging it against the
+    # sampling footprint conflates a transient, output-scaled spike with the persistent weights and can flip a
+    # moderate model (an SDXL job that merely requests a 4x upscaler) into falsely reading as weight-dominant
+    # and claiming the whole card. The post-processing phase is reserved separately, when imminent, via
+    # ``post_processing_reserve_mb`` below.
+    peak_mb = predict_job_sampling_vram_mb(job, baseline)
     activation_working_set_mb = 0.0
     if peak_mb is not None and weights_mb is not None:
         activation_working_set_mb = max(0.0, peak_mb - weights_mb)
-    reserve_mb = max(base_reserve_mb, activation_working_set_mb)
+    # ``post_processing_reserve_mb`` is the imminent post-processing peak of in-flight jobs whose inference
+    # slots have already been released (so the measurement still reads high) but whose upscalers/face-fixers
+    # are about to allocate. Folding it into the activation-inclusive reserve (never the bounded weight floor
+    # ``base_reserve_mb``, since it is a transient activation peak and not this model's persistent weights)
+    # makes the co-residency and weight-dominant tests forward-looking: a heavy model will escalate to
+    # evicting a sibling model or claiming the card rather than co-residing into VRAM that is about to be
+    # reclaimed. Because ``activation_working_set_mb`` is now sampling-only, this term carries the whole
+    # post-processing contribution: the loading model's own post-proc is reserved by the scheduler's committed
+    # reserve once it reaches that phase, not pre-charged here against its sampling-phase residency.
+    reserve_mb = max(base_reserve_mb, activation_working_set_mb) + max(0.0, post_processing_reserve_mb)
     overhead = max(0.0, per_process_overhead_mb)
     process_count = max(1, num_inference_processes)
     extra_contexts = max(0, num_extra_resident_contexts)
@@ -531,6 +560,28 @@ def _job_feature_kinds(job: ImageGenerateJobPopResponse) -> list[FEATURE_KIND]:
     return features
 
 
+def _job_upscale_factor(job: ImageGenerateJobPopResponse) -> float:
+    """Return the largest linear upscale factor the job requests, or 1.0 when it requests none.
+
+    The post-processing activation peak scales with the *upscaled output* megapixels, so the factor (x2 vs
+    x4) is the dominant per-model signal for that phase. The factor ROM and resolution live in hordelib
+    (the single source of truth for upscaler facts); both it and ``KNOWN_UPSCALERS`` are torch-free and
+    imported lazily so the orchestrator never eagerly pulls hordelib. Never raises: any error yields 1.0
+    (no enlargement) so the estimate falls back to generation resolution rather than crashing.
+    """
+    try:
+        from horde_sdk.generation_parameters import KNOWN_UPSCALERS
+        from hordelib.pipeline.constants import max_upscale_factor
+
+        post_processing = job.payload.post_processing or []
+        upscaler_values = {u.value for u in KNOWN_UPSCALERS}
+        upscalers = [pp for pp in post_processing if pp in upscaler_values]
+        return float(max_upscale_factor(upscalers))
+    except Exception as e:
+        logger.debug(f"Upscale-factor resolution failed for job {job.id_}: {type(e).__name__} {e}")
+        return 1.0
+
+
 def predict_job_vram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
     """Return a job's predicted peak VRAM (MB) via hordelib's burden estimate, or None when unavailable.
 
@@ -549,6 +600,39 @@ def predict_job_vram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) 
     steady_mb = None if burden is None else float(burden.vram_mb)
     load_peak_mb = _baseline_load_peak_mb(baseline)
     candidates = [value for value in (steady_mb, load_peak_mb) if value is not None]
+    return max(candidates) if candidates else None
+
+
+def predict_job_sampling_vram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
+    """Return a job's predicted *sampling-phase* peak VRAM (MB), or None when unavailable.
+
+    This is the peak that governs weight *residency* and *preload admission*: the resident weights plus the
+    per-step sampling activation that must stay in VRAM together while the model samples, taken as the larger
+    of the sampling-phase burden (``BurdenEstimate.vram_sampling_mb``) and the baseline's transient *load
+    peak* (a combined checkpoint co-resides its text encoder and diffusion weights while loading).
+
+    It deliberately excludes the post-processing activation (upscaler/face-fixer). That peak runs *after*
+    sampling on the already-loaded model (often after the inference slot is released for overlap, sometimes
+    after the weights are evicted), so it is temporally disjoint from weight residency. Folding it into a
+    residency or preload decision conflates a transient, output-scaled spike with the persistent weight
+    footprint and can flip a moderate model (an SDXL job that merely requests a 4x upscaler) into falsely
+    claiming the whole card. The post-processing phase is budgeted separately, when it is imminent, via
+    :func:`predict_job_post_processing_vram_mb` and the scheduler's committed post-processing reserve.
+
+    Falls back to the combined steady estimate (as :func:`predict_job_vram_mb`) when the pinned hordelib
+    predates the phase-split, so an older engine keeps its prior, more conservative behavior. Never raises.
+    """
+    burden = _estimate_job_burden(job, baseline)
+    if burden is None:
+        return _baseline_load_peak_mb(baseline)
+    try:
+        sampling_mb: float | None = float(burden.vram_sampling_mb)
+    except AttributeError:
+        # Older hordelib without the phase-split: the sampling-only figure is unknown, so fall back to the
+        # combined steady estimate (conservative) rather than losing the residency signal entirely.
+        sampling_mb = float(burden.vram_mb)
+    load_peak_mb = _baseline_load_peak_mb(baseline)
+    candidates = [value for value in (sampling_mb, load_peak_mb) if value is not None]
     return max(candidates) if candidates else None
 
 
@@ -585,6 +669,27 @@ def predict_job_ram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -
     return None if burden is None else float(burden.ram_mb)
 
 
+def predict_job_post_processing_vram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
+    """Return a job's predicted *post-processing-phase* VRAM peak (MB), or None when unavailable.
+
+    This is the marginal upscaler/face-fixer cost that lands *after* sampling, once the inference slot has
+    already been released for the next job. The scheduler reserves it against concurrent dispatch so a
+    freshly-released slot is not handed VRAM an in-flight job's upscaler is about to claim. Returns 0.0 for
+    a job with no post-processing features (so the reserve self-scales away when nothing is post-processing),
+    and None when no estimate is available. Never raises (see :func:`predict_job_vram_mb`).
+    """
+    burden = _estimate_job_burden(job, baseline)
+    if burden is None:
+        return None
+    try:
+        post_processing_mb = burden.vram_post_processing_mb
+    except AttributeError:
+        # An older pinned hordelib predates the phase-split; the post-proc peak is then unknown and the
+        # caller reserves nothing rather than crashing the scheduling cycle.
+        return None
+    return float(post_processing_mb)
+
+
 def _estimate_job_burden(job: ImageGenerateJobPopResponse, baseline: str | None) -> BurdenEstimate | None:
     """Return hordelib's ``BurdenEstimate`` for a job, or None when the estimate cannot be produced.
 
@@ -595,13 +700,19 @@ def _estimate_job_burden(job: ImageGenerateJobPopResponse, baseline: str | None)
     try:
         from hordelib.feature_impact import estimate_job_burden
 
-        return estimate_job_burden(
-            baseline=baseline if baseline is not None else "",
-            width=job.payload.width,
-            height=job.payload.height,
-            batch=max(1, job.payload.n_iter),
-            features=_job_feature_kinds(job),
-        )
+        common_kwargs = {
+            "baseline": baseline if baseline is not None else "",
+            "width": job.payload.width,
+            "height": job.payload.height,
+            "batch": max(1, job.payload.n_iter),
+            "features": _job_feature_kinds(job),
+        }
+        try:
+            return estimate_job_burden(**common_kwargs, post_processing_upscale_factor=_job_upscale_factor(job))
+        except TypeError:
+            # An older pinned hordelib predates the upscale-factor parameter. Fall back to the coarse
+            # (generation-resolution) estimate rather than losing the whole budget on a version mismatch.
+            return estimate_job_burden(**common_kwargs)
     except Exception as e:
         logger.debug(f"Job burden estimate failed for job {job.id_}: {type(e).__name__} {e}")
         return None
@@ -632,30 +743,46 @@ class VramBudget:
         job: ImageGenerateJobPopResponse,
         baseline: str | None,
         free_vram_mb: float | None,
+        committed_reserve_mb: float = 0.0,
     ) -> BudgetVerdict:
         """Return the budget verdict for admitting ``job`` given the measured free VRAM.
 
         Admits (fits=True) when telemetry is absent (cold start) or no estimate is available, so the
         budget never wedges a worker that has not yet reported VRAM; otherwise requires
-        ``free >= predicted + reserve``.
+        ``free - committed_reserve >= predicted + reserve``.
+
+        ``predicted`` is the *sampling-phase* peak (:func:`predict_job_sampling_vram_mb`), the cost of
+        loading the weights and sampling them. A job's post-processing peak (its upscaler/face-fixer) is
+        not charged here: it runs after sampling, once the slot is released, and is reserved at that point
+        through ``committed_reserve_mb`` instead. Gating the preload on the combined lifetime peak would
+        double-charge an output-scaled upscale spike against the load decision and needlessly defer (or
+        misroute through the over-budget path) an ordinary job that merely requests an upscaler.
+
+        ``committed_reserve_mb`` is VRAM already spoken for by in-flight jobs whose cost is not yet
+        reflected in the measured free figure: chiefly the post-processing peak of a job whose inference
+        slot has been released (for overlap) but whose upscaler/face-fixer has not yet allocated. Holding
+        it back here is what stops the freed slot from being handed VRAM the in-flight job is about to
+        claim. It defaults to 0.0, so callers that do not track it (and the unit tests) keep the prior
+        instantaneous behavior.
         """
         if free_vram_mb is None:
             return BudgetVerdict(fits=True, predicted_mb=None, available_mb=None, reserve_mb=self._reserve_mb)
 
-        predicted = predict_job_vram_mb(job, baseline)
+        effective_free_mb = free_vram_mb - committed_reserve_mb
+        predicted = predict_job_sampling_vram_mb(job, baseline)
         if predicted is None:
             return BudgetVerdict(
                 fits=True,
                 predicted_mb=None,
-                available_mb=free_vram_mb,
+                available_mb=effective_free_mb,
                 reserve_mb=self._reserve_mb,
             )
 
-        fits = free_vram_mb >= predicted + self._reserve_mb
+        fits = effective_free_mb >= predicted + self._reserve_mb
         return BudgetVerdict(
             fits=fits,
             predicted_mb=predicted,
-            available_mb=free_vram_mb,
+            available_mb=effective_free_mb,
             reserve_mb=self._reserve_mb,
         )
 

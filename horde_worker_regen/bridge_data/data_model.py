@@ -431,6 +431,18 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """Available system RAM (MB) the budget keeps in reserve so resident-in-RAM models do not force
     the OS to page to disk. Only used when `enable_vram_budget` is true."""
 
+    post_processing_budget_reserve_enabled: bool = Field(default=True)
+    """Hold back the imminent post-processing VRAM peak of in-flight jobs when admitting new ones.
+
+    When a job finishes sampling it releases its inference slot for overlap *before* its upscaler or
+    face-fixer allocates VRAM, so the measured free figure transiently overstates what is available. With
+    this on (the default), the scheduler subtracts the predicted post-processing peak of every job currently
+    in post-processing from the free VRAM it gates dispatch, the overlap cap, and the residency forecast
+    against -- so a freshly-released slot is not handed VRAM an in-flight job is about to claim (the cause of
+    the post-processing-phase thrash that trips the post-process watchdog on a shared GPU). The reserve
+    self-scales to zero whenever nothing is post-processing, so roomy cards are unaffected. Set false to
+    restore the prior instantaneous behavior. Only used when `enable_vram_budget` is true."""
+
     vram_per_process_overhead_mb: int = Field(default=0, ge=0)
     """Per-process VRAM (MB) one inference process consumes for its torch/CUDA context with no model loaded.
 

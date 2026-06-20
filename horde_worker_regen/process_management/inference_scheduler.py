@@ -39,6 +39,7 @@ from horde_worker_regen.process_management.resource_budget import (
     WholeCardResidencyState,
     forecast_weight_streaming,
     is_model_locally_unservable_for,
+    predict_job_post_processing_vram_mb,
 )
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_state import WorkerState
@@ -497,6 +498,7 @@ class InferenceScheduler:
             num_inference_processes=num_processes,
             configured_reserve_floor_mb=floor_mb,
             num_extra_resident_contexts=num_safety_contexts,
+            post_processing_reserve_mb=self._committed_post_processing_reserve_mb(),
         )
 
     def _establish_whole_card_residency(
@@ -545,6 +547,25 @@ class InferenceScheduler:
                 f"siblings/safety would force the driver to stream activations to host RAM and run several "
                 f"times slower. {self._process_map.residency_snapshot()}</>",
             )
+
+    def _whole_card_teardown_exhausted(self, forecast: StreamForecast) -> bool:
+        """Whether a whole-card residency has done all it can and the head can now load best-effort.
+
+        The whole-card branch defers a heavy head while a teardown can still make room: idle siblings left to
+        stop, the safety process still on-GPU, or their freed VRAM still draining. This returns True only once
+        none of those remain: the live inference-process count is already at (or below) the forecast's target,
+        safety is off-GPU if this residency needs it, and the device has drained enough that the weights will
+        load now (``fits_weights_now``). A model that reaches this state but still cannot fit co-resident (its
+        activation peak overflows even sole residency) can never converge by deferring, so the scheduler loads
+        it onto the cleared card best-effort and lets it sample slowly under the over-budget step grace rather
+        than wedging the queue until the recovery supervisor soft-resets the pools.
+        """
+        target = forecast.max_resident_processes() or 1
+        if self._process_map.num_loaded_inference_processes() > target:
+            return False
+        if self._whole_card_safety_off_gpu_enabled() and not self._process_lifecycle.is_safety_gpu_paused:
+            return False
+        return forecast.fits_weights_now
 
     def whole_card_residency_grace_active(self) -> bool:
         """Whether a whole-card residency is establishing, so the held queue is intentional (not a wedge).
@@ -733,6 +754,15 @@ class InferenceScheduler:
             f"{self._process_map.residency_snapshot()}</>",
         )
 
+    def _log_whole_card_terminal_admit(self, job: ImageGenerateJobPopResponse) -> None:
+        """Announce a whole-card head admitted best-effort after its teardown was structurally exhausted."""
+        logger.opt(ansi=True).warning(
+            f"<fg #ff8c69>Whole-card head {job.model} reached its target sole residency but its activation "
+            f"peak still overflows the card; admitting it best-effort to load onto the cleared device (it will "
+            f"sample slowly under the over-budget step grace) rather than wedge the queue until save-our-ship. "
+            f"{self._process_map.residency_snapshot()}</>",
+        )
+
     def _measured_free_vram_mb(self) -> float | None:
         """Return the most conservative measured device-wide free VRAM (MB), or None when not yet reported.
 
@@ -746,6 +776,40 @@ class InferenceScheduler:
     def _measured_available_ram_mb(self) -> float:
         """The measured system-wide available RAM (MB), read live in the parent process."""
         return psutil.virtual_memory().available / (1024 * 1024)
+
+    def _committed_post_processing_reserve_mb(self) -> float:
+        """Sum the imminent post-processing-phase VRAM peaks of jobs currently in post-processing (MB).
+
+        When a job finishes sampling it releases its inference slot for overlap *before* its
+        upscaler/face-fixer allocates, so the measured free-VRAM figure still reads as if that headroom
+        were available. This derives the VRAM that is therefore spoken-for but not yet realised: for each
+        inference process in ``INFERENCE_POST_PROCESSING``, the predicted post-processing peak of the job it
+        is running. Subtracted from measured free VRAM at the dispatch/overlap gates and folded into the
+        residency forecast, it stops a freshly-released slot being handed VRAM an in-flight job is about to
+        claim. Returns 0.0 when nothing is post-processing (so the reserve self-scales away on roomy cards)
+        or when the feature is disabled. Never raises: a bad per-job estimate is skipped.
+        """
+        if not self._budget_active() or not self._runtime_config.bridge_data.post_processing_budget_reserve_enabled:
+            return 0.0
+
+        total_mb = 0.0
+        jobs_in_progress = self._job_tracker.jobs_in_progress
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.last_process_state != HordeProcessState.INFERENCE_POST_PROCESSING:
+                continue
+            job = process_info.last_job_referenced
+            # A post-processing process's job is still mid-inference in the tracker (the result that ends
+            # the inference stage only arrives once post-processing completes). Guard against a stale
+            # reference that has already left that stage.
+            if job is None or job not in jobs_in_progress:
+                continue
+            baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
+            peak_mb = predict_job_post_processing_vram_mb(job, str(baseline) if baseline is not None else None)
+            if peak_mb is not None:
+                total_mb += peak_mb
+        return total_mb
 
     def _max_jobs_in_progress_allowed(self, processes_post_processing: int) -> int:
         """The cap on concurrently in-progress jobs for this scheduling decision.
@@ -765,7 +829,24 @@ class InferenceScheduler:
         if self._job_tracker.has_exclusive_job_in_progress():
             return max(1, len(self._job_tracker.jobs_in_progress))
 
-        base = self._max_concurrent_inference_processes + processes_post_processing
+        # The post-processing overlap bump raises the cap *because* a process is post-processing -- but that
+        # process is holding (or about to hold) its upscaler/face-fixer VRAM peak, the worst moment to admit
+        # another job. Grant the bump only while the device still has staging headroom once the in-flight
+        # post-processing reserve is held back; otherwise drop it so the post-proc peaks of several jobs
+        # cannot align and over-commit the card. Gated on the feature flag so behavior is unchanged when off.
+        post_processing_bump = processes_post_processing
+        if (
+            post_processing_bump > 0
+            and self._budget_active()
+            and self._runtime_config.bridge_data.post_processing_budget_reserve_enabled
+        ):
+            free_vram_mb = self._process_map.get_free_vram_mb()
+            if free_vram_mb is not None:
+                bump_floor = max(_SPECULATIVE_DISPATCH_MIN_FREE_VRAM_MB, self._vram_budget.reserve_mb)
+                if (free_vram_mb - self._committed_post_processing_reserve_mb()) < bump_floor:
+                    post_processing_bump = 0
+
+        base = self._max_concurrent_inference_processes + post_processing_bump
         if not self._runtime_config.bridge_data.gpu_sampling_lease_enabled:
             return base
 
@@ -780,7 +861,7 @@ class InferenceScheduler:
         if free_vram_mb is None or free_vram_mb < staging_floor:
             return base
 
-        return self._max_inference_processes + processes_post_processing
+        return self._max_inference_processes + post_processing_bump
 
     def _expire_stale_model_map_entries(self) -> list[str]:
         """Expire model-map entries whose owning process can no longer be loading that model."""
@@ -1025,6 +1106,7 @@ class InferenceScheduler:
                 # because it can be per-pending-job per-tick; unchanged observations are coalesced by
                 # _log_stream_forecast, while decision or headroom changes still log immediately.
                 self._log_stream_forecast(job, forecast)
+                whole_card_terminal = False
                 if self._whole_card_residency_enabled() and forecast.needs_exclusive_residency:
                     first_time = not self._job_tracker.is_admitted_exclusive(job)
                     self._job_tracker.mark_admitted_exclusive(job)
@@ -1036,22 +1118,34 @@ class InferenceScheduler:
                     # this model, and never a live in-progress model) so their VRAM returns to the driver. A
                     # live sibling is left to drain; the preload simply waits until the device is clear.
                     self.unload_models_from_vram(available_process, under_pressure=True, for_head_of_queue=True)
-                    return False
+                    if not self._whole_card_teardown_exhausted(forecast):
+                        # Still tearing down idle siblings, cycling safety off-GPU, or waiting for their freed
+                        # VRAM to drain: defer and let a later tick re-evaluate against the reduced topology.
+                        return False
+                    # Teardown is structurally exhausted (already at the target process count, safety settled)
+                    # yet the activation-inclusive peak still overflows even sole residency, so co-residency can
+                    # never be reached. The weights DO fit alone (fits_weights_now), so fall through to the
+                    # best-effort admit and load onto the now-cleared card, where it samples slowly under the
+                    # over-budget step grace, instead of deferring every tick until the supervisor soft-resets.
+                    whole_card_terminal = True
 
                 # Head-of-queue starvation backstop (see _HEAD_STARVATION_FORCE_ADMIT_SECONDS): once the head
                 # has been budget-deferred on an otherwise-idle device past the wedge horizon, stop deferring
                 # and admit it best-effort. Reclamation is structurally exhausted by then (an earlier tick
                 # would have freed room otherwise), so continuing to defer only wedges the queue until the
                 # recovery supervisor soft-resets every pool and faults the whole backlog: strictly worse than
-                # loading one head onto an idle card. Whole-card models never reach here (their branch above
-                # returns first), so this only rescues a plain over-budget head that the verdicts keep
-                # rejecting (e.g. a head failing the RAM budget against allocator-stranded idle RAM that no
-                # reclaim path can return).
+                # loading one head onto an idle card. A whole-card head reaches the shared admit only once its
+                # teardown is exhausted (``whole_card_terminal`` above); this timer-based backstop rescues a
+                # plain over-budget head that the verdicts keep rejecting (e.g. a head failing the RAM budget
+                # against allocator-stranded idle RAM that no reclaim path can return).
                 force_admit_starved_head = (
                     is_head_blocker and self._head_starved_seconds(job) >= _HEAD_STARVATION_FORCE_ADMIT_SECONDS
                 )
-                if force_admit_starved_head:
-                    self._log_head_starvation_force_admit(job)
+                if whole_card_terminal or force_admit_starved_head:
+                    if whole_card_terminal:
+                        self._log_whole_card_terminal_admit(job)
+                    else:
+                        self._log_head_starvation_force_admit(job)
                     if not self._job_tracker.is_admitted_over_budget(job):
                         # First admit of this heavy head: open the bounded load grace so the supervisor does
                         # not read its multi-gigabyte load as a structural wedge (see heavy_head_load_grace_active).
@@ -1060,7 +1154,12 @@ class InferenceScheduler:
                     if self._runtime_config.bridge_data.overbudget_exclusive_mode:
                         self._job_tracker.mark_admitted_exclusive(job)
                 else:
-                    vram_verdict = self._vram_budget.check_job(job, baseline, self._measured_free_vram_mb())
+                    vram_verdict = self._vram_budget.check_job(
+                        job,
+                        baseline,
+                        self._measured_free_vram_mb(),
+                        committed_reserve_mb=self._committed_post_processing_reserve_mb(),
+                    )
                     if not vram_verdict.fits:
                         if not self._vram_budget_defer_notified:
                             logger.opt(ansi=True).warning(

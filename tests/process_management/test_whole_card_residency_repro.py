@@ -23,6 +23,7 @@ from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.resource_budget import (
     StreamForecast,
@@ -352,7 +353,11 @@ class TestWholeCardSiblingTeardown:
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
         # Activation-inclusive peak == weights + 2500 MB working set, so the reserve is 2500 (above the floor)
         # and Flux needs sole residency: (16375 - 11500 - 2500) // 1288 == 1.
-        monkeypatch.setattr(resource_budget, "predict_job_vram_mb", lambda job, baseline: _FLUX_WEIGHTS_MB + 2500)
+        monkeypatch.setattr(
+            resource_budget,
+            "predict_job_sampling_vram_mb",
+            lambda job, baseline: _FLUX_WEIGHTS_MB + 2500,
+        )
 
         scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=4)
         # Stub the lifecycle scaler so the test asserts the call and returns an int the scheduler can log.
@@ -613,8 +618,8 @@ class TestWholeCardResidencyState:
 
 # --- Regression: a moderate-weight checkpoint must NOT claim the whole card; high-res Flux must take it ---
 #
-# Both faults trace to one term: forecast reserve = max(base_floor, predict_job_vram_mb - weights), where
-# the activation-inclusive peak scales with width x height x batch. For a moderate-weight SDXL checkpoint
+# Both faults trace to one term: forecast reserve = max(base_floor, predict_job_sampling_vram_mb - weights),
+# where the sampling-phase peak scales with width x height x batch. For a moderate-weight SDXL checkpoint
 # that reserve balloons with batch and resolution and can flip the model into needs_exclusive /
 # requires_teardown, so a model occupying a fraction of the card claims the whole device. For a high-res
 # Flux fp8 job the same reserve can edge past free_if_alone and falsely mark it streams_unavoidably, so it
@@ -762,7 +767,7 @@ class TestSchedulerResidencyRouting:
     async def test_sdxl_head_is_not_marked_exclusive(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An SDXL head on a busy card reclaims a sibling and loads co-resident; it never claims the device."""
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: 4900.0)
-        monkeypatch.setattr(resource_budget, "predict_job_vram_mb", lambda job, baseline: 9517.0)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 9517.0)
 
         scheduler, _process_map, job_tracker = _build_overhead_storm_scheduler(
             free_mb=2000.0,
@@ -785,7 +790,7 @@ class TestSchedulerResidencyRouting:
         hang. The weight-based ``fits_alone`` routes it to sole residency instead.
         """
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
-        monkeypatch.setattr(resource_budget, "predict_job_vram_mb", lambda job, baseline: 15218.0)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 15218.0)
 
         scheduler, _process_map, job_tracker = _build_overhead_storm_scheduler(
             free_mb=2000.0,
@@ -831,3 +836,175 @@ class TestHeavyHeadLoadGrace:
 
         pm._inference_scheduler._heavy_head_admitted_at = time.time()
         assert pm._assess_wedge() is False
+
+
+def _sole_residency_scheduler(
+    *,
+    free_mb: float,
+    safety_paused: bool = True,
+    max_inference: int = 4,
+) -> tuple[InferenceScheduler, JobTracker, HordeProcessInfo]:
+    """A scheduler already collapsed to a single (loading) inference process, safety cycled off-GPU.
+
+    Mirrors the live post-teardown state (``logs/bridge.log`` 2026-06-19 20:52, "inference processes 3 -> 1
+    of 4, target 1"): the whole-card residency reduced the pool to its target of one process and moved safety
+    off the card, but the heavy head still does not fit co-resident. The lone idle process holds a resident
+    model that the head's preload would swap out. ``max_inference`` is the *ceiling* (4 on the live box); the
+    map holds only the one surviving process, so ``num_loaded_inference_processes()`` is 1.
+    """
+    proc = make_mock_process_info(1, model_name=_RESIDENT_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
+    proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+    proc.vram_usage_mb = _DEVICE_TOTAL_VRAM_MB - free_mb
+    process_map = ProcessMap({1: proc})
+    job_tracker = JobTracker()
+    bridge_data = make_mock_bridge_data(
+        enable_vram_budget=True,
+        whole_card_exclusive_residency=True,
+        vram_reserve_mb=_VRAM_RESERVE_MB,
+        ram_reserve_mb=_RAM_RESERVE_MB,
+        vram_per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+        overbudget_exclusive_mode=True,
+        safety_on_gpu=True,
+        image_models_to_load=[_RESIDENT_SDXL, _FLUX_MODEL],
+        max_threads=1,
+    )
+    scheduler = _make_inference_scheduler(
+        process_map=process_map,
+        job_tracker=job_tracker,
+        bridge_data=bridge_data,
+        max_concurrent=1,
+        max_inference=max_inference,
+    )
+    # The residency has already cycled safety off-GPU, so its context is not on the card.
+    scheduler._process_lifecycle.is_safety_gpu_paused = safety_paused
+    return scheduler, job_tracker, proc
+
+
+class TestWholeCardTerminalAdmit:
+    """The live wedge: a whole-card model at its target sole residency that still cannot fit co-resident.
+
+    Reproduces ``logs/bridge.log`` epoch 2026-06-19 20:49:03 (head job 471e6823, Flux.1-Schnell fp8,
+    ``post_processing: False``): the scheduler tore the pool down to its target of one process for the heavy
+    head, but the sampling-phase peak (~15273 MB) exceeds even the sole-residency capacity (~15087 MB), so the
+    forecast keeps returning ``requires_sibling_teardown`` with no sibling left to stop. Before the fix the
+    head is deferred every tick and never loads (the queue wedges until save-our-ship soft-resets the pools at
+    the 120 s establish grace); after it, the head is admitted best-effort and loaded onto the cleared card,
+    where it runs slowly under the over-budget step grace.
+    """
+
+    async def test_flux_at_target_residency_is_admitted_not_wedged_forever(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """RED on current code: at one live process the head is deferred forever and never preloads.
+
+        Wedge geometry: weights 11500 + sampling peak 15218 -> reserve 3718, so weights + reserve (15218)
+        exceed even ``free_if_alone`` (15087). ``fits_alone`` (weights + 2048 floor) is True, so this is a
+        whole-card model (not streams-unavoidably); ``fits_coresident`` can never flip, even at one process.
+        """
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 15218.0)
+
+        scheduler, job_tracker, proc = _sole_residency_scheduler(free_mb=15007.0)
+        head_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
+        await track_popped_job_async(job_tracker, head_job)
+
+        # The forecast at one live process is genuinely the unsatisfiable-teardown trap.
+        forecast = scheduler._forecast_streaming(head_job, _FLUX_BASELINE)
+        assert forecast.needs_exclusive_residency is True
+        assert forecast.requires_sibling_teardown is True
+        assert forecast.max_resident_processes() == 1  # already at target; no sibling left to stop
+
+        admitted = any(scheduler.preload_models() for _ in range(30))
+
+        # The fix: teardown is structurally exhausted and the card has drained, so the head loads best-effort
+        # under the over-budget step grace instead of deferring until the recovery supervisor soft-resets.
+        assert admitted is True, "head must be admitted, not deferred until save-our-ship"
+        assert proc.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        assert job_tracker.is_admitted_over_budget(head_job) is True
+        assert job_tracker.is_admitted_exclusive(head_job) is True
+
+    async def test_undrained_card_defers_no_premature_admit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Drain guard: at target residency but the card not yet drained, the head still defers (no OOM load).
+
+        Right after the idle siblings' processes are stopped, their VRAM has not been returned to the driver,
+        so the measurement reads low. ``fits_weights_now`` is False there, so the terminal admit must hold off
+        (loading the multi-GB checkpoint into VRAM that is still occupied would fault the load itself).
+        """
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 15218.0)
+
+        # free_now is still low: the stopped siblings' VRAM has not been returned to the driver yet.
+        scheduler, job_tracker, proc = _sole_residency_scheduler(free_mb=2000.0)
+        head_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
+        await track_popped_job_async(job_tracker, head_job)
+
+        admitted = any(scheduler.preload_models() for _ in range(30))
+
+        assert admitted is False
+        assert proc.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+        assert job_tracker.is_admitted_over_budget(head_job) is False
+
+    def test_teardown_exhausted_requires_target_safety_and_drain(self) -> None:
+        """The terminal-admit gate fires only at-target AND safety-settled AND the card drained."""
+        drained = StreamForecast(
+            weights_mb=_FLUX_WEIGHTS_MB,
+            reserve_mb=3718.0,
+            base_reserve_mb=float(_VRAM_RESERVE_MB),
+            free_now_mb=15007.0,
+            free_if_alone_mb=15087.0,
+            free_after_model_evict_mb=15087.0,
+            total_vram_mb=float(_DEVICE_TOTAL_VRAM_MB),
+            per_process_overhead_mb=float(_PER_PROCESS_OVERHEAD_MB),
+        )
+        assert drained.max_resident_processes() == 1  # target is sole residency
+
+        # At target (1 process), safety off-GPU, and drained -> exhausted: admit.
+        at_target, _jt, _proc = _sole_residency_scheduler(free_mb=15007.0)
+        assert at_target._whole_card_teardown_exhausted(drained) is True
+
+        # Safety still on the card (this residency needs it off) -> not yet exhausted.
+        at_target._process_lifecycle.is_safety_gpu_paused = False
+        assert at_target._whole_card_teardown_exhausted(drained) is False
+
+        # Card not drained yet (fits_weights_now False) -> not yet exhausted, even at target + safety settled.
+        not_drained = StreamForecast(
+            weights_mb=_FLUX_WEIGHTS_MB,
+            reserve_mb=3718.0,
+            base_reserve_mb=float(_VRAM_RESERVE_MB),
+            free_now_mb=12000.0,
+            free_if_alone_mb=15087.0,
+            free_after_model_evict_mb=15087.0,
+            total_vram_mb=float(_DEVICE_TOTAL_VRAM_MB),
+            per_process_overhead_mb=float(_PER_PROCESS_OVERHEAD_MB),
+        )
+        drained_sched, _jt2, _proc2 = _sole_residency_scheduler(free_mb=12000.0)
+        assert drained_sched._whole_card_teardown_exhausted(not_drained) is False
+
+        # A sibling inference process is still up (current 2 > target 1) -> more teardown possible, defer.
+        two_proc, _pmap, _jt3 = _build_overhead_storm_scheduler(
+            free_mb=15007.0,
+            resident_models=[_RESIDENT_SD15, _RESIDENT_SDXL],
+        )
+        two_proc._process_lifecycle.is_safety_gpu_paused = True
+        assert two_proc._whole_card_teardown_exhausted(drained) is False
+
+    def test_fits_weights_now_keys_on_measured_free_and_bounded_floor(self) -> None:
+        """``fits_weights_now`` is the weight-headroom test against the *live* free, distinct from fits_alone."""
+        base = {
+            "weights_mb": _FLUX_WEIGHTS_MB,
+            "reserve_mb": 3718.0,  # the activation-inclusive peak reserve
+            "base_reserve_mb": float(_VRAM_RESERVE_MB),  # 2048 bounded weight floor
+            "free_if_alone_mb": 15087.0,
+            "free_after_model_evict_mb": 15087.0,
+        }
+        # free_now leaves weights + 2048 floor (13548) room but NOT weights + full 3718 reserve: keys on floor.
+        fits = StreamForecast(free_now_mb=13800.0, **base)
+        assert fits.fits_weights_now is True
+        assert fits.fits_coresident is False  # the activation peak still does not fit at this free
+        # Below weights + floor: the load itself would fault, so the gate is False.
+        too_tight = StreamForecast(free_now_mb=13000.0, **base)
+        assert too_tight.fits_weights_now is False
+        assert too_tight.fits_alone is True  # structurally fits alone (keyed on free_if_alone, not free_now)
+        # No measurement (cold start): not safe to load, so False.
+        assert StreamForecast(free_now_mb=None, **base).fits_weights_now is False

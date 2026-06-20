@@ -109,7 +109,7 @@ class TestBudgetStarvationWedge:
         """
         monkeypatch.setattr(
             resource_budget,
-            "predict_job_vram_mb",
+            "predict_job_sampling_vram_mb",
             lambda job, baseline: _HEAVY_SDXL_PREDICTED_VRAM_MB,
         )
         # RAM is irrelevant to this VRAM-bound case, but the best-effort VRAM admit skips the RAM gate
@@ -155,7 +155,7 @@ class TestBudgetStarvationWedge:
         verdict flips the outcome, isolating the budget gate (not the confounders) as the cause.
         """
         fittable_vram = _ACHIEVABLE_FREE_VRAM_MB - _VRAM_RESERVE_MB - 100.0
-        monkeypatch.setattr(resource_budget, "predict_job_vram_mb", lambda job, baseline: fittable_vram)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: fittable_vram)
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 1000.0)
 
         scheduler, _process_map, job_tracker, proc_sd15, proc_sdxl = _build_wedged_scheduler(
