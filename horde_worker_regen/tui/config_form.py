@@ -41,6 +41,11 @@ class FieldKind(enum.StrEnum):
     """A fixed set of multi-selectable string choices (e.g. alchemy forms)."""
 
 
+# Sentinel for "no explicit default declared" so that a legitimate falsy explicit default
+# (False, 0, "") is still honored. The kind-based fallback only applies when this is unchanged.
+_UNSET: Any = object()
+
+
 @dataclasses.dataclass(frozen=True)
 class ConfigField:
     """One editable bridgeData field: its YAML key, presentation, and edit semantics."""
@@ -56,9 +61,20 @@ class ConfigField:
     maximum: int | None = None
     unit: str = ""
     choices: tuple[str, ...] = ()
+    explicit_default: Any = _UNSET
+    """The worker's real default when the key is absent, when it differs from the kind-based fallback.
+
+    The editor shows this as the field's value when the YAML omits the key, so the displayed value
+    matches what the worker (``reGenBridgeData``) would actually use. Required because the kind-based
+    fallback (BOOL->False, INT->minimum) silently disagrees with model fields that default True or to a
+    non-minimum number, which would mislead the operator. Enforced against the model by
+    ``tests/tui/test_config_form_defaults.py``.
+    """
 
     def default(self) -> Any:  # noqa: ANN401 - heterogeneous defaults by kind
         """The value used when the key is absent from the file."""
+        if self.explicit_default is not _UNSET:
+            return self.explicit_default
         if self.kind is FieldKind.BOOL:
             return False
         if self.kind is FieldKind.INT:
@@ -157,6 +173,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         requires_restart=True,
         minimum=0,
         maximum=4,
+        explicit_default=1,
     ),
     ConfigField(
         "max_batch",
@@ -175,6 +192,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Max resolution = 64*64*8*max_power px (8=512², 32=1024²). Higher needs more VRAM.",
         minimum=1,
         maximum=512,
+        explicit_default=8,
     ),
     # Memory & performance
     ConfigField(
@@ -211,6 +229,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.BOOL,
         "Memory & performance",
         "Aggressively free VRAM between jobs. Recommended for cards under 16 GB.",
+        explicit_default=True,
     ),
     ConfigField(
         "very_fast_disk_mode",
@@ -234,7 +253,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Only take jobs below the model's average step count (good for slow workers).",
     ),
     # Content & safety
-    ConfigField("nsfw", "Allow NSFW", FieldKind.BOOL, "Content & safety", "Serve NSFW requests."),
+    ConfigField(
+        "nsfw", "Allow NSFW", FieldKind.BOOL, "Content & safety", "Serve NSFW requests.", explicit_default=True
+    ),
     ConfigField(
         "censor_nsfw", "Censor NSFW", FieldKind.BOOL, "Content & safety", "Censor NSFW images even when nsfw is true."
     ),
@@ -258,6 +279,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.BOOL,
         "Content & safety",
         "Allow requests from behind VPNs/proxies.",
+        explicit_default=True,
     ),
     ConfigField(
         "require_upfront_kudos",
@@ -276,7 +298,12 @@ CONFIG_FIELDS: list[ConfigField] = [
         requires_restart=True,
     ),
     ConfigField(
-        "allow_img2img", "Allow img2img", FieldKind.BOOL, "Features", "Accept jobs that supply a source image."
+        "allow_img2img",
+        "Allow img2img",
+        FieldKind.BOOL,
+        "Features",
+        "Accept jobs that supply a source image.",
+        explicit_default=True,
     ),
     ConfigField(
         "allow_painting",
@@ -398,6 +425,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.BOOL,
         "Alchemist",
         "Allow alchemy alongside image jobs (vs only when the image queue is empty).",
+        explicit_default=True,
     ),
     ConfigField(
         "alchemy_max_concurrency",
@@ -417,6 +445,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=0,
         maximum=49152,
         unit="MB",
+        explicit_default=2000,
     ),
     # Other
     ConfigField(
@@ -456,6 +485,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=0,
         maximum=3600,
         unit="s",
+        explicit_default=30,
     ),
     ConfigField(
         "cache_home", "Models folder", FieldKind.STR, "Other", "Where models are stored.", requires_restart=True
