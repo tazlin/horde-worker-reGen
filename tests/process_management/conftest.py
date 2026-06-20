@@ -215,6 +215,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.alchemy_allow_concurrent = True
     bd.alchemy_max_concurrency = 1
     bd.alchemy_vram_headroom_mb = 2000
+    bd.alchemy_ram_headroom_mb = 2048
     bd.alchemy_caption_enabled = False
     bd.forms = []
     bd._loaded_from_env_vars = False

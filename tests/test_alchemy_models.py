@@ -21,6 +21,7 @@ from horde_worker_regen.process_management.messages import (
     HordeAlchemyResultMessage,
     HordeControlFlag,
 )
+from horde_worker_regen.process_management.resource_budget import CommittedReserveLedger
 
 
 def _result_message(
@@ -135,8 +136,9 @@ class TestAlchemySubmitShapes:
 class _StubProcessInfo:
     """Stands in for HordeProcessInfo at the dispatch seam."""
 
-    def __init__(self, process_id: int) -> None:
+    def __init__(self, process_id: int, process_launch_identifier: int = 0) -> None:
         self.process_id = process_id
+        self.process_launch_identifier = process_launch_identifier
         self.sent_messages: list[HordeAlchemyControlMessage] = []
 
     def safe_send_message(self, message: HordeAlchemyControlMessage) -> bool:
@@ -159,13 +161,16 @@ class _StubProcessMap:
 def _make_coordinator(process_map: _StubProcessMap) -> AlchemyCoordinator:
     coordinator = AlchemyCoordinator.__new__(AlchemyCoordinator)
     coordinator._process_map = process_map  # type: ignore[assignment]
+    coordinator._reserve_ledger = CommittedReserveLedger()
     coordinator._pending_forms = deque()
     coordinator._in_flight = {}
+    coordinator._in_flight_owner = {}
     coordinator._pending_submits = deque()
     coordinator._form_time_popped = {}
     coordinator._estimator = AlchemyHeadroomEstimator()
     coordinator._free_vram_baseline_mb = None
     coordinator._min_free_vram_mb = None
+    coordinator.num_forms_faulted = 0
     return coordinator
 
 
@@ -354,8 +359,10 @@ def _make_policy_coordinator(
     coordinator._state = _StubState()  # type: ignore[assignment]
     coordinator._process_map = process_map  # type: ignore[assignment]
     coordinator._job_tracker = job_tracker  # type: ignore[assignment]
+    coordinator._reserve_ledger = CommittedReserveLedger()
     coordinator._pending_forms = deque()
     coordinator._in_flight = {f"form-{i}": None for i in range(in_flight)}  # type: ignore[misc]
+    coordinator._in_flight_owner = {}
     coordinator._estimator = AlchemyHeadroomEstimator()
     coordinator._last_pop_time = 0.0
     coordinator._pop_frequency = 4.0

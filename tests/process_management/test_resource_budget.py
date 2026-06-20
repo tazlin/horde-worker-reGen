@@ -12,7 +12,12 @@ from horde_worker_regen.process_management.inference_scheduler import InferenceS
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.resource_budget import BudgetVerdict, RamBudget, VramBudget
+from horde_worker_regen.process_management.resource_budget import (
+    BudgetVerdict,
+    CommittedReserveLedger,
+    RamBudget,
+    VramBudget,
+)
 
 from .conftest import (
     make_job_pop_response,
@@ -85,6 +90,58 @@ class TestVramBudget:
             in BudgetVerdict(fits=False, predicted_mb=4000.0, available_mb=1000.0, reserve_mb=2048.0).reason()
         )
         assert "fits" in BudgetVerdict(fits=True, predicted_mb=1000.0, available_mb=8000.0, reserve_mb=2048.0).reason()
+
+
+class TestCommittedReserveLedger:
+    """The shared ledger accounts for every flow's in-flight cost as one combined figure."""
+
+    def test_set_and_total(self) -> None:
+        """Entries from different flows sum into one combined VRAM/RAM total."""
+        ledger = CommittedReserveLedger()
+        ledger.set("image_post_processing", "aggregate", vram_mb=1000.0)
+        ledger.set("alchemy", "form-1", vram_mb=400.0, ram_mb=200.0)
+        assert ledger.total_vram_mb() == 1400.0
+        assert ledger.total_ram_mb() == 200.0
+
+    def test_release_is_idempotent(self) -> None:
+        """Releasing a unit drops its reserve; releasing again is harmless."""
+        ledger = CommittedReserveLedger()
+        ledger.set("alchemy", "form-1", vram_mb=400.0)
+        ledger.release("alchemy", "form-1")
+        ledger.release("alchemy", "form-1")
+        assert ledger.total_vram_mb() == 0.0
+
+    def test_replace_flow_drops_stale_units(self) -> None:
+        """Replacing a flow's entries drops units no longer present (self-healing on lost results)."""
+        ledger = CommittedReserveLedger()
+        ledger.set("image_post_processing", "aggregate", vram_mb=1000.0)
+        ledger.replace_flow("alchemy", vram_mb_by_unit={"form-1": 300.0, "form-2": 300.0})
+        assert ledger.total_vram_mb() == 1600.0
+        # A later reconcile where form-1's process died leaves only form-2 under alchemy.
+        ledger.replace_flow("alchemy", vram_mb_by_unit={"form-2": 300.0})
+        assert ledger.total_vram_mb() == 1300.0
+        # The image flow's entry is untouched by an alchemy replace.
+        ledger.replace_flow("alchemy", vram_mb_by_unit={})
+        assert ledger.total_vram_mb() == 1000.0
+
+    def test_negative_costs_floored_to_zero(self) -> None:
+        """A noisy negative estimate cannot credit headroom back into the total."""
+        ledger = CommittedReserveLedger()
+        ledger.set("alchemy", "form-1", vram_mb=-500.0)
+        assert ledger.total_vram_mb() == 0.0
+
+
+class TestRamBudgetCommittedReserve:
+    """RamBudget subtracts the committed reserve symmetrically with VramBudget."""
+
+    def test_committed_reserve_can_flip_verdict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """RAM already committed by in-flight work is held back from the admission decision."""
+        monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 6000.0)
+        budget = RamBudget(reserve_mb=4096.0)
+        job = make_job_pop_response("stable_diffusion")
+        # 11000 - 0 >= 6000 + 4096 -> fits; 11000 - 2000 < 10096 -> defers.
+        assert budget.check_job(job, "x", available_ram_mb=11000.0, committed_reserve_mb=0.0).fits is True
+        assert budget.check_job(job, "x", available_ram_mb=11000.0, committed_reserve_mb=2000.0).fits is False
 
 
 def _budget_bridge_data() -> Mock:

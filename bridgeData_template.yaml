@@ -385,10 +385,17 @@ alchemy_allow_concurrent: true
 # compute/VRAM to run more alchemy concurrently with image generation.
 alchemy_max_concurrency: 1
 
-# Minimum free VRAM (MB) required before popping a graph alchemy form in concurrent mode.
-# Acts as the floor for the headroom estimator, which raises the requirement toward the
-# observed median cost of recent alchemy forms.
+# Cold-start floor (MB) for an alchemy form's predicted VRAM cost. Alchemy shares the same
+# committed-reserve accounting as image generation: a form is popped only when EFFECTIVE free
+# VRAM (measured free minus VRAM already committed by in-flight image and alchemy work) covers
+# the form's predicted cost. The prediction starts at this floor and rises toward the observed
+# median cost of recent forms as measurements accumulate.
 alchemy_vram_headroom_mb: 2000
+
+# Minimum effective available system RAM (MB) required before popping an alchemy form, enforced
+# only in high_memory_mode (where graph forms keep weights resident in RAM). The RAM analogue of
+# alchemy_vram_headroom_mb; keeps alchemy from pushing a memory-resident worker into paging.
+alchemy_ram_headroom_mb: 2048
 
 ##########################################
 ## reGen Advanced Settings              ##

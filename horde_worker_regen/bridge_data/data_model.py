@@ -404,11 +404,23 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """
 
     alchemy_vram_headroom_mb: int = Field(default=2000, ge=0)
-    """Minimum free VRAM (MB) required before popping a graph alchemy form in concurrent mode.
+    """Cold-start floor (MB) for an alchemy form's predicted VRAM cost.
 
-    Acts as the floor for the headroom estimator, which raises the requirement toward the
-    observed median cost of recent alchemy forms. Free VRAM is read from worker memory
-    reports; when unavailable, alchemy falls back to backfill-only behavior.
+    Alchemy admission shares the same committed-reserve accounting as image generation: a form is
+    popped only when the device's *effective* free VRAM (measured free minus VRAM already committed by
+    in-flight image and alchemy work) covers the form's predicted cost. That prediction comes from the
+    headroom estimator, which raises it toward the observed median cost of recent forms; until real
+    measurements accumulate it falls back to this floor. Free VRAM is read from worker memory reports;
+    when unavailable, alchemy falls back to backfill-only behavior.
+    """
+
+    alchemy_ram_headroom_mb: int = Field(default=2048, ge=0)
+    """Minimum effective available system RAM (MB) required before popping an alchemy form.
+
+    The RAM analogue of `alchemy_vram_headroom_mb`: in `high_memory_mode`, graph alchemy forms load
+    weights into system RAM too, so alchemy is held back when available RAM (minus RAM already committed
+    by in-flight work) falls below this floor, keeping it from pushing a memory-resident worker into
+    paging. Read from the live system RAM figure; when unavailable, alchemy does not gate on RAM.
     """
 
     enable_vram_budget: bool = Field(default=True)

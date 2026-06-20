@@ -151,6 +151,17 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """Return whether the given process id/launch id pair was intentionally retired."""
         return self.get_retired_launch(process_id, process_launch_identifier) is not None
 
+    def is_launch_active(self, process_id: int, process_launch_identifier: int) -> bool:
+        """Return whether this exact process launch is the one currently occupying its slot.
+
+        A launch stops being active once it is replaced (crash recovery installs a new, higher launch
+        identifier under a fresh pid) or removed (scale-down, quarantine). Callers holding a reference to
+        work that was dispatched to a now-dead launch use this to detect that its result will never
+        arrive, since results only ever come from the exact launch the work was sent to.
+        """
+        info = self.get(process_id)
+        return info is not None and info.process_launch_identifier == process_launch_identifier
+
     def _prune_retired_launches(self) -> None:
         """Prune expired tombstones and enforce the registry size cap."""
         now = time.time()

@@ -718,6 +718,76 @@ def _estimate_job_burden(job: ImageGenerateJobPopResponse, baseline: str | None)
         return None
 
 
+class CommittedReserveLedger:
+    """A single accounting of VRAM/RAM committed by in-flight work across every workload flow.
+
+    The measured device-wide free-VRAM (and system available-RAM) figure already reflects every
+    *realised* allocation, but it lags work that has been admitted and is about to allocate: a job
+    whose inference slot was released for overlap before its upscaler allocates, or an alchemy form
+    just dispatched to a child process. Each flow registers that not-yet-realised cost here so every
+    admission gate subtracts the same combined figure and two flows cannot independently admit
+    against the same free VRAM (the over-commit the image and alchemy gates used to each cause alone).
+
+    Entries are namespaced by ``(flow, unit)`` so a flow can refresh or drop only its own holds. The
+    ledger is pure accounting: it does not know why a reserve exists, mirroring how :class:`VramBudget`
+    keeps no per-model bookkeeping. All callers run on the single event-loop thread, so no locking.
+
+    The hold is intentionally conservative: a reserve is held until the flow releases it, so while an
+    admitted unit's allocation is being realised its cost is briefly counted twice (once in the now-lower
+    measured free figure, once here). Erring toward deferral is the safe direction; it prevents the
+    over-commit at the cost of occasionally under-using VRAM under heavy concurrent load. Fairness
+    (which flow wins a contended lane) is decided above this layer, not by it.
+    """
+
+    def __init__(self) -> None:
+        """Initialize an empty ledger."""
+        self._vram_mb: dict[tuple[str, str], float] = {}
+        self._ram_mb: dict[tuple[str, str], float] = {}
+
+    def set(self, flow: str, unit: str, *, vram_mb: float = 0.0, ram_mb: float = 0.0) -> None:
+        """Register (or refresh) the committed VRAM/RAM for one unit of work.
+
+        Non-positive figures are stored as zero rather than dropped, so a unit that is still in flight
+        but momentarily estimated at zero keeps its slot in the flow namespace.
+        """
+        self._vram_mb[(flow, unit)] = max(0.0, vram_mb)
+        self._ram_mb[(flow, unit)] = max(0.0, ram_mb)
+
+    def release(self, flow: str, unit: str) -> None:
+        """Drop the reserve for one unit of work (idempotent)."""
+        self._vram_mb.pop((flow, unit), None)
+        self._ram_mb.pop((flow, unit), None)
+
+    def replace_flow(
+        self,
+        flow: str,
+        *,
+        vram_mb_by_unit: dict[str, float],
+        ram_mb_by_unit: dict[str, float] | None = None,
+    ) -> None:
+        """Atomically replace every entry for ``flow`` with the given per-unit costs.
+
+        Reconciling the whole namespace each cycle (rather than tracking individual add/release events)
+        makes the ledger self-healing: a unit whose result message was lost when its process died simply
+        stops appearing in the next reconcile and its reserve is dropped, so no stale hold leaks.
+        """
+        ram_mb_by_unit = ram_mb_by_unit or {}
+        self._vram_mb = {k: v for k, v in self._vram_mb.items() if k[0] != flow}
+        self._ram_mb = {k: v for k, v in self._ram_mb.items() if k[0] != flow}
+        for unit, vram_mb in vram_mb_by_unit.items():
+            self._vram_mb[(flow, unit)] = max(0.0, vram_mb)
+        for unit, ram_mb in ram_mb_by_unit.items():
+            self._ram_mb[(flow, unit)] = max(0.0, ram_mb)
+
+    def total_vram_mb(self) -> float:
+        """Return the combined committed VRAM (MB) across all flows."""
+        return sum(self._vram_mb.values())
+
+    def total_ram_mb(self) -> float:
+        """Return the combined committed RAM (MB) across all flows."""
+        return sum(self._ram_mb.values())
+
+
 class VramBudget:
     """Decides whether the device's measured free VRAM can absorb another job's predicted peak.
 
@@ -815,28 +885,35 @@ class RamBudget:
         job: ImageGenerateJobPopResponse,
         baseline: str | None,
         available_ram_mb: float | None,
+        committed_reserve_mb: float = 0.0,
     ) -> BudgetVerdict:
         """Return the budget verdict for admitting ``job`` given the measured available system RAM.
 
         Admits (fits=True) when no measurement or estimate is available, so the budget never wedges a
-        worker; otherwise requires ``available >= predicted + reserve``.
+        worker; otherwise requires ``available - committed_reserve >= predicted + reserve``.
+
+        ``committed_reserve_mb`` is RAM already spoken for by in-flight work whose cost is not yet
+        reflected in the measured available figure (the RAM analogue of the VRAM committed reserve;
+        chiefly other flows' just-admitted weight loads). It defaults to 0.0 so callers that do not
+        track it keep the prior instantaneous behavior.
         """
         if available_ram_mb is None:
             return BudgetVerdict(fits=True, predicted_mb=None, available_mb=None, reserve_mb=self._reserve_mb)
 
+        effective_available_mb = available_ram_mb - committed_reserve_mb
         predicted = predict_job_ram_mb(job, baseline)
         if predicted is None:
             return BudgetVerdict(
                 fits=True,
                 predicted_mb=None,
-                available_mb=available_ram_mb,
+                available_mb=effective_available_mb,
                 reserve_mb=self._reserve_mb,
             )
 
-        fits = available_ram_mb >= predicted + self._reserve_mb
+        fits = effective_available_mb >= predicted + self._reserve_mb
         return BudgetVerdict(
             fits=fits,
             predicted_mb=predicted,
-            available_mb=available_ram_mb,
+            available_mb=effective_available_mb,
             reserve_mb=self._reserve_mb,
         )

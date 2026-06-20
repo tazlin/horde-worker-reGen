@@ -34,6 +34,7 @@ from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.resource_budget import (
+    CommittedReserveLedger,
     RamBudget,
     StreamForecast,
     VramBudget,
@@ -140,6 +141,7 @@ class InferenceScheduler:
     _model_last_in_demand: dict[str, float]
     _vram_budget: VramBudget
     _ram_budget: RamBudget
+    _reserve_ledger: CommittedReserveLedger
     _vram_budget_defer_notified: bool
     _ram_budget_defer_notified: bool
     _scheduler_diagnostic_log_state: dict[str, tuple[tuple[object, ...], float, int]]
@@ -158,6 +160,7 @@ class InferenceScheduler:
         max_inference_processes: int,
         lru: LRUCache,
         performance_model: PerformanceModel | None = None,
+        reserve_ledger: CommittedReserveLedger | None = None,
     ) -> None:
         """Initialize the scheduler with references to the components it needs to manage.
 
@@ -180,6 +183,10 @@ class InferenceScheduler:
             lru (LRUCache): The worker's LRU cache, used to track recently used models for unloading decisions.
             performance_model (PerformanceModel | None): Supplies an expected sampling time per dispatched
                 job for the audit ledger (and, in a later phase, slow-job remediation). May be ``None``.
+            reserve_ledger (CommittedReserveLedger | None): The shared committed-VRAM/RAM ledger every
+                workload flow contributes to, so image generation and alchemy cannot independently admit
+                against the same free VRAM. When ``None`` (unit tests driving the scheduler alone) a private
+                ledger is created, so the scheduler still accounts for its own post-processing reserve.
         """
         self._state = state
         self._process_map = process_map
@@ -210,6 +217,7 @@ class InferenceScheduler:
         # scheduling cycle by _vram_budget_active(), which also tolerates partially-mocked test config.
         self._vram_budget = VramBudget(reserve_mb=_DEFAULT_VRAM_RESERVE_MB)
         self._ram_budget = RamBudget(reserve_mb=_DEFAULT_RAM_RESERVE_MB)
+        self._reserve_ledger = reserve_ledger if reserve_ledger is not None else CommittedReserveLedger()
         self._vram_budget_defer_notified = False
         self._ram_budget_defer_notified = False
         self._scheduler_diagnostic_log_state = {}
@@ -512,7 +520,7 @@ class InferenceScheduler:
             num_inference_processes=num_processes,
             configured_reserve_floor_mb=floor_mb,
             num_extra_resident_contexts=num_safety_contexts,
-            post_processing_reserve_mb=self._committed_post_processing_reserve_mb(),
+            post_processing_reserve_mb=self._committed_vram_reserve_mb(),
         )
 
     def _establish_whole_card_residency(
@@ -616,9 +624,15 @@ class InferenceScheduler:
         """
         available_ram_mb = self._measured_available_ram_mb()
         weights_mb = forecast.weights_mb
+        committed_ram_mb = self._reserve_ledger.total_ram_mb()
         if weights_mb is None:
-            return self._ram_budget.check_job(job, baseline, available_ram_mb).fits
-        return available_ram_mb >= float(weights_mb) + self._ram_budget.reserve_mb
+            return self._ram_budget.check_job(
+                job,
+                baseline,
+                available_ram_mb,
+                committed_reserve_mb=committed_ram_mb,
+            ).fits
+        return (available_ram_mb - committed_ram_mb) >= float(weights_mb) + self._ram_budget.reserve_mb
 
     def _begin_whole_card_residency(
         self,
@@ -956,6 +970,27 @@ class InferenceScheduler:
                 total_mb += peak_mb
         return total_mb
 
+    _IMAGE_PP_RESERVE_FLOW = "image_post_processing"
+    """The shared-ledger flow namespace under which this scheduler registers its post-processing reserve."""
+
+    def _committed_vram_reserve_mb(self) -> float:
+        """Return the combined committed VRAM (MB) across every flow, refreshing this scheduler's own entry.
+
+        Each call re-derives the image-generation post-processing reserve from live process state and
+        publishes it into the shared :class:`CommittedReserveLedger` as a single aggregate entry, then
+        returns the ledger total (which also includes any in-flight alchemy forms other flows registered).
+        Re-publishing every call keeps the entry self-healing: it always reflects current state and never
+        leaks. This combined figure is what the VRAM admission and residency-forecast gates subtract, so a
+        freshly-released slot is not handed VRAM that image post-processing *or* concurrent alchemy is about
+        to claim.
+        """
+        self._reserve_ledger.set(
+            self._IMAGE_PP_RESERVE_FLOW,
+            "aggregate",
+            vram_mb=self._committed_post_processing_reserve_mb(),
+        )
+        return self._reserve_ledger.total_vram_mb()
+
     def _max_jobs_in_progress_allowed(self, processes_post_processing: int) -> int:
         """The cap on concurrently in-progress jobs for this scheduling decision.
 
@@ -988,7 +1023,7 @@ class InferenceScheduler:
             free_vram_mb = self._process_map.get_free_vram_mb()
             if free_vram_mb is not None:
                 bump_floor = max(_SPECULATIVE_DISPATCH_MIN_FREE_VRAM_MB, self._vram_budget.reserve_mb)
-                if (free_vram_mb - self._committed_post_processing_reserve_mb()) < bump_floor:
+                if (free_vram_mb - self._committed_vram_reserve_mb()) < bump_floor:
                     post_processing_bump = 0
 
         base = self._max_concurrent_inference_processes + post_processing_bump
@@ -1326,7 +1361,7 @@ class InferenceScheduler:
                         job,
                         baseline,
                         self._measured_free_vram_mb(),
-                        committed_reserve_mb=self._committed_post_processing_reserve_mb(),
+                        committed_reserve_mb=self._committed_vram_reserve_mb(),
                     )
                     if not vram_verdict.fits:
                         if not self._vram_budget_defer_notified:
@@ -1394,7 +1429,12 @@ class InferenceScheduler:
                     else:
                         self._vram_budget_defer_notified = False
 
-                        ram_verdict = self._ram_budget.check_job(job, baseline, self._measured_available_ram_mb())
+                        ram_verdict = self._ram_budget.check_job(
+                            job,
+                            baseline,
+                            self._measured_available_ram_mb(),
+                            committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
+                        )
                         if not ram_verdict.fits:
                             if not self._ram_budget_defer_notified:
                                 logger.opt(ansi=True).warning(

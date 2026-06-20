@@ -1,13 +1,18 @@
 """Pops, dispatches, and submits alchemy (interrogation) jobs from the AI Horde API.
 
-Image jobs always take priority for process time and VRAM. By default
-(``alchemy_allow_concurrent``) alchemy may still run alongside image generation, but only
-when a process lane is spare (no waiting image job needs it) and the headroom estimator
-judges there is enough free VRAM for a typical alchemy form. With ``alchemy_allow_concurrent``
-off, alchemy reverts to a strict backfill workload that pops only when the image queue is
-empty. Graph forms (upscalers, facefixers, strip_background) are dispatched to inference
-processes; CLIP forms (caption, interrogation, nsfw) to the safety process. Dispatch is
-keyed on :class:`WorkerCapability`, not process type.
+Admission is two layers. The *fairness* layer decides whether alchemy may take a contended
+resource at all: image jobs always take priority for process time, so in concurrent mode
+(``alchemy_allow_concurrent``) a graph form is only popped into a process lane no waiting image
+job needs, and with concurrency off alchemy reverts to strict backfill (pop only when the image
+queue is empty). Beneath it, the *capacity* layer decides whether the device can physically hold
+another form: alchemy shares the same :class:`CommittedReserveLedger` as image generation, so a
+form is admitted only when *effective* free VRAM/RAM (measured free minus what in-flight image and
+alchemy work has already committed) covers the form's predicted cost. The two flows therefore
+cannot independently admit against the same free VRAM the way two separate gates once could.
+
+Graph forms (upscalers, facefixers, strip_background) are dispatched to inference processes; CLIP
+forms (caption, interrogation, nsfw) to the safety process. Dispatch is keyed on
+:class:`WorkerCapability`, not process type.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from collections import deque
 from typing import TYPE_CHECKING, override
 
 import aiohttp
+import psutil
 import yarl
 from horde_sdk import RequestErrorResponse
 from horde_sdk.ai_horde_api import GENERATION_STATE
@@ -34,9 +40,7 @@ from horde_sdk.generation_parameters.alchemy.consts import (
     KNOWN_FACEFIXERS,
     KNOWN_MISC_POST_PROCESSORS,
     KNOWN_UPSCALERS,
-    is_facefixer_form,
     is_strip_background_form,
-    is_upscaler_form,
 )
 from loguru import logger
 
@@ -53,8 +57,10 @@ from horde_worker_regen.process_management.messages import (
     HordeControlFlag,
 )
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.workload_flow import WorkloadKind, capability_for_alchemy_form
 from horde_worker_regen.runtime_version import runtime_version
 
 if TYPE_CHECKING:
@@ -101,10 +107,12 @@ class _AlchemySubmitRequest(AlchemyJobSubmitRequest):
 
 
 def required_capability(form: str) -> WorkerCapability:
-    """Return the capability a process must declare to serve the given form."""
-    if is_upscaler_form(form) or is_facefixer_form(form) or is_strip_background_form(form):
-        return WorkerCapability.ALCHEMY_GRAPH
-    return WorkerCapability.ALCHEMY_CLIP
+    """Return the capability a process must declare to serve the given form.
+
+    Thin alias over :func:`workload_flow.capability_for_alchemy_form`, which is the single source of truth
+    for form-to-capability routing.
+    """
+    return capability_for_alchemy_form(form)
 
 
 DEFAULT_ALCHEMY_FORMS: tuple[str, ...] = ("caption", "nsfw", "interrogation", "post-process")
@@ -202,6 +210,7 @@ class AlchemyCoordinator:
     _state: WorkerState
     _process_map: ProcessMap
     _job_tracker: JobTracker
+    _reserve_ledger: CommittedReserveLedger
     _shutdown_manager: ShutdownManager
     _runtime_config: RuntimeConfig
     _api_sessions: ApiSessions
@@ -209,6 +218,12 @@ class AlchemyCoordinator:
     _pending_forms: deque[AlchemyFormSpec]
     _in_flight: dict[str, AlchemyFormSpec]
     """Forms dispatched to a child process, keyed by form_id, awaiting a result message."""
+    _in_flight_owner: dict[str, tuple[int, int]]
+    """form_id -> the (process_id, process_launch_identifier) the form was dispatched to.
+
+    A result arrives only from the exact launch the form was sent to, so this lets the reaper tell a
+    form whose owning process has died (its result will never come) from one that is merely still running.
+    """
     _pending_submits: deque[PendingAlchemySubmitJob]
     _form_time_popped: dict[str, float]
 
@@ -232,6 +247,7 @@ class AlchemyCoordinator:
         shutdown_manager: ShutdownManager,
         runtime_config: RuntimeConfig,
         api_sessions: ApiSessions,
+        reserve_ledger: CommittedReserveLedger | None = None,
         canned_alchemy_source: CannedAlchemySource | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators.
@@ -239,16 +255,20 @@ class AlchemyCoordinator:
         Args:
             state: The shared worker state.
             process_map: The shared process map.
-            job_tracker: The image job tracker (consulted for contention policy).
+            job_tracker: The image job tracker (consulted for the fairness/contention policy).
             shutdown_manager: The shutdown manager.
             runtime_config: Holds the current bridge configuration snapshot.
             api_sessions: The API session holder.
+            reserve_ledger: The shared committed-VRAM/RAM ledger image generation also uses, so the two
+                flows account for one another's in-flight cost and cannot over-commit the device. When
+                ``None`` (unit tests driving the coordinator alone) a private ledger is created.
             canned_alchemy_source: When set, forms come from this source and submits are
                 recorded locally instead of touching the API (harness/benchmark mode).
         """
         self._state = state
         self._process_map = process_map
         self._job_tracker = job_tracker
+        self._reserve_ledger = reserve_ledger if reserve_ledger is not None else CommittedReserveLedger()
         self._shutdown_manager = shutdown_manager
         self._runtime_config = runtime_config
         self._api_sessions = api_sessions
@@ -262,6 +282,7 @@ class AlchemyCoordinator:
 
         self._pending_forms = deque()
         self._in_flight = {}
+        self._in_flight_owner = {}
         self._pending_submits = deque()
         self._form_time_popped = {}
 
@@ -273,6 +294,16 @@ class AlchemyCoordinator:
         self._pop_frequency = 4.0
         self._error_pop_frequency = 15.0
         self._loop_interval = 1.0
+
+    @property
+    def kind(self) -> WorkloadKind:
+        """The workload flow this coordinator runs (satisfies the ``FlowCoordinator`` protocol)."""
+        return WorkloadKind.ALCHEMY
+
+    @property
+    def num_in_flight(self) -> int:
+        """Forms popped, dispatched, or awaiting submission (the flow's total live work units)."""
+        return len(self._pending_forms) + len(self._in_flight) + len(self._pending_submits)
 
     @property
     def num_forms_pending(self) -> int:
@@ -344,7 +375,7 @@ class AlchemyCoordinator:
         if offers_graph and not self._has_spare_image_lane():
             return False
 
-        return self._has_vram_headroom()
+        return self._has_vram_headroom() and self._has_ram_headroom()
 
     def _has_spare_image_lane(self) -> bool:
         """Return True if an idle inference lane exists beyond what queued image jobs need."""
@@ -358,15 +389,46 @@ class AlchemyCoordinator:
         return idle_image_lanes > undispatched_image_jobs
 
     def _has_vram_headroom(self) -> bool:
-        """Return True if free VRAM covers a typical alchemy form (per the estimator)."""
+        """Return True if *effective* free VRAM covers a typical alchemy form (per the estimator).
+
+        Effective free is the measured device-wide free VRAM minus everything the shared ledger records
+        as already committed by in-flight image and alchemy work, so a form is not admitted against VRAM
+        another flow is about to claim.
+        """
         free_vram_mb = self._process_map.get_free_vram_mb()
         if free_vram_mb is None:
             # No VRAM telemetry yet (cold start or CPU-only): fall back to backfill.
             return len(self._job_tracker.jobs_pending_inference) == 0
+        effective_free_mb = free_vram_mb - self._reserve_ledger.total_vram_mb()
         return self._estimator.fits(
-            free_vram_mb=free_vram_mb,
+            free_vram_mb=effective_free_mb,
             floor_mb=float(self.bridge_data.alchemy_vram_headroom_mb),
         )
+
+    def _has_ram_headroom(self) -> bool:
+        """Return True if effective available system RAM clears the alchemy RAM floor.
+
+        Only enforced in ``high_memory_mode``, where graph forms keep weights resident in RAM and could
+        push a memory-resident worker into paging. Effective available RAM subtracts the shared ledger's
+        committed RAM. When the floor is zero or RAM cannot be read, this does not gate.
+        """
+        if not self.bridge_data.high_memory_mode:
+            return True
+        floor_mb = float(self.bridge_data.alchemy_ram_headroom_mb)
+        if floor_mb <= 0:
+            return True
+        available_ram_mb = self._measured_available_ram_mb()
+        if available_ram_mb is None:
+            return True
+        return (available_ram_mb - self._reserve_ledger.total_ram_mb()) >= floor_mb
+
+    @staticmethod
+    def _measured_available_ram_mb() -> float | None:
+        """The measured system-wide available RAM (MB), or None if it cannot be read."""
+        try:
+            return psutil.virtual_memory().available / (1024 * 1024)
+        except Exception:
+            return None
 
     def _sample_vram(self) -> None:
         """Track the free-VRAM baseline and in-flight low-water mark for the cost estimator."""
@@ -530,6 +592,10 @@ class AlchemyCoordinator:
             )
             if sent:
                 self._in_flight[spec.form_id] = spec
+                self._in_flight_owner[spec.form_id] = (
+                    process_info.process_id,
+                    process_info.process_launch_identifier,
+                )
                 logger.debug(
                     f"Dispatched alchemy form {spec.form_id} ({spec.form}) to process {process_info.process_id}",
                 )
@@ -538,9 +604,74 @@ class AlchemyCoordinator:
 
         self._pending_forms = still_pending
 
+    def _reap_lost_in_flight_forms(self) -> None:
+        """Drop in-flight forms whose owning process launch is gone, before reconciling the reserve.
+
+        A form's result arrives only from the exact process launch it was dispatched to. A child that
+        raises while running a form still reports a faulted result, but one that dies *hard* (segfault,
+        OOM kill, watchdog kill) before reporting never does, so the form would otherwise sit in
+        ``_in_flight`` forever: it would hold a VRAM reserve in the shared ledger that permanently
+        starves image-generation admission, and consume an ``alchemy_max_concurrency`` slot. Recovery
+        replaces or removes the dead launch, so :meth:`ProcessMap.is_launch_active` tells us the result
+        will never come. Reaping the form here (counting it faulted; the horde reissues it elsewhere) is
+        what makes :meth:`_sync_reserve_ledger`'s self-healing real.
+        """
+        lost = [
+            form_id
+            for form_id, (process_id, launch) in self._in_flight_owner.items()
+            if not self._process_map.is_launch_active(process_id, launch)
+        ]
+        for form_id in lost:
+            spec = self._in_flight.pop(form_id, None)
+            self._in_flight_owner.pop(form_id, None)
+            self._form_time_popped.pop(form_id, None)
+            self.num_forms_faulted += 1
+            form_name = spec.form if spec is not None else "unknown"
+            logger.warning(
+                f"Alchemy form {form_id} ({form_name}) lost: the process it was dispatched to is gone "
+                "before a result arrived; dropping it so its resource reserve is released.",
+            )
+
+    def _sync_reserve_ledger(self) -> None:
+        """Publish each in-flight alchemy form's predicted VRAM/RAM cost into the shared ledger.
+
+        Reconciling the whole ``alchemy`` namespace each cycle (rather than add/release per form) makes
+        the reserve self-healing: a form whose owning process died is dropped from ``_in_flight`` by
+        :meth:`_reap_lost_in_flight_forms` (run just before this), so its hold simply stops being
+        republished and no stale reserve leaks to starve image generation.
+
+        The per-form cost is charged by what the form actually allocates, not a flat figure:
+
+        - **Graph forms** (upscalers, facefixers, strip_background) load a post-processor onto an inference
+          process, so they reserve the estimator's current VRAM prediction (floored by
+          ``alchemy_vram_headroom_mb``). In ``high_memory_mode`` those weights are *also* kept resident in
+          system RAM, so the form additionally reserves ``alchemy_ram_headroom_mb`` of RAM. That RAM hold is
+          what the image scheduler's RAM gate and this coordinator's own :meth:`_has_ram_headroom` subtract,
+          so neither flow admits work against RAM a graph form is about to claim.
+        - **CLIP forms** (caption, nsfw, interrogation) run on the safety process against an already-resident
+          model, so dispatching one adds no not-yet-realised VRAM or RAM and is charged zero. Reserving the
+          graph cost for them would needlessly hold image generation back.
+        """
+        predicted_vram = self._estimator.predicted_cost_mb(float(self.bridge_data.alchemy_vram_headroom_mb))
+        graph_ram_mb = float(self.bridge_data.alchemy_ram_headroom_mb) if self.bridge_data.high_memory_mode else 0.0
+
+        vram_mb_by_unit: dict[str, float] = {}
+        ram_mb_by_unit: dict[str, float] = {}
+        for form_id, spec in self._in_flight.items():
+            is_graph = required_capability(spec.form) is WorkerCapability.ALCHEMY_GRAPH
+            vram_mb_by_unit[form_id] = predicted_vram if is_graph else 0.0
+            ram_mb_by_unit[form_id] = graph_ram_mb if is_graph else 0.0
+
+        self._reserve_ledger.replace_flow(
+            "alchemy",
+            vram_mb_by_unit=vram_mb_by_unit,
+            ram_mb_by_unit=ram_mb_by_unit,
+        )
+
     def on_alchemy_result(self, message: HordeAlchemyResultMessage) -> None:
         """Accept a form result from a child process and queue it for submission."""
         spec = self._in_flight.pop(message.form_id, None)
+        self._in_flight_owner.pop(message.form_id, None)
         if spec is None:
             logger.warning(f"Received alchemy result for unknown form {message.form_id} ({message.form})")
 
@@ -694,6 +825,8 @@ class AlchemyCoordinator:
                     self._sample_vram()
                     await self.api_alchemy_pop()
                     self.dispatch_pending_forms()
+                    self._reap_lost_in_flight_forms()
+                    self._sync_reserve_ledger()
                     await self.api_submit_alchemy()
                     self._state.alchemy_forms_in_flight = (
                         len(self._pending_forms) + len(self._in_flight) + len(self._pending_submits)

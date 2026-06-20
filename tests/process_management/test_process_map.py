@@ -231,3 +231,26 @@ class TestFirstStepTimeout:
         """With no first-step timeout supplied the pre-first-step window uses the per-step timeout."""
         process_map = self._starting_proc(elapsed=self._PER_STEP + 10, current_step=None)
         assert process_map.is_stuck_on_inference(0, self._PER_STEP) is True
+
+
+class TestIsLaunchActive:
+    """ProcessMap.is_launch_active distinguishes the live launch from a replaced or absent one."""
+
+    def test_matching_launch_is_active(self) -> None:
+        """The launch currently occupying a slot is active."""
+        proc = make_mock_process_info(0)
+        proc.process_launch_identifier = 5
+        process_map = ProcessMap({0: proc})
+        assert process_map.is_launch_active(0, 5) is True
+
+    def test_absent_process_is_not_active(self) -> None:
+        """A process id no longer in the map (removed on recovery/scale-down) is not active."""
+        process_map = ProcessMap({0: make_mock_process_info(0)})
+        assert process_map.is_launch_active(99, 0) is False
+
+    def test_replaced_launch_is_not_active(self) -> None:
+        """A stale launch id for a since-replaced slot is not active even though the pid is reused."""
+        proc = make_mock_process_info(0)
+        proc.process_launch_identifier = 8  # the replacement launch now occupies pid 0
+        process_map = ProcessMap({0: proc})
+        assert process_map.is_launch_active(0, 7) is False

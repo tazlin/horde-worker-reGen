@@ -81,6 +81,7 @@ from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.recovery_supervisor import RecoveryAction, RecoverySupervisor
+from horde_worker_regen.process_management.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot, WorkerRunMetrics
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.safety_orchestrator import SafetyOrchestrator
@@ -702,6 +703,11 @@ class HordeWorkerProcessManager:
             process_lifecycle=self._process_lifecycle,
         )
 
+        # One committed-VRAM/RAM reserve ledger shared by every workload flow (image generation and
+        # alchemy today; audio/video later), so they account for one another's in-flight cost and cannot
+        # independently admit against the same free VRAM.
+        self._reserve_ledger = CommittedReserveLedger()
+
         self._inference_scheduler = InferenceScheduler(
             state=self._state,
             process_map=self._process_map,
@@ -714,6 +720,7 @@ class HordeWorkerProcessManager:
             max_inference_processes=self.max_inference_processes,
             lru=self._lru,
             performance_model=self._performance_model,
+            reserve_ledger=self._reserve_ledger,
         )
         # Feed the startup-measured per-process VRAM overhead to the scheduler's streaming forecast, so it
         # can estimate the free VRAM achievable under sole residency (total - one process's context).
@@ -768,6 +775,7 @@ class HordeWorkerProcessManager:
             shutdown_manager=self._shutdown_manager,
             runtime_config=self._runtime_config,
             api_sessions=self._api_sessions,
+            reserve_ledger=self._reserve_ledger,
             canned_alchemy_source=canned_alchemy_source,
         )
         self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
