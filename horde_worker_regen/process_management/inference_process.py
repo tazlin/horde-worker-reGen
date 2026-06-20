@@ -351,7 +351,11 @@ class HordeInferenceProcess(HordeProcess):
         Returns:
             float | None: The time elapsed during downloading, or None if no models were downloaded.
         """
-        with self._aux_model_lock:
+        # Not a plain ``with self._aux_model_lock:`` because the bound block-exit release can raise
+        # when the supervisor has force-released the shared lock out from under us; see
+        # ``_release_aux_model_lock`` for why that over-release is benign and must not be fatal.
+        self._aux_model_lock.acquire()
+        try:
             time_start = time.time()
 
             lora_manager = self._shared_model_manager.manager.lora
@@ -423,6 +427,26 @@ class HordeInferenceProcess(HordeProcess):
 
             logger.info("No auxiliary models downloaded")
             return None
+        finally:
+            self._release_aux_model_lock()
+
+    def _release_aux_model_lock(self) -> None:
+        """Release the shared aux-model lock, tolerating a benign supervisor-forced over-release.
+
+        ``_aux_model_lock`` is a single *bounded* multiprocessing lock created once in the manager and
+        shared by every inference child and the supervisor. When the supervisor replaces this slot it
+        reclaims that lock on our behalf (``HordeProcessLifecycleManager._release_held_primitives``).
+        If that reclaim lands while we are still inside the critical section, our own release pushes the
+        bounded lock past its ceiling and raises "released too many times". The protected work is
+        already finished and the lock is genuinely free, so the over-release is benign: swallowing it
+        keeps a slow-but-alive aux download from tearing the whole inference process down (an observed
+        crash-loop that re-loaded the model on every LoRA job under supervisor pressure). This mirrors
+        the supervisor side, which already swallows the symmetric ``ValueError`` when it force-releases.
+        """
+        try:
+            self._aux_model_lock.release()
+        except ValueError:
+            pass
 
     @logger.catch(reraise=True)
     def preload_model(
