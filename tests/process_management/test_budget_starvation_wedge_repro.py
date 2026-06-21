@@ -99,13 +99,12 @@ class TestBudgetStarvationWedge:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The bug, and its fix: a head whose predicted peak + reserve exceeds the free-VRAM floor.
+        """A head whose predicted peak + reserve exceeds the free-VRAM floor must not defer forever.
 
-        Before the fix this state deferred forever (no cycle ever admitted the preload, so the queue
-        wedged and the head was faulted). After the fix the budget first attempts reclamation and, once
-        that is exhausted while no live job holds the device, admits the head best-effort so the queue
-        makes progress. Loading one model onto an otherwise-idle GPU cannot reintroduce the
-        multi-process over-commit the budget exists to prevent.
+        If nothing ever admits the preload, the queue wedges and the head is faulted. Instead the budget must
+        first attempt reclamation and, once that is exhausted while no live job holds the device, admit the
+        head best-effort so the queue makes progress. Loading one model onto an otherwise-idle GPU cannot
+        reintroduce the multi-process over-commit the budget exists to prevent.
         """
         monkeypatch.setattr(
             resource_budget,

@@ -11,8 +11,8 @@ Failure mode:
     faulted, and dropped. This recurs every ~2-3 min; the steady drop stream trips the horde server's
     "dropping too many jobs" guard, which forced the worker into maintenance.
 
-What the *previous* fix (commit e32179c) did and did not cover:
-    e32179c added the isolated/degraded retry classification and a 90 s first-step grace. The existing
+What the earlier over-budget handling did and did not cover:
+    An earlier layer added the isolated/degraded retry classification and a 90 s first-step grace, and
     ``test_oversized_job_crash_storm_repro`` pins that the retry is *isolated*. Neither addresses a model
     the device genuinely cannot run: the isolated retry still thrashes, and nothing stops the worker
     popping/dropping the model until the server forces maintenance. This module reproduces that gap and

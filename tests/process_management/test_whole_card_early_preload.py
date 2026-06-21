@@ -126,11 +126,11 @@ class TestEarlyRamPreStage:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """RED on current code: the head is reserved exclusive but no idle process is given its RAM preload.
+        """A reserved-exclusive head must get its RAM preload in an idle process, not be deferred bare.
 
-        Today the residency tears the idle siblings down and defers, so Flux's disk->RAM load does not begin
-        until the SDXL job drains. The fix pre-stages Flux into a spare process's RAM concurrently with the
-        SDXL sampling, so the load is already done (or well underway) when the device frees.
+        If the residency merely tears the idle siblings down and defers, Flux's disk->RAM load does not begin
+        until the SDXL job drains. Instead it must pre-stage Flux into a spare process's RAM concurrently with
+        the SDXL sampling, so the load is already done (or well underway) when the device frees.
         """
         _seed_flux_weight_estimates(monkeypatch)
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 12000.0)
@@ -210,7 +210,7 @@ class TestResidencyConvergesAfterDrain:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """RED on current code: after the live job drains, nothing drives the teardown to sole residency.
+        """After the live job drains, the teardown must drive the pool to sole residency for the head.
 
         Post-drain state: Flux is resident in RAM on a spare (``PRELOADED_MODEL``), the former busy process is
         idle but still holds its CUDA context, and no job is in progress. The residency must now scale down to
@@ -320,7 +320,7 @@ class TestLiveLogRamGateRegression:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """RED before the fix: at 25GB free the burden gate (24+4=28GB) rejects, so it kills all siblings.
+        """At 25GB free a full-burden gate (24+4=28GB) would reject and kill all siblings; weights alone fit.
 
         The head's weights (~11.5GB) plus the reserve (4GB) fit comfortably in the 25GB available, so the
         weights-based gate must pre-stage; the worker must not fall back to the teardown path.

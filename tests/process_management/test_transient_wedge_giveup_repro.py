@@ -11,8 +11,8 @@ as an unrecoverable wedge and faulted.
 
 The fix makes a queue deadlock count as a *structural* wedge only once it has persisted past any normal
 model-load / churn window, restoring the supervisor's definitive-signal assumption. These tests assert
-that fixed behavior and are therefore RED against the pre-fix code (which treats an instantaneous queue
-deadlock as structural).
+that behavior: an instantaneous queue deadlock during a model load must not be treated as structural,
+only one that persists past the load window.
 """
 
 from __future__ import annotations

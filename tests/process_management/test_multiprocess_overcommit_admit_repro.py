@@ -87,8 +87,8 @@ class TestMultiProcessOvercommitForecast:
 
         The weight-dominant gates miss it: ``_weights_dominant`` (and so ``needs_exclusive_residency`` and
         ``requires_sibling_teardown``) judge the moderate-weight SDXL "not card-filling" under the fixed
-        two-context ceiling, so before the fix *no* structural remedy fired and the head was force-admitted
-        into an OOM. The topology-aware ``needs_process_count_reduction`` catches it: the live four contexts
+        two-context ceiling, so no structural remedy fires from them and the head would be force-admitted into
+        an OOM. The topology-aware ``needs_process_count_reduction`` catches it: the live four contexts
         squeeze the bounded weights off the card, but the model co-resides once the process count is reduced.
         """
         forecast = _sdxl_four_process_forecast()

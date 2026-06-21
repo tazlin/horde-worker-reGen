@@ -203,9 +203,9 @@ async def test_inference_crash_reported_as_process_ended_is_recovered() -> None:
 
     The SDXL-controlnet fault raises inside ``start_inference``; ``@logger.catch(reraise=True)`` re-raises
     it into the child's control-message loop, which sets the end flag and exits via the same graceful
-    PROCESS_ENDED path as a preload death. Before the fix the slot was never replaced
-    (``num_process_recoveries: 0`` in the report) and the level idled to timeout. The recovery here, plus
-    the manager's orphaned-in-progress-job watchdog, is what lets the level continue after the fault.
+    PROCESS_ENDED path as a preload death. If that path is not recognised as a crash the slot is never
+    replaced (``num_process_recoveries: 0`` in the report) and the level idles to timeout. The recovery here,
+    plus the manager's orphaned-in-progress-job watchdog, is what lets the level continue after the fault.
     """
     model_map = HordeModelMap(
         root={

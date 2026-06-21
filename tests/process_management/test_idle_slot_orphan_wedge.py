@@ -115,9 +115,9 @@ class TestWatchdogPuntsIdleShieldedOrphan:
     async def test_watchdog_punts_job_shielded_only_by_idle_waiting_slot(self) -> None:
         """The exact wedge: an in-progress job referenced only by an idle ``WAITING_FOR_JOB`` slot.
 
-        Before the fix the watchdog treats the idle slot as the owner, deletes the job's grace-clock entry
-        every tick, and never punts it. After the fix the job is recognised as orphaned and punted once the
-        grace window elapses, so it stops pinning the in-progress count.
+        If the watchdog treats the idle slot as the owner, it deletes the job's grace-clock entry every tick
+        and never punts it. Instead the job must be recognised as orphaned and punted once the grace window
+        elapses, so it stops pinning the in-progress count.
         """
         pm = make_testable_process_manager()
         idle_slot = make_mock_process_info(2, model_name="AlbedoBase XL 3.1", state=HordeProcessState.WAITING_FOR_JOB)

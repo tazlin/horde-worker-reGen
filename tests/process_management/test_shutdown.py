@@ -279,10 +279,10 @@ class TestFaultReportOutstandingJobs:
 class TestShutdownDrainsUnsubmittableJob:
     """Integration: an un-submittable job must never be able to block shutdown forever.
 
-    This reproduces the observed failure end to end: a job reaches PENDING_SUBMIT without a safety
-    verdict (censored is None), is_time_for_shutdown() stays False because the submit queue is
-    non-empty, and (before the fix) the submitter spun on it forever. The submitter must punt the job
-    so the queue drains and shutdown can complete.
+    This reproduces the failure end to end: a job reaches PENDING_SUBMIT without a safety verdict
+    (censored is None), is_time_for_shutdown() stays False because the submit queue is non-empty, and a
+    naive submitter would spin on it forever. The submitter must punt the job so the queue drains and
+    shutdown can complete.
     """
 
     async def test_poison_submit_job_is_drained_and_shutdown_completes(self) -> None:
