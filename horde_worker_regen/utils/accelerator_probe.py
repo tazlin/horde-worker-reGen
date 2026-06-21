@@ -11,6 +11,15 @@ This module runs the enumeration in a short-lived subprocess and returns the res
 data. The subprocess pays the torch cost and frees it on exit, leaving the caller torch-free. It stays
 backend-agnostic: the subprocess uses the same hordelib helper, so it reports whatever backend ComfyUI
 supports (CUDA/ROCm, Intel XPU, Apple MPS, DirectML, CPU), not just NVIDIA.
+
+Beyond the inventory, the subprocess also measures two VRAM figures the streaming forecast needs: the
+*first/sole* process's context cost (the one-time CUDA runtime allocation plus one context), and the
+*marginal* cost of each additional sibling context. The marginal is measured directly by bringing up a
+second context-holding process and reading the device-wide used delta -- so the forecast can size
+``free_after_model_evict`` from the real per-process cost instead of charging the whole one-time-inclusive
+overhead per process (which over-counts badly on a big card and is what wedged a 24GB worker). The delta is
+only visible cross-process where the platform reports true device-wide VRAM; Linux does, Windows WDDM does
+not, so there the marginal reads 0 and the worker falls back to the conservative overhead-per-context sizing.
 """
 
 from __future__ import annotations
@@ -27,32 +36,124 @@ from pydantic import BaseModel
 # parsing is robust against any stray stdout (logging/telemetry banners) the import might produce.
 _RESULT_PREFIX = "ACCEL_PROBE_JSON:"
 
-_PROBE_SOURCE = f"""
-import json
+# A minimal second process that materialises *its own* backend context on the same device (a real kernel
+# launch, so the runtime/context fully allocates -- enumeration alone does not), announces it, then idles
+# until the probe kills it. Run via ``python -c`` from the probe (below), so it stays a plain source string.
+_HOLDER_SOURCE = """
 import sys
 
 try:
-    from hordelib.utils.torch_memory import (
-        enumerate_accelerators,
-        get_torch_free_vram_mb,
-        get_torch_total_vram_mb,
-    )
+    import torch
+
+    if torch.cuda.is_available():
+        _dev = "cuda"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        _dev = "xpu"
+    else:
+        _dev = None
+    if _dev is not None:
+        # A matmul loads cuBLAS, so the context materialises the way a real inference process's does (a bare
+        # elementwise kernel under-counts it slightly); .item() forces the sync.
+        _block = torch.ones((512, 512), device=_dev)
+        float((_block @ _block).sum().item())
+    sys.stdout.write("HOLDER_READY\\n")
+    sys.stdout.flush()
+    sys.stdin.readline()  # idle until the probe signals shutdown (or kills us)
+except BaseException as exc:  # noqa: BLE001
+    sys.stderr.write("HOLDER_ERR:" + repr(exc))
+    sys.exit(4)
+"""
+
+_PROBE_SOURCE = f"""
+import json
+import subprocess
+import sys
+import threading
+
+try:
+    from hordelib.utils.torch_memory import enumerate_accelerators
+    # Device-wide free (mem_get_info), NOT comfy's per-process view (torch_memory.get_torch_free_vram_mb):
+    # only the device-wide figure sees a *sibling* process's context, which is the whole point of the
+    # second-context measurement below. (On Windows WDDM even this is per-process, so the marginal reads 0
+    # there and the worker falls back; on the Linux servers the worker targets it is true device-wide.)
+    from hordelib.api import get_torch_device_free_vram_mb, get_torch_total_vram_mb
 
     _accelerators = enumerate_accelerators()
-    # Right after enumeration (which initialises the backend) the only device allocation is this fresh
-    # process's runtime/CUDA context, with no model loaded, so total-free approximates the per-process
-    # VRAM overhead on an idle device -- the term the streaming forecast subtracts from total VRAM to get
-    # the free achievable under sole residency.
+
+    def _device_used_mb():
+        return max(0, int(get_torch_total_vram_mb()) - int(get_torch_device_free_vram_mb()))
+
+    def _materialize_context():
+        import torch
+        if torch.cuda.is_available():
+            _dev = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            _dev = "xpu"
+        else:
+            return
+        # Match the holder: a matmul loads cuBLAS so this process's context materialises like a real
+        # inference process's, and the figures (first-context overhead and the marginal) stay comparable.
+        _block = torch.ones((512, 512), device=_dev)
+        float((_block @ _block).sum().item())
+
+    # First/sole context: materialise this process's context and read device-wide used -- the one-time runtime
+    # cost plus one context (plus any fixed device baseline, e.g. a desktop compositor), the figure that
+    # survives at sole residency, which the forecast subtracts from total VRAM for free_if_alone.
     try:
-        _overhead_mb = max(0, int(get_torch_total_vram_mb()) - int(get_torch_free_vram_mb()))
+        _materialize_context()
+        _overhead_mb = _device_used_mb()
     except BaseException:
         _overhead_mb = 0
+
+    # Marginal cost of an *additional* sibling context: bring up a second process that materialises its own
+    # context, then measure the device-wide used delta. The one-time runtime (and any device baseline) is
+    # already counted, so the delta is what each extra inference process really costs -- the per-context figure
+    # the forecast multiplies by (process count - 1) for free_after_model_evict, instead of charging the whole
+    # one-time-inclusive overhead per process. Best-effort: any failure leaves it 0 and the worker falls back.
+    _marginal_mb = 0
+    _holder = None
+    try:
+        _holder = subprocess.Popen(
+            [sys.executable, "-c", {_HOLDER_SOURCE!r}],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        _ready = {{"ok": False}}
+
+        def _await_ready():
+            # Scan the holder's stdout for the sentinel rather than reading one line: importing hordelib
+            # prints telemetry banners to stdout first. An empty read is EOF (the holder died).
+            while True:
+                line = _holder.stdout.readline()
+                if not line:
+                    return
+                if line.strip() == "HOLDER_READY":
+                    _ready["ok"] = True
+                    return
+
+        _waiter = threading.Thread(target=_await_ready, daemon=True)
+        _waiter.start()
+        _waiter.join(timeout=90)  # bound a hung holder so it never costs the basic device inventory
+        if _ready["ok"]:
+            _marginal_mb = max(0, _device_used_mb() - _overhead_mb)
+    except BaseException:
+        _marginal_mb = 0
+    finally:
+        if _holder is not None:
+            try:
+                _holder.kill()
+            except BaseException:
+                pass
+
     _payload = [
         {{
             "index": int(a.index),
             "name": str(a.name),
             "total_vram_mb": int(a.total_vram_mb),
             "runtime_overhead_mb": _overhead_mb,
+            "marginal_overhead_mb": _marginal_mb,
         }}
         for a in _accelerators
     ]
@@ -71,8 +172,15 @@ class ProbedAccelerator(BaseModel):
     name: str
     total_vram_mb: int
     runtime_overhead_mb: int = 0
-    """Approx. per-process VRAM (MB) a fresh torch process consumes for its context, measured on the idle
-    device at probe time. Defaults to 0 for probes/serialisations that predate this field."""
+    """Approx. VRAM (MB) the *first/sole* fresh torch process consumes on the idle device: the one-time
+    CUDA-runtime/kernel allocation plus one context. Sizes free-if-alone. Defaults to 0 for probes/
+    serialisations that predate this field."""
+    marginal_overhead_mb: int = 0
+    """Approx. VRAM (MB) each *additional* sibling process's context costs once the first has paid the shared
+    one-time runtime cost, measured by bringing up a second context and taking the device-wide used delta.
+    On one GPU this is several times smaller than ``runtime_overhead_mb``. Sizes free-after-model-evict.
+    0 when it could not be measured (single-context backends, probe failure), where the worker falls back to
+    the conservative ``runtime_overhead_mb`` per context."""
 
 
 def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelerator]:

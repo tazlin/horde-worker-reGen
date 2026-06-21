@@ -130,9 +130,15 @@ class SystemResources:
     total_ram_bytes: int
     device_map: TorchDeviceMap
     per_process_overhead_mb: int = 0
-    """Approx. VRAM (MB) one inference process consumes for its torch/CUDA context with no model loaded,
-    measured by the accelerator probe on the idle device. The streaming forecast subtracts this from total
-    VRAM to estimate the free achievable under sole residency. 0 when unmeasured."""
+    """Approx. VRAM (MB) the *first/sole* inference process consumes for its torch/CUDA context with no model
+    loaded (the one-time runtime cost plus one context), measured by the accelerator probe on the idle
+    device. The streaming forecast subtracts this from total VRAM to estimate the free achievable under sole
+    residency. 0 when unmeasured."""
+    marginal_process_overhead_mb: int = 0
+    """Approx. VRAM (MB) each *additional* inference process's context costs once the first has paid the
+    shared one-time runtime cost, measured by the probe's second-context delta. The forecast multiplies this
+    (not the one-time-inclusive ``per_process_overhead_mb``) by the sibling count for free-after-model-evict.
+    0 when unmeasured, where the forecast falls back to charging the full overhead per context."""
 
     @classmethod
     def detect(cls) -> SystemResources:
@@ -161,11 +167,13 @@ class SystemResources:
             )
 
         per_process_overhead_mb = max((a.runtime_overhead_mb for a in accelerators), default=0)
+        marginal_process_overhead_mb = max((a.marginal_overhead_mb for a in accelerators), default=0)
 
         return cls(
             total_ram_bytes=total_ram,
             device_map=device_map,
             per_process_overhead_mb=per_process_overhead_mb,
+            marginal_process_overhead_mb=marginal_process_overhead_mb,
         )
 
 
@@ -728,8 +736,11 @@ class HordeWorkerProcessManager:
             reserve_ledger=self._reserve_ledger,
         )
         # Feed the startup-measured per-process VRAM overhead to the scheduler's streaming forecast, so it
-        # can estimate the free VRAM achievable under sole residency (total - one process's context).
+        # can estimate the free VRAM achievable under sole residency (total - one process's context) and,
+        # from the probe's second-context delta, the marginal cost of each additional sibling context (so
+        # free-after-model-evict is not the one-time runtime cost multiplied by the process count).
         self._inference_scheduler.set_measured_per_process_overhead_mb(system_resources.per_process_overhead_mb)
+        self._inference_scheduler.set_measured_marginal_overhead_mb(system_resources.marginal_process_overhead_mb)
         # Attribute between-jobs reload/respawn churn (model swaps, VRAM evictions, process cycles) into
         # the run metrics so the periodic duty-cycle line can name it alongside the per-job phase gaps.
         self._inference_scheduler.set_churn_observer(self._run_metrics.record_churn)

@@ -230,12 +230,18 @@ class InferenceScheduler:
         # allocation), NOT the marginal cost of an additional sibling context -- see
         # _measured_idle_context_residency_mb below, from which the marginal is derived.
         self._measured_per_process_overhead_mb: float = 0.0
+        # Startup-measured *marginal* VRAM cost of each additional sibling context (the probe's second-context
+        # delta, set by the manager via set_measured_marginal_overhead_mb). This is hard data available from
+        # the first scheduling tick, so it sizes free_after_model_evict correctly even in the startup window
+        # before any sibling reaches idle. 0 until measured (or unmeasurable), where the scheduler falls back
+        # to the idle-residency derivation below and then to the conservative overhead-per-context sizing.
+        self._measured_marginal_overhead_mb: float = 0.0
         # Lowest device-wide *used* VRAM observed while every loaded inference process is idle with no model
         # resident (the clean all-contexts baseline, typically at startup). This is the true combined cost of
         # all process contexts -- the one-time CUDA runtime plus one context each -- so the marginal cost of an
-        # additional context is (residency - per_process_overhead) / (count - 1). Used to size
-        # free_after_model_evict from measurement instead of multiplying the one-time cost by the process count
-        # (which manufactured the multi-GB phantom shortfall that wedged high-VRAM workers). None until seen.
+        # additional context is (residency - per_process_overhead) / (count - 1). A runtime fallback for the
+        # probe's direct marginal measurement: sizes free_after_model_evict from measurement instead of
+        # multiplying the one-time cost by the process count. None until seen.
         self._measured_idle_context_residency_mb: float | None = None
         self._idle_residency_process_count: int = 0
         # Set while a whole-card model is being given sole residency by stopping idle sibling processes to
@@ -467,6 +473,16 @@ class InferenceScheduler:
         if isinstance(overhead_mb, (int, float)) and not isinstance(overhead_mb, bool) and overhead_mb >= 0:
             self._measured_per_process_overhead_mb = float(overhead_mb)
 
+    def set_measured_marginal_overhead_mb(self, marginal_mb: int | float) -> None:
+        """Record the startup-measured *marginal* per-additional-context VRAM cost (MB) from the probe.
+
+        Hard data (the probe's second-context delta) available from the first scheduling tick, so it fixes the
+        startup-window over-count without waiting for siblings to reach idle. 0 (or unmeasurable) leaves the
+        scheduler on its idle-residency fallback.
+        """
+        if isinstance(marginal_mb, (int, float)) and not isinstance(marginal_mb, bool) and marginal_mb >= 0:
+            self._measured_marginal_overhead_mb = float(marginal_mb)
+
     def _per_process_overhead_mb(self) -> float:
         """Return the per-process VRAM overhead (MB) to assume: configured override, else measured, else 0.
 
@@ -520,12 +536,17 @@ class InferenceScheduler:
     def _marginal_process_overhead_mb(self) -> float | None:
         """Return the per-additional-context VRAM cost (MB), or None to fall back to the first-context overhead.
 
-        Derived from the measured all-contexts idle residency: ``residency = per_process_overhead + (count - 1)
-        * marginal``, so ``marginal = (residency - per_process_overhead) / (count - 1)``. Returns None when no
-        clean baseline has been observed, when only one process was up (no marginal to derive), or when the
-        residency is not above the first-context overhead (an inconsistent or contaminated probe reading) -- in
-        every such case the forecast conservatively reuses the first-context overhead per additional context.
+        Prefers the probe's directly-measured second-context delta (hard data, available from the first tick,
+        so it also covers the startup window where siblings have not yet reached idle). Failing that (the probe
+        could not measure it on this backend), derives it from the measured all-contexts idle residency:
+        ``residency = per_process_overhead + (count - 1) * marginal``, so ``marginal = (residency -
+        per_process_overhead) / (count - 1)``. Returns None when neither is available -- no probe delta, and no
+        clean idle baseline (or only one process up, or a residency at/below the first-context overhead, an
+        inconsistent reading) -- in which case the forecast conservatively reuses the first-context overhead
+        per additional context.
         """
+        if self._measured_marginal_overhead_mb > 0:
+            return self._measured_marginal_overhead_mb
         residency = self._measured_idle_context_residency_mb
         count = self._idle_residency_process_count
         if residency is None or count < 2:
