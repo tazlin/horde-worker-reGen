@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from enum import IntEnum
 
 import psutil
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -116,6 +117,60 @@ periodic reminders with a suppressed-repeat count.
 
 _SCHEDULER_DIAGNOSTIC_MB_BUCKET = 256.0
 """Bucket size for deciding whether memory telemetry changed enough to re-log a scheduler diagnostic."""
+
+
+class _ModelSizeTier(IntEnum):
+    """How much of the device a model's inference is expected to want, for concurrency decisions.
+
+    Ordered so heavier tiers compare greater. ``LIGHT`` jobs (SD1.5/SD2) are cheap enough to sample
+    side by side; ``HEAVY`` (SDXL) jobs need the job they would overlap to be well underway first; and
+    ``EXTRA_LARGE`` (Cascade/Flux/Qwen/Z-Image and the named VRAM-heavy checkpoints) effectively want
+    the whole card and never share it.
+    """
+
+    LIGHT = 0
+    HEAVY = 1
+    EXTRA_LARGE = 2
+
+
+_LIGHT_BASELINE_VALUES = frozenset(
+    {
+        KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1.value,
+        KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_2_512.value,
+        KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_2_768.value,
+    },
+)
+"""Baselines treated as light enough to thread together without headway."""
+
+_HEAVY_BASELINE_VALUES = frozenset(
+    {
+        KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value,
+    },
+)
+"""Baselines that need the job they overlap to be well underway before joining the card."""
+
+_EXTRA_LARGE_BASELINE_VALUES = frozenset(
+    {
+        KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade.value,
+        KNOWN_IMAGE_GENERATION_BASELINE.flux_1.value,
+        KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell.value,
+        KNOWN_IMAGE_GENERATION_BASELINE.flux_dev.value,
+        KNOWN_IMAGE_GENERATION_BASELINE.qwen_image.value,
+        KNOWN_IMAGE_GENERATION_BASELINE.z_image_turbo.value,
+    },
+)
+"""Baselines that effectively want the whole card and never share it with a concurrent job."""
+
+_OVERLAP_HEADWAY_MIXED_HEAVY = 0.5
+"""Fraction of the in-flight job's sampling that must be done before a concurrent job joins it when
+exactly one side of the overlap is heavy (e.g. an SDXL is running and a cheaper SD1.5 wants to join,
+or vice versa). Gives the heavier job room to get past its memory-hungry startup before another
+sampler adds pressure."""
+
+_OVERLAP_HEADWAY_BOTH_HEAVY = 0.75
+"""Fraction of the in-flight job's sampling that must be done before a *second heavy* job joins it.
+Two SDXL jobs stacking their weight loads and activation peaks is the over-subscription that thrashes
+a sampler into a watchdog teardown, so the running job must be most of the way done first."""
 
 
 class InferenceScheduler:
@@ -1136,6 +1191,121 @@ class InferenceScheduler:
 
         return self._max_inference_processes + post_processing_bump
 
+    def _model_size_tier(self, model_name: str | None) -> _ModelSizeTier:
+        """Classify a model by how much of the device its inference is expected to want.
+
+        A model named in the VRAM-heavy list, or carrying an extra-large baseline, wants the whole card.
+        SDXL is heavy; SD1.5/SD2 are light. An unknown baseline (no loaded reference for the model)
+        falls back to light so the overlap gate stays permissive rather than starving dispatch on
+        missing metadata; a genuinely large model is always classified by its known baseline.
+        """
+        if model_name is not None and model_name in VRAM_HEAVY_MODELS:
+            return _ModelSizeTier.EXTRA_LARGE
+
+        baseline = self._model_metadata.get_baseline(model_name) if model_name is not None else None
+        baseline_value = baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
+        if baseline_value in _EXTRA_LARGE_BASELINE_VALUES:
+            return _ModelSizeTier.EXTRA_LARGE
+        if baseline_value in _HEAVY_BASELINE_VALUES:
+            return _ModelSizeTier.HEAVY
+        return _ModelSizeTier.LIGHT
+
+    @staticmethod
+    def _job_batch_amount(job: ImageGenerateJobPopResponse) -> int:
+        """The batch size (``n_iter``) of a job, floored at 1 for malformed values."""
+        n_iter = job.payload.n_iter
+        return n_iter if isinstance(n_iter, int) and n_iter > 0 else 1
+
+    def _process_running_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
+        """The inference process currently dispatched the given in-flight job, if any.
+
+        Matches on the slot's ``last_job_referenced`` (stamped at dispatch) so the overlap gate can read
+        the running job's live step progress.
+        """
+        job_id = job.id_
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            referenced = process_info.last_job_referenced
+            if referenced is not None and referenced.id_ == job_id:
+                return process_info
+        return None
+
+    def _in_flight_progress_fraction(self, job: ImageGenerateJobPopResponse) -> float:
+        """How far along the in-flight job's sampling is, in ``[0.0, 1.0]``.
+
+        A freshly dispatched job that has not yet reported a step reads as ``0.0`` (the slot's progress
+        fields are unset), which is exactly when a heavy overlap is most dangerous.
+        """
+        process_info = self._process_running_job(job)
+        if process_info is None:
+            return 0.0
+
+        total_steps = process_info.last_total_steps
+        current_step = process_info.last_current_step
+        if total_steps is not None and total_steps > 0 and current_step is not None:
+            return max(0.0, min(1.0, current_step / total_steps))
+
+        percent_complete = process_info.last_heartbeat_percent_complete
+        if percent_complete is not None:
+            return max(0.0, min(1.0, percent_complete / 100.0))
+
+        return 0.0
+
+    @staticmethod
+    def _required_overlap_headway(running_tier: _ModelSizeTier, candidate_tier: _ModelSizeTier) -> float:
+        """Progress the running job must have made before a candidate joins it concurrently.
+
+        Only called once both jobs are known to be non-extra-large and non-batched (those are hard
+        blocks handled earlier). Two light jobs thread together freely; any pairing involving a heavy
+        job requires headway, and two heavy jobs require the most.
+        """
+        if running_tier <= _ModelSizeTier.LIGHT and candidate_tier <= _ModelSizeTier.LIGHT:
+            return 0.0
+        if running_tier >= _ModelSizeTier.HEAVY and candidate_tier >= _ModelSizeTier.HEAVY:
+            return _OVERLAP_HEADWAY_BOTH_HEAVY
+        return _OVERLAP_HEADWAY_MIXED_HEAVY
+
+    def _concurrent_overlap_allowed(self, candidate_job: ImageGenerateJobPopResponse) -> bool:
+        """Whether ``candidate_job`` may start while other jobs are already sampling.
+
+        The concurrency cap (``max_threads``) only counts in-flight jobs; it does not look at what those
+        jobs are or how far along they are. That lets two heavy SDXL jobs (plus a speculatively-staged
+        third) stack their weight loads and activation peaks on the card at once, thrashing a sampler
+        into a step-timeout teardown. This gate adds the missing dimension: a new overlap is admitted
+        only when the in-flight work can tolerate it.
+
+        Rules, scaled by model size:
+            * The first job (nothing in flight) always starts.
+            * An extra-large or batched candidate never joins a busy card; it wants the card to itself.
+            * An extra-large or batched job already in flight never shares the card.
+            * Otherwise the running job must have made size-appropriate headway: none for light+light,
+              modest when one side is heavy, considerable for two heavy jobs.
+
+        A blocked job is not dropped; it keeps its queue position and dispatches once the in-flight
+        job(s) progress or finish.
+        """
+        in_progress_jobs = self._job_tracker.jobs_in_progress
+        if not in_progress_jobs:
+            return True
+
+        candidate_tier = self._model_size_tier(candidate_job.model)
+        if candidate_tier >= _ModelSizeTier.EXTRA_LARGE or self._job_batch_amount(candidate_job) > 1:
+            return False
+
+        for job in in_progress_jobs:
+            running_tier = self._model_size_tier(job.model)
+            if running_tier >= _ModelSizeTier.EXTRA_LARGE or self._job_batch_amount(job) > 1:
+                return False
+
+            required_headway = self._required_overlap_headway(running_tier, candidate_tier)
+            if required_headway <= 0.0:
+                continue
+            if self._in_flight_progress_fraction(job) < required_headway:
+                return False
+
+        return True
+
     def _expire_stale_model_map_entries(self) -> list[str]:
         """Expire model-map entries whose owning process can no longer be loading that model."""
         expired: list[str] = []
@@ -1895,6 +2065,16 @@ class InferenceScheduler:
                 return None
 
         self._model_recently_missing = False
+
+        # Hold a would-be concurrent job back until the in-flight job(s) have made size-appropriate
+        # headway, so two heavy models (or a batch / extra-large model) do not stack their loads and
+        # activation peaks on the card and thrash a sampler into a watchdog teardown. The line-skip
+        # bypass is exempt: it deliberately keeps the GPU fed with a small job while another slot is
+        # only downloading aux models, and is already size-limited. information_only look-ahead is not
+        # gated here so callers still see the next job; the real dispatch path below enforces the hold.
+        if not information_only and line_skip is None and not self._concurrent_overlap_allowed(next_job):
+            self._pending_line_skip = None
+            return None
 
         next_job_and_process = NextJobAndProcess(
             next_job=next_job,
