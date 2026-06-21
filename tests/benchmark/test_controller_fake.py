@@ -203,9 +203,7 @@ def test_warm_mode_streams_live_progress(tmp_path: Path) -> None:
         ),
     )
     sink = _RecordingSink()
-    BenchmarkController(
-        ladder, tmp_path, process_mode="fake", warm=True, validate=False, progress_sink=sink
-    ).run()
+    BenchmarkController(ladder, tmp_path, process_mode="fake", warm=True, validate=False, progress_sink=sink).run()
 
     progress = [event for event in sink.events if isinstance(event, LevelProgress)]
     assert progress, "warm mode emitted no LevelProgress events; the live card would never update"

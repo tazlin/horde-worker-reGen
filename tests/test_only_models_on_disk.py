@@ -5,8 +5,8 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 import pytest
-
 from horde_model_reference import MODEL_REFERENCE_CATEGORY
+
 from horde_worker_regen.bridge_data.load_config import BridgeDataLoader
 
 

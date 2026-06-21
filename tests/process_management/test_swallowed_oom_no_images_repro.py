@@ -47,8 +47,7 @@ from .conftest import make_job_pop_response, make_mock_process_info
 # ``f"{type(e).__name__}: {e}"`` over hordelib's ``run_image_pipeline`` RuntimeError, which surfaces with the
 # resolution fields unresolved ("Model: unknown, Steps: unknown, Resolution: ?x?") when no output node ran.
 _NO_IMAGES_INFO = (
-    "RuntimeError: Pipeline failed to run - no images were produced. "
-    "Model: unknown, Steps: unknown, Resolution: ?x?"
+    "RuntimeError: Pipeline failed to run - no images were produced. Model: unknown, Steps: unknown, Resolution: ?x?"
 )
 _STORM_MODEL = "AlbedoBase XL (SDXL)"
 

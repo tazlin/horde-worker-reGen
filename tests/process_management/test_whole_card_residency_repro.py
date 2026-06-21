@@ -846,11 +846,11 @@ def _sole_residency_scheduler(
 ) -> tuple[InferenceScheduler, JobTracker, HordeProcessInfo]:
     """A scheduler already collapsed to a single (loading) inference process, safety cycled off-GPU.
 
-    Mirrors the live post-teardown state (``logs/bridge.log`` 2026-06-19 20:52, "inference processes 3 -> 1
-    of 4, target 1"): the whole-card residency reduced the pool to its target of one process and moved safety
-    off the card, but the heavy head still does not fit co-resident. The lone idle process holds a resident
-    model that the head's preload would swap out. ``max_inference`` is the *ceiling* (4 on the live box); the
-    map holds only the one surviving process, so ``num_loaded_inference_processes()`` is 1.
+    Mirrors the post-teardown state ("inference processes 3 -> 1 of 4, target 1"): the whole-card residency
+    reduced the pool to its target of one process and moved safety off the card, but the heavy head still does
+    not fit co-resident. The lone idle process holds a resident model that the head's preload would swap out.
+    ``max_inference`` is the *ceiling* (4 here); the map holds only the one surviving process, so
+    ``num_loaded_inference_processes()`` is 1.
     """
     proc = make_mock_process_info(1, model_name=_RESIDENT_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
     proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
@@ -881,12 +881,12 @@ def _sole_residency_scheduler(
 
 
 class TestWholeCardTerminalAdmit:
-    """The live wedge: a whole-card model at its target sole residency that still cannot fit co-resident.
+    """The wedge: a whole-card model at its target sole residency that still cannot fit co-resident.
 
-    Reproduces ``logs/bridge.log`` epoch 2026-06-19 20:49:03 (head job 471e6823, Flux.1-Schnell fp8,
-    ``post_processing: False``): the scheduler tore the pool down to its target of one process for the heavy
-    head, but the sampling-phase peak (~15273 MB) exceeds even the sole-residency capacity (~15087 MB), so the
-    forecast keeps returning ``requires_sibling_teardown`` with no sibling left to stop. Before the fix the
+    Reproduces a Flux.1-Schnell fp8 head with ``post_processing: False``: the scheduler tore the pool down to
+    its target of one process for the heavy head, but the sampling-phase peak (~15273 MB) exceeds even the
+    sole-residency capacity (~15087 MB), so the forecast keeps returning ``requires_sibling_teardown`` with no
+    sibling left to stop. Before the fix the
     head is deferred every tick and never loads (the queue wedges until save-our-ship soft-resets the pools at
     the 120 s establish grace); after it, the head is admitted best-effort and loaded onto the cleared card,
     where it runs slowly under the over-budget step grace.

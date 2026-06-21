@@ -266,7 +266,7 @@ def _live_log_overlap_scheduler(
     *,
     available_ram_mb: float,
 ) -> tuple[InferenceScheduler, JobTracker, list[HordeProcessInfo]]:
-    """Faithful recreation of the live-log condition (bridge.log active session, ~11:58 / ~12:00).
+    """Faithful recreation of the over-commit condition the worker met under load.
 
     The state at the moment the worker chose to tear all siblings down instead of pre-staging:
 
@@ -308,9 +308,9 @@ def _live_log_overlap_scheduler(
 
 
 class TestLiveLogRamGateRegression:
-    """The live regression: a heavy head's conservative RAM *burden* over-rejected the RAM-only pre-stage.
+    """The regression: a heavy head's conservative RAM *burden* over-rejected the RAM-only pre-stage.
 
-    Reproduces the active-session bridge.log: a Flux head behind an in-flight SDXL job, idle model-free
+    Reproduces the over-commit signature: a Flux head behind an in-flight SDXL job, idle model-free
     siblings, and a 64GB box whose available RAM sat below Flux's ~24GB activation-inclusive ``predict_job_ram_mb``
     burden plus the reserve. A RAM preload only materialises the model's *weights* (~11.5GB), so gating on the
     full burden wrongly refused to stage and the worker tore every idle sibling down instead.

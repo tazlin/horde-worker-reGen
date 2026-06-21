@@ -28,7 +28,7 @@ class _InlineThread:
     background threads to race the assertions.
     """
 
-    def __init__(self, *, target: Callable[..., Any], args: tuple[Any, ...] = (), **_kwargs: Any) -> None:
+    def __init__(self, *, target: Callable[..., Any], args: tuple[Any, ...] = (), **_kwargs: Any) -> None:  # noqa: ANN401
         """Capture the target and positional args, ignoring thread-only kwargs (name/daemon)."""
         self._target = target
         self._args = args

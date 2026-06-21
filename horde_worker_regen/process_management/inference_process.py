@@ -462,10 +462,8 @@ class HordeInferenceProcess(HordeProcess):
         crash-loop that re-loaded the model on every LoRA job under supervisor pressure). This mirrors
         the supervisor side, which already swallows the symmetric ``ValueError`` when it force-releases.
         """
-        try:
+        with contextlib.suppress(ValueError):
             self._aux_model_lock.release()
-        except ValueError:
-            pass
 
     def _enforce_lora_disk_floor(self, lora_manager: object) -> None:
         """Constrain the ad-hoc LoRA cache to the disk floor before fetching this job's LoRAs.

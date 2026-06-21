@@ -24,7 +24,7 @@ from .conftest import make_mock_process_info
 
 
 class TestNumAvailableInferenceProcesses:
-    """"Available" must equal "can accept a job", not merely "not actively busy"."""
+    """ "Available" must equal "can accept a job", not merely "not actively busy"."""
 
     def test_idle_and_preloaded_and_complete_slots_are_available(self) -> None:
         """The three between-jobs states a job can actually be dispatched into all count as available."""

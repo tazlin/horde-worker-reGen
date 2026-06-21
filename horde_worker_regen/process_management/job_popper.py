@@ -112,9 +112,7 @@ def _select_models_for_pop(
     # over-budget attempt would otherwise be popped only to be dropped, and a steady drop stream trips
     # the horde's "dropping too many jobs" maintenance guard. Shares the scheduler's best-effort-admit
     # breaker policy so popping and admitting agree on which models are locally unservable.
-    held_back = {
-        model for model in models if is_model_locally_unservable_for(bridge_data, job_tracker, model)
-    }
+    held_back = {model for model in models if is_model_locally_unservable_for(bridge_data, job_tracker, model)}
     if held_back:
         logger.debug(f"Not popping models held back as locally unservable: {sorted(held_back)}")
         models = models.difference(held_back)

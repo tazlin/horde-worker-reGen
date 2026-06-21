@@ -40,7 +40,7 @@ class _LockReclaimingManager:
     ``_release_held_primitives``) while this still-alive child is mid critical-section.
     """
 
-    def __init__(self, aux_lock: Any) -> None:
+    def __init__(self, aux_lock: Any) -> None:  # noqa: ANN401
         self._aux_lock = aux_lock
         self._fired = False
 
@@ -53,7 +53,7 @@ class _LockReclaimingManager:
         return Mock()  # a non-None lora manager; a no-LoRA job returns before it is used
 
 
-def _bare_inference_proc(aux_lock: Any, active_model: str) -> HordeInferenceProcess:
+def _bare_inference_proc(aux_lock: Any, active_model: str) -> HordeInferenceProcess:  # noqa: ANN401
     """Build a HordeInferenceProcess wired only for the resident-model aux-download path.
 
     A real construction spins up HordeLib/SharedModelManager; only ``download_aux_models`` and the

@@ -1,9 +1,9 @@
-"""Reproduction of the *admission-side* root cause behind the swallowed-OOM storm (db0 062026-02).
+"""Reproduction of the *admission-side* root cause behind the swallowed-OOM storm.
 
 Companion to ``test_swallowed_oom_no_images_repro`` (which fixed how the *resulting* fault is classified).
 This module pins why the worker drove four/five SDXL processes onto one 24 GB card in the first place.
 
-The live forecast (bridge.log) for a head-of-queue SDXL job, with four inference processes alive:
+The forecast for a head-of-queue SDXL job, with four inference processes alive, reads:
 
     Stream forecast for WAI-NSFW-illustrious-SDXL: weights ~4900 MB + 6275 MB reserve exceed 16140 MB free
     (after model evict: 3794 MB, alone: 20018 MB) ... [free_now=16140, after_model_evict=3794, alone=20018,
