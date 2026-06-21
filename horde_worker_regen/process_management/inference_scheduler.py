@@ -1932,6 +1932,36 @@ class InferenceScheduler:
 
         return min(candidates, key=_displacement_cost)
 
+    def _select_idle_thread_diversity_job(
+        self,
+        head_job: ImageGenerateJobPopResponse,
+        candidates: list[ImageGenerateJobPopResponse],
+    ) -> tuple[ImageGenerateJobPopResponse, HordeProcessInfo] | None:
+        """A pending distinct-model job resident on a free process that may overlap the in-flight work.
+
+        When the head's own process cannot take work right now because it is busy sampling the head's model,
+        a later job for a *different* model that is already resident on an idle process can run concurrently
+        instead of leaving the thread idle. Preferring a distinct model also avoids loading a duplicate copy
+        of the head's model onto a second process: with several same-model jobs ahead of a lone different
+        model (a run of one checkpoint followed by another), threading the different model alongside the run
+        processes it for free under the run, rather than idling a thread and tacking the second model on at
+        the end as its own load. The overlap-headway gate still applies (two heavy models are not stacked
+        without headway), degraded retries that must run isolated are skipped, and the head keeps its queue
+        position (the caller records a line-skip) so it dispatches the moment its process frees.
+        """
+        for candidate_job in candidates:
+            if candidate_job.model is None or candidate_job.model == head_job.model:
+                continue
+            if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
+                continue
+            candidate_process = self._process_map.get_process_by_horde_model_name(candidate_job.model)
+            if candidate_process is None or not candidate_process.can_accept_job():
+                continue
+            if not self._concurrent_overlap_allowed(candidate_job):
+                continue
+            return candidate_job, candidate_process
+        return None
+
     async def get_next_job_and_process(
         self,
         information_only: bool = False,
@@ -2160,7 +2190,19 @@ class InferenceScheduler:
                 process_with_model = line_skip_selection.process_with_model
                 line_skip = line_skip_selection.line_skip
             else:
-                return None
+                # The head's own process is busy sampling its model, so the head cannot run yet. Rather than
+                # idle a free inference process, fill it with a pending job for a *different* model already
+                # resident there: a multi-threaded worker covers more distinct models per concurrent slot and
+                # avoids duplicate-loading the head's model. The head keeps its queue position via the
+                # line-skip. Falls through to None when nothing distinct is runnable (so a run of same-model
+                # jobs still waits for the busy process rather than duplicating its model).
+                diversity = self._select_idle_thread_diversity_job(next_job, next_n_jobs)
+                if diversity is None:
+                    return None
+                diversity_job, diversity_process = diversity
+                line_skip = LineSkip(displaced_job=next_job)
+                next_job = diversity_job
+                process_with_model = diversity_process
 
         self._model_recently_missing = False
 
