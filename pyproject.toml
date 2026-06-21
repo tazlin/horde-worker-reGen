@@ -268,4 +268,5 @@ testpaths = ["tests"]
 norecursedirs = ["bin", ".venv", "build", "dist", "*.egg-info"]
 markers = [
     "e2e: full-lifecycle tests that spawn real child processes (slower than unit tests)",
+    "gpu: needs a real CUDA/accelerator device; auto-skipped when none is present (so CI stays GPU-free)",
 ]

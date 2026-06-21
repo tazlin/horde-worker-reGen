@@ -883,20 +883,19 @@ def _sole_residency_scheduler(
 class TestWholeCardTerminalAdmit:
     """The wedge: a whole-card model at its target sole residency that still cannot fit co-resident.
 
-    Reproduces a Flux.1-Schnell fp8 head with ``post_processing: False``: the scheduler tore the pool down to
+    Reproduces a Flux.1-Schnell fp8 head with ``post_processing: False``: the scheduler tears the pool down to
     its target of one process for the heavy head, but the sampling-phase peak (~15273 MB) exceeds even the
     sole-residency capacity (~15087 MB), so the forecast keeps returning ``requires_sibling_teardown`` with no
-    sibling left to stop. Before the fix the
-    head is deferred every tick and never loads (the queue wedges until save-our-ship soft-resets the pools at
-    the 120 s establish grace); after it, the head is admitted best-effort and loaded onto the cleared card,
-    where it runs slowly under the over-budget step grace.
+    sibling left to stop. Such a head must be admitted best-effort and loaded onto the cleared card (where it
+    runs slowly under the over-budget step grace) rather than deferred every tick until the queue wedges and
+    save-our-ship soft-resets the pools at the 120 s establish grace.
     """
 
     async def test_flux_at_target_residency_is_admitted_not_wedged_forever(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """RED on current code: at one live process the head is deferred forever and never preloads.
+        """At one live process the head must be admitted, not deferred forever without ever preloading.
 
         Wedge geometry: weights 11500 + sampling peak 15218 -> reserve 3718, so weights + reserve (15218)
         exceed even ``free_if_alone`` (15087). ``fits_alone`` (weights + 2048 floor) is True, so this is a
@@ -1008,3 +1007,131 @@ class TestWholeCardTerminalAdmit:
         assert too_tight.fits_alone is True  # structurally fits alone (keyed on free_if_alone, not free_now)
         # No measurement (cold start): not safe to load, so False.
         assert StreamForecast(free_now_mb=None, **base).fits_weights_now is False
+
+
+# --- Regression: a 24GB 4090 at startup must not give a moderate SDXL head whole-card residency ---
+#
+# When the first job (a plain SDXL checkpoint) is popped while sibling inference processes are still
+# PROCESS_STARTING, the clean *all-idle* baseline cannot be captured (a starting process is not
+# WAITING_FOR_JOB), so the scheduler's idle-residency derivation of the per-additional-context marginal is
+# unavailable. Without a marginal the forecast sizes free_after_model_evict as ``total - contexts *
+# per_process_overhead``; on a 4090 the per-process overhead is the device-wide CUDA-runtime figure (~4.1GB,
+# dominated by the one-time runtime), so 5 contexts manufacture a ~20GB phantom shortfall (free_after_model_
+# evict collapses to ~3.5GB, below the SDXL checkpoint's ~4.9GB weights), ``needs_process_count_reduction``
+# fires, and the scheduler reserves the whole card for a moderate model that ~20GB free would have co-resided.
+#
+# The accelerator probe's *directly measured* marginal (a second-context delta, ~455MB on a 4090) is hard
+# data available from the first scheduling tick, so it covers exactly this startup window, before any sibling
+# reaches idle. These tests inject that probe figure (set_measured_marginal_overhead_mb) and assert the head
+# co-resides. The SDXL-stays-co-resident coverage elsewhere does not exercise this case: it pins a small
+# (1288MB) overhead and never asserts on needs_process_count_reduction.
+
+_DEVICE_TOTAL_VRAM_MB_4090 = 24074.0
+# The first inference process's device-wide used VRAM at its memory report: dominated by the one-time CUDA
+# runtime allocation, NOT a true per-additional-context cost. The forecast takes this as per_process_overhead.
+_MEASURED_OVERHEAD_4090_MB = 4112.0
+# The probe's measured marginal (second-context delta) on a 4090 -- the real cost of each additional inference
+# context, ~9x smaller than the one-time-inclusive overhead.
+_MEASURED_MARGINAL_4090_MB = 455.0
+_SDXL_WEIGHTS_MB = 4900.0  # the registry seed for an SDXL checkpoint
+_SDXL_SAMPLING_PEAK_MB = 8000.0  # -> reserve ~3100MB activation working set for a 1024x1024 SDXL job
+_NUM_PROCESSES_4090 = 5
+
+
+def _build_4090_startup_scheduler() -> tuple[InferenceScheduler, ProcessMap, JobTracker]:
+    """Five inference processes on a 24GB 4090, ~20GB free, with siblings still starting (no idle baseline).
+
+    Process 1 is up and idle (model-free), reporting the device-wide free; the other four are still
+    PROCESS_STARTING, which is the startup window in which the first job is popped. While any process is not
+    yet WAITING_FOR_JOB the clean all-contexts idle baseline cannot be captured -- but the probe's directly
+    measured marginal (injected here, as the manager does at startup) covers exactly this window, so the
+    forecast sizes free_after_model_evict from the real per-context cost rather than overhead-times-N.
+    """
+    used_mb = _MEASURED_OVERHEAD_4090_MB  # ~4.1GB used: one context materialised, ~19962MB free
+    procs: dict[int, object] = {}
+    for pid in range(1, _NUM_PROCESSES_4090 + 1):
+        state = HordeProcessState.WAITING_FOR_JOB if pid == 1 else HordeProcessState.PROCESS_STARTING
+        proc = make_mock_process_info(pid, model_name=None, state=state)
+        proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB_4090
+        proc.vram_usage_mb = used_mb
+        procs[pid] = proc
+    process_map = ProcessMap(procs)
+
+    job_tracker = JobTracker()
+    bridge_data = make_mock_bridge_data(
+        enable_vram_budget=True,
+        whole_card_exclusive_residency=True,
+        vram_reserve_mb=_VRAM_RESERVE_MB,
+        ram_reserve_mb=_RAM_RESERVE_MB,
+        vram_per_process_overhead_mb=_MEASURED_OVERHEAD_4090_MB,  # pin the measured figure for determinism
+        overbudget_exclusive_mode=True,
+        safety_on_gpu=False,
+        image_models_to_load=[_SDXL_MODEL],
+        max_threads=2,
+    )
+    scheduler = _make_inference_scheduler(
+        process_map=process_map,
+        job_tracker=job_tracker,
+        bridge_data=bridge_data,
+        max_concurrent=2,
+        max_inference=_NUM_PROCESSES_4090,
+    )
+    scheduler._process_lifecycle.is_safety_gpu_paused = False
+    # The manager feeds the probe's startup-measured marginal to the scheduler; with siblings still starting
+    # this is the only marginal available, and it is what closes the startup-window phantom shortfall.
+    scheduler.set_measured_marginal_overhead_mb(_MEASURED_MARGINAL_4090_MB)
+    return scheduler, process_map, job_tracker
+
+
+class TestSdxlStartupResidencyRace:
+    """A moderate SDXL head on a 24GB card with ~20GB free must never be forced into whole-card residency."""
+
+    def test_forecast_does_not_demand_teardown_at_startup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With the probe's measured marginal, the SDXL head co-resides at startup (no phantom teardown).
+
+        Without a marginal the forecast would model free_after_model_evict as 24074 - 4112 - 4*4112 == 3514MB
+        (below the 4900MB weights) and demand a sibling-process teardown. The probe's ~455MB marginal sizes it
+        as 24074 - 4112 - 4*455 == 18142MB instead, so the ~4.9GB checkpoint co-resides -- no teardown.
+        """
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _SDXL_WEIGHTS_MB)
+        monkeypatch.setattr(
+            resource_budget,
+            "predict_job_sampling_vram_mb",
+            lambda job, baseline: _SDXL_SAMPLING_PEAK_MB,
+        )
+
+        scheduler, _process_map, _job_tracker = _build_4090_startup_scheduler()
+        head_job = make_job_pop_response(_SDXL_MODEL, width=1024, height=1024, n_iter=1)
+
+        forecast = scheduler._forecast_streaming(head_job, _SDXL_BASELINE)
+
+        assert forecast.needs_exclusive_residency is False
+        assert forecast.requires_sibling_teardown is False
+        assert forecast.needs_process_count_reduction is False, (
+            "a 4.9GB SDXL checkpoint with ~20GB free must co-reside, not demand a sibling-process teardown; "
+            f"free_after_model_evict modeled as {forecast.free_after_model_evict_mb} MB is a phantom shortfall"
+        )
+
+    async def test_scheduler_does_not_reserve_whole_card_for_sdxl(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """End to end: with the probe marginal the scheduler never reserves the whole card for SDXL at startup.
+
+        A phantom shortfall would mark the head exclusive and set ``_sibling_teardown_for_model`` to the SDXL
+        model, so the TUI would show the whole card reserved for it. With ~20GB free and the measured marginal,
+        SDXL reclaims through the normal co-resident path and never claims the device.
+        """
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _SDXL_WEIGHTS_MB)
+        monkeypatch.setattr(
+            resource_budget,
+            "predict_job_sampling_vram_mb",
+            lambda job, baseline: _SDXL_SAMPLING_PEAK_MB,
+        )
+
+        scheduler, _process_map, job_tracker = _build_4090_startup_scheduler()
+        head_job = make_job_pop_response(_SDXL_MODEL, width=1024, height=1024, n_iter=1)
+        await track_popped_job_async(job_tracker, head_job)
+
+        scheduler.preload_models()
+
+        assert scheduler._sibling_teardown_for_model is None, "SDXL must not reserve the whole card"
+        assert job_tracker.is_admitted_exclusive(head_job) is False
+        assert scheduler.whole_card_residency_grace_active() is False

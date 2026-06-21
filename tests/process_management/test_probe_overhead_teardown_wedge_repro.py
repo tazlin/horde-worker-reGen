@@ -179,9 +179,10 @@ class TestProbeOverheadTeardownWedge:
 
         forecast = scheduler._forecast_streaming(job, "stable_diffusion_xl")
 
-        # The reserve the forecast assembled must match the live log so the repro is faithful.
+        # The reserve the forecast assembles must match the modeled sampling peak so the repro is faithful.
         assert forecast.reserve_mb == pytest.approx(_SDXL_SAMPLING_PEAK_MB - _SDXL_WEIGHTS_MB)
-        # The wedge: pre-fix the worker demanded a sibling-process teardown no idle process could provide.
+        # The wedge geometry: an over-counted overhead would demand a sibling-process teardown no idle process
+        # could provide. With the true residency it must not.
         assert forecast.requires_sibling_teardown is False
         assert forecast.needs_exclusive_residency is False
         # The correct remedy under the true residency: evict a sibling model (and in fact it co-resides).
@@ -210,3 +211,33 @@ class TestProbeOverheadTeardownWedge:
 
         assert scheduler._measured_idle_context_residency_mb is None
         assert scheduler._marginal_process_overhead_mb() is None
+
+    def test_probe_marginal_takes_precedence_over_idle_residency(self) -> None:
+        """The probe's directly-measured marginal wins over the idle-residency derivation when both exist.
+
+        The probe figure is hard data available from the first tick (it covers the startup window), so the
+        scheduler prefers it. Without it, the idle-residency derivation is the fallback; with neither, None.
+        """
+        scheduler = _build_scheduler_at_idle_residency()
+        scheduler._maybe_capture_idle_context_residency()
+        derived = (_IDLE_DEVICE_USED_ALL_CONTEXTS_MB - _PROBE_SINGLE_PROCESS_OVERHEAD_MB) / (
+            _NUM_INFERENCE_PROCESSES - 1
+        )
+        # Both sources available: the probe figure (set by the manager) takes precedence.
+        scheduler.set_measured_marginal_overhead_mb(412.0)
+        assert scheduler._marginal_process_overhead_mb() == pytest.approx(412.0)
+        # A zero/unmeasurable probe figure (e.g. Windows WDDM) falls back to the idle-residency derivation.
+        scheduler.set_measured_marginal_overhead_mb(0)
+        assert scheduler._marginal_process_overhead_mb() == pytest.approx(derived)
+
+    def test_probe_marginal_alone_covers_startup_window(self) -> None:
+        """With only the probe marginal (no idle baseline yet), the scheduler still has a marginal at startup."""
+        scheduler = _build_scheduler_at_idle_residency()
+        # Simulate the startup window: a sibling is still loading, so the clean all-idle baseline never holds.
+        for process_info in scheduler._process_map.values():
+            process_info.loaded_horde_model_name = "AMPonyXL"
+        scheduler._maybe_capture_idle_context_residency()
+        assert scheduler._measured_idle_context_residency_mb is None  # no idle-residency fallback available
+
+        scheduler.set_measured_marginal_overhead_mb(455.0)
+        assert scheduler._marginal_process_overhead_mb() == pytest.approx(455.0)
