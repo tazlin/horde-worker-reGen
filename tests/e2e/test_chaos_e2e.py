@@ -9,11 +9,20 @@ so a genuinely-wedged run resolves quickly instead of burning the wall clock.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from horde_worker_regen.harness import HarnessConfig, run_harness_async
 from horde_worker_regen.process_management._canned_scenarios import make_simple_scenario
 from horde_worker_regen.process_management.fault_injection import FaultProfile
+
+# Spawning a fresh child re-imports the whole stack and is several times slower on Windows than on the
+# Linux CI runner. A wedge/recovery probe pays that cost once per re-spawn, so any budget sized for CI is
+# too tight locally on Windows (the recovery still succeeds, it just runs past the clock). Scale the
+# recovery-bounded budgets by this factor on Windows; CI (Linux) keeps the original, tight values so a
+# genuine regression still surfaces quickly there.
+_SPAWN_SLOWDOWN = 4.0 if sys.platform == "win32" else 1.0
 
 # The bridge-data model enforces sane minimums (e.g. inference_step_timeout >= 15), so a wedge probe
 # cannot lean on tiny watchdog timeouts. Instead it bounds the whole run with a short timeout_seconds:
@@ -21,15 +30,17 @@ from horde_worker_regen.process_management.fault_injection import FaultProfile
 _WEDGE_TIMEOUT_SECONDS = 15.0
 
 # Detecting a *hang* (as opposed to a crash, which is caught immediately via is_alive) requires
-# waiting out a full inference_step_timeout of silence. That floor is 15s (the bridge-data minimum),
-# so a hang probe must allow detection + recovery + the remaining jobs to finish well past it.
-_HANG_DETECT_TIMEOUT_SECONDS = 45.0
+# waiting out a full inference_step_timeout of silence. That floor is 15s (the bridge-data minimum), and
+# every fresh process hangs after its first job, so the run pays one detect+respawn cycle per job. The
+# budget must clear all of them plus the per-respawn spawn cost (the Windows term is what ``_SPAWN_SLOWDOWN``
+# covers).
+_HANG_DETECT_TIMEOUT_SECONDS = 45.0 * _SPAWN_SLOWDOWN
 
 # A deterministic crash-on-start is only recoverable by the save-our-ship escalation: the crash-loop
 # breaker must quarantine the pool (several process re-spawns), the supervisor attempts a soft reset,
 # then gives up and abandons ship. Each step is bounded by real process-spawn cost (notably slow on
 # Windows), so this allows generous headroom over the observed ~20-30s rather than a tight wedge bound.
-_SAVE_OUR_SHIP_TIMEOUT_SECONDS = 60.0
+_SAVE_OUR_SHIP_TIMEOUT_SECONDS = 60.0 * _SPAWN_SLOWDOWN
 
 
 @pytest.mark.e2e
