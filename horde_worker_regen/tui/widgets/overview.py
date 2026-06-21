@@ -74,6 +74,14 @@ _STATIC_GLYPHS: dict[WorkerPhase, str] = {
 class OverviewView(VerticalScroll):
     """A dashboard led by a living status hero and a health checklist."""
 
+    DEFAULT_CSS = """
+    OverviewView #overview-residency {
+        width: auto;
+    }
+    """
+    """The residency box (a non-expanding Panel) sizes to its content rather than the full screen width,
+    since its sparse "armed" state never has enough to justify spanning the whole row."""
+
     def __init__(self) -> None:
         """Set up the view, including the client-side trend history for the Trends sparklines."""
         super().__init__()
@@ -392,6 +400,7 @@ class OverviewView(VerticalScroll):
             subtitle_align="right",
             border_style=border,
             padding=(0, 1),
+            expand=False,
         )
 
     def _render_health(self, report: HealthReport) -> Panel:
