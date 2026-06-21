@@ -33,6 +33,7 @@ class FieldKind(enum.StrEnum):
 
     BOOL = "bool"
     INT = "int"
+    FLOAT = "float"
     STR = "str"
     STR_LIST = "str_list"
     MODEL_LIST = "model_list"
@@ -46,6 +47,13 @@ class FieldKind(enum.StrEnum):
 _UNSET: Any = object()
 
 
+def format_number(value: float) -> str:
+    """Render a numeric bound without a trailing ``.0`` (so a float field shows ``512`` not ``512.0``)."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 @dataclasses.dataclass(frozen=True)
 class ConfigField:
     """One editable bridgeData field: its YAML key, presentation, and edit semantics."""
@@ -57,8 +65,8 @@ class ConfigField:
     help: str = ""
     requires_restart: bool = False
     secret: bool = False
-    minimum: int | None = None
-    maximum: int | None = None
+    minimum: float | None = None
+    maximum: float | None = None
     unit: str = ""
     choices: tuple[str, ...] = ()
     explicit_default: Any = _UNSET
@@ -77,8 +85,10 @@ class ConfigField:
             return self.explicit_default
         if self.kind is FieldKind.BOOL:
             return False
+        if self.kind is FieldKind.FLOAT:
+            return float(self.minimum) if self.minimum is not None else 0.0
         if self.kind is FieldKind.INT:
-            return self.minimum if self.minimum is not None else 0
+            return int(self.minimum) if self.minimum is not None else 0
         if self.kind in (FieldKind.STR_LIST, FieldKind.MODEL_LIST, FieldKind.SELECT_MULTI):
             return []
         return ""
@@ -367,10 +377,11 @@ CONFIG_FIELDS: list[ConfigField] = [
     ConfigField(
         "min_lora_disk_free_gb",
         "Min LoRA disk free",
-        FieldKind.INT,
+        FieldKind.FLOAT,
         "LoRA",
-        "Keep at least this many GB free on the LoRA cache disk. Below it, the worker evicts old "
-        "LoRAs to make room and stops offering LoRAs if it still can't clear the floor. 0 disables.",
+        "Keep at least this many GB free on the LoRA cache disk (fractions allowed). Below it, the "
+        "worker evicts old LoRAs to make room and stops offering LoRAs if it still can't clear the "
+        "floor. 0 disables.",
         minimum=0,
         maximum=512,
         unit="GB",
@@ -546,16 +557,22 @@ def coerce_value(field: ConfigField, raw: object) -> Any:  # noqa: ANN401 - kind
     """Convert a widget value into the typed value for the YAML, raising ValueError on bad input."""
     if field.kind is FieldKind.BOOL:
         return bool(raw)
-    if field.kind is FieldKind.INT:
+    if field.kind in (FieldKind.INT, FieldKind.FLOAT):
         text = str(raw).strip()
+        is_int = field.kind is FieldKind.INT
         try:
-            value = int(text)
+            value: float = int(text) if is_int else float(text)
         except ValueError as error:
-            raise ValueError(f"{field.label} must be a whole number") from error
+            noun = "a whole number" if is_int else "a number"
+            raise ValueError(f"{field.label} must be {noun}") from error
         if field.minimum is not None and value < field.minimum:
-            raise ValueError(f"{field.label} must be at least {field.minimum}")
+            raise ValueError(f"{field.label} must be at least {format_number(field.minimum)}")
         if field.maximum is not None and value > field.maximum:
-            raise ValueError(f"{field.label} must be at most {field.maximum}")
+            raise ValueError(f"{field.label} must be at most {format_number(field.maximum)}")
+        # Write a clean integer to the YAML when a float field holds a whole number (2, not 2.0); the
+        # worker accepts either and this keeps the file tidy and matches what the user typed.
+        if not is_int and isinstance(value, float) and value.is_integer():
+            return int(value)
         return value
     if field.kind in (FieldKind.STR_LIST, FieldKind.MODEL_LIST, FieldKind.SELECT_MULTI):
         if isinstance(raw, list):
