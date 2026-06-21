@@ -63,6 +63,22 @@ def test_unknown_literal_is_flagged_not_included() -> None:
     assert _statuses(result, "Definitely Not Real") is EffectiveStatus.UNKNOWN
 
 
+def test_only_on_disk_drops_to_download_models() -> None:
+    """With only_on_disk, a resolved model not already on disk is excluded, never queued to download."""
+    result = resolve_effective_models(["all sdxl"], [], _CATALOG, load_large_models=True, only_on_disk=True)
+    # AlbedoBase XL is on disk and loads; Juggernaut XL is not on disk and is dropped (not downloaded).
+    assert {m.name for m in result.included} == {"AlbedoBase XL"}
+    assert _statuses(result, "Juggernaut XL") is EffectiveStatus.EXCLUDED_OFFLINE
+    offline = next(m for m in result.rows if m.name == "Juggernaut XL")
+    assert "on disk" in offline.reason.lower()
+
+
+def test_only_on_disk_off_keeps_to_download_models() -> None:
+    """Without only_on_disk, a not-yet-present model still loads (as a to-download row)."""
+    result = resolve_effective_models(["all sdxl"], [], _CATALOG, load_large_models=True, only_on_disk=False)
+    assert _statuses(result, "Juggernaut XL") is EffectiveStatus.TO_DOWNLOAD
+
+
 def test_all_sdxl_expands_from_reference() -> None:
     """'all sdxl' expands to every SDXL model without needing usage stats."""
     result = resolve_effective_models(["all sdxl"], [], _CATALOG, load_large_models=True)

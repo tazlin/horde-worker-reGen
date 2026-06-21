@@ -16,16 +16,15 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.timer import Timer
 from textual.widgets import Button, Label, Static, Switch
 
-from horde_worker_regen.model_download_plan import free_model_bytes
+from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
 from horde_worker_regen.tui.formatters import human_bytes
 from horde_worker_regen.tui.model_catalog import (
     ModelInfo,
-    fetch_model_popularity,
     friendly_baseline,
     has_popularity_meta,
-    load_image_models,
 )
 from horde_worker_regen.tui.model_resolution import (
     EffectiveModel,
@@ -42,6 +41,7 @@ _STATUS_GLYPH: dict[EffectiveStatus, tuple[str, str]] = {
     EffectiveStatus.TO_DOWNLOAD: ("⬇", "yellow"),
     EffectiveStatus.SKIPPED: ("✗", "red dim"),
     EffectiveStatus.EXCLUDED_LARGE: ("⚠", "dark_orange"),
+    EffectiveStatus.EXCLUDED_OFFLINE: ("⤫", "dark_orange"),
     EffectiveStatus.UNKNOWN: ("⚠", "red"),
 }
 
@@ -85,28 +85,39 @@ class ModelManagerView(Vertical):
         text-style: bold;
         padding: 1 1 0 1;
     }
-    ModelManagerView #mm-large-row {
+    ModelManagerView #mm-large-row, ModelManagerView #mm-ondisk-row {
         height: 3;
         padding: 0 1;
     }
-    ModelManagerView #mm-large-row Label {
+    ModelManagerView #mm-large-row Label, ModelManagerView #mm-ondisk-row Label {
         width: 1fr;
         content-align: left middle;
         height: 3;
     }
     """
 
-    def __init__(self, load_values: list[str], skip_values: list[str], *, load_large_models: bool) -> None:
-        """Pre-fill the rule editors and the large-models switch from the loaded config."""
+    def __init__(
+        self,
+        load_values: list[str],
+        skip_values: list[str],
+        *,
+        load_large_models: bool,
+        only_on_disk: bool = False,
+    ) -> None:
+        """Pre-fill the rule editors and the toggles from the loaded config."""
         super().__init__(id="mm-root")
         self._load_values = list(load_values)
         self._skip_values = list(skip_values)
         self._load_large = load_large_models
+        self._only_on_disk = only_on_disk
         self._catalog: list[ModelInfo] | None = None
         self._popularity: dict[str, int] | None = None
         self._free_disk_bytes: int | None = None
+        self._weights_root: str | None = None
         self._worker_loaded_count: int | None = None
         self._last_result: ResolutionResult | None = None
+        self._catalog_poll: Timer | None = None
+        """Polls the shared cache until the startup warm finishes, then adopts the catalog and stops."""
 
     def compose(self) -> ComposeResult:
         """Lay out the preview, the Resolve control, the two rule editors, and the large-models switch."""
@@ -123,11 +134,17 @@ class ModelManagerView(Vertical):
         with Horizontal(id="mm-large-row"):
             yield Label("Include large models (Flux, Cascade) in 'all' / 'top' commands")
             yield Switch(value=self._load_large, id="cfg-load_large_models")
+        with Horizontal(id="mm-ondisk-row"):
+            yield Label("Only models already on disk (never download; drop the rest)")
+            yield Switch(value=self._only_on_disk, id="cfg-only_models_on_disk")
 
     def on_mount(self) -> None:
-        """Render the initial hint, then load the reference only if it is already cached (no network)."""
+        """Render the initial hint, then adopt the catalog from the shared cache (warmed at startup)."""
         self._recompute()
-        self.run_worker(self._load_cached_catalog, thread=True, exclusive=True, group="mm-catalog")
+        self._adopt_from_cache()
+        if self._catalog is None:
+            # The startup warm may still be in flight; poll the cache and adopt it the moment it lands.
+            self._catalog_poll = self.set_interval(0.5, self._adopt_from_cache)
 
     def update_worker_models(self, active_models: list[str]) -> None:
         """Note how many models a running worker currently has loaded (None/empty clears the note)."""
@@ -143,13 +160,16 @@ class ModelManagerView(Vertical):
         self._sync_values()
         self._recompute()
         if self._catalog is None:
-            # The picker may have loaded the reference since mount; adopt it without forcing a fetch.
-            self.run_worker(self._load_cached_catalog, thread=True, exclusive=True, group="mm-catalog")
+            # The picker (or the startup warm) may have loaded the reference since mount; adopt it.
+            self._adopt_from_cache()
 
     def on_switch_changed(self, message: Switch.Changed) -> None:
-        """Recompute when the large-models switch toggles."""
+        """Recompute when the large-models or only-on-disk switch toggles."""
         if message.switch.id == "cfg-load_large_models":
             self._load_large = message.value
+            self._recompute()
+        elif message.switch.id == "cfg-only_models_on_disk":
+            self._only_on_disk = message.value
             self._recompute()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -169,51 +189,60 @@ class ModelManagerView(Vertical):
             self._skip_values = self.query_one("#mle-root-models_to_skip", ModelListEditor).values()
             self._load_large = self.query_one("#cfg-load_large_models", Switch).value
 
-    def _load_cached_catalog(self) -> None:
-        """If the reference is already loaded elsewhere, adopt it without forcing a network fetch."""
-        from horde_model_reference.model_reference_manager import ModelReferenceManager
-
-        if not ModelReferenceManager.has_instance():
+    def _adopt_from_cache(self) -> None:
+        """Adopt the catalog from the shared cache if it is loaded; stop polling once it is (UI thread)."""
+        snapshot = CATALOG_CACHE.snapshot()
+        if not snapshot.is_loaded:
             return
-        try:
-            catalog = load_image_models()
-            free = free_model_bytes()
-        except Exception:  # noqa: BLE001 - best-effort; the user can still press Resolve
-            return
-        self.app.call_from_thread(self._adopt_catalog, catalog, free, None)
+        if self._catalog_poll is not None:
+            self._catalog_poll.stop()
+            self._catalog_poll = None
+        self._adopt_catalog(snapshot.catalog, snapshot.free_disk_bytes, snapshot.popularity, snapshot.weights_root)
 
     def _resolve(self) -> None:
-        """Load the reference (forcing a fetch if needed) and usage stats when a top/bottom rule is present."""
+        """Load the reference from the cache (fetching if needed) and usage stats for top/bottom rules."""
+        want_popularity = has_popularity_meta(self._load_values + self._skip_values) or not self._load_values
         try:
-            catalog = load_image_models()
-            free = free_model_bytes()
+            snapshot = CATALOG_CACHE.ensure_loaded(want_popularity=want_popularity)
         except Exception as error:  # noqa: BLE001 - surface any loader failure to the user
-            self.app.call_from_thread(self._on_resolve_error, f"{type(error).__name__}: {error}")
-            return
-
-        popularity = self._popularity
-        if has_popularity_meta(self._load_values + self._skip_values) or not self._load_values:
+            # A stats failure should not lose an otherwise-good catalog load; retry catalog-only.
             try:
-                popularity = fetch_model_popularity()
-            except Exception as error:  # noqa: BLE001 - stats are optional; all/literal rules still resolve
-                self.app.call_from_thread(self._adopt_catalog, catalog, free, self._popularity)
-                self.app.call_from_thread(
-                    self._set_resolve_status,
-                    Text(f"Loaded reference; usage stats unavailable ({error}).", style="yellow"),
-                )
+                snapshot = CATALOG_CACHE.ensure_loaded()
+            except Exception:  # noqa: BLE001 - now the reference itself could not be loaded
+                self.app.call_from_thread(self._on_resolve_error, f"{type(error).__name__}: {error}")
                 return
-        self.app.call_from_thread(self._adopt_catalog, catalog, free, popularity)
+            self.app.call_from_thread(
+                self._adopt_catalog,
+                snapshot.catalog,
+                snapshot.free_disk_bytes,
+                snapshot.popularity,
+                snapshot.weights_root,
+            )
+            self.app.call_from_thread(
+                self._set_resolve_status,
+                Text(f"Loaded reference; usage stats unavailable ({error}).", style="yellow"),
+            )
+            return
+        self.app.call_from_thread(
+            self._adopt_catalog,
+            snapshot.catalog,
+            snapshot.free_disk_bytes,
+            snapshot.popularity,
+            snapshot.weights_root,
+        )
         self.app.call_from_thread(self._set_resolve_status, Text("Resolved.", style="green"))
 
     def _adopt_catalog(
         self,
-        catalog: list[ModelInfo],
+        catalog: list[ModelInfo] | None,
         free_disk_bytes: int | None,
         popularity: dict[str, int] | None,
+        weights_root: str | None = None,
     ) -> None:
         """Store the loaded catalog/stats on the UI thread and refresh the preview."""
         self._catalog = catalog
         self._free_disk_bytes = free_disk_bytes
+        self._weights_root = weights_root
         if popularity is not None:
             self._popularity = popularity
         self._recompute()
@@ -236,6 +265,7 @@ class ModelManagerView(Vertical):
             self._skip_values,
             self._catalog,
             load_large_models=self._load_large,
+            only_on_disk=self._only_on_disk,
             popularity=self._popularity,
         )
         self._last_result = result
@@ -275,6 +305,8 @@ class ModelManagerView(Vertical):
         unsized = sum(1 for model in included if model.size_bytes is None)
         if unsized:
             text.append(f"  ·  {unsized} unsized", style="yellow")
+        if self._weights_root:
+            text.append(f"\nmodels dir: {self._weights_root}", style="grey50")
         if self._worker_loaded_count is not None:
             text.append(f"\nWorker currently has {self._worker_loaded_count} model(s) loaded.", style="grey50")
         headline.update(text)

@@ -2150,7 +2150,8 @@ class HordeWorkerProcessManager:
                 self._process_lifecycle._replace_inference_process(process_info)
             case SupervisorCommand.RELOAD_CONFIG:
                 logger.info("Supervisor requested config reload from disk.")
-                self.get_bridge_data_from_disk()
+                # Off the control loop: the resolve is network-bound and must not stall the worker.
+                self._schedule_config_reload()
             case SupervisorCommand.SET_CONCURRENCY:
                 self._apply_set_concurrency(command.target_threads, command.target_processes)
             case SupervisorCommand.PAUSE_DOWNLOADS:
@@ -2552,45 +2553,32 @@ class HordeWorkerProcessManager:
     _bridge_data_last_modified_time = 0.0
     """The time the bridge data file on disk was last modified."""
 
-    def get_bridge_data_from_disk(self) -> None:
-        """Load the bridge data from disk."""
+    _bridge_data_reload_lock: asyncio.Lock | None = None
+    """Serialises off-loop reloads so the mtime watcher and an explicit reload command never overlap."""
+
+    _config_reload_tasks: set[asyncio.Task[None]] | None = None
+    """Strong references to in-flight off-loop reload tasks (asyncio only weakly references tasks)."""
+
+    def _load_bridge_data_blocking(self) -> reGenBridgeData | None:
+        """Read and resolve bridge data from disk, returning the new model (or None when nothing to apply).
+
+        This is the network-bound half of a reload: ``BridgeDataLoader.load`` resolves meta instructions
+        (``top N`` etc.) against the horde stats API, which can take many seconds. It is split out so the
+        event loop can run it in a thread (see :meth:`_reload_bridge_data_off_loop`) instead of stalling
+        every other coroutine (job popping, heartbeats, submission) for the duration. Safe to call off the
+        event loop; all the dependent state changes happen in :meth:`_apply_reloaded_bridge_data`.
+        """
         if self.bridge_data._loaded_from_env_vars:
-            return
+            return None
 
         if self.horde_model_reference_manager is None:
             logger.debug("No model reference manager available; skipping bridge data reload")
-            return
+            return None
 
         try:
-            previous_effective = self._runtime_config.effective_max_threads
-            # The setter calls RuntimeConfig.update, which re-derives the effective concurrency cap
-            # (clamped to the session ceiling) from the reloaded max_threads.
-            self.bridge_data = BridgeDataLoader.load(
+            return BridgeDataLoader.load(
                 file_path=BRIDGE_CONFIG_FILENAME,
                 horde_model_reference_manager=self.horde_model_reference_manager,
-            )
-            # Re-coerce on every reload so a config edit re-enabling a feature whose packages are still
-            # missing is caught again; the warning only fires when a flag actually flips, not each tick.
-            coerce_bridge_data_to_capabilities(self.bridge_data)
-            new_effective = self._runtime_config.effective_max_threads
-            if new_effective != previous_effective:
-                logger.info(
-                    f"Concurrent-inference cap changed {previous_effective} -> {new_effective} "
-                    f"from {BRIDGE_CONFIG_FILENAME}.",
-                )
-            if self.bridge_data.max_threads > self._max_concurrent_inference_processes:
-                logger.warning(
-                    f"max_threads={self.bridge_data.max_threads} exceeds this session's ceiling of "
-                    f"{self._max_concurrent_inference_processes} (capped to {new_effective}); "
-                    "restart the worker to raise the ceiling.",
-                )
-            logger.debug(f"Models to load: {self.bridge_data.image_models_to_load}")
-            logger.debug(f"Custom models: {self.bridge_data.custom_models}")
-            # Re-assert the config's download controls (config is authoritative on reload, overriding any
-            # prior live TUI override); a None rate-limit means unlimited, sent as 0 to clear any cap.
-            self._process_lifecycle.set_download_controls(
-                paused=self.bridge_data.downloads_paused,
-                rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
             )
         except Exception as e:
             logger.debug(e)
@@ -2603,7 +2591,64 @@ class HordeWorkerProcessManager:
                 for error in e.errors():
                     logger.error(f"{error['loc'][0]}: {error['msg']}")
 
-            return
+            return None
+
+    def _apply_reloaded_bridge_data(self, bridge_data: reGenBridgeData) -> None:
+        """Swap in freshly-loaded bridge data and re-derive dependent state (must run on the event loop)."""
+        previous_effective = self._runtime_config.effective_max_threads
+        # The setter calls RuntimeConfig.update, which re-derives the effective concurrency cap
+        # (clamped to the session ceiling) from the reloaded max_threads.
+        self.bridge_data = bridge_data
+        # Re-coerce on every reload so a config edit re-enabling a feature whose packages are still
+        # missing is caught again; the warning only fires when a flag actually flips, not each tick.
+        coerce_bridge_data_to_capabilities(self.bridge_data)
+        new_effective = self._runtime_config.effective_max_threads
+        if new_effective != previous_effective:
+            logger.info(
+                f"Concurrent-inference cap changed {previous_effective} -> {new_effective} "
+                f"from {BRIDGE_CONFIG_FILENAME}.",
+            )
+        if self.bridge_data.max_threads > self._max_concurrent_inference_processes:
+            logger.warning(
+                f"max_threads={self.bridge_data.max_threads} exceeds this session's ceiling of "
+                f"{self._max_concurrent_inference_processes} (capped to {new_effective}); "
+                "restart the worker to raise the ceiling.",
+            )
+        logger.debug(f"Models to load: {self.bridge_data.image_models_to_load}")
+        logger.debug(f"Custom models: {self.bridge_data.custom_models}")
+        # Re-assert the config's download controls (config is authoritative on reload, overriding any
+        # prior live TUI override); a None rate-limit means unlimited, sent as 0 to clear any cap.
+        self._process_lifecycle.set_download_controls(
+            paused=self.bridge_data.downloads_paused,
+            rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
+        )
+
+    def get_bridge_data_from_disk(self) -> None:
+        """Load the bridge data from disk (blocking).
+
+        Prefer :meth:`_reload_bridge_data_off_loop` when called from the event loop; this synchronous
+        form is for startup (before the loop runs) and is kept for callers that are not on the loop.
+        """
+        bridge_data = self._load_bridge_data_blocking()
+        if bridge_data is not None:
+            self._apply_reloaded_bridge_data(bridge_data)
+
+    async def _reload_bridge_data_off_loop(self) -> None:
+        """Reload bridge data without stalling the event loop (the resolve is run in a worker thread)."""
+        if self._bridge_data_reload_lock is None:
+            self._bridge_data_reload_lock = asyncio.Lock()
+        async with self._bridge_data_reload_lock:
+            bridge_data = await asyncio.to_thread(self._load_bridge_data_blocking)
+            if bridge_data is not None:
+                self._apply_reloaded_bridge_data(bridge_data)
+
+    def _schedule_config_reload(self) -> None:
+        """Kick off an off-loop reload from synchronous, on-loop code (e.g. a supervisor command)."""
+        if self._config_reload_tasks is None:
+            self._config_reload_tasks = set()
+        task = asyncio.create_task(self._reload_bridge_data_off_loop())
+        self._config_reload_tasks.add(task)
+        task.add_done_callback(self._config_reload_tasks.discard)
 
     async def _bridge_data_loop(self) -> None:
         while True:
@@ -2615,7 +2660,7 @@ class HordeWorkerProcessManager:
 
                 if self._last_bridge_data_reload_time < self._bridge_data_last_modified_time:
                     logger.info(f"Reloading {BRIDGE_CONFIG_FILENAME}")
-                    self.get_bridge_data_from_disk()
+                    await self._reload_bridge_data_off_loop()
                     # Capture mtime immediately after a successful load so that
                     # a modification during the load does not go undetected.
                     self._last_bridge_data_reload_time = os.path.getmtime(BRIDGE_CONFIG_FILENAME)

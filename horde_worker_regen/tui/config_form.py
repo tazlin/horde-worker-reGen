@@ -405,6 +405,13 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Models",
         "Include Flux/Cascade in ALL/TOP meta commands (otherwise excluded by size).",
     ),
+    ConfigField(
+        "only_models_on_disk",
+        "Only models on disk",
+        FieldKind.BOOL,
+        "Models",
+        "Only offer models already downloaded; any resolved model not on disk is dropped, never fetched.",
+    ),
     # Alchemist
     ConfigField(
         "alchemist",

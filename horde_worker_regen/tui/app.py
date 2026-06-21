@@ -35,6 +35,7 @@ from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.tui import socket_protocol as sp
 from horde_worker_regen.tui.attach import AttachedWorkerSupervisor, SupervisorLike
+from horde_worker_regen.tui.cache_home import apply_cache_home_env
 from horde_worker_regen.tui.benchmark_launcher import (
     BenchmarkOptions,
     BenchmarkSupervisor,
@@ -163,7 +164,12 @@ class HordeWorkerTUI(App[None]):
     def on_mount(self) -> None:
         """Begin the refresh loop, then run first-run setup or the usual start/onboarding prompts."""
         self.set_interval(0.1, self._tick)
+        # Resolve the models volume from config before any disk figures are computed, so free space and
+        # on-disk checks match the worker's configured cache_home instead of defaulting to ./models.
+        with contextlib.suppress(Exception):
+            apply_cache_home_env(self._config_path)
         self._maybe_check_for_updates()
+        self._warm_model_catalog()
         if self._should_run_setup_wizard():
             self._run_setup_wizard()
         elif self._should_auto_start():
@@ -171,6 +177,25 @@ class HordeWorkerTUI(App[None]):
             self._maybe_prompt_onboarding()
         else:
             self._prompt_worker_start()
+
+    def _warm_model_catalog(self) -> None:
+        """Pre-load the image-model catalog in the background so views open instantly (best-effort).
+
+        Funnels through the shared cache, so by the time the operator opens the picker or the Models
+        config panel the catalog is usually already in memory instead of triggering a slow first fetch.
+        A failure here is silent: the views still load on demand and surface their own errors.
+        """
+        if os.environ.get("AI_HORDE_TESTING"):
+            return
+        self.run_worker(self._warm_model_catalog_blocking, thread=True, exclusive=True, group="catalog-warm")
+
+    @staticmethod
+    def _warm_model_catalog_blocking() -> None:
+        """Blocking catalog warm for the worker thread; swallows failures (the warm is best-effort)."""
+        from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
+
+        with contextlib.suppress(Exception):
+            CATALOG_CACHE.ensure_loaded()
 
     def _maybe_check_for_updates(self) -> None:
         """Kick off a background release check, unless disabled, in fake mode, or under tests."""
@@ -521,13 +546,13 @@ class HordeWorkerTUI(App[None]):
         self._supervisor.restart()
 
     def on_config_editor_view_apply_requested(self, message: ConfigEditorView.ApplyRequested) -> None:
-        """Apply a saved config change: hot-reload, or restart for startup-locked fields."""
+        """Restart the worker for a saved change to a restart-locked field.
+
+        Plain saves are not routed here: the worker watches bridgeData.yaml and hot-reloads on its own,
+        so only restart-locked fields (⟳) need the app to act.
+        """
         if message.restart:
             self.action_restart_worker()
-        elif self._supervisor.request_reload_config():
-            self.notify("Saved and sent config reload to worker.")
-        else:
-            self.notify("Saved. Worker not running; reload not sent.", severity="warning")
 
     def on_benchmark_view_run_requested(self, message: BenchmarkView.RunRequested) -> None:
         """Stop the worker (freeing the GPU) and launch the benchmark, off the UI thread."""

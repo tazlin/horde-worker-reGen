@@ -40,6 +40,8 @@ class EffectiveStatus(enum.StrEnum):
     """Would have loaded, but a skip rule removed it."""
     EXCLUDED_LARGE = "excluded_large"
     """A large model dropped from a meta selection because large models are not opted in."""
+    EXCLUDED_OFFLINE = "excluded_offline"
+    """A model dropped because it is not on disk and "only on disk" is enabled (never downloaded)."""
     UNKNOWN = "unknown"
     """A literal entry that is not a model in the reference (typically a typo)."""
 
@@ -124,6 +126,7 @@ def resolve_effective_models(
     catalog: list[ModelInfo] | None,
     *,
     load_large_models: bool,
+    only_on_disk: bool = False,
     popularity: dict[str, int] | None = None,
 ) -> ResolutionResult:
     """Compute the effective model set for a load/skip config against the loaded ``catalog``.
@@ -133,6 +136,8 @@ def resolve_effective_models(
         skip_entries: The raw ``models_to_skip`` list (literal names and/or meta commands).
         catalog: The image-model reference as ``ModelInfo`` rows, or None when not loaded yet.
         load_large_models: Whether Flux/Cascade are kept in meta selections.
+        only_on_disk: When True, models that are not already on disk are dropped (never downloaded),
+            mirroring the worker's ``only_models_on_disk`` config.
         popularity: Model-name -> last-month usage count, needed only to expand ``top``/``bottom N``.
 
     Returns:
@@ -209,6 +214,7 @@ def resolve_effective_models(
     included: list[EffectiveModel] = []
     skipped: list[EffectiveModel] = []
     excluded_large: list[EffectiveModel] = []
+    excluded_offline: list[EffectiveModel] = []
     for name, reason in include_source.items():
         model = by_name[name]
         if name in skip_source:
@@ -236,6 +242,18 @@ def resolve_effective_models(
                 ),
             )
             continue
+        if only_on_disk and not model.on_disk:
+            excluded_offline.append(
+                EffectiveModel(
+                    name,
+                    model.baseline,
+                    EffectiveStatus.EXCLUDED_OFFLINE,
+                    model.size_on_disk_bytes,
+                    model.on_disk,
+                    "not on disk; dropped by “Only models on disk”",
+                ),
+            )
+            continue
         status = EffectiveStatus.ON_DISK if model.on_disk else EffectiveStatus.TO_DOWNLOAD
         included.append(
             EffectiveModel(name, model.baseline, status, model.size_on_disk_bytes, model.on_disk, reason),
@@ -251,6 +269,7 @@ def resolve_effective_models(
         sorted(included, key=by_lower_name)
         + sorted(skipped, key=by_lower_name)
         + sorted(excluded_large, key=by_lower_name)
+        + sorted(excluded_offline, key=by_lower_name)
         + list(unknown.values())
     )
     return ResolutionResult(

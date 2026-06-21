@@ -104,9 +104,16 @@ async def _wait_for_rows(pilot: object, table: DataTable, count: int) -> None:
 @pytest.mark.e2e
 async def test_model_picker_filters_and_marking(monkeypatch: pytest.MonkeyPatch) -> None:
     """The (patched) reference populates the table; filters narrow it; marking returns the names."""
+    from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
+
+    CATALOG_CACHE.reset()
     monkeypatch.setattr(
-        "horde_worker_regen.tui.widgets.model_picker.load_image_models",
+        "horde_worker_regen.tui.catalog_cache.load_image_models",
         lambda: list(_MODELS),
+    )
+    monkeypatch.setattr(
+        "horde_worker_regen.tui.catalog_cache.free_model_bytes",
+        lambda: None,
     )
     app = _PickerHost()
     async with app.run_test(size=(130, 44)) as pilot:

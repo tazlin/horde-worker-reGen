@@ -329,4 +329,38 @@ class BridgeDataLoader:
                 "are available in the model reference manager.",
             )
 
+        if bridge_data.only_models_on_disk:
+            bridge_data.image_models_to_load = BridgeDataLoader._filter_to_models_on_disk(
+                bridge_data.image_models_to_load,
+                horde_model_reference_manager,
+            )
+
         return bridge_data.image_models_to_load
+
+    @staticmethod
+    def _filter_to_models_on_disk(
+        model_names: list[str],
+        horde_model_reference_manager: ModelReferenceManager,
+    ) -> list[str]:
+        """Drop any resolved model whose files are not already present on disk (no download is queued).
+
+        Honors ``only_models_on_disk``: presence is an existence-only check against the same weights
+        roots the download planner uses, so the served set is pinned to what the operator already has.
+        """
+        from horde_model_reference import MODEL_REFERENCE_CATEGORY
+
+        from horde_worker_regen.model_download_plan import is_model_present
+
+        references = horde_model_reference_manager.get_all_model_references()
+        image_records = references.get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
+
+        on_disk = [name for name in model_names if is_model_present(name, image_records)]
+
+        dropped = len(model_names) - len(on_disk)
+        if dropped:
+            logger.info(
+                f"only_models_on_disk is set: dropped {dropped} model(s) not present on disk; "
+                f"keeping {len(on_disk)} already-downloaded model(s).",
+            )
+
+        return on_disk

@@ -14,9 +14,9 @@ from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, DataTable, Input, Label, Select, Static
 
-from horde_worker_regen.model_download_plan import free_model_bytes
+from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
 from horde_worker_regen.tui.formatters import human_bytes
-from horde_worker_regen.tui.model_catalog import ModelInfo, friendly_baseline, load_image_models
+from horde_worker_regen.tui.model_catalog import ModelInfo, friendly_baseline
 
 _ADD = "＋"
 _REMOVE = "✕"
@@ -94,6 +94,7 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         self._current: ModelInfo | None = None
         self._loaded = False
         self._free_disk_bytes: int | None = None
+        self._weights_root: str | None = None
 
     def compose(self) -> ComposeResult:
         """Lay out the filters, search, model table with a detail panel, and buttons."""
@@ -115,6 +116,7 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
             yield Static("", id="picker-disk")
             with Horizontal(classes="dialog-buttons"):
                 yield Button("Add marked", variant="primary", id="picker-add")
+                yield Button("Refresh", id="picker-refresh")
                 yield Button("Cancel", id="picker-cancel")
 
     def on_mount(self) -> None:
@@ -127,20 +129,29 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         table.add_column("Flags", width=12)
         self.run_worker(self._load_models, thread=True, exclusive=True)
 
-    def _load_models(self) -> None:
-        """Blocking load of the model reference (runs in a worker thread)."""
+    def _load_models(self, *, force: bool = False) -> None:
+        """Load the model reference from the shared cache (runs in a worker thread).
+
+        Reads the warm cache, so unless ``force`` is set this usually returns instantly with what the
+        startup warm (or another view) already loaded, rather than re-fetching over the network.
+        """
         try:
-            models = load_image_models()
+            snapshot = CATALOG_CACHE.ensure_loaded(force=force)
         except Exception as error:  # noqa: BLE001 - surface any loader failure to the user
             self.app.call_from_thread(self._on_load_error, f"{type(error).__name__}: {error}")
             return
-        self.app.call_from_thread(self._on_models_loaded, models)
+        self.app.call_from_thread(
+            self._on_models_loaded, snapshot.catalog or [], snapshot.free_disk_bytes, snapshot.weights_root
+        )
 
-    def _on_models_loaded(self, models: list[ModelInfo]) -> None:
+    def _on_models_loaded(
+        self, models: list[ModelInfo], free_disk_bytes: int | None, weights_root: str | None
+    ) -> None:
         """Populate the baseline filter and the table once models arrive."""
         self._all_models = models
         self._by_name = {model.name: model for model in models}
-        self._free_disk_bytes = free_model_bytes()
+        self._free_disk_bytes = free_disk_bytes
+        self._weights_root = weights_root
         self._loaded = True
         baselines = sorted({model.baseline for model in models if model.baseline})
         self.query_one("#picker-baseline", Select).set_options(
@@ -252,6 +263,9 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         else:
             shortfall = to_download_bytes - (self._free_disk_bytes or 0)
             footer.append(f"OVER BUDGET by {human_bytes(shortfall)}", style="bold red")
+        if self._weights_root:
+            footer.append("\nmodels dir: ", style="grey50")
+            footer.append(self._weights_root, style="grey62")
         return footer
 
     def _show_detail(self, row: int) -> None:
@@ -363,8 +377,11 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
             self._apply_filters()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Return the marked names on Add, or cancel."""
+        """Return the marked names on Add, refresh the catalog, or cancel."""
         if event.button.id == "picker-cancel":
             self.dismiss(None)
         elif event.button.id == "picker-add":
             self.dismiss(sorted(self._chosen))
+        elif event.button.id == "picker-refresh":
+            self.query_one("#picker-status", Static).update("Refreshing model reference…")
+            self.run_worker(lambda: self._load_models(force=True), thread=True, exclusive=True)

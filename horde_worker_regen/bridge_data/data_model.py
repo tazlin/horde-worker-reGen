@@ -370,6 +370,15 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     load_large_models: bool = Field(default=False)
 
+    only_models_on_disk: bool = Field(default=False)
+    """If true, the worker only offers models whose files are already on disk.
+
+    Any model the load rules resolve to (a literal name or a meta command like ``top 5``) that is not
+    already present is dropped from ``image_models_to_load`` rather than downloaded. Lets an operator
+    pin the served set to what they have without curating an explicit list, and guarantees a config
+    change never kicks off a large download.
+    """
+
     custom_models: list[dict] = Field(
         default_factory=list,
     )

@@ -52,6 +52,14 @@ Stickiness only activates when the number of configured models exceeds
 process already has a model loaded. When it fires, the pop is restricted to
 models already loaded on idle processes.
 
+`only_models_on_disk` (default `false`) constrains the served set to models whose
+weights are already present. The load rules are resolved as usual (literal names
+plus any `TOP n` / `ALL` expansions), then any resolved model that is not on disk
+is dropped rather than downloaded. This pins the worker to what you already have
+without curating an explicit list, and guarantees a config edit never triggers a
+large download. Presence is resolved against the configured weights root
+(`cache_home` / `AIWORKER_CACHE_HOME`), the same location the worker downloads to.
+
 ### Queue sizing
 
 `queue_size` controls how many jobs the worker will hold in its internal

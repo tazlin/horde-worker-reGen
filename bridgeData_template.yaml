@@ -302,6 +302,12 @@ models_to_load:
 # Otherwise, I suggest including the models you know you can handle manually.
 load_large_models: false
 
+# Only offer models that are already downloaded. When true, any model your load rules resolve to
+# (a literal name, or an expansion of a TOP/ALL command) that is not already on disk is dropped instead
+# of being downloaded. Useful to pin the served set to what you have without curating an explicit list,
+# and guarantees a config change never kicks off a large download. Default: false.
+only_models_on_disk: false
+
 # Models to skip when `dynamic_models` is true or TOP n models are selected in models_to_load.
 # Avoid loading models due to VRAM constraints, NSFW content, or other reasons.
 # Models skipped are not replaced by other models, meaning TOP n will load fewer models. See the note above models_to_load.

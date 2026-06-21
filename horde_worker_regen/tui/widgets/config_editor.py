@@ -95,10 +95,14 @@ class ConfigEditorView(Vertical):
     """
 
     class ApplyRequested(Message):
-        """Posted after a successful save when the user wants the worker to pick up the change."""
+        """Posted after a successful save when the worker must be restarted to pick up the change.
+
+        A plain Save does not post this: the worker watches bridgeData.yaml's mtime and hot-reloads on
+        its own, so the only reason to message the app is a restart-locked field the watch cannot apply.
+        """
 
         def __init__(self, *, restart: bool) -> None:
-            """Record whether the worker should restart (vs. hot-reload)."""
+            """Record that the worker should restart (only restart is routed through this message)."""
             super().__init__()
             self.restart = restart
 
@@ -114,9 +118,12 @@ class ConfigEditorView(Vertical):
         with Horizontal(id="config-actions"):
             yield Button("Reload from disk", id="config-reload", variant="default")
             yield Button("Save", id="config-save", variant="primary")
-            yield Button("Save + apply", id="config-apply", variant="success")
             yield Button("Save + restart worker", id="config-restart", variant="warning")
-        yield Static(f"Editing {self._config_path}  ·  ⟳ marks fields that need a worker restart", id="config-status")
+        yield Static(
+            f"Editing {self._config_path}  ·  Save applies automatically (the worker watches the file)  ·  "
+            "⟳ marks fields that only take effect on restart",
+            id="config-status",
+        )
 
         with TabbedContent(id="config-subtabs"):
             for label, sections in CONFIG_SUBTABS:
@@ -135,6 +142,7 @@ class ConfigEditorView(Vertical):
                 [str(item) for item in current_value(_FIELD_BY_KEY[MODELS_TO_LOAD_KEY], self._data)],
                 [str(item) for item in current_value(_FIELD_BY_KEY[MODELS_TO_SKIP_KEY], self._data)],
                 load_large_models=bool(current_value(_FIELD_BY_KEY["load_large_models"], self._data)),
+                only_on_disk=bool(current_value(_FIELD_BY_KEY["only_models_on_disk"], self._data)),
             )
             return
 
@@ -220,8 +228,8 @@ class ConfigEditorView(Vertical):
             self._reload_from_disk()
         elif event.button.id == "config-save":
             self._save()
-        elif event.button.id in ("config-apply", "config-restart") and self._save():
-            self.post_message(self.ApplyRequested(restart=event.button.id == "config-restart"))
+        elif event.button.id == "config-restart" and self._save():
+            self.post_message(self.ApplyRequested(restart=True))
 
     def set_view_mode(self, mode: OverviewViewMode) -> None:
         """Apply the shared F6 density contract to the config sub-tabs.
@@ -294,7 +302,10 @@ class ConfigEditorView(Vertical):
         except OSError as error:
             self._set_status(f"Failed to write {self._config_path}: {error}", "red")
             return False
-        self._set_status(f"Saved {self._config_path}.", "green")
+        self._set_status(
+            f"Saved {self._config_path}. A running worker reloads it automatically; restart only for ⟳ fields.",
+            "green",
+        )
         return True
 
     def _collect_values(self) -> list[tuple[ConfigField, object]]:
