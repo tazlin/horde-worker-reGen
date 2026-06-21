@@ -211,13 +211,6 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     # Memory & performance
     ConfigField(
-        "high_memory_mode",
-        "High memory mode",
-        FieldKind.BOOL,
-        "Memory & performance",
-        "Use more VRAM to cut model reload time. Recommended for 24 GB+ cards.",
-    ),
-    ConfigField(
         "high_performance_mode",
         "High performance mode",
         FieldKind.BOOL,

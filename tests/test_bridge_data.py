@@ -13,45 +13,34 @@ from horde_worker_regen.bridge_data.load_config import BridgeDataLoader, ConfigF
 
 
 class TestLeaseResidencyWarning:
-    """The lease only helps under residency, so enabling it without residency must be detected."""
+    """The lease only helps under residency, so enabling it with frequent unloads must be detected."""
 
     def test_disabled_lease_is_never_flagged(self) -> None:
-        """A disabled lease is never flagged, regardless of residency settings."""
+        """A disabled lease is never flagged, regardless of unload settings."""
         assert (
             _warn_lease_without_residency(
                 gpu_sampling_lease_enabled=False,
-                high_memory_mode=False,
                 unload_models_from_vram_often=True,
             )
             is False
         )
 
     def test_resident_lease_is_not_flagged(self) -> None:
-        """high_memory_mode with no frequent unload is the resident config the lease needs."""
+        """No frequent unload is the resident config the lease needs, so it is not flagged."""
         assert (
             _warn_lease_without_residency(
                 gpu_sampling_lease_enabled=True,
-                high_memory_mode=True,
                 unload_models_from_vram_often=False,
             )
             is False
         )
 
-    @pytest.mark.parametrize(
-        ("high_memory_mode", "unload_often"),
-        [
-            (False, False),  # no high-memory pin: model is not held in VRAM between jobs
-            (True, True),  # high-memory but actively unloads: not resident in practice
-            (False, True),
-        ],
-    )
-    def test_non_resident_lease_is_flagged(self, high_memory_mode: bool, unload_often: bool) -> None:
-        """A lease enabled without true residency is flagged as counterproductive."""
+    def test_non_resident_lease_is_flagged(self) -> None:
+        """A lease enabled alongside frequent unloads (no residency to overlap) is flagged."""
         assert (
             _warn_lease_without_residency(
                 gpu_sampling_lease_enabled=True,
-                high_memory_mode=high_memory_mode,
-                unload_models_from_vram_often=unload_often,
+                unload_models_from_vram_often=True,
             )
             is True
         )
@@ -63,7 +52,6 @@ class TestLeaseResidencyWarning:
             raw = yaml.load(f)
         raw["gpu_sampling_lease_enabled"] = True
         raw["unload_models_from_vram_often"] = True
-        raw["high_memory_mode"] = False
 
         bridge_data = reGenBridgeData.model_validate(raw)
 

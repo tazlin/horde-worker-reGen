@@ -408,12 +408,10 @@ class AlchemyCoordinator:
     def _has_ram_headroom(self) -> bool:
         """Return True if effective available system RAM clears the alchemy RAM floor.
 
-        Only enforced in ``high_memory_mode``, where graph forms keep weights resident in RAM and could
-        push a memory-resident worker into paging. Effective available RAM subtracts the shared ledger's
-        committed RAM. When the floor is zero or RAM cannot be read, this does not gate.
+        Graph forms keep weights resident in RAM and could push a memory-resident worker into paging, so
+        alchemy is held back when available RAM runs low. Effective available RAM subtracts the shared
+        ledger's committed RAM. When the floor is zero or RAM cannot be read, this does not gate.
         """
-        if not self.bridge_data.high_memory_mode:
-            return True
         floor_mb = float(self.bridge_data.alchemy_ram_headroom_mb)
         if floor_mb <= 0:
             return True
@@ -644,16 +642,16 @@ class AlchemyCoordinator:
 
         - **Graph forms** (upscalers, facefixers, strip_background) load a post-processor onto an inference
           process, so they reserve the estimator's current VRAM prediction (floored by
-          ``alchemy_vram_headroom_mb``). In ``high_memory_mode`` those weights are *also* kept resident in
-          system RAM, so the form additionally reserves ``alchemy_ram_headroom_mb`` of RAM. That RAM hold is
-          what the image scheduler's RAM gate and this coordinator's own :meth:`_has_ram_headroom` subtract,
-          so neither flow admits work against RAM a graph form is about to claim.
+          ``alchemy_vram_headroom_mb``). Those weights are also kept resident in system RAM, so the form
+          additionally reserves ``alchemy_ram_headroom_mb`` of RAM. That RAM hold is what the image
+          scheduler's RAM gate and this coordinator's own :meth:`_has_ram_headroom` subtract, so neither
+          flow admits work against RAM a graph form is about to claim.
         - **CLIP forms** (caption, nsfw, interrogation) run on the safety process against an already-resident
           model, so dispatching one adds no not-yet-realised VRAM or RAM and is charged zero. Reserving the
           graph cost for them would needlessly hold image generation back.
         """
         predicted_vram = self._estimator.predicted_cost_mb(float(self.bridge_data.alchemy_vram_headroom_mb))
-        graph_ram_mb = float(self.bridge_data.alchemy_ram_headroom_mb) if self.bridge_data.high_memory_mode else 0.0
+        graph_ram_mb = float(self.bridge_data.alchemy_ram_headroom_mb)
 
         vram_mb_by_unit: dict[str, float] = {}
         ram_mb_by_unit: dict[str, float] = {}

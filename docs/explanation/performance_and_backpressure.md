@@ -223,8 +223,8 @@ When a resource does not fit, the scheduler **defers** the preload for that cycl
 and starts **reclaiming** the resource from idle resident models, overriding the
 count-based residency protection (`under_pressure`) so an idle copy is evicted
 even in the affinity regime but never an in-progress or next-up model. This is
-the "auto-throttle" behavior: it overrides the residency that `high_memory_mode`
-would otherwise hold, and logs prominently when it does so.
+the "auto-throttle" behavior: it evicts resident models the worker would
+otherwise keep staged for fast reload, and logs prominently when it does so.
 
 Cold start (no VRAM telemetry yet) and a missing burden estimate both **admit**,
 so the budget never wedges a worker that has not yet reported memory. Set
@@ -266,17 +266,16 @@ so it never starves image jobs:
   of recent forms and raises the requirement toward it; free VRAM is read from the
   worker's per-process memory reports. With no VRAM telemetry yet (cold start /
   CPU-only), it falls back to backfill.
-- **RAM-headroom gate**: in `high_memory_mode` (where graph forms keep weights
-  resident in system RAM), a form also pops only when effective available RAM clears
-  `alchemy_ram_headroom_mb`, keeping alchemy from pushing a memory-resident worker
-  into paging. Outside `high_memory_mode`, or when RAM cannot be read, this gate does
-  not apply.
+- **RAM-headroom gate**: because graph forms keep weights resident in system RAM, a
+  form also pops only when effective available RAM clears `alchemy_ram_headroom_mb`,
+  keeping alchemy from pushing a memory-resident worker into paging. When RAM cannot
+  be read, this gate does not apply.
 - **Backfill fallback**: with `alchemy_allow_concurrent: false`, all of the above
   collapses to the legacy rule: pop only when the image queue is fully drained.
 
 Each in-flight form's shared-ledger reserve is charged by what it actually allocates:
-a graph form reserves the predicted VRAM cost (and, in `high_memory_mode`, an
-`alchemy_ram_headroom_mb` RAM hold for its resident weights), while a CLIP form runs on
+a graph form reserves the predicted VRAM cost (and an `alchemy_ram_headroom_mb` RAM
+hold for its resident weights), while a CLIP form runs on
 the safety process's already-resident model and reserves nothing, so it never holds image
 generation back. The reserve is reconciled to the in-flight set each cycle. A form whose
 process dies hard before reporting a result (so no faulted result is ever sent) is detected

@@ -76,24 +76,19 @@ Three boolean flags interact to determine timings and parallelism:
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `high_performance_mode`     | Cuts `process_timeout` to 1/3 of default; allows post-processing overlap                                                                                                                                                           |
 | `moderate_performance_mode` | Cuts `process_timeout` to 1/2 of default; allows post-processing overlap                                                                                                                                                           |
-| `extra_slow_worker`         | Disables all performance **and** memory modes (`high_performance_mode`, `moderate_performance_mode`, `high_memory_mode`, `very_high_memory_mode`); forces `queue_size=0`, `max_threads=1`, and `preload_timeout` to at least `120` |
+| `extra_slow_worker`         | Disables both performance modes (`high_performance_mode`, `moderate_performance_mode`); forces `queue_size=0`, `max_threads=1`, and `preload_timeout` to at least `120`                                                             |
 
 These flags also affect safety-check timeouts and how aggressively the scheduler
 preloads models.
 
-### Memory modes
-
-`high_memory_mode` and `very_high_memory_mode` signal that the worker has
-abundant RAM/VRAM. They relax constraints on concurrent model preloading and
-model eviction.
-
 ### VRAM and RAM budget
 
-Because several inference processes share one GPU, residency-favoring settings
-(`high_memory_mode`, a large model set, deep `queue_size`) can over-commit the
-device and crash with an out-of-memory error. The VRAM/RAM budget guards against
-this by gating model preloads on **measured** free VRAM and available RAM rather
-than process counts. See
+Because several inference processes share one GPU, a large model set or a deep
+`queue_size` can over-commit the device and crash with an out-of-memory error.
+The VRAM/RAM budget guards against this by gating model preloads on **measured**
+free VRAM and available RAM rather than process counts. It also decides when to
+keep a model resident versus evict it, so the worker no longer needs a manual
+"keep models resident" switch. See
 [The VRAM and RAM budget](performance_and_backpressure.md#the-vram-and-ram-budget)
 for how it works.
 
@@ -103,9 +98,9 @@ for how it works.
 | `vram_reserve_mb`    | `2048`  | Free VRAM (MB) kept in reserve on top of a job's estimated peak. Covers transient spikes such as tiled VAE decode. Larger trades throughput for safety.                |
 | `ram_reserve_mb`     | `4096`  | Available system RAM (MB) kept in reserve so resident-in-RAM models do not force the OS to page to disk.                                                               |
 
-When the budget overrides `high_memory_mode` residency to reclaim VRAM/RAM under
-pressure, it logs prominently; frequent eviction/reload churn is a signal to
-reduce the model set or disable `high_memory_mode`.
+When the budget evicts resident models to reclaim VRAM/RAM under pressure, it
+logs prominently; frequent eviction/reload churn is a signal to reduce the model
+set or the queue depth.
 
 ### Very fast disk mode
 

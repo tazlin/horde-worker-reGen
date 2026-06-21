@@ -65,8 +65,15 @@ window open.
 | **Insights** | Live, actionable recommendations (low GPU duty cycle, VRAM pressure, fault rate, idle time, configuration mismatches) and a recent-activity rollup. |
 | **Benchmark** | A guided, plan-first flow: **Preview plan** shows what each level needs and what will run on this machine (no GPU), **Run benchmark** measures it, and **Apply suggested config** writes the recommendation. Model tiers are individual toggles (sd15/sdxl on by default; flux/qwen opt-in). Advanced options are collapsed by default with inline explanations, and each capability is separately selectable: queue depth / thread count / batch size, hires-fix / post-processing / controlnet / QR-code, and the alchemy CLIP / graph / concurrent lanes, so you can measure exactly the features you run. The suggested config shows per-setting **provenance** (proven / untested / failed / capped), and **History** browses and compares past runs. For the full benchmark CLI, see [`horde-benchmark`](../reference/cli.md#horde-benchmark). |
 
-Saving on the Config tab gives you three choices: *Save*, *Save and apply* (hot-reload), and *Save and
-restart worker*. Fields that only take effect after a restart are marked as such.
+The Config tab offers *Reload from disk*, *Save*, and *Save + restart worker*. A plain *Save* is enough
+to apply most changes: the running worker watches `bridgeData.yaml` and hot-reloads it on its own. Only
+fields marked with ⟳ need a restart, which is what *Save + restart worker* is for.
+
+Saving only writes the fields you actually changed: values you never touched (including settings the
+form merely shows at their default) are left exactly as they are on disk, so a fresh Save adds nothing
+surprising and a no-op Save changes nothing at all. If an edited value is out of range, the save is
+blocked, every problem is listed at once, and the editor jumps to the first offending field; a value
+that was already invalid on disk but that you did not touch will not block an unrelated change.
 
 ## Keyboard shortcuts
 

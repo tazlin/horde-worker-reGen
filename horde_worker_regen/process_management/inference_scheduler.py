@@ -226,7 +226,18 @@ class InferenceScheduler:
         # Startup-measured per-process VRAM overhead (one torch/CUDA context, no model), set by the manager
         # via set_measured_per_process_overhead_mb. The streaming forecast subtracts it from total VRAM to
         # estimate the free achievable under sole residency. 0 until measured (free-if-alone == total then).
+        # NB: this is the *first/sole* context cost (it includes the one-time, device-wide CUDA runtime
+        # allocation), NOT the marginal cost of an additional sibling context -- see
+        # _measured_idle_context_residency_mb below, from which the marginal is derived.
         self._measured_per_process_overhead_mb: float = 0.0
+        # Lowest device-wide *used* VRAM observed while every loaded inference process is idle with no model
+        # resident (the clean all-contexts baseline, typically at startup). This is the true combined cost of
+        # all process contexts -- the one-time CUDA runtime plus one context each -- so the marginal cost of an
+        # additional context is (residency - per_process_overhead) / (count - 1). Used to size
+        # free_after_model_evict from measurement instead of multiplying the one-time cost by the process count
+        # (which manufactured the multi-GB phantom shortfall that wedged high-VRAM workers). None until seen.
+        self._measured_idle_context_residency_mb: float | None = None
+        self._idle_residency_process_count: int = 0
         # Set while a whole-card model is being given sole residency by stopping idle sibling processes to
         # reclaim their CUDA contexts (a context is only freed by the process exiting). Holds the model name
         # so the teardown is logged once and the process count is restored once the exclusive job drains.
@@ -461,11 +472,68 @@ class InferenceScheduler:
 
         An explicit ``vram_per_process_overhead_mb`` config value (> 0) wins so operators can tune; otherwise
         the startup-measured figure is used. Tolerant of partially-mocked config (non-numeric -> measured).
+        This is the *first/sole* context cost (it includes the one-time CUDA runtime allocation), used to size
+        ``free_if_alone``; the per-additional-context cost is :meth:`_marginal_process_overhead_mb`.
         """
         configured = self._runtime_config.bridge_data.vram_per_process_overhead_mb
         if isinstance(configured, (int, float)) and not isinstance(configured, bool) and configured > 0:
             return float(configured)
         return self._measured_per_process_overhead_mb
+
+    def _maybe_capture_idle_context_residency(self) -> None:
+        """Record the device-wide used VRAM when every inference process is idle with no model resident.
+
+        That measurement is the true combined cost of all process contexts (the one-time CUDA runtime plus one
+        context each), which the forecast needs to size ``free_after_model_evict`` without multiplying the
+        one-time cost by the process count. The clean window is at startup, before any model loads; once a
+        model has loaded this rarely holds again, so the minimum observed value is kept (later, cache-dirtied
+        observations read higher and are ignored). Cheap and side-effect-free beyond the cached figure, so it
+        is safe to call every scheduling tick.
+        """
+        free_mb = self._process_map.get_free_vram_mb()
+        total_mb = self._process_map.get_reported_total_vram_mb()
+        if free_mb is None or total_mb is None:
+            return
+        process_count = 0
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
+                continue
+            process_count += 1
+            # A clean baseline requires every live inference process up, idle, and holding no model: any model
+            # resident (even one offloaded to RAM but still tracked) means the reading includes weight VRAM.
+            if (
+                process_info.last_process_state != HordeProcessState.WAITING_FOR_JOB
+                or process_info.loaded_horde_model_name is not None
+            ):
+                return
+        if process_count < 1:
+            return
+        used_mb = total_mb - free_mb
+        if used_mb <= 0:
+            return
+        if self._measured_idle_context_residency_mb is None or used_mb < self._measured_idle_context_residency_mb:
+            self._measured_idle_context_residency_mb = used_mb
+            self._idle_residency_process_count = process_count
+
+    def _marginal_process_overhead_mb(self) -> float | None:
+        """Return the per-additional-context VRAM cost (MB), or None to fall back to the first-context overhead.
+
+        Derived from the measured all-contexts idle residency: ``residency = per_process_overhead + (count - 1)
+        * marginal``, so ``marginal = (residency - per_process_overhead) / (count - 1)``. Returns None when no
+        clean baseline has been observed, when only one process was up (no marginal to derive), or when the
+        residency is not above the first-context overhead (an inconsistent or contaminated probe reading) -- in
+        every such case the forecast conservatively reuses the first-context overhead per additional context.
+        """
+        residency = self._measured_idle_context_residency_mb
+        count = self._idle_residency_process_count
+        if residency is None or count < 2:
+            return None
+        per_process = self._per_process_overhead_mb()
+        if per_process <= 0 or residency <= per_process:
+            return None
+        return (residency - per_process) / (count - 1)
 
     def _whole_card_residency_enabled(self) -> bool:
         """Whether preventative whole-card exclusive residency is on (config, tolerant of mocked config)."""
@@ -511,6 +579,9 @@ class InferenceScheduler:
             not self._process_lifecycle.is_safety_gpu_paused
         )
         num_safety_contexts = self._process_map.num_safety_processes() if safety_on_gpu else 0
+        # Refresh the clean all-contexts idle baseline (a no-op once startup has passed) so the marginal
+        # per-context cost reflects measurement rather than the one-time-cost-times-N over-count.
+        self._maybe_capture_idle_context_residency()
         return forecast_weight_streaming(
             job,
             str(baseline) if baseline is not None else None,
@@ -521,6 +592,7 @@ class InferenceScheduler:
             configured_reserve_floor_mb=floor_mb,
             num_extra_resident_contexts=num_safety_contexts,
             post_processing_reserve_mb=self._committed_vram_reserve_mb(),
+            marginal_process_overhead_mb=self._marginal_process_overhead_mb(),
         )
 
     def _establish_whole_card_residency(

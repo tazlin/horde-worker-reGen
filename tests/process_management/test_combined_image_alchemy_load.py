@@ -200,24 +200,24 @@ class TestAlchemyAdmissionMatrix:
 
 
 class TestAlchemyRamHeadroom:
-    """The RAM analogue of the VRAM gate, only enforced in high_memory_mode."""
+    """The RAM analogue of the VRAM gate: alchemy is held back when effective available RAM is scarce."""
 
-    def test_no_gate_outside_high_memory_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Without high_memory_mode, RAM never blocks alchemy even when it is scarce."""
+    def test_ample_ram_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With plenty of available RAM the gate does not hold alchemy back."""
         coordinator = _make_coordinator(
-            bridge_data=_bridge_data(high_memory_mode=False, alchemy_ram_headroom_mb=4096),
+            bridge_data=_bridge_data(alchemy_ram_headroom_mb=4096),
             process_map=_StubProcessMap(),
             job_tracker=_StubJobTracker(),
             reserve_ledger=CommittedReserveLedger(),
         )
-        monkeypatch.setattr(alchemy_popper_module.psutil, "virtual_memory", lambda: _FakeVmem(available_mb=100.0))
+        monkeypatch.setattr(alchemy_popper_module.psutil, "virtual_memory", lambda: _FakeVmem(available_mb=8000.0))
         assert coordinator._has_ram_headroom() is True
 
-    def test_high_memory_mode_defers_under_ram_pressure(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """In high_memory_mode, low effective available RAM holds alchemy back."""
+    def test_defers_under_ram_pressure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Low effective available RAM (after the committed-RAM subtraction) holds alchemy back."""
         ledger = CommittedReserveLedger()
         coordinator = _make_coordinator(
-            bridge_data=_bridge_data(high_memory_mode=True, alchemy_ram_headroom_mb=4096),
+            bridge_data=_bridge_data(alchemy_ram_headroom_mb=4096),
             process_map=_StubProcessMap(),
             job_tracker=_StubJobTracker(),
             reserve_ledger=ledger,
@@ -285,8 +285,8 @@ def _spec(form_id: str, form: str) -> AlchemyFormSpec:
 class TestFormCostClassification:
     """The per-form reserve reflects what the form actually allocates, not a flat graph cost.
 
-    Graph forms (upscalers, facefixers, strip_background) load post-processor weights into VRAM (and, in
-    high_memory_mode, RAM) on an inference process. CLIP forms (caption, nsfw, interrogation) run on the
+    Graph forms (upscalers, facefixers, strip_background) load post-processor weights into VRAM (and RAM)
+    on an inference process. CLIP forms (caption, nsfw, interrogation) run on the
     safety process against an already-resident model, so dispatching one adds no not-yet-realised VRAM/RAM
     and must not subtract headroom that image generation could otherwise use.
     """
@@ -329,7 +329,7 @@ class TestFormCostClassification:
 
 
 class TestAlchemyRamReserve:
-    """In high_memory_mode, in-flight graph forms keep weights resident in RAM and commit it to the ledger.
+    """In-flight graph forms keep weights resident in RAM and commit it to the shared ledger.
 
     Without this the ledger's RAM total stayed zero, so the committed-RAM subtraction the image scheduler's
     RAM gate and alchemy's own RAM headroom check perform was a no-op despite the docstrings advertising it.
@@ -343,26 +343,18 @@ class TestAlchemyRamReserve:
             reserve_ledger=ledger,
         )
 
-    def test_graph_form_commits_ram_in_high_memory_mode(self) -> None:
+    def test_graph_form_commits_ram(self) -> None:
         """A graph form in flight reserves its RAM footprint (the configured floor) for other flows to see."""
         ledger = CommittedReserveLedger()
-        coordinator = self._coordinator(ledger, high_memory_mode=True)
+        coordinator = self._coordinator(ledger)
         coordinator._in_flight = {"g1": _spec("g1", "RealESRGAN_x4plus")}
         coordinator._sync_reserve_ledger()
         assert ledger.total_ram_mb() == 3000.0
 
-    def test_no_ram_committed_outside_high_memory_mode(self) -> None:
-        """Without high_memory_mode weights are not kept resident, so no RAM is committed."""
-        ledger = CommittedReserveLedger()
-        coordinator = self._coordinator(ledger, high_memory_mode=False)
-        coordinator._in_flight = {"g1": _spec("g1", "RealESRGAN_x4plus")}
-        coordinator._sync_reserve_ledger()
-        assert ledger.total_ram_mb() == 0.0
-
     def test_clip_form_commits_no_ram(self) -> None:
         """A CLIP form runs against the resident safety-process model and commits no RAM."""
         ledger = CommittedReserveLedger()
-        coordinator = self._coordinator(ledger, high_memory_mode=True)
+        coordinator = self._coordinator(ledger)
         coordinator._in_flight = {"c1": _spec("c1", "nsfw")}
         coordinator._sync_reserve_ledger()
         assert ledger.total_ram_mb() == 0.0
@@ -370,7 +362,7 @@ class TestAlchemyRamReserve:
     def test_committed_ram_self_gates_next_form(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A graph form's own committed RAM is subtracted by the RAM headroom check for the next form."""
         ledger = CommittedReserveLedger()
-        coordinator = self._coordinator(ledger, high_memory_mode=True)
+        coordinator = self._coordinator(ledger)
         monkeypatch.setattr(
             alchemy_popper_module.psutil,
             "virtual_memory",

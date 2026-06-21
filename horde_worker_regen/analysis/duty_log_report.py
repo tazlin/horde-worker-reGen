@@ -49,7 +49,8 @@ _CHURN_ENTRY_RE = re.compile(r"(?P<count>\d+) (?P<label>[a-zA-Z ]+)")
 
 _CONFIG_RE = re.compile(
     r"unload_models_from_vram_often: (?P<unload>\w+) \| high_performance_mode: (?P<hpm>\w+) \| "
-    r"moderate_performance_mode: (?P<mpm>\w+) \| high_memory_mode: (?P<hmm>\w+)",
+    # high_memory_mode was removed from the worker; the optional group still parses older logs that carry it.
+    r"moderate_performance_mode: (?P<mpm>\w+)(?: \| high_memory_mode: (?P<hmm>\w+))?",
 )
 _IDENTITY_RE = re.compile(
     r"dreamer_name: (?P<name>[^|]+?) \|.*?num_models: (?P<num_models>\d+).*?"
@@ -278,7 +279,8 @@ def build_epoch_report(index: int, lines: list[str]) -> EpochReport:
             config.unload_models_from_vram_often = config_match.group("unload") == "True"
             config.high_performance_mode = config_match.group("hpm") == "True"
             config.moderate_performance_mode = config_match.group("mpm") == "True"
-            config.high_memory_mode = config_match.group("hmm") == "True"
+            # high_memory_mode was removed from the worker; only older logs carry it (None when absent).
+            config.high_memory_mode = config_match.group("hmm") == "True" if config_match.group("hmm") else None
             continue
 
         identity_match = _IDENTITY_RE.search(line)

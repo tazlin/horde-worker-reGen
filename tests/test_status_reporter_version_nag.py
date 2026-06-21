@@ -18,7 +18,6 @@ def _stub_bridge_data() -> SimpleNamespace:
         limit_max_steps=False,
         max_batch=1,
         allow_sdxl_controlnet=False,
-        high_memory_mode=False,
         max_threads=1,
         minutes_allowed_without_jobs=10,
         suppress_speed_warnings=False,

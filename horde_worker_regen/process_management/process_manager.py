@@ -578,8 +578,6 @@ class HordeWorkerProcessManager:
 
         if mp_primitives is None:
             vae_decode_semaphore_max = 1
-            if self.bridge_data.high_memory_mode:
-                vae_decode_semaphore_max = self.max_inference_processes
 
             # The lease is an independent denoise gate (see _resolve_inference_concurrency): with
             # it enabled the whole-job inference semaphore opens to every process so spare
@@ -963,12 +961,10 @@ class HordeWorkerProcessManager:
     def _log_resource_budget_posture(self) -> None:
         """Log, once at startup, whether the VRAM/RAM budget is active and how it will behave.
 
-        This is the "warn loudly" half of the auto-throttle: when residency-favoring modes
-        (``high_memory_mode``/``very_high_memory_mode``) are combined with a model set or queue depth
-        that can over-commit the device, the operator is told up front that the budget will evict
-        resident models under measured pressure (so any eviction churn they see later is expected and
-        the remedy is to reduce the model set or disable the mode). The runtime budget is the actual
-        enforcement; this only surfaces the posture.
+        This is the "warn loudly" half of the auto-throttle: the operator is told up front that the budget
+        gates preloads and concurrent dispatch on measured free VRAM/RAM and evicts idle resident models
+        under measured pressure (so any eviction churn they see later is expected and the remedy is to reduce
+        the model set). The runtime budget is the actual enforcement; this only surfaces the posture.
         """
         if not self.bridge_data.enable_vram_budget:
             logger.warning(
@@ -982,20 +978,12 @@ class HordeWorkerProcessManager:
         total_vram_mb = round(primary_device.total_memory / (1024 * 1024)) if primary_device is not None else None
         total_vram_note = f"{total_vram_mb} MB VRAM" if total_vram_mb is not None else "an unknown amount of VRAM"
 
-        residency_mode = self.bridge_data.high_memory_mode or self.bridge_data.very_high_memory_mode
         logger.info(
             f"VRAM/RAM budget active (reserve {self.bridge_data.vram_reserve_mb} MB VRAM / "
             f"{self.bridge_data.ram_reserve_mb} MB RAM on {total_vram_note}): preloads and concurrent "
             "dispatch are gated on measured free VRAM/RAM, and idle resident models are evicted under "
             "pressure to prevent out-of-memory crashes.",
         )
-        if residency_mode:
-            logger.warning(
-                "high_memory_mode keeps models resident; with several inference processes this can "
-                "over-commit the GPU. The VRAM budget will auto-throttle by evicting idle resident "
-                "models when free VRAM runs low. If you see frequent eviction/reload churn, reduce the "
-                "number of loaded models or disable high_memory_mode.",
-            )
 
     async def unload_models_from_vram(
         self,
@@ -2450,8 +2438,6 @@ class HordeWorkerProcessManager:
             allow_post_processing=bridge_data.allow_post_processing,
             high_performance_mode=bridge_data.high_performance_mode,
             moderate_performance_mode=bridge_data.moderate_performance_mode,
-            high_memory_mode=bridge_data.high_memory_mode,
-            very_high_memory_mode=bridge_data.very_high_memory_mode,
             extra_slow_worker=bridge_data.extra_slow_worker,
             alchemist=bridge_data.alchemist,
             alchemy_concurrent=bridge_data.alchemy_allow_concurrent,

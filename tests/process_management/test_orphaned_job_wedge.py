@@ -38,8 +38,6 @@ def _make_plm(*, process_map: ProcessMap) -> ProcessLifecycleManager:
     bridge_data.image_models_to_load = ["stable_diffusion"]
     bridge_data.max_threads = 1
     bridge_data.safety_on_gpu = False
-    bridge_data.high_memory_mode = False
-    bridge_data.very_high_memory_mode = False
     bridge_data.process_timeout = 300
     bridge_data.inference_step_timeout = 15
     bridge_data.preload_timeout = 80

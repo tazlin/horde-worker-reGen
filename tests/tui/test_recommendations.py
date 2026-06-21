@@ -64,7 +64,7 @@ def test_low_duty_cycle_with_work_suggests_tuning() -> None:
         _snapshot(
             gpu_utilization_mean_percent=30.0,
             jobs_pending_inference=2,
-            config=_config(high_memory_mode=False, max_threads=1, queue_size=0),
+            config=_config(max_threads=1, queue_size=0),
         ),
     )
     assert any("duty cycle" in item.title.lower() for item in result)

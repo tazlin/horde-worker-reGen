@@ -94,12 +94,6 @@ max_power: 8
 #   12GB-16GB VRAM: 32-64 (no higher than 64)
 #   24GB+ VRAM: 64-128 (no higher than 128)
 
-# Use more VRAM on average but reduce time spent loading models.
-high_memory_mode: false
-# Suggested values:
-#   24GB+ VRAM: true
-#   12GB-16GB VRAM: true (consider false if offering Cascade or Flux)
-
 # Fill local queue much faster but may be penalized by the server if you cannot keep up with jobs.
 high_performance_mode: false
 # Suggested values:
@@ -406,19 +400,14 @@ alchemy_max_concurrency: 1
 # median cost of recent forms as measurements accumulate.
 alchemy_vram_headroom_mb: 2000
 
-# Minimum effective available system RAM (MB) required before popping an alchemy form, enforced
-# only in high_memory_mode (where graph forms keep weights resident in RAM). The RAM analogue of
-# alchemy_vram_headroom_mb; keeps alchemy from pushing a memory-resident worker into paging.
+# Minimum effective available system RAM (MB) required before popping an alchemy form (graph forms keep
+# weights resident in RAM). The RAM analogue of alchemy_vram_headroom_mb; keeps alchemy from pushing a
+# memory-resident worker into paging.
 alchemy_ram_headroom_mb: 2048
 
 ##########################################
 ## reGen Advanced Settings              ##
 ##########################################
-
-# Use even more RAM/VRAM to keep additional models resident simultaneously.
-# This has data-center grade cards in mind, and is not recommended for consumer grade cards.
-# Implies high_memory_mode.
-very_high_memory_mode: false
 
 # If true, the process will stop and restart when the model loaded changes.
 # Warning: This can cause substantial delays in processing.
@@ -471,8 +460,8 @@ model_stickiness: 0.0
 # Coordinate the GPU denoising loop across inference processes with a shared lease.
 # When true, at most `gpu_sampling_lease_slots` processes run the denoising loop at once;
 # extra processes stage their next pipeline concurrently, keeping the GPU busy between jobs.
-# Trades extra resident VRAM for higher GPU utilization. REQUIRES residency:
-#   high_memory_mode: true + unload_models_from_vram_often: false
+# Trades extra resident memory for higher GPU utilization. Counterproductive with
+# unload_models_from_vram_often: true (no staged residency to overlap).
 gpu_sampling_lease_enabled: false
 
 # How many inference processes may run the GPU denoising loop at once when

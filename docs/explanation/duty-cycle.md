@@ -229,9 +229,9 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
   card it is too aggressive; turning it **off** measured cleaner (fewer swaps, much smaller
   `queue_wait`, slightly higher duty, and fewer transient wedges). Leave it off below 24 GB.
 - **`unload_models_from_vram_often`** is recommended **on** for cards under 16 GB, where freeing VRAM
-  between jobs is worth the reload cost. On larger cards the opposite pairing wins: `high_memory_mode:
-  true` with `unload_models_from_vram_often: false` keeps models resident across jobs, which is the only
-  configuration that actually raises duty, and only when the working set genuinely fits in VRAM.
+  between jobs is worth the reload cost. On larger cards leaving it **off** lets the worker keep
+  recently-used models staged in RAM for fast reload (the VRAM/RAM budget decides what stays resident),
+  which is the pairing that actually raises duty, and only when the working set genuinely fits.
 
 ## See also
 

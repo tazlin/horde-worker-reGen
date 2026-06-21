@@ -605,3 +605,83 @@ class TestPostProcessingOverlapGate:
         )
         # Feature off: the bump is retained regardless of free VRAM (prior behavior).
         assert scheduler._max_jobs_in_progress_allowed(1) == 3
+
+
+class TestMarginalProcessOverhead:
+    """The forecast sizes free_after_model_evict from per_process_overhead + (contexts-1)*marginal.
+
+    On one device the CUDA runtime is loaded once and shared, so a single fresh process measures the whole
+    one-time cost (~4.3GB on a 24GB card) while each additional sibling context costs only a few hundred MB.
+    Sizing free_after_model_evict as contexts*per_process_overhead multiplies that one-time cost by the
+    process count, manufacturing a multi-GB phantom shortfall that wedges high-VRAM workers.
+    """
+
+    def _forecast(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        per_process_overhead_mb: float,
+        marginal_process_overhead_mb: float | None,
+        num_inference_processes: int = 4,
+        weights_mb: float = 4900.0,
+        sampling_peak_mb: float = 17128.0,
+        free_now_mb: float = 18634.0,
+    ) -> resource_budget.StreamForecast:
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda j, b: weights_mb)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda j, b: sampling_peak_mb)
+        monkeypatch.setattr(resource_budget, "effective_inference_reserve_mb", lambda *a, **k: 2000.0)
+        return resource_budget.forecast_weight_streaming(
+            make_mock_job(width=1024, height=1024),
+            "stable_diffusion_xl",
+            free_now_mb=free_now_mb,
+            total_vram_mb=24074.0,
+            per_process_overhead_mb=per_process_overhead_mb,
+            num_inference_processes=num_inference_processes,
+            configured_reserve_floor_mb=0.0,
+            marginal_process_overhead_mb=marginal_process_overhead_mb,
+        )
+
+    def test_default_marginal_reproduces_contexts_times_overhead(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Omitting the marginal keeps the old total - N*overhead sizing exactly (no behavior change)."""
+        forecast = self._forecast(monkeypatch, per_process_overhead_mb=4266.0, marginal_process_overhead_mb=None)
+        assert forecast.free_after_model_evict_mb == pytest.approx(24074.0 - 4 * 4266.0)  # 7010
+        # free_if_alone keeps the full single-context overhead regardless of the marginal.
+        assert forecast.free_if_alone_mb == pytest.approx(24074.0 - 4266.0)
+
+    def test_measured_marginal_frees_after_model_evict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A small measured marginal sizes free_after_model_evict to reality, not the one-time-cost-times-N."""
+        # marginal 391 == (5440 idle residency - 4266 probe) / (4 - 1), the measured-hardware numbers.
+        forecast = self._forecast(monkeypatch, per_process_overhead_mb=4266.0, marginal_process_overhead_mb=391.0)
+        assert forecast.free_after_model_evict_mb == pytest.approx(24074.0 - 4266.0 - 391.0 * 3)  # 18635
+        # free_if_alone still pays the full first-context overhead (the surviving process keeps the runtime).
+        assert forecast.free_if_alone_mb == pytest.approx(24074.0 - 4266.0)
+
+    def test_marginal_flips_teardown_to_model_eviction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The over-counted overhead demands a sibling-process teardown; the marginal makes it co-resident."""
+        over_counted = self._forecast(monkeypatch, per_process_overhead_mb=4266.0, marginal_process_overhead_mb=None)
+        assert over_counted.requires_sibling_teardown is True
+        assert over_counted.needs_exclusive_residency is True
+
+        with_marginal = self._forecast(monkeypatch, per_process_overhead_mb=4266.0, marginal_process_overhead_mb=391.0)
+        assert with_marginal.requires_sibling_teardown is False
+        assert with_marginal.needs_exclusive_residency is False
+        assert with_marginal.fits_after_model_evict is True
+
+    def test_marginal_lifts_max_resident_processes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A cheap marginal lets more contexts co-reside than the old per-context overhead allowed."""
+        # A moderate model so the budget is comfortably positive and the count is overhead-bound.
+        over_counted = self._forecast(
+            monkeypatch,
+            per_process_overhead_mb=4266.0,
+            marginal_process_overhead_mb=None,
+            sampling_peak_mb=6948.0,
+        )
+        with_marginal = self._forecast(
+            monkeypatch,
+            per_process_overhead_mb=4266.0,
+            marginal_process_overhead_mb=391.0,
+            sampling_peak_mb=6948.0,
+        )
+        assert over_counted.max_resident_processes() is not None
+        assert with_marginal.max_resident_processes() is not None
+        assert with_marginal.max_resident_processes() > over_counted.max_resident_processes()

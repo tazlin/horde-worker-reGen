@@ -97,8 +97,6 @@ class InferenceProcessEntryPoint(Protocol):
         process_launch_identifier: int,
         *,
         low_memory_mode: bool = False,
-        high_memory_mode: bool = False,
-        very_high_memory_mode: bool = False,
         amd_gpu: bool = False,
         directml: int | None = None,
         vram_heavy_models: bool = False,
@@ -120,7 +118,6 @@ class SafetyProcessEntryPoint(Protocol):
         process_launch_identifier: int,
         cpu_only: bool = True,
         *,
-        high_memory_mode: bool = False,
         amd_gpu: bool = False,
         directml: int | None = None,
         dry_run_skip_safety: bool = False,
@@ -165,8 +162,6 @@ def start_inference_process(
     process_launch_identifier: int,
     *,
     low_memory_mode: bool = False,
-    high_memory_mode: bool = False,
-    very_high_memory_mode: bool = False,
     amd_gpu: bool = False,
     directml: int | None = None,
     vram_heavy_models: bool = False,
@@ -186,9 +181,6 @@ def start_inference_process(
         vae_decode_semaphore (Semaphore): The semaphore to use to limit concurrent VAE decoding.
         process_launch_identifier (int): The unique identifier for this launch.
         low_memory_mode (bool, optional): If true, the process will attempt to use less memory. Defaults to True.
-        high_memory_mode (bool, optional): If true, the process will attempt to use more memory. Defaults to False.
-        very_high_memory_mode (bool, optional): If true, the process will attempt to use even more memory.
-            Defaults to False.
         amd_gpu (bool, optional): If true, the process will attempt to use AMD GPU-specific optimisations.
             Defaults to False.
         directml (int | None, optional): If not None, the process will attempt to use DirectML \
@@ -243,9 +235,7 @@ def start_inference_process(
                 logger.debug(
                     f"Initialising hordelib with process_id={process_id}, "
                     f"process_launch_identifier={process_launch_identifier}, "
-                    f"high_memory_mode={high_memory_mode} "
-                    f"and amd_gpu={amd_gpu}, low_memory_mode={low_memory_mode}, "
-                    f"very_high_memory_mode={very_high_memory_mode}",
+                    f"amd_gpu={amd_gpu}, low_memory_mode={low_memory_mode}",
                 )
 
                 extra_comfyui_args = ["--disable-smart-memory"]
@@ -262,16 +252,7 @@ def start_inference_process(
                 # mapping to comfy model class names.
                 models_not_to_force_load: list[str] = [KNOWN_IMAGE_GENERATION_BASELINE.flux_1]
 
-                if very_high_memory_mode:
-                    extra_comfyui_args.append("--gpu-only")
-                elif high_memory_mode:
-                    # extra_comfyui_args.append("--normalvram")
-                    models_not_to_force_load.extend(
-                        [
-                            KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade,
-                        ],
-                    )
-                elif low_memory_mode:
+                if low_memory_mode:
                     extra_comfyui_args.append("--novram")
                     models_not_to_force_load.extend(
                         [
@@ -282,10 +263,6 @@ def start_inference_process(
                 elif not vram_heavy_models:
                     logger.info("Reserving 1.4GB VRAM.")
                     extra_comfyui_args.extend(["--reserve-vram", "1.4"])
-
-                if high_memory_mode and vram_heavy_models:
-                    logger.info("High memory mode and vram heavy models are both enabled. Reserving 6GB VRAM.")
-                    extra_comfyui_args.extend(["--reserve-vram", "6"])
 
                 if "--reserve-vram" not in extra_comfyui_args:
                     logger.warning("No VRAM reservation specified.")
@@ -326,9 +303,6 @@ def start_inference_process(
             dry_run_skip_inference=dry_run_skip_inference,
             dry_run_inference_delay=dry_run_inference_delay,
             gpu_sampling_lease=gpu_sampling_lease,
-            # Propagate the operator's memory assertion so HordeLib keeps models resident
-            # (no per-job aggressive unload / RAM->VRAM reload) when there is VRAM headroom.
-            high_memory_mode=high_memory_mode or very_high_memory_mode,
         )
 
         _spawn_timing_mark(process_id, "inference", "process-constructed")
@@ -344,7 +318,6 @@ def start_safety_process(
     process_launch_identifier: int,
     cpu_only: bool = True,
     *,
-    high_memory_mode: bool = False,
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_safety: bool = False,
@@ -358,7 +331,6 @@ def start_safety_process(
         disk_lock (Lock): The lock to use for disk access.
         process_launch_identifier (int): The unique identifier for this launch.
         cpu_only (bool, optional): If true, the process will not use the GPU. Defaults to True.
-        high_memory_mode (bool, optional): If true, the process will attempt to use more memory. Defaults to False.
         amd_gpu (bool, optional): If true, the process will attempt to use AMD GPU-specific optimizations.
             Defaults to False.
         directml (int | None, optional): If not None, the process will attempt to use DirectML \
@@ -398,7 +370,7 @@ def start_safety_process(
 
             configure_child_telemetry(process_id)
 
-            logger.debug(f"Initialising hordelib with process_id={process_id} and high_memory_mode={high_memory_mode}")
+            logger.debug(f"Initialising hordelib with process_id={process_id}")
 
             extra_comfyui_args = ["--disable-smart-memory"]
 
@@ -418,8 +390,7 @@ def start_safety_process(
         logger.debug(
             f"Initialising hordelib with process_id={process_id}, "
             f"process_launch_identifier={process_launch_identifier}, "
-            f"cpu_only={cpu_only}, high_memory_mode={high_memory_mode} "
-            f"and amd_gpu={amd_gpu}",
+            f"cpu_only={cpu_only} and amd_gpu={amd_gpu}",
         )
         worker_process = HordeSafetyProcess(
             process_id=process_id,

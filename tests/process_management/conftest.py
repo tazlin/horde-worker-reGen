@@ -160,8 +160,6 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.extra_model_directories = []
     bd.max_threads = 1
     bd.queue_size = 1
-    bd.high_memory_mode = False
-    bd.very_high_memory_mode = False
     bd.high_performance_mode = False
     bd.moderate_performance_mode = False
     bd.safety_on_gpu = False

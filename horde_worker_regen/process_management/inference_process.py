@@ -112,7 +112,6 @@ class HordeInferenceProcess(HordeProcess):
         disk_lock: Lock,
         process_launch_identifier: int,
         *,
-        high_memory_mode: bool = False,
         dry_run_skip_inference: bool = False,
         dry_run_inference_delay: float = 1.0,
         gpu_sampling_lease: Semaphore | None = None,
@@ -129,9 +128,6 @@ class HordeInferenceProcess(HordeProcess):
             aux_model_lock (Lock): A lock used to prevent multiple processes from downloading auxiliary models at the \
             disk_lock (Lock): A lock used to prevent multiple processes from accessing disk at the same time.
             process_launch_identifier (int): The identifier for the process launch.
-            high_memory_mode (bool, optional): Whether or not to use high memory mode. This mode uses more memory, but\
-                may be faster if the system has enough memory and VRAM. \
-                Defaults to False.
             dry_run_skip_inference (bool, optional): Skip real inference and return a dummy image. Defaults to False.
             dry_run_inference_delay (float, optional): Seconds to sleep when dry-run inference is active. \
                 Defaults to 1.0.
@@ -168,11 +164,11 @@ class HordeInferenceProcess(HordeProcess):
                 sys.exit(1)
 
             try:
-                logger.info(f"Initialising HordeLib with high_memory_mode={high_memory_mode}")
+                logger.info("Initialising HordeLib")
                 with logger.catch(reraise=True):
                     self._horde = HordeLib(
                         comfyui_callback=self._comfyui_callback,
-                        aggressive_unloading=not high_memory_mode,
+                        aggressive_unloading=True,
                     )
                     self._shared_model_manager = SharedModelManager(do_not_load_model_mangers=True)
             except Exception as e:

@@ -25,7 +25,6 @@ Pick the block closest to your card and adjust from there. The benchmark (on the
 ```yaml
 queue_size: 1        # <32 GB RAM: 0, 32 GB: 1, >32 GB: 2
 safety_on_gpu: true
-high_memory_mode: true
 high_performance_mode: true
 unload_models_from_vram_often: false
 max_threads: 1       # 2 is often viable for xx90 cards

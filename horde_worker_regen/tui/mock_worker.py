@@ -349,7 +349,6 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
         safety_on_gpu=True,
         allow_lora=True,
         allow_post_processing=True,
-        high_memory_mode=True,
     )
 
     while True:

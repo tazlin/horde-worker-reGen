@@ -133,8 +133,6 @@ class WorkerConfigSummary(BaseModel):
     allow_post_processing: bool = True
     high_performance_mode: bool = False
     moderate_performance_mode: bool = False
-    high_memory_mode: bool = False
-    very_high_memory_mode: bool = False
     extra_slow_worker: bool = False
 
     alchemist: bool = False

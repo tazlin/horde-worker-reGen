@@ -433,7 +433,6 @@ class StatusReporter:
                     f"unload_models_from_vram_often: {bridge_data.unload_models_from_vram_often}",
                     f"high_performance_mode: {bridge_data.high_performance_mode}",
                     f"moderate_performance_mode: {bridge_data.moderate_performance_mode}",
-                    f"high_memory_mode: {bridge_data.high_memory_mode}",
                 ],
             ),
         )
@@ -444,7 +443,6 @@ class StatusReporter:
                     f"preload_timeout: {bridge_data.preload_timeout}",
                     f"download_timeout: {bridge_data.download_timeout}",
                     f"post_process_timeout: {bridge_data.post_process_timeout}",
-                    f"very_high_memory_mode: {bridge_data.very_high_memory_mode}",
                     f"cycle_process_on_model_change: {bridge_data.cycle_process_on_model_change}",
                     f"exit_on_unhandled_faults: {bridge_data.exit_on_unhandled_faults}",
                     f"jobs_pending_safety_check: {jobs_pending_safety_check}",
@@ -499,22 +497,7 @@ class StatusReporter:
         # Device memory warnings
         for device in device_map.root.values():
             total_memory_mb = device.total_memory / 1024 / 1024
-            if total_memory_mb < 10_000 and bridge_data.high_memory_mode:
-                logger.warning(
-                    f"Device {device.device_name} ({device.device_index}) has less than 10GB of memory. "
-                    "This may cause issues with `high_memory_mode` enabled.",
-                )
-            elif (
-                total_memory_mb > 20_000
-                and not bridge_data.high_memory_mode
-                and bridge_data.max_threads == 1
-                and total_ram_gigabytes > 32
-            ):
-                logger.warning(
-                    f"Device {device.device_name} ({device.device_index}) has more than 20GB of memory. "
-                    "You should enable `high_memory_mode` in your config to take advantage of this.",
-                )
-            elif total_memory_mb > 20_000 and bridge_data.extra_slow_worker:
+            if total_memory_mb > 20_000 and bridge_data.extra_slow_worker:
                 logger.warning(
                     f"Device {device.device_name} ({device.device_index}) has more than 20GB of memory. "
                     "There are very few GPUs with this much memory that should be running in extra slow worker "

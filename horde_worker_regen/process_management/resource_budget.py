@@ -165,7 +165,19 @@ class StreamForecast:
     total_vram_mb: float | None = None
     """Device total VRAM (MB), or None when unknown. Kept so the forecast can size a partial teardown."""
     per_process_overhead_mb: float = 0.0
-    """Per-process runtime/context VRAM (MB). Kept so the forecast can size a partial teardown."""
+    """VRAM (MB) of the *first/sole* process's runtime context: the one-time CUDA runtime/kernel allocation
+    plus one context. This is what a single fresh process measures and what survives at sole residency, so it
+    sizes ``free_if_alone``. It is NOT the cost of each additional process: on one device the CUDA runtime is
+    loaded once and shared, so every sibling beyond the first costs only ``marginal_process_overhead_mb``."""
+    marginal_process_overhead_mb: float | None = None
+    """VRAM (MB) each *additional* sibling process's context costs once the first process has paid the shared
+    one-time CUDA runtime cost (measured ~10x smaller than ``per_process_overhead_mb`` on a 24GB CUDA card).
+
+    Sizes ``free_after_model_evict`` (and the partial-teardown depth) as ``per_process_overhead + (contexts-1)
+    * marginal`` rather than ``contexts * per_process_overhead``. The latter multiplies the one-time runtime
+    cost by the process count, manufacturing a multi-GB phantom shortfall that flips a co-residable model into
+    falsely demanding sibling-process teardown. None (or a non-positive value) falls back to
+    ``per_process_overhead_mb`` so a directly-constructed forecast keeps its prior, conservative behavior."""
     base_reserve_mb: float | None = None
     """The bounded inference-reserve floor (ComfyUI ``minimum_inference_memory`` / the configured floor).
 
@@ -188,6 +200,19 @@ class StreamForecast:
         """The bounded weight-footprint reserve, falling back to ``reserve_mb`` when unset."""
         return self.base_reserve_mb if self.base_reserve_mb is not None else self.reserve_mb
 
+    @property
+    def _effective_marginal_overhead_mb(self) -> float:
+        """The per-additional-context VRAM cost, falling back to the (larger) first-context overhead when unset.
+
+        Defaulting to ``per_process_overhead_mb`` reproduces the prior ``contexts * per_process_overhead``
+        sizing exactly, so a directly-constructed forecast that does not supply a marginal keeps its old,
+        conservative behavior.
+        """
+        marginal = self.marginal_process_overhead_mb
+        if marginal is not None and marginal > 0:
+            return marginal
+        return self.per_process_overhead_mb
+
     def _fits(self, free_mb: float | None, reserve_mb: float) -> bool:
         """Whether the weights plus ``reserve_mb`` fit within ``free_mb`` (None capacity admits)."""
         if not self.known or free_mb is None:
@@ -207,16 +232,20 @@ class StreamForecast:
     def _weights_dominant(self) -> bool:
         """Whether the model is too heavy to co-reside with even one sibling context (a whole-card model).
 
-        Tearing down sibling *processes* only reclaims their fixed ~1GB CUDA contexts, so it helps a model
-        whose own weights-plus-activations leave no room for another context, not one whose large estimate is
-        a transient activation spike. The gate is keyed on the activation-inclusive peak against the ceiling
-        of sole-occupancy-plus-one-sibling-context (``total - 2*overhead``): a model that cannot fit even
-        there genuinely needs the card. When total VRAM or the per-process overhead is unknown (a
-        directly-constructed forecast) it defaults True, preserving the prior, more eager behavior.
+        Tearing down sibling *processes* only reclaims their CUDA contexts, so it helps a model whose own
+        weights-plus-activations leave no room for another context, not one whose large estimate is a transient
+        activation spike. The gate is keyed on the activation-inclusive peak against the ceiling of
+        sole-occupancy-plus-one-sibling-context (``total - per_process_overhead - marginal``: the loader's full
+        first context plus one additional sibling context): a model that cannot fit even there genuinely needs
+        the card. When total VRAM or the per-process overhead is unknown (a directly-constructed forecast) it
+        defaults True, preserving the prior, more eager behavior.
         """
         if self.total_vram_mb is None or self.per_process_overhead_mb <= 0:
             return True
-        return not self._fits_peak(self.total_vram_mb - 2 * self.per_process_overhead_mb)
+        self_plus_one_sibling = (
+            self.total_vram_mb - self.per_process_overhead_mb - self._effective_marginal_overhead_mb
+        )
+        return not self._fits_peak(self_plus_one_sibling)
 
     @property
     def fits_coresident(self) -> bool:
@@ -284,13 +313,16 @@ class StreamForecast:
 
     @property
     def needs_process_count_reduction(self) -> bool:
-        """A moderate-weight model whose bounded weights are squeezed off the card by the *live* sibling
+        """Return True when the model fits alone but not after sibling models are evicted.
+
+        A moderate-weight model whose bounded weights are squeezed off the card by the *live* sibling
         process contexts, yet which fits once the process count is reduced: the over-commit is cured by
         stopping idle sibling processes, distinct from the sole residency a weight-dominant model needs.
 
-        This is the soak's blind spot (db0 062026-02): four ~4 GB CUDA contexts on a 24 GB card leave under
-        4 GB free even with every sibling model evicted -- below an SDXL checkpoint's ~4.9 GB of weights -- so
-        the model literally cannot load until a sibling *process* stops. ``_weights_dominant`` (and therefore
+        This catches an over-commit the weight-dominant gate misses: four ~4 GB CUDA contexts on a 24 GB card
+        leave under 4 GB free even with every sibling model evicted -- below an SDXL checkpoint's ~4.9 GB of
+        weights -- so the model literally cannot load until a sibling *process* stops. ``_weights_dominant``
+        (and therefore
         ``needs_exclusive_residency`` / ``requires_sibling_teardown``) miss it: their self-plus-one-sibling
         ceiling judges the moderate weights "not card-filling", so no teardown is triggered and the head is
         deferred until the starvation backstop force-admits it into an OOM.
@@ -323,15 +355,18 @@ class StreamForecast:
         """Largest number of co-resident process contexts that still fits the weights plus the reserve.
 
         Lets a teardown stop only as many sibling processes as the model actually needs gone, rather than
-        always collapsing to sole residency. Returns None when it cannot be sized (unknown weights/total, or
-        no per-process overhead to reason about), and at least 1 otherwise (the loading process must survive).
+        always collapsing to sole residency. The loader's own context costs the full ``per_process_overhead``
+        (it pays the one-time CUDA runtime cost); each additional co-resident context costs only the
+        ``marginal``. Returns None when it cannot be sized (unknown weights/total, or no per-process overhead to
+        reason about), and at least 1 otherwise (the loading process must survive).
         """
         if self.weights_mb is None or self.total_vram_mb is None or self.per_process_overhead_mb <= 0:
             return None
         budget = self.total_vram_mb - self.weights_mb - self.reserve_mb
-        if budget <= 0:
+        if budget <= self.per_process_overhead_mb:
             return 1
-        return max(1, int(budget // self.per_process_overhead_mb))
+        additional = int((budget - self.per_process_overhead_mb) // self._effective_marginal_overhead_mb)
+        return max(1, 1 + additional)
 
     def reason(self) -> str:
         """Return a short human-readable explanation, for logging a residency decision."""
@@ -474,12 +509,13 @@ def forecast_weight_streaming(
     reserve_vram_gb: float | None = None,
     num_extra_resident_contexts: int = 0,
     post_processing_reserve_mb: float = 0.0,
+    marginal_process_overhead_mb: float | None = None,
 ) -> StreamForecast:
     """Return a :class:`StreamForecast` for loading ``job``'s model given the device's measured state.
 
     Two derived capacities let the forecast pick the least-disruptive remedy. ``free_if_alone`` is
     ``total - per_process_overhead`` (sole residency: every sibling process stopped, only this process's
-    context left). ``free_after_model_evict`` is ``total - num_inference_processes * per_process_overhead``
+    context left). ``free_after_model_evict`` is ``total - per_process_overhead - (contexts - 1) * marginal``
     (siblings alive but holding no model, so all contexts remain): the best a model can reach without
     stopping a process. Comparing the model against both tells apart one that only streams because of
     co-resident sibling *models* (curable by eviction) from one whose siblings' fixed *contexts* over-commit
@@ -487,11 +523,20 @@ def forecast_weight_streaming(
     processes`` is the count of loaded inference processes (including the one that will load this model);
     values below 1 are treated as 1.
 
+    ``per_process_overhead_mb`` is the cost of the *first/sole* context (the one-time, device-wide CUDA
+    runtime/kernel allocation plus one context), the figure a single fresh process measures. Every *additional*
+    sibling context costs only ``marginal_process_overhead_mb`` because the runtime is loaded once per device
+    and shared. Sizing ``free_after_model_evict`` as ``contexts * per_process_overhead`` (the old behavior,
+    preserved when ``marginal`` is None) multiplies that one-time cost by the process count and manufactures a
+    multi-GB phantom shortfall, which flips a co-residable model into falsely demanding a sibling-process
+    teardown. ``free_if_alone`` keeps the full first-context overhead (the surviving process still pays the
+    one-time cost).
+
     ``num_extra_resident_contexts`` is the count of *non-inference* processes that also hold a CUDA context
     on the card (the safety process when ``safety_on_gpu`` is set). Their contexts are real device-wide
-    commitments that a stopping of idle *inference* siblings cannot reclaim, so they are subtracted from
-    both achievable-free figures; sole residency for a heavy model therefore implies moving them off the
-    GPU too. Never raises.
+    commitments that a stopping of idle *inference* siblings cannot reclaim, so they are subtracted (at the
+    marginal cost, the runtime being already paid) from the achievable-free figure; sole residency for a heavy
+    model therefore implies moving them off the GPU too. Never raises.
     """
     weights_mb = predict_job_weight_mb(job, baseline)
     base_reserve_mb = effective_inference_reserve_mb(
@@ -527,6 +572,15 @@ def forecast_weight_streaming(
     # reserve once it reaches that phase, not pre-charged here against its sampling-phase residency.
     reserve_mb = max(base_reserve_mb, activation_working_set_mb) + max(0.0, post_processing_reserve_mb)
     overhead = max(0.0, per_process_overhead_mb)
+    # The first context pays the one-time CUDA runtime cost; each additional context costs only the marginal.
+    # Default the marginal to the full overhead so an unsupplied marginal reproduces the old contexts*overhead.
+    marginal = (
+        overhead
+        if marginal_process_overhead_mb is None or marginal_process_overhead_mb <= 0
+        else float(
+            marginal_process_overhead_mb,
+        )
+    )
     process_count = max(1, num_inference_processes)
     extra_contexts = max(0, num_extra_resident_contexts)
     if total_vram_mb is None or total_vram_mb <= 0:
@@ -538,8 +592,11 @@ def forecast_weight_streaming(
         # NOT charged here -- a model only "streams unavoidably" when it overflows even that ceiling.
         free_if_alone_mb = max(0.0, float(total_vram_mb) - overhead)
         # free_after_model_evict is the current reality with every process's context materialised, including
-        # the safety-on-GPU context, since stopping idle *inference* siblings cannot reclaim it.
-        free_after_model_evict_mb = max(0.0, float(total_vram_mb) - overhead * (process_count + extra_contexts))
+        # the safety-on-GPU context, since stopping idle *inference* siblings cannot reclaim it. The loading
+        # process's context costs the full first-context overhead (it pays the shared one-time runtime cost);
+        # every other inference and safety context costs only the marginal.
+        additional_contexts = (process_count - 1) + extra_contexts
+        free_after_model_evict_mb = max(0.0, float(total_vram_mb) - overhead - marginal * additional_contexts)
     return StreamForecast(
         weights_mb=weights_mb,
         reserve_mb=reserve_mb,
@@ -549,6 +606,7 @@ def forecast_weight_streaming(
         free_after_model_evict_mb=free_after_model_evict_mb,
         total_vram_mb=float(total_vram_mb) if total_vram_mb is not None and total_vram_mb > 0 else None,
         per_process_overhead_mb=overhead,
+        marginal_process_overhead_mb=marginal,
     )
 
 
@@ -887,9 +945,9 @@ class VramBudget:
 class RamBudget:
     """Decides whether measured available system RAM can absorb another job's predicted RAM cost.
 
-    The RAM analogue of :class:`VramBudget`. ``high_memory_mode`` keeps model weights resident in
-    system RAM as well as VRAM; with several processes that can exhaust RAM and force the OS to page
-    to disk, which collapses throughput.
+    The RAM analogue of :class:`VramBudget`. The worker keeps recently-used model weights resident in
+    system RAM for fast reload; with several processes that can exhaust RAM and force the OS to page to
+    disk, which collapses throughput.
     The available-RAM figure is system-wide (it already reflects every process), so like the VRAM
     budget this needs no per-process bookkeeping.
     """

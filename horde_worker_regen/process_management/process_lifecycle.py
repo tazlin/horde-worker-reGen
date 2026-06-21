@@ -369,7 +369,6 @@ class ProcessLifecycleManager:
                     cpu_only,
                 ),
                 kwargs={
-                    "high_memory_mode": bridge_data.high_memory_mode,
                     "amd_gpu": self._amd_gpu,
                     "directml": self._directml,
                     "dry_run_skip_safety": bridge_data.dry_run_skip_safety,
@@ -544,8 +543,6 @@ class ProcessLifecycleManager:
                 self.num_processes_launched,
             ),
             kwargs={
-                "very_high_memory_mode": bridge_data.very_high_memory_mode,
-                "high_memory_mode": bridge_data.high_memory_mode,
                 "amd_gpu": self._amd_gpu,
                 "directml": self._directml,
                 "vram_heavy_models": vram_heavy_models,

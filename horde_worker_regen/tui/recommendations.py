@@ -50,7 +50,6 @@ class Recommendation:
 _LOW_DUTY_CYCLE = 50.0
 _HIGH_VRAM_FRACTION = 0.92
 _HIGH_FAULT_RATE = 0.10
-_BIG_GPU_VRAM_MB = 20_000
 
 
 def analyze(snapshot: WorkerStateSnapshot) -> list[Recommendation]:
@@ -72,7 +71,6 @@ def analyze(snapshot: WorkerStateSnapshot) -> list[Recommendation]:
     _check_vram_pressure(snapshot, recommendations)
     _check_duty_cycle(snapshot, recommendations)
     _check_idle(snapshot, recommendations)
-    _check_memory_mode(snapshot, recommendations)
 
     if config.extra_slow_worker and config.max_batch > 1:
         recommendations.append(
@@ -143,8 +141,6 @@ def _check_duty_cycle(snapshot: WorkerStateSnapshot, out: list[Recommendation]) 
             f"GPU duty cycle is {duty:.0f}% with work queued. The GPU is idling between jobs, usually "
             "RAM→VRAM reloads. "
         )
-        if not snapshot.config.high_memory_mode:
-            detail += "Enabling high_memory_mode keeps models resident and cuts reload thrash. "
         if snapshot.config.max_threads == 1 or snapshot.config.queue_size == 0:
             detail += "Raising max_threads/queue_size lets a second job stage while one samples."
         out.append(Recommendation(Severity.SUGGESTION, f"Low GPU duty cycle ({duty:.0f}%)", detail.strip()))
@@ -160,22 +156,5 @@ def _check_idle(snapshot: WorkerStateSnapshot, out: list[Recommendation]) -> Non
                 "Frequently idle (low demand)",
                 f"~{minutes:.0f} minutes without jobs this session. Offering more models or raising "
                 "max_power can increase the jobs you receive.",
-            ),
-        )
-
-
-def _check_memory_mode(snapshot: WorkerStateSnapshot, out: list[Recommendation]) -> None:
-    """Suggest high_memory_mode on a big GPU that has it disabled."""
-    config = snapshot.config
-    if config.high_memory_mode or config.extra_slow_worker:
-        return
-    biggest = max((process.total_vram_mb for process in snapshot.processes), default=0)
-    if biggest > _BIG_GPU_VRAM_MB and config.max_threads == 1:
-        out.append(
-            Recommendation(
-                Severity.SUGGESTION,
-                "Large GPU without high_memory_mode",
-                f"This GPU reports {biggest} MB VRAM but high_memory_mode is off. Enabling it keeps models "
-                "resident and improves throughput.",
             ),
         )

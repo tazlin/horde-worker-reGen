@@ -19,8 +19,6 @@ def _compute_extra_slow_overrides(
     *,
     high_performance_mode: bool,
     moderate_performance_mode: bool,
-    high_memory_mode: bool,
-    very_high_memory_mode: bool,
     queue_size: int,
     max_threads: int,
     preload_timeout: int,
@@ -41,14 +39,6 @@ def _compute_extra_slow_overrides(
         overrides["moderate_performance_mode"] = False
         if log:
             logger.warning("Extra slow worker is enabled, so moderate_performance_mode has been set to False.")
-    if high_memory_mode:
-        overrides["high_memory_mode"] = False
-        if log:
-            logger.warning("Extra slow worker is enabled, so high_memory_mode has been set to False.")
-    if very_high_memory_mode:
-        overrides["very_high_memory_mode"] = False
-        if log:
-            logger.warning("Extra slow worker is enabled, so very_high_memory_mode has been set to False.")
     if queue_size > 0:
         overrides["queue_size"] = 0
         if log:
@@ -123,87 +113,30 @@ def cap_queue_size(*, max_threads: int, queue_size: int, log: bool = False) -> i
     return queue_size
 
 
-def _resolve_high_memory_from_very_high(
-    *,
-    very_high_memory_mode: bool,
-    high_memory_mode: bool,
-    log: bool = False,
-) -> bool:
-    """Ensure very_high_memory_mode implies high_memory_mode.
-
-    Returns:
-        The resolved high_memory_mode value.
-    """
-    if very_high_memory_mode and not high_memory_mode:
-        if log:
-            logger.debug("very_high_memory_mode is enabled, so high_memory_mode has been set to True.")
-        return True
-    return high_memory_mode
-
-
-def _apply_high_memory_constraints(
-    *,
-    high_memory_mode: bool,
-    queue_size: int,
-    unload_models_from_vram_often: bool,
-    cycle_process_on_model_change: bool,
-    log: bool = False,
-) -> bool:
-    """Apply constraints and emit warnings for high_memory_mode.
-
-    Returns:
-        The adjusted cycle_process_on_model_change value.
-    """
-    if not high_memory_mode:
-        return cycle_process_on_model_change
-
-    if log:
-        if queue_size == 0:
-            logger.warning(
-                "High memory mode is enabled, you should consider setting queue_size to 1 or higher. "
-                "Increasing this value increases system memory usage. See the bridgeData_template.yaml for more "
-                "information.",
-            )
-        if unload_models_from_vram_often:
-            logger.warning(
-                "High memory mode is enabled, you should consider setting unload_models_from_vram_often to False.",
-            )
-
-    if cycle_process_on_model_change:
-        if log:
-            logger.warning(
-                "High memory mode is enabled, so cycle_process_on_model_change has been set to False.",
-            )
-        return False
-
-    return cycle_process_on_model_change
-
-
 def _warn_lease_without_residency(
     *,
     gpu_sampling_lease_enabled: bool,
-    high_memory_mode: bool,
     unload_models_from_vram_often: bool,
     log: bool = False,
 ) -> bool:
-    """Detect (and optionally warn about) enabling the GPU sampling lease without residency.
+    """Detect (and optionally warn about) enabling the GPU sampling lease without model residency.
 
-    The lease brackets the diffusion model's VRAM load together with the denoise loop, so without
-    residency each process's RAM->VRAM transfer is serialized behind sampling instead of
-    overlapping it — usually a throughput loss rather than a gain.
+    The lease brackets the diffusion model's RAM->VRAM load together with the denoise loop so a spare
+    process can stage its next pipeline while another samples. With ``unload_models_from_vram_often`` the
+    model is fully evicted between jobs, so there is no staged residency to overlap and the lease serializes
+    the reload behind sampling instead — usually a throughput loss rather than a gain.
 
     Returns:
         True if the lease is enabled in a non-resident (counterproductive) configuration.
     """
     if not gpu_sampling_lease_enabled:
         return False
-    non_resident = unload_models_from_vram_often or not high_memory_mode
+    non_resident = unload_models_from_vram_often
     if non_resident and log:
         logger.warning(
-            "gpu_sampling_lease_enabled is set without VRAM residency (high_memory_mode=true + "
-            "unload_models_from_vram_often=false). The lease brackets the model's VRAM load as "
-            "well as the denoise loop, so without residency it serializes RAM->VRAM transfers "
-            "behind sampling and typically reduces throughput.",
+            "gpu_sampling_lease_enabled is set with unload_models_from_vram_often=true, which fully evicts "
+            "the model between jobs. The lease brackets the model's RAM->VRAM load as well as the denoise "
+            "loop, so without residency it serializes reloads behind sampling and typically reduces throughput.",
         )
     return non_resident
 
@@ -313,15 +246,6 @@ class reGenBridgeData(CombinedHordeBridgeData):
     be favored when popping a job.
     """
 
-    high_memory_mode: bool = Field(default=False)
-    """Indicates that the worker should consume more memory to improve performance."""
-
-    very_high_memory_mode: bool = Field(default=False)
-    """Indicates that the worker should consume even more memory to improve performance.
-
-    This has data-center grade cards in mind, and is not recommended for consumer grade cards.
-    """
-
     high_performance_mode: bool = Field(default=False)
     """If you have a 4090 or better, set this to true to enable high performance mode."""
 
@@ -340,11 +264,11 @@ class reGenBridgeData(CombinedHordeBridgeData):
     When true, at most `gpu_sampling_lease_slots` inference processes run the denoising loop at
     once; any extra processes stage their next pipeline (model load, prompt encode) concurrently,
     so when a sampling process finishes the next starts immediately — keeping the GPU busy
-    between jobs instead of idling during per-job warm-up. Trades extra resident VRAM (each
-    process keeps its model loaded) for higher GPU utilization, and **requires** residency
-    (`high_memory_mode: true` + `unload_models_from_vram_often: false`) to help: the lease
-    brackets the diffusion model's VRAM load as well as the denoise loop, so without residency it
-    serializes the RAM->VRAM transfer behind sampling rather than overlapping it."""
+    between jobs instead of idling during per-job warm-up. Trades extra resident memory (each
+    process keeps its model staged) for higher GPU utilization, and is counterproductive with
+    `unload_models_from_vram_often: true`: the lease brackets the diffusion model's RAM->VRAM load
+    as well as the denoise loop, so when the model is fully evicted between jobs it serializes the
+    reload behind sampling rather than overlapping it."""
 
     gpu_sampling_lease_slots: int = Field(default=1, ge=1)
     """How many inference processes may run the GPU denoising loop at once when
@@ -436,10 +360,10 @@ class reGenBridgeData(CombinedHordeBridgeData):
     alchemy_ram_headroom_mb: int = Field(default=2048, ge=0)
     """Minimum effective available system RAM (MB) required before popping an alchemy form.
 
-    The RAM analogue of `alchemy_vram_headroom_mb`: in `high_memory_mode`, graph alchemy forms load
-    weights into system RAM too, so alchemy is held back when available RAM (minus RAM already committed
-    by in-flight work) falls below this floor, keeping it from pushing a memory-resident worker into
-    paging. Read from the live system RAM figure; when unavailable, alchemy does not gate on RAM.
+    The RAM analogue of `alchemy_vram_headroom_mb`: graph alchemy forms load weights into system RAM too,
+    so alchemy is held back when available RAM (minus RAM already committed by in-flight work) falls below
+    this floor, keeping it from pushing a memory-resident worker into paging. Read from the live system RAM
+    figure; when unavailable, alchemy does not gate on RAM.
     """
 
     enable_vram_budget: bool = Field(default=True)
@@ -583,8 +507,6 @@ class reGenBridgeData(CombinedHordeBridgeData):
             for field_name, value in _compute_extra_slow_overrides(
                 high_performance_mode=self.high_performance_mode,
                 moderate_performance_mode=self.moderate_performance_mode,
-                high_memory_mode=self.high_memory_mode,
-                very_high_memory_mode=self.very_high_memory_mode,
                 queue_size=self.queue_size,
                 max_threads=self.max_threads,
                 preload_timeout=self.preload_timeout,
@@ -606,23 +528,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
             log=True,
         )
 
-        self.high_memory_mode = _resolve_high_memory_from_very_high(
-            very_high_memory_mode=self.very_high_memory_mode,
-            high_memory_mode=self.high_memory_mode,
-            log=True,
-        )
-
-        self.cycle_process_on_model_change = _apply_high_memory_constraints(
-            high_memory_mode=self.high_memory_mode,
-            queue_size=self.queue_size,
-            unload_models_from_vram_often=self.unload_models_from_vram_often,
-            cycle_process_on_model_change=self.cycle_process_on_model_change,
-            log=True,
-        )
-
         _warn_lease_without_residency(
             gpu_sampling_lease_enabled=self.gpu_sampling_lease_enabled,
-            high_memory_mode=self.high_memory_mode,
             unload_models_from_vram_often=self.unload_models_from_vram_often,
             log=True,
         )
