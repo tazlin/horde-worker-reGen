@@ -25,6 +25,7 @@ from horde_worker_regen.tui.config_form import (
     FieldKind,
     coerce_value,
     current_value,
+    format_number,
     load_config,
     save_config,
 )
@@ -33,6 +34,9 @@ from horde_worker_regen.tui.widgets.model_manager import ModelManagerView
 
 _FIELD_BY_KEY = {field.key: field for field in CONFIG_FIELDS}
 _MODELS_SECTION = "Models"
+
+# Which sub-tab a section lives on, so a validation error can name (and jump to) the right page.
+_SECTION_TO_SUBTAB: dict[str, str] = {section: label for label, sections in CONFIG_SUBTABS for section in sections}
 
 
 def _subtab_id(label: str) -> str:
@@ -240,7 +244,7 @@ class ConfigEditorView(Vertical):
         bounds = ""
         if field.minimum is not None and field.maximum is not None:
             unit = f" {field.unit}" if field.unit else ""
-            bounds = f"  ({field.minimum}–{field.maximum}{unit})"
+            bounds = f"  ({format_number(field.minimum)}–{format_number(field.maximum)}{unit})"
         elif field.unit:
             bounds = f"  ({field.unit})"
         marker = "  ⟳" if field.requires_restart else ""
@@ -287,7 +291,7 @@ class ConfigEditorView(Vertical):
                 classes="config-field",
             )
         else:
-            input_type = "integer" if field.kind is FieldKind.INT else "text"
+            input_type = {FieldKind.INT: "integer", FieldKind.FLOAT: "number"}.get(field.kind, "text")
             field_input = Input(
                 value=str(value),
                 id=widget_id,
@@ -407,16 +411,45 @@ class ConfigEditorView(Vertical):
         self._set_status("Reloaded from disk.", "green")
 
     def _save(self) -> bool:
-        """Collect widget values into the YAML and write it. Returns False on a validation error."""
-        try:
-            updates = self._collect_values()
-        except ValueError as error:
-            self._set_status(str(error), "red")
-            return False
+        """Validate and write only the fields the operator changed. Returns False on a validation error.
 
-        for field, value in updates:
-            present = self._key_present(field.key)
-            if present or value != field.default():
+        Saving only changed fields is a deliberate anti-frustration choice: a value that is already
+        out of bounds on disk (or that an older config simply omits) cannot block an unrelated edit,
+        a no-op Save leaves the file and its mtime untouched so the running worker is not needlessly
+        hot-reloaded, and any validation error can only ever concern a field the operator just touched.
+        All errors are surfaced together and the editor jumps to the first one, so nothing is hidden on
+        another sub-tab.
+        """
+        try:
+            current = self._widget_state()
+        except Exception:  # noqa: BLE001 - a DOM read glitch must not strand the operator on an unsaveable form
+            current = None
+        baseline = self._clean_state
+        if current is None or baseline is None:
+            # No reliable baseline to diff against: coerce every field rather than risk dropping edits.
+            changed_keys = {field.key for field in CONFIG_FIELDS}
+        else:
+            changed_keys = {key for key, value in current.items() if baseline.get(key) != value}
+
+        errors: list[tuple[ConfigField, str]] = []
+        coerced: list[tuple[ConfigField, object]] = []
+        for field in CONFIG_FIELDS:
+            if field.key not in changed_keys:
+                continue
+            try:
+                coerced.append((field, self._coerce_field(field)))
+            except ValueError as error:
+                errors.append((field, str(error)))
+
+        if errors:
+            self._report_save_errors(errors)
+            return False
+        if not coerced:
+            self._set_status("No changes to save.", "green")
+            return True
+
+        for field, value in coerced:
+            if self._key_present(field.key) or value != field.default():
                 self._data[field.key] = value
 
         try:
@@ -432,32 +465,44 @@ class ConfigEditorView(Vertical):
         )
         return True
 
-    def _collect_values(self) -> list[tuple[ConfigField, object]]:
-        """Read and coerce every field's widget value (raises ValueError on bad input)."""
-        collected: list[tuple[ConfigField, object]] = []
-        for field in CONFIG_FIELDS:
-            if field.kind is FieldKind.MODEL_LIST:
-                editor = self.query_one(f"#mle-root-{field.key}", ModelListEditor)
-                collected.append((field, coerce_value(field, editor.values())))
-                continue
-            if field.kind is FieldKind.SELECT_MULTI:
-                chosen = [
-                    choice for choice in field.choices if self.query_one(f"#cfg-{field.key}-{choice}", Checkbox).value
-                ]
-                collected.append((field, coerce_value(field, chosen)))
-                continue
+    def _coerce_field(self, field: ConfigField) -> object:
+        """Read one field's widget value and coerce it to its typed YAML value (raises ValueError)."""
+        if field.kind is FieldKind.MODEL_LIST:
+            return coerce_value(field, self.query_one(f"#mle-root-{field.key}", ModelListEditor).values())
+        if field.kind is FieldKind.SELECT_MULTI:
+            chosen = [
+                choice for choice in field.choices if self.query_one(f"#cfg-{field.key}-{choice}", Checkbox).value
+            ]
+            return coerce_value(field, chosen)
 
-            widget = self.query_one(f"#cfg-{field.key}")
-            if isinstance(widget, Switch):
-                raw: object = widget.value
-            elif isinstance(widget, TextArea):
-                raw = widget.text
-            elif isinstance(widget, Input):
-                raw = widget.value
-            else:
-                continue
-            collected.append((field, coerce_value(field, raw)))
-        return collected
+        widget = self.query_one(f"#cfg-{field.key}")
+        if isinstance(widget, Switch):
+            raw: object = widget.value
+        elif isinstance(widget, TextArea):
+            raw = widget.text
+        elif isinstance(widget, Input):
+            raw = widget.value
+        else:
+            raw = ""
+        return coerce_value(field, raw)
+
+    def _report_save_errors(self, errors: list[tuple[ConfigField, str]]) -> None:
+        """Surface every validation error at once and jump to the first offending field.
+
+        The operator may have edited fields across several sub-tabs, so a terse message that silently
+        referred to a field on a hidden page is exactly the trap this avoids: switch to the first
+        offending field's sub-tab, focus it, and list every problem (each message already names its
+        field).
+        """
+        first_field = errors[0][0]
+        tab_label = _SECTION_TO_SUBTAB.get(first_field.section)
+        with contextlib.suppress(Exception):
+            if tab_label is not None:
+                self.query_one("#config-subtabs", TabbedContent).active = _subtab_id(tab_label)
+            self.query_one(f"#cfg-{first_field.key}").focus()
+        details = "; ".join(message for _field, message in errors)
+        location = f"  See the {tab_label} tab." if tab_label else ""
+        self._set_status(f"Couldn't save: {details}.{location}", "red")
 
     def _key_present(self, key: str) -> bool:
         """Whether a key already exists in the loaded YAML mapping."""
