@@ -19,6 +19,10 @@ bootstrap.py
 download_models.py
 run_worker.py
 convert_config_to_env.py
+# One-touch full in-place upgrade (re-runs the installer over this folder); update-runtime.* below is the
+# deps-only re-sync. Both must ship so an installed worker can self-update.
+update.cmd
+update.sh
 update-runtime.cmd
 update-runtime.sh
 update-runtime-rocm.sh
