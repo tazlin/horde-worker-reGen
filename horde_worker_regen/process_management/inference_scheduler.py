@@ -299,6 +299,16 @@ class InferenceScheduler:
         # multiplying the one-time cost by the process count. None until seen.
         self._measured_idle_context_residency_mb: float | None = None
         self._idle_residency_process_count: int = 0
+        # Highest device-wide *used* VRAM observed while every loaded inference process is idle with no model
+        # resident: the floor reclaim can never get below. The clean baseline above keeps the *minimum* on the
+        # assumption a model's cache returns to the device when it unloads; when that assumption fails (the
+        # allocator/runtime retains multi-GB per context, as a real inference context does once it has loaded a
+        # checkpoint), the *effective* floor is the maximum, not the minimum. A probe measured against a minimal
+        # holder under-counts this, so once the effective floor is known it supersedes the probe in deriving the
+        # per-context marginal -- otherwise the forecast believes in reclaimable VRAM the device never returns
+        # and routes every load into an evict-all admit. None until seen.
+        self._measured_effective_idle_used_mb: float | None = None
+        self._effective_idle_process_count: int = 0
         # Set while a whole-card model is being given sole residency by stopping idle sibling processes to
         # reclaim their CUDA contexts (a context is only freed by the process exiting). Holds the model name
         # so the teardown is logged once and the process count is restored once the exclusive job drains.
@@ -587,6 +597,16 @@ class InferenceScheduler:
         if self._measured_idle_context_residency_mb is None or used_mb < self._measured_idle_context_residency_mb:
             self._measured_idle_context_residency_mb = used_mb
             self._idle_residency_process_count = process_count
+        # The effective floor is the *worst* (highest) fully-idle, fully-evicted reading: the VRAM reclaim
+        # provably cannot return. Kept per the live context count so a later, fewer-process reading does not
+        # mask an earlier over-commit.
+        if (
+            self._measured_effective_idle_used_mb is None
+            or process_count > self._effective_idle_process_count
+            or (process_count == self._effective_idle_process_count and used_mb > self._measured_effective_idle_used_mb)
+        ):
+            self._measured_effective_idle_used_mb = used_mb
+            self._effective_idle_process_count = process_count
 
     def _marginal_process_overhead_mb(self) -> float | None:
         """Return the per-additional-context VRAM cost (MB), or None to fall back to the first-context overhead.
@@ -600,21 +620,55 @@ class InferenceScheduler:
         inconsistent reading) -- in which case the forecast conservatively reuses the first-context overhead
         per additional context.
         """
-        if self._measured_marginal_overhead_mb > 0:
-            return self._measured_marginal_overhead_mb
-        residency = self._measured_idle_context_residency_mb
-        count = self._idle_residency_process_count
-        if residency is None or count < 2:
-            return None
         per_process = self._per_process_overhead_mb()
-        if per_process <= 0 or residency <= per_process:
-            return None
-        return (residency - per_process) / (count - 1)
+
+        def _derive(residency: float | None, count: int) -> float | None:
+            if residency is None or count < 2 or per_process <= 0 or residency <= per_process:
+                return None
+            return (residency - per_process) / (count - 1)
+
+        # The measured *effective* floor is ground truth for what reclaim achieves: when a real inference
+        # context retains more cache than the probe's minimal holder allocated, the probe under-counts the
+        # marginal and the forecast over-counts reclaimable VRAM. Take the larger of the probe estimate and the
+        # effective-floor derivation so the forecast never believes in headroom the device will not return; the
+        # effective floor only rises above the probe once contexts genuinely over-commit (the threads>1 regime),
+        # so a roomy card keeps the probe estimate unchanged.
+        effective_derived = _derive(self._measured_effective_idle_used_mb, self._effective_idle_process_count)
+        probe = self._measured_marginal_overhead_mb if self._measured_marginal_overhead_mb > 0 else None
+        candidates = [c for c in (probe, effective_derived) if c is not None]
+        if candidates:
+            return max(candidates)
+        # No probe and no effective floor: fall back to the clean idle-residency derivation (startup path).
+        return _derive(self._measured_idle_context_residency_mb, self._idle_residency_process_count)
 
     def _whole_card_residency_enabled(self) -> bool:
         """Whether preventative whole-card exclusive residency is on (config, tolerant of mocked config)."""
         enabled = self._runtime_config.bridge_data.whole_card_exclusive_residency
         return enabled is True
+
+    def _max_coresident_for_peak_mb(self, peak_mb: float, reserve_mb: float) -> int | None:
+        """Largest live inference-process count that still fits ``peak_mb`` plus ``reserve_mb``.
+
+        Sizes the context-reduction depth from the *same* conservative figure the VRAM verdict rejects on
+        (the burden estimate), not the forecast's resident-weight estimate. The two estimators differ -- the
+        forecast judges co-residence from the resident weight footprint while the admission verdict uses the
+        fuller per-job burden peak -- so a moderate head can read co-resident in the forecast yet be rejected
+        by the verdict every tick, the gap that routes it into the evict-all admit. Reasoning the teardown
+        depth from the verdict's own peak makes the structural remedy fire exactly when admission would
+        otherwise reject and thrash. The loader's first context costs the full one-time overhead; each
+        additional co-resident context costs only the marginal. Returns None when it cannot be sized.
+        """
+        total_mb = self._process_map.get_reported_total_vram_mb()
+        per_process = self._per_process_overhead_mb()
+        if total_mb is None or per_process <= 0:
+            return None
+        marginal = self._marginal_process_overhead_mb() or per_process
+        if marginal <= 0:
+            return None
+        budget = total_mb - peak_mb - reserve_mb
+        if budget <= per_process:
+            return 1
+        return max(1, 1 + int((budget - per_process) // marginal))
 
     def _forecast_streaming(
         self,
@@ -677,6 +731,7 @@ class InferenceScheduler:
         forecast: StreamForecast,
         *,
         announce: bool,
+        target_override: int | None = None,
     ) -> None:
         """Claim the device for a whole-card model: stop idle siblings and move safety off-GPU.
 
@@ -696,7 +751,10 @@ class InferenceScheduler:
         self._whole_card_forecast = forecast
         self._whole_card_cooldown_until = time.time() + self._whole_card_cooldown_seconds()
 
-        target = forecast.max_resident_processes() or 1
+        # ``target_override`` lets a caller size the depth from the admission verdict's rejected peak rather
+        # than the forecast's lighter resident-weight estimate, for the activation-peak context over-commit the
+        # weight-based gates leave co-resident.
+        target = target_override if target_override is not None else (forecast.max_resident_processes() or 1)
         current = self._process_map.num_loaded_inference_processes()
         after = current
         if target < current:
@@ -1684,6 +1742,46 @@ class InferenceScheduler:
                                 self._unservable_admit_notified[job.model] = True
                             return False
                         self._unservable_admit_notified.pop(job.model, None)
+
+                        # Before evicting every resident model and admitting the head exclusively, check whether
+                        # the live process *contexts* are the over-commit rather than the resident models. The
+                        # weight-based teardown gates above leave a moderate head co-resident because its weights
+                        # fit after a model eviction, but its activation peak does not fit while this many
+                        # contexts are live (the threads>1 regime, where each extra context retains VRAM the
+                        # allocator never returns). When more inference contexts are live than the head's
+                        # weights-plus-reserve can co-reside with (``max_resident_processes``, sized from the
+                        # measured per-context cost), reducing the process count is the structural remedy: it
+                        # returns a context's retained VRAM so the head and a sibling model co-reside and
+                        # pipeline. Evicting every model and loading exclusively instead strands the models the
+                        # next jobs reuse and churns a full reload per job. Only idle siblings are stopped (the
+                        # all-idle branch we are in), and the residency cooldown restores concurrency afterwards.
+                        # The depth is sized from the verdict's own rejected peak (not the forecast's lighter
+                        # resident-weight estimate) so the reduction fires exactly when admission would reject.
+                        max_resident = None
+                        if vram_verdict.predicted_mb is not None:
+                            max_resident = self._max_coresident_for_peak_mb(
+                                vram_verdict.predicted_mb,
+                                vram_verdict.reserve_mb,
+                            )
+                        if (
+                            self._whole_card_residency_enabled()
+                            and max_resident is not None
+                            and self._process_map.num_loaded_inference_processes() > max_resident
+                        ):
+                            first_time = not self._job_tracker.is_admitted_exclusive(job)
+                            self._job_tracker.mark_admitted_exclusive(job)
+                            self._establish_whole_card_residency(
+                                job,
+                                forecast,
+                                announce=first_time,
+                                target_override=max_resident,
+                            )
+                            self.unload_models_from_vram(
+                                available_process,
+                                under_pressure=True,
+                                for_head_of_queue=True,
+                            )
+                            return False
 
                         self.unload_models(under_pressure=True, for_head_of_queue=True)
                         if not self._job_tracker.is_admitted_over_budget(job):
