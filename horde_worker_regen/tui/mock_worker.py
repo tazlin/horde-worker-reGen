@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
     RecentJobRecord,
     SupervisorChannel,
     SupervisorCommand,
+    SystemMemorySnapshot,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -245,6 +246,29 @@ class _MockSafetyProcess:
 
 _GB = 1024**3
 
+
+def _mock_system_memory(processes: list[_MockProcess]) -> SystemMemorySnapshot:
+    """A believable system-RAM picture for the fake worker: per-role RSS against a 64 GB machine."""
+    inference_rss = sum(p.ram_bytes for p in processes)
+    orchestrator_rss = 1 * _GB
+    safety_rss = 2 * _GB
+    download_rss = 1 * _GB // 2
+    worker_total = inference_rss + orchestrator_rss + safety_rss + download_rss
+    total = 64 * _GB
+    # Leave the machine comfortably below its ceiling: a few GB of other apps on top of the worker.
+    available = max(_GB, total - worker_total - 6 * _GB)
+    return SystemMemorySnapshot(
+        total_bytes=total,
+        available_bytes=available,
+        worker_rss_by_role={
+            "orchestrator": orchestrator_rss,
+            "inference": inference_rss,
+            "safety": safety_rss,
+            "download": download_rss,
+        },
+    )
+
+
 # A synthetic background-download lifecycle so the Downloads tab is demonstrable under --process-mode fake.
 _MOCK_DOWNLOAD_QUEUE: list[tuple[str, str, int]] = [
     ("Flux.1-Schnell fp8 (Compact)", "image model", 12 * _GB),
@@ -443,6 +467,7 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
             gpu_utilization_busy_fraction=round(random.uniform(0.55, 0.95), 2),
             vram_high_water_mb_per_process={p.process_id: p.vram_high_water_mb for p in processes},
             disk_free_bytes={"G:\\": 412 * 1024**3},
+            system_memory=_mock_system_memory(processes),
             downloads=downloads.snapshot(),
             download_plan=downloads.plan,
         )

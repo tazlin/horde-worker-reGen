@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         DownloadPlanSummary,
         DownloadStatusSnapshot,
     )
+    from horde_worker_regen.process_management.system_memory import SystemMemorySummary
 
 
 def _human_bytes(num_bytes: float | None) -> str:
@@ -109,6 +110,7 @@ class StatusReporter:
         jobs_being_safety_checked: int,
         jobs_in_progress: int,
         total_ram_gigabytes: int,
+        system_memory: SystemMemorySummary | None = None,
         download_status: DownloadStatusSnapshot | None = None,
         download_plan: DownloadPlanSummary | None = None,
     ) -> float:
@@ -139,6 +141,8 @@ class StatusReporter:
             jobs_being_safety_checked: Number of jobs being safety checked.
             jobs_in_progress: Number of jobs in progress.
             total_ram_gigabytes: Total RAM in gigabytes.
+            system_memory: Live system-RAM summary (total/available and the worker's per-role share), or
+                None when not yet sampled.
             download_status: Live background-download status, or None when no download process runs.
             download_plan: The config's disk-budget summary, or None when the reference is not loaded.
 
@@ -180,6 +184,10 @@ class StatusReporter:
         )
 
         logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
+
+        # Print system RAM info (total in use, the worker's per-role share, and what's left)
+        if self._print_system_memory(logging_function, system_memory):
+            logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
 
         # Print downloads info (only when there is something to show)
         if self._print_downloads(logging_function, download_status, download_plan):
@@ -382,6 +390,41 @@ class StatusReporter:
             logging_function(
                 f"  <fg #ff5555>Failed: {failure.model_name} [{failure.feature}]: {failure.reason}</>",
             )
+
+    @staticmethod
+    def _print_system_memory(
+        logging_function: Callable[..., None],
+        system_memory: SystemMemorySummary | None,
+    ) -> bool:
+        """Print the system-RAM section; return whether anything was printed.
+
+        Three lines: the whole-machine in-use/total picture, the worker's own subtotal broken down by
+        what each process role is holding, and what the rest of the machine (OS and other apps) is using.
+        Nothing is printed when no sample exists or the total reads as zero (a degenerate cold start).
+        """
+        if system_memory is None or system_memory.total_bytes <= 0:
+            return False
+
+        from horde_worker_regen.process_management.system_memory import ROLE_LABELS
+
+        used_fraction = system_memory.used_fraction
+        used_pct = f" ({used_fraction * 100:.0f}%)" if used_fraction is not None else ""
+
+        logging_function("<b>System RAM:</b>")
+        logging_function(
+            f"  In use: {_human_bytes(system_memory.used_bytes)} / {_human_bytes(system_memory.total_bytes)}"
+            f"{used_pct} | available {_human_bytes(system_memory.available_bytes)}",
+        )
+
+        role_items = system_memory.nonzero_role_items()
+        breakdown = " | ".join(f"{ROLE_LABELS.get(role, role)} {_human_bytes(value)}" for role, value in role_items)
+        worker_line = f"  Worker: {_human_bytes(system_memory.worker_total_bytes)} total"
+        if breakdown:
+            worker_line += f" ({breakdown})"
+        logging_function(f"<fg #7dcea0>{worker_line}</>")
+
+        logging_function(f"  Other (OS + apps): {_human_bytes(system_memory.other_bytes)}")
+        return True
 
     def _print_worker_info(
         self,

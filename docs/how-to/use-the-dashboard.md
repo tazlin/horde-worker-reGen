@@ -57,7 +57,7 @@ window open.
 
 | Tab | What it shows |
 |-----|---------------|
-| **Overview** | Headline metrics (jobs submitted/faulted, queue depth, GPU duty cycle, kudos/hr), worker identity, and a per-process summary. |
+| **Overview** | Headline metrics (jobs submitted/faulted, queue depth, GPU duty cycle, kudos/hr), a system-RAM line (machine in-use/total plus the worker's own footprint broken down by inference/safety/orchestrator/download), worker identity, and a per-process summary. |
 | **Live** | One panel per inference process: state, current model and job, a sampling progress bar, iterations/second, VRAM/RAM (current and peak), and heartbeat freshness. |
 | **Downloads** | Model download progress, with pause/resume and an optional bandwidth cap. |
 | **Logs** | Tail `logs/bridge.log` or any subprocess `logs/bridge_n.log`, with level and substring filters. These are the same files the worker already writes (see [Logs](../reference/logs.md)). |

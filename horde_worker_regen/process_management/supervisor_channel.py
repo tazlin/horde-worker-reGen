@@ -27,8 +27,9 @@ if TYPE_CHECKING:
 
     from horde_worker_regen.process_management.process_info import HordeProcessInfo
     from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
+    from horde_worker_regen.process_management.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 5
+SUPERVISOR_PROTOCOL_VERSION = 6
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -39,6 +40,8 @@ v4 added the lightweight :class:`WorkerLivenessFrame`, emitted on its own cadenc
 can judge worker liveness independently of full-snapshot production.
 v5 added the resolved model ``baseline`` to ``JobQueueEntry`` and ``RecentJobRecord`` so the queue and
 recent-jobs tables can show a model's baseline alongside its name.
+v6 added the snapshot's ``system_memory`` field (:class:`SystemMemorySnapshot`): total/available RAM and
+the worker's per-role RSS share.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -447,6 +450,41 @@ class WholeCardResidencyStatus(BaseModel):
     """The forecast's largest co-resident process count that still avoids streaming."""
 
 
+class SystemMemorySnapshot(BaseModel):
+    """The system-RAM picture and the worker's per-role share of it, for the supervisor/TUI.
+
+    The wire projection of :class:`~horde_worker_regen.process_management.system_memory.SystemMemorySummary`.
+    Only the raw figures travel; the derived breakdown (used, other, fractions) is recomputed on the
+    receiving side via :meth:`to_summary` so the math lives in exactly one place.
+    """
+
+    total_bytes: int = 0
+    """Total physical RAM on the machine."""
+    available_bytes: int = 0
+    """RAM the OS reports as available without paging."""
+    worker_rss_by_role: dict[str, int] = Field(default_factory=dict)
+    """Per-role resident-set sizes (bytes) for the worker's own processes (see the ``ROLE_*`` keys)."""
+
+    @classmethod
+    def from_summary(cls, summary: SystemMemorySummary) -> SystemMemorySnapshot:
+        """Project a worker-side :class:`SystemMemorySummary` onto the wire model."""
+        return cls(
+            total_bytes=summary.total_bytes,
+            available_bytes=summary.available_bytes,
+            worker_rss_by_role=dict(summary.worker_rss_by_role),
+        )
+
+    def to_summary(self) -> SystemMemorySummary:
+        """Rebuild a :class:`SystemMemorySummary` (with its derived properties) from the wire fields."""
+        from horde_worker_regen.process_management.system_memory import build_system_memory_summary
+
+        return build_system_memory_summary(
+            total_bytes=self.total_bytes,
+            available_bytes=self.available_bytes,
+            worker_rss_by_role=self.worker_rss_by_role,
+        )
+
+
 class WorkerStateSnapshot(BaseModel):
     """One frame of worker state pushed from the worker to its supervisor over the pipe.
 
@@ -523,6 +561,9 @@ class WorkerStateSnapshot(BaseModel):
     vram_high_water_mb_per_process: dict[int, int] = Field(default_factory=dict)
     ram_high_water_mb_per_process: dict[int, int] = Field(default_factory=dict)
     disk_free_bytes: dict[str, int] = Field(default_factory=dict)
+
+    system_memory: SystemMemorySnapshot | None = None
+    """Live system-RAM total/available and the worker's per-role RSS share (None before first sample)."""
 
     downloads: DownloadStatusSnapshot | None = None
     """Live download-subsystem state (None when background downloads are disabled)."""

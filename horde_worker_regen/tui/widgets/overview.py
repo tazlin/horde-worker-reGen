@@ -25,6 +25,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
 from horde_worker_regen.tui.formatters import (
     format_its,
     format_percent,
+    human_bytes,
     human_duration,
     human_mb,
     job_id_text,
@@ -225,6 +226,9 @@ class OverviewView(VerticalScroll):
         if snapshot is not None:
             body.append(self._headline_metrics_line(snapshot))
             body.append(self._activity_line(snapshot))
+            memory_line = self._memory_line(snapshot)
+            if memory_line is not None:
+                body.append(memory_line)
             why_no_work = summarize_skips(snapshot.last_pop_skipped_reasons)
             if why_no_work:
                 body.append(Text.assemble(("∅ why no work: ", "yellow"), (why_no_work, "italic yellow")))
@@ -278,6 +282,35 @@ class OverviewView(VerticalScroll):
             ("  ·  queued ", "grey50"),
             (str(snapshot.jobs_pending_inference), "grey70"),
         )
+
+    @staticmethod
+    def _memory_line(snapshot: WorkerStateSnapshot) -> Text | None:
+        """A system-RAM line: whole-machine in-use/total and the worker's per-role share.
+
+        Returns None when no memory sample has arrived yet (older worker, or before the first report), so
+        the hero simply omits the line rather than showing zeroes.
+        """
+        wire = snapshot.system_memory
+        if wire is None or wire.total_bytes <= 0:
+            return None
+        from horde_worker_regen.process_management.system_memory import ROLE_LABELS
+
+        summary = wire.to_summary()
+        used_fraction = summary.used_fraction
+        used_pct = f" ({used_fraction * 100:.0f}%)" if used_fraction is not None else ""
+
+        line = Text.assemble(
+            ("RAM ", "grey50"),
+            (f"{human_bytes(summary.used_bytes)} / {human_bytes(summary.total_bytes)}", "grey70"),
+            (used_pct, "grey50"),
+            ("  ·  worker ", "grey50"),
+            (human_bytes(summary.worker_total_bytes), "bold cyan"),
+        )
+        role_items = summary.nonzero_role_items()
+        if role_items:
+            parts = ", ".join(f"{ROLE_LABELS.get(role, role)} {human_bytes(value)}" for role, value in role_items)
+            line.append(f" ({parts})", style="grey50")
+        return line
 
     @staticmethod
     def _residency_banner(residency: WholeCardResidencyStatus) -> Text:

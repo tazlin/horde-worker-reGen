@@ -102,6 +102,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
     SupervisorChannel,
     SupervisorCommand,
     SupervisorControlMessage,
+    SystemMemorySnapshot,
     WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerStateSnapshot,
@@ -121,6 +122,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.job_models import HordeJobInfo
     from horde_worker_regen.process_management.job_tracker import TrackedJob
     from horde_worker_regen.process_management.messages import HordeJobMetricsMessage
+    from horde_worker_regen.process_management.system_memory import SystemMemorySummary
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2098,6 +2100,7 @@ class HordeWorkerProcessManager:
             jobs_being_safety_checked=len(self._job_tracker.jobs_being_safety_checked),
             jobs_in_progress=len(self._job_tracker.jobs_in_progress),
             total_ram_gigabytes=self.total_ram_gigabytes,
+            system_memory=self._sample_system_memory(),
             download_status=self._model_availability.status,
             download_plan=self._get_download_plan_summary(),
         )
@@ -2373,6 +2376,70 @@ class HordeWorkerProcessManager:
         """Round an MB figure to a whole MB for the wire, preserving None."""
         return int(round(value)) if value is not None else None
 
+    @staticmethod
+    def _process_rss_bytes(os_pid: int | None) -> int:
+        """Sample one process's resident-set size (bytes) by OS pid, returning 0 if it cannot be read.
+
+        Used for processes the worker does not get a self-reported RAM figure from (the download
+        process). A dead pid, a permission error, or a missing pid all yield 0 rather than raising on
+        the control loop.
+        """
+        if not os_pid:
+            return 0
+        import psutil
+
+        try:
+            return int(psutil.Process(os_pid).memory_info().rss)
+        except (psutil.Error, OSError):
+            return 0
+
+    def _sample_system_memory(self) -> SystemMemorySummary:
+        """Build the current system-RAM summary: total/available plus the worker's per-role RSS share.
+
+        Inference and safety processes self-report their RSS in their periodic memory reports (already
+        kept on the process map), so those are summed from there. The orchestrator (this process) and the
+        background download process do not, so their RSS is sampled directly via psutil. All figures are
+        resident-set size; see :mod:`system_memory` for why the per-role sum is an upper bound.
+        """
+        import psutil
+
+        from horde_worker_regen.process_management.system_memory import (
+            ROLE_DOWNLOAD,
+            ROLE_INFERENCE,
+            ROLE_ORCHESTRATOR,
+            ROLE_SAFETY,
+            build_system_memory_summary,
+        )
+
+        virtual_memory = psutil.virtual_memory()
+
+        inference_rss = 0
+        safety_rss = 0
+        for process_info in self._process_map.values():
+            if process_info.process_type == HordeProcessType.INFERENCE:
+                inference_rss += max(0, process_info.ram_usage_bytes)
+            elif process_info.process_type == HordeProcessType.SAFETY:
+                safety_rss += max(0, process_info.ram_usage_bytes)
+
+        download_info = self._process_lifecycle.download_process_info
+        download_rss = self._process_rss_bytes(download_info.os_pid if download_info is not None else None)
+
+        try:
+            orchestrator_rss = int(psutil.Process().memory_info().rss)
+        except (psutil.Error, OSError):
+            orchestrator_rss = 0
+
+        return build_system_memory_summary(
+            total_bytes=virtual_memory.total,
+            available_bytes=virtual_memory.available,
+            worker_rss_by_role={
+                ROLE_ORCHESTRATOR: orchestrator_rss,
+                ROLE_INFERENCE: inference_rss,
+                ROLE_SAFETY: safety_rss,
+                ROLE_DOWNLOAD: download_rss,
+            },
+        )
+
     def _whole_card_residency_status(self) -> WholeCardResidencyStatus:
         """Project the scheduler's whole-card residency state onto the wire model (MB rounded to int)."""
         state = self._inference_scheduler.whole_card_residency_state()
@@ -2523,6 +2590,7 @@ class HordeWorkerProcessManager:
             alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
             pending_jobs=self._build_pending_jobs_list(),
             whole_card_residency=self._whole_card_residency_status(),
+            system_memory=SystemMemorySnapshot.from_summary(self._sample_system_memory()),
         )
 
     def build_run_record(self) -> WorkerRunRecord:

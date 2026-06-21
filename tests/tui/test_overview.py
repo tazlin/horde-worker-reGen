@@ -7,6 +7,7 @@ from rich.console import Console
 from horde_worker_regen.process_management.supervisor_channel import (
     JobQueueEntry,
     ProcessSnapshot,
+    SystemMemorySnapshot,
     WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerStateSnapshot,
@@ -45,6 +46,40 @@ def _busy_process() -> ProcessSnapshot:
         vram_usage_mb=8000,
         total_vram_mb=24000,
     )
+
+
+def test_overview_hero_shows_system_memory_line() -> None:
+    """The hero renders a RAM line with the in-use/total figure and the worker's per-role breakdown."""
+    _GB = 1024**3
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        worker_registered=True,
+        system_memory=SystemMemorySnapshot(
+            total_bytes=64 * _GB,
+            available_bytes=20 * _GB,
+            worker_rss_by_role={"orchestrator": 1 * _GB, "inference": 18 * _GB, "safety": 2 * _GB},
+        ),
+    )
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    hero = _render(OverviewView()._render_hero(report, snapshot, frame=0))
+
+    assert "RAM 44.0 GB / 64.0 GB" in hero
+    assert "worker 21.0 GB" in hero
+    assert "inference 18.0 GB" in hero
+
+
+def test_overview_hero_omits_memory_line_without_sample() -> None:
+    """With no memory sample (older worker) the hero simply omits the RAM line."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        worker_registered=True,
+    )
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    hero = _render(OverviewView()._render_hero(report, snapshot, frame=0))
+
+    assert "RAM " not in hero
 
 
 def test_overview_shows_lora_pause_when_background_download_blocks_pops() -> None:
