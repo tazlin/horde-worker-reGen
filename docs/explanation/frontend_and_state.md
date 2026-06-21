@@ -79,6 +79,22 @@ and hands off to the benchmark/start flow. It reuses existing controls (the same
 model picker the Config tab uses) and never blocks the dashboard: cancelling
 leaves the worker stopped and the tabs available for manual configuration.
 
+## Guarding unsaved config edits
+
+Config edits live only in the form widgets until **Save** writes them to
+`bridgeData.yaml` (a running worker then hot-reloads the file on its own). Because
+switching tabs does not destroy the form, leaving the Config tab does not lose the
+edits outright, but it is an easy way to forget to save them. The app therefore
+gates navigation away from a *dirty* Config tab: Textual switches the tab before
+the app sees it, so the guard snaps back to Config and shows a modal offering to
+**leave** (keep the edits live in the form), **discard** (revert the form to
+disk), **stay**, or **never** warn again for the rest of the session. Dirty
+detection is a best-effort comparison of the raw widget values against a baseline
+captured on mount/save/reload, so a malformed in-progress entry never raises and a
+detection glitch can never trap the operator on the tab. The "never" choice is
+intentionally session-scoped (not persisted): it is a per-sitting convenience, not
+a durable preference.
+
 ## Worker identity preflight
 
 Worker names are unique horde-wide and tied to the API key that first registers

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import enum
 from pathlib import Path
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
+from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Rule, Static, Switch, TabbedContent, TabPane, TextArea
 
 from horde_worker_regen.app_state import OverviewViewMode
@@ -41,6 +44,81 @@ def _subtab_id(label: str) -> str:
 def _normalise_form(value: str) -> str:
     """Normalise an alchemy form for comparison (the worker lowercases and underscores forms)."""
     return value.replace("-", "_").lower()
+
+
+class ConfigLeaveChoice(enum.StrEnum):
+    """The user's response to the "you have unsaved config edits" warning when leaving the Config tab."""
+
+    LEAVE = "leave"
+    """Navigate away but keep the unsaved edits live in the form (nothing is written to disk)."""
+    DISCARD = "discard"
+    """Revert the form to the values on disk, then navigate away."""
+    STAY = "stay"
+    """Cancel the navigation and stay on the Config tab."""
+    NEVER = "never"
+    """Navigate away and stop warning for the rest of this session."""
+
+
+class ConfigLeaveModal(ModalScreen[ConfigLeaveChoice]):
+    """Warns that the Config tab has unsaved edits before the user navigates away."""
+
+    DEFAULT_CSS = """
+    ConfigLeaveModal {
+        align: center middle;
+    }
+    ConfigLeaveModal #config-leave-dialog {
+        width: 72;
+        height: auto;
+        padding: 1 2;
+        border: thick $warning;
+        background: $surface;
+    }
+    ConfigLeaveModal #config-leave-dialog Button {
+        width: 100%;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "stay", "Stay")]
+
+    _BUTTON_CHOICES: dict[str, ConfigLeaveChoice] = {
+        "config-leave-keep": ConfigLeaveChoice.LEAVE,
+        "config-leave-discard": ConfigLeaveChoice.DISCARD,
+        "config-leave-stay": ConfigLeaveChoice.STAY,
+        "config-leave-never": ConfigLeaveChoice.NEVER,
+    }
+
+    def compose(self) -> ComposeResult:
+        """Lay out the warning and the four choices."""
+        with Vertical(id="config-leave-dialog"):
+            yield Static(self._message(), id="config-leave-message")
+            yield Button("Leave (keep my edits in the form)", id="config-leave-keep", variant="primary")
+            yield Button("Discard my edits and leave", id="config-leave-discard", variant="warning")
+            yield Button("Stay on Config", id="config-leave-stay", variant="default")
+            yield Button("Leave and don't warn me again this session", id="config-leave-never", variant="default")
+
+    @staticmethod
+    def _message() -> Text:
+        """Explain that the edits are not yet saved to disk."""
+        return Text.assemble(
+            ("Unsaved config edits\n\n", "bold"),
+            (
+                "You have changes on the Config tab that have not been saved to bridgeData.yaml. "
+                "Leaving keeps them in the form for now, but they will be lost if you reload from disk "
+                "or close the app. Save them first to apply them to the worker.",
+                "grey70",
+            ),
+        )
+
+    def action_stay(self) -> None:
+        """Dismiss as 'stay' when escape is pressed."""
+        self.dismiss(ConfigLeaveChoice.STAY)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Dismiss with the choice the pressed button represents."""
+        choice = self._BUTTON_CHOICES.get(event.button.id or "")
+        if choice is not None:
+            self.dismiss(choice)
 
 
 class ConfigEditorView(Vertical):
@@ -112,6 +190,7 @@ class ConfigEditorView(Vertical):
         self._config_path = config_path
         self._data = load_config(config_path)
         self._mode = OverviewViewMode.NORMAL
+        self._clean_state: dict[str, object] | None = None
 
     def compose(self) -> ComposeResult:
         """Lay out the pinned action bar and status line, then the grouped fields in sub-tabs."""
@@ -222,6 +301,47 @@ class ConfigEditorView(Vertical):
             )
         return control
 
+    def on_mount(self) -> None:
+        """Capture the loaded values as the clean baseline for unsaved-change detection."""
+        with contextlib.suppress(Exception):
+            self._clean_state = self._widget_state()
+
+    def is_dirty(self) -> bool:
+        """Whether any field differs from the last loaded/saved state (best-effort; never raises).
+
+        Compares raw widget values against the baseline captured on mount, save, or reload, so it does
+        not run validation and a malformed in-progress entry cannot make this throw. A failure to read
+        the widgets is reported as clean, so a glitch here can never trap the user on the Config tab.
+        """
+        try:
+            current = self._widget_state()
+        except Exception:  # noqa: BLE001 - dirty detection must never block navigation
+            return False
+        if self._clean_state is None:
+            self._clean_state = current
+            return False
+        return current != self._clean_state
+
+    def _widget_state(self) -> dict[str, object]:
+        """A raw, uncoerced snapshot of every editable widget keyed by field, for change detection."""
+        state: dict[str, object] = {}
+        for field in CONFIG_FIELDS:
+            if field.kind is FieldKind.MODEL_LIST:
+                state[field.key] = tuple(self.query_one(f"#mle-root-{field.key}", ModelListEditor).values())
+            elif field.kind is FieldKind.SELECT_MULTI:
+                state[field.key] = tuple(
+                    self.query_one(f"#cfg-{field.key}-{choice}", Checkbox).value for choice in field.choices
+                )
+            else:
+                widget = self.query_one(f"#cfg-{field.key}")
+                if isinstance(widget, Switch):
+                    state[field.key] = widget.value
+                elif isinstance(widget, TextArea):
+                    state[field.key] = widget.text
+                elif isinstance(widget, Input):
+                    state[field.key] = widget.value
+        return state
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Dispatch the action-bar buttons (model-list buttons are handled by their own editor)."""
         if event.button.id == "config-reload":
@@ -282,6 +402,8 @@ class ConfigEditorView(Vertical):
                     widget.text = "\n".join(str(item) for item in value)
                 elif isinstance(widget, Input):
                     widget.value = str(value)
+        with contextlib.suppress(Exception):
+            self._clean_state = self._widget_state()
         self._set_status("Reloaded from disk.", "green")
 
     def _save(self) -> bool:
@@ -302,6 +424,8 @@ class ConfigEditorView(Vertical):
         except OSError as error:
             self._set_status(f"Failed to write {self._config_path}: {error}", "red")
             return False
+        with contextlib.suppress(Exception):
+            self._clean_state = self._widget_state()
         self._set_status(
             f"Saved {self._config_path}. A running worker reloads it automatically; restart only for ⟳ fields.",
             "green",

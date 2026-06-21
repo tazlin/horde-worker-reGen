@@ -35,7 +35,6 @@ from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.tui import socket_protocol as sp
 from horde_worker_regen.tui.attach import AttachedWorkerSupervisor, SupervisorLike
-from horde_worker_regen.tui.cache_home import apply_cache_home_env
 from horde_worker_regen.tui.benchmark_launcher import (
     BenchmarkOptions,
     BenchmarkSupervisor,
@@ -44,12 +43,13 @@ from horde_worker_regen.tui.benchmark_launcher import (
     apply_suggested_to_config,
     record_suggested_as_known_good,
 )
+from horde_worker_regen.tui.cache_home import apply_cache_home_env
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.update_check import check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
-from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
+from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, ConfigLeaveChoice, ConfigLeaveModal
 from horde_worker_regen.tui.widgets.downloads import DownloadsView
 from horde_worker_regen.tui.widgets.insights import InsightsView
 from horde_worker_regen.tui.widgets.live_view import LiveView
@@ -139,6 +139,9 @@ class HordeWorkerTUI(App[None]):
         self._last_benchmark_status = BenchmarkSupervisorStatus.IDLE
         self._pending_benchmark_options = BenchmarkOptions()
         self._view_mode = self._app_state_store.load().overview_view_mode
+        self._last_main_tab = "tab-overview"
+        self._allow_tab_switch_to: str | None = None
+        self._config_leave_warning_suppressed = False
 
     def compose(self) -> ComposeResult:
         """Lay out the header, status bar, tabbed views, and footer."""
@@ -544,6 +547,50 @@ class HordeWorkerTUI(App[None]):
         starting again).
         """
         self._supervisor.restart()
+
+    def on_tabbed_content_tab_activated(self, message: TabbedContent.TabActivated) -> None:
+        """Guard against leaving the Config tab with unsaved edits.
+
+        Textual switches the tab before this fires, so when the user navigates off a dirty Config tab we
+        revert to it and prompt, then honour their choice. Sub-tab activations (the config/benchmark inner
+        TabbedContents) are ignored here; only the top-level ``main-tabs`` is gated.
+        """
+        if message.tabbed_content.id != "main-tabs" or message.pane is None or message.pane.id is None:
+            return
+        new_tab = message.pane.id
+        if self._allow_tab_switch_to == new_tab:
+            self._allow_tab_switch_to = None
+            self._last_main_tab = new_tab
+            return
+        leaving_config = self._last_main_tab == "tab-config" and new_tab != "tab-config"
+        if leaving_config and not self._config_leave_warning_suppressed and self._config_is_dirty():
+            target = new_tab
+            self._allow_tab_switch_to = "tab-config"
+            message.tabbed_content.active = "tab-config"
+            self._last_main_tab = "tab-config"
+            self.push_screen(ConfigLeaveModal(), lambda outcome: self._on_config_leave_choice(outcome, target))
+            return
+        self._last_main_tab = new_tab
+
+    def _config_is_dirty(self) -> bool:
+        """Whether the Config tab has unsaved edits (best-effort; a lookup failure reads as clean)."""
+        try:
+            return self.query_one(ConfigEditorView).is_dirty()
+        except Exception:  # noqa: BLE001 - the guard must never block navigation
+            return False
+
+    def _on_config_leave_choice(self, outcome: ConfigLeaveChoice | None, target: str) -> None:
+        """Apply the unsaved-edits choice: stay, discard-and-leave, leave, or leave-and-suppress."""
+        if outcome is None or outcome is ConfigLeaveChoice.STAY:
+            return
+        if outcome is ConfigLeaveChoice.DISCARD:
+            with contextlib.suppress(NoMatches):
+                self.query_one(ConfigEditorView).reload_from_disk()
+        elif outcome is ConfigLeaveChoice.NEVER:
+            self._config_leave_warning_suppressed = True
+        with contextlib.suppress(NoMatches):
+            self._allow_tab_switch_to = target
+            self.query_one("#main-tabs", TabbedContent).active = target
 
     def on_config_editor_view_apply_requested(self, message: ConfigEditorView.ApplyRequested) -> None:
         """Restart the worker for a saved change to a restart-locked field.
