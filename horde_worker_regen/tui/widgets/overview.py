@@ -79,9 +79,12 @@ class OverviewView(VerticalScroll):
     OverviewView #overview-residency {
         width: auto;
     }
+    OverviewView #overview-alchemy {
+        width: auto;
+    }
     """
-    """The residency box (a non-expanding Panel) sizes to its content rather than the full screen width,
-    since its sparse "armed" state never has enough to justify spanning the whole row."""
+    """The residency and alchemy boxes (non-expanding Panels) size to their content rather than the full
+    screen width, since their content is never wide enough to justify spanning the whole row."""
 
     def __init__(self) -> None:
         """Set up the view, including the client-side trend history for the Trends sparklines."""
