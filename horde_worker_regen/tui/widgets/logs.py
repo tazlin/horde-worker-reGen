@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, RichLog, Select, Static
 
@@ -38,6 +40,10 @@ _LEVEL_CHOICES = ["ALL", "DEBUG", "INFO", "WARNING", "ERROR"]
 class LogsView(Vertical):
     """Follow a selected bridge log file with level and substring filtering."""
 
+    BINDINGS = [
+        Binding("end", "jump_to_latest", "Jump to latest"),
+    ]
+
     DEFAULT_CSS = """
     LogsView #log-controls {
         height: 3;
@@ -64,6 +70,12 @@ class LogsView(Vertical):
     LogsView #log-tally {
         height: 1;
         padding: 0 1;
+    }
+    LogsView #log-scroll-hint {
+        height: 1;
+        padding: 0 1;
+        color: $warning;
+        text-style: bold;
     }
     """
 
@@ -94,6 +106,8 @@ class LogsView(Vertical):
         self._mode = OverviewViewMode.NORMAL
         self._level_counts: dict[str, int] = {}
         """Running per-level line counts for the detailed-view tally (the shape of the run)."""
+        self._unseen_below = 0
+        """Lines appended while the user was scrolled up; cleared when they return to the bottom."""
 
     def compose(self) -> ComposeResult:
         """Lay out the process/history/level/search controls and the log output."""
@@ -109,10 +123,12 @@ class LogsView(Vertical):
             yield Input(placeholder="filter text…", id="log-search")
         yield Static(id="log-tally")
         yield RichLog(id="log-output", highlight=False, markup=False, wrap=False, max_lines=5000)
+        yield Static(id="log-scroll-hint")
 
     def on_mount(self) -> None:
         """Discover log files and begin polling."""
         self.query_one("#log-tally", Static).display = False
+        self.query_one("#log-scroll-hint", Static).display = False
         self._refresh(select_first=True)
         self.set_interval(0.5, self._poll)
 
@@ -199,9 +215,13 @@ class LogsView(Vertical):
         self._current_path = path
         self._follower = LogFollower(path)
         self._level_counts = {}
+        self._unseen_below = 0
         log = self.query_one("#log-output", RichLog)
+        log.auto_scroll = True
         log.clear()
         log.write(Text(f"── following {path} ──", style="italic grey62"))
+        with contextlib.suppress(Exception):
+            self._render_scroll_hint()
 
     def set_view_mode(self, mode: OverviewViewMode) -> None:
         """Apply the shared F6 density contract to the log view.
@@ -273,12 +293,43 @@ class LogsView(Vertical):
         if not new_lines:
             return
         log = self.query_one("#log-output", RichLog)
+        # Follow the tail only while the user is already at the bottom. When they have scrolled up to
+        # read, pause auto-scroll so new lines never yank the viewport, and tally what they have not
+        # seen so a hint can offer a one-key jump back to the latest.
+        at_bottom = log.is_vertical_scroll_end
+        log.auto_scroll = at_bottom
+        written = 0
         for line in new_lines:
             styled = self._style_line(line)
             if styled is not None:
                 log.write(styled)
+                written += 1
+        # Tally what the user has not seen while scrolled up; clear it once they are back at the bottom
+        # (whether they scrolled there by hand or jumped with End).
+        if at_bottom:
+            self._unseen_below = 0
+        else:
+            self._unseen_below += written
+        self._render_scroll_hint()
         if self._mode is OverviewViewMode.DETAILS:
             self._render_tally()
+
+    def _render_scroll_hint(self) -> None:
+        """Show or hide the 'new lines below' hint based on whether the user has scrolled up."""
+        hint = self.query_one("#log-scroll-hint", Static)
+        if self._unseen_below > 0:
+            hint.update(Text(f"↓ {self._unseen_below:,} new line(s) below — press End to jump to latest"))
+            hint.display = True
+        else:
+            hint.display = False
+
+    def action_jump_to_latest(self) -> None:
+        """Scroll to the newest line and resume following the tail."""
+        log = self.query_one("#log-output", RichLog)
+        log.auto_scroll = True
+        log.scroll_end(animate=False)
+        self._unseen_below = 0
+        self._render_scroll_hint()
 
     def _style_line(self, line: str) -> Text | None:
         """Apply level and search filters, returning a styled line or None to drop it.
