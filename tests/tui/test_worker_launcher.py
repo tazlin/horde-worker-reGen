@@ -14,6 +14,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
     WorkerStateSnapshot,
 )
 from horde_worker_regen.run_worker import WorkerLaunchOptions
+from horde_worker_regen.tui import worker_launcher
 from horde_worker_regen.tui.worker_launcher import (
     SupervisorStatus,
     WorkerProcessMode,
@@ -286,9 +287,19 @@ def test_request_graceful_stop_is_non_blocking_and_finalized_by_tick() -> None:
     assert ctx.process_count == 1  # an intentional stop must never trigger a relaunch
 
 
-def test_graceful_stop_terminates_worker_that_overruns_deadline() -> None:
-    """A worker that ignores the shutdown request past its deadline is force-terminated by a tick."""
+def test_graceful_stop_terminates_worker_that_overruns_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker that ignores the shutdown request past its deadline is force-killed by a tick.
+
+    The force path tree-kills by pid (so the worker's inference/safety subprocesses cannot be orphaned),
+    rather than terminating only the direct child; the spy stands in for that OS-level tree kill.
+    """
     ctx = _FakeCtx()
+    killed_pids: list[int] = []
+    monkeypatch.setattr(
+        worker_launcher,
+        "kill_process_tree",
+        lambda pid, **_kwargs: killed_pids.append(pid) or [pid],
+    )
     supervisor = WorkerSupervisor(
         WorkerLaunchOptions(),
         mode=WorkerProcessMode.FAKE,
@@ -298,10 +309,11 @@ def test_graceful_stop_terminates_worker_that_overruns_deadline() -> None:
     process = ctx.last_process
     assert process is not None
 
-    supervisor.request_graceful_stop(timeout=0.0)  # deadline is now, so the next tick must terminate
+    supervisor.request_graceful_stop(timeout=0.0)  # deadline is now, so the next tick must force-kill
     supervisor.tick()
-    assert process.terminated is True
+    assert killed_pids == [process.pid]
 
+    process.kill_it()  # the tree kill takes the worker down; the next tick observes the exit
     supervisor.tick()
     assert not supervisor.is_alive()
     assert supervisor.status is SupervisorStatus.STOPPED

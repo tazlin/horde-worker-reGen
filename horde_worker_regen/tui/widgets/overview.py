@@ -424,12 +424,6 @@ class OverviewView(VerticalScroll):
         config = snapshot.config
         uptime = human_duration(time.time() - snapshot.session_start_time) if snapshot.session_start_time else "-"
 
-        memory_mode = "normal"
-        if config.very_high_memory_mode:
-            memory_mode = "very high"
-        elif config.high_memory_mode:
-            memory_mode = "high"
-
         performance_mode = "normal"
         if config.high_performance_mode:
             performance_mode = "high"
@@ -449,12 +443,12 @@ class OverviewView(VerticalScroll):
         table.add_row("Models", str(config.num_models), "Custom models", "yes" if config.custom_models else "no")
         table.add_row("Threads", str(config.max_threads), "Queue size", str(config.queue_size))
         table.add_row("Max power", str(config.max_power), "Max batch", str(config.max_batch))
-        table.add_row("Memory mode", memory_mode, "Performance", performance_mode)
+        table.add_row("Performance", performance_mode, "Safety on GPU", "yes" if config.safety_on_gpu else "no")
         table.add_row(
-            "Safety on GPU",
-            "yes" if config.safety_on_gpu else "no",
             "Allows",
             self._allow_summary(snapshot),
+            "",
+            "",
         )
         return table
 

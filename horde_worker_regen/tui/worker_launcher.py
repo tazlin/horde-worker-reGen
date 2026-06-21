@@ -26,6 +26,7 @@ from typing import TextIO
 
 from loguru import logger
 
+from horde_worker_regen.process_management.owned_process_registry import kill_process_tree
 from horde_worker_regen.process_management.supervisor_channel import (
     SupervisorCommand,
     SupervisorControlMessage,
@@ -63,12 +64,15 @@ class SupervisorStatus(enum.StrEnum):
 _HEALTHY_UPTIME_SECONDS = 60.0
 """A worker alive and reporting for this long is considered stable; the restart budget resets."""
 
-GRACEFUL_STOP_TIMEOUT_SECONDS = 95.0
+GRACEFUL_STOP_TIMEOUT_SECONDS = 150.0
 """How long :meth:`WorkerSupervisor.stop` waits for the worker to drain and exit before terminating it.
 
-Kept above the worker's own force-kill backstop (``shutdown_manager.MAX_SHUTDOWN_GRACE_SECONDS``, 90s)
-so the worker always exits on its own first; ``terminate()`` then becomes a true last resort instead
-of firing mid-drain, which previously re-orphaned in-flight jobs."""
+Kept above the worker's *entire* self-teardown window so the worker always exits on its own first and the
+force-kill is a true last resort, never firing mid-drain (which previously killed in-flight jobs and
+re-orphaned their subprocesses). That window is the worker's hard-capped drain grace
+(``shutdown_manager.MAX_SHUTDOWN_GRACE_SECONDS``) plus the fault-report tail it spends reissuing still
+-outstanding jobs (``_FAULT_REPORT_GRACE_SECONDS``) before it self-exits; this value carries headroom
+over their sum."""
 
 
 def _stream_has_real_fd(stream: TextIO | None) -> bool:
@@ -328,9 +332,24 @@ class WorkerSupervisor:
             return
         if time.time() < self._graceful_stop_deadline:
             return
-        logger.warning("Worker did not exit within the graceful-stop window; terminating.")
-        process.terminate()
-        self._graceful_stop_deadline = 0.0  # terminate() is forceful; the next tick will finalize.
+        logger.warning("Worker did not exit within the graceful-stop window; terminating its process tree.")
+        self._force_kill_tree(process)
+        self._graceful_stop_deadline = 0.0  # the kill is forceful; the next tick will finalize.
+
+    def _force_kill_tree(self, process: BaseProcess) -> None:
+        """Hard-kill the worker and every subprocess it spawned (inference/safety/download).
+
+        A plain ``terminate()`` ends only the direct child; its grandchildren are not bound to it by a
+        process group / job object (notably on Windows), so they would be orphaned and stay resident on
+        the GPU with nothing left to reap them. Killing the whole tree by pid is the orphan-proof path.
+        Falls back to ``terminate()`` only when the pid is unavailable.
+        """
+        if process.pid is not None:
+            with contextlib.suppress(Exception):
+                kill_process_tree(process.pid)
+        else:
+            with contextlib.suppress(Exception):
+                process.terminate()
 
     def _complete_graceful_stop(self) -> None:
         """Finalize a graceful stop once the worker has exited: clean up the pipe and mark it stopped."""
@@ -490,8 +509,8 @@ class WorkerSupervisor:
             self.send_command(SupervisorControlMessage(command=SupervisorCommand.SHUTDOWN))
             process.join(timeout)
             if process.is_alive():
-                logger.warning("Worker did not exit after shutdown request; terminating.")
-                process.terminate()
+                logger.warning("Worker did not exit after shutdown request; terminating its process tree.")
+                self._force_kill_tree(process)
                 process.join(5.0)
         self._cleanup_process()
         self._graceful_stop_deadline = 0.0
