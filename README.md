@@ -99,3 +99,14 @@ The full documentation site starts at [docs/](docs/index.md).
 Many bundled models use the
 [CreativeML OpenRAIL License](https://huggingface.co/spaces/CompVis/stable-diffusion-license). Please
 review it before use.
+
+## AI Assistance Disclosure
+
+This project uses AI assistance in its development. Models include those provided through Github
+(including its FIM "autocomplete" feature), OpenAI, Anthropic and Deepseek. We encourage any contributors
+to disclose their use of AI assistance in their contributions, but it is not required. We do, however, require
+that all contributions, whether AI-assisted or not, adhere to our contribution guidelines and code of conduct
+as outlined in the CONTRIBUTING.md file. Further, we do not accept unattended or automated AI contributions;
+a human must review and make a best effort to understand and verify the contribution before it is accepted.
+If you have any questions about our AI assistance policy, please feel free to reach out to us on our Discord
+server or through our issue tracker.
