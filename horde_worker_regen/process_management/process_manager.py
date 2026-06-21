@@ -34,8 +34,8 @@ from horde_sdk.ai_horde_api.apimodels import (
     FindUserRequest,
     ImageGenerateJobPopResponse,
     ModifyWorkerRequest,
-    SingleWorkerDetailsResponse,
     UserDetailsResponse,
+    WorkerDetailItem,
 )
 from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
@@ -107,6 +107,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
     WorkerStateSnapshot,
 )
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
+from horde_worker_regen.process_management.worker_identity import lookup_worker_by_name
 from horde_worker_regen.process_management.worker_state import WorkerState
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
@@ -859,13 +860,11 @@ class HordeWorkerProcessManager:
         :meth:`_apply_supervisor_command`).
         """
         simple_client = AIHordeAPISimpleClient()
-        worker_details: SingleWorkerDetailsResponse = simple_client.worker_details_by_name(
-            worker_name=self.bridge_data.dreamer_worker_name,
-        )
+        worker_details = lookup_worker_by_name(simple_client, self.bridge_data.dreamer_worker_name)
         if worker_details is None:
             logger.debug(
-                f"Worker with name {self.bridge_data.dreamer_worker_name} "
-                f"does not appear to exist yet to set maintenance={enabled}.",
+                f"Worker with name {self.bridge_data.dreamer_worker_name} is not registered yet "
+                f"(the horde creates it on first pop); nothing to set maintenance={enabled} on.",
             )
             return
         modify_worker_request = ModifyWorkerRequest(
@@ -1141,10 +1140,15 @@ class HordeWorkerProcessManager:
                 logger.error("The server failed to respond. Is the horde or your internet down?")
             await logger.complete()
 
-    def _fetch_worker_details(self, worker_name: str) -> SingleWorkerDetailsResponse | None:
-        """Synchronous worker-details lookup (run in a thread); mirrors :meth:`remove_maintenance`."""
+    def _fetch_worker_details(self, worker_name: str) -> WorkerDetailItem | None:
+        """Synchronous worker-details lookup (run in a thread); mirrors :meth:`remove_maintenance`.
+
+        Returns None for a name that is not yet registered (the normal first-run state, since the horde
+        registers a worker on its first pop) instead of raising and logging at ERROR. See
+        :func:`lookup_worker_by_name`.
+        """
         simple_client = AIHordeAPISimpleClient()
-        return simple_client.worker_details_by_name(worker_name=worker_name)
+        return lookup_worker_by_name(simple_client, worker_name)
 
     async def api_get_worker_details(self) -> None:
         """Best-effort refresh of this worker's maintenance/paused flags from the worker-details API.

@@ -52,10 +52,11 @@ class TestSetMaintenanceApiCall:
         captured: dict[str, object] = {}
 
         class FakeClient:
-            def worker_details_by_name(self, worker_name: str) -> Mock:
+            def workers_all_details(self, worker_name: str | None = None, *, api_key: str | None = None) -> list[Mock]:
                 details = Mock()
                 details.id_ = "worker-1"
-                return details
+                details.name = worker_name
+                return [details]
 
             def worker_modify(self, request: object) -> None:
                 captured["maintenance"] = request.maintenance  # type: ignore[attr-defined]
@@ -66,6 +67,30 @@ class TestSetMaintenanceApiCall:
         manager.set_maintenance(enabled)
 
         assert captured["maintenance"] is enabled
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_unregistered_worker_is_a_quiet_no_op(self, enabled: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A not-yet-registered name (empty list result) returns without modifying or raising.
+
+        The horde registers a worker implicitly on its first pop, so a brand-new name is unknown until
+        then; that must be treated as the normal first-run case, not an error.
+        """
+        modified = False
+
+        class FakeClient:
+            def workers_all_details(self, worker_name: str | None = None, *, api_key: str | None = None) -> list[Mock]:
+                return []
+
+            def worker_modify(self, request: object) -> None:
+                nonlocal modified
+                modified = True
+
+        monkeypatch.setattr(process_manager_module, "AIHordeAPISimpleClient", lambda: FakeClient())
+        manager = make_testable_process_manager()
+
+        manager.set_maintenance(enabled)
+
+        assert modified is False
 
     def test_remove_maintenance_clears_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``remove_maintenance`` is the ``set_maintenance(False)`` convenience wrapper."""

@@ -108,10 +108,15 @@ fails fast *before* any process spawns:
    defaults, and the alchemist name must differ from the dreamer name when
    alchemy is enabled.
 2. A **network** check: each enabled name must be either unregistered (a
-   brand-new worker) or already owned by the configured API key. Per the chosen
-   policy this hard-fails on any failure, including the API being unreachable
-   (after a small bounded retry), so the worker never silently runs under a name
-   the horde will reject.
+   brand-new worker) or already owned by the configured API key. The name is
+   resolved through the single-worker-by-name endpoint, not the all-workers list:
+   the list only returns workers that are currently *active*, so an idle worker
+   registered under the name would be invisible there and a collision would slip
+   past the check. The endpoint's `WorkerNotFound` response is the one signal read
+   as "name is free"; every other error is treated as a failure to verify. Per the
+   chosen policy this hard-fails on any such failure, including the API being
+   unreachable (after a small bounded retry), so the worker never silently runs
+   under a name the horde will reject.
 
 ## Durable app state
 

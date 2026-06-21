@@ -10,13 +10,17 @@ This module verifies the configuration *before* any processes spawn:
 1. A local check (no network): names must not be the reserved defaults, and the alchemist name must
    differ from the dreamer name when alchemy is enabled.
 2. A network check: each enabled name must be either unregistered (a brand-new worker, the normal
-   first-run case) or already owned by the configured API key. Ownership is accepted on *either* the
-   worker id appearing in the account's worker_ids OR the worker's owner matching the authenticated
-   username, because the user-details worker_ids list can lag or omit a worker the account genuinely
-   owns (right after a fresh registration, or once an idle worker is pruned from the list while still
-   findable by name). Per the project's chosen policy this hard-fails on *any* failure, including the
-   API being unreachable (after a small bounded retry), so the worker never silently runs under a
-   name the horde will reject.
+   first-run case) or already owned by the configured API key. The name is resolved through the
+   single-worker-by-name endpoint, *not* the all-workers list: the list only returns workers that are
+   currently active, so an idle (offline) worker registered under the name is invisible there and a
+   collision would slip past this check, only to fail later at pop time. The by-name endpoint finds
+   the worker regardless of activity, and its ``WorkerNotFound`` response is the genuine "name is free"
+   signal. Ownership is then accepted on *either* the worker id appearing in the account's worker_ids
+   OR the worker's owner matching the authenticated username, because the user-details worker_ids list
+   can lag or omit a worker the account genuinely owns (right after a fresh registration, or once an
+   idle worker is pruned from the list while still findable by name). Per the project's chosen policy
+   this hard-fails on *any* failure, including the API being unreachable (after a small bounded retry),
+   so the worker never silently runs under a name the horde will reject.
 """
 
 from __future__ import annotations
@@ -26,9 +30,12 @@ import time
 from horde_sdk.ai_horde_api.ai_horde_clients import AIHordeAPIClientSession, AIHordeAPISimpleClient
 from horde_sdk.ai_horde_api.apimodels import (
     FindUserRequest,
+    SingleWorkerDetailsResponse,
+    SingleWorkerNameDetailsRequest,
     UserDetailsResponse,
     WorkerDetailItem,
 )
+from horde_sdk.ai_horde_api.consts import RC
 from horde_sdk.generic_api.apimodels import RequestErrorResponse
 from loguru import logger
 
@@ -96,9 +103,8 @@ def _verify_worker_names_owned(bridge_data: reGenBridgeData) -> None:
     for attempt in range(_OWNERSHIP_CHECK_ATTEMPTS):
         try:
             owned_worker_ids, account_username = _fetch_account_identity(bridge_data.api_key)
-            simple_client = AIHordeAPISimpleClient()
             for name in names:
-                worker = _lookup_worker(simple_client, name, bridge_data.api_key)
+                worker = _lookup_registered_worker(name, bridge_data.api_key)
                 if worker is None:
                     logger.info(f"Worker name {name!r} is not yet registered; it will be created on first pop.")
                     continue
@@ -142,6 +148,30 @@ def _fetch_account_identity(api_key: str) -> tuple[set[str], str | None]:
     return worker_ids, response.username
 
 
+def _lookup_registered_worker(name: str, api_key: str) -> WorkerDetailItem | None:
+    """Return the worker registered under ``name``, or None only when the name is genuinely free.
+
+    Uses the single-worker-by-name endpoint rather than the all-workers list: the list only returns
+    *active* workers, so an idle worker registered under the name would be invisible there and a name
+    collision would slip past the preflight, surfacing only as a cryptic credentials error at pop time.
+
+    The error is handled by meaning, not swallowed: a ``WorkerNotFound`` response is the one signal that
+    the name is unregistered (mapped to None, the normal first-run case). Any *other* error response is
+    raised so the caller's retry/hard-fail path treats it as a transient or definitive failure to verify,
+    never as "the name is free".
+    """
+    with AIHordeAPIClientSession() as session:
+        response = session.submit_request(
+            SingleWorkerNameDetailsRequest(worker_name=name, apikey=api_key),
+            SingleWorkerDetailsResponse,
+        )
+    if isinstance(response, RequestErrorResponse):
+        if response.rc == RC.WorkerNotFound:
+            return None
+        raise RuntimeError(f"worker-details-by-name returned an error for {name!r}: {response.message}")
+    return response
+
+
 def _worker_is_owned_by_account(
     worker: WorkerDetailItem,
     owned_worker_ids: set[str],
@@ -164,16 +194,20 @@ def _worker_is_owned_by_account(
     return bool(owner) and owner == username
 
 
-def _lookup_worker(
+def lookup_worker_by_name(
     simple_client: AIHordeAPISimpleClient,
     name: str,
-    api_key: str,
+    *,
+    api_key: str | None = None,
 ) -> WorkerDetailItem | None:
-    """Return the worker registered under ``name`` (case-insensitive), or None if none exists.
+    """Return the active worker registered under ``name`` (case-insensitive), or None if none is found.
 
-    Uses the list endpoint with a name filter so a missing worker is an empty result rather than an
+    Uses the *list* endpoint with a name filter so a missing worker is an empty result rather than an
     exception, and re-checks the name client-side so the result is correct regardless of how the
-    server interprets the filter.
+    server interprets the filter. The list endpoint only returns *active* workers, which suits its
+    callers (e.g. toggling maintenance on the worker you are currently running). The startup ownership
+    preflight deliberately does not use this: it must also see idle workers, so it goes through the
+    single-worker-by-name endpoint instead (see ``_lookup_registered_worker``).
     """
     response = simple_client.workers_all_details(worker_name=name, api_key=api_key)
     for worker in response:
