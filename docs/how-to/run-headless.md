@@ -24,6 +24,8 @@ horde-bridge.cmd
 
 These scripts ensure the environment, download and verify your configured models, then run the
 worker. Model downloads happen before the worker starts, so the first run can take a while.
+`horde-worker.cmd --headless` (or `./horde-worker.sh --headless`) does the same thing if you prefer a
+single launcher for every mode.
 
 To run more than one worker on the same machine (one per GPU), pass a distinct name through to the
 worker:

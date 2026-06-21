@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from horde_worker_regen.runtime_version import runtime_version
+from horde_worker_regen.update_check import NEWER_RELEASE_ENV_VAR
 
 if TYPE_CHECKING:
     from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, UserDetailsResponse
@@ -465,15 +466,16 @@ class StatusReporter:
         total_ram_gigabytes: int,
     ) -> None:
         """Print various warnings based on worker state."""
-        # Version warnings
+        # Version warnings. The required-version gate is operator-controlled (_version_meta.json); the
+        # newer-release nag comes from the GitHub releases check set up at startup (update_check.py).
         if os.getenv("AIWORKER_NOT_REQUIRED_VERSION"):
             logger.warning(
                 "There is a required update available for the AI Worker. `git pull` and `update-runtime` to update.",
             )
-        elif os.getenv("AIWORKER_NOT_RECOMMENDED_VERSION"):
+        elif newer_release := os.getenv(NEWER_RELEASE_ENV_VAR):
             logger.warning(
-                "There is a recommended update available for the AI Worker. "
-                "`git pull` and `update-runtime` to update.",
+                f"A newer AI Worker release (v{newer_release}) is available. Update with "
+                "'winget upgrade Haidra.HordeWorker', or re-run the installer (the same install command).",
             )
 
         # Extra slow worker warnings

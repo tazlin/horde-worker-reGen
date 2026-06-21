@@ -12,7 +12,7 @@ Windows, `.sh` on Linux/macOS, and the `-rocm` variants on AMD Linux.
 |--------|---------|
 | `install.ps1` / `install.sh` | One-line installer (download release, bootstrap runtime, launch). |
 | `update-runtime` | Install or update dependencies into the managed environment. |
-| `horde-worker` | Launch the dashboard: web browser by default, or `--terminal` for the in-terminal UI. |
+| `horde-worker` | Launch the worker: web browser dashboard by default, `--terminal` for the in-terminal UI, or `--headless` for no UI (foreground worker, downloads models first). |
 | `horde-bridge` | Run the headless worker (downloads/verifies models first). |
 
 `horde-worker` and `horde-bridge` pass any extra arguments through to the underlying program.
@@ -43,8 +43,10 @@ Installed as console scripts (defined in `pyproject.toml`):
 | `--attach HOST:PORT` | Attach to a running worker host instead of owning the worker. |
 | `--directml N` | DirectML device index. DirectML is currently unavailable, so this has no working backend. |
 
-The launcher-only flags `--terminal` (in-terminal UI) and `--host HOST` (bind the served dashboard,
-unauthenticated) are handled by the `horde-worker` script before this program runs.
+The launcher-only flags `--terminal` (in-terminal UI), `--headless` (no UI; runs the foreground worker
+via `horde-bridge`), and `--host HOST` (bind the served dashboard, unauthenticated) are handled by the
+`horde-worker` script before this program runs. In the default browser mode on a machine with no
+graphical display, the launcher falls back to the in-terminal UI automatically.
 
 ## `run_worker` (headless)
 

@@ -3,7 +3,9 @@
 Updating matches how you installed. In every case: stop the worker first, update, then start it again.
 Announcements for new versions go out on [Discord](https://discord.gg/3DxrhksKzn).
 
-The dashboard also checks for new releases in the background and notifies you when one is available.
+The worker checks for new releases in the background and tells you when one is available: the
+dashboard shows a notification, and a headless/console worker logs it at startup and in its periodic
+status report. Set `HORDE_WORKER_NO_UPDATE_CHECK=1` to disable the check.
 
 ## Steps
 

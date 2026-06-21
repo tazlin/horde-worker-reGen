@@ -123,6 +123,36 @@ def _build_served_command(args: argparse.Namespace, host_port: int) -> str:
     return " ".join(parts)
 
 
+def _is_graphical_environment() -> bool:
+    """Whether a browser can plausibly be opened on this machine.
+
+    Windows and macOS always have a window server. On Linux a browser needs an X11 or Wayland
+    display, so a server/SSH session with neither set is treated as headless. This is the signal the
+    web launcher uses to avoid serving a dashboard nobody can open and to fall back to the terminal UI.
+    """
+    if sys.platform in ("win32", "darwin"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _run_terminal_fallback(args: argparse.Namespace) -> None:
+    """Run the in-terminal TUI instead of serving a browser dashboard, mapping across the worker options."""
+    from horde_worker_regen.tui import app as tui_app
+
+    tui_argv = ["--process-mode", args.process_mode]
+    if args.config:
+        tui_argv += ["--config", args.config]
+    if args.load_config_from_env_vars:
+        tui_argv.append("-e")
+    if args.amd:
+        tui_argv.append("--amd")
+    if args.worker_name:
+        tui_argv += ["-n", args.worker_name]
+    if args.directml is not None:
+        tui_argv += ["--directml", str(args.directml)]
+    tui_app.main(tui_argv)
+
+
 def _host_running(address: tuple[str, int]) -> bool:
     """Whether a worker host already accepts connections at ``address``."""
     try:
@@ -235,11 +265,30 @@ def _schedule_dashboard_open(host: str, port: int, *, app_window: bool) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     """Console-script entry point (``horde-worker-web``): ensure a host, serve the dashboard, open a browser."""
-    from textual_serve.server import Server
-
     args = _parse_args(argv)
     web_host = _resolve_host(args.host)
     web_port = _resolve_port(args.port)
+
+    # A loopback-only web dashboard is useless on a machine with no browser, so on a headless box fall
+    # back to the in-terminal TUI (or, with no terminal either, point the user at the right mode).
+    # Binding the LAN (--host) or suppressing the auto-open (--no-browser) is explicit "serve anyway"
+    # intent (e.g. for a remote browser), so it skips the fallback.
+    forced_serve = args.no_browser or web_host not in _LOOPBACK_HOSTS
+    if not _is_graphical_environment() and not forced_serve:
+        if sys.stdout.isatty():
+            print("No graphical display detected; opening the in-terminal dashboard instead of a browser.")
+            _run_terminal_fallback(args)
+            return
+        print(
+            "No graphical display and no interactive terminal were detected, so the web dashboard cannot "
+            "be shown here. Use '--headless' to run the worker with no UI, or '--host 0.0.0.0' to serve "
+            "the dashboard for a browser on another machine (unauthenticated; opt-in).",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    from textual_serve.server import Server
+
     host_port = _resolve_host_port(args.host_port)
     host_address = ("127.0.0.1", host_port)
 

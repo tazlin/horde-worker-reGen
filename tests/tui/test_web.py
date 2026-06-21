@@ -95,3 +95,71 @@ def test_open_dashboard_prefers_app_window_then_falls_back(monkeypatch: pytest.M
 
     web._open_dashboard("http://y", app_window=False)
     assert opened == ["http://x", "http://y"]  # --browser always uses a tab
+
+
+def test_graphical_environment_true_on_windows_and_mac(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows and macOS always have a window server, so a browser can be opened."""
+    monkeypatch.setattr(web.sys, "platform", "win32")
+    assert web._is_graphical_environment() is True
+    monkeypatch.setattr(web.sys, "platform", "darwin")
+    assert web._is_graphical_environment() is True
+
+
+def test_graphical_environment_linux_needs_a_display(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Linux a browser needs an X11 or Wayland display; neither set is headless."""
+    monkeypatch.setattr(web.sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    assert web._is_graphical_environment() is False
+    monkeypatch.setenv("DISPLAY", ":0")
+    assert web._is_graphical_environment() is True
+
+
+def test_main_falls_back_to_terminal_when_headless_with_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A no-display box with a real terminal runs the in-terminal TUI instead of serving a browser."""
+    monkeypatch.setattr(web, "_is_graphical_environment", lambda: False)
+    monkeypatch.setattr(web.sys.stdout, "isatty", lambda: True)
+    captured: list[list[str]] = []
+    monkeypatch.setattr(web, "_run_terminal_fallback", lambda args: captured.append([args.process_mode]))
+
+    web.main(["--process-mode", "fake"])
+
+    assert captured == [["fake"]]
+
+
+def test_main_refuses_when_headless_with_no_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No display and no terminal means the dashboard cannot be shown, so exit with guidance."""
+    monkeypatch.setattr(web, "_is_graphical_environment", lambda: False)
+    monkeypatch.setattr(web.sys.stdout, "isatty", lambda: False)
+    monkeypatch.setattr(web, "_run_terminal_fallback", lambda args: pytest.fail("must not run the terminal TUI"))
+
+    with pytest.raises(SystemExit) as exc_info:
+        web.main([])
+
+    assert exc_info.value.code == 1
+
+
+def test_main_serves_anyway_when_lan_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Binding the LAN (--host) is explicit serve intent, so the headless fallback is skipped."""
+    monkeypatch.setattr(web, "_is_graphical_environment", lambda: False)
+    monkeypatch.setattr(web.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(web, "_run_terminal_fallback", lambda args: pytest.fail("must not fall back when LAN-bound"))
+    monkeypatch.setattr(web, "_host_running", lambda address: True)
+    monkeypatch.setattr(web, "_schedule_dashboard_open", lambda *a, **k: None)
+
+    served: list[str] = []
+
+    class _FakeServer:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def serve(self) -> None:
+            served.append("served")
+
+    import textual_serve.server
+
+    monkeypatch.setattr(textual_serve.server, "Server", _FakeServer)
+
+    web.main(["--host", "0.0.0.0", "--no-browser"])
+
+    assert served == ["served"]

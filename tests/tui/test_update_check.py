@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from horde_worker_regen.tui import update_check
-from horde_worker_regen.tui.update_check import UpdateInfo, check_for_update
+from horde_worker_regen import update_check
+from horde_worker_regen.update_check import UpdateInfo, check_for_update
 
 
 @pytest.mark.parametrize(

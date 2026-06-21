@@ -197,6 +197,47 @@ def _record_worker_start_in_app_state() -> None:
         logger.debug(f"Could not record worker start in app state: {app_state_error}")
 
 
+def _run_release_update_check() -> None:
+    """Look up the latest release and log whether the worker is current (the blocking body of the check).
+
+    When a newer release is found it is recorded in ``AIWORKER_NEWER_RELEASE_AVAILABLE`` so the periodic
+    status report can re-nag. Any failure is swallowed: an update check must never affect the worker.
+    """
+    from horde_worker_regen.update_check import NEWER_RELEASE_ENV_VAR, check_for_update, current_version
+
+    try:
+        info = check_for_update()
+    except Exception as update_error:  # noqa: BLE001 - an update check must never affect the worker
+        logger.debug(f"Release update check failed: {update_error}")
+        return
+    if info is None:
+        logger.info(f"Worker v{current_version()} is up to date.")
+        return
+    os.environ[NEWER_RELEASE_ENV_VAR] = info.latest_version
+    logger.warning(
+        f"Update available: v{current_version()} -> v{info.latest_version}. Update with "
+        "'winget upgrade Haidra.HordeWorker', or re-run the installer (the same install command).",
+    )
+
+
+def _start_release_update_check() -> None:
+    """Log, off the startup path, whether a newer worker release exists (best-effort, non-blocking).
+
+    The GitHub release lookup is a network call, so it runs on a daemon thread to keep worker startup
+    instant and offline-safe. This is the headless/console counterpart to the dashboard's update
+    notification; both share :mod:`horde_worker_regen.update_check`, and neither touches
+    ``_version_meta.json`` (which exists only for the operator-controlled hard minimum-version gate).
+    """
+    import threading
+
+    from horde_worker_regen.update_check import update_check_disabled
+
+    if update_check_disabled():
+        return
+
+    threading.Thread(target=_run_release_update_check, name="release-update-check", daemon=True).start()
+
+
 def _log_benchmark_hint() -> None:
     """Log a one-time, non-blocking hint when no current benchmark exists for this worker version.
 
@@ -264,6 +305,8 @@ def _prepare_runtime(options: WorkerLaunchOptions, *, supervised: bool = False) 
     from horde_worker_regen.version_meta import do_version_check
 
     do_version_check()
+
+    _start_release_update_check()
 
     _record_worker_start_in_app_state()
 

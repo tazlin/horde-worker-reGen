@@ -105,18 +105,9 @@ def do_version_check() -> None:
             input("Press Enter to continue...")
             exit(1)
 
-    if (
-        semver.version.Version.compare(
-            semver.version.Version.parse(horde_worker_regen.__version__),
-            semver.version.Version.parse(version_meta.recommended_version),
-        )
-        < 0
-    ):
-        logger.warning(
-            f"Current worker version {horde_worker_regen.__version__} is not the recommended version. "
-            f"Please consider updating to {version_meta.recommended_version}.",
-        )
-        os.environ["AIWORKER_NOT_RECOMMENDED_VERSION"] = "1"
+    # The "recommended version" nag used to come from _version_meta.json; the worker now sources
+    # update awareness from the GitHub releases API instead (see horde_worker_regen.update_check),
+    # so this check only enforces the operator-controlled hard minimum version and beta branch below.
 
     if version_meta.beta_version_info:
         current_version_semver = semver.VersionInfo.parse(horde_worker_regen.__version__)

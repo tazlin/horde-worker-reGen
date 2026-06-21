@@ -8,21 +8,30 @@ convenience layer on top.
 
 ## Launch it
 
-The launcher scripts pick the interface for you:
+The launcher scripts offer three peer interfaces:
 
 ```bash
 # Windows
-horde-worker.cmd            # opens the dashboard in your web browser (default)
-horde-worker.cmd --terminal # runs the dashboard in this terminal instead
+horde-worker.cmd            # web dashboard in your browser (default)
+horde-worker.cmd --terminal # the dashboard in this terminal (no browser)
+horde-worker.cmd --headless # no UI: run the worker in the foreground, printing to this console
 
 # Linux / macOS
 ./horde-worker.sh
 ./horde-worker.sh --terminal
+./horde-worker.sh --headless
 ```
 
 The window you launch from is the worker: closing it (or pressing `Ctrl+C` in it) stops the worker.
 In browser mode the worker runs in a persistent background host, so closing the browser tab leaves
 the worker running and you can reopen the dashboard to reconnect.
+
+`--headless` is the no-UI path: it downloads/verifies your models and then runs the worker directly
+(equivalent to `run_worker`; see [Run headless](run-headless.md)), so a server or service sees the
+worker's own log output rather than a UI. On a machine with no graphical display, the default
+(browser) mode detects that a browser cannot be opened and automatically falls back to the in-terminal
+dashboard; with no terminal either, it tells you to use `--headless` (or `--host` to serve a browser
+on another machine).
 
 To try the whole interface without a GPU, models, or an API key, run a synthetic worker:
 
