@@ -221,6 +221,42 @@ async def test_model_picker_membership_shows_and_blocks_target(monkeypatch: pyte
 
 
 @pytest.mark.e2e
+async def test_model_picker_single_click_toggles_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A single real mouse click on a row marks it (and clicking again unmarks it).
+
+    Guards the click path itself: ``DataTable`` stops the ``Click`` event on a cell-cursor click, so a
+    handler on the modal never sees it. The other e2e tests call ``_toggle`` directly and so cannot
+    catch a dead click handler; this one drives the click through the widget.
+    """
+    from textual.geometry import Offset
+
+    from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
+
+    CATALOG_CACHE.reset()
+    monkeypatch.setattr("horde_worker_regen.tui.catalog_cache.load_image_models", lambda: list(_MODELS))
+    monkeypatch.setattr("horde_worker_regen.tui.catalog_cache.free_model_bytes", lambda: None)
+
+    app = _PickerHost()
+    async with app.run_test(size=(150, 44)) as pilot:
+        await pilot.pause()
+        modal = app.screen
+        assert isinstance(modal, ModelPickerModal)
+        table = modal.query_one("#picker-table", DataTable)
+        await _wait_for_rows(pilot, table, 3)
+
+        # Offset (3, 1): column 0 (marker) of the first data row, below the header at y=0.
+        await pilot.click(table, offset=Offset(3, 1))
+        await pilot.pause()
+        assert str(table.get_cell_at(Coordinate(0, 0))) == "✕ Unmark"
+        assert modal._visible[0].name in modal._chosen
+
+        await pilot.click(table, offset=Offset(3, 1))
+        await pilot.pause()
+        assert str(table.get_cell_at(Coordinate(0, 0))) == "＋ Mark"
+        assert modal._visible[0].name not in modal._chosen
+
+
+@pytest.mark.e2e
 async def test_model_picker_disk_and_marked_filters(monkeypatch: pytest.MonkeyPatch) -> None:
     """The on-disk filter and the marked-only filter narrow the table."""
     from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
