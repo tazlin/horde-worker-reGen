@@ -94,7 +94,7 @@ class ConfigField:
         return ""
 
 
-# Section order is the display order.
+# Section order is the display order within each subtab.
 SECTIONS = (
     "Connection",
     "Identity",
@@ -104,22 +104,43 @@ SECTIONS = (
     "Features",
     "LoRA",
     "Models",
+    "Model downloads",
     "Alchemist",
+    "Timeouts",
+    "Retry & scheduling",
+    "VRAM budget",
+    "Exclusive residency",
+    "Unservable model breaker",
+    "Self-maintenance",
+    "GPU sampling lease",
     "Other",
+    "Dry-run",
 )
 
 # Sub-tab grouping for the config editor: each tab bundles related sections so no single page
 # requires long scrolling. Order is the tab order; "Models" is its own tab (the unified panel).
 CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Essentials", ("Connection", "Identity")),
-    ("Models", ("Models",)),
+    ("Models", ("Models", "Model downloads")),
     ("Performance", ("Throughput", "Memory & performance")),
     ("Content", ("Content & safety", "Features")),
     # LoRA and Alchemy are logically distinct concerns (one is an image-job feature, the other a separate
     # worker role), so each gets its own sub-tab rather than sharing a crowded combined page.
     ("LoRA", ("LoRA",)),
     ("Alchemy", ("Alchemist",)),
+    ("Timeouts", ("Timeouts", "Retry & scheduling")),
+    (
+        "Budget",
+        (
+            "VRAM budget",
+            "Exclusive residency",
+            "Unservable model breaker",
+            "Self-maintenance",
+            "GPU sampling lease",
+        ),
+    ),
     ("Advanced", ("Other",)),
+    ("Developer", ("Dry-run",)),
 )
 
 SECTION_GUIDANCE: dict[str, str] = {
@@ -127,9 +148,20 @@ SECTION_GUIDANCE: dict[str, str] = {
     "See the suggested values per GPU tier in the README.",
     "Models": "Edit the load/skip rules below; the panel previews exactly which models will load and "
     "their disk cost. Press Resolve to expand 'top N' / 'bottom N' commands (needs usage stats).",
+    "Model downloads": "Controls background download behaviour. The Downloads tab provides a live pause/resume "
+    "toggle; downloads_paused here sets the default at worker startup.",
     "LoRA": "Allowing LoRA downloads them on demand; set a civitai_api_token for resources that require it.",
     "Alchemist": "Alchemy is a separate worker role (interrogation / post-processing), distinct from LoRA. "
     "Enabling it serves alchemy jobs alongside (or instead of) image generation.",
+    "Timeouts": "All timeouts are in seconds. Raise first-step and contended timeouts if Flux or SDXL "
+    "jobs are being false-killed during their initial step or under co-residence load.",
+    "VRAM budget": "Controls how the scheduler gates preloads and dispatch against measured free VRAM. "
+    "Disabling the master switch (enable_vram_budget) restores availability-only behavior.",
+    "GPU sampling lease": "The lease serializes denoising loops so spare processes can stage their next pipeline "
+    "in parallel. Counterproductive with unload_models_from_vram_often (no staged residency to overlap). "
+    "Changes to these fields require a worker restart.",
+    "Dry-run": "Testing flags that skip real GPU work. All fields here require a worker restart. "
+    "Do not enable these on a production worker.",
 }
 
 # Curated against bridgeData_template.yaml key names (note: dreamer_name, allow_painting, cache_home).
@@ -245,6 +277,14 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.BOOL,
         "Memory & performance",
         "Load multiple models off disk at once. Needs a very fast disk; high disk usage.",
+    ),
+    ConfigField(
+        "cycle_process_on_model_change",
+        "Cycle process on model change",
+        FieldKind.BOOL,
+        "Memory & performance",
+        "Restart the inference process when the loaded model changes. Reduces inter-run drift "
+        "at the cost of a full process-restart delay on every model switch.",
     ),
     ConfigField(
         "extra_slow_worker",
@@ -387,7 +427,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "LoRA",
         "Delete LoRAs not in the reference when download_models runs (also removes custom ones).",
     ),
-    # Models
+    # Models (rendered as ModelManagerView by config_editor.py)
     ConfigField(
         "models_to_load",
         "Models to load",
@@ -415,6 +455,34 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.BOOL,
         "Models",
         "Only offer models already downloaded; any resolved model not on disk is dropped, never fetched.",
+    ),
+    # Model downloads
+    ConfigField(
+        "downloads_paused",
+        "Pause downloads",
+        FieldKind.BOOL,
+        "Model downloads",
+        "Hold background model downloads at startup. Overridable live from the Downloads tab.",
+    ),
+    ConfigField(
+        "download_rate_limit_kbps",
+        "Download rate limit",
+        FieldKind.INT,
+        "Model downloads",
+        "Cap background downloads to this many KB/s (0 = unlimited). Enforced at 16 MB granularity.",
+        minimum=0,
+        maximum=100000,
+        unit="KB/s",
+        explicit_default=0,
+    ),
+    ConfigField(
+        "extra_model_directories",
+        "Extra model directories",
+        FieldKind.STR_LIST,
+        "Model downloads",
+        "Additional directories to search for already-downloaded models (one path per line). "
+        "Each must be laid out like the primary model folder. New downloads always go to the primary root.",
+        requires_restart=True,
     ),
     # Alchemist
     ConfigField(
@@ -475,6 +543,291 @@ CONFIG_FIELDS: list[ConfigField] = [
         unit="MB",
         explicit_default=2000,
     ),
+    ConfigField(
+        "alchemy_ram_headroom_mb",
+        "Alchemy RAM floor",
+        FieldKind.INT,
+        "Alchemist",
+        "Minimum free RAM (MB) before popping an alchemy form. Analogous to the VRAM floor, keeps "
+        "alchemy from pushing a memory-resident worker into paging.",
+        minimum=0,
+        maximum=49152,
+        unit="MB",
+        explicit_default=2048,
+    ),
+    # Timeouts
+    ConfigField(
+        "process_timeout",
+        "Job timeout",
+        FieldKind.INT,
+        "Timeouts",
+        "Max seconds a job may run before being killed. High-performance mode divides by 3; moderate by 2.",
+        minimum=15,
+        maximum=3600,
+        unit="s",
+        explicit_default=300,
+    ),
+    ConfigField(
+        "post_process_timeout",
+        "Post-process timeout",
+        FieldKind.INT,
+        "Timeouts",
+        "Max seconds for upscaling / face-fixing before the job is killed.",
+        minimum=15,
+        maximum=600,
+        unit="s",
+        explicit_default=60,
+    ),
+    ConfigField(
+        "preload_timeout",
+        "Preload timeout",
+        FieldKind.INT,
+        "Timeouts",
+        "Max seconds to load a model from disk into VRAM before the process is killed.",
+        minimum=15,
+        maximum=600,
+        unit="s",
+        explicit_default=80,
+    ),
+    ConfigField(
+        "inference_step_timeout",
+        "Step timeout",
+        FieldKind.INT,
+        "Timeouts",
+        "Max seconds a single sampling step may make no progress before the slot is killed as hung.",
+        minimum=15,
+        maximum=60,
+        unit="s",
+        explicit_default=20,
+    ),
+    ConfigField(
+        "inference_first_step_timeout",
+        "First step timeout",
+        FieldKind.INT,
+        "Timeouts",
+        "Wider grace for the first sampling step, which also covers the cold work before it "
+        "(streaming a large model, prompt encoding). Raise if Flux is killed on its first step.",
+        minimum=15,
+        maximum=600,
+        unit="s",
+        explicit_default=90,
+    ),
+    ConfigField(
+        "contended_step_timeout",
+        "Contended step timeout",
+        FieldKind.INT,
+        "Timeouts",
+        "Wider per-step grace for legitimate but heartbeat-silent heavy work: co-residence contention, "
+        "hires-fix second pass, VAE decode, ControlNet graph.",
+        minimum=15,
+        maximum=600,
+        unit="s",
+        explicit_default=120,
+    ),
+    ConfigField(
+        "download_timeout",
+        "Aux download timeout",
+        FieldKind.INT,
+        "Timeouts",
+        "Max seconds to allow an auxiliary model (LoRA, etc.) to download.",
+        minimum=15,
+        maximum=3600,
+        unit="s",
+        explicit_default=211,
+    ),
+    # Retry & scheduling
+    ConfigField(
+        "max_inference_attempts",
+        "Max inference attempts",
+        FieldKind.INT,
+        "Retry & scheduling",
+        "How many times a job may be dispatched before being faulted. 1 = no retry; 2 (default) = one retry.",
+        minimum=1,
+        maximum=5,
+        explicit_default=2,
+    ),
+    ConfigField(
+        "minutes_allowed_without_jobs",
+        "Idle exit timeout",
+        FieldKind.INT,
+        "Retry & scheduling",
+        "Minutes to stay alive with no jobs before exiting. 0 = run indefinitely.",
+        minimum=0,
+        maximum=3600,
+        unit="min",
+        explicit_default=30,
+    ),
+    ConfigField(
+        "model_stickiness",
+        "Model stickiness",
+        FieldKind.FLOAT,
+        "Retry & scheduling",
+        "Probability (0.0–1.0) that the currently-loaded model is favored when popping a job. "
+        "Higher values reduce model switches at the cost of throughput diversity.",
+        minimum=0.0,
+        maximum=1.0,
+    ),
+    # VRAM budget
+    ConfigField(
+        "enable_vram_budget",
+        "Enable VRAM budget",
+        FieldKind.BOOL,
+        "VRAM budget",
+        "Gate preloads and dispatch on measured VRAM. When off, uses availability-only behavior "
+        "(not recommended on a shared/consumer GPU).",
+        explicit_default=True,
+    ),
+    ConfigField(
+        "vram_reserve_mb",
+        "VRAM reserve",
+        FieldKind.INT,
+        "VRAM budget",
+        "Free VRAM (MB) kept in reserve above a job's estimated peak. Larger = safer, lower throughput.",
+        minimum=0,
+        maximum=49152,
+        unit="MB",
+        explicit_default=2048,
+    ),
+    ConfigField(
+        "ram_reserve_mb",
+        "RAM reserve",
+        FieldKind.INT,
+        "VRAM budget",
+        "System RAM (MB) kept in reserve so resident-in-RAM models do not force paging.",
+        minimum=0,
+        maximum=131072,
+        unit="MB",
+        explicit_default=4096,
+    ),
+    # Exclusive residency
+    ConfigField(
+        "overbudget_exclusive_mode",
+        "Overbudget exclusive mode",
+        FieldKind.BOOL,
+        "Exclusive residency",
+        "When a model is admitted over budget (best-effort head-of-queue), evict all other residents "
+        "and suppress concurrent dispatch so it runs on an uncontended device.",
+        explicit_default=True,
+    ),
+    ConfigField(
+        "whole_card_exclusive_residency",
+        "Whole-card exclusive residency",
+        FieldKind.BOOL,
+        "Exclusive residency",
+        "Proactively give a model that needs most of the card sole residency before it streams, "
+        "rather than reacting after a fault.",
+        explicit_default=True,
+    ),
+    ConfigField(
+        "whole_card_residency_safety_off_gpu",
+        "Move safety off-GPU during whole-card",
+        FieldKind.BOOL,
+        "Exclusive residency",
+        "Move the safety process off-GPU while a whole-card model holds the device, freeing its "
+        "~1 GB CUDA context. Only applies when both enable_vram_budget and safety_on_gpu are true.",
+        explicit_default=True,
+    ),
+    ConfigField(
+        "whole_card_residency_cooldown_seconds",
+        "Whole-card cooldown",
+        FieldKind.INT,
+        "Exclusive residency",
+        "Seconds to hold single-residency mode after the last whole-card job finishes, so back-to-back "
+        "heavy jobs share one teardown/restore cycle instead of each churning it.",
+        minimum=0,
+        maximum=600,
+        unit="s",
+        explicit_default=45,
+    ),
+    ConfigField(
+        "overbudget_step_timeout",
+        "Overbudget step timeout",
+        FieldKind.INT,
+        "Exclusive residency",
+        "Per-step grace (seconds) for a job admitted over budget. Heavy models may stream weights "
+        "each step and are legitimately slower than inference_step_timeout.",
+        minimum=15,
+        maximum=600,
+        unit="s",
+        explicit_default=120,
+    ),
+    # Unservable model breaker
+    ConfigField(
+        "unservable_model_fault_threshold",
+        "Unservable fault threshold",
+        FieldKind.INT,
+        "Unservable model breaker",
+        "Consecutive OOM/over-budget faults for one model before it is held back. 0 disables. "
+        "A successful generation resets the counter.",
+        minimum=0,
+        maximum=20,
+        explicit_default=3,
+    ),
+    ConfigField(
+        "unservable_model_cooldown_seconds",
+        "Unservable cooldown",
+        FieldKind.INT,
+        "Unservable model breaker",
+        "How long (seconds) a model flagged locally unservable is suppressed before the worker retries it.",
+        minimum=0,
+        maximum=86400,
+        unit="s",
+        explicit_default=900,
+    ),
+    # Self-maintenance
+    ConfigField(
+        "self_maintenance_fault_threshold",
+        "Self-maintenance fault threshold",
+        FieldKind.INT,
+        "Self-maintenance",
+        "Cross-model OOM faults within the window before the worker self-pauses popping. 0 disables.",
+        minimum=0,
+        maximum=100,
+        explicit_default=6,
+    ),
+    ConfigField(
+        "self_maintenance_window_seconds",
+        "Self-maintenance window",
+        FieldKind.INT,
+        "Self-maintenance",
+        "Rolling window (seconds) over which OOM faults are counted for the self-throttle.",
+        minimum=1,
+        maximum=3600,
+        unit="s",
+        explicit_default=600,
+    ),
+    ConfigField(
+        "self_maintenance_cooldown_seconds",
+        "Self-maintenance cooldown",
+        FieldKind.INT,
+        "Self-maintenance",
+        "How long (seconds) the worker holds its self-imposed pop-pause before resuming.",
+        minimum=0,
+        maximum=3600,
+        unit="s",
+        explicit_default=300,
+    ),
+    # GPU sampling lease
+    ConfigField(
+        "gpu_sampling_lease_enabled",
+        "GPU sampling lease",
+        FieldKind.BOOL,
+        "GPU sampling lease",
+        "Serialize GPU denoising loops so spare processes stage their next pipeline while one samples. "
+        "Counterproductive with unload_models_from_vram_often (no staged residency to overlap).",
+        requires_restart=True,
+    ),
+    ConfigField(
+        "gpu_sampling_lease_slots",
+        "Sampling lease slots",
+        FieldKind.INT,
+        "GPU sampling lease",
+        "How many processes may run the denoising loop at once when gpu_sampling_lease_enabled is true. "
+        "1 serializes; values > 1 permit concurrent loops (time-sliced on Windows WDDM).",
+        requires_restart=True,
+        minimum=1,
+        maximum=16,
+    ),
     # Other
     ConfigField(
         "remove_maintenance_on_init",
@@ -516,7 +869,57 @@ CONFIG_FIELDS: list[ConfigField] = [
         explicit_default=30,
     ),
     ConfigField(
+        "capture_kudos_training_data",
+        "Capture kudos training data",
+        FieldKind.BOOL,
+        "Other",
+        "Opt in to telemetry capture for kudos model training.",
+    ),
+    ConfigField(
+        "kudos_training_data_file",
+        "Kudos training data file",
+        FieldKind.STR,
+        "Other",
+        "File path to write kudos training data (only used when capture is enabled).",
+    ),
+    ConfigField(
         "cache_home", "Models folder", FieldKind.STR, "Other", "Where models are stored.", requires_restart=True
+    ),
+    # Dry-run
+    ConfigField(
+        "dry_run_skip_inference",
+        "Skip inference",
+        FieldKind.BOOL,
+        "Dry-run",
+        "Skip real GPU inference and return a dummy 1x1 image instead.",
+        requires_restart=True,
+    ),
+    ConfigField(
+        "dry_run_skip_safety",
+        "Skip safety",
+        FieldKind.BOOL,
+        "Dry-run",
+        "Skip the NSFW/CSAM safety evaluation model.",
+        requires_restart=True,
+    ),
+    ConfigField(
+        "dry_run_skip_api",
+        "Skip API calls",
+        FieldKind.BOOL,
+        "Dry-run",
+        "Skip job pop and submit; use canned scenarios instead.",
+        requires_restart=True,
+    ),
+    ConfigField(
+        "dry_run_inference_delay",
+        "Inference delay",
+        FieldKind.FLOAT,
+        "Dry-run",
+        "Seconds to sleep when skip-inference is active, simulating GPU work.",
+        minimum=0.0,
+        maximum=60.0,
+        unit="s",
+        explicit_default=1.0,
     ),
 ]
 

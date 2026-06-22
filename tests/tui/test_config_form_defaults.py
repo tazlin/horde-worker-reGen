@@ -22,7 +22,17 @@ from horde_worker_regen.tui.config_form import CONFIG_FIELDS, FieldKind
 # even though the model carries a placeholder/default. Aligning these to the SDK placeholder
 # ("An Awesome Dreamer", "0000000000", "./") would be worse UX, so they are exempt from parity.
 _INTENTIONALLY_BLANK = frozenset(
-    {"api_key", "civitai_api_token", "dreamer_name", "alchemist_name", "cache_home"},
+    {
+        "api_key",
+        "civitai_api_token",
+        "dreamer_name",
+        "alchemist_name",
+        "cache_home",
+        # These fields have model default=None (meaning "unset"); the editor shows a blank/zero
+        # placeholder that the operator is expected to fill in before enabling the feature.
+        "kudos_training_data_file",
+        "download_rate_limit_kbps",
+    }
 )
 
 
