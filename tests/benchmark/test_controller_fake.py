@@ -160,10 +160,14 @@ def test_warm_mode_runs_fixed_levels_without_subprocesses(tmp_path: Path, monkey
     fixed_levels = [level for level in ladder if level.scenario.soak_seconds is None]
     assert len(fixed_levels) >= 2, "need multiple fixed levels to exercise warm reuse"
 
-    def _fail_if_called(*args: object, **kwargs: object) -> subprocess.Popen:
+    # Assert the warm path never takes the controller's per-level subprocess seam, rather than patching
+    # subprocess.Popen wholesale: the warm worker legitimately shells out to git during startup and status
+    # reporting (logfire's service_version, runtime_version()'s dev suffix), so breaking Popen sabotages the
+    # worker itself instead of detecting a per-level level_runner spawn.
+    def _fail_if_called(self: BenchmarkController, level: object, command: object) -> tuple[int, bool]:
         raise AssertionError("warm mode must not spawn per-level subprocesses")
 
-    monkeypatch.setattr(subprocess, "Popen", _fail_if_called)
+    monkeypatch.setattr(BenchmarkController, "_run_level_subprocess", _fail_if_called)
 
     controller = BenchmarkController(ladder, tmp_path, process_mode="fake", warm=True, validate=False)
     report = controller.run()

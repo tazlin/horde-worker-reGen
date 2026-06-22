@@ -156,19 +156,17 @@ def download_all_models(
         logger.error("Failed to load compvis model manager")
         exit(1)
 
-    any_compvis_model_failed_to_download = False
-    for model in bridge_data.image_models_to_load:
-        if not SharedModelManager.manager.compvis.download_model(model):
-            logger.error(f"Failed to download model {model}")
-            any_compvis_model_failed_to_download = True
+    from horde_worker_regen.model_download_core import ensure_models_present
 
-        # This will check the SHA of the model and redownload it if it's corrupted or the model reference entry changed
-        if not SharedModelManager.manager.compvis.validate_model(model):  # noqa: SIM102
-            if not SharedModelManager.manager.compvis.download_model(model):
-                logger.error(f"Failed to redownload model {model}")
-                any_compvis_model_failed_to_download = True
+    outcome = ensure_models_present(
+        SharedModelManager.manager.compvis,
+        list(bridge_data.image_models_to_load),
+        on_model_finish=lambda name, _index, _total, ok: (
+            None if ok else logger.error(f"Failed to download model {name}")
+        ),
+    )
 
-    if any_compvis_model_failed_to_download:
+    if outcome.failed:
         logger.error("Failed to download all models.")
         exit(1)
     else:

@@ -11,8 +11,9 @@ Behavioural notes grounded in a hordelib source trace:
 - ``SharedModelManager.load_model_managers()`` reads the model reference from disk (offline): the
   parent process owns reference downloading. It is reported as the ``INITIALIZING`` phase and retried
   with backoff on failure.
-- The first on-disk scan (``available_models``) can SHA256-hash large files; it is reported as the
-  ``SCANNING`` phase so it never looks hung.
+- The first on-disk scan (``available_models``) is an existence check over the configured models; it is
+  reported as the ``SCANNING`` phase so it never looks hung. Integrity (checksums) is verified lazily by
+  ``validate_model`` after a download, not during this scan.
 - ``download_file`` exposes a per-chunk ``callback(downloaded, total)`` but no pause/rate-limit. We
   implement both inside that callback (block while paused; sleep to cap kB/s).
 
@@ -37,6 +38,7 @@ from multiprocessing.synchronize import Lock, Semaphore
 
 from loguru import logger
 
+from horde_worker_regen.model_download_core import ChunkPacer, DownloadAborted, download_one_model
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.horde_process import HordeProcess, HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.messages import (
@@ -71,10 +73,6 @@ FEATURE_SAFETY = "safety models"
 
 def _post_processing_feature(name: str) -> str:
     return f"post-processing ({name})"
-
-
-class _DownloadInterrupted(Exception):
-    """Raised inside the progress callback to abort an in-flight download on shutdown."""
 
 
 class HordeDownloadProcess(HordeProcess):
@@ -151,9 +149,7 @@ class HordeDownloadProcess(HordeProcess):
         self._cb_feature = FEATURE_IMAGE_MODEL
         self._cb_model = ""
         self._cb_target_dir = ""
-        self._cb_last_bytes = 0
-        self._cb_last_time = 0.0
-        self._cb_speed_bps: float | None = None
+        self._pacer = ChunkPacer()
         self._last_status_emit = 0.0
 
     # region status reporting
@@ -383,48 +379,29 @@ class HordeDownloadProcess(HordeProcess):
     # region downloads
 
     def _progress_callback(self, downloaded: int, total: int) -> None:
-        """Per-chunk hook: update progress, enforce pause/rate-limit, emit throttled status."""
-        if self._end_process:
-            raise _DownloadInterrupted
-        now = time.time()
-        delta = max(0, downloaded - self._cb_last_bytes)
-        elapsed = now - self._cb_last_time if self._cb_last_time else 0.0
+        """Per-chunk hook: pace via the shared core (pause/rate-limit/speed/ETA), then emit throttled status.
 
-        if self._rate_limit_kbps and elapsed >= 0 and delta > 0:
-            allowed = delta / (self._rate_limit_kbps * 1024.0)
-            if allowed > elapsed:
-                time.sleep(allowed - elapsed)
-                now = time.time()
-                elapsed = now - self._cb_last_time if self._cb_last_time else 0.0
-
-        if elapsed > 0 and delta > 0:
-            instantaneous = delta / elapsed
-            self._cb_speed_bps = (
-                instantaneous if self._cb_speed_bps is None else (0.7 * self._cb_speed_bps + 0.3 * instantaneous)
-            )
-        self._cb_last_bytes = downloaded
-        self._cb_last_time = now
-
-        eta = None
-        if self._cb_speed_bps and total > downloaded:
-            eta = (total - downloaded) / self._cb_speed_bps
+        The core blocks the chunk loop while paused (calling back to emit a PAUSED snapshot) and raises
+        :class:`DownloadAborted` on shutdown; here we only translate its result into a status snapshot.
+        """
+        progress = self._pacer.step(
+            downloaded,
+            total,
+            is_paused=lambda: self._paused,
+            rate_limit_kbps=lambda: self._rate_limit_kbps,
+            should_abort=lambda: self._end_process,
+            on_pause_wait=lambda: self._send_status(DownloadPhase.PAUSED, force=True),
+        )
         with self._lock:
             self._current = CurrentDownloadStatus(
                 model_name=self._cb_model,
                 feature=self._cb_feature,
                 target_dir=self._cb_target_dir,
-                downloaded_bytes=downloaded,
-                total_bytes=total,
-                speed_bps=self._cb_speed_bps,
-                eta_seconds=eta,
+                downloaded_bytes=progress.downloaded_bytes,
+                total_bytes=progress.total_bytes,
+                speed_bps=progress.speed_bps,
+                eta_seconds=progress.eta_seconds,
             )
-
-        # Live pause: block here (holding the chunk loop) until resumed or shutdown.
-        while self._paused and not self._end_process:
-            self._send_status(DownloadPhase.PAUSED, force=True)
-            time.sleep(0.2)
-        if self._end_process:
-            raise _DownloadInterrupted
         self._send_status(DownloadPhase.DOWNLOADING)
 
     def _begin_download_context(self, *, model: str, feature: str, target_dir: str) -> None:
@@ -434,9 +411,7 @@ class HordeDownloadProcess(HordeProcess):
         self._cb_model = model
         self._cb_feature = feature
         self._cb_target_dir = target_dir
-        self._cb_last_bytes = 0
-        self._cb_last_time = 0.0
-        self._cb_speed_bps = None
+        self._pacer = ChunkPacer()
         with self._lock:
             self._current = CurrentDownloadStatus(model_name=model, feature=feature, target_dir=target_dir)
         self._send_status(DownloadPhase.DOWNLOADING, force=True)
@@ -471,10 +446,8 @@ class HordeDownloadProcess(HordeProcess):
         )
         started = time.time()
         try:
-            succeeded = bool(compvis.download_model(model_name, callback=self._progress_callback))
-            if succeeded and compvis.validate_model(model_name) is False:
-                succeeded = bool(compvis.download_model(model_name, callback=self._progress_callback))
-        except _DownloadInterrupted:
+            succeeded = download_one_model(compvis, model_name, callback=self._progress_callback)
+        except DownloadAborted:
             self._end_download_context()
             return
         except OSError as e:
@@ -601,7 +574,7 @@ class HordeDownloadProcess(HordeProcess):
 
             if self._allow_controlnet:
                 self._download_controlnet_models()
-        except _DownloadInterrupted:
+        except DownloadAborted:
             pass
         except Exception as e:  # noqa: BLE001 - aux is best-effort; the worker still serves image jobs
             logger.error(f"Download process: aux downloads failed: {type(e).__name__} {e}")

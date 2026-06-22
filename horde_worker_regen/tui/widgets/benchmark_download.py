@@ -11,6 +11,7 @@ heavy inference-stack import off the TUI process and reuses one code path for bo
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 
 from rich.console import Group, RenderableType
@@ -19,14 +20,18 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Static
+from textual.widgets import Button, Input, Static
 
 from horde_worker_regen.benchmark.download_progress import (
+    DownloadControl,
     DownloadEvent,
     DownloadModelRow,
     decode_download_events,
+    encode_download_control,
 )
 from horde_worker_regen.tui.benchmark_launcher import BenchmarkOptions
+from horde_worker_regen.tui.formatters import human_bytes, human_duration
+from horde_worker_regen.tui.widgets.downloads import DownloadsView
 
 _PLAN_TIMEOUT_SECONDS = 240.0
 """Cap on the dry-run plan subprocess: it imports the inference stack and probes the GPU (slow, cold)."""
@@ -73,6 +78,16 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
     BenchmarkDownloadModal #download-actions Button {
         margin-right: 1;
     }
+    BenchmarkDownloadModal #download-controls {
+        height: 3;
+    }
+    BenchmarkDownloadModal #download-controls Button {
+        margin-right: 1;
+    }
+    BenchmarkDownloadModal #download-rate {
+        width: 26;
+        margin-right: 1;
+    }
     """
 
     BINDINGS = [("escape", "dismiss_modal", "Close")]
@@ -86,6 +101,11 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
         self._progress: dict[str, str] = {}
         """Per-model status (``downloading`` / ``done`` / ``failed``) accumulated during a download run."""
         self._busy = False
+        self._paused = False
+        self._process: subprocess.Popen[str] | None = None
+        """The running download subprocess, kept so control commands can be written to its stdin."""
+        self._current_progress: DownloadEvent | None = None
+        """The latest ``model_progress`` event, rendered as a live progress bar for the current model."""
 
     def compose(self) -> ComposeResult:
         """Lay out the intro line, the scrollable plan/progress body, and the action buttons."""
@@ -100,12 +120,17 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
             )
             with VerticalScroll(id="download-body-scroll"):
                 yield Static(id="download-body")
+            with Horizontal(id="download-controls"):
+                yield Button("Pause", id="download-pause", variant="primary")
+                yield Input(placeholder="rate limit KB/s (0 = off)", id="download-rate", type="integer")
+                yield Button("Apply limit", id="download-rate-apply")
             with Horizontal(id="download-actions"):
                 yield Button("Download missing models", id="download-start", variant="success", disabled=True)
                 yield Button("Close", id="download-close", variant="warning")
 
     def on_mount(self) -> None:
         """Kick off the (slow, cold) dry-run plan computation and show a working state meanwhile."""
+        self.query_one("#download-controls").display = False
         self._set_body(
             Text(
                 "Working out which models are needed (this starts no benchmark and downloads nothing; "
@@ -158,11 +183,39 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
         self._set_body(Text(f"Could not work out the download plan: {message}", style="red"))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Route the action buttons to start a download or close the modal."""
+        """Route the action buttons to start a download, toggle controls, or close the modal."""
         if event.button.id == "download-start":
             self._start_download()
         elif event.button.id == "download-close":
             self.dismiss(self._downloaded_any)
+        elif event.button.id == "download-pause":
+            self._toggle_pause()
+        elif event.button.id == "download-rate-apply":
+            self._apply_rate_limit()
+
+    def _toggle_pause(self) -> None:
+        """Pause or resume the running download by writing a control line to its stdin."""
+        self._paused = not self._paused
+        self._write_control(DownloadControl(cmd="pause" if self._paused else "resume"))
+        self.query_one("#download-pause", Button).label = "Resume" if self._paused else "Pause"
+
+    def _apply_rate_limit(self) -> None:
+        """Apply the rate-limit field to the running download (0 or blank clears the cap)."""
+        raw = self.query_one("#download-rate", Input).value.strip()
+        try:
+            kbps = max(int(raw), 0) if raw else 0
+        except ValueError:
+            return
+        self._write_control(DownloadControl(cmd="rate", kbps=kbps))
+
+    def _write_control(self, control: DownloadControl) -> None:
+        """Write one control command to the download subprocess's stdin (a no-op if it is not running)."""
+        process = self._process
+        if process is None or process.stdin is None:
+            return
+        with contextlib.suppress(Exception):
+            process.stdin.write(encode_download_control(control) + "\n")
+            process.stdin.flush()
 
     def action_dismiss_modal(self) -> None:
         """Close the modal (Escape), reporting whether anything was downloaded."""
@@ -174,9 +227,14 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
         if self._plan is None or self._busy:
             return
         self._busy = True
+        self._paused = False
+        self._current_progress = None
         self._progress = {model.name: "downloading" for model in self._plan.models if not model.on_disk}
         self.query_one("#download-start", Button).disabled = True
         self.query_one("#download-close", Button).disabled = True
+        controls = self.query_one("#download-controls")
+        controls.display = True
+        self.query_one("#download-pause", Button).label = "Pause"
         self._render_progress(header="Downloading models…")
         self.run_worker(self._run_download, thread=True, exclusive=True, group="bench-dl-run")
 
@@ -184,7 +242,8 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
         """(Worker thread) stream the real download subprocess, parsing progress events line by line."""
         try:
             process = subprocess.Popen(  # noqa: S603 - argv is built from our own options, not user input
-                self._options.build_download_command(),
+                self._options.build_download_command(control_stdin=True),
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -194,6 +253,7 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
             self.app.call_from_thread(self._finish_download, f"{type(e).__name__}: {e}")
             return
 
+        self._process = process
         assert process.stdout is not None
         for line in process.stdout:
             for download_event in decode_download_events(line):
@@ -205,15 +265,22 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
         """(UI thread) fold one streamed progress event into the per-model status and re-render."""
         if event.kind == "model_started":
             self._progress[event.name] = "downloading"
+            self._current_progress = None
+        elif event.kind == "model_progress":
+            self._current_progress = event
         elif event.kind == "model_finished":
             self._progress[event.name] = "done" if event.ok else "failed"
             if event.ok:
                 self._downloaded_any = True
+            self._current_progress = None
         self._render_progress(header="Downloading models…")
 
     def _finish_download(self, error: str | None) -> None:
         """(UI thread) render the final summary and re-enable closing the modal."""
         self._busy = False
+        self._current_progress = None
+        with contextlib.suppress(Exception):
+            self.query_one("#download-controls").display = False
         self.query_one("#download-close", Button).disabled = False
         failed = sum(1 for status in self._progress.values() if status == "failed")
         done = sum(1 for status in self._progress.values() if status == "done")
@@ -229,14 +296,39 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
         self._render_progress(header=header)
 
     def _render_progress(self, *, header: RenderableType) -> None:
-        """(UI thread) render the header plus a per-model status table from the accumulated progress."""
+        """(UI thread) render the header, a live bar for the current model, and the per-model status table."""
         table = Table(expand=True)
         table.add_column("Model")
         table.add_column("Status")
         for name, status in self._progress.items():
             table.add_row(name, _status_text(status))
-        body: RenderableType = Group(header, Text(""), table) if self._progress else header
-        self._set_body(body)
+        if not self._progress:
+            self._set_body(header)
+            return
+        parts: list[RenderableType] = [header, Text("")]
+        if self._current_progress is not None:
+            parts.extend([self._progress_line(self._current_progress), Text("")])
+        parts.append(table)
+        self._set_body(Group(*parts))
+
+    @staticmethod
+    def _progress_line(event: DownloadEvent) -> Text:
+        """Render a one-line progress bar (bar, sizes, speed, ETA) for the in-flight model."""
+        percent = (event.downloaded_bytes / event.total_bytes * 100) if event.total_bytes else None
+        bar = DownloadsView._progress_bar(percent)
+        sizes = f"{human_bytes(event.downloaded_bytes)} / {human_bytes(event.total_bytes)}"
+        speed = f"{human_bytes(event.speed_bps)}/s" if event.speed_bps else "-"
+        eta = human_duration(event.eta_seconds) if event.eta_seconds is not None else "-"
+        return Text.assemble(
+            (f"{event.name}  ", "bold"),
+            (bar, "green"),
+            ("   ", ""),
+            (sizes, "grey70"),
+            ("   ⇣ ", "grey50"),
+            (speed, "grey70"),
+            ("   ETA ", "grey50"),
+            (eta, "grey70"),
+        )
 
     def _set_body(self, renderable: RenderableType) -> None:
         """Replace the scrollable body's contents."""

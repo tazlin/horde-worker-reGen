@@ -192,15 +192,16 @@ def cached_image_records() -> Mapping[str, GenericModelRecord] | None:
     """Return the image-gen reference records if already loaded, else None (never forces a fetch).
 
     Lets the editor compute a disk total only when the picker has already loaded the catalog, so the
-    Config tab never triggers the model-reference network prefetch just by being opened.
+    Config tab never triggers the model-reference network prefetch just by being opened. Resolves the
+    same beta-aware record set as the picker (``load_image_models``) and the worker subprocesses, so a
+    beta (pending-queue) model on disk is never miscounted as "to download" on the editor's footer.
     """
-    from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
     from horde_model_reference.model_reference_manager import ModelReferenceManager
 
     if not ModelReferenceManager.has_instance():
         return None
-    references = ModelReferenceManager.get_instance().get_all_model_references()
-    return references.get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
+    records, _beta_names = _image_records_with_beta(ModelReferenceManager.get_instance())
+    return records
 
 
 def disk_summary(model_names: list[str]) -> DiskSummary | None:

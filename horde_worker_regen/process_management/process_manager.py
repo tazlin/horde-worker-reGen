@@ -1403,21 +1403,35 @@ class HordeWorkerProcessManager:
             plan = self._get_download_plan_summary()
             if plan is not None:
                 StatusReporter.log_startup_download_plan(plan)
-            present = self._model_availability.present or set()
-            configured = set(self.bridge_data.image_models_to_load)
-            missing = sorted(configured - present)
             # Only run the (heavier) auxiliary pass on a genuinely incomplete install; a worker that
             # already has all its image models almost certainly has its aux models too.
-            download_aux = len(missing) > 0
-            if missing or download_aux:
-                logger.info(
-                    f"Worker has {len(present)} of {len(configured)} configured models on disk; "
-                    f"background-downloading {len(missing)} missing: {missing}",
-                )
-                self._process_lifecycle.request_downloads(missing, download_aux=download_aux)
+            self._request_downloads_for_configured_missing(run_aux_if_incomplete=True)
 
         self._maybe_start_safety_processes()
         self._maybe_start_inference_processes()
+
+    def _request_downloads_for_configured_missing(self, *, run_aux_if_incomplete: bool) -> None:
+        """Background-download any configured image models not yet on disk (no-op if none are missing).
+
+        Shared by the initial scan-complete trigger and the config-reload path, so a config change that
+        adds a model fetches it without restarting the worker. The download process dedups against what it
+        already has or is in-flight on, so re-sending the full missing set on every reload is safe. The
+        auxiliary pass (LoRa/ControlNet/post-processing/safety) is one-shot in the download process, so
+        ``run_aux_if_incomplete`` only matters for the very first request.
+        """
+        if not self._enable_background_downloads:
+            return
+        present = self._model_availability.present or set()
+        configured = set(self.bridge_data.image_models_to_load)
+        missing = sorted(configured - present)
+        download_aux = run_aux_if_incomplete and len(missing) > 0
+        if not missing and not download_aux:
+            return
+        logger.info(
+            f"Worker has {len(present)} of {len(configured)} configured models on disk; "
+            f"background-downloading {len(missing)} missing: {missing}",
+        )
+        self._process_lifecycle.request_downloads(missing, download_aux=download_aux)
 
     def _maybe_start_safety_processes(self) -> None:
         """Start safety processes once the required safety models are on disk (background-download mode).
@@ -2742,6 +2756,9 @@ class HordeWorkerProcessManager:
             paused=self.bridge_data.downloads_paused,
             rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
         )
+        # A config change can add image models that are not yet on disk; fetch them in the background so a
+        # newly-configured model becomes servable without a restart (the startup trigger is one-shot).
+        self._request_downloads_for_configured_missing(run_aux_if_incomplete=False)
 
     def get_bridge_data_from_disk(self) -> None:
         """Load the bridge data from disk (blocking).

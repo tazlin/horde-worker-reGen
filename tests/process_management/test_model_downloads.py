@@ -341,6 +341,56 @@ class TestManagerDownloadHandling:
         assert snapshot.lora_pops_blocked_by_downloads is False
 
 
+class TestConfigReloadTriggersDownloads:
+    """A config change that adds a model must background-download it without a restart."""
+
+    def _manager_in_download_mode(self, **bridge_overrides: object) -> Mock:
+        manager = make_testable_process_manager(**bridge_overrides)  # type: ignore
+        manager._enable_background_downloads = True
+        manager._process_lifecycle = Mock()
+        # Past the one-shot startup trigger, so only the reload path can drive a new request.
+        manager._initial_download_requested = True
+        return manager  # type: ignore[return-value]
+
+    def _mark_present(self, manager: Mock, present: set[str]) -> None:
+        manager._model_availability.update(present=present, currently_downloading=None, pending=(), failed=())
+
+    def test_reload_requests_newly_configured_missing_model(self) -> None:
+        """Adding a model to the config fetches just the new one, without the heavy aux pass."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        self._mark_present(manager, {"a"})
+
+        new_bridge = make_mock_bridge_data(image_models_to_load=["a", "b"], dry_run_skip_inference=True)
+        manager._apply_reloaded_bridge_data(new_bridge)
+
+        manager._process_lifecycle.request_downloads.assert_called_once()
+        args, kwargs = manager._process_lifecycle.request_downloads.call_args
+        assert args[0] == ["b"]
+        assert kwargs["download_aux"] is False
+
+    def test_reload_with_all_models_present_requests_nothing(self) -> None:
+        """A reload that adds no missing model triggers no download."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        self._mark_present(manager, {"a"})
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(image_models_to_load=["a"], dry_run_skip_inference=True),
+        )
+
+        manager._process_lifecycle.request_downloads.assert_not_called()
+
+    def test_helper_no_op_when_background_downloads_disabled(self) -> None:
+        """Without a download process, the trigger is a silent no-op (no spurious request)."""
+        manager = make_testable_process_manager(image_models_to_load=["a", "b"])  # type: ignore
+        manager._enable_background_downloads = False
+        manager._process_lifecycle = Mock()
+        self._mark_present(manager, {"a"})
+
+        manager._request_downloads_for_configured_missing(run_aux_if_incomplete=False)
+
+        manager._process_lifecycle.request_downloads.assert_not_called()
+
+
 class TestManagerSafetyDeferral:
     """The manager defers the safety-process launch until the download process provides its models.
 

@@ -34,7 +34,7 @@ class DownloadEvent(BaseModel):
     simply stay at their defaults for a given kind.
     """
 
-    kind: Literal["planned", "model_started", "model_finished", "complete"]
+    kind: Literal["planned", "model_started", "model_progress", "model_finished", "complete"]
 
     # kind == "planned"
     models: list[DownloadModelRow] = Field(default_factory=list)
@@ -44,7 +44,7 @@ class DownloadEvent(BaseModel):
     fits: bool = True
     shortfall_bytes: int = 0
 
-    # kind in {"model_started", "model_finished"}
+    # kind in {"model_started", "model_progress", "model_finished"}
     name: str = ""
     index: int = 0
     """1-based position of this model among those being downloaded."""
@@ -53,9 +53,39 @@ class DownloadEvent(BaseModel):
     ok: bool = True
     detail: str = ""
 
+    # kind == "model_progress" (live per-chunk progress for the current model)
+    downloaded_bytes: int = 0
+    total_bytes: int = 0
+    speed_bps: float | None = None
+    eta_seconds: float | None = None
+
     # kind == "complete"
     downloaded: int = 0
     failed: int = 0
+
+
+class DownloadControl(BaseModel):
+    """A control command the TUI sends to the running ``download`` subprocess over its stdin."""
+
+    cmd: Literal["pause", "resume", "rate"]
+    kbps: int = 0
+    """For ``rate``: the bandwidth cap in kB/s (0 or negative clears it)."""
+
+
+def encode_download_control(control: DownloadControl) -> str:
+    """Serialise one control command as a single JSON line for the subprocess's stdin."""
+    return control.model_dump_json()
+
+
+def decode_download_control(line: str) -> DownloadControl | None:
+    """Parse one stdin line into a control command, or None when it is blank/not a control line."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return DownloadControl.model_validate_json(line)
+    except ValueError:
+        return None
 
 
 def encode_download_event(event: DownloadEvent) -> str:
@@ -83,8 +113,11 @@ def decode_download_events(raw_stdout: str) -> list[DownloadEvent]:
 
 
 __all__ = [
+    "DownloadControl",
     "DownloadEvent",
     "DownloadModelRow",
+    "decode_download_control",
     "decode_download_events",
+    "encode_download_control",
     "encode_download_event",
 ]

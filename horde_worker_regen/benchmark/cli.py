@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.benchmark.download_progress import DownloadEvent, DownloadModelRow
     from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel
     from horde_worker_regen.benchmark.report import BenchmarkReport, MachineInfo
+    from horde_worker_regen.model_download_core import DownloadControls
     from horde_worker_regen.model_download_plan import DownloadPlan
 
 
@@ -166,6 +167,11 @@ def _add_download_parser(subparsers: argparse._SubParsersAction) -> None:
         "--json-progress",
         action="store_true",
         help="Emit structured, line-delimited progress events for a parent process (used by the TUI).",
+    )
+    download.add_argument(
+        "--control-stdin",
+        action="store_true",
+        help="Read pause/resume/rate control commands (one JSON object per line) from stdin (used by the TUI).",
     )
     download.add_argument("--directml", type=int, default=None, help="DirectML device index (for Windows AMD GPUs).")
 
@@ -331,27 +337,53 @@ def _download_controlnet_annotators(*, directml: int | None) -> bool:
     return bool(SharedModelManager.preload_annotators())
 
 
+def _start_stdin_control_thread() -> DownloadControls:
+    """Apply pause/resume/rate control lines from stdin to a DownloadControls, live during a download.
+
+    The TUI's download modal writes one JSON control object per line to this subprocess's stdin; a daemon
+    reader thread folds them into the controls the shared download core reads each chunk.
+    """
+    import threading
+
+    from horde_worker_regen.benchmark.download_progress import decode_download_control
+    from horde_worker_regen.model_download_core import DownloadControls
+
+    controls = DownloadControls()
+
+    def _reader() -> None:
+        for line in sys.stdin:
+            control = decode_download_control(line)
+            if control is None:
+                continue
+            if control.cmd == "pause":
+                controls.set_paused(True)
+            elif control.cmd == "resume":
+                controls.set_paused(False)
+            elif control.cmd == "rate":
+                controls.set_rate_limit(control.kbps)
+
+    threading.Thread(target=_reader, name="benchmark-download-control", daemon=True).start()
+    return controls
+
+
 def _download_compvis_models(
     model_names: list[str],
     *,
     emit: Callable[[DownloadEvent], None],
     json_progress: bool,
-    directml: int | None,
+    controls: DownloadControls | None = None,
 ) -> int:
-    """Download each named checkpoint via the shared compvis manager; return how many failed.
+    """Download each named checkpoint via the shared download core; return how many failed.
 
-    Mirrors the validated download loop in :func:`horde_worker_regen.download_models.download_all_models`
-    (download, then re-download once if the on-disk SHA does not match the record), scoped to an explicit
-    list instead of the worker config.
+    Uses the same dedup + validate/retry routine as the worker's download process
+    (:func:`horde_worker_regen.model_download_core.ensure_models_present`), so the benchmark fetch and the
+    worker fetch are one code path. Checkpoints need only the model managers, not a full
+    ``hordelib.initialise()`` (no torch/ComfyUI), which keeps this phase light and GPU-free.
     """
-    import hordelib
+    from hordelib.api import SharedModelManager
 
     from horde_worker_regen.benchmark.download_progress import DownloadEvent
-
-    extra_comfyui_args = [f"--directml={directml}"] if directml is not None else []
-    hordelib.initialise(extra_comfyui_args=extra_comfyui_args)
-
-    from hordelib.api import SharedModelManager
+    from horde_worker_regen.model_download_core import ModelProgress, ensure_models_present
 
     SharedModelManager.load_model_managers()
     compvis = SharedModelManager.manager.compvis
@@ -359,22 +391,41 @@ def _download_compvis_models(
         logger.error("Failed to load the compvis (Stable Diffusion) model manager; cannot download.")
         return len(model_names)
 
-    failed = 0
-    total = len(model_names)
-    for index, name in enumerate(model_names, start=1):
+    def on_start(name: str, index: int, total: int) -> None:
         emit(DownloadEvent(kind="model_started", name=name, index=index, total=total))
         if not json_progress:
             logger.info(f"[{index}/{total}] Downloading {name} ...")
-        ok = bool(compvis.download_model(name))
-        if ok and not compvis.validate_model(name):
-            ok = bool(compvis.download_model(name))  # the record changed or the file is corrupt: fetch again
+
+    def on_progress(name: str, index: int, total: int, progress: ModelProgress) -> None:
+        emit(
+            DownloadEvent(
+                kind="model_progress",
+                name=name,
+                index=index,
+                total=total,
+                downloaded_bytes=progress.downloaded_bytes,
+                total_bytes=progress.total_bytes,
+                speed_bps=progress.speed_bps,
+                eta_seconds=progress.eta_seconds,
+            ),
+        )
+
+    def on_finish(name: str, index: int, total: int, ok: bool) -> None:
         if not ok:
-            failed += 1
             logger.error(f"[{index}/{total}] Failed to download {name}.")
         elif not json_progress:
             logger.success(f"[{index}/{total}] {name}: done.")
         emit(DownloadEvent(kind="model_finished", name=name, index=index, total=total, ok=ok))
-    return failed
+
+    outcome = ensure_models_present(
+        compvis,
+        list(model_names),
+        controls=controls,
+        on_model_start=on_start,
+        on_progress=on_progress,
+        on_model_finish=on_finish,
+    )
+    return outcome.failed
 
 
 def _run_download(args: argparse.Namespace) -> int:
@@ -399,6 +450,7 @@ def _run_download(args: argparse.Namespace) -> int:
 
     plan = models_disk_plan(model_names)
     json_progress: bool = args.json_progress
+    controls = _start_stdin_control_thread() if getattr(args, "control_stdin", False) else None
 
     # Controlnet annotators are lazily-downloaded checkpoints distinct from the image models; surface them
     # as an explicit plan row (ROM size) and fetch them too, so a controlnet level does not cold-load the
@@ -504,7 +556,7 @@ def _run_download(args: argparse.Namespace) -> int:
             missing,
             emit=emit,
             json_progress=json_progress,
-            directml=args.directml,
+            controls=controls,
         )
 
     annotators_failed = 0
