@@ -19,6 +19,7 @@ class BenchTier(StrEnum):
     SDXL = auto()
     FLUX = auto()
     QWEN = auto()
+    ZIMAGE = auto()
 
 
 class BenchStage(StrEnum):

@@ -146,6 +146,7 @@ def make_canned_job(
     workflow: str | None = None,
     post_processing: list[str] | None = None,
     hires_fix: bool = False,
+    cfg_scale: float | None = None,
     source_image_base64: str | None = None,
     source_processing: str | None = None,
 ) -> ImageGenerateJobPopResponse:
@@ -169,6 +170,8 @@ def make_canned_job(
     data["payload"]["ddim_steps"] = ddim_steps
     data["payload"]["n_iter"] = n_iter
     data["payload"]["hires_fix"] = hires_fix
+    if cfg_scale is not None:
+        data["payload"]["cfg_scale"] = cfg_scale
 
     if loras is not None:
         data["payload"]["loras"] = [entry.model_dump(by_alias=True) for entry in loras]
@@ -383,6 +386,7 @@ class SoakImageTemplate:
     workflow: str | None = None
     post_processing: list[str] = field(default_factory=list)
     hires_fix: bool = False
+    cfg_scale: float | None = None
     weight: float = 1.0
     """Relative likelihood of this template being chosen on each pop."""
 
@@ -436,6 +440,7 @@ class GeneratingJobSource(CannedJobSource):
             workflow=template.workflow,
             post_processing=template.post_processing or None,
             hires_fix=template.hires_fix,
+            cfg_scale=template.cfg_scale,
         )
 
 

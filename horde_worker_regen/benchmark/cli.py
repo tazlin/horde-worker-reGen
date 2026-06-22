@@ -36,9 +36,9 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
     ramp.add_argument(
         "--tiers",
         default="sd15,sdxl",
-        help="Comma-separated model tiers to attempt (sd15, sdxl, flux, qwen). flux/qwen are opt-in "
-        "(very large: 17-20 GB download, 13-16 GB VRAM) and auto-skip when the machine cannot hold them; "
-        "qwen is a beta model sourced from the pending reference.",
+        help="Comma-separated model tiers to attempt (sd15, sdxl, flux, qwen, zimage). flux/qwen/zimage "
+        "are opt-in (very large: 17-20 GB download, 13-16 GB VRAM) and auto-skip when the machine cannot "
+        "hold them; qwen and zimage are beta models sourced from the pending reference.",
     )
     ramp.add_argument(
         "--process-mode",

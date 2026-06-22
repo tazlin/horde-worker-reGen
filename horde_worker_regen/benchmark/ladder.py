@@ -17,9 +17,10 @@ The matrix is grounded in what the worker and hordelib can actually do:
 - **Alchemy** runs on two independent lanes: the CLIP lane (caption/interrogation/NSFW, on the safety
   process) and the graph lane (upscalers/face-fixers/strip-background, on the inference processes),
   each its own axis, plus a concurrent-with-image-jobs rung.
-- **flux/qwen** are very large (17-20 GB download, 13-16 GB VRAM); they are opt-in tiers and the
-  controller warns and pre-flight-skips them when the machine cannot hold them. qwen is sourced from
-  the beta/pending reference (see :data:`BETA_TIERS`).
+- **flux/qwen/zimage** are very large (17-20 GB download, 13-16 GB VRAM); they are opt-in tiers and
+  the controller warns and pre-flight-skips them when the machine cannot hold them. qwen and zimage
+  are sourced from the beta/pending reference (see :data:`BETA_TIERS`). zimage additionally requires
+  fixed job parameters (steps=9, cfg_scale=1.0) and does not support hires_fix or controlnet.
 """
 
 from __future__ import annotations
@@ -50,11 +51,17 @@ No qwen model is in the canonical AI-Horde image reference yet; this is the expe
 Confirm against the PRIMARY pending queue once published and update if it differs. A wrong/absent
 name simply pre-flight-skips the qwen tier rather than failing the run."""
 
+_ZIMAGE_BETA_MODEL_NAME = "Z-Image-Turbo"
+"""Name for the Z-Image-Turbo checkpoint, confirmed from change_id 14 in the pending reference.
+
+Status: pending approval. A wrong/absent name pre-flight-skips the zimage tier rather than failing."""
+
 BENCH_TIER_MODELS: dict[BenchTier, str] = {
     BenchTier.SD15: "Deliberate",
     BenchTier.SDXL: "AlbedoBase XL (SDXL)",
     BenchTier.FLUX: "Flux.1-Schnell fp8 (Compact)",
     BenchTier.QWEN: _QWEN_BETA_MODEL_NAME,
+    BenchTier.ZIMAGE: _ZIMAGE_BETA_MODEL_NAME,
 }
 
 BENCH_TIER_MODEL_POOLS: dict[BenchTier, list[str]] = {
@@ -73,6 +80,7 @@ BENCH_TIER_MODEL_POOLS: dict[BenchTier, list[str]] = {
     BenchTier.SDXL: ["AlbedoBase XL (SDXL)"],
     BenchTier.FLUX: ["Flux.1-Schnell fp8 (Compact)"],
     BenchTier.QWEN: [_QWEN_BETA_MODEL_NAME],
+    BenchTier.ZIMAGE: [_ZIMAGE_BETA_MODEL_NAME],
 }
 
 _TIER_BASELINES: dict[BenchTier, str] = {
@@ -80,6 +88,7 @@ _TIER_BASELINES: dict[BenchTier, str] = {
     BenchTier.SDXL: "stable_diffusion_xl",
     BenchTier.FLUX: "flux_1",
     BenchTier.QWEN: "qwen_image",
+    BenchTier.ZIMAGE: "z_image_turbo",
 }
 
 _TIER_RESOLUTIONS: dict[BenchTier, int] = {
@@ -87,12 +96,21 @@ _TIER_RESOLUTIONS: dict[BenchTier, int] = {
     BenchTier.SDXL: 1024,
     BenchTier.FLUX: 1024,
     BenchTier.QWEN: 1024,
+    BenchTier.ZIMAGE: 1024,
 }
 
-HUGE_TIERS: frozenset[BenchTier] = frozenset({BenchTier.FLUX, BenchTier.QWEN})
+_TIER_JOB_OVERRIDES: dict[BenchTier, dict[str, object]] = {
+    BenchTier.ZIMAGE: {"steps": 9, "cfg_scale": 1.0},
+}
+"""Per-tier fixed job parameters applied to every canned job for that tier.
+
+Used for models with locked inference requirements (e.g. distilled flow-matching models that
+require a specific step count and guidance scale to produce valid output)."""
+
+HUGE_TIERS: frozenset[BenchTier] = frozenset({BenchTier.FLUX, BenchTier.QWEN, BenchTier.ZIMAGE})
 """Tiers whose models are very large (17-20 GB); the controller warns and pre-flight-skips them."""
 
-BETA_TIERS: frozenset[BenchTier] = frozenset({BenchTier.QWEN})
+BETA_TIERS: frozenset[BenchTier] = frozenset({BenchTier.QWEN, BenchTier.ZIMAGE})
 """Tiers sourced from the beta/pending reference; the worker env opts into beta categories for these."""
 
 _CONTROLNET_SWEEP_TYPES: tuple[str, ...] = ("canny", "depth", "openpose")
@@ -182,14 +200,25 @@ class LadderOptions(BaseModel):
     (fake/CI or undetected) falls back to a bounded multiple of the baseline's native resolution."""
 
 
+def tier_canned_job_overrides(tier: BenchTier) -> dict[str, object]:
+    """Return the tier-specific CannedImageJobSpec overrides (e.g. fixed steps, cfg_scale).
+
+    Empty dict for tiers without requirements. Used by the soak builder so continuously
+    generated jobs respect the same fixed parameters as the ramp's canned scenarios.
+    """
+    return dict(_TIER_JOB_OVERRIDES.get(tier, {}))
+
+
 def _tier_job(tier: BenchTier, **overrides: object) -> CannedImageJobSpec:
     resolution_override = overrides.pop("resolution", None)
     resolution = resolution_override if isinstance(resolution_override, int) else _TIER_RESOLUTIONS[tier]
+    # Tier-level defaults first; caller-supplied overrides take precedence.
+    merged: dict[str, object] = {**_TIER_JOB_OVERRIDES.get(tier, {}), **overrides}
     return CannedImageJobSpec(
         model=BENCH_TIER_MODELS[tier],
         width=resolution,
         height=resolution,
-        **overrides,  # type: ignore[arg-type]
+        **merged,  # type: ignore[arg-type]
     )
 
 
@@ -364,26 +393,28 @@ def _add_feature_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
     """Add the stage-C feature axes: hires-fix, post-processing, controlnet, and the QR-code workflow."""
     half_jobs = max(2, opts.jobs_per_level // 2)
 
-    add(
-        stage=BenchStage.FEATURES,
-        tier=tier,
-        axis=BenchAxis.HIRES_FIX,
-        rung=1,
-        name="hires_fix",
-        description=f"{tier}: hires_fix (second upscaled sampling pass)",
-        scenario=ScenarioSpec(
-            name=f"{tier}-hires",
-            image_jobs=[
-                _tier_job(
-                    tier,
-                    count=half_jobs,
-                    resolution=_TIER_RESOLUTIONS[tier] * 2 if tier is BenchTier.SD15 else 1024,
-                    hires_fix=True,
-                ),
-            ],
-        ),
-        criteria=_its_advisory_criteria(),
-    )
+    # hires_fix is not supported by all model families (e.g. zimage declares it unsupported).
+    if tier is not BenchTier.ZIMAGE:
+        add(
+            stage=BenchStage.FEATURES,
+            tier=tier,
+            axis=BenchAxis.HIRES_FIX,
+            rung=1,
+            name="hires_fix",
+            description=f"{tier}: hires_fix (second upscaled sampling pass)",
+            scenario=ScenarioSpec(
+                name=f"{tier}-hires",
+                image_jobs=[
+                    _tier_job(
+                        tier,
+                        count=half_jobs,
+                        resolution=_TIER_RESOLUTIONS[tier] * 2 if tier is BenchTier.SD15 else 1024,
+                        hires_fix=True,
+                    ),
+                ],
+            ),
+            criteria=_its_advisory_criteria(),
+        )
 
     _add_post_processing_levels(add, tier=tier, opts=opts)
 
@@ -585,4 +616,5 @@ __all__ = [
     "LadderOptions",
     "RampLevel",
     "build_default_ladder",
+    "tier_canned_job_overrides",
 ]

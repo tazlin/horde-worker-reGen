@@ -29,6 +29,7 @@ from horde_worker_regen.benchmark.ladder import (
     _TIER_RESOLUTIONS,
     BENCH_TIER_MODELS,
     RampLevel,
+    tier_canned_job_overrides,
 )
 from horde_worker_regen.benchmark.report import SuggestedBridgeData
 from horde_worker_regen.benchmark.scenarios import (
@@ -95,6 +96,7 @@ def build_soak_scenario(
     if suggested.allow_post_processing:
         profiles.append(_SoakProfile(weight=2, post_processing=list(_SOAK_POST_PROCESSING)))
 
+    fixed_job_kwargs = tier_canned_job_overrides(tier)
     image_jobs: list[CannedImageJobSpec] = [
         CannedImageJobSpec(
             model=model,
@@ -105,6 +107,7 @@ def build_soak_scenario(
             control_type=profile.control_type,
             workflow=profile.workflow,
             post_processing=list(profile.post_processing),
+            **fixed_job_kwargs,  # type: ignore[arg-type]
         )
         for model in models
         for profile in profiles

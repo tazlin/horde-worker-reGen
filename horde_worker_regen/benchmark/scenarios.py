@@ -35,6 +35,7 @@ class CannedImageJobSpec(BaseModel):
     width: int = 512
     height: int = 512
     steps: int = 30
+    cfg_scale: float | None = None
     n_iter: int = 1
     hires_fix: bool = False
     lora_names: list[str] = Field(default_factory=list)
@@ -103,6 +104,7 @@ class ScenarioSpec(BaseModel):
                         ddim_steps=spec.steps,
                         n_iter=spec.n_iter,
                         hires_fix=spec.hires_fix,
+                        cfg_scale=spec.cfg_scale,
                         loras=(
                             [LorasPayloadEntry(name=name) for name in spec.lora_names] if spec.lora_names else None
                         ),
@@ -149,6 +151,7 @@ class ScenarioSpec(BaseModel):
                 width=spec.width,
                 height=spec.height,
                 steps=spec.steps,
+                cfg_scale=spec.cfg_scale,
                 n_iter=spec.n_iter,
                 control_type=spec.control_type,
                 workflow=spec.workflow,

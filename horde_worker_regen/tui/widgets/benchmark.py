@@ -84,9 +84,15 @@ _TIER_TOGGLES: tuple[_TierToggle, ...] = (
     _TierToggle(
         BenchTier.QWEN, "Qwen", "Very large beta model; needs the pending reference, auto-skips if absent.", False
     ),
+    _TierToggle(
+        BenchTier.ZIMAGE,
+        "Z-Image",
+        "~19 GB beta model (pending reference); fixed steps=9, no hires_fix. Auto-skips when absent.",
+        False,
+    ),
 )
-"""The model tiers an operator can select. flux/qwen default off: they are large and opt-in, and the
-ramp pre-flight auto-skips them when the machine cannot hold them."""
+"""The model tiers an operator can select. flux/qwen/zimage default off: they are large and opt-in,
+and the ramp pre-flight auto-skips them when the machine cannot hold them."""
 
 
 def _tier_switch_id(tier: BenchTier) -> str:

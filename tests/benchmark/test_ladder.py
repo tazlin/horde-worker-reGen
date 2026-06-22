@@ -43,6 +43,21 @@ class TestDefaultLadder:
         assert ladder[0].tier == "flux"
         assert ladder[0].baseline_hordelib == "flux_1"
 
+    def test_zimage_not_included_by_default(self) -> None:
+        """Z-Image is opt-in (large and beta)."""
+        assert not any(level.tier == "zimage" for level in build_default_ladder())
+
+    def test_zimage_opt_in_baseline(self) -> None:
+        """Requesting zimage adds its baseline level with the correct hordelib baseline."""
+        ladder = build_default_ladder(LadderOptions(tiers=["zimage"], include_alchemy=False))
+        assert ladder[0].tier == "zimage"
+        assert ladder[0].baseline_hordelib == "z_image_turbo"
+
+    def test_zimage_has_no_hires_fix_levels(self) -> None:
+        """Z-Image declares hires_fix unsupported; the ladder produces no hires_fix level for it."""
+        ladder = build_default_ladder(LadderOptions(tiers=["zimage"]))
+        assert not any(level.axis == "hires_fix" for level in ladder)
+
     def test_downloads_opt_in_and_marked_networked(self) -> None:
         """Download levels appear only on request and are marked as needing network."""
         assert not any(level.stage == "E" for level in build_default_ladder())

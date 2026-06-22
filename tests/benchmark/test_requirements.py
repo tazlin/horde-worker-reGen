@@ -246,14 +246,19 @@ def test_controlnet_not_installed_skips_with_install_hint() -> None:
 
 
 def test_absent_huge_checkpoint_is_a_hard_skip_even_when_forced() -> None:
-    """A missing flux/qwen checkpoint cannot be forced: real-mode benchmarking never downloads weights."""
-    req = _req(tier="flux", models_missing=["Flux.1-Schnell fp8 (Compact)"])
-    reason = requirement_skip_reason(
-        req,
-        machine=MachineInfo(total_vram_mb=80_000),
-        process_mode="real",
-        civitai_available=True,
-        force=True,
-    )
-    assert reason is not None
-    assert "not present on disk" in reason
+    """A missing flux/qwen/zimage checkpoint cannot be forced: real-mode benchmarking never downloads weights."""
+    for tier, missing_model in [
+        ("flux", "Flux.1-Schnell fp8 (Compact)"),
+        ("qwen", "Qwen-Image"),
+        ("zimage", "Z-Image-Turbo"),
+    ]:
+        req = _req(tier=tier, models_missing=[missing_model])
+        reason = requirement_skip_reason(
+            req,
+            machine=MachineInfo(total_vram_mb=80_000),
+            process_mode="real",
+            civitai_available=True,
+            force=True,
+        )
+        assert reason is not None, f"expected hard skip for {tier}"
+        assert "not present on disk" in reason

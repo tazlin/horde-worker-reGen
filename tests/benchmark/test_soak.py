@@ -95,6 +95,18 @@ class TestBuildSoakScenario:
         assert len(scenario.image_jobs) == 1
         assert scenario.image_jobs[0].model == "Deliberate"
 
+    def test_zimage_soak_applies_fixed_steps_and_cfg(self) -> None:
+        """All ZIMAGE soak jobs use steps=9 and cfg_scale=1.0 (locked inference parameters)."""
+        suggested = SuggestedBridgeData(max_batch=4, models_to_load=["Z-Image-Turbo"])
+        scenario = build_soak_scenario(suggested, BenchTier.ZIMAGE, soak_seconds=60.0)
+
+        for spec in scenario.image_jobs:
+            assert spec.steps == 9, f"expected steps=9 for all ZIMAGE jobs, got {spec.steps}"
+            assert spec.cfg_scale == 1.0, f"expected cfg_scale=1.0 for all ZIMAGE jobs, got {spec.cfg_scale}"
+        # No controlnet or hires_fix profiles should appear in a ZIMAGE soak.
+        assert all(spec.control_type is None for spec in scenario.image_jobs)
+        assert all(not spec.hires_fix for spec in scenario.image_jobs)
+
 
 class TestBuildValidationLevel:
     """The validation level carries the soak scenario, the synthesized config, and soak criteria."""

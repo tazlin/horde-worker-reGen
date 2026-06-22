@@ -72,7 +72,7 @@ def _enable_beta_models() -> None:
     os.environ.setdefault(BETA_CATEGORIES_ENV_VAR, MODEL_REFERENCE_CATEGORY.image_generation.value)
     os.environ.setdefault(BETA_API_KEY_ENV_VAR, _ANON_AI_HORDE_API_KEY)
     logger.info(
-        f"Beta models enabled for the qwen tier via {BETA_CATEGORIES_ENV_VAR}={os.environ[BETA_CATEGORIES_ENV_VAR]}.",
+        f"Beta models enabled for beta tier(s) via {BETA_CATEGORIES_ENV_VAR}={os.environ[BETA_CATEGORIES_ENV_VAR]}.",
     )
     if not os.getenv("HORDE_MODEL_REFERENCE_PRIMARY_API_URL"):
         logger.warning(
