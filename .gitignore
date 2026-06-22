@@ -15,6 +15,7 @@ benchmark_results/*_validate/*
 *.faulthandler
 
 logs/remote_logs/*
+logs/*.zip
 
 .horde_worker_regen/*
 
