@@ -128,9 +128,9 @@ class ModelManagerView(Vertical):
             yield Button("Resolve ⟳", id="mm-resolve", variant="primary")
             yield Static(id="mm-resolve-status")
         yield Label("LOAD RULES  ·  models and meta commands to offer", classes="mm-rules-label")
-        yield ModelListEditor("models_to_load", self._load_values)
+        yield ModelListEditor("models_to_load", self._load_values, sibling_values=self._skip_editor_values)
         yield Label("SKIP RULES  ·  only remove from the set above (never add back)", classes="mm-rules-label")
-        yield ModelListEditor("models_to_skip", self._skip_values)
+        yield ModelListEditor("models_to_skip", self._skip_values, sibling_values=self._load_editor_values)
         with Horizontal(id="mm-large-row"):
             yield Label("Include large models (Flux, Cascade) in 'all' / 'top' commands")
             yield Switch(value=self._load_large, id="cfg-load_large_models")
@@ -180,6 +180,18 @@ class ModelManagerView(Vertical):
         self._sync_values()
         self.query_one("#mm-resolve-status", Static).update(Text("Resolving…", style="grey62"))
         self.run_worker(self._resolve, thread=True, exclusive=True, group="mm-catalog")
+
+    def _load_editor_values(self) -> list[str]:
+        """The models-to-load editor's current entries (for the skip picker's membership view)."""
+        with contextlib.suppress(Exception):  # the editor may not be mounted yet
+            return self.query_one("#mle-root-models_to_load", ModelListEditor).values()
+        return []
+
+    def _skip_editor_values(self) -> list[str]:
+        """The models-to-skip editor's current entries (for the load picker's membership view)."""
+        with contextlib.suppress(Exception):  # the editor may not be mounted yet
+            return self.query_one("#mle-root-models_to_skip", ModelListEditor).values()
+        return []
 
     def _sync_values(self) -> None:
         """Copy the live editor/switch values into local state (so background work sees them)."""

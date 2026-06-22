@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 
 import pytest
 from rich.console import Console
 from textual.app import App
 from textual.coordinate import Coordinate
-from textual.widgets import Checkbox, DataTable, Input
+from textual.screen import Screen
+from textual.widgets import Checkbox, DataTable, Input, Select
 
 from horde_worker_regen.tui.model_catalog import ModelInfo
 from horde_worker_regen.tui.widgets.model_picker import ModelPickerModal
@@ -75,16 +77,62 @@ def test_detail_for_shows_full_record_with_homepage() -> None:
     assert "example.com/deliberate" in detail
 
 
+def test_marker_and_in_config_membership() -> None:
+    """In membership mode the marker and In-config cells reflect both lists."""
+    modal = ModelPickerModal(in_target={"Deliberate"}, in_other={"Spicy Model"})
+    # A model already in the target list is shown as present and is not re-addable.
+    assert modal._marker_for(_MODELS[0]) == "✓ in load"
+    assert _render(modal._in_config_cell(_MODELS[0])).strip() == "load"
+    # A model in the sibling list is still addable, and shows its membership.
+    assert modal._marker_for(_MODELS[2]) == "＋ Mark"
+    assert _render(modal._in_config_cell(_MODELS[2])).strip() == "skip"
+    # An uninvolved model is plain-addable with no membership.
+    assert modal._marker_for(_MODELS[1]) == "＋ Mark"
+    assert _render(modal._in_config_cell(_MODELS[1])).strip() == "-"
+    modal._chosen.add(_MODELS[1].name)
+    assert modal._marker_for(_MODELS[1]) == "✕ Unmark"
+
+
+def test_matches_search_spans_metadata() -> None:
+    """Search matches name, description, and tags (not just the name)."""
+    modal = ModelPickerModal()
+    assert modal._matches_search(_MODELS[0], "albedo") is False
+    assert modal._matches_search(_MODELS[0], "deliberate") is True
+    assert modal._matches_search(_MODELS[0], "versatile") is True  # description
+    assert modal._matches_search(_MODELS[0], "anime") is True  # tag
+    assert modal._matches_search(_MODELS[1], "albedo") is True
+
+
+def test_sort_value_orders_by_active_column() -> None:
+    """The sort key follows the active column; baseline groups SD 1.5 before SDXL."""
+    modal = ModelPickerModal()
+    modal._sort_index = 1  # Model name (default).
+    by_name = sorted(_MODELS, key=modal._sort_value)
+    assert [model.name for model in by_name] == ["AlbedoBase XL (SDXL)", "Deliberate", "Spicy Model"]
+    modal._sort_index = 3  # Baseline.
+    by_baseline = [model.name for model in sorted(_MODELS, key=modal._sort_value)]
+    assert by_baseline.index("Deliberate") < by_baseline.index("AlbedoBase XL (SDXL)")
+    assert by_baseline.index("Spicy Model") < by_baseline.index("AlbedoBase XL (SDXL)")
+
+
+def test_cells_for_has_one_cell_per_column() -> None:
+    """Each row supplies exactly one cell per declared column."""
+    from horde_worker_regen.tui.widgets.model_picker import _COLUMNS
+
+    assert len(ModelPickerModal().cells_for(_MODELS[0])) == len(_COLUMNS)
+
+
 class _PickerHost(App[None]):
     """Hosts the picker and records the dismissed result."""
 
-    def __init__(self) -> None:
+    def __init__(self, screen_factory: Callable[[], Screen] | None = None) -> None:
         super().__init__()
         self.result: list[str] | None = None
         self.result_set = False
+        self._screen_factory = screen_factory or (lambda: ModelPickerModal(exclude=set()))
 
     def on_mount(self) -> None:
-        self.push_screen(ModelPickerModal(exclude=set()), self._store)
+        self.push_screen(self._screen_factory(), self._store)
 
     def _store(self, value: list[str] | None) -> None:
         self.result = value
@@ -129,13 +177,85 @@ async def test_model_picker_filters_and_marking(monkeypatch: pytest.MonkeyPatch)
         modal.query_one("#picker-search", Input).value = "albedo"
         await _wait_for_rows(pilot, table, 1)
 
-        # Marking the single visible row flips its state cell to the remove glyph.
+        # Marking the single visible row flips its marker cell to the unmark label.
         modal._toggle(0)
         await pilot.pause()
-        assert str(table.get_cell_at(Coordinate(0, 0))) == "✕"
+        assert str(table.get_cell_at(Coordinate(0, 0))) == "✕ Unmark"
 
         await pilot.click("#picker-add")
         await pilot.pause()
 
     assert app.result_set
     assert app.result == ["AlbedoBase XL (SDXL)"]
+
+
+@pytest.mark.e2e
+async def test_model_picker_membership_shows_and_blocks_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Members of the target list stay visible, show as present, and cannot be re-added."""
+    from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
+
+    CATALOG_CACHE.reset()
+    monkeypatch.setattr("horde_worker_regen.tui.catalog_cache.load_image_models", lambda: list(_MODELS))
+    monkeypatch.setattr("horde_worker_regen.tui.catalog_cache.free_model_bytes", lambda: None)
+
+    app = _PickerHost(lambda: ModelPickerModal(in_target={"Deliberate"}, in_other={"Spicy Model"}))
+    async with app.run_test(size=(150, 44)) as pilot:
+        await pilot.pause()
+        modal = app.screen
+        assert isinstance(modal, ModelPickerModal)
+        table = modal.query_one("#picker-table", DataTable)
+        await _wait_for_rows(pilot, table, 3)  # nothing is hidden in membership mode
+
+        # Default sort is by name: AlbedoBase, Deliberate, Spicy Model.
+        assert str(table.get_cell_at(Coordinate(1, 0))) == "✓ in load"
+        modal._toggle(1)  # toggling a target member is a no-op
+        await pilot.pause()
+        assert str(table.get_cell_at(Coordinate(1, 0))) == "✓ in load"
+
+        modal._toggle(0)  # mark AlbedoBase (not in either list)
+        await pilot.pause()
+        await pilot.click("#picker-add")
+        await pilot.pause()
+
+    assert app.result == ["AlbedoBase XL (SDXL)"]
+
+
+@pytest.mark.e2e
+async def test_model_picker_disk_and_marked_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The on-disk filter and the marked-only filter narrow the table."""
+    from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
+
+    disk_models = [
+        ModelInfo("OnDiskModel", "stable_diffusion_1", nsfw=False, inpainting=False, on_disk=True),
+        ModelInfo("ToDownloadModel", "stable_diffusion_xl", nsfw=False, inpainting=False, on_disk=False),
+    ]
+    CATALOG_CACHE.reset()
+    monkeypatch.setattr("horde_worker_regen.tui.catalog_cache.load_image_models", lambda: list(disk_models))
+    monkeypatch.setattr("horde_worker_regen.tui.catalog_cache.free_model_bytes", lambda: None)
+
+    app = _PickerHost()
+    async with app.run_test(size=(150, 44)) as pilot:
+        await pilot.pause()
+        modal = app.screen
+        assert isinstance(modal, ModelPickerModal)
+        table = modal.query_one("#picker-table", DataTable)
+        await _wait_for_rows(pilot, table, 2)
+
+        modal.query_one("#picker-disk-filter", Select).value = "on"
+        await _wait_for_rows(pilot, table, 1)
+        assert str(table.get_cell_at(Coordinate(0, 1))) == "OnDiskModel"
+
+        modal.query_one("#picker-disk-filter", Select).value = "off"
+        await _wait_for_rows(pilot, table, 1)
+        assert str(table.get_cell_at(Coordinate(0, 1))) == "ToDownloadModel"
+
+        modal.query_one("#picker-disk-filter", Select).value = ""
+        await _wait_for_rows(pilot, table, 2)
+
+        # Mark one model, then the marked-only filter should leave just it.
+        modal._toggle(0)
+        await pilot.pause()
+        marked_name = modal._visible[0].name
+        modal.query_one("#picker-marked-only", Checkbox).value = True
+        await _wait_for_rows(pilot, table, 1)
+        assert str(table.get_cell_at(Coordinate(0, 1))) == marked_name

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -77,16 +79,28 @@ class ModelListEditor(Vertical):
     }
     """
 
-    def __init__(self, key: str, values: list[str], *, show_disk_total: bool = False) -> None:
+    def __init__(
+        self,
+        key: str,
+        values: list[str],
+        *,
+        show_disk_total: bool = False,
+        sibling_values: Callable[[], list[str]] | None = None,
+    ) -> None:
         """Create the editor for ``key`` pre-filled with ``values``.
 
         When ``show_disk_total`` is set (the models-to-load list), a disk-budget line is shown once the
         model reference has been loaded (by opening the picker); it never forces a network fetch itself.
+
+        ``sibling_values`` (when given) returns the other list's current entries (load vs skip), so the
+        picker can show membership of both lists and make the resulting delta obvious. Without it the
+        picker falls back to simply hiding this list's entries.
         """
         super().__init__(id=f"mle-root-{key}")
         self._key = key
         self._values = list(values)
         self._show_disk_total = show_disk_total
+        self._sibling_values = sibling_values
 
     def compose(self) -> ComposeResult:
         """Lay out the entries container and the (two-row) control area."""
@@ -200,7 +214,7 @@ class ModelListEditor(Vertical):
             self.add_entry(field_input.value)
             field_input.value = ""
         elif button_id == f"mle-pick-{self._key}":
-            self.app.push_screen(ModelPickerModal(set(self._values)), self._on_picker_result)
+            self._open_picker()
         elif button_id == f"mle-meta-{self._key}":
             self.app.push_screen(MetaBuilderModal(), self._on_meta_result)
         elif button_id == f"mle-clear-{self._key}":
@@ -218,6 +232,24 @@ class ModelListEditor(Vertical):
             self.add_entry(event.value)
             event.input.value = ""
             event.stop()
+
+    def _open_picker(self) -> None:
+        """Open the model picker, showing both lists' membership when a sibling provider is set."""
+        if self._sibling_values is None:
+            self.app.push_screen(ModelPickerModal(set(self._values)), self._on_picker_result)
+            return
+        target_label, other_label = ("skip", "load") if self._key == "models_to_skip" else ("load", "skip")
+        in_target = {entry for entry in self._values if not is_meta_instruction(entry)}
+        in_other = {entry for entry in self._sibling_values() if not is_meta_instruction(entry)}
+        self.app.push_screen(
+            ModelPickerModal(
+                in_target=in_target,
+                in_other=in_other,
+                target_label=target_label,
+                other_label=other_label,
+            ),
+            self._on_picker_result,
+        )
 
     def _on_picker_result(self, result: list[str] | None) -> None:
         """Add models chosen in the picker modal."""
