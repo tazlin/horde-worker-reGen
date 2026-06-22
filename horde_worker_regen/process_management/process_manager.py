@@ -22,6 +22,7 @@ import aiohttp
 import aiohttp.client_exceptions
 import certifi
 from aiohttp import ClientSession
+from horde_model_reference import SourceSelector
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
 from horde_model_reference.model_reference_manager import ModelReferenceManager
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
@@ -815,9 +816,11 @@ class HordeWorkerProcessManager:
             try:
                 horde_model_reference_manager = ModelReferenceManager.get_instance()
 
-                # all_refs = horde_model_reference_manager.get_all_model_references(False)
-                # _sd_ref = all_refs[MODEL_REFERENCE_CATEGORY.image_generation]
-                _sd_ref = horde_model_reference_manager.get_model_reference(MODEL_REFERENCE_CATEGORY.image_generation)
+                source = self._beta_aware_image_source(horde_model_reference_manager)
+                _sd_ref = horde_model_reference_manager.get_model_reference(
+                    MODEL_REFERENCE_CATEGORY.image_generation,
+                    source=source,
+                )
 
                 if not isinstance(_sd_ref, dict):
                     raise ValueError(
@@ -829,6 +832,35 @@ class HordeWorkerProcessManager:
             except Exception as e:
                 logger.error(e)
                 time.sleep(5)
+
+    @staticmethod
+    def _beta_aware_image_source(manager: ModelReferenceManager) -> SourceSelector:
+        """Return the image-generation source selector, registering the beta (pending) provider if opted in.
+
+        The orchestrator builds its own copy of the image reference (``stable_diffusion_reference``) and
+        would otherwise stay canonical-only, while the inference subprocesses load the PRIMARY pending-queue
+        (beta) models such as qwen whenever ``HORDELIB_BETA_MODEL_CATEGORIES`` is set. A beta model the
+        children can load but the orchestrator has never heard of is never offered or scheduled, and a job
+        for it would ``KeyError`` on the reference lookups. Mirroring the subprocess contract here keeps the
+        two in agreement. Beta is best-effort: any failure degrades to the canonical source rather than
+        blocking reference init. ``hordelib.beta_models`` is torch-free, so importing it here does not
+        violate the torch-free orchestrator invariant.
+        """
+        try:
+            from horde_model_reference import PENDING_SOURCE_ID
+            from hordelib.beta_models import beta_source_for, build_pending_provider
+
+            if manager.get_provider(PENDING_SOURCE_ID) is None:
+                provider = build_pending_provider()
+                if provider is not None:
+                    manager.register_provider(provider, replace=True)
+
+            return beta_source_for(MODEL_REFERENCE_CATEGORY.image_generation, manager)
+        except Exception as e:  # noqa: BLE001 - beta is best-effort; never block reference init
+            from horde_model_reference import HORDE_SOURCE_ID
+
+            logger.warning(f"Could not enable beta models for the orchestrator reference: {type(e).__name__}: {e}")
+            return HORDE_SOURCE_ID
 
     def _apply_self_maintenance_throttle(self) -> None:
         """Local-pause popping when resource/OOM faults approach the horde's server-side drop tolerance.
