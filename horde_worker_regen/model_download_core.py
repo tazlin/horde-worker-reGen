@@ -115,7 +115,17 @@ class ChunkPacer:
     """Holds the per-download state needed to enforce rate-limit and compute a smoothed speed/ETA.
 
     One pacer is used per file download; call :meth:`step` from the download's per-chunk callback.
+
+    Both the throttle wait and the pause wait are sliced into short polls rather than one long sleep.
+    That keeps three properties a single ``time.sleep`` quietly broke: shutdown (``should_abort``) lands
+    within a poll instead of after a multi-minute wait; the UI keeps refreshing mid-wait (``on_wait``);
+    and a low cap against a large chunk cannot idle the connection long enough for the server to drop it,
+    since the throttle wait is bounded by :data:`MAX_THROTTLE_SECONDS` (a brief rate overshoot is the
+    deliberate price of a download that survives the cap).
     """
+
+    MAX_THROTTLE_SECONDS = 5.0
+    """Upper bound on a single chunk's throttle wait, so a low cap cannot stall the socket into a drop."""
 
     def __init__(self) -> None:
         """Start with no observed bytes, time, or speed."""
@@ -131,28 +141,54 @@ class ChunkPacer:
         is_paused: Callable[[], bool],
         rate_limit_kbps: Callable[[], int | None],
         should_abort: Callable[[], bool],
-        on_pause_wait: Callable[[], None] | None = None,
+        on_wait: Callable[[ModelProgress], None] | None = None,
         poll_seconds: float = 0.2,
     ) -> ModelProgress:
         """Pace one chunk: honour the rate cap, smooth the speed, then block while paused.
 
+        ``on_wait`` (if given) is invoked with the current progress on each poll while the chunk is
+        being throttled or held paused, so a caller can keep its display live during the wait.
+
         Raises:
-            DownloadAborted: if ``should_abort`` is true on entry or after a pause.
+            DownloadAborted: if ``should_abort`` is true on entry, or observed during a wait.
         """
         if should_abort():
             raise DownloadAborted
 
         now = time.time()
+
+        # The first observation only establishes a baseline: there is no prior sample to rate-limit
+        # against, and the first callback often carries the whole chunk already read, so pacing it would
+        # freeze the transfer before a single byte of feedback (the "stuck at 0%" report).
+        if self._last_time == 0.0:
+            self._last_bytes = downloaded
+            self._last_time = now
+            progress = ModelProgress(downloaded, total, None, None)
+            self._wait_while_paused(
+                progress,
+                is_paused=is_paused,
+                should_abort=should_abort,
+                on_wait=on_wait,
+                poll_seconds=poll_seconds,
+            )
+            return progress
+
         delta = max(0, downloaded - self._last_bytes)
-        elapsed = now - self._last_time if self._last_time else 0.0
+        elapsed = now - self._last_time
 
         rate = rate_limit_kbps()
         if rate and delta > 0:
-            allowed = delta / (rate * 1024.0)
-            if allowed > elapsed:
-                time.sleep(allowed - elapsed)
-                now = time.time()
-                elapsed = now - self._last_time if self._last_time else 0.0
+            target = delta / (rate * 1024.0)
+            sleep_for = min(max(0.0, target - elapsed), self.MAX_THROTTLE_SECONDS)
+            self._sleep_in_slices(
+                sleep_for,
+                lambda: self._progress_at(downloaded, total),
+                should_abort=should_abort,
+                on_wait=on_wait,
+                poll_seconds=poll_seconds,
+            )
+            now = time.time()
+            elapsed = now - self._last_time
 
         if elapsed > 0 and delta > 0:
             instantaneous = delta / elapsed
@@ -162,21 +198,64 @@ class ChunkPacer:
         self._last_bytes = downloaded
         self._last_time = now
 
+        progress = self._progress_at(downloaded, total)
+        self._wait_while_paused(
+            progress,
+            is_paused=is_paused,
+            should_abort=should_abort,
+            on_wait=on_wait,
+            poll_seconds=poll_seconds,
+        )
+        return progress
+
+    def _progress_at(self, downloaded: int, total: int) -> ModelProgress:
+        """Build a progress reading at the current byte count using the latest smoothed speed."""
         eta = (total - downloaded) / self._speed_bps if self._speed_bps and total > downloaded else None
-
-        while is_paused() and not should_abort():
-            if on_pause_wait is not None:
-                on_pause_wait()
-            time.sleep(poll_seconds)
-        if should_abort():
-            raise DownloadAborted
-
         return ModelProgress(
             downloaded_bytes=downloaded,
             total_bytes=total,
             speed_bps=self._speed_bps,
             eta_seconds=eta,
         )
+
+    def _sleep_in_slices(
+        self,
+        seconds: float,
+        make_progress: Callable[[], ModelProgress],
+        *,
+        should_abort: Callable[[], bool],
+        on_wait: Callable[[ModelProgress], None] | None,
+        poll_seconds: float,
+    ) -> None:
+        """Sleep ``seconds`` in ``poll_seconds`` slices, checking abort and emitting heartbeats each slice."""
+        remaining = seconds
+        while remaining > 0:
+            if should_abort():
+                raise DownloadAborted
+            if on_wait is not None:
+                on_wait(make_progress())
+            nap = min(poll_seconds, remaining)
+            time.sleep(nap)
+            remaining -= nap
+        if should_abort():
+            raise DownloadAborted
+
+    def _wait_while_paused(
+        self,
+        progress: ModelProgress,
+        *,
+        is_paused: Callable[[], bool],
+        should_abort: Callable[[], bool],
+        on_wait: Callable[[ModelProgress], None] | None,
+        poll_seconds: float,
+    ) -> None:
+        """Block while paused, emitting a heartbeat each poll; raise on abort."""
+        while is_paused() and not should_abort():
+            if on_wait is not None:
+                on_wait(progress)
+            time.sleep(poll_seconds)
+        if should_abort():
+            raise DownloadAborted
 
 
 def download_one_model(
@@ -236,15 +315,21 @@ def ensure_models_present(
             _name: str = name,
             _index: int = index,
         ) -> None:
+            def _emit(progress: ModelProgress) -> None:
+                if on_progress is not None:
+                    on_progress(_name, _index, total, progress)
+
+            # ``on_wait`` keeps the heartbeat alive while a chunk is throttled or paused, so a rate-limited
+            # benchmark download still ticks instead of looking frozen between chunks.
             progress = _pacer.step(
                 downloaded,
                 total_bytes,
                 is_paused=controls.is_paused,
                 rate_limit_kbps=controls.rate_limit_kbps,
                 should_abort=should_abort,
+                on_wait=_emit,
             )
-            if on_progress is not None:
-                on_progress(_name, _index, total, progress)
+            _emit(progress)
 
         succeeded = download_one_model(compvis, name, callback=_callback)
         if succeeded:

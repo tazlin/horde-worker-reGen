@@ -51,6 +51,7 @@ from horde_worker_regen.tui.responsive import (
     select_columns,
     shed_hint,
 )
+from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
 
 _TREND_HISTORY = 180
 """How many trend samples (GPU-duty / kudos-per-hour / job counts) the Trends region retains."""
@@ -238,6 +239,9 @@ class OverviewView(VerticalScroll):
             memory_line = self._memory_line(snapshot)
             if memory_line is not None:
                 body.append(memory_line)
+            download_line = self._download_line(snapshot)
+            if download_line is not None:
+                body.append(download_line)
             why_no_work = summarize_skips(snapshot.last_pop_skipped_reasons)
             if why_no_work:
                 body.append(Text.assemble(("∅ why no work: ", "yellow"), (why_no_work, "italic yellow")))
@@ -319,6 +323,31 @@ class OverviewView(VerticalScroll):
         if role_items:
             parts = ", ".join(f"{ROLE_LABELS.get(role, role)} {human_bytes(value)}" for role, value in role_items)
             line.append(f" ({parts})", style="grey50")
+        return line
+
+    @staticmethod
+    def _download_line(snapshot: WorkerStateSnapshot) -> Text | None:
+        """A slim hero line for an in-flight background download: model, current-file %, and speed.
+
+        Returns None when nothing is downloading, so the hero stays uncluttered on an idle worker.
+        """
+        activity = summarize_download_activity(snapshot)
+        if activity is None:
+            return None
+        percent = f"{activity.percent:.0f}%" if activity.percent is not None else "?"
+        speed = f"{human_bytes(activity.speed_bps)}/s" if activity.speed_bps else "-"
+        marker, marker_style = ("⏸ downloading (paused)", "yellow") if activity.paused else ("⬇ downloading", "cyan")
+        line = Text.assemble(
+            (marker + "  ", marker_style),
+            (shorten(activity.current_name, 28), "grey70"),
+            ("  ", ""),
+            (percent, "bold"),
+        )
+        if activity.total is not None:
+            line.append("  ·  ", style="grey37")
+            line.append(f"{activity.ready}/{activity.total} ready", style="grey50")
+        line.append("  ·  ⇣ ", style="grey50")
+        line.append(speed, style="grey70")
         return line
 
     @staticmethod
@@ -781,6 +810,16 @@ class OverviewView(VerticalScroll):
         total_procs = len(snapshot.processes)
         procs_colour = "green" if alive == total_procs else "yellow"
         line.append_text(Text.assemble(sep, ("procs ", "grey50"), (f"{alive}/{total_procs}", procs_colour)))
+
+        activity = summarize_download_activity(snapshot)
+        if activity is not None:
+            percent = f"{activity.percent:.0f}%" if activity.percent is not None else "?"
+            speed = f"{human_bytes(activity.speed_bps)}/s" if activity.speed_bps else "-"
+            marker, marker_style = ("⏸", "yellow") if activity.paused else ("⬇", "cyan")
+            line.append_text(
+                Text.assemble(sep, (f"{marker} ", marker_style), (percent, "bold"), (" ", ""), (speed, "grey62")),
+            )
+
         line.append_text(Text.assemble(sep, ("⌚ ", "grey50"), (f"{human_duration(age)} ago", "grey70")))
         return Panel(line, border_style=report.severity.colour, padding=(0, 1))
 

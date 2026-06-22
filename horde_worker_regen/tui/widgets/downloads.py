@@ -9,6 +9,8 @@ why anything is downloading right now.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
@@ -46,6 +48,59 @@ _PHASE_DETAIL: dict[DownloadPhase, str] = {
 }
 
 _BAR_WIDTH = 32
+
+
+@dataclass(frozen=True)
+class DownloadActivity:
+    """A compact, cross-view summary of live background-download progress.
+
+    Lets headline surfaces (the Downloads tab label, the overview's slim line) show "what is fetching
+    and how far along" without each reaching into the snapshot's download internals or re-deriving the
+    ready/total fraction.
+    """
+
+    paused: bool
+    """Whether the active download is currently held paused (vs actively transferring)."""
+    ready: int | None
+    """Configured models already on disk, or None when the count is not yet known."""
+    total: int | None
+    """Configured models in total (present + still to download), or None when not yet known."""
+    current_name: str
+    """The model whose file is downloading (or paused) right now."""
+    percent: float | None
+    """Completion of the current file (0-100), or None when its size is unknown."""
+    speed_bps: float | None
+    """Current transfer speed in bytes/sec, or None before a sample exists."""
+
+
+def summarize_download_activity(snapshot: WorkerStateSnapshot | None) -> DownloadActivity | None:
+    """Summarize the in-flight download, or None when nothing is downloading (or paused mid-download).
+
+    Returns None unless the download process is actively working a file (phase DOWNLOADING or PAUSED with
+    a current entry), so a caller can cheaply decide whether to surface a download indicator at all. The
+    ready/total fraction reuses :meth:`DownloadsView._readiness` so the tab, overview and Downloads view
+    can never disagree.
+    """
+    downloads = snapshot.downloads if snapshot is not None else None
+    if downloads is None or downloads.current is None:
+        return None
+    if downloads.phase not in (DownloadPhase.DOWNLOADING, DownloadPhase.PAUSED):
+        return None
+
+    plan = snapshot.download_plan if snapshot is not None else None
+    readiness = DownloadsView._readiness(plan, downloads) if plan is not None else None
+    # Carry None (not a fabricated 0/0) when readiness is unknown, so a caller renders the activity
+    # marker without a misleading count during the window before the plan is computed.
+    ready, total = readiness if readiness is not None else (None, None)
+    current = downloads.current
+    return DownloadActivity(
+        paused=downloads.paused,
+        ready=ready,
+        total=total,
+        current_name=current.model_name,
+        percent=current.percent,
+        speed_bps=current.speed_bps,
+    )
 
 
 class DownloadsView(VerticalScroll):
@@ -206,20 +261,24 @@ class DownloadsView(VerticalScroll):
     def _readiness(plan: DownloadPlanSummary, downloads: DownloadStatusSnapshot | None) -> tuple[int, int] | None:
         """Live ``(ready, total)`` model count, or None when there is no download process to track.
 
-        The denominator is the configured total from the plan; ``downloads.present_model_names`` cannot
-        be used because it lists *every* image model on disk, not just the configured ones. A model
-        counts as not-ready while it is queued, currently downloading, or failed (deduped by name so a
-        download that is still listed in the queue is not subtracted twice).
+        Single-sourced from the plan, which the worker recomputes live from the one on-disk presence
+        authority (:mod:`horde_model_reference.on_disk_layout`): ``ready`` is exactly the number of
+        configured models present on disk and ``total`` the configured count, so ``ready`` climbs as
+        downloads land and is bounded to ``[num_present, total]`` by construction.
+
+        The live download queue is deliberately NOT folded into this count. It derives presence by a
+        different route (hordelib's sha256-gated availability), and mixing the two once let a queue that
+        drifted larger than the plan's missing set drag an already-present worker's count toward 0 (the
+        100/101 -> 0 report). The queue still drives the per-model downloading/queued/failed detail
+        rendered elsewhere; it just no longer competes with the plan over the headline tally. ``downloads``
+        is retained only as the gate for "is a download process even running?".
         """
-        total = plan.num_present + plan.num_to_download
-        if total <= 0 or downloads is None:
+        if downloads is None:
             return None
-        remaining = {item.model_name for item in downloads.pending}
-        if downloads.current is not None:
-            remaining.add(downloads.current.model_name)
-        failed = {failure.model_name for failure in downloads.failures} - remaining
-        ready = max(0, total - len(remaining) - len(failed))
-        return ready, total
+        total = plan.num_present + plan.num_to_download
+        if total <= 0:
+            return None
+        return plan.num_present, total
 
     def _render_plan(self, plan: DownloadPlanSummary | None, downloads: DownloadStatusSnapshot | None) -> Panel:
         """Render the configuration's disk budget: present, to-download, total, free, and fit."""

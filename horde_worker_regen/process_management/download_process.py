@@ -38,7 +38,7 @@ from multiprocessing.synchronize import Lock, Semaphore
 
 from loguru import logger
 
-from horde_worker_regen.model_download_core import ChunkPacer, DownloadAborted, download_one_model
+from horde_worker_regen.model_download_core import ChunkPacer, DownloadAborted, ModelProgress, download_one_model
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.horde_process import HordeProcess, HordeProcessType, WorkerCapability
 from horde_worker_regen.process_management.messages import (
@@ -381,8 +381,9 @@ class HordeDownloadProcess(HordeProcess):
     def _progress_callback(self, downloaded: int, total: int) -> None:
         """Per-chunk hook: pace via the shared core (pause/rate-limit/speed/ETA), then emit throttled status.
 
-        The core blocks the chunk loop while paused (calling back to emit a PAUSED snapshot) and raises
-        :class:`DownloadAborted` on shutdown; here we only translate its result into a status snapshot.
+        The core raises :class:`DownloadAborted` on shutdown and, via ``on_wait``, calls back on every poll
+        while a chunk is throttled or held paused; here each call (mid-wait and final) is translated into a
+        status snapshot, so a rate-limited or paused download keeps reporting instead of looking wedged.
         """
         progress = self._pacer.step(
             downloaded,
@@ -390,8 +391,12 @@ class HordeDownloadProcess(HordeProcess):
             is_paused=lambda: self._paused,
             rate_limit_kbps=lambda: self._rate_limit_kbps,
             should_abort=lambda: self._end_process,
-            on_pause_wait=lambda: self._send_status(DownloadPhase.PAUSED, force=True),
+            on_wait=self._emit_progress,
         )
+        self._emit_progress(progress)
+
+    def _emit_progress(self, progress: ModelProgress) -> None:
+        """Publish a progress snapshot for the current download, choosing PAUSED vs DOWNLOADING live."""
         with self._lock:
             self._current = CurrentDownloadStatus(
                 model_name=self._cb_model,
@@ -402,7 +407,10 @@ class HordeDownloadProcess(HordeProcess):
                 speed_bps=progress.speed_bps,
                 eta_seconds=progress.eta_seconds,
             )
-        self._send_status(DownloadPhase.DOWNLOADING)
+        if self._paused:
+            self._send_status(DownloadPhase.PAUSED, force=True)
+        else:
+            self._send_status(DownloadPhase.DOWNLOADING)
 
     def _begin_download_context(self, *, model: str, feature: str, target_dir: str) -> None:
         if not self._download_bandwidth_acquired:

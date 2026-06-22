@@ -85,10 +85,114 @@ def test_chunk_pacer_aborts_when_signalled() -> None:
 def test_chunk_pacer_rate_limit_paces_a_chunk() -> None:
     """A capped rate sleeps long enough to honour the cap for the chunk's byte delta."""
     pacer = ChunkPacer()
+    # The first observation only establishes a baseline (no prior sample to pace against), so prime it
+    # before measuring the paced second chunk.
+    pacer.step(0, 10240, is_paused=lambda: False, rate_limit_kbps=lambda: 50, should_abort=lambda: False)
     started = time.time()
-    # 10240 bytes at 50 kB/s => ~0.2s of pacing on this first chunk.
+    # 10240 bytes at 50 kB/s => ~0.2s of pacing on this chunk.
     pacer.step(10240, 10240, is_paused=lambda: False, rate_limit_kbps=lambda: 50, should_abort=lambda: False)
     assert time.time() - started >= 0.15
+
+
+def _prime(pacer: ChunkPacer, total: int, *, rate: int) -> None:
+    """Establish the pacer's baseline so the next step is a paced (non-first) observation."""
+    pacer.step(0, total, is_paused=lambda: False, rate_limit_kbps=lambda: rate, should_abort=lambda: False)
+
+
+def test_chunk_pacer_does_not_stall_on_large_first_chunk() -> None:
+    """A large *first* chunk under a cap returns at once: pacing it would freeze before any feedback.
+
+    Reproduces the "stuck at 0%" report: the first callback often arrives with the whole chunk already
+    read, and pacing ``downloaded - 0`` against a low cap would sleep for minutes before the UI ever
+    saw a byte. The first observation must only set the baseline.
+    """
+    pacer = ChunkPacer()
+    done = threading.Event()
+
+    def run() -> None:
+        pacer.step(
+            8_000_000, 8_000_000, is_paused=lambda: False, rate_limit_kbps=lambda: 50, should_abort=lambda: False
+        )
+        done.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+    assert done.is_set(), "the first observation must establish a baseline without pacing"
+
+
+def test_chunk_pacer_aborts_during_rate_limit_wait() -> None:
+    """A long rate-limit wait stays interruptible: abort lands within a poll, not after the full sleep.
+
+    Without this an abort (worker shutdown) set during a low-rate throttle would be ignored until the
+    multi-minute sleep elapsed, leaving the process apparently wedged.
+    """
+    pacer = ChunkPacer()
+    _prime(pacer, 10_000_000, rate=50)
+
+    abort = threading.Event()
+    raised: list[bool] = []
+
+    def run() -> None:
+        try:
+            # 10 MB at 50 kB/s would otherwise pace for ~200s.
+            pacer.step(
+                10_000_000, 10_000_000, is_paused=lambda: False, rate_limit_kbps=lambda: 50, should_abort=abort.is_set
+            )
+        except DownloadAborted:
+            raised.append(True)
+
+    thread = threading.Thread(target=run, daemon=True)
+    started = time.time()
+    thread.start()
+    time.sleep(0.3)
+    abort.set()
+    thread.join(timeout=3.0)
+    assert not thread.is_alive(), "the rate-limit wait must observe the abort rather than block for the whole sleep"
+    assert raised == [True]
+    assert time.time() - started < 3.0
+
+
+def test_chunk_pacer_caps_throttle_wait() -> None:
+    """A single chunk's throttle wait is bounded so a low cap cannot idle the socket long enough to drop.
+
+    A very low limit against a large chunk would otherwise sleep for many minutes inside one callback,
+    leaving the connection idle (servers drop it) and breaking the in-flight download.
+    """
+    pacer = ChunkPacer()
+    _prime(pacer, 50_000_000, rate=10)
+    done = threading.Event()
+
+    def run() -> None:
+        # 50 MB at 10 kB/s is ~4880s uncapped.
+        pacer.step(
+            50_000_000, 50_000_000, is_paused=lambda: False, rate_limit_kbps=lambda: 10, should_abort=lambda: False
+        )
+        done.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=ChunkPacer.MAX_THROTTLE_SECONDS + 3.0)
+    assert done.is_set(), "a single chunk's throttle wait must be capped, not unbounded"
+
+
+def test_chunk_pacer_heartbeats_during_throttle_wait() -> None:
+    """The pacer emits periodic heartbeats during a throttle wait, so the UI refreshes mid-wait."""
+    pacer = ChunkPacer()
+    _prime(pacer, 10_000_000, rate=100)
+    beats: list[ModelProgress] = []
+
+    # 2 MB at 100 kB/s is ~20s, capped to MAX_THROTTLE_SECONDS, polled every ~0.2s => many heartbeats.
+    pacer.step(
+        2_000_000,
+        10_000_000,
+        is_paused=lambda: False,
+        rate_limit_kbps=lambda: 100,
+        should_abort=lambda: False,
+        on_wait=beats.append,
+    )
+    assert len(beats) >= 2
+    assert all(beat.downloaded_bytes == 2_000_000 for beat in beats)
 
 
 # --- download_one_model: validate + retry-once --------------------------------------------------------

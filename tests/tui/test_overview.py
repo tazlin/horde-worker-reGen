@@ -5,6 +5,10 @@ from __future__ import annotations
 from rich.console import Console
 
 from horde_worker_regen.process_management.supervisor_channel import (
+    CurrentDownloadStatus,
+    DownloadPhase,
+    DownloadPlanSummary,
+    DownloadStatusSnapshot,
     JobQueueEntry,
     ProcessSnapshot,
     SystemMemorySnapshot,
@@ -46,6 +50,62 @@ def _busy_process() -> ProcessSnapshot:
         vram_usage_mb=8000,
         total_vram_mb=24000,
     )
+
+
+def _downloading_snapshot(*, paused: bool = False) -> WorkerStateSnapshot:
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        worker_registered=True,
+    )
+    snapshot.download_plan = DownloadPlanSummary(num_present=2, num_to_download=3)
+    snapshot.downloads = DownloadStatusSnapshot(
+        phase=DownloadPhase.PAUSED if paused else DownloadPhase.DOWNLOADING,
+        current=CurrentDownloadStatus(
+            model_name="HugeCheckpoint",
+            feature="image model",
+            target_dir="/models",
+            downloaded_bytes=3 * 1024**2,
+            total_bytes=12 * 1024**2,
+            speed_bps=1.5 * 1024**2,
+        ),
+        paused=paused,
+    )
+    return snapshot
+
+
+def test_overview_hero_shows_download_line_when_active() -> None:
+    """The hero renders a slim download line (model, current-file %, speed) while a fetch is in flight."""
+    snapshot = _downloading_snapshot()
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    hero = _render(OverviewView()._render_hero(report, snapshot, frame=0))
+
+    assert "downloading" in hero
+    assert "HugeCheckpoint" in hero
+    assert "25%" in hero  # 3 of 12 MB
+    assert "MB/s" in hero
+
+
+def test_overview_hero_omits_download_line_when_idle() -> None:
+    """With no download in flight the hero shows no download line, keeping an idle worker uncluttered."""
+    snapshot = WorkerStateSnapshot(config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"))
+    snapshot.downloads = DownloadStatusSnapshot(phase=DownloadPhase.IDLE)
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    hero = _render(OverviewView()._render_hero(report, snapshot, frame=0))
+
+    assert "downloading" not in hero
+
+
+def test_overview_compact_bar_includes_download_progress() -> None:
+    """The thin status bar appends the current-download percent and speed when a fetch is active."""
+    snapshot = _downloading_snapshot()
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    bar = _render(OverviewView()._render_compact_bar(report, snapshot, frame=0))
+
+    assert "25%" in bar
+    assert "MB/s" in bar
 
 
 def test_overview_hero_shows_system_memory_line() -> None:

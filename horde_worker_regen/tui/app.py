@@ -355,6 +355,7 @@ class HordeWorkerTUI(App[None]):
                 mode=self._view_mode,
             )
             self.query_one(DownloadsView).update_view(snapshot, mode=self._view_mode)
+            self._update_downloads_tab_label(snapshot)
             self.query_one(LogsView).set_view_mode(self._view_mode)
             config_editor = self.query_one(ConfigEditorView)
             config_editor.set_view_mode(self._view_mode)
@@ -378,6 +379,27 @@ class HordeWorkerTUI(App[None]):
             # The refresh interval can fire during mount or teardown; skip until the DOM is ready.
             pass
         self._handle_benchmark_status_transition()
+
+    def _update_downloads_tab_label(self, snapshot: WorkerStateSnapshot | None) -> None:
+        """Badge the Downloads tab with live progress so an active fetch is visible from any tab.
+
+        Idle (no download in flight) the tab reads plainly "Downloads"; while fetching it shows the
+        ready/total model count and a pause marker, so the operator does not have to open the tab to see
+        that work is happening.
+        """
+        from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
+
+        activity = summarize_download_activity(snapshot)
+        try:
+            tab = self.query_one("#main-tabs", TabbedContent).get_tab("tab-downloads")
+        except (NoMatches, ValueError):
+            return
+        if activity is None:
+            tab.label = "Downloads"
+        else:
+            marker = "⏸" if activity.paused else "⬇"
+            count = f" {activity.ready}/{activity.total}" if activity.total is not None else ""
+            tab.label = f"Downloads {marker}{count}"
 
     def _handle_benchmark_status_transition(self) -> None:
         """Notify and refresh persisted status when the benchmark finishes, fails, or is cancelled."""

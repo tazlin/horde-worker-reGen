@@ -172,6 +172,51 @@ async def test_tick_judges_responsiveness_on_liveness_not_snapshot_age(
         assert captured[-1] is not None and captured[-1] > 90.0
 
 
+async def test_downloads_tab_label_badges_active_download(tmp_path: Path) -> None:
+    """The Downloads tab label gains a live ready/total badge while a download is in flight, then clears."""
+    from horde_worker_regen.process_management.supervisor_channel import (
+        CurrentDownloadStatus,
+        DownloadPhase,
+        DownloadPlanSummary,
+        DownloadStatusSnapshot,
+    )
+
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    supervisor = WorkerSupervisor(WorkerLaunchOptions(worker_name="TabBadge"), mode=WorkerProcessMode.FAKE)
+    app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
+
+    downloading = WorkerStateSnapshot(config=WorkerConfigSummary(dreamer_name="T", worker_version="0.0.0"))
+    downloading.download_plan = DownloadPlanSummary(num_present=1, num_to_download=2)
+    downloading.downloads = DownloadStatusSnapshot(
+        phase=DownloadPhase.DOWNLOADING,
+        current=CurrentDownloadStatus(
+            model_name="BigModel",
+            feature="image model",
+            target_dir="/models",
+            downloaded_bytes=512,
+            total_bytes=1024,
+            speed_bps=4096.0,
+        ),
+    )
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        tabs = app.query_one("#main-tabs", TabbedContent)
+
+        supervisor.latest_snapshot = downloading
+        app._tick()
+        await pilot.pause()
+        # plan: 1 present + 2 to download => 1 of 3 ready (single-sourced from on-disk presence).
+        label = tabs.get_tab("tab-downloads").label_text
+        assert "Downloads" in label and "1/3" in label and "⬇" in label
+
+        idle = WorkerStateSnapshot(config=WorkerConfigSummary(dreamer_name="T", worker_version="0.0.0"))
+        idle.downloads = DownloadStatusSnapshot(phase=DownloadPhase.IDLE)
+        supervisor.latest_snapshot = idle
+        app._tick()
+        await pilot.pause()
+        assert tabs.get_tab("tab-downloads").label_text == "Downloads"
+
+
 async def test_wizard_start_focuses_downloads_tab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Choosing 'Start' in the wizard surfaces the Downloads tab so first-run downloads are visible (P1.2)."""
     monkeypatch.chdir(tmp_path)

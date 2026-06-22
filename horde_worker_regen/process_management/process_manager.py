@@ -511,7 +511,9 @@ class HordeWorkerProcessManager:
         self._initial_download_requested = False
         self._download_wait_started = 0.0
         self._download_plan_summary: DownloadPlanSummary | None = None
-        self._download_plan_computed = False
+        self._download_plan_refreshed_at = 0.0
+        """Monotonic time the disk plan was last (re)computed; it refreshes on a throttle so the presence
+        counts track downloads completing, all from the single horde_model_reference presence authority."""
         # Periodic, parent-owned reference refresh: subprocesses never download references, so the
         # parent re-downloads on this cadence and tells every subprocess to reload from disk. The same
         # reload also re-reads lora.json/ti.json, which is how cross-process LoRa/TI downloads become
@@ -1333,6 +1335,10 @@ class HordeWorkerProcessManager:
     _DOWNLOAD_STARTUP_GRACE_SECONDS = 90.0
     """How long to wait for the download process's first availability report before starting
     inference anyway, so a missing/failed download process can never wedge startup forever."""
+
+    _DOWNLOAD_PLAN_REFRESH_SECONDS = 2.0
+    """How often the disk plan is recomputed so its presence counts track downloads completing live,
+    while keeping the existence checks off the hot path."""
 
     _REFERENCE_REFRESH_INTERVAL_SECONDS = 1800.0
     """How often the parent re-downloads the model reference and tells subprocesses to reload from
@@ -2367,18 +2373,23 @@ class HordeWorkerProcessManager:
             self._supervisor = None
 
     def _get_download_plan_summary(self) -> DownloadPlanSummary | None:
-        """Compute the config's disk-implications summary once, then return the cached value.
+        """Compute the config's disk-implications summary, refreshed on a short throttle.
 
         Existence-only and torch-free (see :mod:`model_download_plan`); the live download process stays
-        authoritative about integrity. Returns None until the model reference is available, so the
-        snapshot simply omits the plan rather than blocking on a not-yet-loaded reference.
+        authoritative about integrity. Presence comes from the single ``horde_model_reference`` on-disk
+        authority, so re-running it as downloads complete is what lets ``num_present`` (and thus the TUI's
+        live readiness) climb without ever disagreeing with the disk budget. The throttle keeps the
+        existence checks off the hot path; the last result is held between refreshes (and when the
+        reference is not yet loaded the snapshot simply omits the plan).
         """
-        if self._download_plan_computed:
+        now = time.monotonic()
+        fresh = (now - self._download_plan_refreshed_at) < self._DOWNLOAD_PLAN_REFRESH_SECONDS
+        if self._download_plan_summary is not None and fresh:
             return self._download_plan_summary
 
         reference = self.stable_diffusion_reference
         if reference is None:
-            return None
+            return self._download_plan_summary
 
         from horde_worker_regen import model_download_plan
 
@@ -2398,7 +2409,7 @@ class HordeWorkerProcessManager:
             num_to_download=plan.num_to_download,
             sizes_complete=plan.sizes_complete,
         )
-        self._download_plan_computed = True
+        self._download_plan_refreshed_at = now
         return self._download_plan_summary
 
     def _safe_model_baseline(self, model_name: str | None) -> str | None:
