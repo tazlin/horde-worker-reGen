@@ -2376,6 +2376,7 @@ class InferenceScheduler:
             # Stamp the in-flight timing onto the slot so the graded-slowdown monitor can measure this
             # job against its expected sampling time; the level resets so notices escalate per dispatch.
             process_with_model.current_inference_started_at = time.time()
+            process_with_model.current_first_step_at = None
             process_with_model.current_job_expected_sampling_seconds = expected_seconds
             process_with_model.current_job_slowdown_level = 0
 

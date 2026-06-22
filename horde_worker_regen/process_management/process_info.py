@@ -92,6 +92,14 @@ class HordeProcessInfo:
 
     Set by the scheduler at dispatch and cleared when a result (or fault) arrives, so the graded-slowdown
     monitor can measure how long the slot has actually been sampling against the expected sampling time."""
+    current_first_step_at: float | None
+    """Epoch time the first sampling step of the current job arrived, or None before sampling starts.
+
+    Distinct from ``current_inference_started_at`` (stamped at dispatch): the gap between the two is the
+    one-time pre-sampling work (cold VRAM load, aux/ControlNet download, prompt encode) that emits no
+    sampling step. The graded-slowdown monitor measures sampling time from here, not from dispatch, so a
+    long cold start is not mis-attributed to slow sampling. Stamped on the first ``INFERENCE_STEP`` beat
+    and cleared at every job boundary (dispatch, result, slot reset)."""
     current_job_expected_sampling_seconds: float | None
     """The performance model's expected sampling seconds for the slot's current job, or None when unknown.
 
@@ -198,6 +206,7 @@ class HordeProcessInfo:
 
         self.last_job_referenced = None
         self.current_inference_started_at = None
+        self.current_first_step_at = None
         self.current_job_expected_sampling_seconds = None
         self.current_job_slowdown_level = 0
 

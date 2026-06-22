@@ -603,6 +603,7 @@ class MessageDispatcher:
         # in-flight timestamps before the graded-slowdown monitor can read them against a finished job.
         if message.process_id in self._process_map:
             self._process_map[message.process_id].current_inference_started_at = None
+            self._process_map[message.process_id].current_first_step_at = None
             self._process_map[message.process_id].current_job_expected_sampling_seconds = None
 
         # Faults are resolved before the success bookkeeping: a retryable failure is requeued (and must

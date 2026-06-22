@@ -215,6 +215,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].last_heartbeat_percent_complete = percent_complete
 
         if heartbeat_type == HordeHeartbeatType.INFERENCE_STEP:
+            if self[process_id].current_first_step_at is None:
+                # First sampling step of this job: the slot has finished its one-time pre-sampling work,
+                # so start the clock the graded-slowdown monitor measures sampling time against.
+                self[process_id].current_first_step_at = time.time()
             self[process_id].last_current_step = current_step
             self[process_id].last_total_steps = total_steps
             self[process_id].last_iterations_per_second = iterations_per_second
@@ -408,6 +412,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].last_current_step = None
         self[process_id].last_total_steps = None
         self[process_id].last_iterations_per_second = None
+        self[process_id].current_first_step_at = None
 
     def delete_safety_processes(self) -> None:
         """Clear all safety processes."""

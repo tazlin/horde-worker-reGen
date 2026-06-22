@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import sys
 import time
@@ -29,9 +30,15 @@ from horde_worker_regen.process_management.messages import (
     HordeControlFlag,
     HordeControlMessage,
     HordeDownloadControlMessage,
+    HordeHeartbeatType,
     HordeProcessState,
 )
 from horde_worker_regen.process_management.owned_process_registry import OwnedProcessRegistry
+from horde_worker_regen.process_management.performance_model import (
+    BatchBucket,
+    ResolutionBucket,
+    signature_from_job,
+)
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
@@ -79,6 +86,35 @@ SLOWDOWN_WARN_RATIO: float = 4.0
 
 The hard kill remains the ``inference_step_timeout`` in :meth:`replace_hung_processes`; these softer,
 evidence-based rungs sit below it so a measurable slowdown is logged before the slot is replaced."""
+
+STEP_TIMEOUT_WORK_FACTOR: float = 2.0
+"""Per-step hang grace scales with this multiple of a job's expected sampling time when no other widening
+applies. A heavier job (more steps, larger pixels, hires) has longer legitimate heartbeat-silent stretches
+than a light one, so the budget tracks its expected work, floored at ``inference_step_timeout`` and capped
+at ``contended_step_timeout`` so a light job stays tight and a genuine wedge is still reaped."""
+
+
+def _job_is_feature_heavy(process_info: HordeProcessInfo) -> bool:
+    """Whether the slot's current job carries features that lengthen its heartbeat-silent work.
+
+    ControlNet (an aux model plus a heavier graph), hires-fix (a whole second sampling pass), batching,
+    and a large output resolution each raise a job's per-step wall time and add non-sampling phases (the
+    hires pass and VAE decode emit no ``INFERENCE_STEP`` beat). The perf-model signature already buckets
+    every one of these, so we read them from it rather than re-deriving from the payload. Returns False
+    when the job cannot be characterised (no baseline / malformed payload).
+    """
+    job = process_info.last_job_referenced
+    if job is None:
+        return False
+    signature = signature_from_job(job, process_info.loaded_horde_model_baseline)
+    if signature is None:
+        return False
+    return (
+        signature.has_controlnet
+        or signature.has_hires_fix
+        or signature.batch_bucket != BatchBucket.SINGLE
+        or signature.resolution_bucket in (ResolutionBucket.LARGE, ResolutionBucket.HUGE)
+    )
 
 
 class ProcessLifecycleManager:
@@ -1214,6 +1250,12 @@ class ProcessLifecycleManager:
         time) so a slowdown is logged, audited, and counted toward the recovery-supervisor severity
         before the watchdog resorts to replacing the slot. A job with no expected time (cold start) is
         skipped, so this never fires on an uncalibrated worker.
+
+        Sampling time is measured from the first sampling step (``current_first_step_at``), not from
+        dispatch: the pre-sampling work a job's features make legitimate (cold VRAM load, aux/ControlNet
+        download, prompt encode, hires/post-processing framing) emits no step, so grading it against the
+        sampling-only expectation would mislabel a heavy or cold job as a hang candidate. A slot that has
+        not yet emitted a step is therefore left to the first-step grace, not graded here.
         """
         now = time.time()
         for process_info in self._process_map.values():
@@ -1221,12 +1263,12 @@ class ProcessLifecycleManager:
                 continue
             if process_info.last_process_state != HordeProcessState.INFERENCE_STARTING:
                 continue
-            started = process_info.current_inference_started_at
+            first_step_at = process_info.current_first_step_at
             expected = process_info.current_job_expected_sampling_seconds
-            if started is None or expected is None or expected <= 0:
+            if first_step_at is None or expected is None or expected <= 0:
                 continue
 
-            elapsed = now - started
+            elapsed = now - first_step_at
             ratio = elapsed / expected
             level = 2 if ratio >= SLOWDOWN_WARN_RATIO else 1 if ratio >= SLOWDOWN_NOTICE_RATIO else 0
             if level <= process_info.current_job_slowdown_level:
@@ -1262,24 +1304,55 @@ class ProcessLifecycleManager:
                 )
 
     def _effective_inference_step_timeout(self, bridge_data: reGenBridgeData, process_info: HordeProcessInfo) -> int:
-        """Per-step hang timeout for a slot, widened for an over-budget job admitted to run slowly.
+        """Per-step hang timeout for a slot, widened when it is doing legitimate heartbeat-silent heavy work.
 
-        A job admitted *against* the VRAM budget (a best-effort head-of-queue admit, possibly exclusive)
-        can stream weights through VRAM each sampling step, so its steps are legitimately far slower than a
-        normal step; killing such a slow-but-progressing job and dropping it is what produced the live drop
-        storm. When the slot's current job was admitted over budget, use ``overbudget_step_timeout`` (floored
-        at ``inference_step_timeout``) so it is given time to finish instead of being mistaken for a hang.
+        The flat ``inference_step_timeout`` was calibrated for a light job on an uncontended device. On a
+        multi-process worker it false-kills healthy jobs in two ways the live logs show: a single sampling
+        step stretched past it by co-residence contention, and a feature phase (hires second pass, VAE
+        decode, post-processing setup) that runs inside ``INFERENCE_STARTING`` and emits no step beat for
+        far longer than a step. Neither is a hang. This widens the per-step grace, up to
+        ``contended_step_timeout`` (floored at ``inference_step_timeout``), only when there is positive
+        evidence of such work, so a light single job keeps the tight timeout and a genuinely wedged slot is
+        still reaped once it has been continuously silent past the (bounded) grace.
+
+        Precedence, all floored at the base per-step timeout:
+
+        - An over-budget / exclusive admit keeps its dedicated ``overbudget_step_timeout`` (a heavy model
+          streaming weights through VRAM every step), unchanged from before and taking priority.
+        - The full ``contended_step_timeout`` is granted when the last heartbeat was a
+          ``PIPELINE_STATE_CHANGE`` (a heavy non-step phase is running), the slot has been graded
+          contention-slowed (``current_job_slowdown_level``), or the job's signature is feature-heavy.
+        - Otherwise the grace scales with the job's expected sampling work (heavier job, longer legitimate
+          silences), bounded by ``contended_step_timeout``.
         """
         base = bridge_data.inference_step_timeout
         job = process_info.last_job_referenced
         if job is None:
             return base
-        if not (self._job_tracker.is_admitted_over_budget(job) or self._job_tracker.is_admitted_exclusive(job)):
+
+        if self._job_tracker.is_admitted_over_budget(job) or self._job_tracker.is_admitted_exclusive(job):
+            overbudget = bridge_data.overbudget_step_timeout
+            if not isinstance(overbudget, int) or isinstance(overbudget, bool):
+                return base
+            return max(base, overbudget)
+
+        contended = bridge_data.contended_step_timeout
+        if not isinstance(contended, int) or isinstance(contended, bool):
             return base
-        overbudget = bridge_data.overbudget_step_timeout
-        if not isinstance(overbudget, int) or isinstance(overbudget, bool):
-            return base
-        return max(base, overbudget)
+        ceiling = max(base, contended)
+
+        if process_info.last_heartbeat_type == HordeHeartbeatType.PIPELINE_STATE_CHANGE:
+            return ceiling
+        if process_info.current_job_slowdown_level >= 1:
+            return ceiling
+        if _job_is_feature_heavy(process_info):
+            return ceiling
+
+        expected = process_info.current_job_expected_sampling_seconds
+        if isinstance(expected, (int, float)) and not isinstance(expected, bool) and expected > 0:
+            scaled = math.ceil(expected * STEP_TIMEOUT_WORK_FACTOR)
+            return max(base, min(ceiling, scaled))
+        return base
 
     def replace_hung_processes(self) -> bool:
         """Replaces processes that haven't checked in since `process_timeout` seconds in bridgeData."""
