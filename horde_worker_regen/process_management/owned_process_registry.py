@@ -147,11 +147,16 @@ class OwnedProcessRegistry:
             return None
         return proc
 
-    def reap_orphans_from_previous_run(self) -> list[int]:
+    def reap_orphans_from_previous_run(self, *, kill_tree: bool = False) -> list[int]:
         """Kill any still-living children recorded by a prior (crashed) run, then reset the registry.
 
         Call this once at startup, before starting new processes: at that point every record is from
         a previous run. Returns the pids actually killed (verified-identity matches only).
+
+        ``kill_tree`` widens each kill to the recorded process *and its descendants*: a host records only
+        the top worker pid, but the GPU-resident processes are that worker's inference/safety children, so
+        reaping the worker alone would leave them orphaned. The worker tracks its own children individually
+        and so leaves this off.
         """
         killed: list[int] = []
         for record in self._load():
@@ -162,6 +167,10 @@ class OwnedProcessRegistry:
                 f"Reaping orphaned {record.process_type} process from a previous run "
                 f"(pid={record.os_pid}, launch={record.launch_identifier})",
             )
+            if kill_tree:
+                kill_process_tree(record.os_pid)
+                killed.append(record.os_pid)
+                continue
             with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 proc.kill()
                 killed.append(record.os_pid)

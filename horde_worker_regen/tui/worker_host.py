@@ -28,6 +28,8 @@ import time
 
 from loguru import logger
 
+from horde_worker_regen.app_state import default_app_state_dir
+from horde_worker_regen.process_management.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.process_management.supervisor_channel import SupervisorControlMessage
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui import socket_protocol as sp
@@ -37,6 +39,13 @@ from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupe
 
 _ACCEPT_TIMEOUT_SECONDS = 0.5
 """How often the accept loop wakes to check for shutdown."""
+
+HOST_OWNED_PIDS_FILENAME = "host_owned_pids.json"
+"""Where the host records the worker pid it owns, kept distinct from the worker's own child registry.
+
+A host that dies the hard way orphans its worker tree; the next host reads this on startup and reaps any
+survivor. It is the host's worker pid only (a separate file from the worker's ``owned_pids.json``, which
+tracks that worker's inference/safety children)."""
 
 
 class WorkerHost:
@@ -329,10 +338,23 @@ def main(argv: list[str] | None = None) -> None:
         worker_name=args.worker_name,
         directml=args.directml,
     )
+
+    # Reap a worker tree a prior host orphaned (a hard-closed launcher), then own this host's worker pid so
+    # a successor can do the same for us. Skipped under test, where it would touch real OS processes and a
+    # shared on-disk file. The Job Object (in the supervisor) is the first line of defence; this is the
+    # backstop for when it could not apply (an old build, or a job-assignment that lost the spawn race).
+    owned_registry: OwnedProcessRegistry | None = None
+    if not os.environ.get("AI_HORDE_TESTING"):
+        owned_registry = OwnedProcessRegistry(path=default_app_state_dir() / HOST_OWNED_PIDS_FILENAME)
+        reaped = owned_registry.reap_orphans_from_previous_run(kill_tree=True)
+        if reaped:
+            logger.warning(f"Reaped an orphaned worker tree left by a previous host: {reaped}")
+
     supervisor = WorkerSupervisor(
         options,
         mode=WorkerProcessMode(args.process_mode),
         auto_restart=not args.no_auto_restart,
+        owned_registry=owned_registry,
     )
     host = WorkerHost(supervisor, host=args.host, port=args.port)
     try:

@@ -26,7 +26,7 @@ from typing import TextIO
 
 from loguru import logger
 
-from horde_worker_regen.process_management.owned_process_registry import kill_process_tree
+from horde_worker_regen.process_management.owned_process_registry import OwnedProcessRegistry, kill_process_tree
 from horde_worker_regen.process_management.supervisor_channel import (
     SupervisorCommand,
     SupervisorControlMessage,
@@ -34,6 +34,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
     WorkerStateSnapshot,
 )
 from horde_worker_regen.run_worker import WorkerLaunchOptions
+from horde_worker_regen.tui.job_object import WorkerJobObject
 
 try:
     # On Windows a duplex Pipe yields PipeConnection; alias it so annotations match (see process_info.py).
@@ -151,6 +152,7 @@ class WorkerSupervisor:
         max_restart_attempts: int = 5,
         restart_backoff_seconds: float = 3.0,
         ctx: BaseContext | None = None,
+        owned_registry: OwnedProcessRegistry | None = None,
     ) -> None:
         """Initialize the supervisor (does not launch; call :meth:`start`).
 
@@ -161,6 +163,9 @@ class WorkerSupervisor:
             max_restart_attempts: Consecutive restart attempts before giving up (reset after stable uptime).
             restart_backoff_seconds: Minimum delay between an observed crash and a relaunch.
             ctx: The multiprocessing context (defaults to a fresh ``spawn`` context).
+            owned_registry: When set, the worker pid is recorded here on spawn (and dropped on a clean stop)
+                so a successor process can reap an orphaned worker tree this one left behind. The owner is
+                expected to have already swept the registry at startup. None disables that tracking.
         """
         self._options = options
         self._mode = mode
@@ -168,6 +173,11 @@ class WorkerSupervisor:
         self._max_restart_attempts = max_restart_attempts
         self._restart_backoff = restart_backoff_seconds
         self._ctx = ctx if ctx is not None else multiprocessing.get_context("spawn")
+        self._owned_registry = owned_registry
+        # A kill-on-close Job Object so an abrupt death of this (owner) process reaps the worker tree with
+        # it on Windows, rather than orphaning a GPU-resident worker; inert elsewhere.
+        self._job = WorkerJobObject()
+        self._spawn_count = 0
 
         self._process: BaseProcess | None = None
         self._connection: Connection | None = None
@@ -242,6 +252,16 @@ class WorkerSupervisor:
         self._process = process
         self._connection = parent_connection
         self._last_spawn_time = time.time()
+        self._spawn_count += 1
+        # Bind the worker to the owner's lifetime, and record its pid, before it can spawn children of its
+        # own: both are how an abruptly-killed owner avoids leaving a GPU-resident worker tree behind.
+        self._job.assign(process.pid)
+        if self._owned_registry is not None:
+            self._owned_registry.record(
+                os_pid=process.pid,
+                launch_identifier=self._spawn_count,
+                process_type="worker",
+            )
         self._set_status(status)
         logger.info(f"Launched worker (mode={self._mode.value}, pid={process.pid}).")
 
@@ -528,6 +548,9 @@ class WorkerSupervisor:
 
     def _cleanup_process(self) -> None:
         """Close the connection and drop the process handle (and the now-dead worker's last snapshot)."""
+        if self._owned_registry is not None and self._process is not None:
+            # The worker is being torn down deliberately; it no longer needs reaping by a successor.
+            self._owned_registry.forget(self._process.pid)
         if self._connection is not None:
             with contextlib.suppress(Exception):
                 self._connection.close()
