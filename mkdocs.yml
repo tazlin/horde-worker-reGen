@@ -1,5 +1,9 @@
 site_name: Horde Worker reGen Documentation
 
+# Force text-mode subprocess pipes (mkdocstrings' ruff/black signature formatter) to UTF-8 so the
+# build does not abort on non-ASCII docstrings under a Windows cp1252 locale. See the module docstring.
+hooks:
+  - docs/hooks/utf8_subprocess.py
 
 plugins:
   - search

@@ -68,7 +68,7 @@ state by reference (see
 | ---------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------ |
 | `job_popper.py`              | `JobPopper`             | The "pop gauntlet" of gates; consecutive-failure backoff                                               |
 | `pop_throttler.py`           | `PopThrottler`          | Pop-rate frequencies and megapixelstep wait timing (`CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS` lives here) |
-| `inference_scheduler.py`     | `InferenceScheduler`    | Decides which job/model to preload and launch; the line-skip cache                                     |
+| `inference_scheduler.py`     | `InferenceScheduler`    | Decides which job/model to preload and launch; the line-skip cache, size/progress-aware concurrent-overlap gating, idle-thread diversity dispatch, and the VRAM-aware co-resident-context teardown |
 | `safety_orchestrator.py`     | `SafetyOrchestrator`    | Dispatches completed images to the safety process                                                      |
 | `alchemy_popper.py`          | `AlchemyCoordinator`    | The separate alchemy pop/dispatch/submit loop and its concurrency gating (`AlchemyHeadroomEstimator`)  |
 | `job_submitter.py`           | `JobSubmitter`          | Uploads images to R2 and submits results to the API                                                    |
@@ -81,6 +81,7 @@ state by reference (see
 | `process_lifecycle.py` | `ProcessLifecycleManager` | Starts, stops, replaces, and hung-checks child processes; owns the shared semaphores/locks             |
 | `process_map.py`       | `ProcessMap`              | The live `HordeProcessInfo` per process; validates state transitions                                   |
 | `process_info.py`      | `HordeProcessInfo`        | Per-process bookkeeping record                                                                         |
+| `process_temperature.py` | `ProcessTemperature`    | Pure classifier turning a slot's raw state + resident/pending models into a "temperature" (hot/next/warm/priming/cold/down) for the status line and TUI |
 | `messages.py`          | message classes + enums   | All IPC message types, `HordeProcessState`, `ModelLoadState`, `HordeControlFlag`, `HordeHeartbeatType` |
 | `shutdown_manager.py`  | `ShutdownManager`         | Graceful shutdown, abort, and the signal handler                                                       |
 
@@ -97,6 +98,7 @@ state by reference (see
 | `api_sessions.py`    | `ApiSessions`                                        | aiohttp and horde-sdk client sessions                                                |
 | `lru_cache.py`       | `LRUCache`                                           | Recency ordering used by model eviction                                              |
 | `run_metrics.py`     | `WorkerRunMetrics` (+ `RunMetricsSnapshot`)          | Aggregates per-job latencies, child phase/download metrics, and crashes for the benchmark/e2e harness |
+| `system_memory.py`   | `SystemMemorySummary`                                | Samples total/available system RAM and per-role RSS (orchestrator/inference/safety/download) via psutil, for the supervisor snapshot and TUI |
 
 ### Resilience and recovery
 
@@ -124,7 +126,7 @@ state by reference (see
 | Path                    | Primary type            | Responsibility                                                                  |
 | ----------------------- | ----------------------- | ------------------------------------------------------------------------------- |
 | `tui/`                  | Textual app (`horde-worker`) | The dashboard: launches/supervises the worker, renders live state, wizard, config editor |
-| `supervisor_channel.py` | `WorkerStateSnapshot`, `SupervisorControlMessage` | Structured state/control protocol between a frontend and the worker |
+| `supervisor_channel.py` | `WorkerStateSnapshot`, `SupervisorControlMessage` | Structured state/control protocol between a frontend and the worker (`SUPERVISOR_PROTOCOL_VERSION`, currently 6; snapshot carries `SystemMemorySnapshot`) |
 | `app_state.py`          | (top-level)             | Durable cross-run state (`.horde_worker_regen/state.json`)                       |
 | `worker_identity.py`    | (functions)             | Startup fail-fast checks that configured worker names are valid and owned        |
 

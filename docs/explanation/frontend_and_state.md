@@ -34,7 +34,10 @@ defines the structured protocol over it:
 - The worker pushes
   [`WorkerStateSnapshot`][horde_worker_regen.process_management.supervisor_channel.WorkerStateSnapshot]
   objects at a steady cadence (the same data the overview, per-process view, and
-  Downloads tab render).
+  Downloads tab render), including a `SystemMemorySnapshot` (machine total/available
+  RAM plus per-role worker RSS). The snapshot is versioned by
+  `SUPERVISOR_PROTOCOL_VERSION` (currently 6) so a frontend can detect a mismatch
+  with a worker built from different code.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate

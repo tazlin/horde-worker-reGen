@@ -69,6 +69,32 @@ timeout:
 
 (`process_timeout` and these timeouts are affected by performance modes.)
 
+The mid-inference timeout is not a single flat value. Before a job's first
+sampling step (its `last_current_step` is still `None`) the slot is doing
+one-time pre-sampling work (streaming a large checkpoint through VRAM, the
+initial prompt encode) that emits no step, so the longer
+`inference_first_step_timeout` applies. Once sampling has started it tightens to
+`inference_step_timeout`, but that flat value suits a light job on an
+uncontended device. On a multi-process worker two healthy cases legitimately go
+heartbeat-silent for longer with no sampling step: a step stretched by
+co-residence contention, and a feature phase that emits no step for its duration
+(the hires-fix second pass, VAE decode, post-processing setup, a ControlNet
+graph). The watchdog therefore widens the per-step grace up to
+`contended_step_timeout` when there is positive evidence of such work (a
+non-step pipeline phase is running, the slot was graded contention-slowed, or
+the job's signature is feature-heavy), otherwise scaling the grace with the
+job's expected sampling time. A genuinely wedged slot is still reaped once it
+has been continuously silent past that bound. An over-budget admit keeps its own
+`overbudget_step_timeout`.
+
+Alongside the hard timeout, `_grade_running_inference()` runs each tick as a
+soft, advisory ladder: it logs and audits a job sampling measurably slower than
+its [performance-model](performance_and_backpressure.md#performance-model-scoring) expectation, escalating
+`current_job_slowdown_level`. It measures sampling time **from the first step**,
+not from dispatch, so a long cold start or feature-heavy startup is never
+mislabelled as slow sampling; it only logs and feeds the widened timeout above,
+and never replaces a slot itself.
+
 When a process exceeds its timeout, it is **replaced immediately** within the
 same call (see below); there is no separate notification sent to the message
 dispatcher. After any recovery, a short `recently_recovered` guard suppresses

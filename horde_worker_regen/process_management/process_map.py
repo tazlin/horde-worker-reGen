@@ -361,7 +361,6 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             process_id (int): The ID of the process to update.
             horde_model_name (str): The name of the horde model to update.
             horde_model_baseline (KNOWN_IMAGE_GENERATION_BASELINE): The baseline of the horde model to update.
-            load_state (ModelLoadState): The load state of the model.
             last_job_referenced (ImageGenerateJobPopResponse | None, optional): The last job referenced by this \
                  process. Defaults to None.
         """

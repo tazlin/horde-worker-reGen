@@ -10,8 +10,11 @@
         - [Performance-model scoring](#performance-model-scoring)
         - [Model affinity (high-throughput regime)](#model-affinity-high-throughput-regime)
         - [The line-skip cache](#the-line-skip-cache)
+        - [Concurrent-overlap gating](#concurrent-overlap-gating)
+        - [Idle-thread diversity scheduling](#idle-thread-diversity-scheduling)
     - [Model eviction (LRU)](#model-eviction-lru)
     - [The VRAM and RAM budget](#the-vram-and-ram-budget)
+        - [Per-context overhead and the effective idle floor](#per-context-overhead-and-the-effective-idle-floor)
     - [Alchemy backpressure](#alchemy-backpressure)
     - [See also](#see-also)
 
@@ -176,6 +179,45 @@ download, the skip decision is cached in `_pending_line_skip` so the second call
 agrees with the first. Without this cache, the launch call could pick a
 different job, causing the block decision to be wasted.
 
+### Concurrent-overlap gating
+
+`max_threads` caps how many jobs may be *in flight* at once, but it only counts jobs; it does not look at
+what those jobs are or how far along they are. That count-only cap will happily let two heavy SDXL jobs
+(plus a speculatively-staged third) stack their weight loads and activation peaks on the same card at the
+same moment, thrashing a sampler badly enough to trip its step-timeout watchdog into a teardown.
+
+`InferenceScheduler._concurrent_overlap_allowed` adds the missing dimension: a new job may join work that
+is already sampling only when the in-flight work can tolerate it. Models are classed into size tiers
+(`_model_size_tier`): a model in the VRAM-heavy list or carrying an extra-large baseline is
+**extra-large**; SDXL is **heavy**; SD1.5/SD2 are **light**; an unknown baseline falls back to light so a
+missing reference does not starve dispatch. The rules, scaled by tier:
+
+- The first job (nothing in flight) always starts.
+- An extra-large or batched candidate never joins a busy card, and an extra-large or batched job already
+  in flight never lets anything share the card: these want the device to themselves.
+- Otherwise the running job must have made size-appropriate **headway** before a candidate joins: none for
+  light + light (they thread freely), modest when one side is heavy, and considerable for two heavy jobs.
+  Progress is read live from the running slot's step counters (a freshly dispatched job that has not yet
+  reported a step reads as `0.0`, which is exactly when a heavy overlap is most dangerous).
+
+A blocked candidate is never dropped; it keeps its queue position and dispatches the moment the in-flight
+jobs progress past the headway threshold or finish.
+
+### Idle-thread diversity scheduling
+
+When the head-of-queue job's process is busy sampling the head's own model, the naive choice is to wait,
+leaving other inference processes idle, or to load a second copy of the head's model onto a spare process.
+Both waste the card. `InferenceScheduler._select_idle_thread_diversity_job` instead looks for a *later*
+pending job whose (distinct) model is **already resident on an idle process** and dispatches that
+concurrently. Preferring a distinct model means a run of several same-model jobs followed by one different
+model processes the different model "for free" alongside the run, rather than idling a thread and tacking
+it on at the end as its own load.
+
+The diversity pick still respects the [concurrent-overlap gate](#concurrent-overlap-gating) (two heavy
+models are not stacked without headway), skips degraded-retry jobs that must run isolated, and records a
+[line-skip](#the-line-skip-cache) for the displaced head so it keeps its queue position and dispatches the
+moment its process frees.
+
 ## Model eviction (LRU)
 
 When the scheduler needs to free VRAM for a new model, it uses the `LRUCache` to
@@ -205,8 +247,8 @@ resources instead.
 
 [`VramBudget` and `RamBudget`][horde_worker_regen.process_management.resource_budget]
 predict a job's peak VRAM and RAM cost from hordelib's per-job burden estimate
-([`estimate_job_burden`][hordelib.feature_impact.estimate_job_burden], the same
-estimate the benchmark pre-flight trusts) and compare it against:
+(`hordelib.feature_impact.estimate_job_burden`, the same estimate the benchmark
+pre-flight trusts) and compare it against:
 
 - **measured device-wide free VRAM**: the conservative minimum across inference
   processes' memory reports
@@ -241,6 +283,40 @@ To keep measurements fresh, inference processes emit an interval-driven memory
 report (every `_memory_report_interval`, 5 s) in addition to the event-driven
 reports at model load/unload, and a dead process's stale VRAM figure is cleared on
 recovery so it cannot be counted as either used or free.
+
+### Per-context overhead and the effective idle floor
+
+The job-burden prediction above is *per job*. Sizing residency across several processes that share one
+card needs a second, *per-process* quantity: how much VRAM each inference context costs **on top of** its
+model weights. The first context pays a large one-time cost (the CUDA runtime allocation); each additional
+co-resident context costs only a smaller **marginal** amount. Multiplying the one-time cost by the process
+count would phantom away most of the card and force needless teardowns; ignoring the marginal entirely
+would over-promise reclaimable VRAM. The scheduler needs both figures to forecast what is actually free
+once idle models are evicted.
+
+It derives them from two measurements, preferring hard data and erring conservative:
+
+- **The startup accelerator probe** measures the marginal per-additional-context cost directly (its
+  second-context delta). This is available from the first scheduling tick, so it also covers the startup
+  window where sibling processes have not yet reached idle. `vram_per_process_overhead_mb` (config) can
+  override the first-context figure when an operator knows their card.
+- **The effective idle floor** is the *worst* (highest) device-wide used-VRAM reading observed when every
+  inference process is up, idle, and holding no model. That is ground truth for what reclaim can never
+  return: if a real inference context retains more allocator cache than the probe's minimal holder did,
+  the probe under-counts the marginal and the forecast would over-promise free VRAM. The scheduler takes
+  the **max** of the probe estimate and the effective-floor derivation, so it never believes in headroom
+  the device will not give back. The floor only rises above the probe once contexts genuinely over-commit
+  (the `threads > 1` regime), so a roomy card keeps the probe estimate unchanged.
+
+These feed two decisions. The streaming forecast uses them to size `free_after_model_evict` (the VRAM
+achievable once idle resident models are gone) without multiplying the one-time cost by the process count.
+And when an over-commit is due to retained per-context cache rather than resident model *weights*, the
+scheduler computes the largest live-context count that still fits the job's peak plus reserve
+(`_max_coresident_for_peak_mb`, sized from the *same* burden peak the admission verdict rejects on) and
+**reduces live contexts** (stops idle sibling processes) to that depth, instead of evicting every resident
+model and forcing a full reload storm. This is the structural remedy for the `threads > 1` co-residence
+thrash: it fires exactly when the admission verdict would otherwise reject the head every tick and route
+it into an evict-all admit.
 
 ## Alchemy backpressure
 

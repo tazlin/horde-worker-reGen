@@ -8,6 +8,15 @@ The worker writes logs to the `logs/` directory. The dashboard's **Logs** tab re
 | `bridge_n.log` | Per-process log. |
 | `trace.log` | Errors and warnings only. |
 | `trace_n.log` | Per-process errors and warnings. |
+| `bridge_tui.log` / `bridge_host.log` | The supervisor (parent) process's own log: TUI dashboard or `--host` wrapper. Captures worker launch, crash-loop, and TUI-process crash diagnostics that never reach `bridge.log`. |
+
+## Rotation and retention
+
+The supervisor logs (`bridge_tui.log` / `bridge_host.log`) and the benchmark run logs rotate at a **25 MB**
+size cap, are compressed to `.zip` once rotated, and keep a bounded number of older files (20 for the
+supervisor, 10 for benchmark runs). This keeps total disk use bounded under a heavy or long-running session,
+and keeps any single file small enough that the **Logs** tab can tail it without buffering a multi-GB file.
+The dashboard reads only the trailing window of a log, so a large file scrolls quickly to the latest lines.
 
 ## Which process is which
 

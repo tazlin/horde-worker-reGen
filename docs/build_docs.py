@@ -24,6 +24,13 @@ def dynamically_create_library_markdown_stubs() -> None:
 
     # For each folder in the folder_lookup, create a file in the docs folder
     for folder, _namespace in folder_lookup.items():
+        # Only document importable packages. A directory without an __init__.py is not a real
+        # subpackage (e.g. amd_go_fast/, whose single file is a ComfyUI node payload copied into
+        # hordelib at install time, not imported from here); mkdocstrings cannot collect it, so
+        # generating a stub for it just breaks the strict docs build.
+        if not (folder / "__init__.py").exists():
+            continue
+
         relative_folder = folder.relative_to(project_root)
         relative_folder = "docs" / relative_folder
         relative_folder.mkdir(parents=True, exist_ok=True)
