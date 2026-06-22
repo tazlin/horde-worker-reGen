@@ -102,6 +102,19 @@ def load_env_vars_from_config() -> None:  # FIXME: there is a dynamic way to do 
                 "This will override the value for `civitai_api_token` in the config file.",
             )
 
+    # Expose the worker's key to the model-download path so hordelib can fetch hostable models from the gated
+    # R2 mirror. The download subprocess inherits this env; the anonymous key cannot be trusted, so it is left
+    # unset (the engine then downloads straight from each model's origin host).
+    configured_api_key = config.get("api_key")
+    if configured_api_key and configured_api_key != "0000000000":
+        if os.getenv("AIHORDE_API_KEY") is None:
+            os.environ["AIHORDE_API_KEY"] = configured_api_key
+        else:
+            print(
+                "AIHORDE_API_KEY environment variable already set. "
+                "This will override the value for `api_key` in the config file.",
+            )
+
     if "horde_url" in config:
         known_ai_horde_urls = [
             "stablehorde.net",

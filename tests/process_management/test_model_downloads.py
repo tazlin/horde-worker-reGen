@@ -239,7 +239,7 @@ class TestManagerDownloadHandling:
         manager = make_testable_process_manager(**bridge_overrides)  # type: ignore
         manager._enable_background_downloads = True
         manager._download_wait_started = time.time()
-        manager._process_lifecycle = Mock()
+        manager._process_lifecycle = Mock(download_process_info=None)
         manager._process_lifecycle._num_process_recoveries = 0
         return manager  # type: ignore[return-value]
 
