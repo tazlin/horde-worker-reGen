@@ -16,12 +16,14 @@ dashboard, so it must be opted into. (The worker host always binds loopback.)
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import shutil
 import socket
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 
 from horde_worker_regen.tui import socket_protocol as sp
@@ -62,6 +64,16 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help=f"Worker-host socket port (default {sp.DEFAULT_HOST_PORT}; ${HOST_PORT_ENV_VAR} overrides).",
     )
     parser.add_argument("--no-browser", action="store_true", help="Do not open any window automatically.")
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Report whether a worker host is already running (and its status), then exit.",
+    )
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Ask a running worker host to stop the worker and exit cleanly, then exit.",
+    )
     parser.add_argument(
         "--browser",
         action="store_true",
@@ -197,6 +209,64 @@ def _shutdown_host(process: subprocess.Popen[bytes], address: tuple[str, int]) -
         process.terminate()
 
 
+def _query_host_status(address: tuple[str, int], *, timeout: float = 2.0) -> dict[str, object] | None:
+    """Connect to a worker host and return its first status frame, or None if none is reachable.
+
+    The host greets a new client with ``hello`` and then broadcasts a status frame within one control
+    interval, so a short read loop is enough to capture the current worker state.
+    """
+    try:
+        with socket.create_connection(address, timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                message = sp.recv_frame(sock)
+                if message is None:
+                    return None
+                if message.get("type") == sp.MSG_STATUS:
+                    return message
+            return None
+    except OSError:
+        return None
+
+
+def _print_host_status(address: tuple[str, int]) -> int:
+    """Print whether a worker host runs at ``address`` and its status; return a process exit code."""
+    status = _query_host_status(address)
+    if status is None:
+        print(f"No worker host is running on {address[0]}:{address[1]}.")
+        return 1
+    running = "running" if status.get("worker_running") else "stopped"
+    print(
+        f"Worker host on {address[0]}:{address[1]}: worker {running} "
+        f"(status={status.get('status')}, mode={status.get('mode')}).",
+    )
+    return 0
+
+
+def _request_host_stop(address: tuple[str, int], *, timeout: float = 5.0) -> int:
+    """Ask a running worker host to stop the worker and exit; return a process exit code.
+
+    After sending the request the write side is half-closed and the socket drained to EOF. This makes
+    the host consume the frame before we fully close: a bare close can race the host's reader and let an
+    RST discard the still-buffered request (the launcher's own exit path tolerates that race via a
+    process-terminate backstop this command has no handle for).
+    """
+    try:
+        with socket.create_connection(address, timeout=2.0) as sock:
+            sp.send_frame(sock, sp.lifecycle_message(sp.LIFECYCLE_SHUTDOWN))
+            sock.shutdown(socket.SHUT_WR)
+            sock.settimeout(timeout)
+            with contextlib.suppress(OSError):
+                while sock.recv(4096):
+                    pass
+    except OSError:
+        print(f"No worker host is running on {address[0]}:{address[1]}.")
+        return 1
+    print(f"Asked the worker host on {address[0]}:{address[1]} to stop; it drains in-flight jobs first.")
+    return 0
+
+
 def _chromium_app_command(url: str) -> list[str] | None:
     """A command to open *url* as a borderless app window in an installed Chromium browser, or None.
 
@@ -266,6 +336,12 @@ def _schedule_dashboard_open(host: str, port: int, *, app_window: bool) -> None:
 def main(argv: list[str] | None = None) -> None:
     """Console-script entry point (``horde-worker-web``): ensure a host, serve the dashboard, open a browser."""
     args = _parse_args(argv)
+
+    # Control commands act on an already-running host and exit; they never start a server or a worker.
+    if args.status or args.stop:
+        control_address = ("127.0.0.1", _resolve_host_port(args.host_port))
+        raise SystemExit(_print_host_status(control_address) if args.status else _request_host_stop(control_address))
+
     web_host = _resolve_host(args.host)
     web_port = _resolve_port(args.port)
 

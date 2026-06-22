@@ -71,6 +71,22 @@ exposure is conservative: the web server and the worker host both bind
 `127.0.0.1` by default; binding the LAN is a deliberate power-user action
 (`--host` / `HORDE_WORKER_WEB_HOST`) that exposes an unauthenticated dashboard.
 
+The host's lifetime is decoupled from the launcher that started it. `tui/web.py`
+spawns a host only when one is not already listening, and on a *clean* exit it
+sends `LIFECYCLE_SHUTDOWN` so the host drains and stops the worker. Two cases
+break that tidy ownership: a launcher that is *hard*-killed (the window's close
+button or `taskkill`) skips that shutdown and orphans the host, and a host
+started directly (`horde-worker-host`) has no launcher to stop it at all. In both,
+the worker keeps running with nothing on screen. Two affordances keep it
+discoverable and stoppable: `horde-worker-web --status` / `--stop` (the same
+status frame and `LIFECYCLE_SHUTDOWN` the host already speaks), and, on Windows, a
+**system-tray icon** the host itself shows (`tui/tray.py`). The tray lives on the
+host rather than the launcher precisely because the host is what survives, so an
+orphaned worker surfaces as a visible icon with *Open dashboard* and *Stop*
+actions instead of an invisible process. The tray is best-effort and
+import-guarded (`pystray`/`Pillow`, Windows-only), so its absence never affects
+the worker.
+
 ## The first-run wizard
 
 On first launch, when `bridgeData.yaml` is unconfigured

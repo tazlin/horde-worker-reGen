@@ -42,6 +42,11 @@ Press `Ctrl+C` in the worker's terminal. It finishes any in-progress jobs before
 killing it unless you are seeing many major errors; you can force a stop by pressing `Ctrl+C`
 repeatedly or sending `SIGKILL`.
 
+A persistent **worker host** (`horde-worker-host`, the process the browser dashboard normally attaches
+to) is a middle ground: it runs the worker with no attached UI but can be inspected and stopped at any
+time with `horde-worker-web --status` / `--stop`, and on Windows it shows a tray icon. See
+[Closing and reattaching](use-the-dashboard.md#closing-and-reattaching).
+
 ## Configure from environment variables (containers)
 
 Instead of a config file, the worker can read its configuration from `AIWORKER_*` environment

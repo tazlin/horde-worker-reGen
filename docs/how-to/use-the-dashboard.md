@@ -22,9 +22,11 @@ horde-worker.cmd --headless # no UI: run the worker in the foreground, printing 
 ./horde-worker.sh --headless
 ```
 
-The window you launch from is the worker: closing it (or pressing `Ctrl+C` in it) stops the worker.
-In browser mode the worker runs in a persistent background host, so closing the browser tab leaves
-the worker running and you can reopen the dashboard to reconnect.
+The window you launch from is the worker. In the in-terminal and headless modes, closing that window
+(or pressing `Ctrl+C`) stops the worker. In the default browser mode the worker runs in a persistent
+background **host**, so closing the browser tab leaves it running and reopening the dashboard
+reconnects. See [Closing and reattaching](#closing-and-reattaching) for exactly what keeps the worker
+alive, how to reattach to a running one, and the Windows tray icon.
 
 `--headless` is the no-UI path: it downloads/verifies your models and then runs the worker directly
 (equivalent to `run_worker`; see [Run headless](run-headless.md)), so a server or service sees the
@@ -88,6 +90,49 @@ that was already invalid on disk but that you did not touch will not block an un
 | `F9` | Restart the worker process |
 | `Ctrl+Q` / `Ctrl+C` | Stop the worker and quit |
 
+## Closing and reattaching
+
+Browser mode (the default) splits the dashboard from the worker: a persistent **host** process owns
+the worker, and each browser tab is just a viewer attached to it over a loopback socket. That is why a
+closed tab does not stop the worker, but it also makes "is it still running?" a fair question. What
+each kind of close does:
+
+| You close... | In this mode | The worker... |
+|--------------|--------------|---------------|
+| The browser tab | browser (default) | keeps running on the host; reopen to reconnect |
+| The launcher window, cleanly | browser (default) | stops (the launcher tells the host to drain and exit) |
+| The launcher window, hard-killed | browser (default) | keeps running, now orphaned (use the tray icon or `--stop`) |
+| The terminal, or `Ctrl+C` | `--terminal` / `--headless` | stops |
+
+### Reattach to a running worker
+
+- **Browser:** run `horde-worker` again. It detects the running host and opens a fresh dashboard tab
+  attached to it (it does not start a second worker).
+- **Terminal:** `horde-worker --terminal --attach` attaches an in-terminal dashboard to the running
+  host (defaults to `127.0.0.1:7717`; pass `--attach HOST:PORT` for another). Closing it detaches
+  without stopping the worker.
+- **Inspect or stop from a terminal, with no UI:**
+
+  ```bash
+  horde-worker-web --status   # is a worker host running here, and is its worker working?
+  horde-worker-web --stop     # ask it to drain in-flight jobs and exit cleanly
+  ```
+
+  `--status` exits non-zero when nothing is running, so scripts can branch on it.
+
+### The tray icon (Windows)
+
+On Windows the worker host shows a **system-tray icon** while it runs, so a worker is never invisible,
+even after the browser and the launcher window are gone. Its menu offers:
+
+- **Open dashboard** -- reopen the browser dashboard attached to this worker (reusing a running web
+  server if there is one).
+- **Stop worker & exit** -- drain in-flight jobs, then stop the worker and host cleanly.
+
+The line at the top of the menu shows whether the worker is currently running. The icon is the simplest
+way to find and stop an orphaned worker after a hard-closed launcher window; the `--stop` command above
+does the same from a terminal. (Linux and macOS have no tray icon yet; use `--status` / `--stop`.)
+
 ## Command-line options
 
 These are options for the `horde-worker` program itself. The wrapper-script flags above (`--terminal`,
@@ -101,7 +146,7 @@ These are options for the `horde-worker` program itself. The wrapper-script flag
 | `--amd`, `--amd-gpu` | Enable AMD GPU optimisations. |
 | `--config PATH` | Path to the `bridgeData.yaml` the config editor reads and writes (default `bridgeData.yaml`). |
 | `--no-auto-restart` | Do not relaunch the worker if it crashes. |
-| `--attach HOST:PORT` | Attach to a running worker host instead of owning the worker (used by the web launcher); the worker survives this session closing. |
+| `--attach [HOST:PORT]` | Attach to a running worker host instead of owning the worker; the worker survives this session closing. With no value, attaches to `127.0.0.1:7717`. |
 | `--directml N` | Select a DirectML device index. DirectML is currently unavailable (see [Run on AMD ROCm](run-on-amd-rocm.md)), so this flag has no working backend at present. |
 
 When it owns the worker, the dashboard relaunches it automatically if it crashes (bounded by a restart

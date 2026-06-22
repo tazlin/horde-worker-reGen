@@ -70,6 +70,7 @@ start so you know what is involved.
 |--------------|-------|
 | Get a good setup for my GPU | [Configure for your GPU](docs/how-to/configure-for-your-gpu.md) |
 | Learn the dashboard | [Use the dashboard](docs/how-to/use-the-dashboard.md) |
+| Keep it running after I close the window, or reattach | [Closing and reattaching](docs/how-to/use-the-dashboard.md#closing-and-reattaching) |
 | Run without a UI (servers, automation) | [Run headless](docs/how-to/run-headless.md) |
 | Run in a container | [Run in Docker](docs/how-to/run-in-docker.md) |
 | Use several GPUs | [Run multiple GPUs](docs/how-to/run-multiple-gpus.md) |

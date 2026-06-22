@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import multiprocessing
+import os
 import queue
 import socket
 import threading
@@ -30,6 +31,7 @@ from loguru import logger
 from horde_worker_regen.process_management.supervisor_channel import SupervisorControlMessage
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui import socket_protocol as sp
+from horde_worker_regen.tui import tray as tray_module
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupervisor
 
@@ -62,6 +64,7 @@ class WorkerHost:
         self._restart_after_stop = False
         """Set by a restart request: once the in-progress graceful stop completes, the worker is started."""
         self._threads: list[threading.Thread] = []
+        self._tray: tray_module.WorkerTray | None = None
 
     @property
     def port(self) -> int:
@@ -90,6 +93,8 @@ class WorkerHost:
         control.start()
         self._threads.append(control)
 
+        self._start_tray()
+
         try:
             self._accept_loop(server)
         finally:
@@ -98,6 +103,29 @@ class WorkerHost:
     def stop(self) -> None:
         """Signal the host to stop serving and shut the worker down."""
         self._stop.set()
+
+    # region tray icon
+
+    def _start_tray(self) -> None:
+        """Show a Windows tray icon for this host (a no-op elsewhere) so a detached worker stays visible."""
+        self._tray = tray_module.WorkerTray(
+            on_open_dashboard=self._open_dashboard,
+            on_stop=self.stop,
+            status_provider=self._tray_status_text,
+        )
+        self._tray.start()
+
+    def _tray_status_text(self) -> str:
+        """The live one-line status the tray menu shows (re-read each time the menu opens)."""
+        running = "running" if self._supervisor.is_alive() else "stopped"
+        return f"Worker {running} ({self._supervisor.mode.value})"
+
+    def _open_dashboard(self) -> None:
+        """Open the dashboard against this host, honouring a non-default web port from the environment."""
+        port_env = os.getenv("HORDE_WORKER_WEB_PORT")
+        tray_module.open_dashboard(int(port_env) if port_env else 8000)
+
+    # endregion
 
     # region client handling
 
@@ -246,8 +274,10 @@ class WorkerHost:
                 self._drop_client(client)
 
     def _shutdown(self) -> None:
-        """Stop accepting clients, stop the worker, and close all sockets."""
+        """Stop accepting clients, remove the tray icon, stop the worker, and close all sockets."""
         self._stop.set()
+        if self._tray is not None:
+            self._tray.stop()
         with self._clients_lock:
             clients = list(self._clients)
             self._clients.clear()

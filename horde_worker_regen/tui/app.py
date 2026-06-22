@@ -728,9 +728,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--attach",
         type=str,
+        nargs="?",
         default=None,
-        help="Attach to a running worker host at host:port (used by the web launcher) instead of owning "
-        "the worker. The worker survives this session closing.",
+        const=f"{sp.DEFAULT_HOST_ADDRESS}:{sp.DEFAULT_HOST_PORT}",
+        help="Attach to a running worker host instead of owning the worker (used by the web launcher, and "
+        f"to reattach a terminal dashboard). With no value, attaches to {sp.DEFAULT_HOST_ADDRESS}:"
+        f"{sp.DEFAULT_HOST_PORT}; pass host:port to target another. The worker survives this session "
+        "closing.",
     )
     return parser.parse_args(argv)
 

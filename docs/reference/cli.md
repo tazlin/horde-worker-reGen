@@ -40,13 +40,29 @@ Installed as console scripts (defined in `pyproject.toml`):
 | `--amd`, `--amd-gpu` | Enable AMD GPU optimisations. |
 | `--config PATH` | `bridgeData.yaml` the config editor reads and writes (default `bridgeData.yaml`). |
 | `--no-auto-restart` | Do not relaunch the worker if it crashes. |
-| `--attach HOST:PORT` | Attach to a running worker host instead of owning the worker. |
+| `--attach [HOST:PORT]` | Attach to a running worker host instead of owning the worker; the worker survives this session closing. With no value, attaches to `127.0.0.1:7717`. |
 | `--directml N` | DirectML device index. DirectML is currently unavailable, so this has no working backend. |
 
 The launcher-only flags `--terminal` (in-terminal UI), `--headless` (no UI; runs the foreground worker
 via `horde-bridge`), and `--host HOST` (bind the served dashboard, unauthenticated) are handled by the
 `horde-worker` script before this program runs. In the default browser mode on a machine with no
 graphical display, the launcher falls back to the in-terminal UI automatically.
+
+## `horde-worker-web` (served dashboard / host control)
+
+Serves the browser dashboard, spawning a background worker host if one is not already running. It also
+carries two control commands that act on an already-running host and exit without starting anything:
+
+| Flag | Meaning |
+|------|---------|
+| `--status` | Report whether a worker host is running here and whether its worker is working, then exit (non-zero when nothing is running). |
+| `--stop` | Ask a running host to drain in-flight jobs and stop the worker and host cleanly, then exit. |
+| `--host-port N` | Worker-host socket port the commands target (default `7717`; `$HORDE_WORKER_HOST_PORT` overrides). |
+| `--host HOST`, `--port N` | Bind address/port of the web server itself (default `127.0.0.1:8000`). |
+
+On Windows the worker host also shows a **system-tray icon** while it runs, with *Open dashboard* and
+*Stop worker & exit* actions, so a detached or orphaned worker stays visible and stoppable. See
+[Use the dashboard](../how-to/use-the-dashboard.md#closing-and-reattaching).
 
 ## `run_worker` (headless)
 

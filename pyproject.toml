@@ -49,6 +49,10 @@ dependencies = [
     "textual>=2.1.0",
     "textual-serve>=1.1.1",
     "logfire>=4.6.0",
+    # Windows-only system-tray icon for the persistent worker host (tui/tray.py), so a detached worker
+    # stays visible and stoppable. Import-guarded, so their absence on other platforms is harmless.
+    "pystray; sys_platform == 'win32'",
+    "pillow; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
