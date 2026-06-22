@@ -13,7 +13,7 @@ from textual.screen import Screen
 from textual.widgets import Checkbox, DataTable, Input, Select
 
 from horde_worker_regen.tui.model_catalog import ModelInfo
-from horde_worker_regen.tui.widgets.model_picker import ModelPickerModal
+from horde_worker_regen.tui.widgets.model_picker import _MARKER_COL, ModelPickerModal
 
 _MODELS = [
     ModelInfo(
@@ -221,8 +221,8 @@ async def test_model_picker_membership_shows_and_blocks_target(monkeypatch: pyte
 
 
 @pytest.mark.e2e
-async def test_model_picker_single_click_toggles_row(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A single real mouse click on a row marks it (and clicking again unmarks it).
+async def test_model_picker_single_click_marker_cell_toggles_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A single real mouse click on the marker cell marks the row (and clicking it again unmarks it).
 
     Guards the click path itself: ``DataTable`` stops the ``Click`` event on a cell-cursor click, so a
     handler on the modal never sees it. The other e2e tests call ``_toggle`` directly and so cannot
@@ -254,6 +254,41 @@ async def test_model_picker_single_click_toggles_row(monkeypatch: pytest.MonkeyP
         await pilot.pause()
         assert str(table.get_cell_at(Coordinate(0, 0))) == "＋ Mark"
         assert modal._visible[0].name not in modal._chosen
+
+
+@pytest.mark.e2e
+async def test_model_picker_single_click_outside_marker_inspects_without_marking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clicking a non-marker cell moves the cursor (showing the detail panel) but never marks the row.
+
+    This is the whole point of the marker-cell gate: a user can click into any row to read its details
+    without that click flipping the row's mark state. Only the ＋/✕ cell toggles.
+    """
+    from textual.geometry import Offset
+
+    from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
+
+    CATALOG_CACHE.reset()
+    monkeypatch.setattr("horde_worker_regen.tui.catalog_cache.load_image_models", lambda: list(_MODELS))
+    monkeypatch.setattr("horde_worker_regen.tui.catalog_cache.free_model_bytes", lambda: None)
+
+    app = _PickerHost()
+    async with app.run_test(size=(150, 44)) as pilot:
+        await pilot.pause()
+        modal = app.screen
+        assert isinstance(modal, ModelPickerModal)
+        table = modal.query_one("#picker-table", DataTable)
+        await _wait_for_rows(pilot, table, 3)
+
+        # Offset (25, 2): the Model column (past the 10-wide marker column) of the second data row.
+        await pilot.click(table, offset=Offset(25, 2))
+        await pilot.pause()
+        assert table.cursor_coordinate.column != _MARKER_COL
+        assert table.cursor_coordinate.row == 1
+        assert modal._current is modal._visible[1]
+        assert str(table.get_cell_at(Coordinate(1, 0))) == "＋ Mark"
+        assert modal._chosen == set()
 
 
 @pytest.mark.e2e

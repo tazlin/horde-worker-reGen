@@ -1,4 +1,4 @@
-"""A modal that browses image models in a table: click a row to mark/unmark it for adding."""
+"""A modal that browses image models in a table: click the ＋/✕ cell to mark, click elsewhere to inspect."""
 
 from __future__ import annotations
 
@@ -46,17 +46,21 @@ _DISK_OFF = "off"
 
 
 class _PickerTable(DataTable):
-    """The picker's model table, emitting a single-click toggle the modal can act on.
+    """The picker's model table, emitting a single-click toggle only when the marker cell is clicked.
 
     ``DataTable._on_click`` calls ``event.stop()`` on every cell-cursor click, so a ``Click`` handler
     on an ancestor never sees the event; and its built-in ``CellSelected`` only fires on a click of the
     *already-highlighted* cell (a de-facto double click for any other row). To get a true single-click
-    toggle we read the clicked row from the event's render metadata, defer to the base handler so the
-    cursor, scroll, and highlight all behave normally, then post our own message.
+    toggle we read the clicked row and column from the event's render metadata, defer to the base
+    handler so the cursor, scroll, and highlight all behave normally, then post our own message.
+
+    The message is posted only for a click on the marker column (the cell that renders ＋ Mark / ✕
+    Unmark), so clicking any other cell merely moves the cursor: that drives the detail panel via
+    ``CellHighlighted`` and lets a user inspect a model without marking it.
     """
 
     class RowToggled(Message):
-        """Posted when a single click lands on a model row (not the header)."""
+        """Posted when a single click lands on a model row's marker cell."""
 
         def __init__(self, row: int) -> None:
             self.row = row
@@ -67,7 +71,7 @@ class _PickerTable(DataTable):
         row = meta.get("row", -1)
         column = meta.get("column", -1)
         await super()._on_click(event)
-        if row >= 0 and column >= 0:
+        if row >= 0 and column == _MARKER_COL:
             self.post_message(self.RowToggled(row))
 
 
@@ -179,7 +183,7 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         """Lay out the filters, search, model table with a detail panel, and buttons."""
         with Vertical(id="picker-dialog"):
             yield Label(
-                "Click a row to mark/unmark it  ·  click a header to sort",
+                "Click ＋/✕ to mark  ·  click a row to inspect  ·  click a header to sort",
                 classes="dialog-title",
             )
             with Horizontal(id="picker-filters"):
@@ -512,7 +516,7 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
 
     @on(_PickerTable.RowToggled)
     def _on_row_toggled(self, event: _PickerTable.RowToggled) -> None:
-        """Toggle the clicked model (single click), via the table's own toggle message."""
+        """Toggle the model whose marker cell was clicked (clicks on other cells only inspect)."""
         self._toggle(event.row)
 
     def action_toggle_add(self) -> None:
