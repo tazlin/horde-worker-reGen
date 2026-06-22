@@ -38,6 +38,14 @@ _MODELS_SECTION = "Models"
 # Which sub-tab a section lives on, so a validation error can name (and jump to) the right page.
 _SECTION_TO_SUBTAB: dict[str, str] = {section: label for label, sections in CONFIG_SUBTABS for section in sections}
 
+# Only fields whose section is bundled into a sub-tab get widgets in ``compose``. A section that is
+# absent from ``CONFIG_SUBTABS`` (e.g. the developer-only "Dry-run" flags, which stay editable via YAML
+# but are deliberately kept out of the operator UI) is never laid out, so the loops that walk every
+# field must iterate this filtered view; querying an uncomposed field raises ``NoMatches``.
+_RENDERED_FIELDS: tuple[ConfigField, ...] = tuple(
+    field for field in CONFIG_FIELDS if field.section in _SECTION_TO_SUBTAB
+)
+
 
 def _subtab_id(label: str) -> str:
     """A DOM-safe TabPane id derived from a sub-tab label (e.g. ``Alchemy`` -> ``cfgtab-alchemy``)."""
@@ -329,7 +337,7 @@ class ConfigEditorView(Vertical):
     def _widget_state(self) -> dict[str, object]:
         """A raw, uncoerced snapshot of every editable widget keyed by field, for change detection."""
         state: dict[str, object] = {}
-        for field in CONFIG_FIELDS:
+        for field in _RENDERED_FIELDS:
             if field.kind is FieldKind.MODEL_LIST:
                 state[field.key] = tuple(self.query_one(f"#mle-root-{field.key}", ModelListEditor).values())
             elif field.kind is FieldKind.SELECT_MULTI:
@@ -390,7 +398,7 @@ class ConfigEditorView(Vertical):
     def _reload_from_disk(self) -> None:
         """Re-read the file and push values back into the widgets."""
         self._data = load_config(self._config_path)
-        for field in CONFIG_FIELDS:
+        for field in _RENDERED_FIELDS:
             value = current_value(field, self._data)
             if field.kind is FieldKind.MODEL_LIST:
                 self.query_one(f"#mle-root-{field.key}", ModelListEditor).set_values([str(item) for item in value])
@@ -427,13 +435,13 @@ class ConfigEditorView(Vertical):
         baseline = self._clean_state
         if current is None or baseline is None:
             # No reliable baseline to diff against: coerce every field rather than risk dropping edits.
-            changed_keys = {field.key for field in CONFIG_FIELDS}
+            changed_keys = {field.key for field in _RENDERED_FIELDS}
         else:
             changed_keys = {key for key, value in current.items() if baseline.get(key) != value}
 
         errors: list[tuple[ConfigField, str]] = []
         coerced: list[tuple[ConfigField, object]] = []
-        for field in CONFIG_FIELDS:
+        for field in _RENDERED_FIELDS:
             if field.key not in changed_keys:
                 continue
             try:

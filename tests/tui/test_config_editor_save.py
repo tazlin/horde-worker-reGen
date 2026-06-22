@@ -102,6 +102,37 @@ async def test_preexisting_invalid_value_does_not_block_unrelated_save(tmp_path:
 
 
 @pytest.mark.e2e
+async def test_save_succeeds_with_unrendered_dry_run_field_present(tmp_path: Path) -> None:
+    """A field whose section has no sub-tab (the hidden Dry-run flags) must not break save/reload.
+
+    These developer-only flags exist in ``CONFIG_FIELDS`` but are intentionally left out of
+    ``CONFIG_SUBTABS``, so they are never composed. The field-walking loops used to query the
+    uncomposed widget and raise ``NoMatches``, soft-locking Save/Reload entirely. Saving an
+    unrelated edit must now succeed and leave the YAML-only flag untouched.
+    """
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "n"\nmax_threads: 1\ndry_run_skip_inference: true\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        # The hidden flag has no widget to query.
+        assert not editor.query("#cfg-dry_run_skip_inference")
+        editor.query_one("#cfg-max_threads", Input).value = "4"
+        assert editor._save() is True
+        await pilot.pause()
+        # Reload also walks every field and must not trip over the uncomposed flag.
+        editor.reload_from_disk()
+        await pilot.pause()
+
+    reloaded = load_config(path)
+    assert reloaded["max_threads"] == 4
+    # The YAML-only developer flag is preserved verbatim, neither dropped nor coerced.
+    assert reloaded["dry_run_skip_inference"] is True
+
+
+@pytest.mark.e2e
 async def test_invalid_edit_reports_error_and_jumps_to_offending_tab(tmp_path: Path) -> None:
     """Editing a field to an invalid value blocks the save and surfaces it on that field's sub-tab."""
     app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "n"\n')
