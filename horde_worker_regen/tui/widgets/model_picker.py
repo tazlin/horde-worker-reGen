@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from rich.console import Group, RenderableType
 from rich.table import Table
 from rich.text import Text
-from textual import events
+from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -152,8 +152,7 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         """Lay out the filters, search, model table with a detail panel, and buttons."""
         with Vertical(id="picker-dialog"):
             yield Label(
-                "Click ＋ Mark to add a model (✕ Unmark to undo)  ·  click a row to see its full record  "
-                "·  click a header to sort",
+                "Click a row to mark/unmark it  ·  click a header to sort",
                 classes="dialog-title",
             )
             with Horizontal(id="picker-filters"):
@@ -484,11 +483,13 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
             self._sort_reverse = False
         self._apply_filters()
 
-    def on_click(self, event: events.Click) -> None:
-        """A single click on the leading marker cell adds/removes the model (other cells only inspect)."""
-        meta = event.style.meta
-        if meta.get("column") == _MARKER_COL and meta.get("row", -1) >= 0:
-            self._toggle(int(meta["row"]))
+    @on(events.Click, "#picker-table")
+    def _on_table_click(self, event: events.Click) -> None:
+        """Toggle the model under the cursor on any single click within the table."""
+        table = self.query_one("#picker-table", DataTable)
+        row = table.cursor_coordinate.row
+        if row >= 0:
+            self._toggle(row)
 
     def action_toggle_add(self) -> None:
         """Add/remove the highlighted model (keyboard)."""

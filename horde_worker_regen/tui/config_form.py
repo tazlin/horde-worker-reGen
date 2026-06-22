@@ -187,7 +187,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "horde_url",
         "Horde URL",
         FieldKind.STR,
-        "Connection",
+        "Other",
         "The horde API base URL. Leave default unless using a custom horde.",
         requires_restart=True,
     ),
