@@ -272,7 +272,7 @@ def run_level(level_json_path: Path, out_dir: Path, *, process_mode: str = "real
 
     logger.remove()
     logger.add(sys.stderr, level="INFO")
-    logger.add(log_path, level="DEBUG", enqueue=True)
+    logger.add(log_path, level="DEBUG", enqueue=True, rotation="25 MB", retention=10, compression="zip")
 
     _start_heartbeat_thread(heartbeat_path)
     _start_stall_watchdog_thread(stall_watchdog)

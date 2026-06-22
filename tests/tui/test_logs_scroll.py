@@ -53,7 +53,7 @@ async def test_logs_pause_autoscroll_when_scrolled_up_and_resume_on_jump(monkeyp
         # First batch arrives while pinned to the bottom: the view follows the tail. (Whether this batch
         # is drained by the manual call or the periodic interval, the at-bottom outcome is the same.)
         view._follower = _FakeFollower([_batch("line", 100)])  # type: ignore[assignment]
-        view._poll()
+        await view._poll()
         await settle()
         assert log.auto_scroll is True
         assert hint.display is False
@@ -67,7 +67,7 @@ async def test_logs_pause_autoscroll_when_scrolled_up_and_resume_on_jump(monkeyp
         # tallied and surfaced. The batch is drained exactly once (by whichever poll wins), so the count
         # is deterministic regardless of the periodic interval.
         view._follower = _FakeFollower([_batch("more", 50)])  # type: ignore[assignment]
-        view._poll()
+        await view._poll()
         await settle()
         assert log.auto_scroll is False
         assert view._unseen_below == 50

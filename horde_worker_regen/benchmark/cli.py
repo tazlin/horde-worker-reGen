@@ -548,7 +548,15 @@ def _setup_controller_file_logging(out_dir: Path) -> None:
     """
     with contextlib.suppress(Exception):
         out_dir.mkdir(parents=True, exist_ok=True)
-        logger.add(out_dir / "controller.log", level="DEBUG", backtrace=True, diagnose=True)
+        logger.add(
+            out_dir / "controller.log",
+            level="DEBUG",
+            rotation="25 MB",
+            retention=10,
+            compression="zip",
+            backtrace=True,
+            diagnose=True,
+        )
         logger.info(f"Benchmark controller log: {(out_dir / 'controller.log').resolve()}")
         logger.info(
             "Per-process worker (subprocess/grand-subprocess) logs are written by hordelib to "

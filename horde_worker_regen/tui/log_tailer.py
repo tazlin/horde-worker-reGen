@@ -11,8 +11,12 @@ import dataclasses
 import re
 from pathlib import Path
 
-_TAIL_BYTES = 64 * 1024
-"""How much of an existing file to show on first open (roughly the last few hundred lines)."""
+_TAIL_BYTES = 256 * 1024
+"""Hard ceiling on how many trailing bytes a single read may pull into memory.
+
+Applied to *every* read path (first open, rotation/truncation re-prime, and bursty catch-up), not
+just first open, so a multi-GB log can never be buffered whole and freeze/crash the TUI. It is an
+absolute byte cap, not a percentage of the file, so the bound holds regardless of file size."""
 
 _MAX_LINES_PER_POLL = 1000
 """Cap lines emitted per poll so a rotation or large catch-up can't flood the UI."""
@@ -143,18 +147,32 @@ class LogFollower:
             return self._read_from(start, drop_partial_first=start > 0)
 
         if signature != self._signature or stat.st_size < self._offset:
-            # Rotated or truncated; start over from the top of the new file.
+            # Rotated or truncated; re-prime the tail of the new file rather than reading it whole.
+            # A rotated-in file can already be large (or this can fire on a misdetected huge current
+            # file), so reading from offset 0 here was the one unbounded path that could OOM/freeze.
             self._signature = signature
-            return self._read_from(0, drop_partial_first=False)
+            start = max(0, stat.st_size - self._tail_bytes)
+            return self._read_from(start, drop_partial_first=start > 0)
 
         if stat.st_size == self._offset:
             return []
         return self._read_from(self._offset, drop_partial_first=False)
 
     def _read_from(self, offset: int, *, drop_partial_first: bool) -> list[str]:
-        """Read complete lines from ``offset``, holding back any trailing partial line."""
+        """Read complete lines from ``offset``, holding back any trailing partial line.
+
+        The read is clamped to the trailing ``_tail_bytes`` of the file: if ``offset`` lags EOF by
+        more than the cap (a stalled or bursty catch-up), it is advanced so a single poll can never
+        buffer more than the cap into memory. ``drop_partial_first`` is forced on when the clamp
+        moves the start forward, since the first line is then almost certainly mid-line.
+        """
         try:
             with self.path.open("rb") as handle:
+                handle.seek(0, 2)  # SEEK_END
+                size = handle.tell()
+                if size - offset > self._tail_bytes:
+                    offset = size - self._tail_bytes
+                    drop_partial_first = True
                 handle.seek(offset)
                 data = handle.read()
         except OSError:

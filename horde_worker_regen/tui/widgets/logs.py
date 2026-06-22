@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from pathlib import Path
 
@@ -108,6 +109,9 @@ class LogsView(Vertical):
         """Running per-level line counts for the detailed-view tally (the shape of the run)."""
         self._unseen_below = 0
         """Lines appended while the user was scrolled up; cleared when they return to the bottom."""
+        self._poll_in_flight = False
+        """Guards against overlapping off-loop reads: a slow read on a large file must not let the
+        0.5s interval stack a second concurrent read of the same follower."""
 
     def compose(self) -> ComposeResult:
         """Lay out the process/history/level/search controls and the log output."""
@@ -284,13 +288,23 @@ class LogsView(Vertical):
         if self._current_path is not None:
             self._switch_file(self._current_path)
 
-    def _poll(self) -> None:
-        """Append any new (filtered) lines and keep the file list current."""
+    async def _poll(self) -> None:
+        """Append any new (filtered) lines and keep the file list current.
+
+        The follower's file read can block on a large log, so it runs off the event loop; an
+        in-flight guard prevents the recurring interval from stacking overlapping reads, and lines
+        from a follower that was swapped out mid-read (a file switch) are discarded as stale.
+        """
         self._refresh(select_first=True)
-        if self._follower is None:
+        follower = self._follower
+        if follower is None or self._poll_in_flight:
             return
-        new_lines = self._follower.poll()
-        if not new_lines:
+        self._poll_in_flight = True
+        try:
+            new_lines = await asyncio.to_thread(follower.poll)
+        finally:
+            self._poll_in_flight = False
+        if not new_lines or follower is not self._follower:
             return
         log = self.query_one("#log-output", RichLog)
         # Follow the tail only while the user is already at the bottom. When they have scrolled up to

@@ -51,8 +51,12 @@ def setup_supervisor_file_logging(role: str, *, quiet_console: bool = False) -> 
         return logger.add(
             log_path,
             level="DEBUG",
-            rotation="1 day",
-            retention="2 days",
+            # Rotate on a 25MB size cap so a heavy run can't grow one file large enough to choke the
+            # Logs tab; zip rotated files and keep a bounded count so total disk use stays bounded
+            # regardless of churn. (loguru 0.7.x takes a single rotation condition, not a list.)
+            rotation="25 MB",
+            retention=20,
+            compression="zip",
             format=_PLAIN_FORMAT,
             backtrace=True,
             diagnose=True,
