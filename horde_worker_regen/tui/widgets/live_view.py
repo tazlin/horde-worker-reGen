@@ -12,6 +12,11 @@ from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
+from horde_worker_regen.process_management.process_temperature import (
+    ProcessTemperature,
+    classify_process_temperature,
+    temperature_phrase,
+)
 from horde_worker_regen.process_management.supervisor_channel import ProcessSnapshot, WorkerStateSnapshot
 from horde_worker_regen.tui.formatters import (
     STATE_LABELS,
@@ -20,6 +25,7 @@ from horde_worker_regen.tui.formatters import (
     job_id_text,
     label_state,
     shorten,
+    temperature_colour,
 )
 
 _BAR_WIDTH = 36
@@ -93,8 +99,10 @@ class LiveView(VerticalScroll):
             return
 
         stale = snapshot_age is not None and snapshot_age > _STALE_AFTER_SECONDS
+        pending_models = frozenset(entry.model for entry in snapshot.pending_jobs if entry.model)
         panels = [
-            self._render_process_panel(process, stale=stale, detailed=detailed) for process in snapshot.processes
+            self._render_process_panel(process, stale=stale, detailed=detailed, pending_models=pending_models)
+            for process in snapshot.processes
         ]
         if stale:
             banner = Text(
@@ -111,16 +119,28 @@ class LiveView(VerticalScroll):
         *,
         stale: bool = False,
         detailed: bool = False,
+        pending_models: frozenset[str] = frozenset(),
     ) -> RenderableType:
         """Render one process as a bordered panel with progress and resource detail."""
-        state_colour = "grey50" if stale else self._state_colour(process.last_process_state)
+        temperature = classify_process_temperature(
+            state=process.last_process_state,
+            loaded_model=process.loaded_horde_model_name,
+            pending_models=pending_models,
+        )
         heartbeat_age = time.time() - process.last_heartbeat_timestamp if process.last_heartbeat_timestamp else None
 
         body = Table.grid(padding=(0, 2))
         body.add_column(justify="right", style="bold cyan", no_wrap=True)
         body.add_column(ratio=1)
 
-        state_label = label_state(process.last_process_state)
+        # A temperature-led state row so a primed slot reads as primed, not idle (see the overview table).
+        if temperature == ProcessTemperature.DOWN:
+            state_label = label_state(process.last_process_state)
+            state_colour = "grey50" if stale else self._state_colour(process.last_process_state)
+        else:
+            phrase = temperature_phrase(temperature, process.last_process_state)
+            state_label = f"{temperature.value.title()} · {phrase}"
+            state_colour = "grey50" if stale else temperature_colour(temperature)
         body.add_row("State", Text(state_label, style=state_colour))
         body.add_row("Model", shorten(process.loaded_horde_model_name, 40))
         if process.loaded_horde_model_baseline:

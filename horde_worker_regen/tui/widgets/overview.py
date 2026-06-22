@@ -15,6 +15,11 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from horde_worker_regen.app_state import OverviewViewMode
+from horde_worker_regen.process_management.process_temperature import (
+    ProcessTemperature,
+    classify_process_temperature,
+    temperature_phrase,
+)
 from horde_worker_regen.process_management.supervisor_channel import (
     JobQueueEntry,
     ProcessSnapshot,
@@ -34,6 +39,7 @@ from horde_worker_regen.tui.formatters import (
     short_baseline,
     shorten,
     sparkline,
+    temperature_colour,
 )
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, summarize_skips
 from horde_worker_regen.tui.responsive import (
@@ -815,8 +821,9 @@ class OverviewView(VerticalScroll):
 
         now = time.time()
         residency = snapshot.whole_card_residency
+        pending_models = frozenset(entry.model for entry in snapshot.pending_jobs if entry.model)
         for process in snapshot.processes:
-            row = _ProcessRow(process=process, now=now, residency=residency)
+            row = _ProcessRow(process=process, now=now, residency=residency, pending_models=pending_models)
             table.add_row(*[spec.render(row) for spec in layout.columns])
 
         caption = self._residency_caption(residency)
@@ -830,16 +837,39 @@ class OverviewView(VerticalScroll):
 
     @staticmethod
     def _process_state_cell(row: _ProcessRow) -> Text:
-        """The State cell: the labelled state, marked with a ★ when this slot holds the whole-card model."""
+        """The State cell: a temperature-led label (``Hot · sampling``), ★ for the whole-card slot.
+
+        Folding the slot's temperature into the label is what makes a primed slot read as primed rather
+        than a uniform ``Idle``: ``Next`` (a queued job will use this resident model), ``Warm`` (resident,
+        nothing queued for it), ``Priming`` (loading), and ``Cold`` (empty) all render distinctly where the
+        raw state would otherwise be ``WAITING_FOR_JOB`` for the first three.
+        """
         process = row.process
-        cell = Text(
-            label_state(process.last_process_state),
-            style=OverviewView._state_style(process.last_process_state),
+        temperature = classify_process_temperature(
+            state=process.last_process_state,
+            loaded_model=process.loaded_horde_model_name,
+            pending_models=row.pending_models,
         )
+        if temperature == ProcessTemperature.DOWN:
+            # Terminal/failed slots keep their plain state label and colour; temperature framing would only
+            # obscure why the slot is gone.
+            state = process.last_process_state
+            cell = Text(label_state(state), style=OverviewView._state_style(state))
+        else:
+            phrase = temperature_phrase(temperature, process.last_process_state)
+            cell = Text(
+                f"{temperature.value.title()} · {phrase}",
+                style=OverviewView._temperature_style(temperature),
+            )
         residency = row.residency
         if residency.active and residency.model and process.loaded_horde_model_name == residency.model:
             cell.append(" ★", style="#f0beff")
         return cell
+
+    @staticmethod
+    def _temperature_style(temperature: ProcessTemperature) -> str:
+        """Map a process temperature to a display colour (hot=active green, cold=dim grey)."""
+        return temperature_colour(temperature)
 
     @staticmethod
     def _vram_cell(process: ProcessSnapshot) -> str:
@@ -1006,6 +1036,8 @@ class _ProcessRow:
     process: ProcessSnapshot
     now: float
     residency: WholeCardResidencyStatus
+    pending_models: frozenset[str] = frozenset()
+    """Models named by queued (not-yet-running) jobs, so a primed slot they target reads as 'next'."""
 
 
 def _heartbeat_age(row: _ProcessRow) -> float | None:
@@ -1017,7 +1049,7 @@ def _heartbeat_age(row: _ProcessRow) -> float | None:
 _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
     ColumnSpec("ID", DensityTier.ESSENTIAL, lambda r: str(r.process.process_id), justify="right", width=3),
     ColumnSpec("Type", DensityTier.ESSENTIAL, lambda r: r.process.process_type.title(), width=9),
-    ColumnSpec("State", DensityTier.ESSENTIAL, OverviewView._process_state_cell, width=12, no_wrap=True),
+    ColumnSpec("State", DensityTier.ESSENTIAL, OverviewView._process_state_cell, width=18, no_wrap=True),
     ColumnSpec("Job", DensityTier.ESSENTIAL, lambda r: job_id_text(r.process.current_job_id), width=8, no_wrap=True),
     ColumnSpec(
         "Progress",

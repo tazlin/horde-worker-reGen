@@ -6,6 +6,24 @@ from collections.abc import Sequence
 
 from rich.text import Text
 
+from horde_worker_regen.process_management.process_temperature import ProcessTemperature
+
+TEMPERATURE_COLOURS: dict[ProcessTemperature, str] = {
+    ProcessTemperature.HOT: "green",
+    ProcessTemperature.NEXT: "bright_yellow",
+    ProcessTemperature.WARM: "cyan",
+    ProcessTemperature.PRIMING: "deep_sky_blue1",
+    ProcessTemperature.COLD: "grey62",
+    ProcessTemperature.DOWN: "red",
+}
+"""Display colour per process temperature, shared by the overview table and the live-view panels."""
+
+
+def temperature_colour(temperature: ProcessTemperature) -> str:
+    """Return the display colour for a process temperature (active=green, cold=dim grey)."""
+    return TEMPERATURE_COLOURS.get(temperature, "yellow")
+
+
 _SPARK_TICKS = "▁▂▃▄▅▆▇█"
 """Eight-level block glyphs, low to high, for compact trend sparklines."""
 

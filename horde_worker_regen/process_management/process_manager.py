@@ -85,6 +85,7 @@ from horde_worker_regen.process_management.performance_model import (
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.process_temperature import classify_process_temperature
 from horde_worker_regen.process_management.recovery_supervisor import RecoveryAction, RecoverySupervisor
 from horde_worker_regen.process_management.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot, WorkerRunMetrics
@@ -1928,8 +1929,24 @@ class HordeWorkerProcessManager:
         inference = [p for p in self._process_map.values() if p.process_type == HordeProcessType.INFERENCE]
         safety = [p for p in self._process_map.values() if p.process_type == HordeProcessType.SAFETY]
 
-        summary_parts = [f"inf#{p.process_id}={p.last_process_state.name}" for p in inference]
-        summary_parts += [f"safety#{p.process_id}={p.last_process_state.name}" for p in safety]
+        # Lead each slot with its temperature so a primed slot reads as primed, not idle: a resident model a
+        # queued job will use (next) is distinct from a resident model nothing needs yet (warm) and from an
+        # empty slot (cold), though all three report WAITING_FOR_JOB. The raw state is kept after the colon so
+        # existing log greps on state names still match.
+        pending_models = frozenset(
+            job.model for job in self._job_tracker.jobs_pending_inference if job.model is not None
+        )
+
+        def _slot(prefix: str, process_info: HordeProcessInfo) -> str:
+            temperature = classify_process_temperature(
+                state=process_info.last_process_state.name,
+                loaded_model=process_info.loaded_horde_model_name,
+                pending_models=pending_models,
+            )
+            return f"{prefix}#{process_info.process_id}={temperature.value}:{process_info.last_process_state.name}"
+
+        summary_parts = [_slot("inf", p) for p in inference]
+        summary_parts += [_slot("safety", p) for p in safety]
         process_summary = " ".join(summary_parts)
 
         if self._state.shutting_down:
