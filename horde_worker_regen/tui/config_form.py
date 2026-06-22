@@ -123,7 +123,8 @@ CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Essentials", ("Connection", "Identity")),
     ("Models", ("Models", "Model downloads")),
     ("Performance", ("Throughput", "Memory & performance")),
-    ("Content", ("Content & safety", "Features")),
+    ("Content", ("Content & safety",)),
+    ("Features", ("Features",)),
     # LoRA and Alchemy are logically distinct concerns (one is an image-job feature, the other a separate
     # worker role), so each gets its own sub-tab rather than sharing a crowded combined page.
     ("LoRA", ("LoRA",)),
@@ -140,7 +141,7 @@ CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     ("Advanced", ("Other",)),
-    ("Developer", ("Dry-run",)),
+    # ("Developer", ("Dry-run",)),
 )
 
 SECTION_GUIDANCE: dict[str, str] = {
@@ -153,10 +154,16 @@ SECTION_GUIDANCE: dict[str, str] = {
     "LoRA": "Allowing LoRA downloads them on demand; set a civitai_api_token for resources that require it.",
     "Alchemist": "Alchemy is a separate worker role (interrogation / post-processing), distinct from LoRA. "
     "Enabling it serves alchemy jobs alongside (or instead of) image generation.",
-    "Timeouts": "All timeouts are in seconds. Raise first-step and contended timeouts if Flux or SDXL "
-    "jobs are being false-killed during their initial step or under co-residence load.",
-    "VRAM budget": "Controls how the scheduler gates preloads and dispatch against measured free VRAM. "
-    "Disabling the master switch (enable_vram_budget) restores availability-only behavior.",
+    "Timeouts": "ADVANCED - most users should leave every field on this tab at its default. "
+    "The defaults are tuned for the common case; wrong values here cause watchdog false-kills or "
+    "let genuinely hung jobs linger too long. Only adjust if you understand the specific symptom "
+    "you are addressing (e.g. Flux killed on its first step: raise inference_first_step_timeout). "
+    "All values are in seconds.",
+    "VRAM budget": "ADVANCED - most users should leave every field on this tab at its default. "
+    "These settings control how the scheduler prevents multi-process GPU over-commit (the cause of "
+    "out-of-memory crashes). Changing them incorrectly can cause OOM storms or permanently "
+    "suppress jobs the card could actually run. Only adjust if you have diagnosed a specific "
+    "budget-related problem in the logs.",
     "GPU sampling lease": "The lease serializes denoising loops so spare processes can stage their next pipeline "
     "in parallel. Counterproductive with unload_models_from_vram_often (no staged residency to overlap). "
     "Changes to these fields require a worker restart.",
@@ -868,20 +875,20 @@ CONFIG_FIELDS: list[ConfigField] = [
         unit="s",
         explicit_default=30,
     ),
-    ConfigField(
-        "capture_kudos_training_data",
-        "Capture kudos training data",
-        FieldKind.BOOL,
-        "Other",
-        "Opt in to telemetry capture for kudos model training.",
-    ),
-    ConfigField(
-        "kudos_training_data_file",
-        "Kudos training data file",
-        FieldKind.STR,
-        "Other",
-        "File path to write kudos training data (only used when capture is enabled).",
-    ),
+    # ConfigField(
+    #     "capture_kudos_training_data",
+    #     "Capture kudos training data",
+    #     FieldKind.BOOL,
+    #     "Other",
+    #     "Opt in to telemetry capture for kudos model training.",
+    # ),
+    # ConfigField(
+    #     "kudos_training_data_file",
+    #     "Kudos training data file",
+    #     FieldKind.STR,
+    #     "Other",
+    #     "File path to write kudos training data (only used when capture is enabled).",
+    # ),
     ConfigField(
         "cache_home", "Models folder", FieldKind.STR, "Other", "Where models are stored.", requires_restart=True
     ),
