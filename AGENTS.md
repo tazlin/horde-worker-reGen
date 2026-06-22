@@ -4,6 +4,23 @@ Guidance for Claude Code (claude.ai/code) when working in this repository. This 
 map; the [`docs/`](docs/index.md) tree is the source of truth for depth and is kept current. Prefer
 linking a reader to a doc page over duplicating it here.
 
+> [!IMPORTANT]
+> **Update the docs in the same change that alters behavior. This is not optional.**
+> Any substantial change -- a new module, a new config field, a changed scheduling/budget/recovery rule,
+> a new IPC message or protocol bump, a renamed entry point -- MUST land with the matching `docs/` edits in
+> the *same* commit/PR. Treat stale docs as a bug in the change, not a follow-up.
+> - **Narrative docs are hand-written and will silently rot** unless you edit them: the `explanation/`,
+>   `how-to/`, `tutorials/`, and `reference/` pages (e.g. `explanation/performance_and_backpressure.md`,
+>   `reference/codebase-map.md`, `reference/logs.md`). When you change a subsystem, find the page that
+>   describes it and bring it in line; do not assume a reviewer will.
+> - **API reference pages auto-generate** from docstrings via `docs/build_docs.py`. After adding or
+>   removing a module under `horde_worker_regen/`, run `uv run --no-sync python docs/build_docs.py` and
+>   commit the regenerated stub(s). The page content still comes from your docstrings, so write them.
+> - Follow [Diátaxis](docs/index.md): put facts in the right quadrant (tutorial / how-to / reference /
+>   explanation) and interlink rather than duplicate.
+> - When you cannot fully reconcile a doc in the same change, say so explicitly in the change description
+>   rather than leaving it silently stale.
+
 ## What this is and why it exists
 
 **Horde Worker reGen** is the local GPU worker for the [AI Horde](https://aihorde.net/): a free,
@@ -106,7 +123,8 @@ uv run pytest tests/process_management/
   `e2e`). `tests/test_chaos*` drive the fault-injection harness.
 - Most pipeline tests run **without a GPU or network** using dry-run mode (`CannedJobSource` +
   `fake_worker_processes`); see [Architecture → Dry-run mode](docs/explanation/architecture.md#dry-run-mode)
-  and `harness.py`.
+  and `harness.py`. The few tests that need a real accelerator are marked `@pytest.mark.gpu` and
+  **auto-skip** at collection time when no CUDA device is present, so CI and GPU-less dev boxes stay green.
 - `AI_HORDE_TESTING=1` is read at runtime to suppress side effects (e.g. action-ledger file mirroring)
   during tests/harness runs.
 - `prek` (not `pre-commit`) runs the hooks; the pinned `ruff`/`pyrefly` versions in
