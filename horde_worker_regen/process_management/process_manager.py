@@ -817,18 +817,20 @@ class HordeWorkerProcessManager:
                 horde_model_reference_manager = ModelReferenceManager.get_instance()
 
                 source = self._beta_aware_image_source(horde_model_reference_manager)
-                _sd_ref = horde_model_reference_manager.get_model_reference(
+                # query() keeps the per-category record type through the source-bearing overload (the
+                # image_generation overload returns an ImageGenerationQuery), so to_list() is typed as
+                # list[ImageGenerationModelRecord] with no cast, unlike get_model_reference + source.
+                records = horde_model_reference_manager.query(
                     MODEL_REFERENCE_CATEGORY.image_generation,
                     source=source,
-                )
-
-                if not isinstance(_sd_ref, dict):
-                    raise ValueError(
-                        "Expected dict[str, ImageGenerationModelRecord] for stable diffusion reference, got "
-                        + str(type(_sd_ref)),
+                ).to_list()
+                if not records:
+                    raise RuntimeError(
+                        "horde_model_reference returned no image_generation models; the reference may have "
+                        "failed to download; cannot continue with an empty reference.",
                     )
 
-                self.stable_diffusion_reference = _sd_ref
+                self.stable_diffusion_reference = {record.name: record for record in records}
             except Exception as e:
                 logger.error(e)
                 time.sleep(5)

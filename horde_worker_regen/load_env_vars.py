@@ -129,17 +129,17 @@ def load_env_vars_from_config() -> None:  # FIXME: there is a dynamic way to do 
         if config_value is True:
             os.environ["AIWORKER_LIMITED_CONSOLE_MESSAGES"] = "1"
 
-    _enable_beta_models(config)
+    apply_beta_model_env_defaults(config.get("api_key"))
 
 
-def _enable_beta_models(config: dict) -> None:
-    """Opt every worker into the image-generation beta (e.g. qwen) by default.
+def apply_beta_model_env_defaults(api_key: str | None = None) -> None:
+    """Opt every worker (and the TUI host, which reuses this) into the image-generation beta by default.
 
-    Beta models live in the model-reference PRIMARY's pending queue rather than the canonical
-    reference, so surfacing one (such as qwen) requires both hordelib's beta opt-in env vars and a
-    PRIMARY URL to read the pending queue from (see ``hordelib.beta_models``). Reading the pending
-    queue only needs a reader-level key, which any AI-Horde key satisfies, including the anonymous
-    ``"0000000000"``; we reuse the worker's own ``api_key`` when one is configured.
+    Beta models (e.g. qwen) live in the model-reference PRIMARY's pending queue rather than the
+    canonical reference, so surfacing one requires both hordelib's beta opt-in env vars and a PRIMARY
+    URL to read the pending queue from (see ``hordelib.beta_models``). Reading the pending queue only
+    needs a reader-level key, which any AI-Horde key satisfies, including the anonymous ``"0000000000"``;
+    callers pass the worker's own ``api_key`` when one is configured, otherwise the anonymous key is used.
 
     Every value is applied with ``setdefault`` so an operator who set any of these explicitly wins,
     including opting back out by exporting ``HORDELIB_BETA_MODEL_CATEGORIES=""`` (an empty value is
@@ -148,10 +148,13 @@ def _enable_beta_models(config: dict) -> None:
     The env-var names are mirrored as literals rather than imported from ``hordelib.beta_models``
     because this runs in the torch-free orchestrator before any subprocess spawns, and importing
     hordelib here would eagerly drag in torch.
+
+    Args:
+        api_key: A reader-level AI-Horde key for the pending-queue reads. Falls back to the anonymous key.
     """
     # Mirrors hordelib.beta_models.BETA_CATEGORIES_ENV_VAR / BETA_API_KEY_ENV_VAR.
     os.environ.setdefault("HORDELIB_BETA_MODEL_CATEGORIES", "image_generation")
-    os.environ.setdefault("HORDELIB_BETA_MODELS_API_KEY", config.get("api_key") or "0000000000")
+    os.environ.setdefault("HORDELIB_BETA_MODELS_API_KEY", api_key or "0000000000")
     os.environ.setdefault("HORDE_MODEL_REFERENCE_PRIMARY_API_URL", "https://models.aihorde.net/api")
 
 

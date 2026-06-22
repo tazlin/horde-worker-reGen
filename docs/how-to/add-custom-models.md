@@ -28,3 +28,19 @@ With the role:
 
 See [Bridge configuration](../explanation/bridge_config.md#custom-models) for how custom models flow
 into the pop request.
+
+## Beta models
+
+Some models are published to the model reference's "pending" (beta) queue before they are promoted
+into the canonical reference. The worker opts every install into the image-generation beta by
+default, so a beta checkpoint such as `Qwen-Image_fp8` is available to load and serve without any
+extra configuration. Reading the beta queue only needs a reader-level AI-Horde key, so the worker
+reuses your configured `api_key` (the anonymous `0000000000` works too).
+
+Being *available* is not the same as being *loaded*: as with any model, the worker only serves a
+beta model once its `name` is in your `models_to_load` list (a literal entry, or via an "all"/"top"
+selection that now includes it).
+
+To opt out, set the environment variable `HORDELIB_BETA_MODEL_CATEGORIES=""` before launching the
+worker. An empty value disables the beta opt-in; any value you set yourself also takes precedence
+over the worker's default.

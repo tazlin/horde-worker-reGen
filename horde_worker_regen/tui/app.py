@@ -43,6 +43,7 @@ from horde_worker_regen.tui.benchmark_launcher import (
     apply_suggested_to_config,
     record_suggested_as_known_good,
 )
+from horde_worker_regen.tui.beta_models import apply_beta_model_env
 from horde_worker_regen.tui.cache_home import apply_cache_home_env
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, build_offline_checks, derive
@@ -171,6 +172,10 @@ class HordeWorkerTUI(App[None]):
         # on-disk checks match the worker's configured cache_home instead of defaulting to ./models.
         with contextlib.suppress(Exception):
             apply_cache_home_env(self._config_path)
+        # Mirror the worker's default beta opt-in into this process before the catalog warms, so the model
+        # picker surfaces pending-queue (beta) models like qwen instead of the canonical-only set.
+        with contextlib.suppress(Exception):
+            apply_beta_model_env(self._config_path)
         self._maybe_check_for_updates()
         self._warm_model_catalog()
         if self._should_run_setup_wizard():
