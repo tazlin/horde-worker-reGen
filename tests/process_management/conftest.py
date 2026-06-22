@@ -175,6 +175,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.process_timeout = 120
     bd.inference_step_timeout = 60
     bd.inference_first_step_timeout = 120
+    bd.contended_step_timeout = 120
     bd.overbudget_step_timeout = 120
     bd.overbudget_exclusive_mode = True
     bd.whole_card_residency_safety_off_gpu = True

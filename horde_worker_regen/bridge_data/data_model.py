@@ -229,6 +229,19 @@ class reGenBridgeData(CombinedHordeBridgeData):
     steady-state step, so the pre-first-step window uses this generous timeout and only falls back to the
     tighter ``inference_step_timeout`` once sampling progress has been observed. The watchdog floors the
     effective first-step grace at ``inference_step_timeout``, so a value below it has no effect."""
+    contended_step_timeout: int = Field(default=120, ge=15, le=600)
+    """Per-step hang timeout (seconds) for a slot doing legitimate but heartbeat-silent heavy work.
+
+    The flat ``inference_step_timeout`` suits a light job on an uncontended device. On a multi-process
+    worker two healthy cases legitimately exceed it with no step heartbeat: a single sampling step
+    stretched by co-residence contention, and a feature phase that emits no sampling step for its
+    duration (the hires-fix second pass, VAE decode, post-processing setup, a ControlNet graph). Neither
+    is a hang. The watchdog widens the per-step grace up to this value (floored at
+    ``inference_step_timeout``) when there is positive evidence of such work: a non-step pipeline phase is
+    running, the slot has been graded contention-slowed, or the job's features (ControlNet, hires-fix,
+    batching, large resolution) make it heavy; otherwise the grace scales with the job's expected sampling
+    time. A genuinely wedged slot is still reaped once it has been continuously silent past this bound, so
+    raise it if heavy/contended jobs are still being false-killed and lower it for faster hang recovery."""
 
     max_inference_attempts: int = Field(default=2, ge=1, le=5)
     """How many times a single job may be dispatched to inference before it is reported faulted.
