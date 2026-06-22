@@ -370,8 +370,21 @@ class DownloadsView(VerticalScroll):
             ("ETA ", "grey50"),
             (eta, "grey70"),
         )
+        renderables: list[RenderableType] = [header, where, progress]
+        if (
+            downloads.rate_limit_kbps
+            and current.speed_bps is not None
+            and current.speed_bps > downloads.rate_limit_kbps * 1024
+        ):
+            renderables.append(
+                Text(
+                    "Speed shown above the set limit: the rolling average takes a moment to settle "
+                    "after the limit is applied.",
+                    style="grey50 italic",
+                )
+            )
         return Panel(
-            Group(header, where, progress),
+            Group(*renderables),
             title="Downloading now",
             title_align="left",
             border_style="green",

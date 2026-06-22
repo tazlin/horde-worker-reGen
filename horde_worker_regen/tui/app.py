@@ -19,8 +19,10 @@ from pathlib import Path
 from loguru import logger
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual.containers import Vertical
 from textual.css.query import NoMatches
-from textual.widgets import Footer, Header, Static, TabbedContent, TabPane
+from textual.screen import ModalScreen
+from textual.widgets import Button, Footer, Header, Static, TabbedContent, TabPane
 
 from horde_worker_regen import __version__
 from horde_worker_regen.app_state import (
@@ -63,6 +65,62 @@ from horde_worker_regen.tui.widgets.onboarding import (
 from horde_worker_regen.tui.widgets.overview import OverviewView
 from horde_worker_regen.tui.wizard import SetupWizardModal, WizardOutcome, is_setup_incomplete
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode, WorkerSupervisor
+
+
+class WebQuitWarningModal(ModalScreen[bool]):
+    """Warn the user that closing this browser tab leaves the worker running in the background."""
+
+    DEFAULT_CSS = """
+    WebQuitWarningModal {
+        align: center middle;
+    }
+    WebQuitWarningModal #web-quit-dialog {
+        width: 72;
+        height: auto;
+        padding: 1 2;
+        border: thick $warning;
+        background: $surface;
+    }
+    WebQuitWarningModal #web-quit-dialog Button {
+        width: 100%;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "stay", "Stay")]
+
+    def compose(self) -> ComposeResult:
+        """Lay out the warning text and the two choices."""
+        with Vertical(id="web-quit-dialog"):
+            yield Static(self._message(), id="web-quit-message")
+            yield Button("Close this dashboard (worker keeps running)", id="web-quit-close", variant="warning")
+            yield Button("Stay", id="web-quit-stay", variant="primary")
+
+    @staticmethod
+    def _message() -> Text:
+        return Text.assemble(
+            ("Worker stays running after you close this tab\n\n", "bold"),
+            (
+                "This dashboard is a browser view of a worker process running on your computer. "
+                "Closing this tab or pressing Ctrl+Q only closes the view - the worker keeps "
+                "contributing to the horde.\n\n"
+                "To stop the worker completely, right-click the AI Horde icon in the taskbar "
+                "notification area (the small icons in the bottom-right corner of your screen) "
+                "and choose 'Stop worker'.",
+                "grey70",
+            ),
+        )
+
+    def action_stay(self) -> None:
+        """Dismiss as False (do not quit) when Escape is pressed."""
+        self.dismiss(False)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Close the dashboard on confirm; stay on cancel."""
+        if event.button.id == "web-quit-close":
+            self.dismiss(True)
+        elif event.button.id == "web-quit-stay":
+            self.dismiss(False)
 
 
 class HordeWorkerTUI(App[None]):
@@ -703,7 +761,23 @@ class HordeWorkerTUI(App[None]):
         self.action_restart_worker()
 
     async def action_quit(self) -> None:
-        """Stop the worker (off the UI thread) and exit."""
+        """Stop the worker (off the UI thread) and exit.
+
+        When running as a browser session on Windows (attached to a worker host), the worker
+        survives this close. A warning modal explains this and offers the user a way back.
+        """
+        if sys.platform == "win32" and isinstance(self._supervisor, AttachedWorkerSupervisor):
+            self.push_screen(WebQuitWarningModal(), self._on_web_quit_choice)
+            return
+        self._do_quit()
+
+    def _on_web_quit_choice(self, confirmed: bool) -> None:
+        """Proceed with quitting only when the user confirmed the web-session close warning."""
+        if confirmed:
+            self._do_quit()
+
+    def _do_quit(self) -> None:
+        """Kick off the stop-and-exit worker (common path for both the direct and confirmed quit)."""
         self.notify("Stopping worker…")
         self.run_worker(self._stop_and_exit, thread=True, exclusive=True, group="lifecycle")
 
