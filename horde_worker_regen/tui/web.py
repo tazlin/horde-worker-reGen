@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import webbrowser
+from collections.abc import Callable
 
 from horde_worker_regen.tui import socket_protocol as sp
 
@@ -36,6 +37,17 @@ HOST_PORT_ENV_VAR = "HORDE_WORKER_HOST_PORT"
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _HOST_SHUTDOWN_TIMEOUT_SECONDS = 120.0
+
+_HOST_WATCH_CONNECT_TIMEOUT_SECONDS = 1.0
+"""Per-attempt connect timeout while the watcher waits for the host's socket to come up."""
+
+_HOST_WATCH_STARTUP_GRACE_SECONDS = 60.0
+"""How long the watcher keeps trying to reach the host before treating it as failed to start.
+
+The host binds its socket early in startup (before any worker/torch work), so a couple of seconds is the
+normal case; this is generous headroom for a loaded box. Exhausting it means the host never came up, which
+leaves nothing to serve, so the launcher winds down just as it would for a host that came up and then died.
+"""
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -209,6 +221,85 @@ def _shutdown_host(process: subprocess.Popen[bytes], address: tuple[str, int]) -
         process.terminate()
 
 
+def _await_host_socket(address: tuple[str, int], *, grace_seconds: float) -> socket.socket | None:
+    """Connect to the host, retrying until it is reachable or ``grace_seconds`` elapses (then None).
+
+    The launcher may have just spawned the host, which needs a moment to bind; the attached case
+    (a host already running) connects on the first try.
+    """
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        try:
+            return socket.create_connection(address, timeout=_HOST_WATCH_CONNECT_TIMEOUT_SECONDS)
+        except OSError:
+            time.sleep(0.5)
+    return None
+
+
+def _watch_host_liveness(
+    address: tuple[str, int],
+    on_host_gone: Callable[[], None],
+    *,
+    grace_seconds: float = _HOST_WATCH_STARTUP_GRACE_SECONDS,
+) -> None:
+    """Hold a connection to the host and call ``on_host_gone`` once it goes away (the launcher's leash).
+
+    The host outlives any one browser session and carries the tray whose "Stop worker && exit" ends the
+    host process directly, which the launcher's ``serve()`` (a separate process) cannot otherwise notice:
+    it would keep serving a dead host as an invisible orphaned console. Watching the host's own control
+    socket is the reliable, pid-reuse-immune way to learn it is gone, and it covers both the spawned and
+    the attached case. A clean socket close is the authoritative signal; an explicit ``host_shutdown``
+    frame, when present, just lets the caller log the host's exit with intent.
+    """
+    sock = _await_host_socket(address, grace_seconds=grace_seconds)
+    if sock is not None:
+        try:
+            with sock:
+                while True:
+                    message = sp.recv_frame(sock)
+                    if message is None:
+                        break  # the host closed the connection: it is gone
+                    if message.get("type") == sp.MSG_HOST_SHUTDOWN:
+                        break  # the host announced it is tearing down
+        except (OSError, ValueError):
+            pass
+    on_host_gone()
+
+
+def _terminate_session_subprocesses() -> None:
+    """Terminate the per-session TUI subprocesses this launcher spawned, so none orphan when it exits.
+
+    ``textual-serve`` runs a fresh TUI subprocess (a shell, on Windows) per browser session as a child of
+    this launcher. Exiting the launcher without reaping them would leave the exact kind of stray console
+    this whole mechanism exists to prevent.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return
+    with contextlib.suppress(Exception):
+        children = psutil.Process().children(recursive=True)
+        for child in children:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                child.terminate()
+        _gone, alive = psutil.wait_procs(children, timeout=5.0)
+        for child in alive:
+            with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                child.kill()
+
+
+def _wind_down_launcher() -> None:
+    """Close this launcher because its host is gone: reap session subprocesses, then exit immediately.
+
+    ``textual-serve``'s blocking ``serve()`` has no thread-safe stop, so once the host (which owns
+    everything of value) has exited there is nothing here worth a graceful unwind: reap the session
+    children and exit hard. ``os._exit`` is deliberate, mirroring the codebase's other force-stop paths.
+    """
+    print("Worker host has exited; closing the dashboard launcher.", file=sys.stderr)
+    _terminate_session_subprocesses()
+    os._exit(0)
+
+
 def _query_host_status(address: tuple[str, int], *, timeout: float = 2.0) -> dict[str, object] | None:
     """Connect to a worker host and return its first status frame, or None if none is reachable.
 
@@ -372,6 +463,16 @@ def main(argv: list[str] | None = None) -> None:
 
     if not args.no_browser:
         _schedule_dashboard_open(web_host, web_port, app_window=not args.browser)
+
+    # Follow the host to the grave: if it exits on its own (notably the tray's "Stop worker && exit"),
+    # this launcher must not linger as an orphaned console serving a dead host.
+    watcher = threading.Thread(
+        target=_watch_host_liveness,
+        args=(host_address, _wind_down_launcher),
+        name="host-liveness-watch",
+        daemon=True,
+    )
+    watcher.start()
 
     server = Server(_build_served_command(args, host_port), host=web_host, port=web_port, title="AI Horde Worker")
     try:

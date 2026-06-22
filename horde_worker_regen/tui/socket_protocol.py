@@ -41,6 +41,12 @@ MSG_SNAPSHOT = "snapshot"
 MSG_STATUS = "status"
 MSG_COMMAND = "command"
 MSG_LIFECYCLE = "lifecycle"
+MSG_HOST_SHUTDOWN = "host_shutdown"
+"""The host is tearing down (tray exit, a stop request, or a crash unwind).
+
+Broadcast to every client just before the host closes its sockets, so a watcher (notably the web launcher)
+learns the host is gone with intent rather than having to infer it from a bare socket EOF. The socket close
+that follows is the authoritative signal; this frame only carries the reason for a precise log line."""
 
 # Lifecycle actions a client may request of the host (process-level, distinct from worker commands).
 LIFECYCLE_START = "start"
@@ -134,6 +140,11 @@ def command_message(command: SupervisorControlMessage) -> dict[str, Any]:
 def lifecycle_message(action: str) -> dict[str, Any]:
     """Wrap a process-level lifecycle request (start/stop/restart the worker)."""
     return {"type": MSG_LIFECYCLE, "action": action}
+
+
+def host_shutdown_message(reason: str = "") -> dict[str, Any]:
+    """The host's farewell, sent to every client as it begins tearing down (see :data:`MSG_HOST_SHUTDOWN`)."""
+    return {"type": MSG_HOST_SHUTDOWN, "reason": reason}
 
 
 # endregion

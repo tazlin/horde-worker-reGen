@@ -283,14 +283,28 @@ class WorkerHost:
                 self._drop_client(client)
 
     def _shutdown(self) -> None:
-        """Stop accepting clients, remove the tray icon, stop the worker, and close all sockets."""
+        """Stop accepting clients, remove the tray icon, stop the worker, and close all sockets.
+
+        Each client is sent a farewell frame before its socket closes, so a watcher (the web launcher)
+        learns the host is going away with intent. This matters most on the tray "Stop worker && exit"
+        path: the host is a separate process from the launcher, so without this the launcher would keep
+        serving a dead host as an invisible orphaned console.
+        """
         self._stop.set()
         if self._tray is not None:
             self._tray.stop()
         with self._clients_lock:
             clients = list(self._clients)
             self._clients.clear()
+        farewell = sp.host_shutdown_message()
         for client in clients:
+            with contextlib.suppress(OSError):
+                sp.send_frame(client, farewell)
+                # Half-close first so the farewell is flushed and the peer reads it before EOF; a bare
+                # close can race into an RST that discards the still-buffered frame (a Windows hazard the
+                # reverse path documents too). The frame is best-effort regardless; the close is what the
+                # watcher ultimately acts on.
+                client.shutdown(socket.SHUT_WR)
             with contextlib.suppress(OSError):
                 client.close()
         if self._server_socket is not None:
