@@ -123,7 +123,9 @@ class WorkerTray:
                 pystray.Menu.SEPARATOR,
                 # "&&" renders a literal "&": a single "&" is a Windows menu mnemonic marker.
                 pystray.MenuItem("Open dashboard", self._handle_open, default=True),
-                pystray.MenuItem("Stop worker && exit", self._handle_stop),
+                pystray.MenuItem(
+                    "Exit Now (Stop the worker before you do this)", self._handle_stop
+                ),  # This instantly kills the process, which is not ideal
             )
             self._icon = pystray.Icon("horde-worker", _create_icon_image(), title=self._title, menu=menu)
             self._thread = threading.Thread(target=self._icon.run, name="worker-tray", daemon=True)
