@@ -19,14 +19,16 @@ from horde_worker_regen.app_state import (
 from horde_worker_regen.benchmark.enums import BenchTier, LevelOutcome
 from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
 from horde_worker_regen.benchmark.progress_channel import (
+    LevelPlanRow,
     LevelStarted,
     RampFinished,
+    RampPlanned,
     RampStarted,
     SuggestionDecisionRow,
 )
 from horde_worker_regen.benchmark.report import BenchmarkReport, LevelReport, MachineInfo, SuggestedBridgeData
 from horde_worker_regen.tui.benchmark_launcher import BenchmarkOptions, BenchmarkRunState, BenchmarkSupervisorStatus
-from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
+from horde_worker_regen.tui.widgets.benchmark import BenchmarkView, _Phase
 from horde_worker_regen.tui.widgets.benchmark_history import BenchmarkHistoryModal
 from horde_worker_regen.tui.widgets.onboarding import BenchmarkOnboardingModal
 
@@ -263,6 +265,84 @@ async def test_history_button_opens_modal(tmp_path: Path, monkeypatch: pytest.Mo
         await pilot.click("#benchmark-history")
         await pilot.pause()
         assert isinstance(app.screen, BenchmarkHistoryModal)
+
+
+def _plan_rows() -> list[LevelPlanRow]:
+    """A two-level plan: one that fits this machine and one skipped for insufficient VRAM."""
+    return [
+        LevelPlanRow(level_id="sd15-base", stage="baseline", tier="sd15", estimated_vram_mb=4096, will_run=True),
+        LevelPlanRow(
+            level_id="flux-base",
+            stage="baseline",
+            tier="flux",
+            estimated_vram_mb=16384,
+            will_run=False,
+            verdict="insufficient VRAM: estimated 16384 MB needed, 12000 MB available",
+        ),
+    ]
+
+
+async def test_setup_collapses_and_plan_folds_once_a_run_is_live(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Starting a run hides the setup chrome and folds the per-level plan so live progress leads."""
+    monkeypatch.chdir(tmp_path)
+    app = _BenchmarkHarness()
+    async with app.run_test() as pilot:
+        view = app.query_one(BenchmarkView)
+
+        # Idle setup: the launch pad is visible and the plan block is hidden (no plan yet).
+        view.update_view(BenchmarkRunState(), BenchmarkSupervisorStatus.IDLE)
+        await pilot.pause()
+        assert app.query_one("#benchmark-setup").display is True
+        assert app.query_one("#benchmark-plan-summary").display is False
+
+        running = BenchmarkRunState()
+        running.apply(RampStarted(run_id="r", num_levels=2))
+        running.apply(RampPlanned(run_id="r", rows=_plan_rows()))
+        running.apply(LevelStarted(level_id="sd15-base", num_levels=2))
+        view.update_view(running, BenchmarkSupervisorStatus.RUNNING)
+        await pilot.pause()
+
+        # Setup is demoted, the plan summary stays visible, and its per-level table folds away.
+        assert app.query_one("#benchmark-setup").display is False
+        assert app.query_one("#benchmark-plan-summary").display is True
+        assert app.query_one("#benchmark-plan-detail", Collapsible).collapsed is True
+
+
+async def test_plan_table_states_readiness_in_plain_language(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plan reads as readiness, not a command: ``Ready``/``Skip`` with a reason, never a bare ``RUN``."""
+    monkeypatch.chdir(tmp_path)
+    app = _BenchmarkHarness()
+    async with app.run_test():
+        view = app.query_one(BenchmarkView)
+        rows = _plan_rows()
+
+        summary = _render_to_text(view._plan_summary(rows))
+        assert "levels will run on this machine" in summary
+        assert "not enough VRAM" in summary  # the skip reason is condensed to plain words
+
+        table = _render_to_text(view._plan_table(rows))
+        assert "Ready" in table
+        assert "Skip" in table
+        assert "RUN" not in table  # the old command-like verdict cell is gone
+
+
+async def test_stepper_marks_the_current_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The phase spine names every step and marks earlier ones done once the screen reaches a later phase."""
+    monkeypatch.chdir(tmp_path)
+    app = _BenchmarkHarness()
+    async with app.run_test():
+        view = app.query_one(BenchmarkView)
+
+        setup = _render_to_text(view._render_stepper(_Phase.SETUP))
+        for step in ("Preview", "Download", "Run", "Apply"):
+            assert step in setup
+
+        # By the Run phase, the earlier Preview/Download steps read as completed (the check glyph).
+        running = _render_to_text(view._render_stepper(_Phase.RUNNING))
+        assert "✓ Preview" in running and "✓ Download" in running
 
 
 class _HistoryHarness(App[None]):

@@ -9,6 +9,7 @@ GPU-exclusive worker/benchmark hand-off.
 from __future__ import annotations
 
 import contextlib
+import enum
 import subprocess
 import typing
 
@@ -143,6 +144,65 @@ def _axis_switch_id(axis: BenchAxis) -> str:
     return f"benchmark-axis-{axis.value}"
 
 
+class _Phase(enum.Enum):
+    """The stage of the guided benchmark flow the screen is currently in.
+
+    The benchmark genuinely *is* an ordered task (look at the plan, optionally fetch models, run, apply
+    the result), so the view reshapes by phase rather than showing every control at once: setup leads
+    with the launch pad, a run leads with the live progress, and a finished run leads with the result.
+    """
+
+    SETUP = "setup"
+    PREVIEW = "preview"
+    RUNNING = "running"
+    RESULTS = "results"
+
+
+_STEP_NUMERALS = "①②③④"
+_STEP_NAMES = ("Preview", "Download", "Run", "Apply")
+_PHASE_ACTIVE_STEP: dict[_Phase, int] = {
+    _Phase.SETUP: 0,
+    _Phase.PREVIEW: 1,
+    _Phase.RUNNING: 2,
+    _Phase.RESULTS: 3,
+}
+"""Which step in the Preview -> Download -> Run -> Apply spine is "current" for each phase."""
+
+_TIER_LABELS: dict[str, str] = {
+    "sd15": "SD 1.5",
+    "sdxl": "SDXL",
+    "flux": "Flux",
+    "qwen": "Qwen",
+}
+"""Plain-language tier names for the plan table, so a novice reads "SD 1.5" rather than the raw "sd15"."""
+
+
+def _tier_label(tier: str) -> str:
+    """Render a raw tier id (``sd15``) as the name an operator recognises (``SD 1.5``)."""
+    return _TIER_LABELS.get(tier, tier.upper() if tier else "-")
+
+
+def _short_verdict(verdict: str) -> str:
+    """Condense a long skip-reason sentence into the few words a plan-table cell can show.
+
+    The controller's verdicts are full diagnostic sentences (e.g. "insufficient VRAM: estimated 16000 MB
+    needed, 12000 MB available"); the full text stays in the resource-detail table. Here we want the gist.
+    """
+    lowered = verdict.lower()
+    if "insufficient vram" in lowered:
+        return "not enough VRAM"
+    if "not present on disk" in lowered:
+        return "model not downloaded"
+    if "controlnet not installed" in lowered:
+        return "controlnet not installed"
+    if "civitai" in lowered:
+        return "needs CivitAI token"
+    if "--only-level" in lowered or "not selected" in lowered:
+        return "not selected"
+    # Fall back to the first clause, which is the human-readable summary before the numeric detail.
+    return verdict.split(":", 1)[0].strip() or "will not run here"
+
+
 class BenchmarkView(VerticalScroll):
     """Launch and monitor a benchmark ramp, then apply the recommended bridgeData."""
 
@@ -185,6 +245,14 @@ class BenchmarkView(VerticalScroll):
     BenchmarkView #benchmark-setup {
         height: auto;
     }
+    BenchmarkView #benchmark-stepper {
+        height: auto;
+        padding: 0 1;
+    }
+    BenchmarkView #benchmark-plan-summary {
+        height: auto;
+        padding: 1 1 0 1;
+    }
     """
 
     class RunRequested(Message):
@@ -210,13 +278,20 @@ class BenchmarkView(VerticalScroll):
         self._worker_mode = worker_mode
         self._app_state_summary: Text = Text("Loading benchmark status…", style="grey70")
         self._has_known_good = False
+        self._plan_rows: list[LevelPlanRow] = []
+        """The most recent plan, from a Preview or a run's RampPlanned event; drives the plan panes."""
+        self._phase: _Phase = _Phase.SETUP
+        """Tracked so the auto-collapse of setup/plan only fires on a phase change, not every tick: the
+        operator stays free to expand or collapse a section by hand within a phase."""
 
     def compose(self) -> ComposeResult:
         """Lay out the guided steps, the primary controls, the collapsed advanced options, and the body.
 
-        The order encodes the recommended path top-to-bottom: read the steps, set the tiers, optionally
-        open Advanced, then act from the button bar (Preview plan leads, since it needs no GPU).
+        The order encodes the recommended path top-to-bottom: the phase spine orients you, the button bar
+        acts (Preview plan leads, since it needs no GPU), then the phase-specific content follows. The
+        setup chrome and the per-level plan auto-demote once a run starts so the live progress leads.
         """
+        yield Static(id="benchmark-stepper")
         with Horizontal(id="benchmark-actions"):
             yield Button("Preview plan", id="benchmark-preview", variant="primary")
             yield Button("Download models", id="benchmark-download", variant="default")
@@ -300,7 +375,18 @@ class BenchmarkView(VerticalScroll):
                     help_text="Write extra per-process detail to the run's console.log.",
                 )
             yield Static(self._app_state_summary, id="benchmark-status", classes="benchmark-body")
-        yield Static(id="benchmark-plan", classes="benchmark-body")
+        # The plan is a plain-language summary line that is always visible (so it stays glanceable while a
+        # run leads with the live progress), with the per-level table and the full resource breakdown each
+        # tucked behind a collapsible. update_view expands the table only in the Preview phase.
+        yield Static(id="benchmark-plan-summary")
+        with Collapsible(title="Plan: what runs on each level", collapsed=False, id="benchmark-plan-detail"):
+            yield Static(id="benchmark-plan-table")
+            with Collapsible(
+                title="Resource detail (VRAM, disk, network, key, controlnet)",
+                collapsed=True,
+                id="benchmark-plan-resource",
+            ):
+                yield Static(id="benchmark-plan-resource-table")
         yield Static(id="benchmark-body", classes="benchmark-body")
 
     @staticmethod
@@ -382,15 +468,85 @@ class BenchmarkView(VerticalScroll):
         ``mode`` follows the shared F6 density contract: thin collapses the setup chrome (guided steps,
         tier toggles, advanced options, persisted status) so only the action bar and the live run / result
         remain; normal and detailed keep the full launch pad (detailed never shows less than normal).
+
+        The layout is also phase-driven: once a run is live or finished, the setup chrome auto-demotes and
+        the per-level plan folds to its summary line, so the live progress (or the result) leads without
+        the operator having to switch density by hand.
         """
+        phase = self._current_phase(status, run_state)
+        phase_changed = phase is not self._phase
+        self._phase = phase
+
         with contextlib.suppress(NoMatches):
-            self.query_one("#benchmark-setup", Vertical).display = mode is not OverviewViewMode.THIN
+            self.query_one("#benchmark-stepper", Static).update(self._render_stepper(phase))
+
+        # Setup hides once a run leads (running/results) and always in thin density; it stays in view
+        # while setting up or previewing, where its controls are the point.
+        setup_visible = mode is not OverviewViewMode.THIN and phase in (_Phase.SETUP, _Phase.PREVIEW)
+        with contextlib.suppress(NoMatches):
+            self.query_one("#benchmark-setup", Vertical).display = setup_visible
+
         self._update_buttons(status, run_state)
-        self.query_one("#benchmark-body", Static).update(self._render_body(run_state, status, frame))
         # A run's RampPlanned event overrides any idle preview with the authoritative plan; an empty
         # plan (before RampPlanned) leaves a previously-previewed plan in place rather than clearing it.
         if run_state.plan_rows:
-            self.query_one("#benchmark-plan", Static).update(self._plan_panel(run_state.plan_rows))
+            self._plan_rows = run_state.plan_rows
+        self._refresh_plan_panes(phase, phase_changed=phase_changed)
+        self.query_one("#benchmark-body", Static).update(self._render_body(run_state, status, frame))
+
+    def _current_phase(self, status: BenchmarkSupervisorStatus, run_state: BenchmarkRunState) -> _Phase:
+        """Classify the screen's phase from the supervisor status and what the run has produced so far."""
+        if status in (BenchmarkSupervisorStatus.PREPARING, BenchmarkSupervisorStatus.RUNNING):
+            return _Phase.RUNNING
+        if status is BenchmarkSupervisorStatus.FINISHED and run_state.suggested_bridge_data_yaml:
+            return _Phase.RESULTS
+        if self._plan_rows or run_state.level_order:
+            return _Phase.PREVIEW
+        return _Phase.SETUP
+
+    def _refresh_plan_panes(self, phase: _Phase, *, phase_changed: bool) -> None:
+        """Show/update the plan summary line and its expandable detail from the latest plan rows.
+
+        The summary line stays visible whenever a plan exists; the per-level table auto-expands only in
+        the Preview phase (and only on a phase change, so a hand toggle within a phase is respected).
+        """
+        has_plan = bool(self._plan_rows)
+        with contextlib.suppress(NoMatches):
+            self.query_one("#benchmark-plan-summary", Static).display = has_plan
+            detail = self.query_one("#benchmark-plan-detail", Collapsible)
+            detail.display = has_plan
+            if not has_plan:
+                return
+            self.query_one("#benchmark-plan-summary", Static).update(self._plan_summary(self._plan_rows))
+            self.query_one("#benchmark-plan-table", Static).update(self._plan_table(self._plan_rows))
+            self.query_one("#benchmark-plan-resource-table", Static).update(self._plan_resource_table(self._plan_rows))
+            if phase_changed:
+                detail.collapsed = phase is not _Phase.PREVIEW
+
+    @staticmethod
+    def _render_stepper(phase: _Phase) -> Panel:
+        """The always-visible phase spine: Preview -> Download -> Run -> Apply, with the current step lit.
+
+        Done steps read green with a check, the current step is bold cyan, and later steps stay grey, so
+        an operator can see at a glance where they are in the flow and what comes next.
+        """
+        active = _PHASE_ACTIVE_STEP[phase]
+        parts: list[tuple[str, str]] = []
+        for index, name in enumerate(_STEP_NAMES):
+            if index < active:
+                parts.append((f"✓ {name}", "green"))
+            elif index == active:
+                parts.append((f"{_STEP_NUMERALS[index]} {name}", "bold cyan"))
+            else:
+                parts.append((f"{_STEP_NUMERALS[index]} {name}", "grey42"))
+            if index < len(_STEP_NAMES) - 1:
+                parts.append(("   →   ", "grey42"))
+        return Panel(
+            Text.assemble(*parts),
+            title="Benchmark · auto-tune this worker",
+            title_align="left",
+            border_style="cyan",
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Translate the action buttons into messages the app coordinates."""
@@ -469,14 +625,9 @@ class BenchmarkView(VerticalScroll):
         The plan starts no worker and never touches the GPU, so it is safe to run while idle without the
         worker/benchmark GPU hand-off the Run path needs.
         """
-        self.query_one("#benchmark-plan", Static).update(
-            Panel(
-                Text("Computing plan (detecting hardware; no worker is started)…", style="yellow"),
-                title="Resource plan",
-                title_align="left",
-                border_style="grey37",
-            ),
-        )
+        summary = self.query_one("#benchmark-plan-summary", Static)
+        summary.display = True
+        summary.update(Text("Computing the plan (detecting your hardware; no worker is started)…", style="yellow"))
         options = self._collect_options()
         self.run_worker(
             lambda: self._compute_plan_preview(options),
@@ -510,19 +661,16 @@ class BenchmarkView(VerticalScroll):
         self.app.call_from_thread(self._render_plan_preview, rows)
 
     def _render_plan_preview(self, rows: list[LevelPlanRow]) -> None:
-        """(UI thread) render the previewed plan rows."""
-        self.query_one("#benchmark-plan", Static).update(self._plan_panel(rows))
+        """(UI thread) store and render the previewed plan rows, expanding the per-level table."""
+        self._plan_rows = rows
+        self._phase = _Phase.PREVIEW
+        self._refresh_plan_panes(_Phase.PREVIEW, phase_changed=True)
 
     def _render_plan_error(self, message: str) -> None:
-        """(UI thread) show why the plan preview could not be produced."""
-        self.query_one("#benchmark-plan", Static).update(
-            Panel(
-                Text(f"Plan preview failed: {message}", style="red"),
-                title="Resource plan",
-                title_align="left",
-                border_style="red",
-            ),
-        )
+        """(UI thread) show why the plan preview could not be produced (any prior table stays in place)."""
+        summary = self.query_one("#benchmark-plan-summary", Static)
+        summary.display = True
+        summary.update(Text(f"Could not compute the plan: {message}", style="red"))
 
     @staticmethod
     def _plan_disk_cell(row: LevelPlanRow) -> str:
@@ -533,12 +681,92 @@ class BenchmarkView(VerticalScroll):
         return f"{row.free_disk_bytes / 1024**3:.0f} / {needed}"
 
     @staticmethod
-    def _plan_panel(rows: list[LevelPlanRow]) -> Panel:
-        """Render the per-level resource plan and predicted run/skip verdicts as a table.
+    def _plan_summary(rows: list[LevelPlanRow]) -> RenderableType:
+        """The plain-language headline above the plan: how many levels run, why any skip, what to fetch.
 
-        When any level still needs models, a plain-language banner sits above the table pointing at the
-        Download models button, so a novice sees the one concrete next step rather than a wall of verdicts.
+        This is the one line that stays visible while a run leads with its live progress, so it answers
+        "is this machine set up to run the benchmark?" without the operator opening the per-level table.
         """
+        total = len(rows)
+        will_run = sum(1 for row in rows if row.will_run)
+        skipped = total - will_run
+        headline = Text()
+        headline.append(f"{will_run} of {total} ", style="bold green")
+        headline.append("levels will run on this machine.", style="grey85")
+        if skipped:
+            reasons = sorted({_short_verdict(row.verdict) for row in rows if not row.will_run and row.verdict})
+            detail = "; ".join(reasons) if reasons else "they do not fit this machine"
+            headline.append(f"  {skipped} skipped: {detail}.", style="grey62")
+
+        lines: list[RenderableType] = [headline]
+        needs_models = any(row.num_models_missing for row in rows)
+        # Only nag when annotators are confirmed absent on disk (present is False); a static ROM size is
+        # not evidence they are missing. Unknown presence stays silent (the level pre-warms before timing).
+        needs_annotators = any(row.requires_controlnet and row.controlnet_annotators_present is False for row in rows)
+        if needs_models or needs_annotators:
+            what = "models" if needs_models and not needs_annotators else "models or controlnet annotators"
+            lines.append(
+                Text(
+                    f"⚠ Some levels need {what} you have not downloaded yet. Use “Download models” first so the "
+                    "timed run is not slowed by downloading mid-benchmark.",
+                    style="yellow",
+                ),
+            )
+        return Group(*lines) if len(lines) > 1 else lines[0]
+
+    @staticmethod
+    def _plan_table(rows: list[LevelPlanRow]) -> Table:
+        """The readable per-level plan: what each level tests, what it needs, and whether it is ready.
+
+        Deliberately four plain columns. The numeric resource breakdown (VRAM/disk/network) lives in the
+        separate resource-detail table for operators who want it, rather than crowding this view.
+        """
+        table = Table(expand=True)
+        table.add_column("Level")
+        table.add_column("Tests")
+        table.add_column("Needs")
+        table.add_column("Status")
+        for row in rows:
+            table.add_row(
+                row.level_id,
+                f"{_tier_label(row.tier)} · {row.stage.replace('_', ' ') if row.stage else 'base'}",
+                BenchmarkView._plan_needs_cell(row),
+                BenchmarkView._plan_status_cell(row),
+            )
+        return table
+
+    @staticmethod
+    def _plan_needs_cell(row: LevelPlanRow) -> str:
+        """A compact, words-and-numbers summary of what a level requires (VRAM, any download, key, etc.)."""
+        bits: list[str] = []
+        if row.estimated_vram_mb is not None:
+            bits.append(f"{row.estimated_vram_mb / 1024:.0f} GB VRAM")
+        if row.download_bytes_needed:
+            bits.append(f"↓{row.download_bytes_needed / 1024**3:.0f} GB")
+        elif row.num_models_missing:
+            bits.append("↓ download")
+        if row.requires_civitai_key:
+            bits.append("CivitAI key")
+        if row.requires_controlnet:
+            bits.append("controlnet")
+        return ", ".join(bits) or "-"
+
+    @staticmethod
+    def _plan_status_cell(row: LevelPlanRow) -> Text:
+        """The readiness verdict in plain language: ``✓ Ready`` to run, or ``⊘ Skip`` with the gist.
+
+        A skip is a prediction, not a failure, so it reads grey (yellow only when the remedy is a
+        download the operator can act on). The full diagnostic sentence stays in the resource detail.
+        """
+        if row.will_run:
+            return Text("✓ Ready", style="green")
+        reason = _short_verdict(row.verdict)
+        style = "yellow" if "download" in reason else "grey50"
+        return Text(f"⊘ Skip · {reason}", style=style)
+
+    @staticmethod
+    def _plan_resource_table(rows: list[LevelPlanRow]) -> Table:
+        """The full numeric resource breakdown, surfaced behind the collapsed Resource detail section."""
         table = Table(expand=True)
         table.add_column("Level")
         table.add_column("Stage/Tier")
@@ -550,7 +778,7 @@ class BenchmarkView(VerticalScroll):
         table.add_column("Verdict")
         for row in rows:
             vram = "-" if row.estimated_vram_mb is None else f"{row.estimated_vram_mb / 1024:.1f}G"
-            verdict = Text("RUN", style="green") if row.will_run else Text(f"SKIP ({row.verdict})", style="grey50")
+            verdict = Text("ready", style="green") if row.will_run else Text(row.verdict or "skip", style="grey50")
             table.add_row(
                 row.level_id,
                 f"{row.stage}/{row.tier}",
@@ -561,22 +789,7 @@ class BenchmarkView(VerticalScroll):
                 BenchmarkView._plan_controlnet_cell(row),
                 verdict,
             )
-
-        body: RenderableType = table
-        needs_models = any(row.num_models_missing for row in rows)
-        # Only nag when annotators are confirmed absent on disk (present is False); a static ROM size is
-        # not evidence they are missing. Unknown presence stays silent (the level pre-warms before timing).
-        needs_annotators = any(row.requires_controlnet and row.controlnet_annotators_present is False for row in rows)
-        if needs_models or needs_annotators:
-            what = "models" if needs_models and not needs_annotators else "models or controlnet annotators"
-            banner = Text(
-                f"Some of these levels need {what} you have not downloaded yet. Press “Download models” "
-                "below to fetch them first: otherwise the benchmark will download them mid-run, which makes the "
-                "timing slower and less accurate.",
-                style="yellow",
-            )
-            body = Group(banner, Text(""), table)
-        return Panel(body, title="Resource plan", title_align="left", border_style="grey37")
+        return table
 
     @staticmethod
     def _plan_controlnet_cell(row: LevelPlanRow) -> Text:
@@ -659,14 +872,18 @@ class BenchmarkView(VerticalScroll):
         if not run_state.level_order and run_state.startup_phase:
             return self._render_starting(run_state, status, frame)
 
-        sections: list[RenderableType] = [self._render_headline(run_state, status, frame)]
+        # A finished run leads with the recommendation (the operator's next action is to apply it); the
+        # run identity and per-level detail follow as supporting context.
+        finished_with_suggestion = run_state.finished and bool(run_state.suggested_bridge_data_yaml)
+        sections: list[RenderableType] = []
+        if finished_with_suggestion:
+            sections.append(self._render_suggestion(run_state))
+        sections.append(self._render_headline(run_state, status, frame))
         current = run_state.current_level_id
         if current is not None and current in run_state.levels:
             sections.append(self._render_current_level(run_state.levels[current], frame))
         if run_state.level_order:
             sections.append(self._render_level_table(run_state))
-        if run_state.finished and run_state.suggested_bridge_data_yaml:
-            sections.append(self._render_suggestion(run_state))
         return Group(*sections)
 
     @staticmethod
