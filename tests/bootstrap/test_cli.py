@@ -101,6 +101,35 @@ def test_launch_syncs_when_no_venv(env: tuple[Path, list]) -> None:
     assert calls == [("sync", "cu126"), ("run", ["horde-worker"])]
 
 
+def test_launch_resyncs_when_lock_changed(env: tuple[Path, list]) -> None:
+    """An in-place update overlays a new uv.lock but keeps the venv; launch must re-sync to match it."""
+    root, calls = env
+    _make_venv(root)
+    (root / "uv.lock").write_text("lock-after-update", encoding="utf-8")
+    # No stamp recorded for this lock -> the venv is stale -> re-sync before running, then record the lock.
+    assert cli.main(["launch", "terminal"]) == 0
+    assert calls == [("sync", "cu126"), ("run", ["horde-worker"])]
+    assert (root / ".venv" / ".horde-sync-stamp").read_text(encoding="utf-8").strip() == cli._lock_fingerprint(root)
+
+
+def test_launch_skips_sync_when_stamp_matches_lock(env: tuple[Path, list]) -> None:
+    """An unchanged install (stamp matches the current lock) starts immediately, without re-syncing."""
+    root, calls = env
+    _make_venv(root)
+    (root / "uv.lock").write_text("lock-current", encoding="utf-8")
+    (root / ".venv" / ".horde-sync-stamp").write_text(cli._lock_fingerprint(root), encoding="utf-8")
+    assert cli.main(["launch", "terminal"]) == 0
+    assert calls == [("run", ["horde-worker"])]
+
+
+def test_sync_writes_lock_stamp(env: tuple[Path, list]) -> None:
+    """A successful sync records the lock it installed so later launches can detect staleness."""
+    root, _ = env
+    (root / "uv.lock").write_text("lock-v1", encoding="utf-8")
+    assert cli.main(["sync"]) == 0
+    assert (root / ".venv" / ".horde-sync-stamp").read_text(encoding="utf-8").strip() == cli._lock_fingerprint(root)
+
+
 def test_preload_runs_download(env: tuple[Path, list]) -> None:
     """`preload` runs the model downloader."""
     root, calls = env

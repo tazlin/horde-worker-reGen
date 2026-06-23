@@ -113,6 +113,22 @@ def pyproject_path(root: Path | None = None) -> Path:
     return (root or install_root()) / "pyproject.toml"
 
 
+def lock_path(root: Path | None = None) -> Path:
+    """Return the bundled ``uv.lock`` path (the resolved versions a sync installs)."""
+    return (root or install_root()) / "uv.lock"
+
+
+def sync_stamp_file(root: Path | None = None) -> Path:
+    """Return the stamp recording the lockfile the venv was last synced against (``.venv/.horde-sync-stamp``).
+
+    It lives inside the venv so it is discarded whenever the venv is recreated, keeping the recorded
+    fingerprint and the actually-installed packages consistent. An in-place update overlays a new
+    ``uv.lock`` but preserves the venv, so comparing this stamp to the current lock is what tells a plain
+    launch the dependencies changed and a re-sync is due.
+    """
+    return venv_dir(root) / ".horde-sync-stamp"
+
+
 def template_config(root: Path | None = None) -> Path:
     """Return the bundled ``bridgeData_template.yaml`` path."""
     return (root or install_root()) / "bridgeData_template.yaml"

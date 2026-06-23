@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 from dataclasses import dataclass
@@ -265,6 +266,7 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -
         rc = rocm.sync_rocm(uv, root=root, hold=options.hold)
         if rc == 0:
             _maybe_prune(uv, root, options)
+            _write_sync_stamp(root)
         return rc
     try:
         backend_mod.validate_locked_extra(token, paths.pyproject_path(root))
@@ -277,12 +279,65 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -
     rc = _run_sync(uv, root, token, feature_extras, options)
     if rc == 0:
         _maybe_prune(uv, root, options)
+        _write_sync_stamp(root)
     return rc
 
 
+def _lock_fingerprint(root: Path) -> str:
+    """Return a content fingerprint of ``uv.lock``, or ``""`` when it cannot be read.
+
+    The lockfile pins every resolved version a sync installs, so its hash is what distinguishes an
+    install whose dependencies have moved (an in-place update overlaid a new lock) from one that has not.
+    """
+    try:
+        return hashlib.sha256(paths.lock_path(root).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _venv_matches_lock(root: Path) -> bool:
+    """Whether the venv's recorded sync stamp matches the current lockfile.
+
+    A missing lock cannot prove staleness, so it is treated as current (never forces a re-sync loop). A
+    missing stamp (an install predating this check, or one never synced through here) is treated as stale
+    so the venv is reconciled once.
+    """
+    fingerprint = _lock_fingerprint(root)
+    if fingerprint == "":
+        return True
+    try:
+        recorded = paths.sync_stamp_file(root).read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return recorded == fingerprint
+
+
+def _write_sync_stamp(root: Path) -> None:
+    """Record the current lock fingerprint after a successful sync (best-effort).
+
+    A missing stamp only costs one extra reconcile sync on the next launch, so any write failure is
+    swallowed rather than failing an otherwise-successful install.
+    """
+    fingerprint = _lock_fingerprint(root)
+    if fingerprint == "":
+        return
+    stamp = paths.sync_stamp_file(root)
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(fingerprint, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _ensure_synced(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -> int:
-    """Sync the venv only when it does not yet exist; existing installs start without re-syncing."""
-    if paths.venv_dir(root).exists():
+    """Sync the venv when it is missing or stale relative to ``uv.lock``.
+
+    An in-place update overlays a new lockfile but preserves the existing venv, so a plain launch must
+    notice the venv no longer matches the lock and re-sync; otherwise the worker code runs ahead of its
+    installed dependencies (the cause of the post-update crash-loop). An unchanged install matches its
+    stamp and starts immediately, with no re-resolve.
+    """
+    if paths.venv_dir(root).exists() and _venv_matches_lock(root):
         return 0
     return _sync(uv, root, cli_flag=cli_flag, options=options)
 

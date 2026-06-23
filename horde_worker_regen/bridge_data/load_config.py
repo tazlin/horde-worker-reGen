@@ -32,6 +32,10 @@ def _make_image_model_load_resolver(
     ``asyncio.run()``, so this is safe to call from inside the worker's running reload loop with no
     worker-thread workaround: a config *reload* used to need a throwaway thread only because the SDK
     constructor could not call ``asyncio.run()`` under a running loop, which injection sidesteps.
+
+    Injection requires ``horde_sdk`` new enough to accept the manager; that floor is enforced by the
+    dependency pin, not tolerated at runtime, so a skewed install fails loudly rather than silently
+    degrading to a network fetch.
     """
     return ImageModelLoadResolver(horde_model_reference_manager)
 
