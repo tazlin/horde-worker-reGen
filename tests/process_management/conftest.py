@@ -12,6 +12,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasP
 from pydantic import JsonValue
 
 from horde_worker_regen.process_management.api_sessions import ApiSessions
+from horde_worker_regen.process_management.card_runtime import CardRuntime
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.job_tracker import JobTracker
@@ -168,6 +169,11 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.unload_models_from_vram_often = False
     bd.gpu_sampling_lease_enabled = False
     bd.gpu_sampling_lease_slots = 1
+    # Multi-GPU config: default to the single-GPU shape (no per-card overrides, auto-detect all). An empty
+    # dict (not a Mock) is required so the effective-config resolver returns the base config unchanged.
+    bd.gpu_overrides = {}
+    bd.gpu_device_indices = None
+    bd.gpu_pop_balance_threshold = 0.5
     bd.cycle_process_on_model_change = False
     bd.very_fast_disk_mode = False
     bd.remove_maintenance_on_init = False
@@ -316,17 +322,56 @@ def make_test_system_resources(
     return SystemResources(total_ram_bytes=total_ram_bytes, device_map=device_map)
 
 
-def make_test_mp_primitives() -> MultiprocessingPrimitives:
-    """Create MultiprocessingPrimitives with mocks instead of real OS primitives."""
+def make_test_mp_primitives(device_indices: tuple[int, ...] = (0,)) -> MultiprocessingPrimitives:
+    """Create MultiprocessingPrimitives with mocks instead of real OS primitives.
+
+    The GPU-concurrency semaphores are per-card maps; the default single fake card (index 0) mirrors the
+    single-GPU test path. Pass more indices to exercise a multi-card layout.
+    """
     return MultiprocessingPrimitives(
         process_message_queue=Mock(),
-        inference_semaphore=Mock(),
+        inference_semaphores={index: Mock() for index in device_indices},
         disk_lock=Mock(),
         aux_model_lock=Mock(),
-        vae_decode_semaphore=Mock(),
-        gpu_sampling_lease=Mock(),
+        vae_decode_semaphores={index: Mock() for index in device_indices},
+        gpu_sampling_leases={index: Mock() for index in device_indices},
         download_bandwidth_semaphore=Mock(),
     )
+
+
+def make_test_card_runtimes(
+    *,
+    target_process_count: int = 2,
+    device_indices: tuple[int, ...] = (0,),
+    max_concurrent_inference: int = 1,
+    config: object | None = None,
+    kind: str = "cuda",
+    mask_kind: str | None = None,
+    total_vram_mb: float | None = 24576.0,
+) -> dict[int, CardRuntime]:
+    """Create a per-card runtime map with mock semaphores, for constructing a ProcessLifecycleManager.
+
+    Defaults to the single-GPU shape (one card, index 0, unmasked). ``target_process_count`` is summed into
+    the lifecycle's ``_max_inference_processes`` just as the real per-card plan is, so a test that wants N
+    total inference processes on one card sets it to N. ``mask_kind`` is None by default (the byte-identical
+    single-GPU path); set it to a backend kind to exercise the masked multi-GPU spawn path.
+    """
+    bridge_config = config if config is not None else make_mock_bridge_data()
+    return {
+        index: CardRuntime(
+            device_index=index,
+            kind=kind,
+            config=bridge_config,  # pyrefly: ignore - a mock stands in for reGenBridgeData in tests
+            total_vram_mb=total_vram_mb,
+            inference_semaphore=Mock(),
+            vae_decode_semaphore=Mock(),
+            gpu_sampling_lease=Mock(),
+            target_process_count=target_process_count,
+            max_concurrent_inference=max_concurrent_inference,
+            mask_kind=mask_kind,
+        )
+        for index in device_indices
+    }
 
 
 def make_testable_process_manager(
@@ -370,12 +415,13 @@ def make_mock_process_info(
     model_name: str | None = "stable_diffusion",
     state: HordeProcessState = HordeProcessState.WAITING_FOR_JOB,
     process_type: HordeProcessType = HordeProcessType.INFERENCE,
+    device_index: int = 0,
     safe_send_returns: bool = True,
 ) -> HordeProcessInfo:
     """Create a real HordeProcessInfo with a mocked mp_process and pipe_connection.
 
     Uses real HordeProcessInfo so Pydantic models that require it (e.g. NextJobAndProcess)
-    pass validation.
+    pass validation. ``device_index`` is the card the process is pinned to (0 on a single-GPU host).
     """
     mp_process = Mock()
     mp_process.is_alive.return_value = True
@@ -394,6 +440,7 @@ def make_mock_process_info(
         process_type=process_type,
         last_process_state=state,
         process_launch_identifier=0,
+        device_index=device_index,
     )
     proc.loaded_horde_model_name = model_name
     return proc

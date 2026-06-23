@@ -371,7 +371,7 @@ class TestWholeCardSiblingTeardown:
         assert admitted is False, "the whole-card head must defer until the device is cleared"
         assert job_tracker.is_admitted_exclusive(head_job) is True
         # Flux needs the whole card: teardown all the way down to one inference process.
-        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(1)
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(1, device_index=None)
         assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
 
     async def test_siblings_restored_after_whole_card_job_drains(
@@ -389,7 +389,7 @@ class TestWholeCardSiblingTeardown:
 
         scheduler._restore_siblings_after_whole_card()
 
-        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4)
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4, device_index=None)
         assert scheduler._sibling_teardown_for_model is None
 
     async def test_restore_held_while_torn_down_model_still_queued(
@@ -435,7 +435,7 @@ class TestWholeCardSiblingTeardown:
         # Cooldown elapsed -> restore concurrency.
         scheduler._whole_card_cooldown_until = time.time() - 1
         scheduler._restore_siblings_after_whole_card()
-        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4)
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(4, device_index=None)
         assert scheduler._sibling_teardown_for_model is None
 
     def test_forecast_stops_charging_safety_context_once_paused(self) -> None:

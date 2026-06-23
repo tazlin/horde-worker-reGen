@@ -53,6 +53,11 @@ class HordeProcessInfo:
     """
     process_type: HordeProcessType
     """The type of this process."""
+    device_index: int
+    """The stable index of the GPU this process is pinned to (0 on a single-GPU host).
+
+    Set at spawn so the scheduler can route a job to a process on an eligible card and aggregate
+    per-card VRAM/residency. Inference memory reports carry the same index, measured from the child."""
     capabilities: WorkerCapability
     """The kinds of work this process can be dispatched (job routing keys on this)."""
     last_process_state: HordeProcessState
@@ -171,6 +176,7 @@ class HordeProcessInfo:
         last_process_state: HordeProcessState,
         process_launch_identifier: int,
         capabilities: WorkerCapability | None = None,
+        device_index: int = 0,
     ) -> None:
         """Initialize a new HordeProcessInfo object.
 
@@ -184,12 +190,14 @@ class HordeProcessInfo:
                 specific process slots.
             capabilities (WorkerCapability | None, optional): The work kinds this process serves. \
                 Defaults to the process type's defaults.
+            device_index (int, optional): The stable index of the GPU this process is pinned to. Defaults to 0.
         """
         self.mp_process = mp_process
         self.pipe_connection = pipe_connection
         self.process_id = process_id
         self.os_pid = mp_process.pid
         self.process_type = process_type
+        self.device_index = device_index
         self.capabilities = capabilities if capabilities is not None else DEFAULT_CAPABILITIES[process_type]
         self.last_process_state = last_process_state
         self.last_process_state_started_at = time.time()

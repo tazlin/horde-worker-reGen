@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 from horde_worker_regen.consts import VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.action_ledger import ActionLedger, LedgerEventType
+from horde_worker_regen.process_management.card_runtime import CardRuntime
 from horde_worker_regen.process_management.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType, WorkerCapability
@@ -137,11 +138,9 @@ class ProcessLifecycleManager:
     _horde_model_map: HordeModelMap
     _job_tracker: JobTracker
     _process_message_queue: ProcessQueue
-    _inference_semaphore: Semaphore
+    _card_runtimes: dict[int, CardRuntime]
     _disk_lock: Lock_MultiProcessing
     _aux_model_lock: Lock_MultiProcessing
-    _vae_decode_semaphore: Semaphore
-    _gpu_sampling_lease: Semaphore
     _download_bandwidth_semaphore: Semaphore
     _gpu_sampling_lease_enabled: bool
     _runtime_config: RuntimeConfig
@@ -180,15 +179,12 @@ class ProcessLifecycleManager:
         horde_model_map: HordeModelMap,
         job_tracker: JobTracker,
         process_message_queue: ProcessQueue,
-        inference_semaphore: Semaphore,
+        card_runtimes: dict[int, CardRuntime],
         disk_lock: Lock_MultiProcessing,
         aux_model_lock: Lock_MultiProcessing,
-        vae_decode_semaphore: Semaphore,
-        gpu_sampling_lease: Semaphore,
         download_bandwidth_semaphore: Semaphore,
         gpu_sampling_lease_enabled: bool = False,
         runtime_config: RuntimeConfig,
-        max_inference_processes: int,
         max_safety_processes: int,
         amd_gpu: bool,
         directml: int | None,
@@ -215,15 +211,15 @@ class ProcessLifecycleManager:
         self._horde_model_map = horde_model_map
         self._job_tracker = job_tracker
         self._process_message_queue = process_message_queue
-        self._inference_semaphore = inference_semaphore
+        self._card_runtimes = card_runtimes
         self._disk_lock = disk_lock
         self._aux_model_lock = aux_model_lock
-        self._vae_decode_semaphore = vae_decode_semaphore
-        self._gpu_sampling_lease = gpu_sampling_lease
         self._download_bandwidth_semaphore = download_bandwidth_semaphore
         self._gpu_sampling_lease_enabled = gpu_sampling_lease_enabled
         self._runtime_config = runtime_config
-        self._max_inference_processes = max_inference_processes
+        # Total inference processes across all driven cards. Single-GPU = that one card's count, identical
+        # to the old global value.
+        self._max_inference_processes = sum(card.target_process_count for card in card_runtimes.values())
         self._max_safety_processes = max_safety_processes
         self._amd_gpu = amd_gpu
         self._directml = directml
@@ -413,6 +409,10 @@ class ProcessLifecycleManager:
             # the safety process must come up off-GPU so it does not re-take a CUDA context.
             cpu_only = (not bridge_data.safety_on_gpu) or self._safety_gpu_paused
 
+            # When the safety model runs on-GPU it lives on the first configured card; its mask_kind is None
+            # on a default single-GPU host (so no pin, byte-identical) and set on a masked multi-GPU host.
+            first_card = self._card_runtimes[min(self._card_runtimes)]
+
             process = self._new_process(
                 target=self._entry_points.safety_entry_point,
                 args=(
@@ -424,6 +424,8 @@ class ProcessLifecycleManager:
                     cpu_only,
                 ),
                 kwargs={
+                    "device_index": first_card.device_index,
+                    "accelerator_kind": first_card.mask_kind,
                     "amd_gpu": self._amd_gpu,
                     "directml": self._directml,
                     "dry_run_skip_safety": bridge_data.dry_run_skip_safety,
@@ -593,8 +595,27 @@ class ProcessLifecycleManager:
         self.end_download_process()
         self.start_download_process()
 
+    def _device_for_new_process(self) -> int:
+        """Pick the card a newly-spawned inference process should run on.
+
+        Fills each driven card up to its ``target_process_count`` (lowest index first), so the initial
+        spawn distributes processes across cards in proportion to their per-card config. When every card is
+        already at target (e.g. a runtime scale-up beyond the configured count) it falls back to the lowest
+        index. On a single-GPU host this is always that one card.
+        """
+        if not self._card_runtimes:
+            return 0
+        counts: dict[int, int] = {}
+        for process_info in self._process_map.values():
+            if process_info.process_type is HordeProcessType.INFERENCE:
+                counts[process_info.device_index] = counts.get(process_info.device_index, 0) + 1
+        for index in sorted(self._card_runtimes):
+            if counts.get(index, 0) < self._card_runtimes[index].target_process_count:
+                return index
+        return min(self._card_runtimes)
+
     def start_inference_processes(self) -> None:
-        """Start all the inference processes configured to be used."""
+        """Start all the inference processes configured to be used, across every driven card."""
         num_processes_to_start = self._max_inference_processes - self._process_map.num_inference_processes()
 
         if num_processes_to_start < 0:
@@ -606,22 +627,35 @@ class ProcessLifecycleManager:
 
         for i in range(num_processes_to_start):
             pid = len(self._process_map)
-            self._start_inference_process(pid)
+            self._start_inference_process(pid, device_index=self._device_for_new_process())
 
             logger.info(f"Started inference process (id: {pid})")
 
             if i == 0:
                 time.sleep(4)
 
-    def _start_inference_process(self, pid: int) -> HordeProcessInfo:
+    def _start_inference_process(self, pid: int, *, device_index: int = 0) -> HordeProcessInfo:
         """Starts an inference process.
 
         :param pid: process ID to assign to the process
+        :param device_index: stable index of the GPU this process is assigned to (0 on a single-GPU host)
         :return: The new HordeProcessInfo
         """
         bridge_data = self._runtime_config.bridge_data
-        logger.info(f"Starting inference process on PID {pid}")
+        # A card whose index is not in the plan (e.g. an unexpected device_index) falls back to the lowest
+        # configured card so a spawn never fails on a missing key; single-GPU always resolves to card 0.
+        card = self._card_runtimes.get(device_index) or self._card_runtimes[min(self._card_runtimes)]
+        logger.info(f"Starting inference process on PID {pid} (device {card.device_index})")
         vram_heavy_models = any(model in VRAM_HEAVY_MODELS for model in bridge_data.image_models_to_load)
+
+        # DirectML has no env-var device mask (unlike CUDA/ROCm/XPU); a process is pinned to a DirectML
+        # adapter only by its ``--directml=N`` comfy arg. When this worker drives several DirectML cards
+        # (mask_kind 'directml'), each process must target its own adapter index. The legacy explicit
+        # ``--directml=N`` flag stays authoritative as a single-device selection: when it is set
+        # (self._directml is not None) it is passed through unchanged for every process.
+        directml_index = self._directml
+        if card.mask_kind == "directml" and self._directml is None:
+            directml_index = card.device_index
 
         pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
         process = self._new_process(
@@ -630,19 +664,21 @@ class ProcessLifecycleManager:
                 pid,
                 self._process_message_queue,
                 child_pipe_connection,
-                self._inference_semaphore,
+                card.inference_semaphore,
                 self._disk_lock,
                 self._aux_model_lock,
-                self._vae_decode_semaphore,
+                card.vae_decode_semaphore,
                 self.num_processes_launched,
             ),
             kwargs={
+                "device_index": card.device_index,
+                "accelerator_kind": card.mask_kind,
                 "amd_gpu": self._amd_gpu,
-                "directml": self._directml,
+                "directml": directml_index,
                 "vram_heavy_models": vram_heavy_models,
                 "dry_run_skip_inference": bridge_data.dry_run_skip_inference,
                 "dry_run_inference_delay": bridge_data.dry_run_inference_delay,
-                "gpu_sampling_lease": self._gpu_sampling_lease if self._gpu_sampling_lease_enabled else None,
+                "gpu_sampling_lease": card.gpu_sampling_lease if self._gpu_sampling_lease_enabled else None,
             },
         )
         process.start()
@@ -653,6 +689,7 @@ class ProcessLifecycleManager:
             process_type=HordeProcessType.INFERENCE,
             last_process_state=HordeProcessState.PROCESS_STARTING,
             process_launch_identifier=self.num_processes_launched,
+            device_index=card.device_index,
         )
         self._process_map[pid] = process_info
         self._register_owned(process_info)
@@ -672,7 +709,7 @@ class ProcessLifecycleManager:
             pid += 1
         return pid
 
-    def scale_inference_processes(self, target_count: int) -> int:
+    def scale_inference_processes(self, target_count: int, *, device_index: int | None = None) -> int:
         """Grow or shrink the running inference processes toward ``target_count``.
 
         Growth spawns fresh processes (bounded by the launched-process ceiling). Shrink ends idle
@@ -681,19 +718,42 @@ class ProcessLifecycleManager:
         target in one call. Used by the benchmark to stage processes on demand and as a memory/VRAM
         pressure lever.
 
+        Args:
+            target_count: The desired inference-process count for the scoped pool.
+            device_index: When given, grow/shrink only that card's pool toward ``target_count`` -- new
+                processes spawn on that card and only idle processes on that card are stopped (the per-card
+                lever a whole-card residency uses to reduce one card's live contexts on a multi-GPU host).
+                When None, the worker-wide pool, bounded by the launched-process ceiling (the single-GPU /
+                benchmark behaviour, unchanged).
+
         Returns:
-            The number of inference processes after scaling.
+            The number of inference processes after scaling (scoped to ``device_index`` when given).
         """
-        target = max(0, min(target_count, self._max_inference_processes))
-        current = self._process_map.num_loaded_inference_processes()
+        if device_index is None:
+            ceiling = self._max_inference_processes
+            current = self._process_map.num_loaded_inference_processes()
+        else:
+            card = self._card_runtimes.get(device_index)
+            ceiling = card.target_process_count if card is not None else self._max_inference_processes
+            current = self._process_map.num_loaded_inference_processes(device_index=device_index)
+        target = max(0, min(target_count, ceiling))
 
         if target > current:
             for _ in range(target - current):
                 pid = self._allocate_inference_pid()
-                self._start_inference_process(pid)
+                new_process_device = device_index if device_index is not None else self._device_for_new_process()
+                self._start_inference_process(pid, device_index=new_process_device)
                 logger.info(f"Scaled up: started inference process {pid}")
         elif target < current:
             disallowed = self.get_processes_with_model_for_queued_job()
+            if device_index is not None:
+                # Confine the shrink to this card: every inference process on another card is off-limits, so
+                # only an idle process on the target card can be the victim.
+                disallowed = disallowed + [
+                    p.process_id
+                    for p in self._process_map.values()
+                    if p.process_type is HordeProcessType.INFERENCE and p.device_index != device_index
+                ]
             for _ in range(current - target):
                 victim = self._process_map._get_first_inference_process_to_kill(disallowed_processes=disallowed)
                 if victim is None:
@@ -703,7 +763,7 @@ class ProcessLifecycleManager:
                 self._process_map.retire_process(victim, "inference scale-down")
                 logger.info(f"Scaled down: stopped inference process {victim.process_id}")
 
-        return self._process_map.num_loaded_inference_processes()
+        return self._process_map.num_loaded_inference_processes(device_index=device_index)
 
     def end_inference_processes(
         self,
@@ -940,14 +1000,17 @@ class ProcessLifecycleManager:
         semaphores are BoundedSemaphores, a Lock is bound to one), so releasing one the child did not
         hold raises ValueError, which we swallow as a harmless no-op rather than inflating a limit.
         """
+        # Release the dead child's own card's GPU semaphores (single-GPU = the one card), plus the shared
+        # disk/aux locks. A child with an unknown device falls back to the lowest configured card.
+        card = self._card_runtimes.get(process_info.device_index) or self._card_runtimes[min(self._card_runtimes)]
         candidates: list[tuple[str, Semaphore | Lock_MultiProcessing]] = [
-            ("inference_semaphore", self._inference_semaphore),
+            ("inference_semaphore", card.inference_semaphore),
             ("disk_lock", self._disk_lock),
             ("aux_model_lock", self._aux_model_lock),
-            ("vae_decode_semaphore", self._vae_decode_semaphore),
+            ("vae_decode_semaphore", card.vae_decode_semaphore),
         ]
         if self._gpu_sampling_lease_enabled:
-            candidates.append(("gpu_sampling_lease", self._gpu_sampling_lease))
+            candidates.append(("gpu_sampling_lease", card.gpu_sampling_lease))
 
         released: list[str] = []
         for name, primitive in candidates:
@@ -1103,7 +1166,7 @@ class ProcessLifecycleManager:
 
         for slot_id in revived:
             if slot_id not in self._process_map:
-                self._start_inference_process(slot_id)
+                self._start_inference_process(slot_id, device_index=self._device_for_new_process())
 
         self._action_ledger.record(
             LedgerEventType.PROCESS_REPLACED,
@@ -1214,7 +1277,7 @@ class ProcessLifecycleManager:
                 },
             )
             self._end_inference_process(process_info)
-            self._start_inference_process(process_info.process_id)
+            self._start_inference_process(process_info.process_id, device_index=process_info.device_index)
             return
 
         failed_model = self._take_recent_load_failure_for_process(process_info.process_id)
@@ -1270,7 +1333,7 @@ class ProcessLifecycleManager:
             self._quarantine_inference_slot(process_info, quarantine_reason)
             return
 
-        self._start_inference_process(process_info.process_id)
+        self._start_inference_process(process_info.process_id, device_index=process_info.device_index)
 
     def get_processes_with_model_for_queued_job(self) -> list[int]:
         """Get the processes that have the model for any queued job."""

@@ -112,6 +112,7 @@ class HordeInferenceProcess(HordeProcess):
         disk_lock: Lock,
         process_launch_identifier: int,
         *,
+        device_index: int = 0,
         dry_run_skip_inference: bool = False,
         dry_run_inference_delay: float = 1.0,
         gpu_sampling_lease: Semaphore | None = None,
@@ -133,6 +134,7 @@ class HordeInferenceProcess(HordeProcess):
                 Defaults to 1.0.
             gpu_sampling_lease (Semaphore | None, optional): Shared lease registered with hordelib to \
                 serialize the GPU denoising loop across processes. None disables coordination. Defaults to None.
+            device_index (int, optional): The stable index of the GPU this process is pinned to. Defaults to 0.
         """
         super().__init__(
             process_id=process_id,
@@ -140,6 +142,7 @@ class HordeInferenceProcess(HordeProcess):
             pipe_connection=pipe_connection,
             disk_lock=disk_lock,
             process_launch_identifier=process_launch_identifier,
+            device_index=device_index,
         )
 
         self._aux_model_lock = aux_model_lock
@@ -566,8 +569,7 @@ class HordeInferenceProcess(HordeProcess):
                     # rather than mistaking a deterministically-unloadable model for a sick slot and churning
                     # the pool. The control-message handler logs and ends the process when this re-raises.
                     logger.error(
-                        f"Failed to preload model {horde_model_name}: "
-                        f"{type(preload_error).__name__} {preload_error}",
+                        f"Failed to preload model {horde_model_name}: {type(preload_error).__name__} {preload_error}",
                     )
                     self.on_horde_model_state_change(
                         process_state=HordeProcessState.PRELOADING_FAILED,

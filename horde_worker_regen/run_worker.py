@@ -27,6 +27,7 @@ def main(
     *,
     amd_gpu: bool = False,
     directml: int | None = None,
+    gpu_device_indices: list[int] | None = None,
     supervisor_connection: Connection | None = None,
 ) -> None:
     """Check for a valid config and start the driver ('main') process for the reGen worker."""
@@ -80,6 +81,16 @@ def main(
     if not bridge_data:
         logger.error("Failed to load bridge data. Exiting...")
         return
+
+    # A --gpu-device-indices CLI flag is a convenience opt-out that overrides the config's
+    # gpu_device_indices (e.g. pin a multi-GPU box to one card without editing bridgeData.yaml).
+    if gpu_device_indices is not None:
+        if bridge_data.gpu_device_indices is not None and bridge_data.gpu_device_indices != gpu_device_indices:
+            logger.warning(
+                "--gpu-device-indices overrides gpu_device_indices from the config "
+                f"({bridge_data.gpu_device_indices} -> {gpu_device_indices}).",
+            )
+        bridge_data.gpu_device_indices = gpu_device_indices
 
     bridge_data.load_env_vars()
 
@@ -158,6 +169,7 @@ class WorkerLaunchOptions:
     amd: bool = False
     worker_name: str | None = None
     directml: int | None = None
+    gpu_device_indices: list[int] | None = None
 
 
 def _redirect_streams_to_file(path: str) -> None:
@@ -363,6 +375,29 @@ def _prepare_runtime(options: WorkerLaunchOptions, *, supervised: bool = False) 
         _log_benchmark_hint()
 
 
+def _parse_device_indices(raw: str) -> list[int]:
+    """Parse a comma-separated ``--gpu-device-indices`` value (e.g. ``"0,2"``) into a list of ints.
+
+    Raises:
+        argparse.ArgumentTypeError: If any entry is not a non-negative integer.
+    """
+    indices: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError as parse_error:
+            raise argparse.ArgumentTypeError(
+                f"Invalid GPU device index '{part}': must be an integer."
+            ) from parse_error
+        if value < 0:
+            raise argparse.ArgumentTypeError(f"Invalid GPU device index '{value}': must be non-negative.")
+        indices.append(value)
+    return indices
+
+
 def init() -> None:
     """Initialise the worker from CLI args and run it (the headless entry point)."""
     # Create args for -v, allowing -vvv
@@ -396,6 +431,16 @@ def init() -> None:
         default=None,
         help="Enable directml and specify device to use.",
     )
+    parser.add_argument(
+        "--gpu-device-indices",
+        type=_parse_device_indices,
+        default=None,
+        metavar="INDICES",
+        help=(
+            "Comma-separated accelerator indices (stable PCI-bus order) this one worker should drive, e.g. "
+            "'0' or '0,2'. Overrides gpu_device_indices in the config. Omit to auto-detect and use all cards."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -406,6 +451,7 @@ def init() -> None:
         amd=args.amd,
         worker_name=args.worker_name,
         directml=args.directml,
+        gpu_device_indices=args.gpu_device_indices,
     )
 
     from horde_worker_regen.process_management.child_crash_capture import (
@@ -424,6 +470,7 @@ def init() -> None:
             options.load_config_from_env_vars,
             amd_gpu=options.amd,
             directml=options.directml,
+            gpu_device_indices=options.gpu_device_indices,
         )
     except Exception as worker_error:
         with contextlib.suppress(Exception):
@@ -454,6 +501,7 @@ def run_supervised(supervisor_connection: Connection, options: WorkerLaunchOptio
             options.load_config_from_env_vars,
             amd_gpu=options.amd,
             directml=options.directml,
+            gpu_device_indices=options.gpu_device_indices,
             supervisor_connection=supervisor_connection,
         )
     except Exception as worker_error:

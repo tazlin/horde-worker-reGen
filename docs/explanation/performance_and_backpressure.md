@@ -203,6 +203,14 @@ missing reference does not starve dispatch. The rules, scaled by tier:
 A blocked candidate is never dropped; it keeps its queue position and dispatches the moment the in-flight
 jobs progress past the headway threshold or finish.
 
+On a multi-GPU worker both this gate and the in-flight **count** cap (`_max_jobs_in_progress_allowed`) are
+scoped to the card the candidate would run on: each card is its own sampling and VRAM domain, so the count
+is taken against that card's own in-progress jobs and its own concurrency ceiling, and the headway check
+compares the candidate only against jobs already sampling on the same card. A heavy job on the big card
+therefore never holds back a job destined for an idle small card, and a one-thread small card never borrows
+the big card's headroom to admit a second concurrent job. A single-GPU worker has one card, so every
+comparison is worker-wide exactly as before.
+
 ### Idle-thread diversity scheduling
 
 When the head-of-queue job's process is busy sampling the head's own model, the naive choice is to wait,
@@ -272,6 +280,24 @@ Cold start (no VRAM telemetry yet) and a missing burden estimate both **admit**,
 so the budget never wedges a worker that has not yet reported memory. Set
 `enable_vram_budget: false` to restore the prior availability-only behavior (not
 recommended on a shared or consumer GPU).
+
+On a multi-GPU worker the whole admission decision is scoped to the card a preload
+would land on (the slot chosen for it). A device-pinned child reports only its own
+card's VRAM, so [`get_free_vram_mb`][horde_worker_regen.process_management.process_map.ProcessMap.get_free_vram_mb]
+and the total/live-context counts take a `device_index` and read just that card;
+the budget compares the job against *that card's* free VRAM plus its own committed
+reserve, eviction reclaims only that card's idle residents, and a whole-card
+exclusive residency claims (and later restores) one card's process pool
+independently of the others. A fresh preload also chooses *which* eligible card to
+load onto by the same sticky-then-least-loaded policy dispatch uses: a card already
+holding the model first (no duplicate load), then the eligible card running the
+fewest jobs. The single safety process is moved off-GPU only for a
+residency on the card it is pinned to (the lowest-index card). System RAM stays a
+single shared pool sized from the *total* process count across all cards. A
+single-GPU worker passes `device_index=None` throughout, so every reading is
+worker-wide exactly as before. (The per-context CUDA overhead the residency
+forecast assumes is a runtime/architecture constant and stays worker-wide; per-card
+overhead probing is a hordelib-side follow-up.)
 
 > The prediction is the conservative hordelib estimate, not a learned per-job
 > measurement. The only measurement the worker has (per-process VRAM high-water)
@@ -395,6 +421,29 @@ The floor is enforced in two places, split across the processes that can act on 
 This division means a tight-but-recoverable disk quietly trims the cache and keeps serving LoRAs,
 while a genuinely full disk stops the worker accepting LoRA jobs it could not fulfil, instead of
 crashing on a failed write.
+
+## Multi-GPU pop shaping
+
+A worker driving several cards presents one identity and pops one job stream, so per-card capability
+differences become pop-side shaping. By default the pop advertises the **union** of every card's
+capabilities (every model any card serves, a feature/NSFW flag if any card allows it, the largest
+`max_power`, the summed thread count;
+[`advertised_capabilities`][horde_worker_regen.process_management.gpu_pop_shaping.advertised_capabilities]),
+so the horde returns work at least one card can run; the worker then routes each returned job to an
+eligible card (the same
+[`eligible_card_indices_for`][horde_worker_regen.process_management.gpu_eligibility.eligible_card_indices_for]
+that preload, dispatch, and placement share) and never dispatches a job to a card that cannot serve it.
+
+When the local queue becomes lopsided -- a card cannot serve at least `gpu_pop_balance_threshold` (default
+0.5) of the held work -- the next pop is instead **scoped** to that under-fed card's capabilities
+([`under_fed_card`][horde_worker_regen.process_management.gpu_pop_shaping.under_fed_card]), so the horde
+returns work the starved card can actually run rather than more for the already-fed cards.
+
+The "locally unservable" breaker (above) is likewise **per card**: a model's over-budget fault streak is
+keyed to the card it faulted on, so a model the small card cannot run is still advertised and dispatched to a
+larger one, and the popper holds a model back only when *every* card that serves it has flagged it
+unservable. A single-GPU worker has one card, so the union is that card's config, no pop is ever targeted,
+and the streak is worker-wide -- identical to before.
 
 ## See also
 

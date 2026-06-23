@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import IntEnum
 
 import psutil
@@ -14,6 +15,8 @@ from loguru import logger
 
 from horde_worker_regen.consts import KNOWN_SLOW_WORKFLOWS, VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management.action_ledger import LedgerEventType
+from horde_worker_regen.process_management.card_runtime import CardRuntime
+from horde_worker_regen.process_management.gpu_eligibility import eligible_card_indices_for
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.job_models import LineSkip, NextJobAndProcess
@@ -43,6 +46,7 @@ from horde_worker_regen.process_management.resource_budget import (
     forecast_weight_streaming,
     is_model_locally_unservable_for,
     predict_job_post_processing_vram_mb,
+    predict_job_weight_mb,
 )
 from horde_worker_regen.process_management.run_metrics import ChurnKind
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
@@ -173,6 +177,34 @@ Two SDXL jobs stacking their weight loads and activation peaks is the over-subsc
 a sampler into a watchdog teardown, so the running job must be most of the way done first."""
 
 
+@dataclass
+class _WholeCardResidency:
+    """Mutable whole-card exclusive-residency state for one card (the worker, on a single-GPU host).
+
+    A heavy model can claim a whole card to itself by stopping that card's idle sibling inference contexts
+    (a context's VRAM is only reclaimed when its process exits) and -- on the card the safety process sits
+    on -- moving safety off-GPU. The scheduler keys one of these per device index so two heavy models on
+    different cards each hold their own residency independently. A single-GPU worker keeps exactly one
+    instance under the ``None`` key, so its behaviour is identical to the pre-multi-GPU scalar fields.
+    """
+
+    model: str | None = None
+    """The model holding (or being given) sole residency on this card; None when no residency is held."""
+    forecast: StreamForecast | None = None
+    """The streaming forecast that established this residency, cached for the status snapshot's hard numbers."""
+    established_at: float = 0.0
+    """When this residency was first established (stop siblings, cycle safety, load weights); 0.0 when none.
+
+    The establishment intentionally holds the queue, which the recovery supervisor must not mistake for a
+    structural wedge until the establish grace elapses."""
+    cooldown_until: float = 0.0
+    """Wall-clock time until which this residency is held even after its heavy job drains, so a burst of
+    heavy jobs reuses one residency instead of each churning a teardown/restore + safety cycle."""
+    restore_at: float = 0.0
+    """When this residency was last restored (siblings respawned, safety cycled back on-GPU); 0.0 when none.
+    The restore churn also briefly makes the queue unservable, so the wedge grace must cover it too."""
+
+
 class InferenceScheduler:
     """Owns model preloading, inference start, and model unloading logic."""
 
@@ -211,6 +243,7 @@ class InferenceScheduler:
         process_lifecycle: ProcessLifecycleManager,
         runtime_config: RuntimeConfig,
         model_metadata: ModelMetadata,
+        card_runtimes: dict[int, CardRuntime] | None = None,
         max_concurrent_inference_processes: int,
         max_inference_processes: int,
         lru: LRUCache,
@@ -232,6 +265,9 @@ class InferenceScheduler:
                 for launching, monitoring, and killing processes as needed.
             runtime_config (RuntimeConfig): Holds the current bridge configuration snapshot.
             model_metadata (ModelMetadata): Provides lookups against the stable-diffusion model reference.
+            card_runtimes (dict[int, CardRuntime] | None): The per-card runtime plan, keyed by stable device
+                index, used to route a job to a card that can serve it on a multi-GPU host. ``None`` or a
+                single entry means single-GPU: dispatch takes the original card-agnostic path unchanged.
             max_concurrent_inference_processes (int): The maximum number of inference processes to run at once.
             max_inference_processes (int): The maximum number of inference processes to have launched at once,
                 including those that are preloading or downloading models.
@@ -250,6 +286,9 @@ class InferenceScheduler:
         self._process_lifecycle = process_lifecycle
         self._runtime_config = runtime_config
         self._model_metadata = model_metadata
+        # Per-card runtime plan for multi-GPU routing. A single entry (or None) means single-GPU, where the
+        # dispatch path stays card-agnostic and byte-identical to before multi-GPU existed.
+        self._card_runtimes: dict[int, CardRuntime] = card_runtimes if card_runtimes is not None else {}
         # The constructor value is the provisioned ceiling; the *live* concurrent cap is read from
         # the runtime config (see the _max_concurrent_inference_processes property) so it can change
         # at runtime without resizing the inference semaphore.
@@ -309,25 +348,12 @@ class InferenceScheduler:
         # and routes every load into an evict-all admit. None until seen.
         self._measured_effective_idle_used_mb: float | None = None
         self._effective_idle_process_count: int = 0
-        # Set while a whole-card model is being given sole residency by stopping idle sibling processes to
-        # reclaim their CUDA contexts (a context is only freed by the process exiting). Holds the model name
-        # so the teardown is logged once and the process count is restored once the exclusive job drains.
-        self._sibling_teardown_for_model: str | None = None
-        # Whole-card residency cooldown: when a whole-card residency is established it is held until this
-        # wall-clock time even after the heavy job drains, so a burst of heavy jobs reuses one residency
-        # instead of each churning a teardown/restore + safety cycle. Refreshed on each whole-card admit.
-        self._whole_card_cooldown_until: float = 0.0
-        # When the current whole-card residency was first established. The establishment (stop siblings,
-        # cycle safety off-GPU, load ~11GB) intentionally holds the queue, which must not be mistaken for a
-        # structural wedge until this grace elapses. 0.0 when no residency is establishing.
-        self._whole_card_established_at: float = 0.0
-        # When a whole-card residency was last restored (siblings respawned, safety cycled back on-GPU).
-        # That churn also briefly makes the queue unservable, so the wedge grace must cover it too.
-        self._whole_card_restore_at: float = 0.0
-        # The streaming forecast that established the current whole-card residency, cached so the status
-        # snapshot can show the hard numbers (weights, reserve, free-if-alone) without re-running it.
-        # None when no residency is held.
-        self._whole_card_forecast: StreamForecast | None = None
+        # Whole-card exclusive-residency state, keyed by the device index a residency is held on. A heavy
+        # model claims a card by stopping that card's idle sibling contexts (and cycling safety off-GPU on the
+        # safety card); keying per card lets two heavy models on different cards each hold their own residency.
+        # A single-GPU worker uses exactly one entry under the None key, identical to the prior scalar fields.
+        # See _WholeCardResidency for the per-card fields and _residency_state for the accessor.
+        self._whole_card_residencies: dict[int | None, _WholeCardResidency] = {}
         # When a heavy head was last admitted best-effort off the whole-card path (the over-budget exclusive
         # branch, for a model that streams even alone). Its load equally holds the queue, so this bounds a
         # wedge grace that the whole-card establishment grace does not cover. 0.0 when none is loading.
@@ -507,15 +533,21 @@ class InferenceScheduler:
         self._ram_budget.set_reserve_mb(float(ram_reserve))
         return True
 
-    def _is_model_locally_unservable(self, model: str | None) -> bool:
-        """Return whether ``model`` is held back as locally unservable (the shared breaker policy).
+    def _is_model_locally_unservable(self, model: str | None, *, device_index: int | None = None) -> bool:
+        """Return whether ``model`` is held back as locally unservable on a card (the shared breaker policy).
 
         Delegates to :func:`is_model_locally_unservable_for` so the scheduler's best-effort-admit gate and
         the popper's model selection apply one identical policy: a model held back here is neither
         best-effort-admitted nor popped, so the worker stops force-admitting and dropping a model the
-        device genuinely cannot run.
+        device genuinely cannot run. ``device_index`` scopes the streak to the card the admit targets on a
+        multi-GPU host; None is the single-GPU / worker-wide reading.
         """
-        return is_model_locally_unservable_for(self._runtime_config.bridge_data, self._job_tracker, model)
+        return is_model_locally_unservable_for(
+            self._runtime_config.bridge_data,
+            self._job_tracker,
+            model,
+            device_index=device_index,
+        )
 
     def _log_overbudget_admit(self, job: ImageGenerateJobPopResponse) -> None:
         """Log a best-effort over-budget admit with the residency/measurement picture (live diagnostics).
@@ -646,7 +678,82 @@ class InferenceScheduler:
         enabled = self._runtime_config.bridge_data.whole_card_exclusive_residency
         return enabled is True
 
-    def _max_coresident_for_peak_mb(self, peak_mb: float, reserve_mb: float) -> int | None:
+    def _residency_state(self, device_index: int | None) -> _WholeCardResidency:
+        """Return the (lazily-created) whole-card residency state for ``device_index``.
+
+        ``None`` is the single-GPU / worker-wide key, so a single-GPU host keeps exactly one residency state
+        and behaves as the pre-multi-GPU scalar fields did.
+        """
+        state = self._whole_card_residencies.get(device_index)
+        if state is None:
+            state = _WholeCardResidency()
+            self._whole_card_residencies[device_index] = state
+        return state
+
+    def _held_residencies(self) -> list[tuple[int | None, _WholeCardResidency]]:
+        """Return ``(device_index, state)`` for every card currently holding a whole-card residency.
+
+        A residency is "held" while its model is set. Used by the per-cycle convergence/restore passes and the
+        supervisor-facing grace checks, which must consider every card's residency, not just one.
+        """
+        return [(index, state) for index, state in self._whole_card_residencies.items() if state.model is not None]
+
+    # The worker-wide (single-GPU) whole-card residency is the entry under the ``None`` key. These properties
+    # expose its fields under their historical scalar names so single-GPU callers and tests read/write the
+    # worker-wide residency exactly as before the per-card ``_whole_card_residencies`` map existed. The
+    # multi-GPU admission path keys residency by real device index and does not go through these.
+    @property
+    def _sibling_teardown_for_model(self) -> str | None:
+        """The model holding the worker-wide whole-card residency (the ``None``-keyed entry)."""
+        return self._residency_state(None).model
+
+    @_sibling_teardown_for_model.setter
+    def _sibling_teardown_for_model(self, value: str | None) -> None:
+        self._residency_state(None).model = value
+
+    @property
+    def _whole_card_forecast(self) -> StreamForecast | None:
+        """The forecast that established the worker-wide whole-card residency."""
+        return self._residency_state(None).forecast
+
+    @_whole_card_forecast.setter
+    def _whole_card_forecast(self, value: StreamForecast | None) -> None:
+        self._residency_state(None).forecast = value
+
+    @property
+    def _whole_card_established_at(self) -> float:
+        """When the worker-wide whole-card residency was established (0.0 when none)."""
+        return self._residency_state(None).established_at
+
+    @_whole_card_established_at.setter
+    def _whole_card_established_at(self, value: float) -> None:
+        self._residency_state(None).established_at = value
+
+    @property
+    def _whole_card_cooldown_until(self) -> float:
+        """Cooldown deadline of the worker-wide whole-card residency."""
+        return self._residency_state(None).cooldown_until
+
+    @_whole_card_cooldown_until.setter
+    def _whole_card_cooldown_until(self, value: float) -> None:
+        self._residency_state(None).cooldown_until = value
+
+    @property
+    def _whole_card_restore_at(self) -> float:
+        """When the worker-wide whole-card residency was last restored (0.0 when none)."""
+        return self._residency_state(None).restore_at
+
+    @_whole_card_restore_at.setter
+    def _whole_card_restore_at(self, value: float) -> None:
+        self._residency_state(None).restore_at = value
+
+    def _max_coresident_for_peak_mb(
+        self,
+        peak_mb: float,
+        reserve_mb: float,
+        *,
+        device_index: int | None = None,
+    ) -> int | None:
         """Largest live inference-process count that still fits ``peak_mb`` plus ``reserve_mb``.
 
         Sizes the context-reduction depth from the *same* conservative figure the VRAM verdict rejects on
@@ -657,8 +764,14 @@ class InferenceScheduler:
         depth from the verdict's own peak makes the structural remedy fire exactly when admission would
         otherwise reject and thrash. The loader's first context costs the full one-time overhead; each
         additional co-resident context costs only the marginal. Returns None when it cannot be sized.
+
+        Args:
+            peak_mb: The job's predicted peak VRAM (MB) that must fit alongside the live contexts.
+            reserve_mb: The transient-spike reserve (MB) required on top of the peak.
+            device_index: When given, size against that one card's total VRAM (the per-card context-reduction
+                depth on a multi-GPU host); when None, the worker-wide total.
         """
-        total_mb = self._process_map.get_reported_total_vram_mb()
+        total_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
         per_process = self._per_process_overhead_mb()
         if total_mb is None or per_process <= 0:
             return None
@@ -674,12 +787,22 @@ class InferenceScheduler:
         self,
         job: ImageGenerateJobPopResponse,
         baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        *,
+        device_index: int | None = None,
     ) -> StreamForecast:
         """Return the weight-streaming forecast for loading ``job``'s model given the device's measured state.
 
         Combines the measured free VRAM and total VRAM (from the children's reports), the configured reserve
         floor, and the per-process overhead so the scheduler can tell a model that only streams because of
         co-resident siblings (curable by exclusive residency) from one that streams even alone.
+
+        Args:
+            job: The job whose model load is being forecast.
+            baseline: The model's known image-generation baseline (or its string form), or None when unknown.
+            device_index: When given, forecast against that one card's measured free/total VRAM and its live
+                inference- and safety-context counts (the per-card forecast on a multi-GPU host); when None,
+                the worker-wide reading. The per-context overhead is a CUDA-runtime/arch constant and stays
+                worker-wide either way (per-card overhead probing is a hordelib-side follow-up).
         """
         configured_floor = self._runtime_config.bridge_data.vram_reserve_mb
         floor_mb = (
@@ -697,18 +820,19 @@ class InferenceScheduler:
         # against the reduced contexts and admits the model, instead of perpetually demanding more teardown
         # against a ceiling that is no longer running. Processes are staged up front (or once a model is on
         # disk), so by the time a job is scheduled the live count already reflects the real contention.
-        num_processes = self._process_map.num_loaded_inference_processes()
+        num_processes = self._process_map.num_loaded_inference_processes(device_index=device_index)
         # The safety process holds its own CUDA context on the card when safety_on_gpu is set; that VRAM is
         # not reclaimable by stopping idle inference siblings, so the forecast must count it against the
         # achievable-free figures (sole residency for a heavy model then implies moving safety off-GPU too).
         # Count the safety context only when safety is *actually* on the GPU right now: once a whole-card
         # job has paused it off-GPU, its context is freed, so continuing to charge it would keep the
         # structural floor (free_after_model_evict) below the model's demand forever and the whole-card
-        # branch would defer the model every tick without ever loading it.
+        # branch would defer the model every tick without ever loading it. The safety process is pinned to a
+        # single card, so on a per-card forecast it is charged only against the card it actually sits on.
         safety_on_gpu = self._runtime_config.bridge_data.safety_on_gpu and (
             not self._process_lifecycle.is_safety_gpu_paused
         )
-        num_safety_contexts = self._process_map.num_safety_processes() if safety_on_gpu else 0
+        num_safety_contexts = self._process_map.num_safety_processes(device_index=device_index) if safety_on_gpu else 0
         # Refresh the clean all-contexts idle baseline (a no-op once startup has passed) so the marginal
         # per-context cost reflects measurement rather than the one-time-cost-times-N over-count.
         self._maybe_capture_idle_context_residency()
@@ -720,16 +844,29 @@ class InferenceScheduler:
         return forecast_weight_streaming(
             job,
             str(baseline) if baseline is not None else None,
-            free_now_mb=self._measured_free_vram_mb(),
-            total_vram_mb=self._process_map.get_reported_total_vram_mb(),
+            free_now_mb=self._measured_free_vram_mb(device_index=device_index),
+            total_vram_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
             per_process_overhead_mb=self._per_process_overhead_mb(),
             num_inference_processes=num_processes,
             configured_reserve_floor_mb=floor_mb,
             num_extra_resident_contexts=num_safety_contexts,
-            post_processing_reserve_mb=self._committed_vram_reserve_mb(),
+            post_processing_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
             marginal_process_overhead_mb=self._marginal_process_overhead_mb(),
             wants_whole_card=wants_whole_card,
         )
+
+    def _residency_should_pause_safety(self, device_index: int | None) -> bool:
+        """Whether a whole-card residency on this card should also move the single safety process off-GPU.
+
+        Requires safety configured-and-on-GPU (:meth:`_whole_card_safety_off_gpu_enabled`) and that this is
+        the card the one safety process is pinned to -- the lowest-index driven card. A residency on a
+        non-safety card never disturbs safety. The worker-wide key (``None``, single-GPU) always qualifies.
+        """
+        if not self._whole_card_safety_off_gpu_enabled():
+            return False
+        if device_index is None or not self._card_runtimes:
+            return True
+        return device_index == min(self._card_runtimes)
 
     def _establish_whole_card_residency(
         self,
@@ -738,6 +875,7 @@ class InferenceScheduler:
         *,
         announce: bool,
         target_override: int | None = None,
+        device_index: int | None = None,
     ) -> None:
         """Claim the device for a whole-card model: stop idle siblings and move safety off-GPU.
 
@@ -748,26 +886,30 @@ class InferenceScheduler:
         safety process off-GPU so its context is freed too. The model is remembered so the residency is held
         and then restored once its job drains (after the configured cooldown). Only idle inference processes
         are stopped; a busy sibling is left to finish its job.
+
+        ``device_index`` scopes the residency to one card on a multi-GPU host (only that card's processes are
+        reduced, and safety is paused only if it sits on that card); None is the single-GPU / worker-wide case.
         """
-        if announce or self._whole_card_established_at == 0.0:
+        state = self._residency_state(device_index)
+        if announce or state.established_at == 0.0:
             # Mark the establishment start (first admit of this heavy job, or a fresh residency) so the
             # recovery supervisor's grace window is measured from when the intentional hold began.
-            self._whole_card_established_at = time.time()
-        self._sibling_teardown_for_model = job.model
-        self._whole_card_forecast = forecast
-        self._whole_card_cooldown_until = time.time() + self._whole_card_cooldown_seconds()
+            state.established_at = time.time()
+        state.model = job.model
+        state.forecast = forecast
+        state.cooldown_until = time.time() + self._whole_card_cooldown_seconds()
 
         # ``target_override`` lets a caller size the depth from the admission verdict's rejected peak rather
         # than the forecast's lighter resident-weight estimate, for the activation-peak context over-commit the
         # weight-based gates leave co-resident.
         target = target_override if target_override is not None else (forecast.max_resident_processes() or 1)
-        current = self._process_map.num_loaded_inference_processes()
+        current = self._process_map.num_loaded_inference_processes(device_index=device_index)
         after = current
         if target < current:
-            after = self._process_lifecycle.scale_inference_processes(target)
+            after = self._process_lifecycle.scale_inference_processes(target, device_index=device_index)
 
         safety_paused = False
-        if self._whole_card_safety_off_gpu_enabled():
+        if self._residency_should_pause_safety(device_index):
             safety_paused = self._process_lifecycle.pause_safety_on_gpu()
 
         if announce or after < current or safety_paused:
@@ -788,6 +930,8 @@ class InferenceScheduler:
         baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
         forecast: StreamForecast,
         available_process: HordeProcessInfo,
+        *,
+        device_index: int | None = None,
     ) -> bool:
         """Whether a whole-card head should be pre-loaded into a spare's RAM while a live job holds the device.
 
@@ -804,8 +948,15 @@ class InferenceScheduler:
         - system RAM can hold the head's *weights* alongside the in-flight job -- the operator's "assuming the
           RAM can support it" (see :meth:`_prestage_weights_fit_ram`). A RAM shortfall falls back to the prior
           claim-the-card-and-wait behavior.
+
+        ``device_index`` scopes "a live job holds the device" to one card on a multi-GPU host (the card the
+        spare slot sits on); None is the single-GPU / worker-wide case.
         """
-        if len(self._job_tracker.jobs_in_progress) == 0:
+        if device_index is None:
+            live_jobs_on_device = len(self._job_tracker.jobs_in_progress)
+        else:
+            live_jobs_on_device = len(self._jobs_in_progress_on_card(device_index))
+        if live_jobs_on_device == 0:
             return False
         if self._is_model_forecast_to_load(job.model):
             return False
@@ -852,6 +1003,7 @@ class InferenceScheduler:
         forecast: StreamForecast,
         *,
         announce: bool,
+        device_index: int | None = None,
     ) -> None:
         """Record a whole-card residency for a head being pre-staged into RAM, without claiming the card yet.
 
@@ -860,18 +1012,22 @@ class InferenceScheduler:
         (so the cooldown, the restore, and the recovery-supervisor wedge grace all cover the pre-stage load and
         the convergence that follows), minus the process teardown and safety pause -- those are deferred to
         :meth:`_converge_whole_card_residency`, which runs once the head is staged and the device frees.
+
+        ``device_index`` scopes the pre-staged residency to one card on a multi-GPU host; None is the
+        single-GPU / worker-wide case.
         """
-        if announce or self._whole_card_established_at == 0.0:
-            self._whole_card_established_at = time.time()
-        self._sibling_teardown_for_model = job.model
-        self._whole_card_forecast = forecast
-        self._whole_card_cooldown_until = time.time() + self._whole_card_cooldown_seconds()
+        state = self._residency_state(device_index)
+        if announce or state.established_at == 0.0:
+            state.established_at = time.time()
+        state.model = job.model
+        state.forecast = forecast
+        state.cooldown_until = time.time() + self._whole_card_cooldown_seconds()
         if announce:
             logger.opt(ansi=True).info(
                 f"<fg #f0beff>Pre-staging whole-card head {job.model} into a spare process's RAM while the "
                 f"in-flight job finishes; the device will be reserved for it (idle siblings stopped"
-                f"{' and safety moved off-GPU' if self._whole_card_safety_off_gpu_enabled() else ''}) once it "
-                f"frees, so its weights are loaded before it samples instead of after. "
+                f"{' and safety moved off-GPU' if self._residency_should_pause_safety(device_index) else ''}) "
+                f"once it frees, so its weights are loaded before it samples instead of after. "
                 f"{self._process_map.residency_snapshot()}</>",
             )
 
@@ -885,19 +1041,19 @@ class InferenceScheduler:
         ``scale_inference_processes`` spares, so reducing the live inference-process count to the forecast's
         target stops the *other* idle siblings (and the former busy process once its job drains) to reclaim
         their CUDA contexts, and safety is moved off-GPU, leaving the staged head the whole card when it samples.
-        A no-op until a residency is held and its model is staged; idempotent at the target.
+        A no-op until a residency is held and its model is staged; idempotent at the target. Converges every
+        held residency, so on a multi-GPU host each card's pre-staged head collapses its own card independently.
         """
-        model = self._sibling_teardown_for_model
-        if model is None:
-            return
-        if not self._is_model_forecast_to_load(model):
-            return
-        forecast = self._whole_card_forecast
-        target = (forecast.max_resident_processes() or 1) if forecast is not None else 1
-        if self._process_map.num_loaded_inference_processes() > target:
-            self._process_lifecycle.scale_inference_processes(target)
-        if self._whole_card_safety_off_gpu_enabled() and not self._process_lifecycle.is_safety_gpu_paused:
-            self._process_lifecycle.pause_safety_on_gpu()
+        for device_index, state in self._held_residencies():
+            model = state.model
+            if model is None or not self._is_model_forecast_to_load(model):
+                continue
+            forecast = state.forecast
+            target = (forecast.max_resident_processes() or 1) if forecast is not None else 1
+            if self._process_map.num_loaded_inference_processes(device_index=device_index) > target:
+                self._process_lifecycle.scale_inference_processes(target, device_index=device_index)
+            if self._residency_should_pause_safety(device_index) and not self._process_lifecycle.is_safety_gpu_paused:
+                self._process_lifecycle.pause_safety_on_gpu()
 
     def _prestaged_whole_card_not_ready(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether ``job`` must wait for its in-progress whole-card residency to claim the card before sampling.
@@ -912,14 +1068,27 @@ class InferenceScheduler:
         Returns False for any job that is not the currently-held residency's model, so ordinary dispatch -- and
         the non-pre-staged whole-card path, which only preloads once already at sole residency -- is unaffected.
         """
-        model = self._sibling_teardown_for_model
-        if model is None or job.model != model:
+        found, device_index = self._residency_holder_for_model(job.model)
+        if not found:
             return False
         baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
-        forecast = self._forecast_streaming(job, baseline)
-        return not self._whole_card_teardown_exhausted(forecast)
+        forecast = self._forecast_streaming(job, baseline, device_index=device_index)
+        return not self._whole_card_teardown_exhausted(forecast, device_index=device_index)
 
-    def _whole_card_teardown_exhausted(self, forecast: StreamForecast) -> bool:
+    def _residency_holder_for_model(self, model: str | None) -> tuple[bool, int | None]:
+        """Return ``(found, device_index)`` for the card whose held whole-card residency is for ``model``.
+
+        ``found`` distinguishes a genuine hit on the ``None`` (single-GPU / worker-wide) key from a miss, since
+        ``None`` is itself a valid residency key.
+        """
+        if model is None:
+            return (False, None)
+        for device_index, state in self._whole_card_residencies.items():
+            if state.model == model:
+                return (True, device_index)
+        return (False, None)
+
+    def _whole_card_teardown_exhausted(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
         """Whether a whole-card residency has done all it can and the head can now load best-effort.
 
         The whole-card branch defers a heavy head while a teardown can still make room: idle siblings left to
@@ -930,11 +1099,14 @@ class InferenceScheduler:
         activation peak overflows even sole residency) can never converge by deferring, so the scheduler loads
         it onto the cleared card best-effort and lets it sample slowly under the over-budget step grace rather
         than wedging the queue until the recovery supervisor soft-resets the pools.
+
+        ``device_index`` scopes the live-context count and the safety check to one card on a multi-GPU host;
+        None is the single-GPU / worker-wide case.
         """
         target = forecast.max_resident_processes() or 1
-        if self._process_map.num_loaded_inference_processes() > target:
+        if self._process_map.num_loaded_inference_processes(device_index=device_index) > target:
             return False
-        if self._whole_card_safety_off_gpu_enabled() and not self._process_lifecycle.is_safety_gpu_paused:
+        if self._residency_should_pause_safety(device_index) and not self._process_lifecycle.is_safety_gpu_paused:
             return False
         return forecast.fits_weights_now
 
@@ -948,16 +1120,16 @@ class InferenceScheduler:
         supervisor. Public: read by the process manager's wedge assessment.
         """
         now = time.time()
-        establishing = (
-            self._sibling_teardown_for_model is not None
-            and self._whole_card_established_at != 0.0
-            and (now - self._whole_card_established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
-        )
-        restoring = (
-            self._whole_card_restore_at != 0.0
-            and (now - self._whole_card_restore_at) < _WHOLE_CARD_RESTORE_GRACE_SECONDS
-        )
-        return establishing or restoring
+        for state in self._whole_card_residencies.values():
+            establishing = (
+                state.model is not None
+                and state.established_at != 0.0
+                and (now - state.established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
+            )
+            restoring = state.restore_at != 0.0 and (now - state.restore_at) < _WHOLE_CARD_RESTORE_GRACE_SECONDS
+            if establishing or restoring:
+                return True
+        return False
 
     def heavy_head_load_grace_active(self) -> bool:
         """Whether a heavy head admitted off the whole-card path is still inside its bounded load window.
@@ -990,9 +1162,12 @@ class InferenceScheduler:
         multi_process = self._max_inference_processes > 1
         possible = enabled and budget_on and (multi_process or safety_off_enabled)
 
-        model = self._sibling_teardown_for_model
+        # Represent the posture with the first held residency (single-GPU has at most one).
+        # ``active`` is true while any card holds a residency.
+        representative = next((state for _index, state in self._held_residencies()), None)
+        model = representative.model if representative is not None else None
         active = model is not None
-        forecast = self._whole_card_forecast
+        forecast = representative.forecast if representative is not None else None
         now = time.time()
 
         phase = ""
@@ -1000,13 +1175,13 @@ class InferenceScheduler:
         processes_target = 0
         weights_mb = reserve_mb = free_now_mb = free_if_alone_mb = None
         max_resident_processes: int | None = None
-        if active:
+        if active and representative is not None:
             establishing = (
-                self._whole_card_established_at != 0.0
-                and (now - self._whole_card_established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
+                representative.established_at != 0.0
+                and (now - representative.established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
             )
             phase = "establishing" if establishing else "holding"
-            cooldown_remaining = max(0.0, self._whole_card_cooldown_until - now)
+            cooldown_remaining = max(0.0, representative.cooldown_until - now)
             if forecast is not None:
                 weights_mb = forecast.weights_mb
                 reserve_mb = forecast.reserve_mb
@@ -1055,38 +1230,57 @@ class InferenceScheduler:
 
         Held while the residency model is still pending or in progress, and for the configured cooldown after
         that, so a burst of heavy jobs reuses one residency rather than each thrashing the process count and
-        the safety process. Once neither condition holds, sibling processes are grown back to the ceiling and
-        the safety process is restored to the GPU. A no-op when no residency is outstanding.
+        the safety process. Once neither condition holds, that card's sibling processes are grown back to its
+        ceiling and -- if the residency was on the safety card -- the safety process is restored to the GPU.
+        Restores every drained card's residency independently; a no-op when none is outstanding.
         """
-        model = self._sibling_teardown_for_model
-        if model is None:
-            return
+        now = time.time()
         active_models = {j.model for j in self._job_tracker.jobs_in_progress}
         active_models.update(j.model for j in self._job_tracker.jobs_pending_inference)
-        if model in active_models or self._job_tracker.has_exclusive_job_in_progress():
-            # Still serving the residency; keep it (and refresh the cooldown so it survives the lull between
-            # back-to-back heavy jobs).
-            self._whole_card_cooldown_until = time.time() + self._whole_card_cooldown_seconds()
-            return
-        if time.time() < self._whole_card_cooldown_until:
-            # Drained, but hold the residency through the cooldown so an imminent heavy job reuses it.
-            return
-        self._sibling_teardown_for_model = None
-        self._whole_card_established_at = 0.0
-        self._whole_card_forecast = None
-        # The restore's own churn (respawning siblings, cycling safety back on-GPU) briefly makes the queue
-        # unservable; mark its start so the wedge grace covers it (see _WHOLE_CARD_RESTORE_GRACE_SECONDS).
-        self._whole_card_restore_at = time.time()
-        safety_restored = self._process_lifecycle.restore_safety_on_gpu()
-        current = self._process_map.num_loaded_inference_processes()
-        if current >= self._max_inference_processes and not safety_restored:
-            return
-        after = self._process_lifecycle.scale_inference_processes(self._max_inference_processes)
-        safety_note = " and restoring safety to the GPU" if safety_restored else ""
-        logger.opt(ansi=True).info(
-            f"<fg #7b7d7d>Whole-card residency for {model} complete; restoring inference processes "
-            f"({current} -> {after} of {self._max_inference_processes}){safety_note}.</>",
-        )
+        # The exclusive-job suppression is worker-wide: it holds every card's residency a little longer, which
+        # only delays restoring concurrency (conservative-safe) rather than risking an over-commit.
+        has_exclusive = self._job_tracker.has_exclusive_job_in_progress()
+        for device_index, state in self._held_residencies():
+            model = state.model
+            if model in active_models or has_exclusive:
+                # Still serving the residency; keep it (refresh the cooldown so it survives the lull between
+                # back-to-back heavy jobs).
+                state.cooldown_until = now + self._whole_card_cooldown_seconds()
+                continue
+            if time.time() < state.cooldown_until:
+                # Drained, but hold the residency through the cooldown so an imminent heavy job reuses it.
+                continue
+            state.model = None
+            state.established_at = 0.0
+            state.forecast = None
+            # The restore's own churn (respawning siblings, cycling safety back on-GPU) briefly makes the queue
+            # unservable; mark its start so the wedge grace covers it (see _WHOLE_CARD_RESTORE_GRACE_SECONDS).
+            state.restore_at = time.time()
+            safety_restored = (
+                self._process_lifecycle.restore_safety_on_gpu()
+                if self._residency_should_pause_safety(device_index)
+                else False
+            )
+            ceiling = self._residency_restore_ceiling(device_index)
+            current = self._process_map.num_loaded_inference_processes(device_index=device_index)
+            if current >= ceiling and not safety_restored:
+                continue
+            after = self._process_lifecycle.scale_inference_processes(ceiling, device_index=device_index)
+            safety_note = " and restoring safety to the GPU" if safety_restored else ""
+            logger.opt(ansi=True).info(
+                f"<fg #7b7d7d>Whole-card residency for {model} complete; restoring inference processes "
+                f"({current} -> {after} of {ceiling}){safety_note}.</>",
+            )
+
+    def _residency_restore_ceiling(self, device_index: int | None) -> int:
+        """The process count to grow back to when a card's whole-card residency is restored.
+
+        That card's own ``target_process_count`` on a multi-GPU host; the worker-wide launched-process
+        ceiling for the single-GPU / worker-wide (``None``) case.
+        """
+        if device_index is not None and device_index in self._card_runtimes:
+            return self._card_runtimes[device_index].target_process_count
+        return self._max_inference_processes
 
     def _update_head_starvation_timer(self, head_job: ImageGenerateJobPopResponse | None) -> None:
         """Track how long the current head-of-queue job has been stuck on an otherwise-idle device.
@@ -1134,21 +1328,25 @@ class InferenceScheduler:
             f"{self._process_map.residency_snapshot()}</>",
         )
 
-    def _measured_free_vram_mb(self) -> float | None:
-        """Return the most conservative measured device-wide free VRAM (MB), or None when not yet reported.
+    def _measured_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
+        """Return the most conservative measured free VRAM (MB), or None when not yet reported.
 
         Sourced from the inference processes' VRAM reports via :meth:`ProcessMap.get_free_vram_mb`, which
         the children compute through hordelib's backend-agnostic accelerator layer (comfy /
         ``torch.cuda.mem_get_info``, accurate and not NVIDIA-specific). The parent stays free of any direct
         GPU query, so this works on every backend the execution layer supports.
+
+        Args:
+            device_index: When given, the free VRAM of that one card (the per-card budget on a multi-GPU
+                host); when None, the most conservative figure across every card (the single-GPU reading).
         """
-        return self._process_map.get_free_vram_mb()
+        return self._process_map.get_free_vram_mb(device_index=device_index)
 
     def _measured_available_ram_mb(self) -> float:
         """The measured system-wide available RAM (MB), read live in the parent process."""
         return psutil.virtual_memory().available / (1024 * 1024)
 
-    def _committed_post_processing_reserve_mb(self) -> float:
+    def _committed_post_processing_reserve_mb(self, *, device_index: int | None = None) -> float:
         """Sum the imminent post-processing-phase VRAM peaks of jobs currently in post-processing (MB).
 
         When a job finishes sampling it releases its inference slot for overlap *before* its
@@ -1159,6 +1357,11 @@ class InferenceScheduler:
         residency forecast, it stops a freshly-released slot being handed VRAM an in-flight job is about to
         claim. Returns 0.0 when nothing is post-processing (so the reserve self-scales away on roomy cards)
         or when the feature is disabled. Never raises: a bad per-job estimate is skipped.
+
+        Args:
+            device_index: When given, sum only the post-processing peaks on that card (the per-card reserve,
+                since a post-processing peak only spends the VRAM of the card running it); when None, sum
+                across every card.
         """
         if not self._budget_active() or not self._runtime_config.bridge_data.post_processing_budget_reserve_enabled:
             return 0.0
@@ -1167,6 +1370,8 @@ class InferenceScheduler:
         jobs_in_progress = self._job_tracker.jobs_in_progress
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
                 continue
             if process_info.last_process_state != HordeProcessState.INFERENCE_POST_PROCESSING:
                 continue
@@ -1185,7 +1390,7 @@ class InferenceScheduler:
     _IMAGE_PP_RESERVE_FLOW = "image_post_processing"
     """The shared-ledger flow namespace under which this scheduler registers its post-processing reserve."""
 
-    def _committed_vram_reserve_mb(self) -> float:
+    def _committed_vram_reserve_mb(self, *, device_index: int | None = None) -> float:
         """Return the combined committed VRAM (MB) across every flow, refreshing this scheduler's own entry.
 
         Each call re-derives the image-generation post-processing reserve from live process state and
@@ -1195,15 +1400,30 @@ class InferenceScheduler:
         leaks. This combined figure is what the VRAM admission and residency-forecast gates subtract, so a
         freshly-released slot is not handed VRAM that image post-processing *or* concurrent alchemy is about
         to claim.
+
+        Args:
+            device_index: When given, return that card's committed reserve: its own post-processing reserve
+                plus the worker-global non-image-post-processing flows (alchemy is not card-attributed, so it
+                is charged conservatively against the card). When None, return the worker-wide ledger total
+                (the single-GPU reading). The worker-wide image-post-processing aggregate is refreshed in the
+                ledger either way, so the status snapshot and other readers are unaffected.
         """
         self._reserve_ledger.set(
             self._IMAGE_PP_RESERVE_FLOW,
             "aggregate",
             vram_mb=self._committed_post_processing_reserve_mb(),
         )
-        return self._reserve_ledger.total_vram_mb()
+        if device_index is None:
+            return self._reserve_ledger.total_vram_mb()
+        per_card_post_processing = self._committed_post_processing_reserve_mb(device_index=device_index)
+        return per_card_post_processing + self._reserve_ledger.total_vram_mb_excluding(self._IMAGE_PP_RESERVE_FLOW)
 
-    def _max_jobs_in_progress_allowed(self, processes_post_processing: int) -> int:
+    def _max_jobs_in_progress_allowed(
+        self,
+        processes_post_processing: int,
+        *,
+        card: CardRuntime | None = None,
+    ) -> int:
         """The cap on concurrently in-progress jobs for this scheduling decision.
 
         Without the GPU sampling lease, the inference semaphore is the sole denoise gate, so this
@@ -1214,12 +1434,31 @@ class InferenceScheduler:
         would otherwise go dark. That pre-staging is permitted up to the full inference-process
         count, but only while there is enough free VRAM to hold another staged model; otherwise it
         falls back to the sampling-slot cap so speculation never over-commits the device.
+
+        Args:
+            processes_post_processing: How many processes are mid post-processing (per the caller's
+                scope, global or per-card), used for the overlap bump.
+            card: When the worker drives more than one card, the card this decision is scoped to: its
+                own sampling-slot and process ceilings are used so the big card's spare threads never
+                inflate a small card's allowance. ``None`` keeps the worker-wide global ceilings, which
+                is exactly the single-GPU case (byte-identical to before). The free-VRAM staging
+                headroom is measured worker-wide either way (a deliberate conservatism until per-card
+                memory-report attribution is implemented).
         """
         # An exclusively-admitted over-budget job needs the whole device; never dispatch another job
         # alongside it. Returning the current in-progress count (floored at 1 so the exclusive job itself
         # can still be dispatched when none is yet running) blocks any *additional* concurrent dispatch.
+        # This stays worker-wide even in the per-card path: the over-budget exclusive admission is itself
+        # whole-worker today, so an exclusive job suppresses dispatch on every card until it clears.
         if self._job_tracker.has_exclusive_job_in_progress():
             return max(1, len(self._job_tracker.jobs_in_progress))
+
+        if card is not None:
+            concurrent_ceiling = card.max_concurrent_inference
+            process_ceiling = card.target_process_count
+        else:
+            concurrent_ceiling = self._max_concurrent_inference_processes
+            process_ceiling = self._max_inference_processes
 
         # The post-processing overlap bump raises the cap *because* a process is post-processing -- but that
         # process is holding (or about to hold) its upscaler/face-fixer VRAM peak, the worst moment to admit
@@ -1238,7 +1477,7 @@ class InferenceScheduler:
                 if (free_vram_mb - self._committed_vram_reserve_mb()) < bump_floor:
                     post_processing_bump = 0
 
-        base = self._max_concurrent_inference_processes + post_processing_bump
+        base = concurrent_ceiling + post_processing_bump
         if not self._runtime_config.bridge_data.gpu_sampling_lease_enabled:
             return base
 
@@ -1253,7 +1492,7 @@ class InferenceScheduler:
         if free_vram_mb is None or free_vram_mb < staging_floor:
             return base
 
-        return self._max_inference_processes + post_processing_bump
+        return process_ceiling + post_processing_bump
 
     def _model_size_tier(self, model_name: str | None) -> _ModelSizeTier:
         """Classify a model by how much of the device its inference is expected to want.
@@ -1330,7 +1569,26 @@ class InferenceScheduler:
             return _OVERLAP_HEADWAY_BOTH_HEAVY
         return _OVERLAP_HEADWAY_MIXED_HEAVY
 
-    def _concurrent_overlap_allowed(self, candidate_job: ImageGenerateJobPopResponse) -> bool:
+    def _jobs_in_progress_on_card(self, device_index: int) -> list[ImageGenerateJobPopResponse]:
+        """The in-progress jobs whose live inference process is pinned to ``device_index``.
+
+        Cards are independent sampling/VRAM domains, so the per-card concurrency gates compare a candidate
+        only against the jobs sharing its card. A job whose running slot cannot be identified is omitted (it
+        is attributed to no card), which only ever relaxes the per-card count, never inflates it.
+        """
+        on_card: list[ImageGenerateJobPopResponse] = []
+        for job in self._job_tracker.jobs_in_progress:
+            running_process = self._process_running_job(job)
+            if running_process is not None and running_process.device_index == device_index:
+                on_card.append(job)
+        return on_card
+
+    def _concurrent_overlap_allowed(
+        self,
+        candidate_job: ImageGenerateJobPopResponse,
+        *,
+        target_device_index: int | None = None,
+    ) -> bool:
         """Whether ``candidate_job`` may start while other jobs are already sampling.
 
         The concurrency cap (``max_threads``) only counts in-flight jobs; it does not look at what those
@@ -1348,8 +1606,20 @@ class InferenceScheduler:
 
         A blocked job is not dropped; it keeps its queue position and dispatches once the in-flight
         job(s) progress or finish.
+
+        Args:
+            candidate_job: The job being considered for dispatch.
+            target_device_index: On a multi-GPU host, the card this candidate would run on; the headway
+                check then considers only jobs already sampling on that same card (jobs on other cards do
+                not contend for its VRAM or sampler). ``None`` (and every single-GPU call) keeps the
+                worker-wide comparison, byte-identical to before.
         """
-        in_progress_jobs = self._job_tracker.jobs_in_progress
+        if self._multi_gpu_routing_active and target_device_index is not None:
+            in_progress_jobs: tuple[ImageGenerateJobPopResponse, ...] | list[ImageGenerateJobPopResponse] = (
+                self._jobs_in_progress_on_card(target_device_index)
+            )
+        else:
+            in_progress_jobs = self._job_tracker.jobs_in_progress
         if not in_progress_jobs:
             return True
 
@@ -1534,9 +1804,10 @@ class InferenceScheduler:
                         set(processes_with_model_for_queued_job) | protected,
                     )
 
-            available_process = self._process_map.get_first_available_inference_process(
-                disallowed_processes=processes_with_model_for_queued_job,
-            )
+            # On a multi-GPU host this also chooses *which* card to load onto: an eligible card already
+            # holding the model first, then the least-loaded eligible card. Single-GPU returns the first
+            # available slot exactly as before.
+            available_process = self._select_preload_process(job, processes_with_model_for_queued_job)
 
             if available_process is None and is_head_blocker:
                 # The head of the queue could not get a slot because affinity (or the queued-model
@@ -1595,11 +1866,18 @@ class InferenceScheduler:
             # (overriding residency under pressure) and defer this preload rather than over-committing.
             if self._budget_active():
                 baseline = self._model_metadata.get_baseline(job.model)
+                # On a multi-GPU host every budget / forecast / residency decision below is scoped to the card
+                # this preload would land on (the slot chosen above). None keeps the worker-wide reading on a
+                # single-GPU host, so the whole block is byte-identical there.
+                target_device_index = available_process.device_index if self._multi_gpu_routing_active else None
                 # A single model loaded onto an otherwise-idle GPU cannot reintroduce the multi-process
                 # over-commit the budget guards against; the over-commit case is several *concurrent*
-                # resident models. So when no job is in-flight (holding the device), a starved head may be
-                # admitted best-effort rather than deferred forever (see the branches below).
-                no_live_resource_consumer = len(self._job_tracker.jobs_in_progress) == 0
+                # resident models. So when no job is in-flight (holding the device -- this card, on a
+                # multi-GPU host), a starved head may be admitted best-effort rather than deferred forever.
+                if target_device_index is None:
+                    no_live_resource_consumer = len(self._job_tracker.jobs_in_progress) == 0
+                else:
+                    no_live_resource_consumer = len(self._jobs_in_progress_on_card(target_device_index)) == 0
 
                 # Whole-card exclusive residency (preventative): forecast whether loading this model alongside
                 # the currently-resident models would drive the device into weight streaming. A heavy model
@@ -1620,7 +1898,7 @@ class InferenceScheduler:
                 # processes are stopped), so the model simply waits for the device to drain. Models that would
                 # stream even with the whole card to themselves (streams_unavoidably) fall through to the
                 # best-effort admit below.
-                forecast = self._forecast_streaming(job, baseline)
+                forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
                 # Trace the forecast for every budget-gated load so the logs show the residency dynamics
                 # (the numbers behind a stream/no-stream decision), not just the action taken. Kept at DEBUG
                 # because it can be per-pending-job per-tick; unchanged observations are coalesced by
@@ -1641,7 +1919,13 @@ class InferenceScheduler:
                 if self._whole_card_residency_enabled() and needs_teardown_path:
                     first_time = not self._job_tracker.is_admitted_exclusive(job)
                     self._job_tracker.mark_admitted_exclusive(job)
-                    if self._should_prestage_whole_card_head(job, baseline, forecast, available_process):
+                    if self._should_prestage_whole_card_head(
+                        job,
+                        baseline,
+                        forecast,
+                        available_process,
+                        device_index=target_device_index,
+                    ):
                         # A live job still holds the device, so the card cannot be claimed yet, but the heavy
                         # head's weights can begin loading into a spare process's RAM right now: preload_model is
                         # a RAM-only load (the weights move to VRAM at sampling time), so it does not contend with
@@ -1651,18 +1935,33 @@ class InferenceScheduler:
                         # before the staged model samples. RAM-gated so a second multi-GB checkpoint is never
                         # forced onto a RAM-pressured host. This is the load-ASAP win: the heavy disk->RAM load
                         # overlaps the in-flight job instead of waiting for the device to drain first.
-                        self._begin_whole_card_residency(job, forecast, announce=first_time)
+                        self._begin_whole_card_residency(
+                            job,
+                            forecast,
+                            announce=first_time,
+                            device_index=target_device_index,
+                        )
                         early_prestage = True
                     else:
                         # Claim the device: stop idle siblings to the model's max-resident count and, on the very
                         # edge, move safety off-GPU too. Announces (once) why, for the operator. Held through the
                         # cooldown so a burst of heavy jobs reuses one residency instead of churning per job.
-                        self._establish_whole_card_residency(job, forecast, announce=first_time)
+                        self._establish_whole_card_residency(
+                            job,
+                            forecast,
+                            announce=first_time,
+                            device_index=target_device_index,
+                        )
                         # Evict the idle resident models on the *other* processes (sparing the slot that will load
                         # this model, and never a live in-progress model) so their VRAM returns to the driver. A
                         # live sibling is left to drain; the preload simply waits until the device is clear.
-                        self.unload_models_from_vram(available_process, under_pressure=True, for_head_of_queue=True)
-                        if not self._whole_card_teardown_exhausted(forecast):
+                        self.unload_models_from_vram(
+                            available_process,
+                            under_pressure=True,
+                            for_head_of_queue=True,
+                            device_index=target_device_index,
+                        )
+                        if not self._whole_card_teardown_exhausted(forecast, device_index=target_device_index):
                             # Still tearing down idle siblings, cycling safety off-GPU, or waiting for their freed
                             # VRAM to drain: defer and let a later tick re-evaluate against the reduced topology.
                             return False
@@ -1708,8 +2007,8 @@ class InferenceScheduler:
                     vram_verdict = self._vram_budget.check_job(
                         job,
                         baseline,
-                        self._measured_free_vram_mb(),
-                        committed_reserve_mb=self._committed_vram_reserve_mb(),
+                        self._measured_free_vram_mb(device_index=target_device_index),
+                        committed_reserve_mb=self._committed_vram_reserve_mb(device_index=target_device_index),
                     )
                     if not vram_verdict.fits:
                         if not self._vram_budget_defer_notified:
@@ -1718,7 +2017,11 @@ class InferenceScheduler:
                                 "Reclaiming idle VRAM.</>",
                             )
                             self._vram_budget_defer_notified = True
-                        freed = self.unload_models_from_vram(available_process, under_pressure=True)
+                        freed = self.unload_models_from_vram(
+                            available_process,
+                            under_pressure=True,
+                            device_index=target_device_index,
+                        )
                         if not freed and is_head_blocker:
                             # Gentle reclaim found nothing to free because every idle resident copy is
                             # another queued job's model. The head of the queue must still make progress,
@@ -1727,6 +2030,7 @@ class InferenceScheduler:
                                 available_process,
                                 under_pressure=True,
                                 for_head_of_queue=True,
+                                device_index=target_device_index,
                             )
                         # Reclamation is exhausted when nothing more could be freed: the predicted peak + reserve
                         # exceeds achievable free VRAM even with every idle resident copy evicted. The burden
@@ -1749,7 +2053,7 @@ class InferenceScheduler:
                         # configured threshold it is held back (not admitted here, not popped in the popper) for
                         # a cooldown, so the worker stops dropping jobs faster than the horde server tolerates
                         # and is never forced into maintenance. The self-throttle backstop catches the aggregate.
-                        if self._is_model_locally_unservable(job.model):
+                        if self._is_model_locally_unservable(job.model, device_index=target_device_index):
                             if not self._unservable_admit_notified.get(job.model, False):
                                 logger.opt(ansi=True).warning(
                                     f"<fg #ff8c69>Model {job.model} keeps faulting over the VRAM budget; held "
@@ -1779,11 +2083,13 @@ class InferenceScheduler:
                             max_resident = self._max_coresident_for_peak_mb(
                                 vram_verdict.predicted_mb,
                                 vram_verdict.reserve_mb,
+                                device_index=target_device_index,
                             )
                         if (
                             self._whole_card_residency_enabled()
                             and max_resident is not None
-                            and self._process_map.num_loaded_inference_processes() > max_resident
+                            and self._process_map.num_loaded_inference_processes(device_index=target_device_index)
+                            > max_resident
                         ):
                             first_time = not self._job_tracker.is_admitted_exclusive(job)
                             self._job_tracker.mark_admitted_exclusive(job)
@@ -1792,11 +2098,13 @@ class InferenceScheduler:
                                 forecast,
                                 announce=first_time,
                                 target_override=max_resident,
+                                device_index=target_device_index,
                             )
                             self.unload_models_from_vram(
                                 available_process,
                                 under_pressure=True,
                                 for_head_of_queue=True,
+                                device_index=target_device_index,
                             )
                             return False
 
@@ -1971,12 +2279,113 @@ class InferenceScheduler:
                 continue
             if self._job_tracker.is_degraded_dispatch_pending(candidate_job):
                 continue
-            candidate_process = self._process_map.get_process_by_horde_model_name(candidate_job.model)
+            candidate_process = self._resident_process_for_job(candidate_job)
             if candidate_process is None or not candidate_process.can_accept_job():
                 continue
-            if not self._concurrent_overlap_allowed(candidate_job):
+            if not self._concurrent_overlap_allowed(
+                candidate_job,
+                target_device_index=candidate_process.device_index,
+            ):
                 continue
             return candidate_job, candidate_process
+        return None
+
+    @property
+    def _multi_gpu_routing_active(self) -> bool:
+        """Whether per-card dispatch routing applies (the worker drives more than one card).
+
+        A single card (or the empty plan unit tests construct) keeps the original card-agnostic dispatch,
+        so all multi-GPU routing below is a strict no-op on a single-GPU host.
+        """
+        return len(self._card_runtimes) > 1
+
+    def _eligible_card_indices(self, job: ImageGenerateJobPopResponse) -> set[int]:
+        """Device indices of the cards whose effective config can serve ``job`` (see ``gpu_eligibility``).
+
+        Restricts dispatch (and the resident-process search) to cards that offer the job's model, fit its
+        weights, enable every feature it needs, and allow its resolution. An unknown fact never excludes a
+        card (the eligibility primitive abstains), so this only ever narrows routing on a genuine mismatch.
+        """
+        baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
+        baseline_value = baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
+        weight_mb = predict_job_weight_mb(job, baseline)
+        return eligible_card_indices_for(
+            job,
+            self._card_runtimes,
+            baseline=baseline_value,
+            weight_mb=weight_mb,
+        )
+
+    def _card_inference_load(self, device_index: int) -> int:
+        """Count this card's inference processes currently busy: the least-loaded routing tie-breaker."""
+        return sum(
+            1
+            for p in self._process_map.values()
+            if p.process_type == HordeProcessType.INFERENCE and p.device_index == device_index and p.is_process_busy()
+        )
+
+    def _pick_best_resident_process(self, candidates: list[HordeProcessInfo]) -> HordeProcessInfo:
+        """Choose which resident process to dispatch to: prefer one ready now, then the least-loaded card.
+
+        The "sticky, then least-loaded" policy at the process level: every candidate already holds the model
+        (sticky), so among them a process that can take work immediately is preferred, and ties break to the
+        card running the fewest inference jobs so a hot model spreads across cards instead of queueing on one.
+        """
+        ready = [p for p in candidates if p.can_accept_job()]
+        pool = ready or candidates
+        return min(pool, key=lambda p: self._card_inference_load(p.device_index))
+
+    def _resident_process_for_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
+        """The resident process to dispatch ``job`` to, honoring per-card eligibility on a multi-GPU host.
+
+        Single-GPU: identical to :meth:`ProcessMap.get_process_by_horde_model_name` (the first resident
+        process), so the dispatch path is byte-identical. Multi-GPU: restrict to processes pinned to cards
+        eligible for this job, then apply the sticky-then-least-loaded policy. Returns None when the model is
+        resident only on cards that cannot serve this particular job, or is not resident anywhere.
+        """
+        if job.model is None:
+            return None
+        if not self._multi_gpu_routing_active:
+            return self._process_map.get_process_by_horde_model_name(job.model)
+        allowed = self._eligible_card_indices(job)
+        candidates = self._process_map.get_processes_by_horde_model_name(job.model, allowed_cards=allowed)
+        if not candidates:
+            return None
+        return self._pick_best_resident_process(candidates)
+
+    def _select_preload_process(
+        self,
+        job: ImageGenerateJobPopResponse,
+        disallowed_processes: list[int],
+    ) -> HordeProcessInfo | None:
+        """The inference slot to preload ``job``'s model onto, choosing the card on a multi-GPU host.
+
+        Single-GPU: identical to :meth:`ProcessMap.get_first_available_inference_process`, so the preload path
+        is byte-identical. Multi-GPU: restrict to cards eligible for this job and pick the placement card by the
+        same sticky-then-least-loaded policy dispatch uses -- a card already holding this model first (avoid a
+        duplicate load), then the card running the fewest inference jobs (balance fresh loads). Returns the
+        first available slot on the best such card, or None when no eligible card has a free slot.
+        """
+        if not self._multi_gpu_routing_active:
+            return self._process_map.get_first_available_inference_process(disallowed_processes=disallowed_processes)
+        eligible = self._eligible_card_indices(job)
+        if not eligible:
+            return None
+
+        def card_placement_key(device_index: int) -> tuple[int, int]:
+            already_serves_model = any(
+                process.loaded_horde_model_name == job.model and process.device_index == device_index
+                for process in self._process_map.values()
+            )
+            return (0 if already_serves_model else 1, self._card_inference_load(device_index))
+
+        for device_index in sorted(eligible, key=card_placement_key):
+            candidate = self._process_map.get_first_available_inference_process(
+                disallowed_processes=disallowed_processes,
+                device_index=device_index,
+            )
+            if candidate is not None:
+                return candidate
         return None
 
     async def get_next_job_and_process(
@@ -2027,7 +2436,7 @@ class InferenceScheduler:
         if next_job.model is None:
             raise ValueError(f"next_job.model is None ({next_job})")
 
-        process_with_model = self._process_map.get_process_by_horde_model_name(next_job.model)
+        process_with_model = self._resident_process_for_job(next_job)
         line_skip: LineSkip | None = None
 
         candidate_job_size = 25
@@ -2060,9 +2469,7 @@ class InferenceScheduler:
                     logger.debug(f"Line-skip candidate {candidate_id} rejected: degraded retry must run isolated.")
                     continue
 
-                candidate_process_with_model = self._process_map.get_process_by_horde_model_name(
-                    candidate_small_job.model,
-                )
+                candidate_process_with_model = self._resident_process_for_job(candidate_small_job)
                 if candidate_process_with_model is None:
                     logger.debug(
                         f"Line-skip candidate {candidate_id} rejected: model {candidate_small_job.model} "
@@ -2099,12 +2506,29 @@ class InferenceScheduler:
 
             return None
 
+        # On a multi-GPU host the head's resident process names the card this dispatch would land on, so the
+        # concurrency cap is scoped to that card: its own in-progress count vs its own ceilings. The scope is
+        # dropped (worker-wide, as on a single-GPU host) when the head is not yet resident (no target card) or
+        # while a worker-wide exclusive job is suppressing all dispatch.
+        target_card: CardRuntime | None = None
+        if (
+            self._multi_gpu_routing_active
+            and process_with_model is not None
+            and not self._job_tracker.has_exclusive_job_in_progress()
+        ):
+            target_card = self._card_runtimes.get(process_with_model.device_index)
+
         processes_post_processing = 0
         if self.post_process_job_overlap_allowed:
-            processes_post_processing = self._process_map.num_busy_with_post_processing()
+            processes_post_processing = self._process_map.num_busy_with_post_processing(
+                device_index=target_card.device_index if target_card is not None else None,
+            )
 
-        jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
-        max_jobs_allowed = self._max_jobs_in_progress_allowed(processes_post_processing)
+        if target_card is not None:
+            jobs_in_progress_count = len(self._jobs_in_progress_on_card(target_card.device_index))
+        else:
+            jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
+        max_jobs_allowed = self._max_jobs_in_progress_allowed(processes_post_processing, card=target_card)
         if jobs_in_progress_count >= max_jobs_allowed:
             if self._job_tracker.has_exclusive_job_in_progress():
                 logger.debug(
@@ -2178,7 +2602,7 @@ class InferenceScheduler:
                 for candidate_job in next_n_jobs:
                     if candidate_job.model is None or candidate_job.model == next_job.model:
                         continue
-                    candidate_process = self._process_map.get_process_by_horde_model_name(candidate_job.model)
+                    candidate_process = self._resident_process_for_job(candidate_job)
                     if candidate_process is not None and candidate_process.can_accept_job():
                         line_skip = LineSkip(displaced_job=next_job)
                         next_job = candidate_job
@@ -2233,7 +2657,11 @@ class InferenceScheduler:
         # bypass is exempt: it deliberately keeps the GPU fed with a small job while another slot is
         # only downloading aux models, and is already size-limited. information_only look-ahead is not
         # gated here so callers still see the next job; the real dispatch path below enforces the hold.
-        if not information_only and line_skip is None and not self._concurrent_overlap_allowed(next_job):
+        if (
+            not information_only
+            and line_skip is None
+            and not self._concurrent_overlap_allowed(next_job, target_device_index=process_with_model.device_index)
+        ):
             self._pending_line_skip = None
             return None
 
@@ -2383,7 +2811,12 @@ class InferenceScheduler:
                 sdk_api_job_info=next_job,
             ),
         ):
-            await self._job_tracker.mark_inference_started(next_job)
+            # Record the card this job runs on (None on a single-GPU host) so its over-budget fault streak is
+            # kept per card: a model unservable on a small card can still be advertised and run on a larger one.
+            dispatched_device_index = (
+                process_with_model.device_index if self._multi_gpu_routing_active else None
+            )
+            await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)
             horde_model_baseline = self._model_metadata.get_baseline(next_job.model)
 
             dispatch_detail: dict[str, str | int | float | bool | None] = {
@@ -2541,6 +2974,7 @@ class InferenceScheduler:
         *,
         under_pressure: bool = False,
         for_head_of_queue: bool = False,
+        device_index: int | None = None,
     ) -> bool:
         """Unload models from VRAM from processes that are not running a job.
 
@@ -2552,6 +2986,10 @@ class InferenceScheduler:
         and gentle reclaim freed nothing because every idle resident copy is another *queued* job's
         model: it additionally overrides the next-up guard so the head can be given room. It never
         evicts an in-progress (live) model.
+
+        ``device_index`` restricts eviction to idle resident copies on that one card: reclaiming VRAM for a
+        load onto card C must evict from card C, since freeing another card's model returns no VRAM to C.
+        None (the single-GPU / worker-wide case) considers every card's idle residents.
 
         Returns True if an idle resident model's unload was issued (room is on the way), False if there
         was nothing to reclaim.
@@ -2576,6 +3014,9 @@ class InferenceScheduler:
                 continue
 
             if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+
+            if device_index is not None and process_info.device_index != device_index:
                 continue
 
             if process_info.is_process_busy():

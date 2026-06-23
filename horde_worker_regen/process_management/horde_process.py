@@ -138,6 +138,7 @@ class HordeProcess(abc.ABC):
         pipe_connection: Connection,
         disk_lock: Lock,
         process_launch_identifier: int,
+        device_index: int = 0,
     ) -> None:
         """Initialise the process.
 
@@ -148,12 +149,15 @@ class HordeProcess(abc.ABC):
             pipe_connection (Connection): Receives `HordeControlMessage`s from the main process.
             disk_lock (Lock): A lock used to prevent multiple processes from accessing disk at the same time.
             process_launch_identifier (int): The unique identifier for this launch.
+            device_index (int, optional): The stable index of the GPU this process is pinned to, reported \
+                back on memory messages so the parent can attribute VRAM per card. Defaults to 0.
         """
         self.process_id = process_id
         self.process_message_queue = process_message_queue
         self.pipe_connection = pipe_connection
         self.disk_lock = disk_lock
         self.process_launch_identifier = process_launch_identifier
+        self.device_index = device_index
 
         self._control_inbox: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._control_reader_stop = threading.Event()
@@ -329,6 +333,7 @@ class HordeProcess(abc.ABC):
             info="Memory report",
             time_elapsed=None,
             ram_usage_bytes=psutil.Process().memory_info().rss,
+            device_index=self.device_index,
         )
 
         try:

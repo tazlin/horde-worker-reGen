@@ -471,14 +471,24 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self,
         capability: WorkerCapability,
         disallowed_processes: list[int] | None = None,
+        *,
+        device_index: int | None = None,
     ) -> HordeProcessInfo | None:
         """Return the first process with the capability that can accept a job, or None.
 
         Processes without a loaded model are preferred (cheapest to (re)target).
+
+        Args:
+            capability: The worker capability the process must have.
+            disallowed_processes: Process ids to skip.
+            device_index: When given, only consider processes pinned to that card (so a multi-GPU preload
+                can target a chosen card); when None, any card.
         """
         disallowed = disallowed_processes or []
 
         for p in self.get_capable_processes(capability):
+            if device_index is not None and p.device_index != device_index:
+                continue
             if (
                 p.last_process_state in (HordeProcessState.WAITING_FOR_JOB, HordeProcessState.PRELOADED_MODEL)
                 and p.loaded_horde_model_name is None
@@ -487,42 +497,57 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 return p
 
         for p in self.get_capable_processes(capability):
+            if device_index is not None and p.device_index != device_index:
+                continue
             if p.can_accept_job() and p.process_id not in disallowed:
                 return p
 
         return None
 
-    def get_free_vram_mb(self) -> float | None:
+    def get_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
         """Return the most conservative free VRAM (MB) across inference processes, or None.
 
         Child processes report ``vram_usage_mb``/``total_vram_mb`` computed as
         ``torch_total - torch_free`` and ``torch_total``, so ``total - usage`` is the
-        device-wide free VRAM at sample time. Workers are typically
-        single-GPU; the minimum free figure across reporting processes is used as a
-        conservative estimate. Returns None when no inference process has reported VRAM yet
+        device-wide free VRAM at sample time. A device-pinned (masked) child sees only its own card as
+        ``cuda:0``, so its report is that card's free VRAM; the minimum across reporting processes is used
+        as a conservative estimate. Returns None when no inference process has reported VRAM yet
         (cold start, or a CPU-only deployment).
+
+        Args:
+            device_index: When given, restrict to inference processes pinned to that card so the figure is
+                that card's free VRAM (the per-card budget on a multi-GPU host); when None, the most
+                conservative figure across every card (the single-GPU / worker-wide reading).
         """
         free_values = [
             p.total_vram_mb - p.vram_usage_mb
             for p in self.values()
-            if p.process_type == HordeProcessType.INFERENCE and p.total_vram_mb > 0
+            if p.process_type == HordeProcessType.INFERENCE
+            and p.total_vram_mb > 0
+            and (device_index is None or p.device_index == device_index)
         ]
         if not free_values:
             return None
         return float(min(free_values))
 
-    def get_reported_total_vram_mb(self) -> float | None:
+    def get_reported_total_vram_mb(self, *, device_index: int | None = None) -> float | None:
         """Return the device's total VRAM (MB) as reported by inference processes, or None.
 
-        Children report ``total_vram_mb`` (``torch_total``); workers are typically single-GPU, so the max
-        across reporting processes is the device total. None until a process has reported (cold start, or a
-        CPU-only deployment). Used by the streaming forecast to derive ComfyUI's inference reserve and the
-        free VRAM achievable under sole residency.
+        Children report ``total_vram_mb`` (``torch_total``); a masked child reports its own card's total, so
+        the max across reporting processes is the (per-card, when filtered) device total. None until a
+        process has reported (cold start, or a CPU-only deployment). Used by the streaming forecast to derive
+        ComfyUI's inference reserve and the free VRAM achievable under sole residency.
+
+        Args:
+            device_index: When given, restrict to processes pinned to that card (the per-card total on a
+                multi-GPU host); when None, the max across every card.
         """
         totals = [
             p.total_vram_mb
             for p in self.values()
-            if p.process_type == HordeProcessType.INFERENCE and p.total_vram_mb > 0
+            if p.process_type == HordeProcessType.INFERENCE
+            and p.total_vram_mb > 0
+            and (device_index is None or p.device_index == device_index)
         ]
         if not totals:
             return None
@@ -554,14 +579,21 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 count += 1
         return count
 
-    def num_loaded_inference_processes(self) -> int:
-        """Return the number of inference processes that haven't been ended."""
+    def num_loaded_inference_processes(self, *, device_index: int | None = None) -> int:
+        """Return the number of inference processes that haven't been ended.
+
+        Args:
+            device_index: When given, count only processes pinned to that card (the per-card live-context
+                count the residency forecast reasons about on a multi-GPU host); when None, count across
+                every card.
+        """
         count = 0
         for p in self.values():
             if (
                 p.process_type == HordeProcessType.INFERENCE
                 and p.last_process_state != HordeProcessState.PROCESS_ENDING
                 and p.last_process_state != HordeProcessState.PROCESS_ENDED
+                and (device_index is None or p.device_index == device_index)
             ):
                 count += 1
         return count
@@ -650,9 +682,17 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     def get_first_available_inference_process(
         self,
         disallowed_processes: list[int] | None = None,
+        *,
+        device_index: int | None = None,
     ) -> HordeProcessInfo | None:
-        """Return the first available inference process, or None if there are none available."""
-        return self.get_first_available(WorkerCapability.IMAGE_GEN, disallowed_processes)
+        """Return the first available inference process, or None if there are none available.
+
+        Args:
+            disallowed_processes: Process ids to skip.
+            device_index: When given, only consider processes pinned to that card (a multi-GPU preload
+                targeting a chosen card); when None, any card.
+        """
+        return self.get_first_available(WorkerCapability.IMAGE_GEN, disallowed_processes, device_index=device_index)
 
     def _get_first_inference_process_to_kill(
         self,
@@ -690,11 +730,18 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 return p
         return None
 
-    def num_safety_processes(self) -> int:
-        """Return the number of safety processes."""
+    def num_safety_processes(self, *, device_index: int | None = None) -> int:
+        """Return the number of safety processes.
+
+        Args:
+            device_index: When given, count only safety processes pinned to that card, so a per-card
+                residency forecast charges the safety CUDA context only against the card it actually sits
+                on (the worker runs a single safety process pinned to the first configured card); when None,
+                count across every card.
+        """
         count = 0
         for p in self.values():
-            if p.process_type == HordeProcessType.SAFETY:
+            if p.process_type == HordeProcessType.SAFETY and (device_index is None or p.device_index == device_index):
                 count += 1
         return count
 
@@ -740,6 +787,27 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 return p
         return None
 
+    def get_processes_by_horde_model_name(
+        self,
+        horde_model_name: str,
+        *,
+        allowed_cards: set[int] | None = None,
+    ) -> list[HordeProcessInfo]:
+        """Return every process that has the given horde model loaded (a model may be resident on >1 card).
+
+        On a multi-GPU host the same model can be loaded on processes pinned to different cards, so this
+        returns all such processes rather than the first. ``allowed_cards``, when given, restricts the result
+        to processes whose pinned ``device_index`` is in that set (the dispatch router passes the job's
+        eligible cards). Single-GPU callers get a one- or zero-element list mirroring
+        :meth:`get_process_by_horde_model_name`.
+        """
+        return [
+            p
+            for p in self.values()
+            if p.loaded_horde_model_name == horde_model_name
+            and (allowed_cards is None or p.device_index in allowed_cards)
+        ]
+
     def num_busy_processes(self) -> int:
         """Return the number of processes that are actively engaged in a task.
 
@@ -759,12 +827,21 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 count += 1
         return count
 
-    def num_busy_with_post_processing(self) -> int:
-        """Return the number of processes that are actively engaged in a post-processing task."""
+    def num_busy_with_post_processing(self, *, device_index: int | None = None) -> int:
+        """Return the number of processes actively engaged in a post-processing task.
+
+        Args:
+            device_index: When given, count only processes pinned to that card (the per-card
+                concurrency gate scopes the post-processing overlap bump to one card); when None,
+                count across every card.
+        """
         count = 0
         for p in self.values():
-            if p.last_process_state == HordeProcessState.INFERENCE_POST_PROCESSING:
-                count += 1
+            if p.last_process_state != HordeProcessState.INFERENCE_POST_PROCESSING:
+                continue
+            if device_index is not None and p.device_index != device_index:
+                continue
+            count += 1
         return count
 
     def num_preloading_processes(self) -> int:

@@ -20,7 +20,7 @@ import sys
 
 import pytest
 
-from horde_worker_regen.process_management.process_manager import MultiprocessingPrimitives
+from horde_worker_regen.process_management.process_manager import CardConcurrency, MultiprocessingPrimitives
 
 
 def test_primitives_bind_to_passed_spawn_context() -> None:
@@ -28,8 +28,15 @@ def test_primitives_bind_to_passed_spawn_context() -> None:
     spawn_ctx = multiprocessing.get_context("spawn")
     primitives = MultiprocessingPrimitives.create(
         spawn_ctx,
-        max_concurrent_inference=1,
-        vae_decode_semaphore_max=1,
+        per_card={
+            0: CardConcurrency(
+                target_process_count=1,
+                max_concurrent_inference=1,
+                inference_semaphore_size=1,
+                vae_decode_semaphore_size=1,
+                gpu_sampling_lease_slots=1,
+            ),
+        },
     )
 
     # A Queue's internal lock is a SemLock; _is_fork_ctx is True only when built from a fork context,
@@ -37,9 +44,9 @@ def test_primitives_bind_to_passed_spawn_context() -> None:
     assert primitives.process_message_queue._rlock._is_fork_ctx is False  # noqa: SLF001
     assert primitives.disk_lock._is_fork_ctx is False  # noqa: SLF001
     assert primitives.aux_model_lock._is_fork_ctx is False  # noqa: SLF001
-    assert primitives.inference_semaphore._is_fork_ctx is False  # noqa: SLF001
-    assert primitives.vae_decode_semaphore._is_fork_ctx is False  # noqa: SLF001
-    assert primitives.gpu_sampling_lease._is_fork_ctx is False  # noqa: SLF001
+    assert primitives.inference_semaphores[0]._is_fork_ctx is False  # noqa: SLF001
+    assert primitives.vae_decode_semaphores[0]._is_fork_ctx is False  # noqa: SLF001
+    assert primitives.gpu_sampling_leases[0]._is_fork_ctx is False  # noqa: SLF001
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="fork start method is POSIX-only; the bug cannot occur on Windows")

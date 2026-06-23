@@ -31,6 +31,7 @@ from horde_worker_regen.process_management.worker_state import WorkerState
 from .conftest import (
     make_job_pop_response,
     make_mock_process_info,
+    make_test_card_runtimes,
     make_test_runtime_config,
     track_popped_job_async,
 )
@@ -55,14 +56,11 @@ def _make_plm(*, process_map: ProcessMap, horde_model_map: HordeModelMap) -> Pro
         horde_model_map=horde_model_map,
         job_tracker=JobTracker(),
         process_message_queue=Mock(),
-        inference_semaphore=Mock(),
+        card_runtimes=make_test_card_runtimes(target_process_count=4),
         disk_lock=Mock(),
         aux_model_lock=Mock(),
-        vae_decode_semaphore=Mock(),
-        gpu_sampling_lease=Mock(),
         download_bandwidth_semaphore=Mock(),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
-        max_inference_processes=4,
         max_safety_processes=1,
         amd_gpu=False,
         directml=None,
@@ -137,7 +135,7 @@ async def test_unexpected_process_ended_during_preload_is_recovered() -> None:
     recovered = plm._reap_if_crashed(dead)
 
     assert recovered is True
-    plm._start_inference_process.assert_called_once_with(1)
+    plm._start_inference_process.assert_called_once_with(1, device_index=0)
     assert plm._num_process_recoveries == 1
     # The stale entry is gone, so preload_models no longer treats the model as resident on the dead slot.
     assert "stable_diffusion" not in model_map.root
@@ -235,7 +233,7 @@ async def test_inference_crash_reported_as_process_ended_is_recovered() -> None:
     recovered = plm._reap_if_crashed(dead)
 
     assert recovered is True
-    plm._start_inference_process.assert_called_once_with(1)
+    plm._start_inference_process.assert_called_once_with(1, device_index=0)
     assert plm._num_process_recoveries == 1
     assert "stable_diffusion_xl" not in model_map.root
 

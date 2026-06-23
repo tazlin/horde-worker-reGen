@@ -105,6 +105,7 @@ class FakeInferenceProcess(HordeProcess):
         disk_lock: Lock,
         process_launch_identifier: int,
         *,
+        device_index: int = 0,
         job_delay_seconds: float = 0.0,
         fail_every_n: int = 0,
         fault_profile: FaultProfile | None = None,
@@ -119,6 +120,7 @@ class FakeInferenceProcess(HordeProcess):
                 released around each fake job so concurrency control is still exercised.
             disk_lock (Lock): The lock to use for disk access.
             process_launch_identifier (int): The unique identifier for this launch.
+            device_index (int, optional): The stable index of the GPU this process is attributed to. Defaults to 0.
             job_delay_seconds (float, optional): How long each fake inference job takes. Defaults to 0.0.
             fail_every_n (int, optional): If > 0, every nth job reports a faulted result instead of \
                 images. Defaults to 0 (never fail).
@@ -131,6 +133,7 @@ class FakeInferenceProcess(HordeProcess):
             pipe_connection=pipe_connection,
             disk_lock=disk_lock,
             process_launch_identifier=process_launch_identifier,
+            device_index=device_index,
         )
         self._inference_semaphore = inference_semaphore
         self._job_delay_seconds = job_delay_seconds
@@ -596,6 +599,8 @@ def start_fake_inference_process(
     vae_decode_semaphore: Semaphore,
     process_launch_identifier: int,
     *,
+    device_index: int = 0,
+    accelerator_kind: str | None = None,
     low_memory_mode: bool = False,
     amd_gpu: bool = False,
     directml: int | None = None,
@@ -627,6 +632,7 @@ def start_fake_inference_process(
             inference_semaphore=inference_semaphore,
             disk_lock=disk_lock,
             process_launch_identifier=process_launch_identifier,
+            device_index=device_index,
             job_delay_seconds=dry_run_inference_delay,
             fail_every_n=fail_every_n,
             fault_profile=fault_profile,
@@ -648,6 +654,8 @@ def start_fake_safety_process(
     process_launch_identifier: int,
     cpu_only: bool = True,
     *,
+    device_index: int = 0,
+    accelerator_kind: str | None = None,
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_safety: bool = False,

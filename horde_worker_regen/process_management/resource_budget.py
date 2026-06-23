@@ -64,6 +64,7 @@ def is_model_locally_unservable_for(
     job_tracker: JobTracker,
     model: str | None,
     *,
+    device_index: int | None = None,
     now: float | None = None,
 ) -> bool:
     """Return whether ``model`` is currently held back as locally unservable, per config and fault history.
@@ -72,6 +73,14 @@ def is_model_locally_unservable_for(
     selection, so popping and admitting never disagree on which models are held back. Reads the configured
     breaker thresholds from ``bridge_data`` and the per-model fault streak from ``job_tracker``. Tolerant of
     partially-mocked config: a non-integer threshold (or one ``<= 0``) disables the breaker.
+
+    Args:
+        bridge_data: The worker config carrying the breaker threshold and cooldown.
+        job_tracker: The job tracker holding the per-(model, card) fault streak.
+        model: The model to test, or None (never unservable).
+        device_index: The card to test the streak on. With None (single-GPU, or a worker-wide query) the
+            worst streak across every card is used, so the single-GPU reading is unchanged.
+        now: Optional time override for the cooldown comparison.
     """
     if model is None:
         return False
@@ -82,8 +91,8 @@ def is_model_locally_unservable_for(
     cooldown_is_numeric = isinstance(cooldown, (int, float)) and not isinstance(cooldown, bool)
     cooldown_seconds = float(cooldown) if cooldown_is_numeric else 0.0
     return is_model_locally_unservable(
-        overbudget_fault_count=job_tracker.get_model_overbudget_fault_count(model),
-        last_overbudget_fault_time=job_tracker.model_last_overbudget_fault_time(model),
+        overbudget_fault_count=job_tracker.get_model_overbudget_fault_count(model, device_index=device_index),
+        last_overbudget_fault_time=job_tracker.model_last_overbudget_fault_time(model, device_index=device_index),
         threshold=threshold,
         cooldown_seconds=cooldown_seconds,
         now=now,
@@ -902,6 +911,15 @@ class CommittedReserveLedger:
     def total_vram_mb(self) -> float:
         """Return the combined committed VRAM (MB) across all flows."""
         return sum(self._vram_mb.values())
+
+    def total_vram_mb_excluding(self, flow: str) -> float:
+        """Return the combined committed VRAM (MB) across every flow except ``flow``.
+
+        Lets a per-card VRAM gate substitute that card's own share of a card-attributed flow (image
+        post-processing) for the worker-wide aggregate, while still charging the flows that are not
+        card-attributed (alchemy) against the card.
+        """
+        return sum(mb for (registered_flow, _unit), mb in self._vram_mb.items() if registered_flow != flow)
 
     def total_ram_mb(self) -> float:
         """Return the combined committed RAM (MB) across all flows."""

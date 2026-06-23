@@ -17,7 +17,12 @@ from horde_worker_regen.process_management.process_lifecycle import ProcessLifec
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
-from .conftest import make_mock_process_info, make_test_runtime_config, track_popped_job_async
+from .conftest import (
+    make_mock_process_info,
+    make_test_card_runtimes,
+    make_test_runtime_config,
+    track_popped_job_async,
+)
 
 
 def _make_plm(
@@ -45,14 +50,11 @@ def _make_plm(
         horde_model_map=Mock(),
         job_tracker=job_tracker or JobTracker(),
         process_message_queue=Mock(),
-        inference_semaphore=Mock(),
+        card_runtimes=make_test_card_runtimes(target_process_count=2),
         disk_lock=Mock(),
         aux_model_lock=Mock(),
-        vae_decode_semaphore=Mock(),
-        gpu_sampling_lease=Mock(),
         download_bandwidth_semaphore=Mock(),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
-        max_inference_processes=2,
         max_safety_processes=1,
         amd_gpu=False,
         directml=None,
@@ -239,7 +241,7 @@ def test_intentional_reclaim_is_not_counted_as_a_crash_recovery() -> None:
 
     assert plm._num_process_recoveries == 0
     assert plm._slot_recovery_history.get(1, []) == []
-    plm._start_inference_process.assert_called_once_with(1)
+    plm._start_inference_process.assert_called_once_with(1, device_index=0)
 
 
 def test_crash_replacement_still_counts_as_a_recovery() -> None:
@@ -434,8 +436,9 @@ def test_end_safety_processes_stops_starting_process_and_marks_intent() -> None:
 def _patch_spawn_with_stub(plm: ProcessLifecycleManager) -> None:
     """Replace real process spawning with a stub that adds an idle mock process to the map."""
 
-    def _fake_start(pid: int) -> HordeProcessInfo:
+    def _fake_start(pid: int, *, device_index: int = 0) -> HordeProcessInfo:
         info = make_mock_process_info(pid, model_name=None, process_type=HordeProcessType.INFERENCE)
+        info.device_index = device_index
         plm._process_map[pid] = info
         plm.num_processes_launched += 1
         return info
@@ -636,5 +639,5 @@ def test_reap_if_crashed_recovers_unintended_ended_process() -> None:
     assert crashed.end_intended is False
 
     assert plm._reap_if_crashed(crashed) is True
-    plm._start_inference_process.assert_called_once_with(3)
+    plm._start_inference_process.assert_called_once_with(3, device_index=0)
     assert plm._num_process_recoveries == 1

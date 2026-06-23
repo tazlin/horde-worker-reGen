@@ -22,7 +22,7 @@ import aiohttp
 import aiohttp.client_exceptions
 import certifi
 from aiohttp import ClientSession
-from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_manager import ModelReferenceManager
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk import RequestErrorResponse
@@ -44,6 +44,7 @@ from pydantic import ValidationError
 from horde_worker_regen.app_state import AppStateStore, WorkerRunRecord, default_app_state_dir
 from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+from horde_worker_regen.bridge_data.gpu_config import resolve_all_effective_gpu_configs
 from horde_worker_regen.bridge_data.load_config import BridgeDataLoader
 from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities
 from horde_worker_regen.consts import (
@@ -55,6 +56,7 @@ from horde_worker_regen.process_management._canned_scenarios import CannedAlchem
 from horde_worker_regen.process_management.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.alchemy_popper import DEFAULT_ALCHEMY_FORMS, AlchemyCoordinator
 from horde_worker_regen.process_management.api_sessions import ApiSessions
+from horde_worker_regen.process_management.card_runtime import CardRuntime
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.duty_cycle import DutyCycleSummary, summarize_duty_cycle
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
@@ -161,6 +163,12 @@ class SystemResources:
 
         total_ram = psutil.virtual_memory().total
 
+        # Pin CUDA enumeration to physical PCI-bus order so a device index maps to a fixed physical slot
+        # across reboots/driver changes. With multi-GPU this is what makes gpu_device_indices/gpu_overrides
+        # (and the per-card device pinning in the children, which inherit this env) refer to stable cards.
+        # setdefault so a deliberate operator override still wins; the probe subprocess inherits it.
+        os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
         accelerators = probe_accelerators()
         device_map = TorchDeviceMap(root={})
         for accelerator in accelerators:
@@ -168,6 +176,7 @@ class SystemResources:
                 device_name=accelerator.name,
                 device_index=accelerator.index,
                 total_memory=accelerator.total_vram_mb * 1024 * 1024,
+                kind=accelerator.kind,
             )
 
         per_process_overhead_mb = max((a.runtime_overhead_mb for a in accelerators), default=0)
@@ -179,6 +188,40 @@ class SystemResources:
             per_process_overhead_mb=per_process_overhead_mb,
             marginal_process_overhead_mb=marginal_process_overhead_mb,
         )
+
+
+def _select_driven_devices(
+    device_map: TorchDeviceMap,
+    configured_indices: list[int] | None,
+) -> TorchDeviceMap:
+    """Filter the detected device map to the cards this worker should drive.
+
+    ``configured_indices`` None means auto-detect: drive every detected accelerator. An explicit list opts
+    the worker into a subset (e.g. a multi-GPU box pinned to one card); the indices are stable PCI-bus
+    indices (see :meth:`SystemResources.detect`). Indices not present in the detected map are warned about
+    and ignored, and a list that matches nothing falls back to all detected devices rather than leaving the
+    worker with no cards. Returns the map unchanged when no accelerators were detected (CPU/dry-run/test
+    paths) so those never break.
+    """
+    # Anything that is not an explicit list (None, or a partially-mocked bridge_data in tests) means
+    # auto-detect: drive every detected device.
+    if not device_map.root or not isinstance(configured_indices, list):
+        return device_map
+    requested = list(dict.fromkeys(configured_indices))  # de-dup, preserve operator order
+    missing = [index for index in requested if index not in device_map.root]
+    if missing:
+        logger.warning(
+            f"gpu_device_indices requested device(s) {missing} that are not present "
+            f"(detected: {sorted(device_map.root)}); ignoring those.",
+        )
+    selected = {index: device_map.root[index] for index in requested if index in device_map.root}
+    if not selected:
+        logger.warning(
+            f"gpu_device_indices {requested} matched no detected devices "
+            f"(detected: {sorted(device_map.root)}); driving all detected devices instead.",
+        )
+        return device_map
+    return TorchDeviceMap(root=selected)
 
 
 def _resolve_inference_concurrency(
@@ -205,32 +248,93 @@ def _resolve_inference_concurrency(
     return max_concurrent_inference_processes, lease_slots
 
 
+@dataclasses.dataclass(frozen=True)
+class CardConcurrency:
+    """Resolved concurrency sizes for one card, mirroring the pre-multi-GPU single-pool computation.
+
+    On a single-GPU host this reproduces exactly the values the old global computation produced, so a
+    one-card worker spawns the same process count with the same semaphore sizes as before.
+    """
+
+    target_process_count: int
+    """How many inference processes this card runs (``queue_size`` + concurrency ceiling)."""
+    max_concurrent_inference: int
+    """This card's concurrent-sampling ceiling (the inference-semaphore size when the lease is disabled)."""
+    inference_semaphore_size: int
+    """Permits on this card's inference semaphore (opened up to the process count when the lease is on)."""
+    vae_decode_semaphore_size: int
+    """Permits on this card's VAE-decode semaphore (always 1 today)."""
+    gpu_sampling_lease_slots: int
+    """Concurrent denoise loops allowed on this card when the GPU sampling lease is enabled."""
+
+
+def resolve_card_concurrency(
+    *,
+    max_threads: int,
+    queue_size: int,
+    num_models_to_load: int,
+    gpu_sampling_lease_enabled: bool,
+    gpu_sampling_lease_slots: int,
+    max_threads_ceiling: int,
+) -> CardConcurrency:
+    """Resolve one card's concurrency sizes from its effective config (the per-card analogue of the globals).
+
+    Mirrors the old single-pool computation: a ceiling of ``max(max_threads, max_threads_ceiling)``, a
+    process count of ``queue_size + ceiling`` collapsed to 1 for the single-model/single-thread case, and
+    the lease-aware inference-semaphore size from :func:`_resolve_inference_concurrency`. Passing one card's
+    effective values reproduces today's globals exactly for a single-GPU host.
+    """
+    ceiling = max(max_threads, max_threads_ceiling)
+    max_concurrent = ceiling
+    target_process_count = queue_size + ceiling
+    if num_models_to_load == 1 and max_concurrent == 1:
+        target_process_count = 1
+    inference_semaphore_size, lease_slots = _resolve_inference_concurrency(
+        gpu_sampling_lease_enabled=gpu_sampling_lease_enabled,
+        configured_lease_slots=gpu_sampling_lease_slots,
+        max_concurrent_inference_processes=max_concurrent,
+        max_inference_processes=target_process_count,
+    )
+    return CardConcurrency(
+        target_process_count=target_process_count,
+        max_concurrent_inference=max_concurrent,
+        inference_semaphore_size=inference_semaphore_size,
+        vae_decode_semaphore_size=1,
+        gpu_sampling_lease_slots=lease_slots,
+    )
+
+
 @dataclasses.dataclass
 class MultiprocessingPrimitives:
-    """Multiprocessing primitives created for IPC."""
+    """Multiprocessing primitives created for IPC.
+
+    The GPU-concurrency gates (inference / VAE-decode / sampling-lease semaphores) are held **per card**:
+    each driven GPU gets its own so one card's sampling cannot block another's. On a single-GPU host each
+    map has exactly one entry keyed by index 0, sized identically to the old single semaphores. The
+    process message queue, disk/aux locks, and download-bandwidth semaphore are genuinely shared across
+    all cards and stay singular.
+    """
 
     process_message_queue: ProcessQueue
-    inference_semaphore: Semaphore
+    inference_semaphores: dict[int, Semaphore]
     disk_lock: Lock_MultiProcessing
     aux_model_lock: Lock_MultiProcessing
-    vae_decode_semaphore: Semaphore
-    gpu_sampling_lease: Semaphore
-    """Serializes the GPU denoising loop across inference processes so they pipeline (one
-    samples while others stage their next pipeline) rather than idling the GPU in lockstep.
-    Sized to the number of GPU sampling slots (1 for a single GPU)."""
+    vae_decode_semaphores: dict[int, Semaphore]
+    gpu_sampling_leases: dict[int, Semaphore]
+    """Per-card GPU sampling lease: serializes that card's denoising loop across its inference processes so
+    they pipeline (one samples while others stage their next pipeline) rather than idling the GPU."""
     download_bandwidth_semaphore: Semaphore
     """Held by the background download process while it is actively downloading, so the parent can
-    coordinate pop policy around WAN-bandwidth contention."""
+    coordinate pop policy around WAN-bandwidth contention. Shared (downloads are not per-card)."""
 
     @classmethod
     def create(
         cls,
         ctx: BaseContext,
-        max_concurrent_inference: int,
-        vae_decode_semaphore_max: int,
-        gpu_sampling_lease_slots: int = 1,
+        *,
+        per_card: dict[int, CardConcurrency],
     ) -> MultiprocessingPrimitives:
-        """Create real multiprocessing primitives from a context.
+        """Create real multiprocessing primitives from a context, one semaphore set per driven card.
 
         The GPU-concurrency gates are BoundedSemaphores, not plain Semaphores, for a reason that is
         load-bearing for crash recovery: a child acquires these inside its own process, so when it
@@ -251,11 +355,20 @@ class MultiprocessingPrimitives:
             # context"). The worker happens to dodge this only because _prepare_runtime forces the global
             # start method to spawn; the benchmark never does, so binding to ctx is the real fix.
             process_message_queue=ctx.Queue(),
-            inference_semaphore=BoundedSemaphore_MultiProcessing(max_concurrent_inference, ctx=ctx),
+            inference_semaphores={
+                index: BoundedSemaphore_MultiProcessing(card.inference_semaphore_size, ctx=ctx)
+                for index, card in per_card.items()
+            },
             disk_lock=Lock_MultiProcessing(ctx=ctx),
             aux_model_lock=Lock_MultiProcessing(ctx=ctx),
-            vae_decode_semaphore=BoundedSemaphore_MultiProcessing(vae_decode_semaphore_max, ctx=ctx),
-            gpu_sampling_lease=BoundedSemaphore_MultiProcessing(max(1, gpu_sampling_lease_slots), ctx=ctx),
+            vae_decode_semaphores={
+                index: BoundedSemaphore_MultiProcessing(card.vae_decode_semaphore_size, ctx=ctx)
+                for index, card in per_card.items()
+            },
+            gpu_sampling_leases={
+                index: BoundedSemaphore_MultiProcessing(max(1, card.gpu_sampling_lease_slots), ctx=ctx)
+                for index, card in per_card.items()
+            },
             download_bandwidth_semaphore=BoundedSemaphore_MultiProcessing(1, ctx=ctx),
         )
 
@@ -409,10 +522,9 @@ class HordeWorkerProcessManager:
     _process_message_queue: ProcessQueue
     """A queue of messages sent from child processes."""
 
-    _inference_semaphore: Semaphore
-    """A semaphore that limits the number of inference processes that can run at once."""
-
-    _vae_decode_semaphore: Semaphore
+    _card_runtimes: dict[int, CardRuntime]
+    """Per-card runtime plan keyed by stable device index: each card's effective config, concurrency
+    semaphores, and process count. A single-GPU host has one entry (index 0) sized as before."""
 
     _disk_lock: Lock_MultiProcessing
     """A lock to prevent multiple processes from accessing the disk at once."""
@@ -535,15 +647,8 @@ class HordeWorkerProcessManager:
         # effective cap is read via the max_concurrent_inference_processes property below.
         self._max_concurrent_inference_processes = ceiling
 
-        self.max_inference_processes = self.bridge_data.queue_size + ceiling
-
-        self._lru = LRUCache(self.max_inference_processes)
-
         self._amd_gpu = amd_gpu
         self._directml = directml
-
-        if len(self.bridge_data.image_models_to_load) == 1 and self.max_concurrent_inference_processes == 1:
-            self.max_inference_processes = 1
 
         self._job_tracker = JobTracker()
 
@@ -553,7 +658,47 @@ class HordeWorkerProcessManager:
             system_resources = SystemResources.detect()
 
         self.total_ram_bytes = system_resources.total_ram_bytes
-        self._device_map = system_resources.device_map
+        # Restrict to the cards this worker drives (all detected unless gpu_device_indices opts into a subset).
+        self._device_map = _select_driven_devices(
+            system_resources.device_map,
+            self.bridge_data.gpu_device_indices,
+        )
+        logger.debug(f"Driving device indices: {sorted(self._device_map.root)}")
+
+        # Build the per-card runtime plan (effective config + concurrency sizes + per-card semaphores) and,
+        # unless a test injected them, the multiprocessing primitives sized for it. A single-GPU host yields
+        # a one-entry map whose process count and semaphore sizes equal the old global computation, so the
+        # total process count and LRU capacity stay identical for one card.
+        self._card_runtimes, mp_primitives = self._build_card_runtimes(
+            ctx=ctx,
+            mp_primitives=mp_primitives,
+            max_threads_ceiling=ceiling,
+        )
+        self.max_inference_processes = sum(card.target_process_count for card in self._card_runtimes.values())
+        self._lru = LRUCache(self.max_inference_processes)
+
+        # Multi-GPU is auto-all by default, so a host that previously only used card 0 now drives every
+        # card under this one identity. Warn prominently in that auto-detected case (not when the operator
+        # explicitly chose the cards) so anyone still running a separate worker per card notices and opts out.
+        if len(self._card_runtimes) > 1 and self.bridge_data.gpu_device_indices is None:
+            logger.warning(
+                f"Multi-GPU: auto-detected {len(self._card_runtimes)} GPUs (indices "
+                f"{sorted(self._card_runtimes)}); this single worker identity now drives all of them under "
+                "one name and one job queue. If you run a separate worker per card, set gpu_device_indices "
+                "(or pass --gpu-device-indices) to pin this worker to specific card(s).",
+            )
+
+        # The legacy --directml=N flag is inherently a single-device selection, so it stays authoritative:
+        # every inference process targets that one adapter. Multi-GPU DirectML is instead opted into via
+        # gpu_device_indices *without* --directml, where each card derives its own --directml index. Warn so
+        # an operator on a multi-adapter DirectML box is not surprised that the explicit flag pins them all.
+        if self._directml is not None and len(self._card_runtimes) > 1:
+            logger.warning(
+                f"--directml={self._directml} selects a single DirectML adapter, so all "
+                f"{len(self._card_runtimes)} driven cards' inference processes will target adapter "
+                f"{self._directml}. For multi-GPU DirectML, omit --directml and set gpu_device_indices to "
+                "the adapter indices instead.",
+            )
 
         self.target_ram_overhead_bytes = min(int(self.total_ram_bytes / 2), 9 * 1024 * 1024 * 1024)
 
@@ -590,34 +735,11 @@ class HordeWorkerProcessManager:
                 logger.warning(e)
                 logger.warning("Error trying to unset maintenance. Did this worker not exist yet?")
 
-        if mp_primitives is None:
-            vae_decode_semaphore_max = 1
-
-            # The lease is an independent denoise gate (see _resolve_inference_concurrency): with
-            # it enabled the whole-job inference semaphore opens to every process so spare
-            # processes can stage their next pipeline (model load, prompt encode) ahead while
-            # others sample; the lease itself bounds concurrent denoise loops. Without it the
-            # inference semaphore stays the sole sampling gate at the concurrent-sampling count.
-            inference_semaphore_size, gpu_sampling_lease_slots = _resolve_inference_concurrency(
-                gpu_sampling_lease_enabled=self.bridge_data.gpu_sampling_lease_enabled,
-                configured_lease_slots=self.bridge_data.gpu_sampling_lease_slots,
-                max_concurrent_inference_processes=self._max_concurrent_inference_processes,
-                max_inference_processes=self.max_inference_processes,
-            )
-
-            mp_primitives = MultiprocessingPrimitives.create(
-                ctx=ctx,
-                max_concurrent_inference=inference_semaphore_size,
-                vae_decode_semaphore_max=vae_decode_semaphore_max,
-                gpu_sampling_lease_slots=gpu_sampling_lease_slots,
-            )
-
+        # The per-card inference / VAE / sampling-lease semaphores live on self._card_runtimes (built
+        # above); only the genuinely shared primitives are read out here.
         self._process_message_queue = mp_primitives.process_message_queue
-        self._inference_semaphore = mp_primitives.inference_semaphore
         self._disk_lock = mp_primitives.disk_lock
         self._aux_model_lock = mp_primitives.aux_model_lock
-        self._vae_decode_semaphore = mp_primitives.vae_decode_semaphore
-        self._gpu_sampling_lease = mp_primitives.gpu_sampling_lease
         self._download_bandwidth_semaphore = mp_primitives.download_bandwidth_semaphore
 
         # Take ownership of child OS pids so a parent that died hard can have its orphaned children
@@ -643,15 +765,12 @@ class HordeWorkerProcessManager:
             horde_model_map=self._horde_model_map,
             job_tracker=self._job_tracker,
             process_message_queue=self._process_message_queue,
-            inference_semaphore=self._inference_semaphore,
+            card_runtimes=self._card_runtimes,
             disk_lock=self._disk_lock,
             aux_model_lock=self._aux_model_lock,
-            vae_decode_semaphore=self._vae_decode_semaphore,
-            gpu_sampling_lease=self._gpu_sampling_lease,
             download_bandwidth_semaphore=self._download_bandwidth_semaphore,
             gpu_sampling_lease_enabled=self.bridge_data.gpu_sampling_lease_enabled,
             runtime_config=self._runtime_config,
-            max_inference_processes=self.max_inference_processes,
             max_safety_processes=self.max_safety_processes,
             amd_gpu=self._amd_gpu,
             directml=self._directml,
@@ -736,6 +855,7 @@ class HordeWorkerProcessManager:
             process_lifecycle=self._process_lifecycle,
             runtime_config=self._runtime_config,
             model_metadata=self._model_metadata,
+            card_runtimes=self._card_runtimes,
             max_concurrent_inference_processes=self._max_concurrent_inference_processes,
             max_inference_processes=self.max_inference_processes,
             lru=self._lru,
@@ -789,6 +909,8 @@ class HordeWorkerProcessManager:
             dry_run_skip_api=bridge_data.dry_run_skip_api,
             canned_job_source=canned_job_source,
             model_availability=self._model_availability,
+            card_runtimes=self._card_runtimes,
+            model_metadata=self._model_metadata,
         )
 
         self._alchemy_coordinator = AlchemyCoordinator(
@@ -812,6 +934,69 @@ class HordeWorkerProcessManager:
                 )
             self.stable_diffusion_reference = None
             self._init_model_reference()
+
+    def _build_card_runtimes(
+        self,
+        *,
+        ctx: BaseContext,
+        mp_primitives: MultiprocessingPrimitives | None,
+        max_threads_ceiling: int,
+    ) -> tuple[dict[int, CardRuntime], MultiprocessingPrimitives]:
+        """Build the per-card runtime plan and, unless injected, the multiprocessing primitives for it.
+
+        Resolves each driven card's effective config and concurrency sizes, creates (or reuses an injected)
+        :class:`MultiprocessingPrimitives` sized per card, and assembles one :class:`CardRuntime` per card.
+        Masking is enabled only when there is a real choice to make -- more than one card, or an explicit
+        ``gpu_device_indices`` selection -- so a default single-GPU host stays unmasked and byte-identical.
+        A host with no detected accelerator (CPU/dry-run) yields a single notional card 0.
+
+        Args:
+            ctx: The multiprocessing context (used only when primitives must be created).
+            mp_primitives: Pre-created primitives (injected by tests), or None to create real ones.
+            max_threads_ceiling: The session-wide concurrency ceiling applied to each card.
+
+        Returns:
+            A 2-tuple of the per-card runtime map (keyed by stable device index) and the primitives used.
+        """
+        bridge_data = self.bridge_data
+        device_indices = sorted(self._device_map.root) or [0]
+        effective_configs = resolve_all_effective_gpu_configs(bridge_data, device_indices)
+        per_card_concurrency = {
+            index: resolve_card_concurrency(
+                max_threads=effective_configs[index].max_threads,
+                queue_size=effective_configs[index].queue_size,
+                num_models_to_load=len(effective_configs[index].image_models_to_load),
+                gpu_sampling_lease_enabled=effective_configs[index].gpu_sampling_lease_enabled,
+                gpu_sampling_lease_slots=effective_configs[index].gpu_sampling_lease_slots,
+                max_threads_ceiling=max_threads_ceiling,
+            )
+            for index in device_indices
+        }
+        if mp_primitives is None:
+            mp_primitives = MultiprocessingPrimitives.create(ctx=ctx, per_card=per_card_concurrency)
+
+        should_mask = len(device_indices) > 1 or bridge_data.gpu_device_indices is not None
+        card_runtimes: dict[int, CardRuntime] = {}
+        for index in device_indices:
+            device_info = self._device_map.root.get(index)
+            kind = device_info.kind if device_info is not None else "cuda"
+            # Total VRAM (bytes -> MB) for the heterogeneous weight-fit check; None when capacity is unknown
+            # (a notional CPU/dry-run card 0 has no device_info), where the eligibility check abstains.
+            total_vram_mb = (device_info.total_memory / (1024 * 1024)) if device_info is not None else None
+            concurrency = per_card_concurrency[index]
+            card_runtimes[index] = CardRuntime(
+                device_index=index,
+                kind=kind,
+                config=effective_configs[index],
+                total_vram_mb=total_vram_mb,
+                inference_semaphore=mp_primitives.inference_semaphores[index],
+                vae_decode_semaphore=mp_primitives.vae_decode_semaphores[index],
+                gpu_sampling_lease=mp_primitives.gpu_sampling_leases[index],
+                target_process_count=concurrency.target_process_count,
+                max_concurrent_inference=concurrency.max_concurrent_inference,
+                mask_kind=(kind if should_mask else None),
+            )
+        return card_runtimes, mp_primitives
 
     def _init_model_reference(self) -> None:
         """Fetch the stable diffusion model reference, retrying on failure."""

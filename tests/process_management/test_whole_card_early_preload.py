@@ -259,7 +259,7 @@ class TestResidencyConvergesAfterDrain:
 
         scheduler.preload_models()
 
-        scheduler._process_lifecycle.scale_inference_processes.assert_called_with(1)
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_with(1, device_index=None)
 
 
 def _live_log_overlap_scheduler(

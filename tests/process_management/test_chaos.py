@@ -27,7 +27,7 @@ from horde_worker_regen.process_management.process_lifecycle import (
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
-from .conftest import make_mock_process_info, make_test_runtime_config
+from .conftest import make_mock_process_info, make_test_card_runtimes, make_test_runtime_config
 
 
 def _make_plm(*, process_map: ProcessMap | None = None) -> ProcessLifecycleManager:
@@ -51,14 +51,11 @@ def _make_plm(*, process_map: ProcessMap | None = None) -> ProcessLifecycleManag
         horde_model_map=Mock(),
         job_tracker=JobTracker(),
         process_message_queue=Mock(),
-        inference_semaphore=Mock(),
+        card_runtimes=make_test_card_runtimes(target_process_count=2),
         disk_lock=Mock(),
         aux_model_lock=Mock(),
-        vae_decode_semaphore=Mock(),
-        gpu_sampling_lease=Mock(),
         download_bandwidth_semaphore=Mock(),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
-        max_inference_processes=2,
         max_safety_processes=1,
         amd_gpu=False,
         directml=None,
@@ -124,14 +121,15 @@ def test_crash_in_postprocessing_releases_inference_semaphore() -> None:
 
     plm._replace_inference_process(dead)
 
-    plm._inference_semaphore.release.assert_called()  # pyrefly: ignore
+    # The dead slot's own card's inference semaphore is the one that must be released (single-GPU = card 0).
+    plm._card_runtimes[0].inference_semaphore.release.assert_called()  # pyrefly: ignore
 
 
 def test_crash_looping_slot_is_eventually_quarantined() -> None:
     """A slot that dies on every launch must stop being respawned after a few attempts (circuit breaker)."""
     spawn_count = 0
 
-    def _respawn_dead(pid: int) -> None:
+    def _respawn_dead(pid: int, *, device_index: int = 0) -> None:
         nonlocal spawn_count
         spawn_count += 1
         replacement = make_mock_process_info(pid, model_name=None, state=HordeProcessState.PROCESS_STARTING)
@@ -173,7 +171,7 @@ def test_quarantine_is_recorded_in_action_ledger() -> None:
     """A crash-looped slot records a PROCESS_QUARANTINED audit event when taken out of the pool."""
     spawn_count = 0
 
-    def _respawn_dead(pid: int) -> None:
+    def _respawn_dead(pid: int, *, device_index: int = 0) -> None:
         nonlocal spawn_count
         spawn_count += 1
         replacement = make_mock_process_info(pid, model_name=None, state=HordeProcessState.PROCESS_STARTING)

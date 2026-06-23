@@ -154,6 +154,11 @@ class TrackedJob:
     concurrent pre-staging/dispatch of other models so a second resident model cannot push free VRAM to ~0
     and spill this job's weights to system RAM (the live storm's mechanism). It also earns a per-step hang
     grace (``overbudget_step_timeout``) so its legitimately slow steps are not killed as a hang."""
+    last_dispatched_device_index: int | None = None
+    """The card this job was last dispatched to, or None on a single-GPU host (no card attribution).
+
+    Keys this model's over-budget fault streak per card so a model unservable on a small card can still be
+    advertised and run on a larger one. None on single-GPU keeps the streak worker-wide, exactly as before."""
 
 
 @dataclass(frozen=True)
@@ -204,8 +209,11 @@ class JobTracker:
         # manager apply the configured thresholds). A model the device genuinely cannot run faults every
         # attempt no matter how it is isolated; tracked here so the worker can stop popping/admitting it
         # before the horde server forces maintenance for "dropping too many jobs".
-        self._model_overbudget_fault_counts: dict[str, int] = {}
-        self._model_last_overbudget_fault_time: dict[str, float] = {}
+        # Keyed by (model, device_index): the over-budget fault streak is per card, so a model unservable on
+        # a small card is still advertised/run on a larger one. device_index is None on a single-GPU host, so
+        # the keying collapses to one entry per model -- behaviourally identical to the prior model-only keys.
+        self._model_overbudget_fault_counts: dict[tuple[str, int | None], int] = {}
+        self._model_last_overbudget_fault_time: dict[tuple[str, int | None], float] = {}
         self._recent_resource_fault_times: list[float] = []
 
         # Defaults to one attempt (no retry: the pre-resiliency behaviour) so a directly-constructed
@@ -221,36 +229,76 @@ class JobTracker:
     _RESOURCE_FAULT_RETENTION_SECONDS = 3600.0
     """How long resource-fault timestamps are retained for the self-throttle window query."""
 
-    def _record_resource_fault(self, model: str | None) -> None:
-        """Record a terminal resource/OOM fault (per-model streak + global timestamp for self-throttle)."""
+    def _record_resource_fault(self, model: str | None, *, device_index: int | None = None) -> None:
+        """Record a terminal resource/OOM fault (per-(model, card) streak + global timestamp for throttle).
+
+        Args:
+            model: The faulting job's model, or None (no per-model streak then).
+            device_index: The card the job ran on, or None on a single-GPU host (worker-wide streak).
+        """
         now = time.time()
         self._recent_resource_fault_times.append(now)
         cutoff = now - self._RESOURCE_FAULT_RETENTION_SECONDS
         self._recent_resource_fault_times = [t for t in self._recent_resource_fault_times if t >= cutoff]
         if model is None:
             return
-        self._model_overbudget_fault_counts[model] = self._model_overbudget_fault_counts.get(model, 0) + 1
-        self._model_last_overbudget_fault_time[model] = now
+        key = (model, device_index)
+        self._model_overbudget_fault_counts[key] = self._model_overbudget_fault_counts.get(key, 0) + 1
+        self._model_last_overbudget_fault_time[key] = now
 
-    def record_model_inference_success(self, model: str | None) -> None:
-        """Clear a model's over-budget fault streak after it successfully produces an inference result."""
+    def record_model_inference_success(self, model: str | None, *, device_index: int | None = None) -> None:
+        """Clear a model's over-budget fault streak after it produces a result on the card it ran on.
+
+        Args:
+            model: The succeeding job's model.
+            device_index: The card it ran on (clears just that card's streak); None clears every card's
+                streak for the model (a single-GPU success, or an unattributed one).
+        """
         if model is None:
             return
-        if self._model_overbudget_fault_counts.pop(model, None) is not None:
+        if device_index is None:
+            keys_to_clear = [key for key in self._model_overbudget_fault_counts if key[0] == model]
+            keys_to_clear += [
+                key
+                for key in self._model_last_overbudget_fault_time
+                if key[0] == model and key not in keys_to_clear
+            ]
+        else:
+            keys_to_clear = [(model, device_index)]
+        cleared = False
+        for key in keys_to_clear:
+            if self._model_overbudget_fault_counts.pop(key, None) is not None:
+                cleared = True
+            self._model_last_overbudget_fault_time.pop(key, None)
+        if cleared:
             logger.debug(f"Model {model} produced a result; clearing its over-budget fault streak.")
-        self._model_last_overbudget_fault_time.pop(model, None)
 
-    def get_model_overbudget_fault_count(self, model: str | None) -> int:
-        """Return the consecutive terminal over-budget fault count for ``model`` (0 if none)."""
+    def get_model_overbudget_fault_count(self, model: str | None, *, device_index: int | None = None) -> int:
+        """Return the consecutive terminal over-budget fault count for ``model`` (0 if none).
+
+        With ``device_index`` given, the streak for that card; with None, the worst (max) streak across every
+        card (so the single-GPU worker-wide reading, where there is one entry, is unchanged).
+        """
         if model is None:
             return 0
-        return self._model_overbudget_fault_counts.get(model, 0)
+        if device_index is not None:
+            return self._model_overbudget_fault_counts.get((model, device_index), 0)
+        counts = [
+            count for (key_model, _device), count in self._model_overbudget_fault_counts.items() if key_model == model
+        ]
+        return max(counts) if counts else 0
 
-    def model_last_overbudget_fault_time(self, model: str | None) -> float | None:
-        """Return the wall-clock time of ``model``'s last terminal over-budget fault, or None."""
+    def model_last_overbudget_fault_time(self, model: str | None, *, device_index: int | None = None) -> float | None:
+        """Return the wall-clock time of ``model``'s last terminal over-budget fault, or None.
+
+        With ``device_index`` given, the time for that card; with None, the most recent across every card.
+        """
         if model is None:
             return None
-        return self._model_last_overbudget_fault_time.get(model)
+        if device_index is not None:
+            return self._model_last_overbudget_fault_time.get((model, device_index))
+        times = [t for (key_model, _device), t in self._model_last_overbudget_fault_time.items() if key_model == model]
+        return max(times) if times else None
 
     def count_recent_resource_faults(self, window_seconds: float, now: float | None = None) -> int:
         """Return how many terminal resource/OOM faults occurred within the last ``window_seconds``."""
@@ -522,8 +570,19 @@ class JobTracker:
         self._job_faults.setdefault(job_pop_response.id_, [])
         return job_info
 
-    async def mark_inference_started(self, job: ImageGenerateJobPopResponse) -> None:
-        """Mark a job as started for inference."""
+    async def mark_inference_started(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        """Mark a job as started for inference, recording the card it was dispatched to.
+
+        Args:
+            job: The job entering inference.
+            device_index: The card it was dispatched to (multi-GPU), or None on a single-GPU host. Stored so
+                its over-budget fault streak (and the success that clears it) is keyed to that card.
+        """
         tracked = self._tracked_for(job)
         if tracked is None:
             if job.id_ is None:
@@ -537,7 +596,11 @@ class JobTracker:
                 job_info=None,
                 time_popped=None,
             )
+            new_tracked = self._tracked_for(job)
+            if new_tracked is not None:
+                new_tracked.last_dispatched_device_index = device_index
             return
+        tracked.last_dispatched_device_index = device_index
         self._set_stage(tracked, JobStage.INFERENCE_IN_PROGRESS)
 
     async def release_in_progress(self, job: ImageGenerateJobPopResponse) -> bool:
@@ -599,9 +662,12 @@ class JobTracker:
             )
             return
         tracked.job_info = job_info
-        # Inference produced a result: this model can run here, so clear any over-budget fault streak that
-        # may have flagged it locally unservable.
-        self.record_model_inference_success(job_info.sdk_api_job_info.model)
+        # Inference produced a result on the card it ran on: this model can run there, so clear that card's
+        # over-budget fault streak (None on a single-GPU host clears the worker-wide streak, as before).
+        self.record_model_inference_success(
+            job_info.sdk_api_job_info.model,
+            device_index=tracked.last_dispatched_device_index,
+        )
 
     async def queue_for_submit(self, job_info: HordeJobInfo) -> None:
         """Queue a job for submission."""
@@ -907,7 +973,10 @@ class JobTracker:
         # is isolated, so without this the worker keeps popping and dropping it until the horde server
         # forces maintenance; the scheduler/manager read these counters to stop the bleeding first.
         if resource_failure:
-            self._record_resource_fault(faulted_job.model)
+            # Key the streak to the card the job was dispatched to (recorded at mark_inference_started); None
+            # on a single-GPU host keeps it worker-wide. The live process's index is not used for the key so
+            # the fault and the success that clears it always agree on the card.
+            self._record_resource_fault(faulted_job.model, device_index=tracked.last_dispatched_device_index)
 
         if self._set_stage(tracked, JobStage.PENDING_SUBMIT):
             # A crash/timeout-faulted job never produces an inference RESULT message, so the

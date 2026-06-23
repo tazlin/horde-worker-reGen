@@ -154,6 +154,11 @@ class HordeProcessMemoryMessage(HordeProcessMessage):
     """The MB of VRAM used on the GPU."""
     vram_total_mb: int | None = None
     """The total MB of VRAM available on the GPU."""
+    device_index: int = 0
+    """The stable index of the GPU this process is pinned to (0 on a single-GPU host).
+
+    A device-pinned child measures its own (masked) device and reports under its global index, so the
+    parent can aggregate VRAM usage/total per card. Defaults to 0 for single-GPU and older children."""
 
 
 class HordeHeartbeatType(enum.Enum):

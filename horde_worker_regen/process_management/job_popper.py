@@ -9,6 +9,7 @@ import time
 from asyncio import CancelledError
 from typing import TYPE_CHECKING
 
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk import RequestErrorResponse
 from horde_sdk.ai_horde_api.apimodels import (
     ImageGenerateJobPopRequest,
@@ -18,6 +19,12 @@ from loguru import logger
 
 from horde_worker_regen.process_management._canned_scenarios import CannedJobSource, make_default_dry_run_source
 from horde_worker_regen.process_management.api_sessions import ApiSessions
+from horde_worker_regen.process_management.gpu_eligibility import eligible_card_indices_for
+from horde_worker_regen.process_management.gpu_pop_shaping import (
+    AdvertisedCapabilities,
+    advertised_capabilities,
+    under_fed_card,
+)
 from horde_worker_regen.process_management.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.model_availability import ModelAvailability
@@ -26,7 +33,10 @@ from horde_worker_regen.process_management.pop_throttler import (
     PopThrottler,
 )
 from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.resource_budget import is_model_locally_unservable_for
+from horde_worker_regen.process_management.resource_budget import (
+    is_model_locally_unservable_for,
+    predict_job_weight_mb,
+)
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.source_image_downloader import SourceImageDownloader
 from horde_worker_regen.process_management.worker_state import WorkerState
@@ -37,6 +47,8 @@ from horde_worker_regen.utils.job_utils import get_single_job_magnitude
 
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+    from horde_worker_regen.process_management.card_runtime import CardRuntime
+    from horde_worker_regen.process_management.model_metadata import ModelMetadata
     from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
 
 
@@ -48,14 +60,30 @@ def _select_models_for_pop(
     *,
     last_pop_had_no_jobs: bool,
     model_availability: ModelAvailability | None = None,
+    configured_models: set[str] | None = None,
+    card_runtimes: dict[int, CardRuntime] | None = None,
 ) -> set[str] | None:
     """Choose which models to include in a pop request.
 
+    Args:
+        bridge_data: The global worker config (for stickiness, custom models, and the unservable breaker).
+        process_map: The live process map (for loaded/free-model stickiness).
+        job_tracker: The job tracker (for the one-running-plus-one-queued cap and the unservable streak).
+        max_inference_processes: The provisioned inference-process ceiling.
+        last_pop_had_no_jobs: Whether the previous pop returned nothing (relaxes stickiness).
+        model_availability: When provided, drops models not yet on disk.
+        configured_models: The candidate model set to draw from. On a multi-GPU host this is the union of
+            every card's configured models; when None it defaults to the global ``image_models_to_load``,
+            byte-identical to the single-GPU behaviour.
+        card_runtimes: The per-card runtime plan. On a multi-GPU host a model is held back as unservable only
+            when it is unservable on *every* card that serves it (so a model fine on a big card keeps being
+            advertised); when None or single-card the worker-wide streak decides, as before.
+
     Returns:
-        A set of model names, or ``None`` if no models are eligible
-        (caller should skip the pop).
+        A set of model names, or ``None`` if no models are eligible (caller should skip the pop).
     """
-    models = set(bridge_data.image_models_to_load)
+    configured = set(bridge_data.image_models_to_load) if configured_models is None else set(configured_models)
+    models = set(configured)
 
     # Never advertise a model that is not on disk: a job for it would be popped only to fault when the
     # inference process cannot find the checkpoint. While availability is unknown (no download process)
@@ -69,10 +97,7 @@ def _select_models_for_pop(
         if process.loaded_horde_model_name is not None
     }
 
-    if (
-        len(bridge_data.image_models_to_load) > max_inference_processes
-        and len(loaded_models) == max_inference_processes
-    ):
+    if len(configured) > max_inference_processes and len(loaded_models) == max_inference_processes:
         if (
             (not last_pop_had_no_jobs)
             and bridge_data.horde_model_stickiness > 0
@@ -89,10 +114,10 @@ def _select_models_for_pop(
                 # no process available to accept a new job).
                 models = free_models
             logger.debug(f"Sticky models -- popping only {models}")
-            if len(bridge_data.image_models_to_load) > 10:
+            if len(configured) > 10:
                 logger.warning(
                     "Model stickiness is intended mostly for slow disks and works best with few models. "
-                    f"You have {len(bridge_data.image_models_to_load)} models configured.",
+                    f"You have {len(configured)} models configured.",
                 )
         elif bridge_data.horde_model_stickiness > 0:
             logger.debug("Models unstuck: asking to pop for all available models.")
@@ -112,7 +137,23 @@ def _select_models_for_pop(
     # over-budget attempt would otherwise be popped only to be dropped, and a steady drop stream trips
     # the horde's "dropping too many jobs" maintenance guard. Shares the scheduler's best-effort-admit
     # breaker policy so popping and admitting agree on which models are locally unservable.
-    held_back = {model for model in models if is_model_locally_unservable_for(bridge_data, job_tracker, model)}
+    if card_runtimes is not None and len(card_runtimes) > 1:
+        # Multi-GPU: hold a model back only when every card that serves it has flagged it unservable. A model
+        # still servable on at least one card keeps being advertised; the worker routes it to that card.
+        held_back = set()
+        for model in models:
+            serving_cards = [
+                device_index
+                for device_index, card in card_runtimes.items()
+                if model in card.config.image_models_to_load
+            ]
+            if serving_cards and all(
+                is_model_locally_unservable_for(bridge_data, job_tracker, model, device_index=device_index)
+                for device_index in serving_cards
+            ):
+                held_back.add(model)
+    else:
+        held_back = {model for model in models if is_model_locally_unservable_for(bridge_data, job_tracker, model)}
     if held_back:
         logger.debug(f"Not popping models held back as locally unservable: {sorted(held_back)}")
         models = models.difference(held_back)
@@ -163,6 +204,8 @@ class JobPopper:
 
     _max_inference_processes: int
     _max_threads_ceiling: int
+    _card_runtimes: dict[int, CardRuntime]
+    _model_metadata: ModelMetadata | None
 
     def __init__(
         self,
@@ -178,6 +221,8 @@ class JobPopper:
         dry_run_skip_api: bool = False,
         canned_job_source: CannedJobSource | None = None,
         model_availability: ModelAvailability | None = None,
+        card_runtimes: dict[int, CardRuntime] | None = None,
+        model_metadata: ModelMetadata | None = None,
     ) -> None:
         """Initialize with all required dependencies for job popping.
 
@@ -186,6 +231,10 @@ class JobPopper:
 
         When `model_availability` is provided, only models present on disk are advertised in
         pop requests (a missing model would otherwise be popped and then fault).
+
+        When `card_runtimes` has more than one card, the pop advertises the union of the cards'
+        capabilities (models, features, resolution, threads); a single card (or None) advertises the global
+        config exactly as before.
         """
         self._state = state
         self._process_map = process_map
@@ -193,6 +242,8 @@ class JobPopper:
         self._shutdown_manager = shutdown_manager
         self._runtime_config = runtime_config
         self._api_sessions = api_sessions
+        self._card_runtimes = card_runtimes if card_runtimes is not None else {}
+        self._model_metadata = model_metadata
 
         self._max_inference_processes = max_inference_processes
         # The constructor value is the provisioned ceiling; the threads advertised in pop requests
@@ -221,6 +272,59 @@ class JobPopper:
     def _max_concurrent_inference_processes(self) -> int:
         """The live concurrent-inference cap (effective ``max_threads``) advertised to the API."""
         return self._runtime_config.effective_max_threads
+
+    @property
+    def _multi_gpu_advertise(self) -> bool:
+        """Whether the pop advertises a union across cards (the worker drives more than one)."""
+        return len(self._card_runtimes) > 1
+
+    def _advertised_capabilities(self) -> AdvertisedCapabilities | None:
+        """The union pop envelope on a multi-GPU host, or None on a single-GPU host (use the global config).
+
+        Returns None when the worker drives one card (or none), so the caller advertises the global config
+        exactly as before; otherwise the union of every card's capabilities (see
+        :func:`~horde_worker_regen.process_management.gpu_pop_shaping.advertised_capabilities`).
+        """
+        if not self._multi_gpu_advertise:
+            return None
+        return advertised_capabilities(self._card_runtimes)
+
+    def _gpu_pop_balance_threshold(self, bridge_data: reGenBridgeData) -> float:
+        """The configured fraction of held work a card must be unable to serve before a pop targets it.
+
+        Read tolerantly (a non-numeric mocked value falls back to 0.5) and clamped to ``[0, 1]``.
+        """
+        raw = bridge_data.gpu_pop_balance_threshold
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            return 0.5
+        return max(0.0, min(1.0, float(raw)))
+
+    def _targeted_under_fed_card(self, bridge_data: reGenBridgeData) -> int | None:
+        """The under-fed card this pop should be scoped to, or None to keep union-popping.
+
+        Computes, for every held job (queued, including those already in flight), which cards could serve it,
+        then asks :func:`~horde_worker_regen.process_management.gpu_pop_shaping.under_fed_card` whether one
+        card is starved past the configured balance threshold. None on a single-GPU host (no targeting) or
+        when model metadata is unavailable (eligibility cannot be judged, so the worker union-pops).
+        """
+        if not self._multi_gpu_advertise or self._model_metadata is None:
+            return None
+        held_jobs = self._job_tracker.jobs_pending_inference
+        if not held_jobs:
+            return None
+        eligible_sets: list[set[int]] = []
+        for job in held_jobs:
+            baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
+            baseline_value = baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
+            weight_mb = predict_job_weight_mb(job, baseline)
+            eligible_sets.append(
+                eligible_card_indices_for(job, self._card_runtimes, baseline=baseline_value, weight_mb=weight_mb),
+            )
+        return under_fed_card(
+            eligible_sets,
+            self._card_runtimes.keys(),
+            balance_threshold=self._gpu_pop_balance_threshold(bridge_data),
+        )
 
     def set_canned_job_source(self, source: CannedJobSource | None) -> None:
         """Swap the canned job source at runtime (a warm benchmark worker's level boundary)."""
@@ -278,13 +382,20 @@ class JobPopper:
             max_jobs_in_queue += bridge_data.max_threads - 1
         return len(self._job_tracker.jobs_pending_inference) >= max_jobs_in_queue
 
-    def _effective_allow_lora(self, bridge_data: reGenBridgeData) -> bool:
-        """Return whether this pop should advertise LoRA support."""
-        if not bridge_data.allow_lora:
-            return False
+    @property
+    def _lora_disk_permits(self) -> bool:
+        """Whether the worker-wide LoRA disk guard currently permits advertising LoRA support.
+
+        Independent of any per-card ``allow_lora`` choice: LoRA storage is one shared cache, so a full disk
+        or an in-progress background download suppresses LoRA advertising for the whole worker.
+        """
         if self._state.lora_disk_exhausted:
             return False
         return not (self._model_availability is not None and self._model_availability.background_download_active)
+
+    def _effective_allow_lora(self, bridge_data: reGenBridgeData) -> bool:
+        """Return whether this pop should advertise LoRA support (config flag and the worker-wide disk guard)."""
+        return bool(bridge_data.allow_lora) and self._lora_disk_permits
 
     def _is_hungry(self, bridge_data: reGenBridgeData) -> bool:
         """Whether the worker should pop again immediately instead of waiting the poll interval.
@@ -455,6 +566,23 @@ class JobPopper:
 
         self._state.last_job_pop_time = time.time()
 
+        # On a multi-GPU host advertise the union of every card's capabilities so the horde returns work
+        # any card can run (the worker then routes each job to an eligible card); single-GPU advertises the
+        # global config unchanged.
+        advertised = self._advertised_capabilities()
+
+        # Adaptive targeting: when the local queue is lopsided away from one card (most held work is servable
+        # only by other cards), scope THIS pop to the under-fed card's capabilities so the horde returns work
+        # it can actually run, instead of more work for the already-fed cards. Union-pop otherwise.
+        if advertised is not None:
+            under_fed = self._targeted_under_fed_card(bridge_data)
+            if under_fed is not None:
+                advertised = advertised_capabilities({under_fed: self._card_runtimes[under_fed]})
+                logger.debug(
+                    f"Adaptive pop: local queue is lopsided away from card {under_fed}; scoping this pop to "
+                    "its capabilities.",
+                )
+
         models = _select_models_for_pop(
             bridge_data,
             self._process_map,
@@ -462,9 +590,30 @@ class JobPopper:
             self._max_inference_processes,
             last_pop_had_no_jobs=self._state.last_pop_no_jobs_available,
             model_availability=self._model_availability,
+            configured_models=set(advertised.models) if advertised is not None else None,
+            card_runtimes=self._card_runtimes if self._multi_gpu_advertise else None,
         )
         if models is None:
             return
+
+        pop_nsfw = advertised.nsfw if advertised is not None else bridge_data.nsfw
+        pop_threads = advertised.threads if advertised is not None else self._max_concurrent_inference_processes
+        pop_max_power = advertised.max_power if advertised is not None else bridge_data.max_power
+        pop_allow_img2img = advertised.allow_img2img if advertised is not None else bridge_data.allow_img2img
+        pop_allow_painting = advertised.allow_inpainting if advertised is not None else bridge_data.allow_inpainting
+        pop_allow_post_processing = (
+            advertised.allow_post_processing if advertised is not None else bridge_data.allow_post_processing
+        )
+        pop_allow_controlnet = advertised.allow_controlnet if advertised is not None else bridge_data.allow_controlnet
+        pop_allow_sdxl_controlnet = (
+            advertised.allow_sdxl_controlnet if advertised is not None else bridge_data.allow_sdxl_controlnet
+        )
+        # Union LoRA: any card opting in, still subject to the worker-wide LoRA disk guard.
+        pop_allow_lora = (
+            (advertised.allow_lora and self._lora_disk_permits)
+            if advertised is not None
+            else self._effective_allow_lora(bridge_data)
+        )
 
         try:
             job_pop_request = ImageGenerateJobPopRequest(
@@ -473,19 +622,19 @@ class JobPopper:
                 bridge_agent=f"AI Horde Worker reGen:{runtime_version()}:https://github.com/Haidra-Org/horde-worker-reGen",
                 models=list(models),
                 blacklist=bridge_data.blacklist,
-                nsfw=bridge_data.nsfw,
-                threads=self._max_concurrent_inference_processes,
-                max_pixels=bridge_data.max_power * 8 * 64 * 64,
+                nsfw=pop_nsfw,
+                threads=pop_threads,
+                max_pixels=pop_max_power * 8 * 64 * 64,
                 require_upfront_kudos=bridge_data.require_upfront_kudos,
-                allow_img2img=bridge_data.allow_img2img,
-                allow_painting=bridge_data.allow_inpainting,
+                allow_img2img=pop_allow_img2img,
+                allow_painting=pop_allow_painting,
                 allow_unsafe_ipaddr=bridge_data.allow_unsafe_ip,
-                allow_post_processing=bridge_data.allow_post_processing,
-                allow_controlnet=bridge_data.allow_controlnet,
-                allow_sdxl_controlnet=bridge_data.allow_sdxl_controlnet,
+                allow_post_processing=pop_allow_post_processing,
+                allow_controlnet=pop_allow_controlnet,
+                allow_sdxl_controlnet=pop_allow_sdxl_controlnet,
                 extra_slow_worker=bridge_data.extra_slow_worker,
                 limit_max_steps=bridge_data.limit_max_steps,
-                allow_lora=self._effective_allow_lora(bridge_data),
+                allow_lora=pop_allow_lora,
                 amount=bridge_data.max_batch,
             )
 

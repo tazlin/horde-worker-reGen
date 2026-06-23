@@ -157,5 +157,5 @@ class TestSchedulerActuatesProcessReduction:
 
         assert admitted is False, "the head must defer while the card is cleared, not force-admit into an OOM"
         # The remedy: a sibling process is stopped down to the fitting count (3), not all the way to one.
-        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(3)
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(3, device_index=None)
         assert scheduler._sibling_teardown_for_model == "CyberRealistic Pony"

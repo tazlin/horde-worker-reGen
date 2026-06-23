@@ -4,18 +4,37 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from typing import Self
 
 from horde_sdk.worker.dispatch.ai_horde.bridge_data import CombinedHordeBridgeData
 from loguru import logger
-from pydantic import Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from ruamel.yaml import YAML
 
 from horde_worker_regen.consts import TOTAL_LORA_DOWNLOAD_TIMEOUT
 from horde_worker_regen.locale_info.regen_bridge_data_fields import BRIDGE_DATA_FIELD_DESCRIPTIONS
 
 
-def _compute_extra_slow_overrides(
+@dataclass(frozen=True)
+class ExtraSlowClamps:
+    """Represents the concurrency/timeout clamps an extra-slow worker forces, each None when unchanged.
+
+    Produced by :func:`compute_extra_slow_clamps` and applied by :func:`apply_extra_slow_clamps`. A field
+    is non-None only when extra-slow mode must override the operator's value, so the apply step touches
+    exactly the changed fields (and the producer logs exactly those). A typed view rather than a
+    field-name->value dict, so both the global validator and the per-card resolver apply the clamps through
+    attributes a type checker can follow, not string key literals.
+    """
+
+    high_performance_mode: bool | None = None
+    moderate_performance_mode: bool | None = None
+    queue_size: int | None = None
+    max_threads: int | None = None
+    preload_timeout: int | None = None
+
+
+def compute_extra_slow_clamps(
     *,
     high_performance_mode: bool,
     moderate_performance_mode: bool,
@@ -23,45 +42,69 @@ def _compute_extra_slow_overrides(
     max_threads: int,
     preload_timeout: int,
     log: bool = False,
-) -> dict[str, bool | int]:
-    """Compute field overrides required when extra_slow_worker is enabled.
+) -> ExtraSlowClamps:
+    """Return the clamps an extra-slow worker forces on the given concurrency/timeout values.
 
-    Returns:
-        A dict of field names to their overridden values.
+    Each returned field is None unless extra-slow mode requires changing it (so an unchanged value is never
+    re-applied or re-logged). When ``log`` is True, a warning is emitted for each clamp actually applied.
     """
-    overrides: dict[str, bool | int] = {}
+    high_clamp: bool | None = None
+    moderate_clamp: bool | None = None
+    queue_clamp: int | None = None
+    threads_clamp: int | None = None
+    preload_clamp: int | None = None
 
     if high_performance_mode:
-        overrides["high_performance_mode"] = False
+        high_clamp = False
         if log:
             logger.warning("Extra slow worker is enabled, so high_performance_mode has been set to False.")
     if moderate_performance_mode:
-        overrides["moderate_performance_mode"] = False
+        moderate_clamp = False
         if log:
             logger.warning("Extra slow worker is enabled, so moderate_performance_mode has been set to False.")
     if queue_size > 0:
-        overrides["queue_size"] = 0
+        queue_clamp = 0
         if log:
             logger.warning(
                 "Extra slow worker is enabled, so queue_size has been set to 0. "
                 "This behavior may change in the future.",
             )
     if max_threads > 1:
-        overrides["max_threads"] = 1
+        threads_clamp = 1
         if log:
             logger.warning(
                 "Extra slow worker is enabled, so max_threads has been set to 1. "
                 "This behavior may change in the future.",
             )
     if preload_timeout < 120:
-        overrides["preload_timeout"] = 120
+        preload_clamp = 120
         if log:
             logger.warning(
                 "Extra slow worker is enabled, so preload_timeout has been set to 120. "
                 "This behavior may change in the future.",
             )
 
-    return overrides
+    return ExtraSlowClamps(
+        high_performance_mode=high_clamp,
+        moderate_performance_mode=moderate_clamp,
+        queue_size=queue_clamp,
+        max_threads=threads_clamp,
+        preload_timeout=preload_clamp,
+    )
+
+
+def apply_extra_slow_clamps(config: reGenBridgeData, clamps: ExtraSlowClamps) -> None:
+    """Mutate *config* in place, applying each clamp that is set (None fields are left untouched)."""
+    if clamps.high_performance_mode is not None:
+        config.high_performance_mode = clamps.high_performance_mode
+    if clamps.moderate_performance_mode is not None:
+        config.moderate_performance_mode = clamps.moderate_performance_mode
+    if clamps.queue_size is not None:
+        config.queue_size = clamps.queue_size
+    if clamps.max_threads is not None:
+        config.max_threads = clamps.max_threads
+    if clamps.preload_timeout is not None:
+        config.preload_timeout = clamps.preload_timeout
 
 
 def compute_performance_timeout(
@@ -141,6 +184,49 @@ def _warn_lease_without_residency(
     return non_resident
 
 
+class GpuOverride(BaseModel):
+    """A per-card delta over the global config: every field optional, ``None`` meaning inherit.
+
+    Lives on :attr:`reGenBridgeData.gpu_overrides`, keyed by stable (PCI-bus) device index. Only the fields
+    meaningful to gate per card are present (concurrency, the served model set, feature flags, and the VRAM
+    budget); ``extra="forbid"`` makes a typo or an attempt to override a global-only field (e.g. ``api_key``)
+    a loud validation error rather than a silently ignored key. Constraints mirror the corresponding fields
+    on :class:`reGenBridgeData`. The orchestrator resolves these into a per-card :class:`reGenBridgeData`
+    via :func:`horde_worker_regen.bridge_data.gpu_config.resolve_effective_gpu_config`.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # -- Concurrency --
+    max_threads: int | None = Field(default=None, ge=1, le=16)
+    queue_size: int | None = Field(default=None, ge=0, le=4)
+    high_performance_mode: bool | None = None
+    moderate_performance_mode: bool | None = None
+    extra_slow_worker: bool | None = None
+    preload_timeout: int | None = Field(default=None, ge=15)
+
+    # -- Models & baselines --
+    image_models_to_load: list[str] | None = Field(default=None, alias="models_to_load")
+    image_models_to_skip: list[str] | None = Field(default=None, alias="models_to_skip")
+    dynamic_models: bool | None = None
+
+    # -- Feature flags --
+    allow_lora: bool | None = None
+    allow_controlnet: bool | None = None
+    allow_sdxl_controlnet: bool | None = None
+    allow_post_processing: bool | None = None
+    allow_inpainting: bool | None = Field(default=None, alias="allow_painting")
+    allow_img2img: bool | None = None
+    nsfw: bool | None = None
+    max_power: int | None = Field(default=None, ge=1, le=512)
+
+    # -- VRAM / memory budget --
+    enable_vram_budget: bool | None = None
+    vram_reserve_mb: int | None = Field(default=None, ge=0)
+    vram_to_leave_free: str | None = Field(default=None, pattern=r"^\d+%$|^\d+$")
+    whole_card_exclusive_residency: bool | None = None
+
+
 class reGenBridgeData(CombinedHordeBridgeData):
     """The config model for reGen. Extra fields added here are specific to this worker implementation.
 
@@ -148,6 +234,35 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """
 
     _loaded_from_env_vars: bool = False
+
+    gpu_device_indices: list[int] | None = Field(default=None)
+    """Which accelerator indices (stable PCI-bus order) this one worker drives.
+
+    ``None`` (the default) auto-detects and uses *every* accelerator-kind device on the machine under a
+    single horde identity. Set an explicit list (e.g. ``[0]`` or ``[0, 2]``) to opt a multi-GPU box out of
+    driving all cards, or to pin which cards this worker owns. Indices key into :attr:`gpu_overrides` and
+    are resolved against ``CUDA_DEVICE_ORDER=PCI_BUS_ID`` so they map to fixed physical slots across reboots.
+    A single-GPU box can ignore this entirely.
+    """
+
+    gpu_overrides: dict[int, GpuOverride] = Field(default_factory=dict)
+    """Optional per-card config deltas, keyed by stable (PCI-bus) device index.
+
+    Each value overrides only the fields it sets (everything else inherits the global config), letting a
+    heterogeneous box give each card its own concurrency, served models, feature flags, and VRAM budget
+    without standing up separate worker instances. A device with no entry here inherits the global config
+    wholesale, so the single-GPU and homogeneous cases need no entries at all.
+    """
+
+    gpu_pop_balance_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    """Local-queue imbalance fraction that switches the next pop from union to a single under-fed card.
+
+    With multiple cards the worker pops the *union* of every card's capabilities by default, then routes
+    each returned job to an eligible card. When at least this fraction of the held/in-flight work is
+    servable by only a subset of cards, the next pop is instead scoped to the under-fed card's capability
+    set, so the horde returns work that card can actually run. 0 always targets the most under-fed card;
+    1 effectively disables targeting (pure union pops). No effect on a single-GPU worker.
+    """
 
     disable_terminal_ui: bool = Field(
         default=True,
@@ -529,15 +644,17 @@ class reGenBridgeData(CombinedHordeBridgeData):
         """Validate and adjust performance mode settings based on cross-field constraints."""
         # Extra slow worker takes priority over all performance/memory settings
         if self.extra_slow_worker:
-            for field_name, value in _compute_extra_slow_overrides(
-                high_performance_mode=self.high_performance_mode,
-                moderate_performance_mode=self.moderate_performance_mode,
-                queue_size=self.queue_size,
-                max_threads=self.max_threads,
-                preload_timeout=self.preload_timeout,
-                log=True,
-            ).items():
-                setattr(self, field_name, value)
+            apply_extra_slow_clamps(
+                self,
+                compute_extra_slow_clamps(
+                    high_performance_mode=self.high_performance_mode,
+                    moderate_performance_mode=self.moderate_performance_mode,
+                    queue_size=self.queue_size,
+                    max_threads=self.max_threads,
+                    preload_timeout=self.preload_timeout,
+                    log=True,
+                ),
+            )
 
         self.process_timeout = compute_performance_timeout(
             high_performance_mode=self.high_performance_mode,

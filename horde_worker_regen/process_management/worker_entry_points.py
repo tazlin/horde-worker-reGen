@@ -27,6 +27,49 @@ _DEFAULT_WORKER_LOG_VERBOSITY = 4
 _SPAWN_TIMING_ENV = "AIWORKER_SPAWN_TIMING"
 
 
+def _apply_device_pin(
+    *,
+    process_id: int,
+    device_index: int,
+    accelerator_kind: str | None,
+    role: str = "inference",
+) -> None:
+    """Mask this process to one GPU before torch loads, when an accelerator kind is provided.
+
+    Applies the env-var portion of hordelib's ``device_pin_env`` (e.g. ``CUDA_VISIBLE_DEVICES``) so the
+    child sees only its assigned card as ``cuda:0`` (or the backend equivalent), keeping every
+    single-device assumption in ComfyUI/hordelib correct without changes there. Must run before the first
+    torch import. A ``None`` kind -- the default single-GPU path with no explicit card selection -- is a
+    no-op, so that case writes no env var and is byte-identical to before. DirectML has no env-var mask (it
+    is pinned by the per-card ``--directml`` comfy arg instead) and cpu/mps need no masking, so those are
+    skipped here. Best-effort: a failure to pin logs a warning and the process runs unmasked rather than
+    crashing at startup.
+
+    Args:
+        process_id: The logical slot id, for the log line.
+        device_index: The stable index of the card to pin to.
+        accelerator_kind: The backend kind (``cuda``/``rocm``/...), or None to skip pinning.
+        role: The process role (``inference``/``safety``) for the log line. Defaults to ``inference``.
+    """
+    if accelerator_kind is None:
+        return
+    try:
+        from hordelib.utils.device_pinning import device_pin_env
+        from hordelib.utils.torch_memory import AcceleratorKind
+
+        kind = AcceleratorKind(accelerator_kind)
+        if kind in (AcceleratorKind.directml, AcceleratorKind.cpu, AcceleratorKind.mps):
+            return
+        pin_env, _extra_args = device_pin_env(kind, device_index)
+        os.environ.update(pin_env)
+        logger.info(f"Pinned {role} process {process_id} to device {device_index} ({kind.value}): {pin_env}")
+    except Exception as pin_error:  # noqa: BLE001 - pinning must never crash a starting child
+        logger.warning(
+            f"Could not pin {role} process {process_id} to device {device_index} "
+            f"({accelerator_kind}): {type(pin_error).__name__} {pin_error}. Running unmasked.",
+        )
+
+
 def _spawn_timing_mark(process_id: int, kind: str, label: str) -> None:
     """Diagnostic: write a raw wall-clock marker to fd 2 for spawn/import-phase timing analysis.
 
@@ -118,6 +161,8 @@ class SafetyProcessEntryPoint(Protocol):
         process_launch_identifier: int,
         cpu_only: bool = True,
         *,
+        device_index: int = 0,
+        accelerator_kind: str | None = None,
         amd_gpu: bool = False,
         directml: int | None = None,
         dry_run_skip_safety: bool = False,
@@ -161,6 +206,8 @@ def start_inference_process(
     vae_decode_semaphore: Semaphore,
     process_launch_identifier: int,
     *,
+    device_index: int = 0,
+    accelerator_kind: str | None = None,
     low_memory_mode: bool = False,
     amd_gpu: bool = False,
     directml: int | None = None,
@@ -180,6 +227,11 @@ def start_inference_process(
         aux_model_lock (Lock): The lock to use for auxiliary model downloading.
         vae_decode_semaphore (Semaphore): The semaphore to use to limit concurrent VAE decoding.
         process_launch_identifier (int): The unique identifier for this launch.
+        device_index (int, optional): The stable index of the GPU this process is assigned to. Reported back \
+            on memory messages so the parent can attribute VRAM per card. Defaults to 0.
+        accelerator_kind (str | None, optional): The accelerator backend of the assigned device \
+            (``cuda``/``rocm``/...), used to pin the process to its card. None applies no pinning. \
+            Defaults to None.
         low_memory_mode (bool, optional): If true, the process will attempt to use less memory. Defaults to True.
         amd_gpu (bool, optional): If true, the process will attempt to use AMD GPU-specific optimisations.
             Defaults to False.
@@ -193,8 +245,10 @@ def start_inference_process(
             coordination, registered with hordelib. None disables it. Defaults to None.
     """
     _spawn_timing_mark(process_id, "inference", "entry")
-    # Must precede the first torch/hordelib import below so the allocator reads it.
+    # Must precede the first torch/hordelib import below so the allocator reads it, and the device mask
+    # must be applied before that too so torch only ever sees this process's assigned card.
     if not dry_run_skip_inference:
+        _apply_device_pin(process_id=process_id, device_index=device_index, accelerator_kind=accelerator_kind)
         _enable_expandable_segments(amd_gpu=amd_gpu, directml=directml)
     enable_child_faulthandler(f"inference_{process_id}")
     with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
@@ -298,6 +352,7 @@ def start_inference_process(
             aux_model_lock=aux_model_lock,
             vae_decode_semaphore=vae_decode_semaphore,
             process_launch_identifier=process_launch_identifier,
+            device_index=device_index,
             dry_run_skip_inference=dry_run_skip_inference,
             dry_run_inference_delay=dry_run_inference_delay,
             gpu_sampling_lease=gpu_sampling_lease,
@@ -316,6 +371,8 @@ def start_safety_process(
     process_launch_identifier: int,
     cpu_only: bool = True,
     *,
+    device_index: int = 0,
+    accelerator_kind: str | None = None,
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_safety: bool = False,
@@ -329,6 +386,11 @@ def start_safety_process(
         disk_lock (Lock): The lock to use for disk access.
         process_launch_identifier (int): The unique identifier for this launch.
         cpu_only (bool, optional): If true, the process will not use the GPU. Defaults to True.
+        device_index (int, optional): The stable index of the GPU to pin to when running on-GPU (i.e. \
+            ``cpu_only`` is False). On a multi-GPU host the safety model lives on the first configured card. \
+            Defaults to 0.
+        accelerator_kind (str | None, optional): The backend kind (``cuda``/``rocm``/...) of the assigned \
+            card, used to pin the on-GPU safety process. None applies no pinning. Defaults to None.
         amd_gpu (bool, optional): If true, the process will attempt to use AMD GPU-specific optimizations.
             Defaults to False.
         directml (int | None, optional): If not None, the process will attempt to use DirectML \
@@ -337,6 +399,16 @@ def start_safety_process(
             Defaults to False.
     """
     _spawn_timing_mark(process_id, "safety", "entry")
+    # The on-GPU safety model (cpu_only False) must be masked to its assigned card before torch loads, the
+    # same as an inference process. cpu_only safety needs no GPU, so it is never pinned; the default
+    # single-GPU on-GPU case passes accelerator_kind None and so also writes no env var (byte-identical).
+    if not cpu_only and not dry_run_skip_safety:
+        _apply_device_pin(
+            process_id=process_id,
+            device_index=device_index,
+            accelerator_kind=accelerator_kind,
+            role="safety",
+        )
     enable_child_faulthandler(f"safety_{process_id}")
     with contextlib.nullcontext():  # contextlib.redirect_stdout(), contextlib.redirect_stderr():
         logger.remove()

@@ -152,6 +152,7 @@ try:
             "index": int(a.index),
             "name": str(a.name),
             "total_vram_mb": int(a.total_vram_mb),
+            "kind": str(a.kind),
             "runtime_overhead_mb": _overhead_mb,
             "marginal_overhead_mb": _marginal_mb,
         }}
@@ -171,6 +172,10 @@ class ProbedAccelerator(BaseModel):
     index: int
     name: str
     total_vram_mb: int
+    kind: str = "cuda"
+    """The accelerator backend reported by the probe (``cuda``/``rocm``/``xpu``/``directml``/...). Used to
+    pin each inference process to its device with the right backend mask. Defaults to ``cuda`` for probes/
+    serialisations that predate this field."""
     runtime_overhead_mb: int = 0
     """Approx. VRAM (MB) the *first/sole* fresh torch process consumes on the idle device: the one-time
     CUDA-runtime/kernel allocation plus one context. Sizes free-if-alone. Defaults to 0 for probes/
