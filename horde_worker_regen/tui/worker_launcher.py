@@ -65,6 +65,33 @@ class SupervisorStatus(enum.StrEnum):
 _HEALTHY_UPTIME_SECONDS = 60.0
 """A worker alive and reporting for this long is considered stable; the restart budget resets."""
 
+WEDGE_LIVENESS_TIMEOUT_SECONDS = 180.0
+"""How long the worker's control loop may stop advancing (while the process is alive and not intentionally
+stopping) before the supervisor treats it as wedged and force-kills + relaunches the whole tree.
+
+This is the backstop for an *alive-but-frozen* worker: the in-worker watchdogs are all steps inside the
+one control-loop coroutine, so a loop that blocks (e.g. a child gone uninterruptibly dark inside a CUDA
+call, dragging the parent down with it) silences every one of them, and an exit-only supervisor never
+relaunches a process that never exits. Progress is judged from the *value* of the worker's reported
+``loop_alive_wall_time`` (see :class:`WorkerLivenessFrame`), not from frame arrival: a daemon thread keeps
+emitting liveness frames with a frozen stamp even while the loop is dead, so only a stamp that has not
+advanced for this whole window counts as wedged.
+
+Sized for a wide false-positive margin. Healthy operation advances the stamp ~every second (the loop ticks
+several times a second and the liveness sender emits every ~1s), and the only heavy synchronous work in a
+tick runs off-loop, so this is ~180 liveness intervals of *zero* progress: far outside normal jitter, yet
+still recovering a permanent wedge long before an operator would notice. A worker that merely served a
+healthy stretch before wedging resets the restart budget like any other recovery, so a rare recurring
+wedge keeps being recovered while a rapid wedge-on-start loop still trips the budget and gives up."""
+
+_SUPERVISOR_STALL_RESET_SECONDS = 30.0
+"""A gap this large between consecutive :meth:`WorkerSupervisor.tick` calls means the *supervisor itself*
+was frozen (the host slept/resumed, the process was descheduled under load, a debugger paused it), not the
+worker. Time the supervisor could not observe must not count toward the wedge window, so on such a gap the
+wedge baseline is reset. Kept well above the sub-second tick cadence (so normal jitter never trips it) and
+well below :data:`WEDGE_LIVENESS_TIMEOUT_SECONDS` (so a real supervisor stall is always re-graced before it
+could be mistaken for a worker wedge)."""
+
 GRACEFUL_STOP_TIMEOUT_SECONDS = 150.0
 """How long :meth:`WorkerSupervisor.stop` waits for the worker to drain and exit before terminating it.
 
@@ -196,6 +223,14 @@ class WorkerSupervisor:
 
         Drives the TUI's responsiveness verdict independently of full-snapshot freshness; None until the
         first frame of either kind arrives."""
+        self._last_loop_advance_wall: float | None = None
+        """Parent wall-clock time when the worker's control loop was last seen to *advance* (a new snapshot
+        arrived, or a liveness frame carried a changed stamp). None until the worker first reports, which is
+        the startup grace: a worker that has not yet sent a frame cannot be judged wedged. Drives the
+        :data:`WEDGE_LIVENESS_TIMEOUT_SECONDS` backstop."""
+        self._last_tick_wall: float | None = None
+        """Parent wall-clock time of the previous :meth:`tick`, used to spot a supervisor-side stall (see
+        :data:`_SUPERVISOR_STALL_RESET_SECONDS`)."""
         self.on_snapshot: Callable[[WorkerStateSnapshot], None] | None = None
         self.on_status_change: Callable[[SupervisorStatus], None] | None = None
 
@@ -234,6 +269,11 @@ class WorkerSupervisor:
         flickering through ``STARTING``.
         """
         self.latest_snapshot = None
+        # The new worker has not reported yet: clear the liveness baseline so the freshly-spawned process
+        # gets the startup grace and the wedge backstop only re-arms once it sends its first frame (rather
+        # than inheriting the dead worker's last stamp and reading as instantly wedged).
+        self.last_liveness_wall_time = None
+        self._last_loop_advance_wall = None
         parent_connection, child_connection = self._ctx.Pipe(duplex=True)
         target = _target_for_mode(self._mode)
         process = self._ctx.Process(  # type: ignore[attr-defined]
@@ -281,6 +321,11 @@ class WorkerSupervisor:
         """
         snapshots: list[WorkerStateSnapshot] = []
         got_any_frame = False
+        # A genuine sign the control loop advanced, distinct from mere frame traffic: a new snapshot (built
+        # only at the *end* of a tick) or a liveness frame whose stamp differs from the last one. A liveness
+        # frame repeating an *unchanged* stamp is explicitly NOT progress, since the daemon sender keeps
+        # emitting it even while the loop is frozen. This distinction is the whole basis of wedge detection.
+        loop_advanced = False
         connection = self._connection
         if connection is None:
             return snapshots
@@ -290,13 +335,18 @@ class WorkerSupervisor:
                 if isinstance(message, WorkerStateSnapshot):
                     snapshots.append(message)
                     got_any_frame = True
+                    loop_advanced = True
                 elif isinstance(message, WorkerLivenessFrame):
+                    if message.loop_alive_wall_time != self.last_liveness_wall_time:
+                        loop_advanced = True
                     self.last_liveness_wall_time = message.loop_alive_wall_time
                     got_any_frame = True
         except (EOFError, OSError):
             # Pipe closed (child exiting); tick() will observe the dead process and react.
             pass
 
+        if loop_advanced:
+            self._last_loop_advance_wall = time.time()
         if got_any_frame:
             self._note_frame_received()
         if snapshots:
@@ -330,6 +380,7 @@ class WorkerSupervisor:
         completes here too: while the worker drains, ticks keep draining snapshots and reporting status;
         once it exits, the stop is finalized. The control loop never has to block on a join.
         """
+        self._note_supervisor_tick()
         self.drain_snapshots()
 
         process = self._process
@@ -338,6 +389,7 @@ class WorkerSupervisor:
 
         if process.is_alive():
             self._terminate_if_graceful_stop_overran(process)
+            self._recover_if_wedged(process)
             return
 
         if self._intentional_stop:
@@ -345,6 +397,57 @@ class WorkerSupervisor:
             return
 
         self._handle_unexpected_exit(process)
+
+    def _note_supervisor_tick(self) -> None:
+        """Spot a supervisor-side stall and re-grace the worker so it is never blamed for the gap.
+
+        A healthy supervisor ticks several times a second; a gap of tens of seconds means *this* process
+        was frozen (the host slept and resumed, it was descheduled under heavy load, a debugger paused it).
+        Time the supervisor could not observe the worker must not accrue against the wedge window, so on
+        such a gap the wedge baseline is moved forward. Recorded before draining so a real worker frame this
+        same tick can still advance the baseline normally afterwards.
+        """
+        now = time.time()
+        previous = self._last_tick_wall
+        self._last_tick_wall = now
+        if previous is None:
+            return
+        if (now - previous) > _SUPERVISOR_STALL_RESET_SECONDS and self._last_loop_advance_wall is not None:
+            logger.debug(
+                f"Supervisor tick gap of {now - previous:.0f}s (it was likely descheduled or the host "
+                "slept); resetting the worker wedge baseline rather than charging the gap to the worker.",
+            )
+            self._last_loop_advance_wall = now
+
+    def _recover_if_wedged(self, process: BaseProcess) -> None:
+        """Force-kill and relaunch a worker whose control loop has stopped advancing (the wedge backstop).
+
+        Distinct from a crash (here the process is still alive) and from a graceful stop (intentional, and
+        owned by the graceful-stop deadline). Progress is judged from the worker's reported loop-tick stamp,
+        not from frame arrival, because the worker keeps emitting liveness frames from a daemon thread even
+        when its control loop is frozen; only a stamp that has not advanced for the whole window is a wedge.
+
+        The kill is the orphan-proof tree kill (a wedged worker still owns GPU-resident inference/safety
+        children). Relaunch is deliberately left to the unexpected-exit path on a later tick, once the
+        process is observed dead, so the restart budget, backoff, and ``auto_restart`` handling all apply
+        unchanged and a second worker is never spawned over one still tearing down.
+        """
+        if self._intentional_stop or self._graceful_stop_deadline != 0.0:
+            return
+        if self._last_loop_advance_wall is None:
+            return  # startup grace: the worker has not reported a single tick yet
+        staleness = time.time() - self._last_loop_advance_wall
+        if staleness <= WEDGE_LIVENESS_TIMEOUT_SECONDS:
+            return
+        logger.error(
+            f"Worker (pid={process.pid}) control loop has not advanced for {staleness:.0f}s "
+            f"(> {WEDGE_LIVENESS_TIMEOUT_SECONDS:.0f}s): alive but wedged. Force-killing its process tree; "
+            "it will be relaunched once the kill is observed.",
+        )
+        # Consume the baseline so this fires exactly once per wedge; detection re-arms only when the
+        # relaunched worker reports its first post-restart liveness frame.
+        self._last_loop_advance_wall = None
+        self._force_kill_tree(process)
 
     def _terminate_if_graceful_stop_overran(self, process: BaseProcess) -> None:
         """Force-terminate a worker that has not exited within its graceful-stop deadline."""
