@@ -74,6 +74,7 @@ from horde_worker_regen.process_management.lru_cache import LRUCache
 from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.messages import (
     AlchemyFormSpec,
+    HordeControlFlag,
     HordeDownloadAvailabilityMessage,
     HordeProcessState,
 )
@@ -1868,25 +1869,38 @@ class HordeWorkerProcessManager:
     """Orphan punts within the window that escalate to the save-our-ship wedge path (soft reset/limp-by)."""
 
     def _inference_slot_owns_job(self, job_id: GenerationID) -> bool:
-        """Whether some live inference slot is currently working on (references) the given job.
+        """Whether some live inference slot owns (references) the given job, busy or dispatch-in-flight.
 
         ``last_job_referenced`` is not cleared when a job completes or its slot returns to idle, so a
-        reference match alone is not ownership: an idle slot (one that ``can_accept_job``) carrying a
-        stale reference will never produce a result for the job. Counting such a slot as the owner lets
-        a job whose result was lost (e.g. dropped by the launch-identifier guard during a recovery
-        storm) sit in progress forever, shielded from the orphaned-job watchdog, until it wedges the
-        whole worker. A slot only owns the job while it is genuinely processing it, i.e. it is not
-        available for new work.
+        reference match alone is not ownership: an idle slot (one that ``can_accept_job``) carrying only a
+        stale reference will never produce a result for the job. Counting such a slot as the owner lets a
+        job whose result was lost (e.g. dropped by the launch-identifier guard during a recovery storm) sit
+        in progress forever, shielded from the orphaned-job watchdog, until it wedges the whole worker.
+
+        A referencing live slot owns the job in two cases. Either it is genuinely busy (not
+        ``can_accept_job``), actively processing the job; or a fresh dispatch is in flight for exactly this
+        job. ``start_inference`` stamps the slot with ``last_control_flag == START_INFERENCE`` and
+        ``current_inference_started_at`` (the dispatch time) the moment it sends START_INFERENCE, and the
+        first inbound result for the slot retires that timestamp. So those two stamps together are an
+        authoritative "dispatched, not yet acked" signal: under host contention a child can stay briefly in
+        a ``can_accept_job`` state (WAITING_FOR_JOB) after the dispatch was sent, and the slot must still own
+        the job through that pre-ack window rather than be mistaken for an idle slot carrying a stale
+        reference (the lost-result case the watchdog legitimately punts).
         """
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
                 continue
             if not process_info.is_process_alive():
                 continue
-            if process_info.can_accept_job():
-                continue
             referenced = process_info.last_job_referenced
-            if referenced is not None and referenced.id_ == job_id:
+            if referenced is None or referenced.id_ != job_id:
+                continue
+            if not process_info.can_accept_job():
+                return True
+            if (
+                process_info.last_control_flag == HordeControlFlag.START_INFERENCE
+                and process_info.current_inference_started_at is not None
+            ):
                 return True
         return False
 
@@ -1929,10 +1943,14 @@ class HordeWorkerProcessManager:
                 reason="orphaned in-progress job (no owning live inference slot)",
                 detail={"stuck_seconds": round(now - first_seen, 1)},
             )
+            # An orphan is an ownership/host-contention failure, not a verdict that the model cannot fit the
+            # card it was dispatched to. Flag it so a terminal punt of an over-budget job does not key that
+            # card's "locally unservable" streak and wrongly de-list a model a capable card can still run.
             self._job_tracker.handle_job_fault_now(
                 faulted_job=job,
                 process_timeout=self.bridge_data.process_timeout,
                 retryable=True,
+                scheduling_fault=True,
             )
             del self._orphan_in_progress_since[job_id]
             self._orphan_punt_history.append(now)
@@ -1974,6 +1992,11 @@ class HordeWorkerProcessManager:
             # loading) or a streams-even-alone head admitted best-effort off that path. Both are the worker
             # doing the right thing, not a wedge, so do not let it soft-reset the pools mid-load. Both graces
             # are bounded, so a load that genuinely never completes still trips the supervisor.
+            structural_queue_wedge = False
+        if structural_queue_wedge and self._process_map.has_inference_in_progress():
+            # Belt-and-braces: even if the queue-deadlock flag latched via some other path, a live slot
+            # actively running a job is progress, not a wedge. This zeroes only the queue-wedge term; a
+            # genuinely hung INFERENCE_STARTING slot is still caught by the step-timeout / orphan watchdogs.
             structural_queue_wedge = False
         return (
             self._is_inference_pool_unrecoverable()

@@ -605,6 +605,16 @@ class MessageDispatcher:
 
     async def _handle_inference_result(self, message: HordeInferenceResultMessage) -> None:
         """Handle an inference job result message."""
+        # A result (success, fault, or even one for a job we no longer track) means the slot is no longer
+        # sampling, so retire its in-flight timestamps first: before the graded-slowdown monitor can read
+        # them against a finished job, and before any early-return below. A dropped result (job gone from
+        # jobs_lookup) that left ``current_inference_started_at`` set could otherwise leave the slot looking
+        # like the dispatch-in-flight owner of a *different* freshly dispatched job.
+        if message.process_id in self._process_map:
+            self._process_map[message.process_id].current_inference_started_at = None
+            self._process_map[message.process_id].current_first_step_at = None
+            self._process_map[message.process_id].current_job_expected_sampling_seconds = None
+
         job_info = await self._job_tracker.get_job_info(message.sdk_api_job_info)
         if job_info is None:
             logger.error(
@@ -621,13 +631,6 @@ class MessageDispatcher:
                 )
                 await self._job_tracker.drop_pending_inference(message.sdk_api_job_info)
             return
-
-        # A result (success or fault) means the slot is no longer sampling this job, so retire its
-        # in-flight timestamps before the graded-slowdown monitor can read them against a finished job.
-        if message.process_id in self._process_map:
-            self._process_map[message.process_id].current_inference_started_at = None
-            self._process_map[message.process_id].current_first_step_at = None
-            self._process_map[message.process_id].current_job_expected_sampling_seconds = None
 
         # Faults are resolved before the success bookkeeping: a retryable failure is requeued (and must
         # not be counted as completed), and the retry brain owns the stage move for both outcomes.
@@ -866,8 +869,12 @@ class MessageDispatcher:
         if (
             self._in_queue_deadlock
             and not queue_deadlock_condition
-            and self._process_map.num_starting_processes() == 0
+            and (self._process_map.num_starting_processes() == 0 or self._process_map.has_inference_in_progress())
         ):
+            # The ``num_starting_processes() == 0`` term is an anti-flap guard so a model-preload window (a
+            # re-spawning slot in PROCESS_STARTING) does not prematurely clear a real all-idle deadlock. But a
+            # slot genuinely mid-inference disproves the all-idle premise outright, so a slow-to-spawn sibling
+            # must not keep the flag latched over a healthy, advancing worker.
             logger.debug("Queue deadlock cleared.")
             self._in_queue_deadlock = False
             self._queue_deadlock_model = None

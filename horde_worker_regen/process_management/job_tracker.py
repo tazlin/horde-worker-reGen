@@ -880,12 +880,15 @@ class JobTracker:
         *,
         is_resource_failure: bool = False,
         retryable: bool = True,
+        scheduling_fault: bool = False,
     ) -> InferenceFailureResolution:
         """Resolve a faulted job: requeue it for another (possibly degraded) attempt, or fault it.
 
         Returns the resolution so the caller can log/audit and, for a degraded retry, drive a more
         conservative re-dispatch. ``retryable=False`` forces a terminal fault (e.g. a post-inference
-        safety failure or a shutdown drain, where re-running inference cannot help).
+        safety failure or a shutdown drain, where re-running inference cannot help). ``scheduling_fault``
+        marks an ownership/scheduling failure (e.g. an orphan punt) that must not feed the per-card
+        "locally unservable" streak, since it is not a verdict on whether the model fits the card.
         """
         return self._resolve_inference_failure_impl(
             faulted_job,
@@ -893,6 +896,7 @@ class JobTracker:
             process_timeout=process_timeout,
             is_resource_failure=is_resource_failure,
             retryable=retryable,
+            scheduling_fault=scheduling_fault,
         )
 
     def handle_job_fault_now(
@@ -903,6 +907,7 @@ class JobTracker:
         *,
         is_resource_failure: bool = False,
         retryable: bool = True,
+        scheduling_fault: bool = False,
     ) -> InferenceFailureResolution:
         """Synchronous fault path for sync callers (e.g. process crash handling). See :meth:`handle_job_fault`."""
         return self._resolve_inference_failure_impl(
@@ -911,6 +916,7 @@ class JobTracker:
             process_timeout=process_timeout,
             is_resource_failure=is_resource_failure,
             retryable=retryable,
+            scheduling_fault=scheduling_fault,
         )
 
     def _resolve_inference_failure_impl(
@@ -921,6 +927,7 @@ class JobTracker:
         process_timeout: float,
         is_resource_failure: bool,
         retryable: bool,
+        scheduling_fault: bool = False,
     ) -> InferenceFailureResolution:
         tracked = self._tracked_for(faulted_job)
 
@@ -971,8 +978,10 @@ class JobTracker:
         # A terminal resource fault feeds the circuit-breaker (per-model "locally unservable" streak) and
         # the self-throttle backstop. A model the device cannot run faults every attempt no matter how it
         # is isolated, so without this the worker keeps popping and dropping it until the horde server
-        # forces maintenance; the scheduler/manager read these counters to stop the bleeding first.
-        if resource_failure:
+        # forces maintenance; the scheduler/manager read these counters to stop the bleeding first. A
+        # scheduling/ownership fault (an orphan punt) is excluded: it is not a card-fit verdict, and keying
+        # it to the dispatched card would wrongly de-list a model a capable card can still run.
+        if resource_failure and not scheduling_fault:
             # Key the streak to the card the job was dispatched to (recorded at mark_inference_started); None
             # on a single-GPU host keeps it worker-wide. The live process's index is not used for the key so
             # the fault and the success that clears it always agree on the card.

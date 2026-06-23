@@ -827,6 +827,29 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 count += 1
         return count
 
+    def has_inference_in_progress(self) -> bool:
+        """Whether a live inference slot is actively running a job (worker-wide).
+
+        True only while a slot is mid-inference (INFERENCE_STARTING or INFERENCE_POST_PROCESSING) on a
+        process still alive. This is the "real inference is advancing" fact the deadlock clear and the wedge
+        assessment both key on, kept in one place so they cannot drift apart. Deliberately narrower than
+        ``is_process_busy`` (which also counts PROCESS_STARTING / preloading / downloading): a slot merely
+        starting or loading a model is not running a job and must keep the anti-flap guard. Worker-wide on
+        purpose: the queue-deadlock premise is itself all-cards-idle, so any one card mid-inference is enough
+        to disprove it.
+        """
+        for process_info in self.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if not process_info.is_process_alive():
+                continue
+            if process_info.last_process_state in (
+                HordeProcessState.INFERENCE_STARTING,
+                HordeProcessState.INFERENCE_POST_PROCESSING,
+            ):
+                return True
+        return False
+
     def num_busy_with_post_processing(self, *, device_index: int | None = None) -> int:
         """Return the number of processes actively engaged in a post-processing task.
 

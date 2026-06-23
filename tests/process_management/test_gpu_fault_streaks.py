@@ -13,7 +13,7 @@ from horde_worker_regen.process_management.job_popper import _select_models_for_
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.process_map import ProcessMap
 
-from .conftest import make_mock_bridge_data, make_test_card_runtimes
+from .conftest import make_job_pop_response, make_mock_bridge_data, make_test_card_runtimes, track_popped_job_async
 
 _THRESHOLD = 3
 
@@ -111,3 +111,37 @@ class TestPopperHoldbackAcrossCards:
             models={"big", "small"},
         )
         assert selected == {"small"}
+
+
+class TestOrphanPuntDoesNotPoisonStreak:
+    """An orphan punt is a scheduling fault, never a per-card "locally unservable" verdict.
+
+    The orphan watchdog punts a stranded in-progress job; that is a host-contention/ownership failure, not
+    evidence the model cannot fit the card it was dispatched to. So even when the punted job was admitted
+    over budget (which otherwise folds into a resource failure), the punt must not key that card's streak and
+    de-list a model a capable card can still run. A genuine resource fault on the same model+card does key it.
+    """
+
+    async def test_over_budget_orphan_punt_does_not_key_its_card(self) -> None:
+        """An over-budget job punted as a scheduling fault leaves its card's streak at zero."""
+        job_tracker = JobTracker()  # one attempt by default, so this punt is terminal
+        job = make_job_pop_response(model="big")
+        await track_popped_job_async(job_tracker, job)
+        await job_tracker.mark_inference_started(job, device_index=1)
+        job_tracker.mark_admitted_over_budget(job)
+
+        job_tracker.handle_job_fault_now(faulted_job=job, retryable=True, scheduling_fault=True)
+
+        assert job_tracker.get_model_overbudget_fault_count("big", device_index=1) == 0
+        assert job_tracker.get_model_overbudget_fault_count("big") == 0
+
+    async def test_genuine_resource_fault_keys_its_card(self) -> None:
+        """The contrast: a real resource fault on the same model+card does feed the per-card streak."""
+        job_tracker = JobTracker()
+        job = make_job_pop_response(model="big")
+        await track_popped_job_async(job_tracker, job)
+        await job_tracker.mark_inference_started(job, device_index=1)
+
+        job_tracker.handle_job_fault_now(faulted_job=job, retryable=True, is_resource_failure=True)
+
+        assert job_tracker.get_model_overbudget_fault_count("big", device_index=1) == 1

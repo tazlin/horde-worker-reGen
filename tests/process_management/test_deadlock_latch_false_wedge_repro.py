@@ -124,3 +124,58 @@ async def test_sustained_all_idle_queue_deadlock_is_still_a_wedge() -> None:
 
     assert pm._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge() is True
     assert pm._assess_wedge() is True
+
+
+async def test_latched_flag_stays_latched_while_a_slot_merely_preloads() -> None:
+    """Guard: the clear-bypass keys on real inference, not on any non-idle state (e.g. a model preload).
+
+    A slot preloading the head's model and a sibling still spinning up are both busy but neither is running
+    a job, so ``has_inference_in_progress()`` is False and the anti-flap guard must keep the latched flag
+    exactly as before. The bypass added for the false-wedge fix must not fire on a mere preload/start.
+    """
+    pm = make_testable_process_manager()
+    pm._state.last_job_pop_time = time.time() - 60
+
+    preloading = make_mock_process_info(1, model_name="resident", state=HordeProcessState.PRELOADING_MODEL)
+    pm._process_map[1] = preloading
+    starting = make_mock_process_info(2, model_name=None, state=HordeProcessState.PROCESS_STARTING)
+    pm._process_map[2] = starting
+
+    pm._message_dispatcher._in_queue_deadlock = True
+    pm._message_dispatcher._last_queue_deadlock_detected_time = time.time() - _STRUCTURAL_WEDGE_AGE
+
+    pm.detect_deadlock()
+
+    # Nothing is mid-inference, so the bypass does not fire and the flag stays latched (anti-flap intact).
+    assert pm._message_dispatcher.get_deadlock_snapshot().in_queue_deadlock is True
+
+
+async def test_inference_suppression_zeroes_only_the_queue_wedge_term() -> None:
+    """Guard: suppressing the queue-wedge while inference advances must not mask an independent wedge.
+
+    With a live slot mid-inference, the structural queue-wedge term is zeroed (the worker is making
+    progress). But an orphaned-job storm is a separate SOS trigger: backdating the punt history past the
+    threshold must still assess the worker as wedged, proving the suppression is scoped to the queue term.
+    """
+    pm = make_testable_process_manager()
+    pm._state.last_job_pop_time = time.time() - 60
+
+    busy = make_mock_process_info(1, model_name="resident", state=HordeProcessState.INFERENCE_STARTING)
+    pm._process_map[1] = busy
+
+    job = make_job_pop_response(model="resident")
+    await track_popped_job_async(pm._job_tracker, job)
+    await pm._job_tracker.mark_inference_started(job)
+    busy.last_job_referenced = job
+
+    # Latch a structural queue wedge; the live inference slot suppresses *that* term.
+    pm._message_dispatcher._in_queue_deadlock = True
+    pm._message_dispatcher._last_queue_deadlock_detected_time = time.time() - _STRUCTURAL_WEDGE_AGE
+
+    # With no other signal, the suppressed queue wedge leaves the worker un-wedged.
+    assert pm._assess_wedge() is False
+
+    # An independent orphan storm must still escalate: suppression touches only the queue-wedge term.
+    now = time.time()
+    pm._orphan_punt_history = [now] * pm._ORPHAN_PUNT_WEDGE_THRESHOLD
+    assert pm._assess_wedge() is True
