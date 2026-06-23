@@ -5,8 +5,10 @@ bridgeData.yaml*
 .models_downloaded
 testing
 dummy
-
+.pt_*/*
+docs/plans/**/*.md
 kudos_training_data*
+.claude/**
 
 benchmark_results/runs
 benchmark_results/**/*
