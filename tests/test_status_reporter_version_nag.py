@@ -51,7 +51,7 @@ def test_newer_release_env_var_triggers_the_nag(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv(NEWER_RELEASE_ENV_VAR, "99.0.0")
     blob = "\n".join(_call_print_warnings())
     assert "newer AI Worker release (v99.0.0)" in blob
-    assert "winget upgrade Haidra.HordeWorker" in blob
+    assert "update.cmd" in blob
 
 
 def test_required_version_takes_precedence_over_newer_release(monkeypatch: pytest.MonkeyPatch) -> None:

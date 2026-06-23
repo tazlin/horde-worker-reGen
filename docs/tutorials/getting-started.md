@@ -38,7 +38,7 @@ It prints what it will install and asks you to confirm (answer `y`). If you run 
 terminal to answer (a script or pipe with no console), re-run it as
 `curl -LsSf .../install.sh | HORDE_WORKER_ASSUME_YES=1 sh` to accept up front.
 
-Other ways to install (winget, a scripted PowerShell command, a manual clone) are in the
+Other ways to install (a scripted PowerShell command, a manual clone) are in the
 [install guide](../how-to/install.md), but the two above are the easiest.
 
 ## Step 2: Let it set itself up

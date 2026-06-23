@@ -27,21 +27,14 @@ If Windows SmartScreen shows "Windows protected your PC", the installer is not c
 
 ### Scripted install (advanced)
 
-Prefer the command line, or want an unattended install? Use `winget`:
-
-```powershell
-winget install Haidra.HordeWorker
-```
-
-Or paste the one-liner into PowerShell:
+Prefer the command line, or want an unattended install? Paste the one-liner into PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.ps1 | iex
 ```
 
 The `irm ... | iex` one-liner may trigger SmartScreen ("Windows protected your PC"). Click
-**More info**, then **Run anyway**, the same step used to install tools like `uv`. `winget install`
-avoids the prompt entirely.
+**More info**, then **Run anyway**, the same step used to install tools like `uv`.
 
 ## Linux and macOS
 
@@ -86,8 +79,7 @@ No) before creating any shortcut.
 
 Keep the install path free of spaces. The one-liner installs into a `HordeWorker` (Windows) or
 `horde-worker` (Linux/macOS) folder in your **current directory**, so `cd` to the drive you want
-before running it. Installing with `winget` instead? See
-[choosing the install drive](https://github.com/Haidra-Org/horde-worker-reGen/blob/main/packaging/winget/README.md#choosing-where-it-installs-and-how-much-disk-you-need).
+before running it.
 
 ## Disk space
 
@@ -98,9 +90,7 @@ bulk, and that floor is unavoidable on a GPU install). The CPU-only build is aro
 **Models are separate and much larger.** Each is around 2 to 8 GB, and a useful selection runs to tens
 or hundreds of GB. The one-liner keeps everything on the drive you run it from, with the models (and the
 uv cache and Python) in the peered `<worker>-data` folder; set `HORDE_WORKER_DATA_DIR` before installing
-to place that folder on another drive. With `winget`, see
-[the winget notes](https://github.com/Haidra-Org/horde-worker-reGen/blob/main/packaging/winget/README.md#choosing-where-it-installs-and-how-much-disk-you-need)
-for installing to another drive and redirecting the model cache.
+to place that folder on another drive.
 
 ## Manual install (git or zip)
 

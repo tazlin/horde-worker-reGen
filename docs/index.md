@@ -78,3 +78,5 @@ under **[Code reference](horde_worker_regen/)**.
 
 - **[Contributing](https://github.com/Haidra-Org/horde-worker-reGen/blob/main/CONTRIBUTING.md)**:
   development setup and guidelines.
+- **[Enable winget publishing](how-to/enable-winget-publishing.md)**: maintainer runbook for the
+  currently-paused winget distribution channel.

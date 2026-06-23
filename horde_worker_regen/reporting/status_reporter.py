@@ -516,7 +516,7 @@ class StatusReporter:
         elif newer_release := os.getenv(NEWER_RELEASE_ENV_VAR):
             logger.warning(
                 f"A newer AI Worker release (v{newer_release}) is available. Update with "
-                "'winget upgrade Haidra.HordeWorker', or re-run the installer (the same install command).",
+                "'update.cmd'/'update.sh', or re-run the installer (the same install command).",
             )
 
         # Extra slow worker warnings

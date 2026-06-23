@@ -26,7 +26,7 @@ and double-click it.
 curl -LsSf https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.sh | sh
 ```
 
-**Windows (command line):** `winget install Haidra.HordeWorker`, or paste
+**Windows (command line):** paste
 `irm https://raw.githubusercontent.com/Haidra-Org/horde-worker-reGen/main/install.ps1 | iex`
 into PowerShell.
 

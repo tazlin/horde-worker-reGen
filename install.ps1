@@ -211,8 +211,8 @@ if ($madeShortcut) {
     Write-Host "  - click the 'AI Horde Worker' shortcut on your Desktop or in the Start Menu, or"
 }
 Write-Host "  - run horde-worker.cmd in $InstallDir (add --terminal for the in-terminal UI, --headless for no UI)."
-Write-Host "To update later: run update.cmd in $InstallDir, re-run the same install command, or"
-Write-Host "  'winget upgrade Haidra.HordeWorker'. Any of these keep your $InstallDir-data folder intact."
+Write-Host "To update later: run update.cmd in $InstallDir, or re-run the same install command"
+Write-Host "  (either keeps your $InstallDir-data folder intact)."
 Write-Host ""
 
 if (Get-Option "HORDE_WORKER_NO_LAUNCH" "") {

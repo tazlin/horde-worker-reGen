@@ -1,12 +1,14 @@
 name: Publish to WinGet
 
-# Opt-in automated submission to the Windows Package Manager community repo, replacing the manual
-# per-release version bump + placeholder SHA256 in packaging/winget/. It stays INACTIVE until a
-# maintainer opts in (see packaging/winget/README.md):
-#   - set the repo variable WINGET_ENABLED to 'true'
-#   - add the secret WINGET_TOKEN: a classic PAT that can push to your fork of microsoft/winget-pkgs
-# The action (winget-releaser, Komac under the hood) reads the release's zip asset, computes its hash,
-# and opens the winget-pkgs PR for Haidra.HordeWorker.
+# Automated submission to the Windows Package Manager community repo.
+#
+# PAUSED: winget publishing is intentionally disabled. The publish job below is hard-gated `if: false`, so
+# this workflow is a guaranteed no-op even if a `release` is published, `workflow_dispatch` is invoked, or
+# the WINGET_ENABLED variable is set to 'true'. Do NOT rely on WINGET_ENABLED alone to keep it off.
+# To turn winget publishing back on, follow the runbook in docs/how-to/enable-winget-publishing.md (restore
+# the `if:` guard below, set the WINGET_ENABLED variable and WINGET_TOKEN secret, and complete the one-time
+# winget-pkgs onboarding). When enabled, the action (winget-releaser, Komac under the hood) reads the
+# release's zip asset, computes its hash, and opens the winget-pkgs PR for Haidra.HordeWorker.
 on:
   release:
     types: [released]
@@ -19,7 +21,8 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    if: ${{ vars.WINGET_ENABLED == 'true' }}
+    # PAUSED hard-off: see docs/how-to/enable-winget-publishing.md. To restore: if: ${{ vars.WINGET_ENABLED == 'true' }}
+    if: false
     steps:
       - name: Submit to winget-pkgs
         uses: vedantmgoyal9/winget-releaser@v2

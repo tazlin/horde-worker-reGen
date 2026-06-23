@@ -1,8 +1,8 @@
 """A best-effort 'is there a newer release?' check, shared by the dashboard and the headless worker.
 
 Compares the running version against the latest GitHub release and, when newer, lets a caller surface a
-non-blocking notice telling the user how to update (``winget upgrade``, ``update.cmd``/``update.sh``, or
-re-running the installer). It deliberately does not apply updates itself: the in-place applier lives in the
+non-blocking notice telling the user how to update (``update.cmd``/``update.sh`` or re-running the
+installer). It deliberately does not apply updates itself: the in-place applier lives in the
 ``worker_bootstrap`` package, which runs before the venv exists; this notifier only informs.
 
 To keep the notice and the applier from disagreeing about what "newer" means, which channel applies, and

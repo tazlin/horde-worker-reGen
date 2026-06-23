@@ -11,3 +11,4 @@ nav:
     - choose-a-pytorch-build.md
     - run-in-docker.md
     - troubleshoot.md
+    - enable-winget-publishing.md

@@ -1,5 +1,9 @@
 # winget manifest for `Haidra.HordeWorker`
 
+> **Paused:** winget publishing is currently disabled and the worker does not advertise winget to users.
+> These manifests and the submission workflow are kept dormant in-tree. To turn winget publishing back on,
+> follow [Enable winget publishing](../../docs/how-to/enable-winget-publishing.md).
+
 These manifests publish the worker to the [Windows Package Manager](https://github.com/microsoft/winget-pkgs)
 so Windows users get a trusted, auto-updating install without a paid code-signing certificate:
 
