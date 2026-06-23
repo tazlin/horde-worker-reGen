@@ -88,6 +88,30 @@ def consent_marker(root: Path | None = None) -> Path:
     return bin_dir(root) / "install-consent"
 
 
+def install_info_file(root: Path | None = None) -> Path:
+    """Return the marker recording how this worker was installed (``bin/install-info``).
+
+    Written once by the front-end that performed the install (the one-line installer, the graphical
+    ``.exe``) as ``key=value`` lines: ``method`` (``one-line``/``exe``/``zip``) and ``repo`` (the
+    ``owner/repo`` the bundle was downloaded from). The self-updater reads it to pull the next release from
+    the same origin the user actually installed from, rather than a hardcoded default. Lives under ``bin/``
+    so it is per-install (the release bundle is shared across front-ends and cannot carry it) and is removed
+    on uninstall, and so an in-place update never clobbers it (``bin`` is preserved by the overlay).
+    """
+    return bin_dir(root) / "install-info"
+
+
+def update_state_file(root: Path | None = None) -> Path:
+    """Return the self-updater's persisted state (``<worker>-data/.update-state.json``).
+
+    Records the version the user chose to skip and when the last launch-time update check ran, so a
+    declined update is not re-offered every launch and the check is throttled. It lives in the writable,
+    preserved data dir (not the worker folder, which an update overlays) so the skip and throttle survive
+    an update and a worker-folder reinstall.
+    """
+    return data_root(root) / ".update-state.json"
+
+
 def git_dir(root: Path | None = None) -> Path:
     """Return where a bundled portable git (MinGit, Windows fallback) is unpacked (``bin/git``)."""
     return bin_dir(root) / "git"

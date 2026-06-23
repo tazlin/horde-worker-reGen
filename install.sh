@@ -10,6 +10,7 @@
 #
 # Options (environment variables, so they work with the curl | sh form):
 #   HORDE_WORKER_DIR         install location (default: ./horde-worker in the current directory)
+#   HORDE_WORKER_REPO        install from a fork (owner/repo; default Haidra-Org/horde-worker-reGen)
 #   HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | rocm | cpu (default: detected from the GPU/driver)
 #   HORDE_WORKER_FEATURES    optional feature extras to install: comma/space list of post-processing,
 #                            controlnet, or 'none' (default: all on NVIDIA/CPU, none on other backends)
@@ -19,8 +20,18 @@
 #   HORDE_WORKER_NO_LAUNCH   skip the "Start now?" prompt and do not launch after install
 set -eu
 
-OWNER="tazlin"
-REPO="horde-worker-reGen"
+# The owner/repo to install from. Defaults to the canonical production repo; a fork overrides it by setting
+# HORDE_WORKER_REPO (e.g. baked into its own one-liner) rather than editing this file, so the committed
+# default never diverges from upstream. The resolved value is recorded in bin/install-info, so the in-place
+# self-updater pulls future releases from the same origin (see worker_bootstrap/updater.py resolve_update_repo).
+REPO_SLUG="${HORDE_WORKER_REPO:-Haidra-Org/horde-worker-reGen}"
+case "$REPO_SLUG" in
+    */*/*) echo "ERROR: HORDE_WORKER_REPO must be 'owner/repo' (got '$REPO_SLUG')." >&2; exit 1 ;;
+    */*) ;;
+    *) echo "ERROR: HORDE_WORKER_REPO must be 'owner/repo' (got '$REPO_SLUG')." >&2; exit 1 ;;
+esac
+OWNER="${REPO_SLUG%/*}"
+REPO="${REPO_SLUG#*/}"
 ASSET="horde-worker-reGen.zip"
 RELEASE_URL="https://github.com/$OWNER/$REPO/releases/latest/download/$ASSET"
 
@@ -71,6 +82,12 @@ else
     exit 1
 fi
 rm -rf "$tmp_dir"
+
+# Record how this worker was installed and from where, so the in-place self-updater pulls future releases
+# from the same origin (this fork/account) rather than a hardcoded default. Lives under bin/ (preserved
+# across updates, removed on uninstall).
+mkdir -p "$INSTALL_DIR/bin"
+printf 'method=one-line\nrepo=%s/%s\n' "$OWNER" "$REPO" > "$INSTALL_DIR/bin/install-info"
 
 cd "$INSTALL_DIR"
 if ! chmod +x ./*.sh 2>/dev/null; then

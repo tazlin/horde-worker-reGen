@@ -290,7 +290,7 @@ class HordeWorkerTUI(App[None]):
             return
         self.notify(
             f"Update available: v{runtime_version()} -> v{info.latest_version}. Update with "
-            "'winget upgrade Haidra.HordeWorker', or re-run the installer (the same install command).",
+            "'update.cmd'/'update.sh', 'winget upgrade Haidra.HordeWorker', or by re-running the installer.",
             title="Update available",
             timeout=10,
         )

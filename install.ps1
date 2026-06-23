@@ -10,6 +10,7 @@
 #
 # Options come from environment variables (so they work with the irm | iex form):
 #   $env:HORDE_WORKER_DIR         install location (default: .\HordeWorker in the current directory)
+#   $env:HORDE_WORKER_REPO        install from a fork (owner/repo; default Haidra-Org/horde-worker-reGen)
 #   $env:HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | cpu (default: detected from the GPU driver)
 #   $env:HORDE_WORKER_FEATURES    optional feature extras: comma/space list of post-processing, controlnet,
 #                                 or 'none' (default: all on NVIDIA/CPU, none on other backends)
@@ -24,8 +25,14 @@ $ErrorActionPreference = "Stop"
 # Windows PowerShell 5.1 defaults to TLS 1.0/1.1; GitHub requires 1.2+, so opt in before downloading.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$Owner = "tazlin"
-$Repo = "horde-worker-reGen"
+# The owner/repo to install from. Defaults to the canonical production repo; a fork overrides it by setting
+# HORDE_WORKER_REPO (e.g. baked into its own one-liner) rather than editing this file, so the committed
+# default never diverges from upstream. The resolved value is recorded in bin/install-info, so the in-place
+# self-updater pulls future releases from the same origin (see worker_bootstrap/updater.py resolve_update_repo).
+$RepoSlug = [Environment]::GetEnvironmentVariable("HORDE_WORKER_REPO")
+if (-not $RepoSlug) { $RepoSlug = "Haidra-Org/horde-worker-reGen" }
+if ($RepoSlug -notmatch "^[^/]+/[^/]+$") { Write-Error "HORDE_WORKER_REPO must be 'owner/repo' (got '$RepoSlug')."; exit 1 }
+$Owner, $Repo = $RepoSlug.Split("/", 2)
 $Asset = "horde-worker-reGen.zip"
 $ReleaseUrl = "https://github.com/$Owner/$Repo/releases/latest/download/$Asset"
 
@@ -118,6 +125,13 @@ if (Test-Path $curl) {
 Write-Host "Extracting..."
 Expand-ReleaseZip -ZipPath $tmpZip -Destination $InstallDir
 Remove-Item $tmpZip -Force
+
+# Record how this worker was installed and from where, so the in-place self-updater pulls future releases
+# from the same origin (this fork/account) rather than a hardcoded default. Lives under bin/ (preserved
+# across updates, removed on uninstall). Written without a BOM so the bootstrap parses the first key cleanly.
+$binDir = Join-Path $InstallDir "bin"
+New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $binDir "install-info"), "method=one-line`nrepo=$Owner/$Repo`n")
 
 # Show what is about to be installed (and from where) and get consent before any heavy download. We do it
 # here, where the user is at a console, then pass HORDE_WORKER_ASSUME_YES so the bootstrap does not prompt

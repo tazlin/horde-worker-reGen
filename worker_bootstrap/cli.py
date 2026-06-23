@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from worker_bootstrap import backend as backend_mod
-from worker_bootstrap import config_seed, consent, detect, gitbin, paths, runner, sync_plan, uvbin
+from worker_bootstrap import config_seed, consent, detect, gitbin, paths, runner, sync_plan, updater, uvbin
 
 _BACKEND_ENV = "HORDE_WORKER_BACKEND"
 _FEATURES_ENV = "HORDE_WORKER_FEATURES"
@@ -366,8 +366,74 @@ def _cmd_sync(args: argparse.Namespace, root: Path, uv: str) -> int:
     return _sync(uv, root, cli_flag=args.backend, options=_sync_options(args))
 
 
+def _maybe_offer_update(root: Path) -> None:
+    """On launch, check for a newer release and (per policy) apply it before syncing/starting.
+
+    Best-effort and never fatal: a failed check or a declined prompt simply proceeds with the current
+    install. ``off`` skips entirely; ``auto`` applies without asking; ``prompt`` (default) asks on an
+    interactive run and only notifies (never blocks) when headless, so an unattended/service start is
+    never wedged waiting on input. The applied overlay changes ``uv.lock`` when dependencies moved, which
+    the subsequent lock-aware sync then installs before the worker starts.
+
+    The self-applier bows out for installs whose updates are owned elsewhere (winget, a git checkout): the
+    in-worker notifier still tells the user how to update those. To avoid a launch being gated on the GitHub
+    API every time, the check is throttled, and a version the user explicitly skipped is not re-offered
+    until a newer one is released.
+    """
+    policy = updater.auto_update_policy()
+    if policy == "off":
+        return
+    allowed, _reason = updater.self_update_allowed(root)
+    if not allowed:
+        return
+    if not updater.should_check_now(root):
+        return
+    try:
+        info = updater.check_for_update(root)
+    except Exception as error:  # noqa: BLE001 - a launch must never fail because the update check did
+        print(f"Update check skipped: {error}", file=sys.stderr)
+        return
+    updater.record_check(root)
+    if not info.available or info.latest is None:
+        return
+    if updater.is_version_skipped(root, info.latest):
+        return
+
+    kind = "beta update" if info.is_prerelease else "update"
+    if policy == "prompt":
+        if not consent.is_interactive():
+            print(
+                f"A worker {kind} is available ({info.current} -> {info.latest}). Run `update` to apply, "
+                "or set HORDE_WORKER_AUTO_UPDATE=auto.",
+                file=sys.stderr,
+            )
+            return
+        answer = (
+            input(f"A worker {kind} is available ({info.current} -> {info.latest}). Update now? [Y/n/skip] ")
+            .strip()
+            .lower()
+        )
+        if answer in ("s", "skip"):
+            updater.mark_version_skipped(root, info.latest)
+            print(f"Skipping {info.latest}; you won't be asked again until a newer version is released.")
+            return
+        if answer in ("n", "no"):
+            print("Skipping the update for this launch.")
+            return
+
+    print(f"Updating to {info.latest} ...")
+    result = updater.perform_update(root, info)
+    if result.ok:
+        print(result.message)
+        updater.clear_skip(root)
+        updater.sync_arp_version(root, info.latest)
+    else:
+        print(f"Update skipped: {result.message}", file=sys.stderr)
+
+
 def _cmd_launch(args: argparse.Namespace, root: Path, uv: str) -> int:
-    """Start the worker in the requested mode, syncing first if the venv is missing."""
+    """Start the worker in the requested mode, syncing first if the venv is missing or stale."""
+    _maybe_offer_update(root)
     rc = _ensure_synced(uv, root, cli_flag=args.backend, options=_sync_options(args))
     if rc != 0:
         return rc
@@ -390,6 +456,68 @@ def _cmd_preload(args: argparse.Namespace, root: Path, uv: str) -> int:
 def _cmd_run(args: argparse.Namespace, root: Path, uv: str) -> int:
     """Run an arbitrary command in the worker venv (uv run --no-sync), for back-compat passthrough."""
     return runner.uv_run(uv, list(args.rest), root=root)
+
+
+def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
+    """Check for, and (unless ``--check``) apply, the latest release in place, then re-sync dependencies.
+
+    Unlike the launch-time offer, this ignores the skip/throttle state (running ``update`` is itself the
+    intent to update now). It refuses to overlay an install whose updates are owned elsewhere (winget, a
+    git checkout), but ``--check`` still reports availability for those.
+    """
+    if args.check:
+        info = updater.check_for_update(root)
+        channel_note = " (beta channel)" if info.channel == "beta" else ""
+        if info.latest is None:
+            print("Could not determine the latest version (the update check failed).", file=sys.stderr)
+            return 1
+        if info.available:
+            print(f"Update available{channel_note}: {info.current} -> {info.latest}")
+        else:
+            print(f"Up to date ({info.current}){channel_note}.")
+        return 0
+
+    # Gate before the network call on the apply path: an install whose updates are owned elsewhere is
+    # refused regardless of what is available.
+    allowed, reason = updater.self_update_allowed(root)
+    if not allowed:
+        print(reason, file=sys.stderr)
+        return 1
+
+    info = updater.check_for_update(root)
+    channel_note = " (beta channel)" if info.channel == "beta" else ""
+    if info.latest is None:
+        print("Could not check for updates; leaving the current install unchanged.", file=sys.stderr)
+        return 1
+    if not info.available:
+        print(f"Already up to date ({info.current}){channel_note}.")
+        return 0
+
+    if not args.yes and consent.is_interactive():
+        answer = input(f"Update {info.current} -> {info.latest}{channel_note}? [Y/n] ")
+        if answer.strip().lower() in ("n", "no"):
+            print("Update cancelled.")
+            return 1
+
+    result = updater.perform_update(root, info)
+    if not result.ok:
+        print(f"Update failed: {result.message}", file=sys.stderr)
+        return 1
+    updater.clear_skip(root)
+    updater.sync_arp_version(root, info.latest)
+
+    # The overlay may have moved uv.lock; reconcile the venv now so the next launch starts on the new deps.
+    # Hold the success line until the reconcile lands so a failed sync is not reported as a clean update
+    # (the overlay invalidated the sync stamp, so the next launch retries the sync regardless).
+    rc = _sync(uv, root, cli_flag=None, options=_sync_options(args))
+    if rc != 0:
+        print(
+            f"{result.message} The dependency sync did not complete; the next launch will retry it.",
+            file=sys.stderr,
+        )
+        return rc
+    print(result.message)
+    return 0
 
 
 def _cmd_install(args: argparse.Namespace, root: Path, uv: str) -> int:
@@ -505,6 +633,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="Run an arbitrary command in the worker venv (uv run --no-sync).")
     p_run.add_argument("rest", nargs=argparse.REMAINDER, help="The command and its arguments.")
 
+    p_update = sub.add_parser("update", help="Update the worker to the latest release in place, then re-sync.")
+    p_update.add_argument("--check", action="store_true", help="Only report whether an update is available.")
+    p_update.add_argument("--yes", action="store_true", help="Apply without prompting (for non-interactive use).")
+
     return parser
 
 
@@ -515,6 +647,7 @@ _HANDLERS = {
     "preload": _cmd_preload,
     "install": _cmd_install,
     "run": _cmd_run,
+    "update": _cmd_update,
 }
 
 

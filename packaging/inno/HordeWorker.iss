@@ -18,6 +18,11 @@
 #ifndef StageDir
   #define StageDir "..\..\stage"
 #endif
+; The owner/repo the self-updater should pull future releases from. Recorded into bin\install-info at
+; install time. CI can override with /DRepo=<owner>/<repo>; defaults to the canonical production repo.
+#ifndef Repo
+  #define Repo "Haidra-Org/horde-worker-reGen"
+#endif
 
 [Setup]
 ; A stable AppId is what lets a later installer upgrade in place and gives a single Add/Remove Programs
@@ -171,5 +176,8 @@ begin
     // Record that consent was captured by the license page so the deferred first-launch sync
     // (horde-worker.cmd -> runtime.cmd -> bootstrap.py) does not prompt the user a second time.
     SaveStringToFile(ExpandConstant('{app}\bin\install-consent'), 'consent recorded (graphical installer)' + #13#10, False);
+    // Record how this worker was installed and from where, so the self-updater can keep the Add/Remove
+    // Programs version honest and pull future releases from the right origin.
+    SaveStringToFile(ExpandConstant('{app}\bin\install-info'), 'method=exe' + #13#10 + 'repo={#Repo}' + #13#10, False);
   end;
 end;

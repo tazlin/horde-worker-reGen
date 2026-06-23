@@ -216,7 +216,7 @@ def _run_release_update_check() -> None:
     os.environ[NEWER_RELEASE_ENV_VAR] = info.latest_version
     logger.warning(
         f"Update available: v{current_version()} -> v{info.latest_version}. Update with "
-        "'winget upgrade Haidra.HordeWorker', or re-run the installer (the same install command).",
+        "'update.cmd'/'update.sh', 'winget upgrade Haidra.HordeWorker', or by re-running the installer.",
     )
 
 

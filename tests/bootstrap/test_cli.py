@@ -19,6 +19,8 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, list[tup
     )
     monkeypatch.delenv("HORDE_WORKER_BACKEND", raising=False)
     monkeypatch.setattr(cli.detect, "detect_backend", lambda: "cu126")
+    # Keep launch tests hermetic: no launch-time update check reaches the network unless a test opts in.
+    monkeypatch.setenv("HORDE_WORKER_AUTO_UPDATE", "off")
 
     # Keep the install path hermetic: don't really prompt for consent or shell out to git.
     monkeypatch.setattr(cli.consent, "ensure_consent", lambda **kw: True)
@@ -120,6 +122,154 @@ def test_launch_skips_sync_when_stamp_matches_lock(env: tuple[Path, list]) -> No
     (root / ".venv" / ".horde-sync-stamp").write_text(cli._lock_fingerprint(root), encoding="utf-8")
     assert cli.main(["launch", "terminal"]) == 0
     assert calls == [("run", ["horde-worker"])]
+
+
+def _available_info() -> object:
+    """An UpdateInfo describing an available update (assets present)."""
+    return cli.updater.UpdateInfo(
+        current="1.0.0",
+        latest="v2.0.0",
+        available=True,
+        bundle_url="https://example/horde-worker-reGen.zip",
+        checksums_url="https://example/SHA256SUMS",
+    )
+
+
+def test_update_check_reports_available(
+    env: tuple[Path, list],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`update --check` reports an available update without applying it."""
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda root: _available_info())
+    assert cli.main(["update", "--check"]) == 0
+    assert "Update available" in capsys.readouterr().out
+
+
+def test_update_applies_then_resyncs(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """`update --yes` applies the update and then re-syncs so the new deps are installed."""
+    _, calls = env
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda root: _available_info())
+    applied: list[bool] = []
+    monkeypatch.setattr(
+        cli.updater,
+        "perform_update",
+        lambda root, info: (
+            applied.append(True) or cli.updater.UpdateResult(True, "Updated to v2.0.0.", "1.0.0", "2.0.0")
+        ),
+    )
+    assert cli.main(["update", "--yes"]) == 0
+    assert applied == [True]
+    assert calls == [("sync", "cu126")]  # reconcile after the overlay
+
+
+def test_launch_auto_update_reconciles_deps_when_lock_changes(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch-time update that moves uv.lock must re-sync before running, not start on the old deps."""
+    root, calls = env
+    _make_venv(root)
+    # Begin in sync: a lockfile and a matching stamp, so a plain launch would otherwise skip the sync.
+    (root / "uv.lock").write_text("lock-old\n", encoding="utf-8")
+    cli.paths.sync_stamp_file(root).write_text(cli.hashlib.sha256(b"lock-old\n").hexdigest(), encoding="utf-8")
+    monkeypatch.setenv("HORDE_WORKER_AUTO_UPDATE", "auto")
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda r: _available_info())
+
+    def fake_apply(r: Path, info: object) -> object:
+        # Mimic a real overlay: a new lockfile lands and the sync stamp is invalidated.
+        (root / "uv.lock").write_text("lock-new\n", encoding="utf-8")
+        cli.updater._invalidate_sync_stamp(root)
+        return cli.updater.UpdateResult(True, "Updated.", "1.0.0", "2.0.0")
+
+    monkeypatch.setattr(cli.updater, "perform_update", fake_apply)
+    assert cli.main(["launch", "terminal"]) == 0
+    assert calls == [("sync", "cu126"), ("run", ["horde-worker"])]
+
+
+def test_launch_auto_update_applies_before_sync(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """With policy=auto, launch applies an available update, then proceeds to sync/run."""
+    root, calls = env
+    _make_venv(root)
+    monkeypatch.setenv("HORDE_WORKER_AUTO_UPDATE", "auto")
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda r: _available_info())
+    applied: list[bool] = []
+    monkeypatch.setattr(
+        cli.updater,
+        "perform_update",
+        lambda r, info: applied.append(True) or cli.updater.UpdateResult(True, "Updated.", "1.0.0", "2.0.0"),
+    )
+    assert cli.main(["launch", "terminal"]) == 0
+    assert applied == [True]
+    assert calls == [("run", ["horde-worker"])]
+
+
+def test_launch_update_off_never_checks(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """With policy=off (the fixture default), the launch path never calls the update check."""
+    root, calls = env
+    _make_venv(root)
+    checked: list[bool] = []
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda r: checked.append(True) or _available_info())
+    assert cli.main(["launch", "terminal"]) == 0
+    assert checked == []
+
+
+def test_update_refused_on_winget_install(
+    env: tuple[Path, list],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`update` refuses to self-apply a winget-managed install (winget owns the version) and never checks."""
+    _, calls = env
+    monkeypatch.setattr(cli.updater, "resolve_install_method", lambda root=None: "winget")
+    checked: list[bool] = []
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda root: checked.append(True) or _available_info())
+    assert cli.main(["update", "--yes"]) == 1
+    assert "winget upgrade" in capsys.readouterr().err
+    assert checked == []  # gated before the network call
+    assert calls == []  # nothing applied or synced
+
+
+def test_launch_bows_out_of_self_update_on_dev_checkout(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a git checkout, launch never runs the self-updater (it would overlay the working tree)."""
+    root, _ = env
+    _make_venv(root)
+    monkeypatch.setenv("HORDE_WORKER_AUTO_UPDATE", "auto")
+    monkeypatch.setattr(cli.updater, "resolve_install_method", lambda root=None: "dev")
+    checked: list[bool] = []
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda r: checked.append(True) or _available_info())
+    assert cli.main(["launch", "terminal"]) == 0
+    assert checked == []
+
+
+def test_launch_skip_persists_and_suppresses_reoffer(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answering 'skip' records the version and a later launch does not re-offer it."""
+    root, _ = env
+    _make_venv(root)
+    state = root / ".update-state.json"
+    monkeypatch.setattr(cli.updater.paths, "update_state_file", lambda root=None: state)
+    monkeypatch.setenv("HORDE_WORKER_AUTO_UPDATE", "prompt")
+    # Force the check to always be due so this exercises skip suppression, not the time throttle.
+    monkeypatch.setattr(cli.updater, "should_check_now", lambda root: True)
+    monkeypatch.setattr(cli.consent, "is_interactive", lambda: True)
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda r: _available_info())
+    applied: list[bool] = []
+    monkeypatch.setattr(
+        cli.updater,
+        "perform_update",
+        lambda r, info: applied.append(True) or cli.updater.UpdateResult(True, "Updated.", "1.0.0", "2.0.0"),
+    )
+
+    monkeypatch.setattr("builtins.input", lambda prompt="": "skip")
+    assert cli.main(["launch", "terminal"]) == 0
+    assert applied == []  # the user skipped, so nothing was applied
+    assert cli.updater.is_version_skipped(root, "v2.0.0") is True
+
+    # A second launch must not re-prompt for the same version; a stray prompt would raise here.
+    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(AssertionError("re-prompted")))
+    assert cli.main(["launch", "terminal"]) == 0
+    assert applied == []
 
 
 def test_sync_writes_lock_stamp(env: tuple[Path, list]) -> None:
