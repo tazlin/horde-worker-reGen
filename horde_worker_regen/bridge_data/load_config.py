@@ -1,41 +1,96 @@
 """Contains methods for loading the config file."""
 
-import asyncio
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterable, Mapping
 from enum import auto
 from pathlib import Path
 
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_model_reference.model_reference_manager import ModelReferenceManager
+from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api.ai_horde_clients import AIHordeAPIManualClient
+from horde_sdk.worker.dispatch.ai_horde.bridge_data import MetaInstruction
 from horde_sdk.worker.model_meta import ImageModelLoadResolver
 from loguru import logger
 from ruamel.yaml import YAML
 from strenum import StrEnum
 
 from horde_worker_regen.bridge_data import AIWORKER_REGEN_PREFIX
+from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
 
-def _make_image_model_load_resolver() -> ImageModelLoadResolver:
-    """Construct an ``ImageModelLoadResolver``, safe to call whether or not an event loop is running.
+def _make_image_model_load_resolver(
+    horde_model_reference_manager: ModelReferenceManager,
+) -> ImageModelLoadResolver:
+    """Construct an ``ImageModelLoadResolver`` over the worker's own reference manager.
 
-    The SDK constructor calls ``asyncio.run()`` to initialise its model reference manager. On a config
-    *reload* this runs inside the worker's already-running event loop (the bridge-data watcher calls the
-    sync loader from an async coroutine), where ``asyncio.run()`` raises and leaves its init coroutine
-    un-awaited: the meta-instruction reload then silently fails. Building the resolver on a short-lived
-    worker thread gives ``asyncio.run()`` the clean, loop-free thread it requires. Off the event loop
-    (startup) we construct it inline, with no thread overhead.
+    Injecting the already-initialised manager makes the SDK read the reference the parent already holds
+    instead of building (and network-prefetching) its own. It also bypasses the SDK's internal
+    ``asyncio.run()``, so this is safe to call from inside the worker's running reload loop with no
+    worker-thread workaround: a config *reload* used to need a throwaway thread only because the SDK
+    constructor could not call ``asyncio.run()`` under a running loop, which injection sidesteps.
     """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return ImageModelLoadResolver()
+    return ImageModelLoadResolver(horde_model_reference_manager)
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(ImageModelLoadResolver).result()
+
+def _meta_instruction_matches_record(instruction: str, record: ImageGenerationModelRecord) -> bool:
+    """Whether a single meta instruction selects ``record`` from the beta (pending-queue) records.
+
+    Mirrors the reference-driven instruction families of ``horde_sdk``'s ``ImageModelLoadResolver`` so
+    opted-in beta models are picked up by the same meta instructions the canonical resolver applies.
+    The usage-stats families (``TOP N`` / ``BOTTOM N``) are not mirrored: those resolve against the
+    horde's stats API, which already returns names for any served model regardless of beta status.
+    """
+
+    def matches(pattern: str) -> bool:
+        return re.match(pattern, instruction, re.IGNORECASE) is not None
+
+    if matches(MetaInstruction.ALL_REGEX):
+        # "all" excludes the heavy baselines unless the operator opted into large models, matching the
+        # SDK's remove_large_models so a beta flux/cascade is not silently bulk-loaded.
+        if os.getenv("AI_HORDE_MODEL_META_LARGE_MODELS"):
+            return True
+        return record.baseline not in (
+            KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade,
+            KNOWN_IMAGE_GENERATION_BASELINE.flux_1,
+        )
+    if matches(MetaInstruction.ALL_SDXL_REGEX):
+        return record.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+    if matches(MetaInstruction.ALL_SD15_REGEX):
+        return record.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
+    if matches(MetaInstruction.ALL_SD21_REGEX):
+        return record.baseline in (
+            KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_2_512,
+            KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_2_768,
+        )
+    if matches(MetaInstruction.ALL_INPAINTING_REGEX):
+        return bool(record.inpainting)
+    if matches(MetaInstruction.ALL_SFW_REGEX):
+        return record.nsfw is False
+    if matches(MetaInstruction.ALL_NSFW_REGEX):
+        return record.nsfw is True
+    return False
+
+
+def _beta_models_for_meta_instructions(
+    instructions: Iterable[str],
+    beta_records: Mapping[str, ImageGenerationModelRecord],
+) -> set[str]:
+    """Resolve meta instructions against beta (pending-queue) image records.
+
+    The SDK resolver only sees the canonical reference, so a meta instruction like ``all`` would
+    silently exclude beta models such as Z-Image. Apply the same instruction families to the
+    beta-merged records so opted-in beta models are selected alongside the canonical ones.
+    """
+    matched: set[str] = set()
+    for instruction in instructions:
+        for name, record in beta_records.items():
+            if _meta_instruction_matches_record(instruction, record):
+                matched.add(name)
+    return matched
 
 
 class UnsupportedConfigFormat(Exception):
@@ -289,7 +344,13 @@ class BridgeDataLoader:
         Returns:
             list[str]: The image models that will be loaded.
         """
-        load_resolver = _make_image_model_load_resolver()
+        load_resolver = _make_image_model_load_resolver(horde_model_reference_manager)
+
+        # The SDK resolver only sees the canonical reference (get_all_model_references never includes a
+        # PRIMARY's pending-queue / beta models), so anything beta would be silently dropped both from the
+        # meta-instruction expansion below and the known-models filter further down. Build the beta-merged
+        # records once and use them to keep opted-in beta models (e.g. qwen, Z-Image) advertised.
+        beta_records = beta_aware_image_records(horde_model_reference_manager)
 
         resolved_models = None
         if bridge_data.meta_load_instructions is not None:
@@ -297,12 +358,14 @@ class BridgeDataLoader:
                 list(bridge_data.meta_load_instructions),
                 AIHordeAPIManualClient(),
             )
+            resolved_models |= _beta_models_for_meta_instructions(bridge_data.meta_load_instructions, beta_records)
 
         if bridge_data.meta_skip_instructions is not None:
             skip_models: set[str] = load_resolver.resolve_meta_instructions(
                 list(bridge_data.meta_skip_instructions),
                 AIHordeAPIManualClient(),
             )
+            skip_models |= _beta_models_for_meta_instructions(bridge_data.meta_skip_instructions, beta_records)
             existing_skip_models = set(bridge_data.image_models_to_skip)
             bridge_data.image_models_to_skip = list(existing_skip_models.union(skip_models))
 
@@ -314,8 +377,8 @@ class BridgeDataLoader:
                 set(bridge_data.image_models_to_load) - set(bridge_data.image_models_to_skip),
             )
 
-        # Remove models not in the model reference manager
-        known_models = load_resolver.resolve_all_model_names()
+        # Remove models not in the model reference manager (canonical + opted-in beta)
+        known_models = set(beta_records)
 
         total_resolved_models = len(bridge_data.image_models_to_load)
 

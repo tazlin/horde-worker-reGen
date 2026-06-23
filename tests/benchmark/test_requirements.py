@@ -164,6 +164,39 @@ def test_compute_requirements_uses_the_real_disk_plan(monkeypatch: pytest.Monkey
     assert [model.target_path for model in req.missing_models] == ["/b"]
 
 
+def test_sizing_helpers_read_offline_never_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``models_disk_plan`` and ``model_present_on_disk`` must read the reference offline, never online.
+
+    These run inside short-lived benchmark subprocesses (the download modal's dry-run plan is one). An
+    online manager would block on a per-process PRIMARY-API round-trip it cannot bound, which is what made
+    the plan preview time out. This pins both helpers to ``ensure_offline_reference_manager`` so the
+    network path cannot silently return.
+    """
+    import horde_worker_regen.reference_helper as reference_helper
+
+    offline_calls = 0
+
+    class _FakeOfflineManager:
+        def get_all_model_references(self) -> dict:
+            return {}
+
+    def _fake_offline() -> _FakeOfflineManager:
+        nonlocal offline_calls
+        offline_calls += 1
+        return _FakeOfflineManager()
+
+    def _forbidden_online() -> object:
+        raise AssertionError("benchmark sizing must not use the online (network) reference manager")
+
+    monkeypatch.setattr(reference_helper, "ensure_offline_reference_manager", _fake_offline)
+    monkeypatch.setattr(reference_helper, "ensure_model_reference_manager_initialized", _forbidden_online)
+
+    requirements_mod.models_disk_plan(["anything"])
+    requirements_mod.model_present_on_disk("anything")
+
+    assert offline_calls == 2
+
+
 def _sd15_controlnet_level() -> RampLevel:
     """Build an sd15 feature ladder and return the classic controlnet (preprocessor) level."""
     ladder = build_default_ladder(

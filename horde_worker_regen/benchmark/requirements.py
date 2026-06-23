@@ -109,16 +109,20 @@ def civitai_token_available() -> bool:
 def model_present_on_disk(model_name: str) -> bool | None:
     """Whether *model_name*'s files are all on disk, or None when it cannot be determined.
 
-    Uses the parent-owned reference (the parent is the only process allowed to fetch references) and
-    the existing :func:`is_model_present` existence check. Fails open (returns None) on any error.
+    Reads the reference offline (disk-only, never downloaded) via the existing
+    :func:`is_model_present` existence check. This runs inside short-lived benchmark subprocesses, which
+    must never fetch references over the network: only the parent/TUI does that, writing the converted
+    JSON to disk that this then reads. An online manager here would block the subprocess on a PRIMARY-API
+    round-trip whose latency it cannot bound, so the read is forced offline. Fails open (returns None) on
+    any error.
     """
     try:
         from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
 
         from horde_worker_regen.model_download_plan import is_model_present
-        from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
+        from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
-        manager = ensure_model_reference_manager_initialized()
+        manager = ensure_offline_reference_manager()
         records = manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
         return is_model_present(model_name, records)
     except Exception as e:  # noqa: BLE001 - presence is best-effort; fail open
@@ -130,16 +134,20 @@ def models_disk_plan(model_names: list[str]) -> DownloadPlan | None:
     """The on-disk/size/free-space picture for ``model_names``, or None when it cannot be determined.
 
     Reuses the same planner the config model-picker uses (so the benchmark's disk story matches the rest of
-    the worker) over the parent-owned reference. Fails open (returns None) so callers fall back to a cheap,
-    presence-only path offline or in tests.
+    the worker) over the on-disk reference, read offline (never downloaded). This is what the download
+    modal's dry-run preview calls; running it in a short-lived subprocess means an online manager would
+    block on a PRIMARY-API fetch per process (the in-memory freshness state is never inherited, so a warm
+    on-disk cache does not spare the round-trip), which can outlast the caller's timeout. Forcing the read
+    offline keeps the preview bounded to local disk; the parent/TUI keeps that disk copy current. Fails
+    open (returns None) so callers fall back to a cheap, presence-only path offline or in tests.
     """
     try:
         from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
 
         from horde_worker_regen.model_download_plan import compute_download_plan
-        from horde_worker_regen.reference_helper import ensure_model_reference_manager_initialized
+        from horde_worker_regen.reference_helper import ensure_offline_reference_manager
 
-        manager = ensure_model_reference_manager_initialized()
+        manager = ensure_offline_reference_manager()
         records = manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation) or {}
         return compute_download_plan(model_names, records)
     except Exception as e:  # noqa: BLE001 - disk sizing is best-effort; fail open to the presence-only path
