@@ -7,6 +7,7 @@
     - [Planning: what a config implies for disk](#planning-what-a-config-implies-for-disk)
     - [Pause and bandwidth controls](#pause-and-bandwidth-controls)
     - [Parallel downloads by host](#parallel-downloads-by-host)
+    - [Segmented downloads (connections per file)](#segmented-downloads-connections-per-file)
     - [Download-only mode and the model picker](#download-only-mode-and-the-model-picker)
     - [Standalone download CLI](#standalone-download-cli)
     - [See also](#see-also)
@@ -142,6 +143,30 @@ which need a full ComfyUI init, run **exclusively** (no other download alongside
 them). Second, a per-file fetch (image or aux) that fails transiently is re-queued a
 bounded number of times rather than abandoned until the next config reload, and a
 recorded failure is cleared once a later attempt for that model succeeds.
+
+## Segmented downloads (connections per file)
+
+Host-level parallelism speeds up fetching *several* files at once but does nothing
+for the rate of a *single* large checkpoint, and that single-file rate is what an
+operator with one big model and a fat link actually feels: a lone TCP stream to a
+CDN is usually window/RTT-limited well below the link. So the engine can fetch one
+large file over several concurrent **ranged** connections at once and reassemble it.
+
+- `download_connections_per_file` (default 4; 1 = single stream) is the per-file
+  connection count, honoured at startup and retuned live on config reload, and also
+  surfaced in the Config tab. It is independent of the host limits above: it
+  parallelizes the bytes *within* one file, while they parallelize *across* files.
+
+The engine ([`download_engine.download_file`][] in `horde_model_reference`) treats
+segmentation as a fast path with a guaranteed fallback. It first sends a one-byte
+ranged probe: only a `206` with a known total over the segmentation threshold
+(~64 MiB) is split into per-connection byte ranges written to a sparse `.spart` at
+their offsets; anything else (a small file, or a server that answers the probe with
+a `200` because it ignores `Range`) drops straight to the original single-stream,
+resumable `.part` path. Segmented downloads do **not** resume an interruption (the
+sparse partial is discarded and refetched), which is why the resumable single stream
+is kept for the cases that benefit from it. The gated R2 mirror is left single-stream
+(it is already the fast accelerator); only the origin fetch is segmented.
 
 ## Download-only mode and the model picker
 

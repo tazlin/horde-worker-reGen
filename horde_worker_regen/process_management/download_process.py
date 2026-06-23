@@ -133,6 +133,7 @@ class HordeDownloadProcess(HordeProcess):
         paused: bool = False,
         max_parallel_downloads: int = 4,
         per_host_concurrency: int = 1,
+        connections_per_file: int = 4,
     ) -> None:
         """Initialise the download process state (model managers are loaded in the main loop)."""
         super().__init__(
@@ -191,6 +192,9 @@ class HordeDownloadProcess(HordeProcess):
         # blocks cheaply in ``scheduler.acquire``. This is what makes a *live* raise of
         # ``max_parallel_downloads`` actually take effect, rather than being capped at the boot-time size.
         self._desired_executor_threads = max(1, max_parallel_downloads)
+        # Max concurrent connections per single large file (forwarded to the engine, which segments a big
+        # file across that many ranged connections to raise its rate). Retuned live via the control message.
+        self._connections_per_file = max(1, connections_per_file)
         self._active: dict[tuple[DownloadKind, str, str], _TaskRuntime] = {}
         self._running_count = 0
         self._executor_threads: list[threading.Thread] = []
@@ -347,6 +351,11 @@ class HordeDownloadProcess(HordeProcess):
                 self._ensure_executor_threads(message.set_max_parallel_downloads)
             changed = True
 
+        if message.set_connections_per_file is not None:
+            # Applies to the next file fetched; in-flight segmented downloads keep their existing connections.
+            self._connections_per_file = max(1, message.set_connections_per_file)
+            changed = True
+
         if desired is not None:
             removed = self._scheduler.prune(
                 keep=lambda task: task.kind is not DownloadKind.IMAGE_MODEL or task.model_name in desired,
@@ -364,6 +373,18 @@ class HordeDownloadProcess(HordeProcess):
         signal.signal(signal.SIGINT, self._signal)
         signal.signal(signal.SIGTERM, self._signal)
         threading.Thread(target=self._control_loop, name="download-control", daemon=True).start()
+
+        if self._connections_per_file > 1:
+            # Loud, once-per-start: the default (>1) trades resumability for single-file speed, so an operator
+            # who restarts mid-download (or has a flaky link) understands why a large file starts over.
+            logger.warning(
+                "Download process: large files use {} connections each for speed; these downloads CANNOT be "
+                "resumed (an interrupted large download restarts from scratch). Set "
+                "download_connections_per_file: 1 to keep resumable single-stream downloads.",
+                self._connections_per_file,
+            )
+        else:
+            logger.info("Download process: single-stream downloads (download_connections_per_file=1); resumable.")
 
         self._send_status(DownloadPhase.INITIALIZING, scan_complete=False, force=True)
         if not self._load_managers_with_retry():
@@ -815,7 +836,8 @@ class HordeDownloadProcess(HordeProcess):
                 self._record_failure(task.model_name, task.feature, "compvis manager unavailable")
                 return False
             with self._manager_lock("compvis"):
-                if download_one_model(compvis, task.model_name, callback=callback):
+                connections = self._connections_per_file
+                if download_one_model(compvis, task.model_name, callback=callback, connections=connections):
                     logger.success(f"Download process: downloaded {task.model_name}")
                     return True
             return False
@@ -824,7 +846,7 @@ class HordeDownloadProcess(HordeProcess):
             if aux_manager is None:
                 return False
             with self._manager_lock(task.manager_key):
-                aux_manager.download_model(task.model_name, callback=callback)
+                aux_manager.download_model(task.model_name, callback=callback, connections=self._connections_per_file)
             return True
         if task.kind is DownloadKind.SAFETY:
             return self._ensure_safety_models()

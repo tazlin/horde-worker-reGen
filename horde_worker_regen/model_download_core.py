@@ -90,8 +90,18 @@ class DownloadOutcome:
 class CompVisLike(Protocol):
     """The subset of a model manager the download core needs (duck-typed; hordelib's compvis satisfies it)."""
 
-    def download_model(self, model_name: str, *, callback: Callable[[int, int], None] | None = ...) -> bool | None:
-        """Fetch *model_name*'s files (skipping any already present); return truthy on success."""
+    def download_model(
+        self,
+        model_name: str,
+        *,
+        callback: Callable[[int, int], None] | None = ...,
+        connections: int = ...,
+    ) -> bool | None:
+        """Fetch *model_name*'s files (skipping any already present); return truthy on success.
+
+        ``connections`` is the max concurrent connections per large file (the engine segments a big file
+        across that many ranged connections to raise single-file throughput; 1 keeps the single stream).
+        """
         ...
 
     def validate_model(self, model_name: str, skip_checksum: bool = ...) -> bool | None:
@@ -289,16 +299,19 @@ def download_one_model(
     model_name: str,
     *,
     callback: Callable[[int, int], None] | None = None,
+    connections: int = 1,
 ) -> bool:
     """Download *model_name*, re-downloading once if the on-disk checksum does not validate.
 
     Returns True only when the download (and any forced re-download) succeeded. ``compvis.download_model``
     already short-circuits when the files are present, so a present-and-valid model is a cheap no-op.
+    ``connections`` is forwarded to the engine so a large file can be fetched over several ranged
+    connections at once (1 keeps the single-stream path).
     """
-    succeeded = bool(compvis.download_model(model_name, callback=callback))
+    succeeded = bool(compvis.download_model(model_name, callback=callback, connections=connections))
     if succeeded and compvis.validate_model(model_name) is False:
         # The record changed or the file is corrupt: fetch it again.
-        succeeded = bool(compvis.download_model(model_name, callback=callback))
+        succeeded = bool(compvis.download_model(model_name, callback=callback, connections=connections))
     return succeeded
 
 
@@ -311,13 +324,15 @@ def ensure_models_present(
     on_model_start: Callable[[str, int, int], None] | None = None,
     on_progress: Callable[[str, int, int, ModelProgress], None] | None = None,
     on_model_finish: Callable[[str, int, int, bool], None] | None = None,
+    connections: int = 1,
 ) -> DownloadOutcome:
     """Ensure every name in *model_names* is on disk, downloading the missing ones with live pause/rate-limit.
 
     Already-present models are skipped (and reported in :attr:`DownloadOutcome.present`); the remainder are
     downloaded one at a time, each with its own :class:`ChunkPacer`. The ``on_*`` callbacks let a caller
     surface progress (the benchmark emits structured events; the worker logs); ``index``/``total`` count the
-    models being downloaded (present ones excluded), so a UI can render "k of n".
+    models being downloaded (present ones excluded), so a UI can render "k of n". ``connections`` is forwarded
+    to the engine to segment each large file across that many ranged connections.
     """
     controls = controls or DownloadControls()
     should_abort = should_abort or (lambda: False)
@@ -357,7 +372,7 @@ def ensure_models_present(
             )
             _emit(progress)
 
-        succeeded = download_one_model(compvis, name, callback=_callback)
+        succeeded = download_one_model(compvis, name, callback=_callback, connections=connections)
         if succeeded:
             outcome.downloaded += 1
         else:

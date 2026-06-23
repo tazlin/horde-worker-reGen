@@ -112,8 +112,18 @@ class RealDownloadCompVis:
         """Whether *model_name*'s declared files are all present (existence-only)."""
         return is_present(self._records[model_name], self._weights_root)
 
-    def download_model(self, model_name: str, *, callback: Callable[[int, int], None] | None = None) -> bool:
-        """Fetch each declared file over HTTP to its canonical path, skipping any already present."""
+    def download_model(
+        self,
+        model_name: str,
+        *,
+        callback: Callable[[int, int], None] | None = None,
+        connections: int = 1,
+    ) -> bool:
+        """Fetch each declared file over HTTP to its canonical path, skipping any already present.
+
+        ``connections`` mirrors the real manager's signature and is accepted but ignored: this stand-in
+        always fetches single-stream.
+        """
         record = self._records[model_name]
         for download, dest in zip(record.config.download, file_paths_for(record, self._weights_root), strict=True):
             if dest.exists():

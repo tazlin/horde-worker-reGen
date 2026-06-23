@@ -327,6 +327,19 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     Raise above 1 to also allow several concurrent downloads from a single host; left at 1, a host is
     never hit by more than one download at a time. Honored at startup and on config reload."""
+    download_connections_per_file: int = Field(default=4, ge=1)
+    """How many concurrent connections to use for a single large model file (default 4; 1 = single stream).
+
+    A single TCP stream to a CDN is often window/RTT-limited well below the link, so a large checkpoint is
+    fetched over this many ranged connections at once to raise its download rate. Only large files on
+    range-capable hosts are segmented; small files and servers that ignore Range fall back to one stream.
+    Honored at startup and on config reload.
+
+    TRADE-OFF: a segmented (multi-connection) download CANNOT be resumed. If it is interrupted (worker
+    restart, network drop, crash), the partial file is discarded and the whole file is re-fetched from the
+    start on the next attempt. Only ``1`` keeps the resumable single-stream behaviour, where an interrupted
+    download continues from where it left off. Set this to ``1`` on a slow or unreliable connection where
+    re-fetching a large checkpoint from scratch is worse than a lower steady-state rate."""
     downloads_paused: bool = Field(default=False)
     """If true, background model downloads are held (the current chunk loop blocks) until resumed.
 

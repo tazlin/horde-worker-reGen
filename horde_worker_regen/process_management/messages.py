@@ -418,6 +418,8 @@ class HordeDownloadControlMessage(HordeControlMessage):
     """If not None, retune the global concurrent-download ceiling (across all hosts), applied live."""
     set_per_host_concurrency: int | None = None
     """If not None, retune how many concurrent downloads to a single host are allowed, applied live."""
+    set_connections_per_file: int | None = None
+    """If not None, retune the max concurrent connections used to fetch a single large file, applied live."""
 
 
 class HordePreloadInferenceModelMessage(HordeControlModelMessage):

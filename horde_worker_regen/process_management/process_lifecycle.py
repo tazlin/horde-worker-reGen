@@ -482,6 +482,7 @@ class ProcessLifecycleManager:
                 "paused": bridge_data.downloads_paused,
                 "max_parallel_downloads": bridge_data.download_max_parallel_downloads,
                 "per_host_concurrency": bridge_data.download_per_host_concurrency,
+                "connections_per_file": bridge_data.download_connections_per_file,
             },
         )
         process.start()
@@ -533,6 +534,7 @@ class ProcessLifecycleManager:
         rate_limit_kbps: int | None = None,
         max_parallel_downloads: int | None = None,
         per_host_concurrency: int | None = None,
+        connections_per_file: int | None = None,
     ) -> None:
         """Forward live download controls (pause/bandwidth/parallelism) to the download process.
 
@@ -542,7 +544,8 @@ class ProcessLifecycleManager:
         """
         if self._download_process_info is None:
             return
-        if all(arg is None for arg in (paused, rate_limit_kbps, max_parallel_downloads, per_host_concurrency)):
+        controls = (paused, rate_limit_kbps, max_parallel_downloads, per_host_concurrency, connections_per_file)
+        if all(arg is None for arg in controls):
             return
         self._download_process_info.safe_send_message(
             HordeDownloadControlMessage(
@@ -552,6 +555,7 @@ class ProcessLifecycleManager:
                 set_rate_limit_kbps=rate_limit_kbps,
                 set_max_parallel_downloads=max_parallel_downloads,
                 set_per_host_concurrency=per_host_concurrency,
+                set_connections_per_file=connections_per_file,
             ),
         )
 

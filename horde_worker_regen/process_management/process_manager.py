@@ -1680,6 +1680,7 @@ class HordeWorkerProcessManager:
                 rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
                 max_parallel_downloads=self.bridge_data.download_max_parallel_downloads,
                 per_host_concurrency=self.bridge_data.download_per_host_concurrency,
+                connections_per_file=self.bridge_data.download_connections_per_file,
             )
             # Let the restarted process's first authoritative scan re-request configured-missing models plus
             # a fresh aux pass (one-shot guard reset), so newly-enabled aux categories actually download.
@@ -3168,6 +3169,7 @@ class HordeWorkerProcessManager:
             rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
             max_parallel_downloads=self.bridge_data.download_max_parallel_downloads,
             per_host_concurrency=self.bridge_data.download_per_host_concurrency,
+            connections_per_file=self.bridge_data.download_connections_per_file,
         )
         # A config change can add image models that are not yet on disk (fetch them in the background so a
         # newly-configured model becomes servable without a restart) or remove models (stop their queued/

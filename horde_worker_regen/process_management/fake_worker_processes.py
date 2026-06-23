@@ -842,6 +842,7 @@ def start_fake_download_process(
     paused: bool = False,
     max_parallel_downloads: int = 4,
     per_host_concurrency: int = 1,
+    connections_per_file: int = 4,
     scripted_present: list[str] | None = None,
     download_delay_seconds: float = 0.0,
     fail_models: list[str] | None = None,
@@ -851,8 +852,9 @@ def start_fake_download_process(
 
     Signature-compatible with ``worker_entry_points.start_download_process``; the worker-config
     arguments are accepted and ignored, except ``rate_limit_kbps``/``paused`` which the fake honors so
-    the pause/throttle controls can be exercised. ``max_parallel_downloads``/``per_host_concurrency`` are
-    accepted for signature parity and ignored (the fake downloads serially). ``fault_profile`` scripts
+    the pause/throttle controls can be exercised. ``max_parallel_downloads``/``per_host_concurrency``/
+    ``connections_per_file`` are accepted for signature parity and ignored (the fake downloads serially,
+    in a single stream). ``fault_profile`` scripts
     crash-on-start and slow downloads. Inject the scripting arguments with ``functools.partial`` (partials
     of module-level functions stay picklable under spawn).
     """

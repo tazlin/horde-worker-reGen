@@ -550,6 +550,14 @@ self_maintenance_cooldown_seconds: 300
 # Approximate: enforced at 16 MB-chunk granularity.
 # download_rate_limit_kbps:
 
+# How many connections to use for a single large model file (default 4; 1 = single stream).
+# A large checkpoint is fetched over this many ranged connections at once to raise its download rate;
+# small files and hosts that ignore Range requests fall back to one stream automatically.
+# WARNING: a multi-connection (value > 1) download CANNOT be resumed. If it is interrupted (restart,
+# network drop, crash), the partial file is discarded and the whole file is re-downloaded from scratch.
+# Set this to 1 on a slow/unreliable connection to keep resumable, single-stream downloads.
+# download_connections_per_file: 4
+
 # If true, background model downloads are held until resumed.
 # Honored on config reload; overridable live from the TUI.
 downloads_paused: false

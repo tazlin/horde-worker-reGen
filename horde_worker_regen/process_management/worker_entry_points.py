@@ -495,6 +495,7 @@ def start_download_process(
     paused: bool = False,
     max_parallel_downloads: int = 4,
     per_host_concurrency: int = 1,
+    connections_per_file: int = 4,
 ) -> None:
     """Start the background model-download process.
 
@@ -517,6 +518,7 @@ def start_download_process(
         paused (bool): Whether downloads start paused. Defaults to False.
         max_parallel_downloads (int): Global concurrent-download ceiling across all hosts. Defaults to 4.
         per_host_concurrency (int): Concurrent downloads allowed per source host. Defaults to 1.
+        connections_per_file (int): Max concurrent connections used to fetch a single large file. Defaults to 4.
     """
     enable_child_faulthandler(f"download_{process_id}")
     with contextlib.nullcontext():
@@ -566,6 +568,7 @@ def start_download_process(
             paused=paused,
             max_parallel_downloads=max_parallel_downloads,
             per_host_concurrency=per_host_concurrency,
+            connections_per_file=connections_per_file,
         )
 
         worker_process.main_loop()

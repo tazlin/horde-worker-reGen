@@ -963,7 +963,7 @@ class TestDownloadProcessConcurrencyFixes:
     def test_same_manager_downloads_serialize(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Two AUX tasks on the *same* manager never run that manager's download_model concurrently."""
         probe = _ConcurrencyProbe()
-        gfpgan = SimpleNamespace(download_model=lambda _name, callback=None: probe.run(0.05))
+        gfpgan = SimpleNamespace(download_model=lambda _name, callback=None, connections=1: probe.run(0.05))
         self._inject_aux_managers(monkeypatch, {"gfpgan": gfpgan})
         process = self._make_process()
 
@@ -976,8 +976,8 @@ class TestDownloadProcessConcurrencyFixes:
     def test_different_managers_download_in_parallel(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """AUX tasks on *different* managers run truly in parallel (independent shared state)."""
         probe = _ConcurrencyProbe()
-        gfpgan = SimpleNamespace(download_model=lambda _name, callback=None: probe.run(0.05))
-        esrgan = SimpleNamespace(download_model=lambda _name, callback=None: probe.run(0.05))
+        gfpgan = SimpleNamespace(download_model=lambda _name, callback=None, connections=1: probe.run(0.05))
+        esrgan = SimpleNamespace(download_model=lambda _name, callback=None, connections=1: probe.run(0.05))
         self._inject_aux_managers(monkeypatch, {"gfpgan": gfpgan, "esrgan": esrgan})
         process = self._make_process()
 

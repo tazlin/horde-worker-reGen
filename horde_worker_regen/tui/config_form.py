@@ -483,6 +483,19 @@ CONFIG_FIELDS: list[ConfigField] = [
         explicit_default=0,
     ),
     ConfigField(
+        "download_connections_per_file",
+        "Connections per file",
+        FieldKind.INT,
+        "Model downloads",
+        "Connections used to fetch a single large file (1 = single stream). A big checkpoint is split "
+        "across this many ranged connections to raise its download rate; small files use one stream. "
+        "WARNING: a multi-connection download CANNOT resume — if interrupted, the whole file restarts "
+        "from scratch. Set this to 1 on a slow/unreliable connection to keep resumable downloads.",
+        minimum=1,
+        maximum=8,
+        explicit_default=4,
+    ),
+    ConfigField(
         "extra_model_directories",
         "Extra model directories",
         FieldKind.STR_LIST,

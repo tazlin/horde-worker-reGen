@@ -203,13 +203,21 @@ class _FlakyManager:
 
     def __init__(self) -> None:
         self.download_calls = 0
+        self.connections_seen: list[int] = []
         self._validate_results = [False]  # first validate fails; absent => assume valid
 
     def is_model_available(self, model_name: str) -> bool:
         return False
 
-    def download_model(self, model_name: str, *, callback: Callable[[int, int], None] | None = None) -> bool:
+    def download_model(
+        self,
+        model_name: str,
+        *,
+        callback: Callable[[int, int], None] | None = None,
+        connections: int = 1,
+    ) -> bool:
         self.download_calls += 1
+        self.connections_seen.append(connections)
         return True
 
     def validate_model(self, model_name: str, skip_checksum: bool = False) -> bool:
@@ -221,6 +229,13 @@ def test_download_one_model_redownloads_once_on_invalid() -> None:
     flaky = _FlakyManager()
     assert download_one_model(flaky, "M") is True
     assert flaky.download_calls == 2  # initial + one forced re-download
+
+
+def test_download_one_model_forwards_connections_to_every_fetch() -> None:
+    """The configured connection count reaches the manager on the initial fetch and the forced re-download."""
+    flaky = _FlakyManager()
+    assert download_one_model(flaky, "M", connections=4) is True
+    assert flaky.connections_seen == [4, 4]
 
 
 # --- ensure_models_present: dedup + real downloads ----------------------------------------------------
@@ -285,9 +300,14 @@ def test_ensure_reports_failure_for_unservable_model(tmp_path: Path) -> None:
         # mirroring how the real compvis.download_model reports a failed fetch.
         original = compvis.download_model
 
-        def _safe_download(model_name: str, *, callback: Callable[[int, int], None] | None = None) -> bool:
+        def _safe_download(
+            model_name: str,
+            *,
+            callback: Callable[[int, int], None] | None = None,
+            connections: int = 1,
+        ) -> bool:
             try:
-                return original(model_name, callback=callback)
+                return original(model_name, callback=callback, connections=connections)
             except Exception:  # noqa: BLE001 - a fetch error is a failed download, not a crash
                 return False
 
