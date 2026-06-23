@@ -6,11 +6,15 @@ jobs (VAE decode, post-processing, encode, IPC hand-off, scheduling latency) are
 where uptime is lost. This sampler polls the device's core-utilization percentage on a
 background thread for the duration of a run, so the report can state a GPU duty cycle.
 
-Utilization is read through hordelib's backend-agnostic accelerator helper
-(:func:`hordelib.utils.torch_memory.get_accelerator_utilization_percent`), which returns the figure
-for whatever backend can report it (NVIDIA via NVML today) and ``None`` elsewhere. It is imported from
-that torch-free submodule rather than the ``hordelib.api`` facade so merely importing this module pulls
-no torch. The worker itself never touches NVML/``pynvml`` directly, so it makes no NVIDIA assumption.
+Utilization is read through hordelib's NVML helper
+(:func:`hordelib.utils.nvml.get_device_utilization_percent`), which returns the NVIDIA figure and ``None``
+on any non-NVIDIA host. This sampler runs in the *orchestrator* process, which must stay torch-free (see
+the torch-free orchestrator invariant): the backend-agnostic ``get_accelerator_utilization_percent`` gates
+on the active torch backend and so does ``import torch`` -- pulling torch into the parent and tripping a
+partial-init circular import. Core utilization is NVML-only telemetry today regardless (CUDA via NVML;
+every other backend reports ``None``), so reading NVML directly is behaviourally identical here while
+keeping the parent torch-free. NVML returns ``None`` off NVIDIA, so non-NVIDIA backends still report no
+duty cycle rather than erroring.
 
 It degrades gracefully: when no backend telemetry is available the sampler collects no
 samples and reports ``None``, so CPU/fake runs, non-NVIDIA backends, and CI are unaffected.
@@ -31,19 +35,18 @@ from loguru import logger
 def _make_utilization_reader(device_index: int) -> Callable[[], int | None] | None:
     """Return a callable reading device core-utilization %, or None when no telemetry source exists.
 
-    Delegates to hordelib's backend-agnostic API so this works on whatever backend reports utilization and
-    yields no sampler elsewhere. Probes once: a backend (or machine) with no utilization source returns
-    ``None`` here, so the caller skips sampling entirely rather than spinning a thread that only collects
-    ``None``.
+    Reads NVML directly (the only utilization source today) so the orchestrator never imports torch. Probes
+    once: a host with no NVML/utilization source returns ``None`` here, so the caller skips sampling entirely
+    rather than spinning a thread that only collects ``None``.
     """
     try:
-        from hordelib.utils.torch_memory import get_accelerator_utilization_percent
+        from hordelib.utils.nvml import get_device_utilization_percent
     except Exception as import_error:  # noqa: BLE001 - "no telemetry" is expected off-GPU, not a crash
         logger.debug(f"GPU utilization sampling unavailable (hordelib import failed: {import_error})")
         return None
 
     def _read() -> int | None:
-        return get_accelerator_utilization_percent(device_index)
+        return get_device_utilization_percent(device_index)
 
     if _read() is None:
         logger.debug("GPU utilization sampling unavailable (no backend telemetry for this device)")

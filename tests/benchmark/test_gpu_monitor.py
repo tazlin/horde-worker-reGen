@@ -68,13 +68,14 @@ class TestGpuUtilizationSampler:
 class TestUtilizationReaderDelegatesToHordelib:
     """The reader consults hordelib's backend-agnostic utilization helper, with no direct NVML in the worker.
 
-    It imports from the torch-free ``hordelib.utils.torch_memory`` submodule (not the ``hordelib.api``
-    facade), so merely building a sampler never drags torch into the importing process.
+    It reads NVML directly via the torch-free ``hordelib.utils.nvml`` submodule (not the torch-importing
+    ``get_accelerator_utilization_percent`` nor the ``hordelib.api`` facade), so building a sampler in the
+    orchestrator never drags torch into the parent process.
     """
 
-    def test_reader_uses_torch_memory_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When hordelib reports a percentage, the built reader returns it for the requested device."""
-        import hordelib.utils.torch_memory as torch_memory
+    def test_reader_uses_nvml_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When NVML reports a percentage, the built reader returns it for the requested device."""
+        import hordelib.utils.nvml as nvml
 
         seen: dict[str, int] = {}
 
@@ -82,7 +83,7 @@ class TestUtilizationReaderDelegatesToHordelib:
             seen["index"] = index
             return 42
 
-        monkeypatch.setattr(torch_memory, "get_accelerator_utilization_percent", fake_utilization, raising=False)
+        monkeypatch.setattr(nvml, "get_device_utilization_percent", fake_utilization, raising=False)
 
         reader = _make_utilization_reader(3)
         assert reader is not None
@@ -90,12 +91,12 @@ class TestUtilizationReaderDelegatesToHordelib:
         assert seen["index"] == 3
 
     def test_reader_is_none_when_no_backend_telemetry(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When hordelib reports None (non-NVIDIA / no telemetry), the sampler builds no reader (no-op)."""
-        import hordelib.utils.torch_memory as torch_memory
+        """When NVML reports None (non-NVIDIA / no telemetry), the sampler builds no reader (no-op)."""
+        import hordelib.utils.nvml as nvml
 
         monkeypatch.setattr(
-            torch_memory,
-            "get_accelerator_utilization_percent",
+            nvml,
+            "get_device_utilization_percent",
             lambda index=0: None,
             raising=False,
         )
@@ -103,9 +104,9 @@ class TestUtilizationReaderDelegatesToHordelib:
 
     def test_reader_is_none_when_helper_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A hordelib too old to expose the helper degrades gracefully to no sampling, never a crash."""
-        import hordelib.utils.torch_memory as torch_memory
+        import hordelib.utils.nvml as nvml
 
-        monkeypatch.delattr(torch_memory, "get_accelerator_utilization_percent", raising=False)
-        # Ensure the lazy `from hordelib.utils.torch_memory import ...` re-resolves against the patched module.
-        monkeypatch.setitem(sys.modules, "hordelib.utils.torch_memory", torch_memory)
+        monkeypatch.delattr(nvml, "get_device_utilization_percent", raising=False)
+        # Ensure the lazy `from hordelib.utils.nvml import ...` re-resolves against the patched module.
+        monkeypatch.setitem(sys.modules, "hordelib.utils.nvml", nvml)
         assert _make_utilization_reader(0) is None

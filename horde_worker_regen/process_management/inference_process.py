@@ -552,11 +552,29 @@ class HordeInferenceProcess(HordeProcess):
 
         if not self._dry_run_skip_inference:
             with contextlib.nullcontext():  # self.disk_lock:
-                self._horde.preload_model(
-                    horde_model_name,
-                    will_load_loras=will_load_loras,
-                    seamless_tiling_enabled=seamless_tiling_enabled,
-                )
+                try:
+                    self._horde.preload_model(
+                        horde_model_name,
+                        will_load_loras=will_load_loras,
+                        seamless_tiling_enabled=seamless_tiling_enabled,
+                    )
+                except Exception as preload_error:
+                    # A load failure is a property of the *model* (an unsupported/corrupt checkpoint the
+                    # backend cannot load), not of this process, but the backend may have left torch/ComfyUI
+                    # in an indeterminate state, so the process still ends after reporting. Naming the model in
+                    # a FAILED state lets the parent quarantine that specific model after repeated failures
+                    # rather than mistaking a deterministically-unloadable model for a sick slot and churning
+                    # the pool. The control-message handler logs and ends the process when this re-raises.
+                    logger.error(
+                        f"Failed to preload model {horde_model_name}: "
+                        f"{type(preload_error).__name__} {preload_error}",
+                    )
+                    self.on_horde_model_state_change(
+                        process_state=HordeProcessState.PRELOADING_FAILED,
+                        horde_model_name=horde_model_name,
+                        horde_model_state=ModelLoadState.FAILED,
+                    )
+                    raise
 
         logger.info(f"Preloaded model {horde_model_name}")
         self._active_model_name = horde_model_name

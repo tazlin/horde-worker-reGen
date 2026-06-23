@@ -685,3 +685,55 @@ class TestMarginalProcessOverhead:
         assert over_counted.max_resident_processes() is not None
         assert with_marginal.max_resident_processes() is not None
         assert with_marginal.max_resident_processes() > over_counted.max_resident_processes()
+
+
+class TestWholeCardIntent:
+    """A baseline declared whole-card (the EXTRA_LARGE tier) claims sole residency even when its weight seed fits.
+
+    Z-Image regressed here: its conservative ~8GB seed read as comfortably co-resident on a 16GB card, so the
+    forecast never gave it the card, it co-resided and thrashed. ``wants_whole_card`` biases the residency
+    verdict on the tier's intent rather than the knife-edge weight-vs-free fit.
+    """
+
+    def _coresident_forecast(self, *, wants_whole_card: bool) -> resource_budget.StreamForecast:
+        # A Z-Image-like load on a 16GB card: 10GB weights comfortably fit co-resident and alone.
+        return resource_budget.StreamForecast(
+            weights_mb=10000.0,
+            reserve_mb=2048.0,
+            free_now_mb=13000.0,
+            free_if_alone_mb=15000.0,
+            free_after_model_evict_mb=14000.0,
+            total_vram_mb=16384.0,
+            per_process_overhead_mb=1354.0,
+            marginal_process_overhead_mb=300.0,
+            wants_whole_card=wants_whole_card,
+        )
+
+    def test_seed_fits_coresident_without_intent(self) -> None:
+        """Baseline check: the same load without the intent flag reads co-resident (the regression behavior)."""
+        forecast = self._coresident_forecast(wants_whole_card=False)
+        assert forecast.fits_coresident is True
+        assert forecast.needs_exclusive_residency is False
+
+    def test_intent_forces_sole_residency(self) -> None:
+        forecast = self._coresident_forecast(wants_whole_card=True)
+        # Intent wins over the fitting weight estimate: claim the card and collapse to a single context.
+        assert forecast.needs_exclusive_residency is True
+        assert forecast.max_resident_processes() == 1
+
+    def test_intent_never_overrides_unservable(self) -> None:
+        """Intent must not force exclusive residency on a model that cannot be served alone (fits_alone gate)."""
+        forecast = resource_budget.StreamForecast(
+            weights_mb=20000.0,  # overflows even the 16GB card alone
+            reserve_mb=2048.0,
+            free_now_mb=13000.0,
+            free_if_alone_mb=15030.0,
+            free_after_model_evict_mb=14000.0,
+            total_vram_mb=16384.0,
+            per_process_overhead_mb=1354.0,
+            marginal_process_overhead_mb=300.0,
+            wants_whole_card=True,
+        )
+        assert forecast.fits_alone is False
+        assert forecast.needs_exclusive_residency is False
+        assert forecast.streams_unavoidably is True

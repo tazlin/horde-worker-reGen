@@ -695,6 +695,7 @@ class HordeWorkerProcessManager:
             on_download_metrics=self._run_metrics.on_download_metrics,
         )
         self._message_dispatcher.set_download_availability_handler(self._on_download_availability)
+        self._message_dispatcher.set_model_load_failure_handler(self._on_model_load_failure)
         self._job_tracker.set_finalize_observer(self._on_job_finalized)
         self._process_lifecycle.set_process_recovery_observer(self._record_process_crash)
 
@@ -1345,6 +1346,30 @@ class HordeWorkerProcessManager:
                 self._reference_refresh_in_progress = False
 
         threading.Thread(target=_refresh, name="reference-refresh", daemon=True).start()
+
+    def _on_model_load_failure(self, process_id: int, model_name: str) -> None:
+        """Handle a child's report that it failed to load ``model_name`` (the poison-model path).
+
+        Records the failure against the model (not the slot). Once the model crosses the quarantine
+        threshold it is taken out of rotation: every queued job for it is faulted non-retryably so the horde
+        reissues them elsewhere instead of the worker re-dispatching the same unloadable model into a
+        pool-wide recovery storm. The scheduler separately refuses to preload a quarantined model. The job the
+        failing process itself held is faulted by the slot-replacement path; this sweeps the *rest* of the
+        backlog for that model.
+        """
+        newly_quarantined = self._process_lifecycle.record_model_load_failure(process_id, model_name)
+        if not newly_quarantined:
+            return
+
+        faulted = 0
+        for job in list(self._job_tracker.jobs_pending_inference):
+            if job.model == model_name and job not in self._job_tracker.jobs_in_progress:
+                self._job_tracker.handle_job_fault_now(job, retryable=False)
+                faulted += 1
+        if faulted:
+            logger.warning(
+                f"Quarantined model {model_name}: faulted {faulted} queued job(s) for reissue to the horde.",
+            )
 
     def _on_download_availability(self, message: HordeDownloadAvailabilityMessage) -> None:
         """Record an on-disk availability snapshot from the download process.

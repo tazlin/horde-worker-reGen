@@ -87,3 +87,20 @@ def test_probe_accelerators_does_not_load_torch_in_caller() -> None:
     assert result.returncode == 0, (
         f"probe_accelerators() loaded torch into the caller:\n{result.stdout}\n{result.stderr}"
     )
+
+
+def test_building_the_gpu_sampler_reader_does_not_load_torch() -> None:
+    """The GPU duty-cycle sampler runs in the orchestrator, so building its reader must not pull torch.
+
+    Regression tripwire: the reader once delegated to ``get_accelerator_utilization_percent``, which gates on
+    the active torch backend and so ``import torch`` -- pulling torch into the parent and tripping a
+    partial-init circular import at worker startup. Import-time guards miss it because torch only entered when
+    the reader was *built* at ``start()``. NVML utilization is torch-free, so this must stay clean.
+    """
+    result = _run_torch_free_snippet(
+        "from horde_worker_regen.utils.gpu_monitor import _make_utilization_reader\n_make_utilization_reader(0)",
+    )
+    assert result.returncode == 0, (
+        f"building the GPU sampler reader loaded torch into the orchestrator:\n{result.stdout}\n{result.stderr}\n"
+        "Read utilization via the torch-free hordelib.utils.nvml helper, never get_accelerator_utilization_percent."
+    )

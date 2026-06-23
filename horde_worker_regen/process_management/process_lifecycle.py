@@ -78,6 +78,19 @@ per-slot breaker. This count is the equivalent signal for safety: a pool that ha
 this many times in the window is failing (e.g. a safety process that crashes on every start), which the
 recovery supervisor escalates rather than rebuilding the pool forever."""
 
+MODEL_LOAD_FAILURE_WINDOW_SECONDS: float = 600.0
+"""Sliding window over which a single model's load failures are counted for quarantine."""
+
+MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD: int = 3
+"""Load failures of one model within ``MODEL_LOAD_FAILURE_WINDOW_SECONDS`` before it is quarantined.
+
+A model that faults the backend every time it is loaded (an unsupported/corrupt checkpoint) is poison: the
+slot crash-loop breaker keys on the *slot*, not the model, so re-dispatching the model round-robin across
+fresh slots burns the whole pool down without any single slot tripping its breaker. Past this count the
+model itself is taken out of rotation (its queued jobs faulted for reissue, further preloads skipped) so
+one bad model can no longer cascade into a pool-wide recovery storm. The window is wider than the slot
+breaker's because a poison model surfaces once per job dispatch, not once per fast respawn."""
+
 SLOWDOWN_NOTICE_RATIO: float = 2.0
 """Sampling time past this multiple of the job's expected time logs a soft notice (rung 1 of the ladder)."""
 
@@ -155,6 +168,9 @@ class ProcessLifecycleManager:
     _quarantined_inference_slots: set[int]
     _num_slots_quarantined: int
     _safety_recovery_history: list[float]
+    _model_load_failure_history: dict[str, list[float]]
+    _quarantined_models: set[str]
+    _recent_load_failure_by_process: dict[int, tuple[str, float]]
 
     def __init__(
         self,
@@ -244,6 +260,9 @@ class ProcessLifecycleManager:
         self._quarantined_inference_slots = set()
         self._num_slots_quarantined = 0
         self._safety_recovery_history = []
+        self._model_load_failure_history = {}
+        self._quarantined_models = set()
+        self._recent_load_failure_by_process = {}
 
     def _validate_spawn_start_method(self) -> None:
         """Fail loudly if children would be created with a CUDA-unsafe start method.
@@ -951,6 +970,56 @@ class ProcessLifecycleManager:
                 f"{', '.join(released)}",
             )
 
+    def record_model_load_failure(self, process_id: int, model_name: str) -> bool:
+        """Record that ``model_name`` failed to load on ``process_id``; return whether it is now quarantined.
+
+        Keyed on the *model*, not the slot: a deterministically-unloadable checkpoint is re-dispatched
+        round-robin across fresh slots, so without a per-model counter no single slot's crash-loop breaker
+        ever trips and the bad model burns the whole pool down. Once a model crosses
+        ``MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD`` failures within the window it is taken out of rotation
+        (see :meth:`is_model_load_quarantined`). The process->model mapping is remembered so the imminent
+        slot replacement can label the recovery as a model-load failure rather than a process crash.
+        """
+        now = time.time()
+        self._recent_load_failure_by_process[process_id] = (model_name, now)
+        recent = [
+            t for t in self._model_load_failure_history.get(model_name, []) if now - t <= MODEL_LOAD_FAILURE_WINDOW_SECONDS
+        ]
+        recent.append(now)
+        self._model_load_failure_history[model_name] = recent
+        if len(recent) >= MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD and model_name not in self._quarantined_models:
+            self._quarantined_models.add(model_name)
+            logger.error(
+                f"Model {model_name} failed to load {len(recent)} times within "
+                f"{MODEL_LOAD_FAILURE_WINDOW_SECONDS:.0f}s; quarantining it (its jobs will be reissued and it "
+                f"will not be preloaded) to stop it churning the inference pool.",
+            )
+            return True
+        return model_name in self._quarantined_models
+
+    def is_model_load_quarantined(self, model_name: str | None) -> bool:
+        """Whether ``model_name`` has been quarantined for repeatedly failing to load."""
+        return model_name is not None and model_name in self._quarantined_models
+
+    def quarantined_models(self) -> frozenset[str]:
+        """The set of models currently quarantined for repeated load failures."""
+        return frozenset(self._quarantined_models)
+
+    def _take_recent_load_failure_for_process(self, process_id: int) -> str | None:
+        """Pop and return the model this process most recently failed to load, if that failure is fresh.
+
+        Used by the slot-replacement path to tell a clean exit after a reported load failure apart from a
+        genuine process crash/hang, so the recovery is labelled and counted correctly. Bounded to the
+        crash-loop window so a stale prior failure cannot mislabel an unrelated later crash.
+        """
+        entry = self._recent_load_failure_by_process.pop(process_id, None)
+        if entry is None:
+            return None
+        model_name, when = entry
+        if time.time() - when > CRASH_LOOP_WINDOW_SECONDS:
+            return None
+        return model_name
+
     def _record_slot_recovery(self, process_id: int) -> int:
         """Record a replacement of the given slot and return how many happened within the window."""
         now = time.time()
@@ -1149,24 +1218,36 @@ class ProcessLifecycleManager:
             self._start_inference_process(process_info.process_id)
             return
 
-        replacements_in_window = self._record_slot_recovery(process_info.process_id)
-        consecutive_start_failures = self._record_start_failure(process_info)
-        crash_looped = replacements_in_window > CRASH_LOOP_MAX_REPLACEMENTS
-        crash_on_start = consecutive_start_failures >= CRASH_LOOP_MAX_START_FAILURES
-        will_quarantine = crash_looped or crash_on_start
-        if not will_quarantine:
+        failed_model = self._take_recent_load_failure_for_process(process_info.process_id)
+        if failed_model is not None:
+            # The slot reported it could not load this model, then exited cleanly (its backend may be in an
+            # indeterminate state). The fault belongs to the *model*, not the slot, so this is labelled a
+            # model-load failure -- not the misleading "crashed or hung" -- and is deliberately kept out of
+            # the slot crash-loop/start-failure breakers: those count *slot* sickness, and feeding a poison
+            # model's failures into them would quarantine a perfectly healthy slot. The model itself is
+            # quarantined by record_model_load_failure once it crosses the threshold.
+            will_quarantine = False
             quarantine_reason = ""
-            recovery_reason = "inference process replaced (crashed or hung)"
-        elif crash_on_start:
-            quarantine_reason = (
-                f"crash on start: {consecutive_start_failures} consecutive failures before reaching readiness"
-            )
-            recovery_reason = f"inference slot quarantined ({quarantine_reason})"
+            recovery_reason = f"inference process replaced (failed to load model {failed_model})"
         else:
-            quarantine_reason = (
-                f"crash loop: {replacements_in_window} replacements within {CRASH_LOOP_WINDOW_SECONDS:.0f}s"
-            )
-            recovery_reason = f"inference slot quarantined ({quarantine_reason})"
+            replacements_in_window = self._record_slot_recovery(process_info.process_id)
+            consecutive_start_failures = self._record_start_failure(process_info)
+            crash_looped = replacements_in_window > CRASH_LOOP_MAX_REPLACEMENTS
+            crash_on_start = consecutive_start_failures >= CRASH_LOOP_MAX_START_FAILURES
+            will_quarantine = crash_looped or crash_on_start
+            if not will_quarantine:
+                quarantine_reason = ""
+                recovery_reason = "inference process replaced (crashed or hung)"
+            elif crash_on_start:
+                quarantine_reason = (
+                    f"crash on start: {consecutive_start_failures} consecutive failures before reaching readiness"
+                )
+                recovery_reason = f"inference slot quarantined ({quarantine_reason})"
+            else:
+                quarantine_reason = (
+                    f"crash loop: {replacements_in_window} replacements within {CRASH_LOOP_WINDOW_SECONDS:.0f}s"
+                )
+                recovery_reason = f"inference slot quarantined ({quarantine_reason})"
         # Record the recovery while the process info still reflects the faulted state: ending the
         # process first overwrites last_process_state with PROCESS_ENDING and loses that diagnostic.
         self._log_recovery_diagnostics(process_info, recovery_reason)

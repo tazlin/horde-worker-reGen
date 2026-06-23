@@ -712,6 +712,11 @@ class InferenceScheduler:
         # Refresh the clean all-contexts idle baseline (a no-op once startup has passed) so the marginal
         # per-context cost reflects measurement rather than the one-time-cost-times-N over-count.
         self._maybe_capture_idle_context_residency()
+        # The EXTRA_LARGE tier (extra-large baselines plus the named VRAM-heavy checkpoints) is the single
+        # source of truth for "wants the whole card and never shares". Feed it to the forecast so a baseline
+        # whose conservative weight seed happens to fit co-resident still claims sole residency on intent,
+        # rather than co-residing and thrashing as Z-Image did.
+        wants_whole_card = self._model_size_tier(job.model) >= _ModelSizeTier.EXTRA_LARGE
         return forecast_weight_streaming(
             job,
             str(baseline) if baseline is not None else None,
@@ -723,6 +728,7 @@ class InferenceScheduler:
             num_extra_resident_contexts=num_safety_contexts,
             post_processing_reserve_mb=self._committed_vram_reserve_mb(),
             marginal_process_overhead_mb=self._marginal_process_overhead_mb(),
+            wants_whole_card=wants_whole_card,
         )
 
     def _establish_whole_card_residency(

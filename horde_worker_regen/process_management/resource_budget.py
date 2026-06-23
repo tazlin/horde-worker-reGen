@@ -178,6 +178,15 @@ class StreamForecast:
     cost by the process count, manufacturing a multi-GB phantom shortfall that flips a co-residable model into
     falsely demanding sibling-process teardown. None (or a non-positive value) falls back to
     ``per_process_overhead_mb`` so a directly-constructed forecast keeps its prior, conservative behavior."""
+    wants_whole_card: bool = False
+    """The baseline is declared to want sole residency regardless of how its weight estimate happens to fit.
+
+    Some baselines (Cascade/Flux/Qwen/Z-Image: the ``EXTRA_LARGE`` tier) are known to behave badly sharing the
+    card even when a conservative weight seed reads as comfortably co-resident, so the scheduler treats them as
+    whole-card models on intent rather than waiting for the weight estimate to cross a knife-edge VRAM
+    threshold. This only *biases toward* sole residency (see :attr:`needs_exclusive_residency`); it never makes
+    an un-loadable model loadable, since the ``fits_alone`` guard still applies."""
+
     base_reserve_mb: float | None = None
     """The bounded inference-reserve floor (ComfyUI ``minimum_inference_memory`` / the configured floor).
 
@@ -297,8 +306,17 @@ class StreamForecast:
         leave no room for a sibling context) from a moderate-weight model with a large transient activation
         estimate (SDXL at a big batch/resolution: it can co-reside, so it must reclaim a sibling *model*
         through the normal budget path, not claim the device and tear down sibling *processes*).
+
+        A baseline flagged ``wants_whole_card`` takes the same sole-residency path even when its (conservative)
+        weight seed reads as co-resident: the tier classification asserts it never shares well in practice, so
+        intent wins over a weight estimate that merely happens to fit. ``fits_alone`` still gates it, so a
+        model that genuinely cannot be served alone is never forced down this path.
         """
-        return self.known and not self.fits_coresident and self.fits_alone and self._weights_dominant
+        if not (self.known and self.fits_alone):
+            return False
+        if self.wants_whole_card:
+            return True
+        return not self.fits_coresident and self._weights_dominant
 
     @property
     def requires_sibling_teardown(self) -> bool:
@@ -359,7 +377,13 @@ class StreamForecast:
         (it pays the one-time CUDA runtime cost); each additional co-resident context costs only the
         ``marginal``. Returns None when it cannot be sized (unknown weights/total, or no per-process overhead to
         reason about), and at least 1 otherwise (the loading process must survive).
+
+        A ``wants_whole_card`` baseline collapses straight to 1: the tier declares it never shares the card, so
+        the teardown target is sole residency regardless of how many contexts the weight seed would otherwise
+        leave room for (a too-low seed must not let a sibling context creep back onto the card).
         """
+        if self.wants_whole_card and self.known:
+            return 1
         if self.weights_mb is None or self.total_vram_mb is None or self.per_process_overhead_mb <= 0:
             return None
         budget = self.total_vram_mb - self.weights_mb - self.reserve_mb
@@ -374,7 +398,9 @@ class StreamForecast:
             return "no weight estimate; treated as co-resident"
         if self.free_now_mb is None:
             return f"no telemetry yet (cold start); weights ~{self.weights_mb:.0f} MB"
-        if self.fits_coresident:
+        # A whole-card-intent baseline takes sole residency even when its weight seed fits co-resident, so report
+        # that intent rather than the misleading "co-resident" the raw fit would otherwise print.
+        if self.fits_coresident and not self.needs_exclusive_residency:
             return (
                 f"weights ~{self.weights_mb:.0f} MB + {self.reserve_mb:.0f} MB reserve fit "
                 f"{self.free_now_mb:.0f} MB free: co-resident"
@@ -385,6 +411,8 @@ class StreamForecast:
             verdict = "weights overflow the card alone: streams unavoidably"
         elif self.requires_sibling_teardown:
             verdict = "weight-dominant: needs idle sibling processes stopped (their contexts over-commit the card)"
+        elif self.needs_exclusive_residency and self.wants_whole_card and self.fits_coresident:
+            verdict = "whole-card baseline: sole residency on intent (evict sibling models)"
         elif self.needs_exclusive_residency:
             verdict = "weight-dominant: needs sole residency (evict sibling models)"
         else:
@@ -510,6 +538,7 @@ def forecast_weight_streaming(
     num_extra_resident_contexts: int = 0,
     post_processing_reserve_mb: float = 0.0,
     marginal_process_overhead_mb: float | None = None,
+    wants_whole_card: bool = False,
 ) -> StreamForecast:
     """Return a :class:`StreamForecast` for loading ``job``'s model given the device's measured state.
 
@@ -536,7 +565,12 @@ def forecast_weight_streaming(
     on the card (the safety process when ``safety_on_gpu`` is set). Their contexts are real device-wide
     commitments that a stopping of idle *inference* siblings cannot reclaim, so they are subtracted (at the
     marginal cost, the runtime being already paid) from the achievable-free figure; sole residency for a heavy
-    model therefore implies moving them off the GPU too. Never raises.
+    model therefore implies moving them off the GPU too.
+
+    ``wants_whole_card`` flags a baseline the caller has classified as a sole-residency model on intent (the
+    ``EXTRA_LARGE`` tier: Cascade/Flux/Qwen/Z-Image), so a conservative weight seed that happens to fit
+    co-resident does not stop it claiming the card. It only biases the residency verdict; ``fits_alone`` still
+    governs whether sole residency is even achievable. Never raises.
     """
     weights_mb = predict_job_weight_mb(job, baseline)
     base_reserve_mb = effective_inference_reserve_mb(
@@ -607,6 +641,7 @@ def forecast_weight_streaming(
         total_vram_mb=float(total_vram_mb) if total_vram_mb is not None and total_vram_mb > 0 else None,
         per_process_overhead_mb=overhead,
         marginal_process_overhead_mb=marginal,
+        wants_whole_card=wants_whole_card,
     )
 
 

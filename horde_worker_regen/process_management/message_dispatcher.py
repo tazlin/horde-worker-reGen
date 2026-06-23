@@ -121,6 +121,8 @@ class MessageDispatcher:
     _on_job_metrics: Callable[[HordeJobMetricsMessage], None] | None = None
     _on_download_metrics: Callable[[HordeDownloadMetricsMessage], None] | None = None
     _on_download_availability: Callable[[HordeDownloadAvailabilityMessage], None] | None = None
+    _on_model_load_failure: Callable[[int, str], None] | None = None
+    """Invoked as ``(process_id, horde_model_name)`` when a child reports it failed to load a model."""
 
     _last_deadlock_detected_time: float = 0.0
     _in_deadlock: bool = False
@@ -195,6 +197,14 @@ class MessageDispatcher:
     ) -> None:
         """Register the callback invoked when the download process reports on-disk availability."""
         self._on_download_availability = handler
+
+    def set_model_load_failure_handler(self, handler: Callable[[int, str], None]) -> None:
+        """Register the callback invoked when a child reports it failed to load a model.
+
+        Called as ``(process_id, horde_model_name)``. Lets the manager track per-model load failures and
+        quarantine a deterministically-unloadable model instead of churning the process pool.
+        """
+        self._on_model_load_failure = handler
 
     async def receive_and_handle_process_messages(self) -> None:
         """Receive and handle any messages from the child processes."""
@@ -536,6 +546,19 @@ class MessageDispatcher:
 
     def _handle_model_state_change(self, message: HordeModelStateChangeMessage) -> None:
         """Handle a model state change message."""
+        if message.horde_model_state == ModelLoadState.FAILED:
+            # The model could not be loaded. Do not record it as resident anywhere: clear any LOADING entry
+            # this process held for it (left by the PRELOADING_MODEL message moments earlier) so the model is
+            # not pinned to a slot that never actually loaded it, then hand the failure to the manager so it
+            # can track repeated failures and quarantine the model.
+            logger.error(
+                f"Process {message.process_id} failed to load model {message.horde_model_name}",
+            )
+            self._horde_model_map.expire_entry(message.horde_model_name)
+            if self._on_model_load_failure is not None:
+                self._on_model_load_failure(message.process_id, message.horde_model_name)
+            return
+
         self._horde_model_map.update_entry(
             horde_model_name=message.horde_model_name,
             load_state=message.horde_model_state,

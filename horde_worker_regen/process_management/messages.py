@@ -37,6 +37,9 @@ class ModelLoadState(enum.Enum):
     """The model is loaded in VRAM."""
     IN_USE = auto()
     """The model is in use by a process."""
+    FAILED = auto()
+    """The model could not be loaded (the backend raised while loading it). Reported so the parent can
+    track per-model load failures and quarantine a deterministically-unloadable model."""
 
     def is_loaded(self) -> bool:
         """Return if the model is loaded in RAM, VRAM, or in use."""
@@ -48,7 +51,7 @@ class ModelLoadState(enum.Enum):
 
     def is_active(self) -> bool:
         """Return if the model is loaded in VRAM or in use."""
-        return self != ModelLoadState.ON_DISK
+        return self != ModelLoadState.ON_DISK and self != ModelLoadState.FAILED
 
 
 class ModelInfo(BaseModel):
@@ -95,6 +98,12 @@ class HordeProcessState(enum.Enum):
     """The process is preloading a model."""
     PRELOADED_MODEL = auto()
     """The process has finished preloading a model."""
+    PRELOADING_FAILED = auto()
+    """The process failed to load a model (e.g. an unsupported/corrupt checkpoint the backend cannot load).
+
+    Distinct from a crash: the child names the offending model so the parent can quarantine *that model*
+    after repeated failures, instead of mistaking a deterministically-unloadable model for a sick process and
+    burning the slot down in an unbounded recovery loop."""
 
     UNLOADED_MODEL_FROM_VRAM = auto()
     """The process has unloaded a model from VRAM."""
