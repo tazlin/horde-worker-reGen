@@ -33,6 +33,11 @@ class WorkerState:
     supervisor_paused: bool = False
     """Local pause requested by a supervising frontend (TUI). Stops new job/alchemy pops; in-flight work finishes."""
 
+    downloads_only_hold: bool = False
+    """The worker is in a download-only posture (pre-fetch models without committing the GPU): the
+    download process runs but inference/safety are held and no jobs are popped. Lifted by GO_LIVE. Kept
+    separate from ``supervisor_paused`` so leaving the hold never clobbers an operator's manual pause."""
+
     self_throttle_paused: bool = False
     """Worker-initiated local pop-pause: the self-throttle backstop engaged because resource/OOM faults
     accumulated fast enough to risk the horde forcing the worker into maintenance. Stops new pops (in-flight

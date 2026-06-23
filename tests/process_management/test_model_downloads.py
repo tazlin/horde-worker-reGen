@@ -4,11 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import sys
+import threading
 import time
+import types
+from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
+from horde_worker_regen.model_download_core import ChunkPacer, DownloadAborted
 from horde_worker_regen.process_management.action_ledger import ActionLedger
-from horde_worker_regen.process_management.download_process import DOWNLOAD_PROCESS_ID
+from horde_worker_regen.process_management.download_process import (
+    DOWNLOAD_PROCESS_ID,
+    FEATURE_IMAGE_MODEL,
+    FEATURE_SAFETY,
+    HordeDownloadProcess,
+    _TaskRuntime,
+)
+from horde_worker_regen.process_management.download_scheduler import DownloadKind, DownloadTask
 from horde_worker_regen.process_management.fake_worker_processes import FakeDownloadProcess
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.job_popper import _select_models_for_pop
@@ -390,6 +404,198 @@ class TestConfigReloadTriggersDownloads:
 
         manager._process_lifecycle.request_downloads.assert_not_called()
 
+    def test_reload_removing_a_model_sends_authoritative_desired_set(self) -> None:
+        """Dropping a model from config sends the now-authoritative set so its download is stopped."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a", "b"])
+        # Both present on disk: the reload adds nothing, so without the desired-set reconcile the old
+        # short-circuit would send nothing and leave b downloading.
+        self._mark_present(manager, {"a", "b"})
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(image_models_to_load=["a"], dry_run_skip_inference=True),
+        )
+
+        manager._process_lifecycle.request_downloads.assert_called_once()
+        args, kwargs = manager._process_lifecycle.request_downloads.call_args
+        assert args[0] == []  # nothing new to fetch
+        assert kwargs["desired_image_models"] == ["a"]
+
+    def test_reload_adding_a_model_also_carries_desired_set(self) -> None:
+        """An add still attaches the authoritative set (harmless dedup) alongside the missing model."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        self._mark_present(manager, {"a"})
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(image_models_to_load=["a", "b"], dry_run_skip_inference=True),
+        )
+
+        manager._process_lifecycle.request_downloads.assert_called_once()
+        args, kwargs = manager._process_lifecycle.request_downloads.call_args
+        assert args[0] == ["b"]
+        assert kwargs["desired_image_models"] == ["a", "b"]
+
+    def test_reload_changing_an_aux_flag_restarts_the_download_process(self) -> None:
+        """Toggling a construction-time download flag (e.g. allow_controlnet) restarts the download process."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        self._mark_present(manager, {"a"})
+        # Normalize to a known baseline, then flip exactly one construction-time download flag. (purge is
+        # pinned because the mock bridge data leaves it an auto-Mock that would never compare equal.)
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(
+                image_models_to_load=["a"],
+                allow_controlnet=False,
+                purge_loras_on_download=False,
+                dry_run_skip_inference=True,
+            ),
+        )
+        manager._process_lifecycle.restart_download_process.reset_mock()
+        manager._initial_download_requested = True
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(
+                image_models_to_load=["a"],
+                allow_controlnet=True,
+                purge_loras_on_download=False,
+                dry_run_skip_inference=True,
+            ),
+        )
+
+        manager._process_lifecycle.restart_download_process.assert_called_once()
+        # The fresh scan must be allowed to re-trigger the initial download + aux pass.
+        assert manager._initial_download_requested is False
+
+    def test_reload_without_download_flag_change_does_not_restart(self) -> None:
+        """A reload that leaves the download flags unchanged never cycles the download process."""
+        manager = self._manager_in_download_mode(image_models_to_load=["a"])
+        self._mark_present(manager, {"a"})
+        # Establish the baseline flags, then reload with the same flags (only the model set changes).
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(
+                image_models_to_load=["a"],
+                allow_controlnet=True,
+                purge_loras_on_download=False,
+                dry_run_skip_inference=True,
+            ),
+        )
+        manager._process_lifecycle.restart_download_process.reset_mock()
+
+        manager._apply_reloaded_bridge_data(
+            make_mock_bridge_data(
+                image_models_to_load=["a", "b"],
+                allow_controlnet=True,
+                purge_loras_on_download=False,
+                dry_run_skip_inference=True,
+            ),
+        )
+
+        manager._process_lifecycle.restart_download_process.assert_not_called()
+
+
+class TestDownloadsOnlyMode:
+    """The download-only posture: pre-fetch models with the GPU uncommitted, then GO_LIVE."""
+
+    def _manager(self, **bridge_overrides: object) -> Mock:
+        manager = make_testable_process_manager(**bridge_overrides)  # type: ignore
+        manager._enable_background_downloads = True
+        manager._process_lifecycle = Mock()
+        manager._initial_download_requested = True
+        return manager  # type: ignore[return-value]
+
+    def _mark_present(self, manager: Mock, present: set[str]) -> None:
+        manager._model_availability.update(present=present, currently_downloading=None, pending=(), failed=())
+
+    def test_enter_hold_sets_state_and_starts_download_process(self) -> None:
+        """Entering the hold flags the state and ensures the download process is running."""
+        manager = self._manager(image_models_to_load=["a"])
+        manager._enter_downloads_only_hold()
+
+        assert manager._state.downloads_only_hold is True
+        manager._process_lifecycle.start_download_process.assert_called_once()
+
+    def test_hold_blocks_inference_start_even_with_a_model_present(self) -> None:
+        """While held, inference does not start despite a present, scanned model."""
+        manager = self._manager(image_models_to_load=["a"])
+        self._mark_present(manager, {"a"})
+        manager._state.downloads_only_hold = True
+
+        manager._maybe_start_inference_processes()
+
+        manager._process_lifecycle.start_inference_processes.assert_not_called()
+
+    def test_go_live_clears_hold_and_starts_inference(self) -> None:
+        """GO_LIVE lifts the hold and brings inference up (a model is present)."""
+        manager = self._manager(image_models_to_load=["a"])
+        self._mark_present(manager, {"a"})
+        manager._state.downloads_only_hold = True
+
+        manager._leave_downloads_only_hold()
+
+        assert manager._state.downloads_only_hold is False
+        manager._process_lifecycle.start_inference_processes.assert_called_once()
+
+    def test_on_demand_download_is_additive_and_kicks_aux(self) -> None:
+        """An on-demand request enqueues the chosen models (no desired-set prune) and can run aux."""
+        manager = self._manager(image_models_to_load=["a"])
+
+        manager._download_models_on_demand(["x", "y"], include_aux=True)
+
+        manager._process_lifecycle.request_downloads.assert_called_once()
+        args, kwargs = manager._process_lifecycle.request_downloads.call_args
+        assert args[0] == ["x", "y"]
+        assert kwargs["download_aux"] is True
+        # Additive: it must NOT carry an authoritative desired set (which would prune configured downloads).
+        assert "desired_image_models" not in kwargs or kwargs["desired_image_models"] is None
+
+
+class TestDownloadEntryPointSignatures:
+    """The download entry points must forward every download-process constructor kwarg.
+
+    Regression guard: a constructor kwarg added to the lifecycle's launch dict but not to the entry-point
+    function makes the spawned process die with ``TypeError: ... unexpected keyword argument`` before it
+    can load managers or report availability. With no inference process started yet, the empty process map
+    then makes the hung-detector falsely declare "all processes unresponsive".
+    """
+
+    def test_real_entry_point_forwards_every_constructor_kwarg(self) -> None:
+        """``start_download_process`` accepts (and forwards) every keyword-only HordeDownloadProcess arg."""
+        import inspect
+
+        from horde_worker_regen.process_management.download_process import HordeDownloadProcess
+        from horde_worker_regen.process_management.worker_entry_points import start_download_process
+
+        ctor_kwargs = {
+            name
+            for name, param in inspect.signature(HordeDownloadProcess.__init__).parameters.items()
+            if param.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+        entry_kwargs = {
+            name
+            for name, param in inspect.signature(start_download_process).parameters.items()
+            if param.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+        missing = ctor_kwargs - entry_kwargs
+        assert not missing, f"download entry point does not forward constructor kwargs: {missing}"
+
+    def test_fake_entry_point_is_signature_compatible_with_the_real_one(self) -> None:
+        """The fake receives the same launch kwargs, so it must accept every real entry-point keyword."""
+        import inspect
+
+        from horde_worker_regen.process_management.fake_worker_processes import start_fake_download_process
+        from horde_worker_regen.process_management.worker_entry_points import start_download_process
+
+        real_kwargs = {
+            name
+            for name, param in inspect.signature(start_download_process).parameters.items()
+            if param.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+        fake_kwargs = {
+            name
+            for name, param in inspect.signature(start_fake_download_process).parameters.items()
+            if param.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+        missing = real_kwargs - fake_kwargs
+        assert not missing, f"fake download entry point is missing kwargs the parent forwards: {missing}"
+
 
 class TestManagerSafetyDeferral:
     """The manager defers the safety-process launch until the download process provides its models.
@@ -583,6 +789,376 @@ class TestFakeDownloadProcessProtocol:
         process._receive_and_handle_control_message(HordeDownloadControlMessage(set_rate_limit_kbps=0))
         status = _drain_availability(message_queue)[-1].status
         assert status is not None and status.rate_limit_kbps is None
+
+    def test_desired_set_prunes_queue_and_drops_in_flight(self) -> None:
+        """A model removed from the authoritative set is dropped from the fake's queue and in-flight slot."""
+        process, message_queue = self._make_process(["a"])
+        process._receive_and_handle_control_message(HordeDownloadControlMessage(model_names=["b", "c"]))
+        process._currently_downloading = "b"
+
+        process._receive_and_handle_control_message(HordeDownloadControlMessage(desired_image_models=["a"]))
+
+        assert process._pending == []
+        assert process._currently_downloading is None
+
+
+class TestRealDownloadProcessReconcile:
+    """The real download process reconciles its staged/queued/in-flight work against the authoritative set.
+
+    These drive ``_handle_control_message`` directly (no managers/hordelib needed): the reconcile is pure
+    state (the staging buffer, the host-aware scheduler, and per-task runtimes) plus a status emit, so it
+    can be unit-tested without a GPU or a real download.
+    """
+
+    def _make_process(self) -> HordeDownloadProcess:
+        return HordeDownloadProcess(
+            process_id=DOWNLOAD_PROCESS_ID,
+            process_message_queue=queue.Queue(),  # type: ignore[arg-type]
+            pipe_connection=Mock(),
+            disk_lock=Mock(),
+            download_bandwidth_semaphore=Mock(),
+            process_launch_identifier=0,
+        )
+
+    @staticmethod
+    def _insert_active(process: HordeDownloadProcess, kind: DownloadKind, model: str, feature: str) -> _TaskRuntime:
+        """Register a fake in-flight task runtime under the scheduler's dedup key for that task."""
+        runtime = _TaskRuntime(
+            status=CurrentDownloadStatus(model_name=model, feature=feature, target_dir=""),
+            pacer=ChunkPacer(),
+        )
+        process._active[(kind, "", model)] = runtime
+        return runtime
+
+    def test_desired_set_prunes_staged_and_queued_model(self) -> None:
+        """A removed model is dropped from the staging buffer and from the scheduler queue."""
+        process = self._make_process()
+        process._pending_image_models = ["a", "b"]
+        process._scheduler.enqueue(
+            DownloadTask(kind=DownloadKind.IMAGE_MODEL, model_name="b", host="h", feature=FEATURE_IMAGE_MODEL),
+        )
+
+        process._handle_control_message(HordeDownloadControlMessage(desired_image_models=["a"]))
+
+        assert process._pending_image_models == ["a"]
+        assert all(task.model_name != "b" for task in process._scheduler.pending_snapshot())
+
+    def test_desired_set_cancels_in_flight_image_model(self) -> None:
+        """Removing the in-flight image model flips its runtime cancel flag, so its callback aborts."""
+        process = self._make_process()
+        runtime = self._insert_active(process, DownloadKind.IMAGE_MODEL, "b", FEATURE_IMAGE_MODEL)
+
+        process._handle_control_message(HordeDownloadControlMessage(desired_image_models=["a"]))
+
+        assert runtime.cancelled is True
+        # The cancel reaches the download via the per-task chunk-callback abort predicate.
+        task = DownloadTask(kind=DownloadKind.IMAGE_MODEL, model_name="b", host="h", feature=FEATURE_IMAGE_MODEL)
+        with pytest.raises(DownloadAborted):
+            process._make_callback(task, runtime)(10, 100)
+
+    def test_desired_set_does_not_cancel_safety_download(self) -> None:
+        """A model removal must never abort an in-flight required safety (or aux) download."""
+        process = self._make_process()
+        runtime = self._insert_active(process, DownloadKind.SAFETY, "safety models", FEATURE_SAFETY)
+
+        process._handle_control_message(HordeDownloadControlMessage(desired_image_models=["a"]))
+
+        assert runtime.cancelled is False
+
+    def test_re_adding_a_model_uncancels_in_flight(self) -> None:
+        """Re-adding the in-flight model (config flap) clears the cancel so it keeps downloading."""
+        process = self._make_process()
+        runtime = self._insert_active(process, DownloadKind.IMAGE_MODEL, "b", FEATURE_IMAGE_MODEL)
+
+        process._handle_control_message(HordeDownloadControlMessage(desired_image_models=["a"]))
+        assert runtime.cancelled is True
+        process._handle_control_message(HordeDownloadControlMessage(desired_image_models=["a", "b"]))
+
+        assert runtime.cancelled is False
+
+    def _process_with_controlnet_only_aux(self) -> HordeDownloadProcess:
+        """A download process whose only enabled aux category is ControlNet (isolates the annotator task)."""
+        return HordeDownloadProcess(
+            process_id=DOWNLOAD_PROCESS_ID,
+            process_message_queue=queue.Queue(),  # type: ignore[arg-type]
+            pipe_connection=Mock(),
+            disk_lock=Mock(),
+            download_bandwidth_semaphore=Mock(),
+            process_launch_identifier=0,
+            allow_lora=False,
+            allow_post_processing=False,
+            allow_sdxl_controlnet=False,
+            allow_controlnet=True,
+        )
+
+    @staticmethod
+    def _inject_controlnet_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Make ``from hordelib.api import SharedModelManager`` yield a manager with only ControlNet (no models)."""
+        controlnet = SimpleNamespace(
+            model_reference={},
+            model_folder_path="/cn",
+            is_model_available=lambda _name: True,
+            get_model_download=lambda _name: [],
+        )
+        manager = SimpleNamespace(
+            lora=None,
+            gfpgan=None,
+            esrgan=None,
+            codeformer=None,
+            miscellaneous=None,
+            controlnet=controlnet,
+        )
+        fake_api = types.ModuleType("hordelib.api")
+        fake_api.SharedModelManager = SimpleNamespace(manager=manager)  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
+
+    def test_annotator_task_skipped_when_already_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A warm worker with annotators on disk must not enqueue (or display) an annotator download."""
+        process = self._process_with_controlnet_only_aux()
+        self._inject_controlnet_manager(monkeypatch)
+        monkeypatch.setattr(HordeDownloadProcess, "_annotators_present", staticmethod(lambda: True))
+
+        process._enqueue_aux_tasks()
+
+        assert not any(task.kind is DownloadKind.ANNOTATORS for task in process._scheduler.pending_snapshot())
+
+    def test_annotator_task_enqueued_when_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When the annotators are not on disk, the annotator task is enqueued so they are fetched."""
+        process = self._process_with_controlnet_only_aux()
+        self._inject_controlnet_manager(monkeypatch)
+        monkeypatch.setattr(HordeDownloadProcess, "_annotators_present", staticmethod(lambda: False))
+
+        process._enqueue_aux_tasks()
+
+        assert any(task.kind is DownloadKind.ANNOTATORS for task in process._scheduler.pending_snapshot())
+
+
+class TestDownloadProcessConcurrencyFixes:
+    """The threaded download path's correctness guards: per-manager locking, retry, bandwidth, pool growth."""
+
+    def _make_process(
+        self,
+        *,
+        semaphore: object | None = None,
+        max_parallel_downloads: int = 4,
+    ) -> HordeDownloadProcess:
+        return HordeDownloadProcess(
+            process_id=DOWNLOAD_PROCESS_ID,
+            process_message_queue=queue.Queue(),  # type: ignore[arg-type]
+            pipe_connection=Mock(),
+            disk_lock=Mock(),
+            download_bandwidth_semaphore=semaphore or Mock(),  # type: ignore[arg-type]
+            process_launch_identifier=0,
+            max_parallel_downloads=max_parallel_downloads,
+        )
+
+    @staticmethod
+    def _inject_aux_managers(monkeypatch: pytest.MonkeyPatch, managers: dict[str, object]) -> None:
+        """Make ``from hordelib.api import SharedModelManager`` yield a manager exposing *managers* by key."""
+        manager = SimpleNamespace(**managers)
+        fake_api = types.ModuleType("hordelib.api")
+        fake_api.SharedModelManager = SimpleNamespace(manager=manager)  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
+
+    def test_same_manager_downloads_serialize(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two AUX tasks on the *same* manager never run that manager's download_model concurrently."""
+        probe = _ConcurrencyProbe()
+        gfpgan = SimpleNamespace(download_model=lambda _name, callback=None: probe.run(0.05))
+        self._inject_aux_managers(monkeypatch, {"gfpgan": gfpgan})
+        process = self._make_process()
+
+        task_a = _aux_task("a", "h1", "gfpgan")
+        task_b = _aux_task("b", "h2", "gfpgan")
+        self._run_dispatch_concurrently(process, [task_a, task_b])
+
+        assert probe.max_active == 1  # the per-manager lock serialized them
+
+    def test_different_managers_download_in_parallel(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AUX tasks on *different* managers run truly in parallel (independent shared state)."""
+        probe = _ConcurrencyProbe()
+        gfpgan = SimpleNamespace(download_model=lambda _name, callback=None: probe.run(0.05))
+        esrgan = SimpleNamespace(download_model=lambda _name, callback=None: probe.run(0.05))
+        self._inject_aux_managers(monkeypatch, {"gfpgan": gfpgan, "esrgan": esrgan})
+        process = self._make_process()
+
+        task_a = _aux_task("a", "h1", "gfpgan")
+        task_b = _aux_task("b", "h2", "esrgan")
+        self._run_dispatch_concurrently(process, [task_a, task_b])
+
+        assert probe.max_active == 2  # distinct manager locks, so both ran at once
+
+    @staticmethod
+    def _run_dispatch_concurrently(process: HordeDownloadProcess, tasks: list[DownloadTask]) -> None:
+        def noop(_downloaded: int, _total: int) -> None:
+            return
+
+        threads = [threading.Thread(target=lambda t=task: process._dispatch_task(t, noop)) for task in tasks]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5.0)
+
+    def test_failed_image_fetch_is_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A failed per-file fetch is re-queued (bounded), so a transient failure is not abandoned."""
+        monkeypatch.setattr("horde_worker_regen.process_management.download_process._RETRY_BACKOFF_SECONDS", 0.0)
+        process = self._make_process()
+        task = DownloadTask(kind=DownloadKind.IMAGE_MODEL, model_name="m", host="h", feature=FEATURE_IMAGE_MODEL)
+
+        process._maybe_retry(task, "boom")
+
+        assert process._attempts[task.dedup_key] == 1
+        assert any(t.model_name == "m" for t in process._scheduler.pending_snapshot())
+
+    def test_retry_gives_up_after_max_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """After the attempt ceiling the task is no longer re-queued (no infinite retry loop)."""
+        monkeypatch.setattr("horde_worker_regen.process_management.download_process._RETRY_BACKOFF_SECONDS", 0.0)
+        from horde_worker_regen.process_management import download_process as dp
+
+        process = self._make_process()
+        task = DownloadTask(kind=DownloadKind.IMAGE_MODEL, model_name="m", host="h", feature=FEATURE_IMAGE_MODEL)
+        process._attempts[task.dedup_key] = dp._MAX_DOWNLOAD_ATTEMPTS
+
+        process._maybe_retry(task, "boom")
+
+        assert not process._scheduler.pending_snapshot()
+
+    def test_coarse_kinds_are_not_retried(self) -> None:
+        """The coarse kinds (safety/LoRa/annotators) own their own retry and are not re-queued here."""
+        process = self._make_process()
+        task = DownloadTask(
+            kind=DownloadKind.SAFETY,
+            model_name="safety models",
+            host="unknown",
+            feature=FEATURE_SAFETY,
+        )
+
+        process._maybe_retry(task, "boom")
+
+        assert not process._scheduler.pending_snapshot()
+        assert task.dedup_key not in process._attempts
+
+    def test_failure_cleared_on_later_success(self) -> None:
+        """A recorded failure is dropped once the model is later marked successful."""
+        process = self._make_process()
+        process._record_failure("m", FEATURE_IMAGE_MODEL, "boom")
+        assert any(f.model_name == "m" for f in process._failures)
+
+        process._clear_failure("m")
+
+        assert not any(f.model_name == "m" for f in process._failures)
+
+    def test_bandwidth_slot_acquired_once_and_released_last(self) -> None:
+        """The cross-process slot is acquired by the first task and released only when the last finishes."""
+        semaphore = _CountingSemaphore()
+        process = self._make_process(semaphore=semaphore)
+
+        process._acquire_bandwidth_slot()  # first task
+        process._acquire_bandwidth_slot()  # second concurrent task
+        assert semaphore.acquired == 1  # only one real acquire for both tasks
+        assert process._bandwidth_held is True
+
+        process._release_bandwidth_slot()  # one task still active
+        assert semaphore.released == 0
+        process._release_bandwidth_slot()  # last task finishes
+        assert semaphore.released == 1
+        assert process._bandwidth_held is False
+
+    def test_executor_pool_grows_but_never_shrinks(self) -> None:
+        """Raising the limit grows the pool to use the new ceiling; a lower limit leaves threads idle."""
+        process = self._make_process(max_parallel_downloads=2)
+        try:
+            process._ensure_executor_threads(2)
+            assert sum(1 for t in process._executor_threads if t.is_alive()) == 2
+            process._ensure_executor_threads(5)
+            assert sum(1 for t in process._executor_threads if t.is_alive()) == 5
+            process._ensure_executor_threads(3)  # a lower limit must not drop threads
+            assert sum(1 for t in process._executor_threads if t.is_alive()) == 5
+        finally:
+            process._end_process = True
+            process._scheduler.close()
+            for thread in process._executor_threads:
+                thread.join(timeout=1.0)
+
+    def test_dead_executor_thread_is_respawned(self) -> None:
+        """A thread that died is pruned and replaced, so download capacity self-heals (oracle safety)."""
+        process = self._make_process(max_parallel_downloads=1)
+        dead = threading.Thread(target=lambda: None)
+        dead.start()
+        dead.join()
+        process._executor_threads = [dead]
+        try:
+            process._ensure_executor_threads(1)
+            assert dead not in process._executor_threads  # the dead thread was pruned
+            assert sum(1 for thread in process._executor_threads if thread.is_alive()) == 1
+        finally:
+            process._end_process = True
+            process._scheduler.close()
+            for thread in process._executor_threads:
+                thread.join(timeout=1.0)
+
+    def test_executor_loop_survives_a_task_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unexpected error in one task is contained: the loop keeps running rather than dying."""
+        process = self._make_process(max_parallel_downloads=1)
+        process._scheduler.enqueue(_aux_task("a", "h1", "gfpgan"))
+        process._scheduler.enqueue(_aux_task("b", "h1", "gfpgan"))
+        calls = {"n": 0}
+
+        def boom(_task: DownloadTask) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("boom")
+            process._end_process = True  # a second task ran, so the loop survived the first error
+
+        monkeypatch.setattr(process, "_run_task", boom)
+        thread = threading.Thread(target=process._executor_loop)
+        thread.start()
+        thread.join(timeout=3.0)
+
+        assert not thread.is_alive()  # the loop exited cleanly via _end_process, it did not crash out
+        assert calls["n"] >= 2  # it processed a second task after the first one raised
+
+
+def _aux_task(model: str, host: str, manager_key: str) -> DownloadTask:
+    """A compact AUX_MODEL task builder for the concurrency tests."""
+    return DownloadTask(
+        kind=DownloadKind.AUX_MODEL,
+        model_name=model,
+        host=host,
+        feature="f",
+        manager_key=manager_key,
+    )
+
+
+class _ConcurrencyProbe:
+    """Records the peak number of overlapping ``run`` calls, to assert (non-)concurrency."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def run(self, seconds: float) -> None:
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(seconds)
+        with self._lock:
+            self.active -= 1
+
+
+class _CountingSemaphore:
+    """A stand-in for the cross-process bandwidth semaphore that counts acquire/release calls."""
+
+    def __init__(self) -> None:
+        self.acquired = 0
+        self.released = 0
+
+    def acquire(self, timeout: float | None = None) -> bool:
+        self.acquired += 1
+        return True
+
+    def release(self) -> None:
+        self.released += 1
 
 
 class TestDownloadMessageRoundTrips:

@@ -199,7 +199,19 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """Cap background model downloads to this many KB/s (None or 0 means unlimited).
 
     Applied by the background download process and honored on config reload. Approximate: enforced at
-    16MB-chunk granularity, so very low limits are coarse."""
+    16MB-chunk granularity, so very low limits are coarse. With parallel downloads the cap is the
+    aggregate: it is divided across the downloads in flight."""
+    download_max_parallel_downloads: int = Field(default=4, ge=1)
+    """How many model downloads may run at once across all source hosts (1 = fully sequential).
+
+    Downloads are parallelized across distinct hosts (e.g. civitai.com / huggingface.co), so a fresh
+    install fetches generation, clip/blip, controlnet and post-processing models concurrently rather than
+    one at a time. Honored at startup and on config reload."""
+    download_per_host_concurrency: int = Field(default=1, ge=1)
+    """How many downloads to the *same* host may run at once (default 1 = one connection per host).
+
+    Raise above 1 to also allow several concurrent downloads from a single host; left at 1, a host is
+    never hit by more than one download at a time. Honored at startup and on config reload."""
     downloads_paused: bool = Field(default=False)
     """If true, background model downloads are held (the current chunk loop blocks) until resumed.
 

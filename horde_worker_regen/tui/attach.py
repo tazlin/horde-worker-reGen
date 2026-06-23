@@ -88,6 +88,15 @@ class SupervisorLike(Protocol):
     def request_download_rate_limit(self, rate_limit_kbps: int) -> bool:
         """Ask the worker to set the download bandwidth cap in KB/s."""
 
+    def request_downloads_only_hold(self) -> bool:
+        """Ask the worker to enter the download-only posture (pre-fetch models, GPU uncommitted)."""
+
+    def request_go_live(self) -> bool:
+        """Ask the worker to leave download-only mode and start serving jobs."""
+
+    def request_download_models(self, model_names: list[str], *, include_aux: bool) -> bool:
+        """Ask the worker to fetch a chosen set of models on demand."""
+
     def request_set_server_maintenance(self, enabled: bool) -> bool:
         """Ask the worker to set its server-side (horde) maintenance flag on or off."""
 
@@ -205,6 +214,24 @@ class AttachedWorkerSupervisor:
             SupervisorControlMessage(
                 command=SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT,
                 download_rate_limit_kbps=rate_limit_kbps,
+            ),
+        )
+
+    def request_downloads_only_hold(self) -> bool:
+        """Ask the worker to enter the download-only posture (pre-fetch models, GPU uncommitted)."""
+        return self.send_command(SupervisorControlMessage(command=SupervisorCommand.DOWNLOADS_ONLY_HOLD))
+
+    def request_go_live(self) -> bool:
+        """Ask the worker to leave download-only mode and start serving jobs."""
+        return self.send_command(SupervisorControlMessage(command=SupervisorCommand.GO_LIVE))
+
+    def request_download_models(self, model_names: list[str], *, include_aux: bool) -> bool:
+        """Ask the worker to fetch a chosen set of models on demand (the TUI download picker)."""
+        return self.send_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.DOWNLOAD_MODELS,
+                download_model_names=list(model_names),
+                download_include_aux=include_aux,
             ),
         )
 

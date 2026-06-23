@@ -285,6 +285,17 @@ class ModelManagerView(Vertical):
         self._render_body(result)
         self._render_warnings(result)
 
+    def configured_included_models(self) -> list[EffectiveModel]:
+        """The currently-resolved configured models (the set the worker would load), for the download picker.
+
+        Empty when the catalog has not resolved yet (the reference loads in the background via
+        ``_adopt_from_cache``); the caller then nudges the operator to Resolve in this tab first.
+        """
+        self._sync_values()
+        if self._last_result is None:
+            return []
+        return self._last_result.included
+
     def _disk_totals(self, included: list[EffectiveModel]) -> tuple[int, int, int, bool, int]:
         """Sum present/to-download bytes from the included rows (sizes are baked into the catalog)."""
         present = sum(model.size_bytes or 0 for model in included if model.on_disk)

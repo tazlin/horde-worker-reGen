@@ -53,10 +53,16 @@ from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.update_check import check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, ConfigLeaveChoice, ConfigLeaveModal
+from horde_worker_regen.tui.widgets.download_picker import (
+    DownloadPickerModal,
+    DownloadPickerRow,
+    DownloadSelection,
+)
 from horde_worker_regen.tui.widgets.downloads import DownloadsView
 from horde_worker_regen.tui.widgets.insights import InsightsView
 from horde_worker_regen.tui.widgets.live_view import LiveView
 from horde_worker_regen.tui.widgets.logs import LogsView
+from horde_worker_regen.tui.widgets.model_manager import ModelManagerView
 from horde_worker_regen.tui.widgets.onboarding import (
     BenchmarkOnboardingModal,
     WorkerStartChoice,
@@ -197,6 +203,12 @@ class HordeWorkerTUI(App[None]):
         self._frame = 0
         self._last_benchmark_status = BenchmarkSupervisorStatus.IDLE
         self._pending_benchmark_options = BenchmarkOptions()
+        # Set when "Download only" starts a stopped worker: the hold command is sent once its pipe is up
+        # (see _tick), since send_command would otherwise race the child's connection.
+        self._pending_downloads_only_hold = False
+        # A picker selection chosen before a freshly-started worker's pipe is up; sent once it is (see
+        # _tick), after the hold command, so the models are fetched without the GPU committing.
+        self._pending_download_models: DownloadSelection | None = None
         self._view_mode = self._app_state_store.load().overview_view_mode
         self._last_main_tab = "tab-overview"
         self._allow_tab_switch_to: str | None = None
@@ -359,6 +371,14 @@ class HordeWorkerTUI(App[None]):
         if choice is None or choice is WorkerStartChoice.STAY_STOPPED:
             self.notify("Worker is stopped. Press F3 to start it.")
             return
+        if choice is WorkerStartChoice.DOWNLOAD_ONLY:
+            # Start the worker and hold it in download-only mode (the hold is sent once its pipe is up).
+            with contextlib.suppress(NoMatches):
+                self.query_one("#main-tabs", TabbedContent).active = "tab-downloads"
+            self._supervisor.start()
+            self._pending_downloads_only_hold = True
+            self.notify("Starting in download-only mode: fetching models, the GPU stays idle until you Go live.")
+            return
         if choice is WorkerStartChoice.START_AND_REMEMBER:
             with contextlib.suppress(Exception):
                 self._app_state_store.set_auto_start_worker(True)
@@ -393,6 +413,18 @@ class HordeWorkerTUI(App[None]):
         """Drain worker state, restart on crash, derive health, and refresh the data views."""
         self._supervisor.tick()
         self._benchmark_supervisor.tick()
+        # Flush a deferred download-only hold (and any picker selection) once the freshly-started worker's
+        # pipe is up. The hold goes first so inference never starts; the selection follows once it is sent.
+        if self._supervisor.is_alive():
+            if self._pending_downloads_only_hold and self._supervisor.request_downloads_only_hold():
+                self._pending_downloads_only_hold = False
+            if self._pending_download_models is not None and not self._pending_downloads_only_hold:
+                selection = self._pending_download_models
+                if self._supervisor.request_download_models(
+                    selection.model_names,
+                    include_aux=selection.include_aux,
+                ):
+                    self._pending_download_models = None
         self._frame += 1
         snapshot = self._supervisor.latest_snapshot
         now = time.time()
@@ -508,6 +540,87 @@ class HordeWorkerTUI(App[None]):
             self.notify("Download rate limit cleared (unlimited).")
         else:
             self.notify(f"Download rate limited to {message.kbps} KB/s.")
+
+    def on_downloads_view_downloads_only_hold_requested(
+        self,
+        _message: DownloadsView.DownloadsOnlyHoldRequested,
+    ) -> None:
+        """Pre-fetch models without committing the GPU: start the worker (if needed), then hold it.
+
+        Starting the worker brings up the download process (which fetches the configured models); the
+        hold keeps inference and job-popping deferred until the operator presses Go live.
+        """
+        with contextlib.suppress(NoMatches):
+            self.query_one("#main-tabs", TabbedContent).active = "tab-downloads"
+        if not self._supervisor.is_alive():
+            # Start the worker, then send the hold once its control pipe is up (see _tick); sending now
+            # would race the child's connection. A cold install has no models present, so inference will
+            # not start in the meantime.
+            self._supervisor.start()
+            self._pending_downloads_only_hold = True
+            self.notify("Starting the worker in download-only mode: fetching models, the GPU stays idle.")
+            return
+        if self._supervisor.request_downloads_only_hold():
+            self.notify("Download-only mode: fetching models; the worker will not serve jobs until you Go live.")
+        else:
+            self.notify("Could not enter download-only mode (worker not reachable).", severity="warning")
+
+    def on_downloads_view_go_live_requested(self, _message: DownloadsView.GoLiveRequested) -> None:
+        """Leave download-only mode so the worker starts serving jobs."""
+        sent = self._supervisor.request_go_live()
+        self.notify(
+            "Going live: the worker will start serving jobs as models finish downloading."
+            if sent
+            else "Worker not running; Go live not sent.",
+            severity="information" if sent else "warning",
+        )
+
+    def on_downloads_view_download_picker_requested(
+        self,
+        _message: DownloadsView.DownloadPickerRequested,
+    ) -> None:
+        """Open the picker (defaulted to the config's missing models), then download the chosen set."""
+        rows = self._download_picker_rows()
+        self.push_screen(DownloadPickerModal(rows), self._on_download_selection)
+
+    def _download_picker_rows(self) -> list[DownloadPickerRow]:
+        """Build the picker rows from the Config tab's resolved model set (empty when not resolved yet)."""
+        try:
+            manager = self.query_one(ModelManagerView)
+        except NoMatches:
+            return []
+        return [
+            DownloadPickerRow(
+                name=model.name,
+                baseline=model.baseline,
+                size_bytes=model.size_bytes,
+                on_disk=model.on_disk,
+            )
+            for model in manager.configured_included_models()
+        ]
+
+    def _on_download_selection(self, selection: DownloadSelection | None) -> None:
+        """Turn a confirmed picker selection into a download request (entering the hold first when needed)."""
+        if selection is None:
+            return
+        with contextlib.suppress(NoMatches):
+            self.query_one("#main-tabs", TabbedContent).active = "tab-downloads"
+        if not self._supervisor.is_alive():
+            # Start the worker, then send the hold + the selection once its pipe is up (see _tick); a cold
+            # install has nothing present, so inference will not start in the meantime.
+            self._supervisor.start()
+            self._pending_downloads_only_hold = True
+            self._pending_download_models = selection
+            self.notify("Starting the worker to download the selected models (the GPU stays idle).")
+            return
+        self._supervisor.request_downloads_only_hold()
+        sent = self._supervisor.request_download_models(selection.model_names, include_aux=selection.include_aux)
+        if sent:
+            count = len(selection.model_names)
+            aux = " plus auxiliary models" if selection.include_aux else ""
+            self.notify(f"Downloading {count} selected model(s){aux}; the worker stays in download-only hold.")
+        else:
+            self.notify("Could not request the download (worker not reachable).", severity="warning")
 
     def _update_status_bar(self, report: HealthReport, snapshot: WorkerStateSnapshot | None) -> None:
         """Render the top status bar, led by the worker's current lifecycle phase."""

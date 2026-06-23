@@ -127,19 +127,35 @@ def _make_download_process(
         download_bandwidth_semaphore=ctx.Semaphore(1),
         process_launch_identifier=1,
     )
-    # Keep the tick loop focused on image models: the required safety models and the optional aux pass
-    # are unrelated networked downloads we are not exercising here.
+    # Keep the work focused on image models: the required safety models and the optional aux pass are
+    # unrelated networked downloads we are not exercising here.
     process._safety_present = True
     process._safety_ensured = True
-    process._aux_done = True
+    process._aux_enqueued = True
     process._refresh_present()
     return process, parent_conn
 
 
 def _drain_to_idle(process: HordeDownloadProcess, *, max_ticks: int = 50) -> None:
-    """Tick the process until it has no more work (mirrors the real main loop without signal handlers)."""
+    """Build and run scheduled work synchronously until idle (executor threads, inline, no real loop).
+
+    The production process runs the executor pool on threads; here a single test thread plays both the
+    orchestrator (``_orchestrate`` stages tasks into the scheduler) and an executor (drain the scheduler,
+    running each admissible task to completion), so the real download path is exercised deterministically.
+    """
     for _ in range(max_ticks):
-        if not process._tick():
+        did = process._orchestrate()
+        ran = False
+        if not process._paused:
+            task = process._scheduler.acquire(timeout=0.0)
+            while task is not None:
+                ran = True
+                try:
+                    process._run_task(task)
+                finally:
+                    process._scheduler.release(task)
+                task = process._scheduler.acquire(timeout=0.0)
+        if not did and not ran and not process._scheduler.has_work() and process._running_count == 0:
             return
     raise AssertionError("download process did not reach idle within the tick budget")
 
@@ -185,8 +201,8 @@ def test_process_downloads_missing_and_skips_present(
     process._handle_control_message(
         _control_message(model_names=[_MODEL_NAME, _OTHER_NAME]),
     )
-    # Only the missing model is queued; the present one is deduped out.
-    assert process._pending == [_MODEL_NAME]
+    # Only the missing model is staged; the present one is deduped out.
+    assert process._pending_image_models == [_MODEL_NAME]
 
     _drain_to_idle(process)
 
@@ -211,11 +227,11 @@ def test_pause_holds_the_queue_then_resume_downloads(
     process._handle_control_message(_control_message(model_names=[_MODEL_NAME], set_paused=True))
     assert process._paused is True
 
-    # While paused, ticking does no work and nothing is fetched.
+    # While paused, orchestrating stages nothing into the scheduler and nothing is fetched.
     for _ in range(5):
-        assert process._tick() is False
+        assert process._orchestrate() is False
     assert model_server.hits.total() == 0
-    assert process._pending == [_MODEL_NAME]
+    assert process._pending_image_models == [_MODEL_NAME]
 
     process._handle_control_message(_control_message(set_paused=False))
     assert process._paused is False
@@ -249,6 +265,8 @@ class _DownloadsHost(App[None]):
         self.view = DownloadsView()
         self.pause_requests: list[DownloadsView.PauseToggleRequested] = []
         self.rate_requests: list[DownloadsView.RateLimitRequested] = []
+        self.hold_requests: list[DownloadsView.DownloadsOnlyHoldRequested] = []
+        self.go_live_requests: list[DownloadsView.GoLiveRequested] = []
 
     def compose(self) -> ComposeResult:
         yield self.view
@@ -258,6 +276,15 @@ class _DownloadsHost(App[None]):
 
     def on_downloads_view_rate_limit_requested(self, message: DownloadsView.RateLimitRequested) -> None:
         self.rate_requests.append(message)
+
+    def on_downloads_view_downloads_only_hold_requested(
+        self,
+        message: DownloadsView.DownloadsOnlyHoldRequested,
+    ) -> None:
+        self.hold_requests.append(message)
+
+    def on_downloads_view_go_live_requested(self, message: DownloadsView.GoLiveRequested) -> None:
+        self.go_live_requests.append(message)
 
 
 def _downloads_host() -> _DownloadsHost:
@@ -314,6 +341,22 @@ async def test_downloads_view_buttons_emit_control_messages() -> None:
 
 
 @pytest.mark.e2e
+async def test_downloads_view_hold_and_go_live_buttons_emit_messages() -> None:
+    """The download-only and go-live controls post the messages the app turns into supervisor commands."""
+    app = _downloads_host()
+    # A wide terminal so all five controls in the row are on-screen and clickable.
+    async with app.run_test(size=(180, 40)) as pilot:
+        await pilot.pause()
+        await pilot.click("#downloads-only-hold")
+        await pilot.pause()
+        assert len(app.hold_requests) == 1
+
+        await pilot.click("#downloads-go-live")
+        await pilot.pause()
+        assert len(app.go_live_requests) == 1
+
+
+@pytest.mark.e2e
 async def test_ui_pause_press_holds_a_real_download_then_resume_completes_it(
     model_server: FakeModelServer,
     tmp_path: Path,
@@ -337,7 +380,7 @@ async def test_ui_pause_press_holds_a_real_download_then_resume_completes_it(
     assert process._paused is True
 
     for _ in range(5):
-        assert process._tick() is False
+        assert process._orchestrate() is False
     assert model_server.hits.total() == 0
     assert is_present(records[_MODEL_NAME], tmp_path) is False
 

@@ -217,3 +217,25 @@ def test_summary_flags_paused_download() -> None:
     activity = summarize_download_activity(_snapshot(downloads=downloads, plan=_plan(0, 1)))
     assert activity is not None
     assert activity.paused is True
+
+
+def test_render_current_lists_each_concurrent_download() -> None:
+    """The 'Downloading now' panel renders every active download and counts the distinct hosts."""
+    downloads = DownloadStatusSnapshot(
+        phase=DownloadPhase.DOWNLOADING,
+        active=[
+            CurrentDownloadStatus(model_name="Flux", feature="image model", target_dir="/m", host="huggingface.co"),
+            CurrentDownloadStatus(model_name="canny", feature="ControlNet", target_dir="/m", host="civitai.com"),
+        ],
+    )
+    text = _render(DownloadsView()._render_current(downloads))
+    assert "Flux" in text
+    assert "canny" in text
+    assert "2 across 2 hosts" in text
+
+
+def test_render_current_falls_back_to_single_current() -> None:
+    """An older snapshot carrying only ``current`` (no ``active`` list) still renders that one download."""
+    downloads = DownloadStatusSnapshot(phase=DownloadPhase.DOWNLOADING, current=_current("Deliberate"))
+    text = _render(DownloadsView()._render_current(downloads))
+    assert "Deliberate" in text

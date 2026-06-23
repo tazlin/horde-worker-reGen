@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 6
+SUPERVISOR_PROTOCOL_VERSION = 7
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -42,6 +42,8 @@ v5 added the resolved model ``baseline`` to ``JobQueueEntry`` and ``RecentJobRec
 recent-jobs tables can show a model's baseline alongside its name.
 v6 added the snapshot's ``system_memory`` field (:class:`SystemMemorySnapshot`): total/available RAM and
 the worker's per-role RSS share.
+v7 added ``DownloadStatusSnapshot.active`` (the full set of concurrent in-flight downloads) for
+host-parallel downloading; ``current`` is retained as the primary entry for single-download consumers.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -334,6 +336,8 @@ class CurrentDownloadStatus(BaseModel):
     model_name: str
     feature: str
     target_dir: str
+    host: str | None = None
+    """The source hostname this is downloading from (e.g. ``civitai.com``); None when not tracked."""
     downloaded_bytes: int = 0
     total_bytes: int = 0
     speed_bps: float | None = None
@@ -360,6 +364,11 @@ class DownloadStatusSnapshot(BaseModel):
 
     phase: DownloadPhase = DownloadPhase.IDLE
     current: CurrentDownloadStatus | None = None
+    """The primary in-flight download (``active[0]`` when any), kept for back-compat with single-download
+    consumers; prefer :attr:`active` for the full set when downloads run in parallel."""
+    active: list[CurrentDownloadStatus] = Field(default_factory=list)
+    """Every download in flight right now (one per executor thread); empty when idle. Parallel downloads
+    target distinct hosts by default, so this typically lists one entry per active host."""
     pending: list[DownloadItem] = Field(default_factory=list)
     failures: list[DownloadFailure] = Field(default_factory=list)
     present_model_names: list[str] = Field(default_factory=list)
@@ -619,6 +628,16 @@ class SupervisorCommand(enum.Enum):
     """Resume held background model downloads."""
     SET_DOWNLOAD_RATE_LIMIT = enum.auto()
     """Set the background-download bandwidth cap in KB/s (0 or None clears the cap)."""
+    DOWNLOADS_ONLY_HOLD = enum.auto()
+    """Hold the worker in a download-only posture: keep the download process (and reference refresh)
+    running but do not start inference/safety or pop jobs. Lets the operator pre-fetch models without
+    committing the GPU. Lifted by :attr:`GO_LIVE`."""
+    GO_LIVE = enum.auto()
+    """Leave the download-only hold and bring the worker fully up (inference/safety start once a model is
+    present, popping resumes). In-flight downloads continue; the present-set gate keeps serving safe."""
+    DOWNLOAD_MODELS = enum.auto()
+    """Fetch a chosen set of models on demand: the selected image models (and optionally the aux pass),
+    enqueued into the background download process without changing config. Drives the TUI download picker."""
     SET_SERVER_MAINTENANCE = enum.auto()
     """Set the worker's *server-side* maintenance flag on the horde (``server_maintenance_enabled``).
 
@@ -644,6 +663,10 @@ class SupervisorControlMessage(BaseModel):
     """The new download bandwidth cap in KB/s, for :attr:`SupervisorCommand.SET_DOWNLOAD_RATE_LIMIT`."""
     server_maintenance_enabled: bool | None = None
     """The desired server-side maintenance state, for :attr:`SupervisorCommand.SET_SERVER_MAINTENANCE`."""
+    download_model_names: list[str] = Field(default_factory=list)
+    """The image models to fetch on demand, for :attr:`SupervisorCommand.DOWNLOAD_MODELS`."""
+    download_include_aux: bool = False
+    """Whether a :attr:`SupervisorCommand.DOWNLOAD_MODELS` request should also run the aux/default pass."""
 
 
 class SupervisorChannel:

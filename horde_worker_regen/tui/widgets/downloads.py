@@ -22,12 +22,18 @@ from textual.widgets import Button, Input, Static
 
 from horde_worker_regen.app_state import OverviewViewMode
 from horde_worker_regen.process_management.supervisor_channel import (
+    CurrentDownloadStatus,
     DownloadPhase,
     DownloadPlanSummary,
     DownloadStatusSnapshot,
     WorkerStateSnapshot,
 )
 from horde_worker_regen.tui.formatters import human_bytes, human_duration, shorten
+
+
+def _host_label(item: CurrentDownloadStatus) -> str:
+    """The source host for one download, for grouping/counting; a placeholder when it is not tracked."""
+    return item.host or "?"
 
 _PHASE_STYLE: dict[DownloadPhase, str] = {
     DownloadPhase.INITIALIZING: "yellow",
@@ -135,6 +141,15 @@ class DownloadsView(VerticalScroll):
             super().__init__()
             self.kbps = kbps
 
+    class DownloadsOnlyHoldRequested(Message):
+        """Posted when the user asks to pre-fetch models without committing the GPU (download-only hold)."""
+
+    class GoLiveRequested(Message):
+        """Posted when the user asks to leave download-only mode and start serving jobs."""
+
+    class DownloadPickerRequested(Message):
+        """Posted when the user wants to choose which models to download (opens the picker modal)."""
+
     def __init__(self) -> None:
         """Track the last-seen paused state so the control row labels itself correctly."""
         super().__init__()
@@ -146,6 +161,9 @@ class DownloadsView(VerticalScroll):
             yield Button("Pause downloads", id="downloads-pause")
             yield Input(placeholder="rate limit KB/s (0 = off)", id="downloads-rate", type="integer")
             yield Button("Apply limit", id="downloads-rate-apply")
+            yield Button("Download only", id="downloads-only-hold")
+            yield Button("Choose models…", id="downloads-pick")
+            yield Button("Go live", id="downloads-go-live")
         yield Static(id="downloads-banner")
         yield Static(id="downloads-plan")
         yield Static(id="downloads-current")
@@ -188,6 +206,12 @@ class DownloadsView(VerticalScroll):
             self.post_message(self.PauseToggleRequested(currently_paused=self._paused))
         elif event.button.id == "downloads-rate-apply":
             self._post_rate_limit()
+        elif event.button.id == "downloads-only-hold":
+            self.post_message(self.DownloadsOnlyHoldRequested())
+        elif event.button.id == "downloads-pick":
+            self.post_message(self.DownloadPickerRequested())
+        elif event.button.id == "downloads-go-live":
+            self.post_message(self.GoLiveRequested())
         event.stop()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -342,12 +366,34 @@ class DownloadsView(VerticalScroll):
         return Panel(line, title="Disk plan", title_align="left", border_style=border, padding=(0, 1))
 
     def _render_current(self, downloads: DownloadStatusSnapshot | None) -> Panel:
-        """Render the in-progress download with its feature, target, progress bar, speed, and ETA."""
-        if downloads is None or downloads.current is None:
+        """Render the in-progress downloads (one block per concurrent download) with bars, speed, and ETA.
+
+        Several downloads can run at once (one per source host by default), so every entry in ``active`` is
+        rendered. ``current`` is used as a single-entry fallback for older single-download snapshots.
+        """
+        active = list(downloads.active) if downloads is not None else []
+        if not active and downloads is not None and downloads.current is not None:
+            active = [downloads.current]
+        if not active:
             body: RenderableType = Text("Nothing downloading right now.", style="grey50")
             return Panel(body, title="Downloading now", title_align="left", border_style="grey37", padding=(0, 1))
 
-        current = downloads.current
+        rate_limit_kbps = downloads.rate_limit_kbps if downloads is not None else None
+        renderables: list[RenderableType] = []
+        for index, item in enumerate(active):
+            if index:
+                renderables.append(Text(""))
+            renderables.extend(self._render_one_download(item, rate_limit_kbps))
+        hosts = len({_host_label(item) for item in active})
+        title = "Downloading now" if len(active) == 1 else f"Downloading now ({len(active)} across {hosts} hosts)"
+        return Panel(Group(*renderables), title=title, title_align="left", border_style="green", padding=(0, 1))
+
+    def _render_one_download(
+        self,
+        current: CurrentDownloadStatus,
+        rate_limit_kbps: int | None,
+    ) -> list[RenderableType]:
+        """Render one download's header, target, and progress line (shared by the concurrent list)."""
         header = Text.assemble(
             (shorten(current.model_name, 40), "bold"),
             ("   ", ""),
@@ -371,11 +417,7 @@ class DownloadsView(VerticalScroll):
             (eta, "grey70"),
         )
         renderables: list[RenderableType] = [header, where, progress]
-        if (
-            downloads.rate_limit_kbps
-            and current.speed_bps is not None
-            and current.speed_bps > downloads.rate_limit_kbps * 1024
-        ):
+        if rate_limit_kbps and current.speed_bps is not None and current.speed_bps > rate_limit_kbps * 1024:
             renderables.append(
                 Text(
                     "Speed shown above the set limit: the rolling average takes a moment to settle "
@@ -383,13 +425,7 @@ class DownloadsView(VerticalScroll):
                     style="grey50 italic",
                 )
             )
-        return Panel(
-            Group(*renderables),
-            title="Downloading now",
-            title_align="left",
-            border_style="green",
-            padding=(0, 1),
-        )
+        return renderables
 
     @staticmethod
     def _progress_bar(percent: float | None) -> str:

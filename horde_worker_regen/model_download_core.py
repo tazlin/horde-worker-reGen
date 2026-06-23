@@ -21,6 +21,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -31,9 +32,34 @@ __all__ = [
     "DownloadControls",
     "DownloadOutcome",
     "ModelProgress",
+    "UNKNOWN_DOWNLOAD_HOST",
+    "download_host_for_url",
     "download_one_model",
     "ensure_models_present",
 ]
+
+UNKNOWN_DOWNLOAD_HOST = "unknown"
+"""Host bucket for downloads whose source URL has no parseable hostname.
+
+Grouped under one conservative bucket so they serialize like a single host by default, rather than being
+treated as many distinct hosts (which would let an unbounded number run in parallel)."""
+
+
+def download_host_for_url(url: str | None) -> str:
+    """Return the lowercased hostname of *url* for per-host download scheduling.
+
+    The hostname (not the full URL) is the unit the scheduler parallelizes against: two files from the
+    same host should be allowed to serialize (don't hammer one server) while different hosts run at once.
+    A missing or unparseable host collapses to :data:`UNKNOWN_DOWNLOAD_HOST` so such downloads are paced
+    conservatively as one bucket rather than spuriously fanned out.
+    """
+    if not url:
+        return UNKNOWN_DOWNLOAD_HOST
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return UNKNOWN_DOWNLOAD_HOST
+    return host.lower() if host else UNKNOWN_DOWNLOAD_HOST
 
 
 class DownloadAborted(Exception):

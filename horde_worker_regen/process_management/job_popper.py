@@ -417,6 +417,11 @@ class JobPopper:
             self._state.last_pop_no_jobs_available = False
             return
 
+        if self._state.downloads_only_hold:
+            # Download-only posture: pre-fetch models without committing the GPU; pop nothing until GO_LIVE.
+            self._state.last_pop_no_jobs_available = False
+            return
+
         cur_time = time.time()
         bridge_data = self._runtime_config.bridge_data
 

@@ -779,6 +779,13 @@ class FakeDownloadProcess(HordeProcess):
             self._paused = message.set_paused
         if message.set_rate_limit_kbps is not None:
             self._rate_limit_kbps = message.set_rate_limit_kbps if message.set_rate_limit_kbps > 0 else None
+        # Mirror the real process: an authoritative configured set prunes queued downloads and drops an
+        # in-flight one the config no longer wants, so a model removed from config stops downloading.
+        if message.desired_image_models is not None:
+            desired = set(message.desired_image_models)
+            self._pending = [name for name in self._pending if name in desired]
+            if self._currently_downloading is not None and self._currently_downloading not in desired:
+                self._currently_downloading = None
         for model_name in message.model_names:
             if model_name in self._present or model_name in self._pending:
                 continue
@@ -825,6 +832,8 @@ def start_fake_download_process(
     directml: int | None = None,
     rate_limit_kbps: int | None = None,
     paused: bool = False,
+    max_parallel_downloads: int = 4,
+    per_host_concurrency: int = 1,
     scripted_present: list[str] | None = None,
     download_delay_seconds: float = 0.0,
     fail_models: list[str] | None = None,
@@ -834,9 +843,10 @@ def start_fake_download_process(
 
     Signature-compatible with ``worker_entry_points.start_download_process``; the worker-config
     arguments are accepted and ignored, except ``rate_limit_kbps``/``paused`` which the fake honors so
-    the pause/throttle controls can be exercised. ``fault_profile`` scripts crash-on-start and slow
-    downloads. Inject the scripting arguments with ``functools.partial`` (partials of module-level
-    functions stay picklable under spawn).
+    the pause/throttle controls can be exercised. ``max_parallel_downloads``/``per_host_concurrency`` are
+    accepted for signature parity and ignored (the fake downloads serially). ``fault_profile`` scripts
+    crash-on-start and slow downloads. Inject the scripting arguments with ``functools.partial`` (partials
+    of module-level functions stay picklable under spawn).
     """
     logger.remove()
     maybe_wait_for_process_debugger(process_id, "fake download")

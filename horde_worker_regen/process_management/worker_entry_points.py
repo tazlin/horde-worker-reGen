@@ -421,6 +421,8 @@ def start_download_process(
     directml: int | None = None,
     rate_limit_kbps: int | None = None,
     paused: bool = False,
+    max_parallel_downloads: int = 4,
+    per_host_concurrency: int = 1,
 ) -> None:
     """Start the background model-download process.
 
@@ -441,6 +443,8 @@ def start_download_process(
         directml (int | None): The DirectML device index, if any. Defaults to None.
         rate_limit_kbps (int | None): Initial bandwidth cap in KB/s (None/0 = unlimited). Defaults to None.
         paused (bool): Whether downloads start paused. Defaults to False.
+        max_parallel_downloads (int): Global concurrent-download ceiling across all hosts. Defaults to 4.
+        per_host_concurrency (int): Concurrent downloads allowed per source host. Defaults to 1.
     """
     enable_child_faulthandler(f"download_{process_id}")
     with contextlib.nullcontext():
@@ -488,6 +492,8 @@ def start_download_process(
             directml=directml,
             rate_limit_kbps=rate_limit_kbps,
             paused=paused,
+            max_parallel_downloads=max_parallel_downloads,
+            per_host_concurrency=per_host_concurrency,
         )
 
         worker_process.main_loop()

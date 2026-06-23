@@ -26,6 +26,8 @@ class WorkerStartChoice(enum.StrEnum):
     """Start the worker for this session only."""
     START_AND_REMEMBER = "start_and_remember"
     """Start the worker now and auto-start it on every future launch."""
+    DOWNLOAD_ONLY = "download_only"
+    """Start only the download subsystem (download-only hold): fetch models without committing the GPU."""
     STAY_STOPPED = "stay_stopped"
     """Leave the worker stopped; the user can start it later (F3)."""
 
@@ -53,15 +55,17 @@ class WorkerStartModal(ModalScreen[WorkerStartChoice]):
     _BUTTON_CHOICES: dict[str, WorkerStartChoice] = {
         "worker-start-now": WorkerStartChoice.START_NOW,
         "worker-start-remember": WorkerStartChoice.START_AND_REMEMBER,
+        "worker-start-download-only": WorkerStartChoice.DOWNLOAD_ONLY,
         "worker-start-stay-stopped": WorkerStartChoice.STAY_STOPPED,
     }
 
     def compose(self) -> ComposeResult:
-        """Lay out the explanatory message and the three choice buttons."""
+        """Lay out the explanatory message and the choice buttons."""
         with Vertical(id="worker-start-dialog"):
             yield Static(self._message(), id="worker-start-message")
             yield Button("Start worker now", id="worker-start-now", variant="success")
             yield Button("Start & auto-start from now on", id="worker-start-remember", variant="primary")
+            yield Button("Download models only (no GPU)", id="worker-start-download-only", variant="default")
             yield Button("Stay stopped", id="worker-start-stay-stopped", variant="default")
 
     @staticmethod

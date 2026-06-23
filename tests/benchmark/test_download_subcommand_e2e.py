@@ -128,3 +128,31 @@ def test_build_download_command_carries_control_stdin_flag() -> None:
     options = BenchmarkOptions(tiers=["sd15"])
     assert "--control-stdin" not in options.build_download_command()
     assert "--control-stdin" in options.build_download_command(control_stdin=True)
+
+
+def test_download_path_skips_the_gpu_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The download subcommand must build its ladder without probing the GPU.
+
+    The out-of-process torch/CUDA probe is a cold, multi-minute startup that the download path never uses
+    (it discards the machine info), and on a cold .exe install it was the dominant cost behind the
+    "Could not work out the download plan: timed out after 240 seconds" preview failure.
+    """
+    captured: dict[str, object] = {}
+
+    def fake_prepare(args: object, tiers: object, *, probe_devices: bool = True) -> tuple[list, object, object]:
+        captured["probe_devices"] = probe_devices
+        return [], SimpleNamespace(total_vram_mb=None), SimpleNamespace()
+
+    monkeypatch.setattr(cli, "_prepare_ladder", fake_prepare)
+    args = SimpleNamespace(
+        tiers="sd15",
+        dry_run=True,
+        json_progress=True,
+        control_stdin=False,
+        process_mode="real",
+    )
+
+    rc = cli._run_download(args)  # type: ignore[arg-type]
+
+    assert rc == 0
+    assert captured["probe_devices"] is False

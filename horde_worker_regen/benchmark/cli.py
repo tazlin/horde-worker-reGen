@@ -193,11 +193,15 @@ def _parse_tiers(raw_tiers: str) -> list[BenchTier] | None:
 def _prepare_ladder(
     args: argparse.Namespace,
     tiers: list[BenchTier],
+    *,
+    probe_devices: bool = True,
 ) -> tuple[list[RampLevel], MachineInfo, LadderOptions]:
     """Apply the worker env, detect the machine, and build the ladder for the given selection.
 
     Shared by ``ramp`` and ``plan`` so the plan an operator previews is built from the exact same
-    ladder (and the same detected VRAM) the ramp would run.
+    ladder (and the same detected VRAM) the ramp would run. ``probe_devices`` controls the GPU
+    enumeration: callers that do not use the device info (the ``download`` path discards it) pass False
+    to skip the out-of-process torch/CUDA probe, which is otherwise a cold, multi-minute startup cost.
     """
     from horde_worker_regen.benchmark.controller import detect_machine_info
     from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
@@ -210,8 +214,9 @@ def _prepare_ladder(
     ensure_worker_env(args.process_mode, tiers)
 
     # Detect the machine once: the ladder uses the VRAM to size the post-processing sweep, and the
-    # controller reuses the same info instead of re-detecting.
-    machine = detect_machine_info()
+    # controller reuses the same info instead of re-detecting. Skipped (probe_devices=False) where the
+    # caller ignores the device info, since the probe runs a cold out-of-process torch import.
+    machine = detect_machine_info(probe_devices=probe_devices)
 
     options = LadderOptions(
         tiers=tiers,
@@ -441,8 +446,12 @@ def _run_download(args: argparse.Namespace) -> int:
     if tiers is None:
         return 2
 
-    logger.info("Resolving the models the selected tiers need (detecting hardware; no worker is started) ...")
-    ladder, _machine, _options = _prepare_ladder(args, tiers)
+    # The download path only needs the model set (it discards the machine info), so skip the GPU probe:
+    # its cold out-of-process torch import is pointless here and, on a cold .exe install, was the dominant
+    # cost behind the "Could not work out the download plan: timed out" preview failure. The probed VRAM
+    # only sizes the post-processing sweep's *resolution*, which does not change which models are fetched.
+    logger.info("Resolving the models the selected tiers need (no worker is started) ...")
+    ladder, _machine, _options = _prepare_ladder(args, tiers, probe_devices=False)
     model_names = sorted({name for level in ladder for name in level.scenario.models_referenced()})
     if not model_names:
         logger.warning("The selected tiers reference no image checkpoints; nothing to download.")
@@ -456,16 +465,24 @@ def _run_download(args: argparse.Namespace) -> int:
     # as an explicit plan row (ROM size) and fetch them too, so a controlnet level does not cold-load the
     # annotator mid-run (the cause of the spurious step-timeout recovery the benchmark used to mask).
     control_types = _ladder_control_types(ladder)
-    from horde_worker_regen.benchmark.requirements import controlnet_annotators_present, controlnet_installed
+    if args.dry_run:
+        # The dry-run plan preview must not import hordelib: a cold hordelib/torch import is what made the
+        # plan time out on .exe installs. Show that ControlNet levels also pull annotator checkpoints, but
+        # resolve their exact installed/on-disk state and size only when actually downloading (below).
+        cn_installed = None
+        annotators_present = None
+        annotator_row = DownloadModelRow(name="ControlNet annotators", on_disk=False) if control_types else None
+    else:
+        from horde_worker_regen.benchmark.requirements import controlnet_annotators_present, controlnet_installed
 
-    cn_installed = controlnet_installed() if control_types else None
-    # Presence is only meaningful with the extra installed (the annotators are never fetched otherwise).
-    annotators_present = controlnet_annotators_present() if control_types and cn_installed else None
-    annotator_row = (
-        _controlnet_annotator_row(control_types, on_disk=annotators_present is True)
-        if cn_installed is not False
-        else None
-    )
+        cn_installed = controlnet_installed() if control_types else None
+        # Presence is only meaningful with the extra installed (the annotators are never fetched otherwise).
+        annotators_present = controlnet_annotators_present() if control_types and cn_installed else None
+        annotator_row = (
+            _controlnet_annotator_row(control_types, on_disk=annotators_present is True)
+            if cn_installed is not False
+            else None
+        )
 
     def emit(event: DownloadEvent) -> None:
         if json_progress:

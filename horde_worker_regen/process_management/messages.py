@@ -388,6 +388,11 @@ class HordeDownloadControlMessage(HordeControlMessage):
     control_flag: HordeControlFlag = HordeControlFlag.DOWNLOAD_MODELS
     model_names: list[str] = Field(default_factory=list)
     """The horde image-model names to ensure are downloaded."""
+    desired_image_models: list[str] | None = None
+    """When set, the authoritative configured image-model set. The download process prunes any pending
+    download not in this set and aborts the in-flight download if it is an image model not in this set,
+    so a config edit that removes a model stops it downloading. ``None`` means no reconciliation (an
+    additive-only message), preserving callers that only add work or set pause/rate controls."""
     download_aux: bool = False
     """If True, also run the one-time auxiliary/default downloads (LoRa defaults, controlnet,
     post-processing, safety helpers) permitted by the worker config."""
@@ -395,6 +400,10 @@ class HordeDownloadControlMessage(HordeControlMessage):
     """If not None, pause (True) or resume (False) downloads; applied live, mid-download."""
     set_rate_limit_kbps: int | None = None
     """If not None, set the bandwidth cap in kB/s; 0 or negative clears the limit."""
+    set_max_parallel_downloads: int | None = None
+    """If not None, retune the global concurrent-download ceiling (across all hosts), applied live."""
+    set_per_host_concurrency: int | None = None
+    """If not None, retune how many concurrent downloads to a single host are allowed, applied live."""
 
 
 class HordePreloadInferenceModelMessage(HordeControlModelMessage):

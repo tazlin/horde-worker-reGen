@@ -459,6 +459,8 @@ class ProcessLifecycleManager:
                 "directml": self._directml,
                 "rate_limit_kbps": bridge_data.download_rate_limit_kbps,
                 "paused": bridge_data.downloads_paused,
+                "max_parallel_downloads": bridge_data.download_max_parallel_downloads,
+                "per_host_concurrency": bridge_data.download_per_host_concurrency,
             },
         )
         process.start()
@@ -476,26 +478,50 @@ class ProcessLifecycleManager:
         self.num_processes_launched += 1
         logger.info("Started background download process")
 
-    def request_downloads(self, model_names: list[str], *, download_aux: bool = False) -> None:
-        """Ask the download process to ensure the given image models are present on disk."""
+    def request_downloads(
+        self,
+        model_names: list[str],
+        *,
+        download_aux: bool = False,
+        desired_image_models: list[str] | None = None,
+    ) -> None:
+        """Ask the download process to ensure the given image models are present on disk.
+
+        ``desired_image_models``, when given, is the authoritative configured image-model set: the
+        download process prunes any queued/in-flight download not in it (so a config edit that removes a
+        model stops it downloading). A reconcile-only request (a removal with nothing new to fetch) is
+        still sent, hence this does not short-circuit when only ``desired_image_models`` is set.
+        """
         if self._download_process_info is None:
             logger.warning("Cannot request downloads: no download process is running")
             return
-        if not model_names and not download_aux:
+        if not model_names and not download_aux and desired_image_models is None:
             return
         self._download_process_info.safe_send_message(
-            HordeDownloadControlMessage(model_names=list(model_names), download_aux=download_aux),
+            HordeDownloadControlMessage(
+                model_names=list(model_names),
+                download_aux=download_aux,
+                desired_image_models=desired_image_models,
+            ),
         )
 
-    def set_download_controls(self, *, paused: bool | None = None, rate_limit_kbps: int | None = None) -> None:
-        """Forward live pause/bandwidth controls to the download process (no-op if none is running).
+    def set_download_controls(
+        self,
+        *,
+        paused: bool | None = None,
+        rate_limit_kbps: int | None = None,
+        max_parallel_downloads: int | None = None,
+        per_host_concurrency: int | None = None,
+    ) -> None:
+        """Forward live download controls (pause/bandwidth/parallelism) to the download process.
 
         Used by both the config-reload path and the supervisor pause/resume/rate commands. A ``None``
         argument leaves that control unchanged; ``rate_limit_kbps`` of 0 (or negative) clears the cap.
+        No-op if no download process is running, or if every argument is ``None``.
         """
         if self._download_process_info is None:
             return
-        if paused is None and rate_limit_kbps is None:
+        if all(arg is None for arg in (paused, rate_limit_kbps, max_parallel_downloads, per_host_concurrency)):
             return
         self._download_process_info.safe_send_message(
             HordeDownloadControlMessage(
@@ -503,6 +529,8 @@ class ProcessLifecycleManager:
                 download_aux=False,
                 set_paused=paused,
                 set_rate_limit_kbps=rate_limit_kbps,
+                set_max_parallel_downloads=max_parallel_downloads,
+                set_per_host_concurrency=per_host_concurrency,
             ),
         )
 
@@ -534,6 +562,17 @@ class ProcessLifecycleManager:
             logger.debug(f"Failed to stop download process: {e}")
         self._forget_owned(self._download_process_info)
         self._download_process_info = None
+
+    def restart_download_process(self) -> None:
+        """Stop and restart the download process so it picks up changed download config.
+
+        The aux gating (nsfw / allow_lora / allow_controlnet / allow_post_processing / purge) is baked
+        into the process at construction; ``start_download_process`` reads the current (reloaded) bridge
+        data, so a stop-then-start is how a config change to those flags takes effect without a worker
+        restart. Live controls (pause / rate / parallelism) do not need this; they are forwarded directly.
+        """
+        self.end_download_process()
+        self.start_download_process()
 
     def start_inference_processes(self) -> None:
         """Start all the inference processes configured to be used."""
@@ -1474,7 +1513,11 @@ class ProcessLifecycleManager:
         if self._state.last_pop_no_jobs_available:
             return any_replaced
 
-        all_processes_timed_out = all(
+        # ``all(...)`` over an empty map is vacuously True, which would falsely declare "all processes
+        # unresponsive" whenever no inference/safety process is running yet: during the startup
+        # download-and-scan window and, deliberately, throughout download-only mode. Require at least one
+        # process to exist before the all-timed-out verdict can hold.
+        all_processes_timed_out = bool(self._process_map) and all(
             ((now - process_info.last_received_timestamp) > bridge_data.process_timeout)
             for process_info in self._process_map.values()
         )

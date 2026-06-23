@@ -1416,28 +1416,140 @@ class HordeWorkerProcessManager:
         self._maybe_start_safety_processes()
         self._maybe_start_inference_processes()
 
-    def _request_downloads_for_configured_missing(self, *, run_aux_if_incomplete: bool) -> None:
-        """Background-download any configured image models not yet on disk (no-op if none are missing).
+    def _request_downloads_for_configured_missing(
+        self,
+        *,
+        run_aux_if_incomplete: bool,
+        previously_configured: set[str] | None = None,
+    ) -> None:
+        """Background-download any configured image models not yet on disk, and prune ones config dropped.
 
         Shared by the initial scan-complete trigger and the config-reload path, so a config change that
         adds a model fetches it without restarting the worker. The download process dedups against what it
         already has or is in-flight on, so re-sending the full missing set on every reload is safe. The
         auxiliary pass (LoRa/ControlNet/post-processing/safety) is one-shot in the download process, so
         ``run_aux_if_incomplete`` only matters for the very first request.
+
+        ``previously_configured`` is the image-model set before a reload; when a reload *removes* a model
+        we send the now-authoritative configured set so the download process stops any queued/in-flight
+        download of the dropped model. The configured set is sent only when there is work or a removal, so
+        an unchanged reload stays a no-op (it never sends a redundant reconcile).
         """
         if not self._enable_background_downloads:
             return
         present = self._model_availability.present or set()
         configured = set(self.bridge_data.image_models_to_load)
         missing = sorted(configured - present)
+        removed = (previously_configured or set()) - configured
         download_aux = run_aux_if_incomplete and len(missing) > 0
-        if not missing and not download_aux:
+        if not missing and not removed and not download_aux:
             return
-        logger.info(
-            f"Worker has {len(present)} of {len(configured)} configured models on disk; "
-            f"background-downloading {len(missing)} missing: {missing}",
+        if removed:
+            logger.info(f"Config removed {len(removed)} image model(s); stopping their downloads: {sorted(removed)}")
+        if missing:
+            logger.info(
+                f"Worker has {len(present)} of {len(configured)} configured models on disk; "
+                f"background-downloading {len(missing)} missing: {missing}",
+            )
+        self._process_lifecycle.request_downloads(
+            missing,
+            download_aux=download_aux,
+            desired_image_models=sorted(configured),
         )
-        self._process_lifecycle.request_downloads(missing, download_aux=download_aux)
+
+    def _download_process_flags(self) -> tuple[object, ...]:
+        """The bridge-data fields baked into the download process at construction (for change detection).
+
+        These gate *which* models the download process fetches (aux categories, nsfw filtering, LoRa
+        purging); unlike pause/rate/parallelism they are constructor arguments, so a change to any of them
+        only takes effect by restarting the process. Order is irrelevant; only equality is compared.
+        """
+        return (
+            self.bridge_data.nsfw,
+            self.bridge_data.allow_lora,
+            self.bridge_data.allow_controlnet,
+            self.bridge_data.allow_sdxl_controlnet,
+            self.bridge_data.allow_post_processing,
+            self.bridge_data.purge_loras_on_download,
+        )
+
+    def _reload_download_process_if_flags_changed(self, previous_flags: tuple[object, ...]) -> None:
+        """Restart the download process when a reload changed its construction-time download gating.
+
+        Live controls (pause/rate/parallelism) are forwarded without a restart; the aux/nsfw/purge flags
+        cannot be, so a change to them stops the current process and starts a fresh one with the new
+        config, then lets the next scan-complete re-trigger the configured downloads (including a fresh
+        aux pass). Inference and safety keep running throughout: only the (jobless) download process
+        cycles, and the present-set is held across the brief gap so popping is unaffected.
+        """
+        if not self._enable_background_downloads:
+            return
+        if self._download_process_flags() == previous_flags:
+            return
+        logger.info("Download-affecting config changed on reload; restarting the background download process.")
+        # A download-process restart failure must not abort the rest of the config reload (or wedge the
+        # worker): the worker keeps serving whatever is present, and the next reload can retry the restart.
+        try:
+            self._process_lifecycle.restart_download_process()
+            # The fresh process must be told the live controls (its constructor took the config defaults, but
+            # a prior live TUI override is intentionally re-asserted from config on every reload anyway).
+            self._process_lifecycle.set_download_controls(
+                paused=self.bridge_data.downloads_paused,
+                rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
+                max_parallel_downloads=self.bridge_data.download_max_parallel_downloads,
+                per_host_concurrency=self.bridge_data.download_per_host_concurrency,
+            )
+            # Let the restarted process's first authoritative scan re-request configured-missing models plus
+            # a fresh aux pass (one-shot guard reset), so newly-enabled aux categories actually download.
+            self._initial_download_requested = False
+        except Exception as e:  # noqa: BLE001 - a reload must never crash on a download-process restart
+            logger.error(f"Failed to restart the download process on reload (continuing): {type(e).__name__}: {e}")
+
+    def _enter_downloads_only_hold(self) -> None:
+        """Enter the download-only posture: keep fetching models but hold inference/safety/popping.
+
+        Lets the operator pre-fetch models without committing the GPU. The download process is ensured
+        running (it is the thing that does the work and the availability oracle); inference and safety
+        stay deferred via the hold gate, and the job popper stops popping. Idempotent.
+        """
+        if not self._enable_background_downloads:
+            logger.warning("Download-only hold requested but background downloads are disabled; ignoring.")
+            return
+        if self._state.downloads_only_hold:
+            return
+        self._state.downloads_only_hold = True
+        self._process_lifecycle.start_download_process()
+        logger.info("Entered download-only mode: pre-fetching models; inference and job popping are held.")
+
+    def _leave_downloads_only_hold(self) -> None:
+        """Leave the download-only posture and bring the worker fully up (GO_LIVE).
+
+        Clears the hold and re-checks the deferred starts immediately; inference/safety come up once a
+        model is present (the normal availability gate), and popping resumes. In-flight downloads are
+        untouched, and the present-set pop gate keeps the worker from advertising a still-downloading model.
+        """
+        if not self._state.downloads_only_hold:
+            return
+        self._state.downloads_only_hold = False
+        logger.info("Leaving download-only mode (GO_LIVE): starting inference/safety and resuming job popping.")
+        self._maybe_start_safety_processes()
+        self._maybe_start_inference_processes()
+
+    def _download_models_on_demand(self, model_names: list[str], *, include_aux: bool) -> None:
+        """Fetch an operator-chosen set of models now, without changing config (drives the TUI picker).
+
+        Additive only: the names are enqueued into the background download process alongside whatever the
+        config already requested (no authoritative-set reconcile, so this never prunes configured
+        downloads). ``include_aux`` also kicks the one-time aux/default pass.
+        """
+        if not self._enable_background_downloads:
+            logger.warning("On-demand download requested but background downloads are disabled; ignoring.")
+            return
+        if not model_names and not include_aux:
+            return
+        self._process_lifecycle.start_download_process()
+        logger.info(f"On-demand download of {len(model_names)} model(s) (aux={include_aux}): {sorted(model_names)}")
+        self._process_lifecycle.request_downloads(list(model_names), download_aux=include_aux)
 
     def _maybe_start_safety_processes(self) -> None:
         """Start safety processes once the required safety models are on disk (background-download mode).
@@ -1458,6 +1570,8 @@ class HordeWorkerProcessManager:
         ``safety_attempted`` rather than the download phase.
         """
         if self._safety_processes_started or not self._enable_background_downloads:
+            return
+        if self._state.downloads_only_hold:
             return
 
         availability = self._model_availability
@@ -1496,6 +1610,8 @@ class HordeWorkerProcessManager:
         presence is known, with a grace-period fallback so a silent download process cannot hang us.
         """
         if self._inference_processes_started or not self._enable_background_downloads:
+            return
+        if self._state.downloads_only_hold:
             return
 
         availability = self._model_availability
@@ -2242,6 +2358,12 @@ class HordeWorkerProcessManager:
                 limit_label = "unlimited" if rate == 0 else f"{rate} KB/s"
                 logger.info(f"Supervisor set download rate limit to {limit_label}.")
                 self._process_lifecycle.set_download_controls(rate_limit_kbps=rate)
+            case SupervisorCommand.DOWNLOADS_ONLY_HOLD:
+                self._enter_downloads_only_hold()
+            case SupervisorCommand.GO_LIVE:
+                self._leave_downloads_only_hold()
+            case SupervisorCommand.DOWNLOAD_MODELS:
+                self._download_models_on_demand(command.download_model_names, include_aux=command.download_include_aux)
             case SupervisorCommand.SET_SERVER_MAINTENANCE:
                 enabled = bool(command.server_maintenance_enabled)
                 logger.warning(
@@ -2741,6 +2863,12 @@ class HordeWorkerProcessManager:
     def _apply_reloaded_bridge_data(self, bridge_data: reGenBridgeData) -> None:
         """Swap in freshly-loaded bridge data and re-derive dependent state (must run on the event loop)."""
         previous_effective = self._runtime_config.effective_max_threads
+        # Captured before the swap so the download request below can detect models the reload dropped and
+        # tell the download process to stop fetching them.
+        previously_configured = set(self.bridge_data.image_models_to_load)
+        # The aux/download gating is baked into the download process at construction, so a change to it
+        # requires a restart; captured before the swap to compare against the reloaded config.
+        previous_download_flags = self._download_process_flags()
         # The setter calls RuntimeConfig.update, which re-derives the effective concurrency cap
         # (clamped to the session ceiling) from the reloaded max_threads.
         self.bridge_data = bridge_data
@@ -2766,10 +2894,19 @@ class HordeWorkerProcessManager:
         self._process_lifecycle.set_download_controls(
             paused=self.bridge_data.downloads_paused,
             rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
+            max_parallel_downloads=self.bridge_data.download_max_parallel_downloads,
+            per_host_concurrency=self.bridge_data.download_per_host_concurrency,
         )
-        # A config change can add image models that are not yet on disk; fetch them in the background so a
-        # newly-configured model becomes servable without a restart (the startup trigger is one-shot).
-        self._request_downloads_for_configured_missing(run_aux_if_incomplete=False)
+        # A config change can add image models that are not yet on disk (fetch them in the background so a
+        # newly-configured model becomes servable without a restart) or remove models (stop their queued/
+        # in-flight downloads); the startup trigger is one-shot, so the reload owns both directions.
+        self._request_downloads_for_configured_missing(
+            run_aux_if_incomplete=False,
+            previously_configured=previously_configured,
+        )
+        # A change to the download process's construction-time gating (aux flags, nsfw, purge) is applied
+        # by restarting it; live controls were already forwarded above.
+        self._reload_download_process_if_flags_changed(previous_download_flags)
 
     def get_bridge_data_from_disk(self) -> None:
         """Load the bridge data from disk (blocking).

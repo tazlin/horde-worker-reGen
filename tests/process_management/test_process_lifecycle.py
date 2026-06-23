@@ -90,6 +90,20 @@ def test_non_spawn_context_is_rejected_on_posix(monkeypatch: pytest.MonkeyPatch)
         _make_plm(ctx=fork_ctx)
 
 
+def test_empty_process_map_is_not_declared_all_unresponsive() -> None:
+    """With no inference/safety process running, the hung-detector must not fire (``all([])`` is True).
+
+    During the startup download-and-scan window, and throughout download-only mode, the process map is
+    legitimately empty. The all-timed-out verdict over an empty map is vacuously True, which previously
+    declared "all processes unresponsive" and tried to recover nothing.
+    """
+    plm = _make_plm(process_map=ProcessMap({}))
+
+    plm.replace_hung_processes()
+
+    assert plm._hung_processes_detected is False
+
+
 def test_broadcast_reload_model_database_targets_inference_and_download() -> None:
     """The reload broadcast reaches every inference process and the download process."""
     from horde_worker_regen.process_management.messages import HordeControlFlag, HordeControlMessage
