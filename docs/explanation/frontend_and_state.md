@@ -92,6 +92,37 @@ actions instead of an invisible process. The tray is best-effort and
 import-guarded (`pystray`/`Pillow`, Windows-only), so its absence never affects
 the worker.
 
+The coupling runs the other way too. The launcher tells the host to stop on its
+own clean exit, but the host can also exit *first*: the tray's *Stop worker &
+exit* ends the host directly, and a host can crash. A launcher blocked in
+`textual-serve`'s `serve()` cannot otherwise notice that, so it would keep serving
+a dead host as exactly the kind of invisible orphaned console this whole design
+fights. So the launcher holds a **liveness leash**: a background thread keeps a
+connection to the host's control socket and, the moment that socket drops (a clean
+close, an explicit `host_shutdown` farewell frame, or a reset), winds the launcher
+down. It first reaps the per-session TUI subprocesses `textual-serve` spawned so
+none of *them* orphan, then exits. The socket is the authoritative signal,
+immune to the pid-reuse hazard a pid-file leash would carry, and it works whether
+this launcher spawned the host or merely attached to a pre-existing one.
+
+Discoverability is not enough on its own: a worker the host spawns is a child
+process tree (the worker and its own inference/safety processes), and on Windows
+a child outlives its parent, so a host that *itself* dies the hard way would
+leave that tree resident on the GPU with nothing left to stop it. Two guards make
+the tree's lifetime track the host's. First, the supervisor binds the worker to a
+Windows **Job Object** created with kill-on-close (`tui/job_object.py`); because
+the host holds the only handle and a job member's children join the job
+automatically, the OS terminates the whole tree the instant the host process
+ends, however it ends. Second, the host records the worker pid it owns in a
+dedicated registry
+([`OwnedProcessRegistry`][horde_worker_regen.process_management.owned_process_registry.OwnedProcessRegistry],
+in `host_owned_pids.json`) and, on startup, reaps any tree a previous host
+orphaned before serving (`reap_orphans_from_previous_run(kill_tree=True)`). The
+job object is the immediate guarantee; the registry sweep is the backstop for
+when it could not apply (a job-assignment that lost the spawn race, or a host from
+an older build). Both verify process identity against pid reuse, and both are
+best-effort and Windows-centric, so neither can wedge startup.
+
 ## The first-run wizard
 
 On first launch, when `bridgeData.yaml` is unconfigured

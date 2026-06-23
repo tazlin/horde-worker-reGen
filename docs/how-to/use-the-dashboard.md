@@ -128,7 +128,8 @@ even after the browser and the launcher window are gone. Its menu offers:
 
 - **Open dashboard** -- reopen the browser dashboard attached to this worker (reusing a running web
   server if there is one).
-- **Stop worker & exit** -- drain in-flight jobs, then stop the worker and host cleanly.
+- **Stop worker & exit** -- drain in-flight jobs, then stop the worker and host cleanly. A still-running
+  launcher window notices the host going away and closes itself too, so nothing is left lingering.
 
 The line at the top of the menu shows whether the worker is currently running. The icon is the simplest
 way to find and stop an orphaned worker after a hard-closed launcher window; the `--stop` command above
