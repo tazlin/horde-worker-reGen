@@ -117,6 +117,7 @@ def _fake_process_info() -> SimpleNamespace:
     return SimpleNamespace(
         process_id=1,
         process_type=SimpleNamespace(name="INFERENCE"),
+        device_index=0,
         last_process_state=SimpleNamespace(name="WAITING_FOR_JOB"),
         is_process_alive=lambda: True,
         is_process_busy=lambda: False,

@@ -1144,6 +1144,24 @@ class InferenceScheduler:
             return False
         return (time.time() - self._heavy_head_admitted_at) < _HEAVY_HEAD_LOAD_GRACE_SECONDS
 
+    def card_residency(self, device_index: int | None) -> tuple[str | None, str]:
+        """Return ``(model, phase)`` for the whole-card residency held on ``device_index`` (per-card view).
+
+        ``model`` is None when this card holds no residency; otherwise ``phase`` is ``establishing`` while the
+        establish grace is still in effect, else ``holding`` -- the same phase split the worker-wide
+        :meth:`whole_card_residency_state` reports. The single-GPU worker-wide residency lives under the
+        ``None`` key, so a single-GPU caller reads it by passing ``device_index=None``. Reads without creating:
+        a card with no residency is left absent from the map.
+        """
+        state = self._whole_card_residencies.get(device_index)
+        if state is None or state.model is None:
+            return None, ""
+        establishing = (
+            state.established_at != 0.0
+            and (time.time() - state.established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
+        )
+        return state.model, ("establishing" if establishing else "holding")
+
     def whole_card_residency_state(self) -> WholeCardResidencyState:
         """Return a read-only view of the whole-card residency posture, for the status snapshot/TUI.
 

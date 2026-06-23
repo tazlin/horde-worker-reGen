@@ -348,6 +348,7 @@ def _build_checks(snapshot: WorkerStateSnapshot, snapshot_age: float | None) -> 
     residency_check = _residency_check(snapshot)
     if residency_check is not None:
         checks.append(residency_check)
+    checks.extend(_per_card_checks(snapshot))
     checks.append(_disk_check(snapshot))
     if snapshot.lora_pops_blocked_by_disk:
         checks.append(
@@ -404,6 +405,32 @@ def _residency_check(snapshot: WorkerStateSnapshot) -> HealthCheck | None:
             "Heavy models (e.g. Flux) may briefly get sole use of the GPU; idle processes pause by design",
         )
     return None
+
+
+def _per_card_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
+    """Per-card VRAM-pressure / unservable-model checks, only on a multi-GPU host (quiet on single-GPU).
+
+    A single-GPU host's VRAM and faults are already covered by the GPU and job-health checks, so this stays
+    silent there to avoid a redundant row. On a multi-GPU host a healthy fleet gets one reassuring summary,
+    while a pressured or quarantining card gets its own named WARN so the operator can see *which* card needs
+    attention rather than a blurred worker-wide figure.
+    """
+    cards = snapshot.per_card
+    if len(cards) <= 1:
+        return []
+    problems: list[HealthCheck] = []
+    for card in cards:
+        name = f"GPU {card.device_index}"
+        if card.is_vram_pressured:
+            free = "?" if card.free_vram_mb is None else f"{card.free_vram_mb / 1024:.1f}G"
+            problems.append(HealthCheck(name, HealthStatus.WARN, f"VRAM pressure: only {free} free"))
+        elif card.unservable_models:
+            problems.append(
+                HealthCheck(name, HealthStatus.WARN, f"{len(card.unservable_models)} model(s) locally unservable"),
+            )
+    if problems:
+        return problems
+    return [HealthCheck("GPUs", HealthStatus.OK, f"{len(cards)} cards healthy")]
 
 
 def _gpu_check(snapshot: WorkerStateSnapshot) -> HealthCheck:

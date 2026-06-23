@@ -59,6 +59,7 @@ from horde_worker_regen.tui.widgets.download_picker import (
     DownloadSelection,
 )
 from horde_worker_regen.tui.widgets.downloads import DownloadsView
+from horde_worker_regen.tui.widgets.gpus import GpusView
 from horde_worker_regen.tui.widgets.insights import InsightsView
 from horde_worker_regen.tui.widgets.live_view import LiveView
 from horde_worker_regen.tui.widgets.logs import LogsView
@@ -152,12 +153,13 @@ class HordeWorkerTUI(App[None]):
     TabbedContent {
         height: 1fr;
     }
-    OverviewView, LiveView, InsightsView, ConfigEditorView, LogsView, BenchmarkView, DownloadsView {
+    OverviewView, GpusView, LiveView, InsightsView, ConfigEditorView, LogsView, BenchmarkView, DownloadsView {
         height: 1fr;
         padding: 1 1;
     }
     /* On a cramped terminal, drop the horizontal padding so the tables get those columns back. */
     Screen.-narrow OverviewView,
+    Screen.-narrow GpusView,
     Screen.-narrow LiveView,
     Screen.-narrow InsightsView,
     Screen.-narrow ConfigEditorView,
@@ -221,6 +223,8 @@ class HordeWorkerTUI(App[None]):
         with TabbedContent(initial="tab-overview", id="main-tabs"):
             with TabPane("Overview", id="tab-overview"):
                 yield OverviewView()
+            with TabPane("GPUs", id="tab-gpus"):
+                yield GpusView()
             with TabPane("Live", id="tab-live"):
                 yield LiveView()
             with TabPane("Downloads", id="tab-downloads"):
@@ -444,6 +448,7 @@ class HordeWorkerTUI(App[None]):
                 frame=self._frame,
                 mode=self._view_mode,
             )
+            self.query_one(GpusView).update_view(snapshot, mode=self._view_mode)
             self.query_one(DownloadsView).update_view(snapshot, mode=self._view_mode)
             self._update_downloads_tab_label(snapshot)
             self.query_one(LogsView).set_view_mode(self._view_mode)

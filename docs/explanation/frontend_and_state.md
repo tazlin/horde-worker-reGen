@@ -35,9 +35,14 @@ defines the structured protocol over it:
   [`WorkerStateSnapshot`][horde_worker_regen.process_management.supervisor_channel.WorkerStateSnapshot]
   objects at a steady cadence (the same data the overview, per-process view, and
   Downloads tab render), including a `SystemMemorySnapshot` (machine total/available
-  RAM plus per-role worker RSS). The snapshot is versioned by
-  `SUPERVISOR_PROTOCOL_VERSION` (currently 6) so a frontend can detect a mismatch
-  with a worker built from different code.
+  RAM plus per-role worker RSS) and a `per_card` list of
+  [`CardSnapshot`][horde_worker_regen.process_management.supervisor_channel.CardSnapshot]
+  (one per driven GPU: VRAM headroom, inference contexts, whole-card residency, and
+  per-card fault/unservable-model health) that the GPUs tab and the Overview per-card
+  strip render. Each `ProcessSnapshot` also carries the `device_index` of the card its
+  slot is pinned to. A single-GPU host reports exactly one `CardSnapshot`. The snapshot
+  is versioned by `SUPERVISOR_PROTOCOL_VERSION` (currently 8) so a frontend can detect a
+  mismatch with a worker built from different code.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate

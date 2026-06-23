@@ -91,7 +91,10 @@ from horde_worker_regen.process_management.process_lifecycle import ProcessLifec
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.process_temperature import classify_process_temperature
 from horde_worker_regen.process_management.recovery_supervisor import RecoveryAction, RecoverySupervisor
-from horde_worker_regen.process_management.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.resource_budget import (
+    CommittedReserveLedger,
+    is_model_locally_unservable_for,
+)
 from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot, WorkerRunMetrics
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.safety_orchestrator import SafetyOrchestrator
@@ -99,6 +102,7 @@ from horde_worker_regen.process_management.shutdown_manager import ShutdownManag
 from horde_worker_regen.process_management.supervisor_channel import (
     PENDING_JOBS_IN_SNAPSHOT,
     RECENT_JOBS_IN_SNAPSHOT,
+    CardSnapshot,
     DownloadPlanSummary,
     JobFeatureSummary,
     JobQueueEntry,
@@ -2863,6 +2867,73 @@ class HordeWorkerProcessManager:
             max_resident_processes=state.max_resident_processes,
         )
 
+    def _build_card_snapshots(self) -> list[CardSnapshot]:
+        """Project per-card multi-GPU state onto wire models, one per driven card.
+
+        A single-GPU host has exactly one card runtime, so it reports one ``CardSnapshot`` (the collapsed card
+        the dashboard renders). Per-card residency, fault streaks and the jobs/hr source are keyed by real
+        device index only when the worker drives more than one card; on a single-GPU host the worker-wide
+        ``None`` key is used, matching how dispatch and streak bookkeeping key those facts. The VRAM/context
+        figures filter the process map by the slot's pinned ``device_index`` (a real attribute, 0 on a
+        single-GPU host), so the single-card figure equals the worker-wide one.
+        """
+        multi_gpu = len(self._card_runtimes) > 1
+        cards: list[CardSnapshot] = []
+        for device_index, card_runtime in sorted(self._card_runtimes.items()):
+            fault_key = device_index if multi_gpu else None
+            device_info = self._device_map.root.get(device_index)
+
+            busy_contexts = sum(
+                1
+                for info in self._process_map.values()
+                if info.process_type == HordeProcessType.INFERENCE
+                and info.device_index == device_index
+                and info.is_process_alive()
+                and info.last_process_state
+                in (HordeProcessState.INFERENCE_STARTING, HordeProcessState.INFERENCE_POST_PROCESSING)
+            )
+
+            residency_model, residency_phase = self._inference_scheduler.card_residency(fault_key)
+
+            unservable_models: list[str] = []
+            worst_fault_streak = 0
+            for model in card_runtime.config.image_models_to_load:
+                worst_fault_streak = max(
+                    worst_fault_streak,
+                    self._job_tracker.get_model_overbudget_fault_count(model, device_index=fault_key),
+                )
+                if is_model_locally_unservable_for(
+                    card_runtime.config,
+                    self._job_tracker,
+                    model,
+                    device_index=fault_key,
+                ):
+                    unservable_models.append(model)
+
+            total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+            if total_vram_mb is None:
+                total_vram_mb = card_runtime.total_vram_mb
+
+            cards.append(
+                CardSnapshot(
+                    device_index=device_index,
+                    device_name=device_info.device_name if device_info is not None else None,
+                    kind=card_runtime.kind,
+                    total_vram_mb=total_vram_mb,
+                    free_vram_mb=self._process_map.get_free_vram_mb(device_index=device_index),
+                    loaded_contexts=self._process_map.num_loaded_inference_processes(device_index=device_index),
+                    busy_contexts=busy_contexts,
+                    target_process_count=card_runtime.target_process_count,
+                    max_concurrent_inference=card_runtime.max_concurrent_inference,
+                    jobs_completed=self._job_tracker.get_card_inference_results(fault_key),
+                    residency_model=residency_model,
+                    residency_phase=residency_phase,
+                    unservable_models=unservable_models,
+                    worst_fault_streak=worst_fault_streak,
+                ),
+            )
+        return cards
+
     def _build_worker_state_snapshot(self) -> WorkerStateSnapshot:
         """Assemble current worker state for the supervisor pipe (mirrors what StatusReporter prints)."""
         import horde_worker_regen
@@ -2988,6 +3059,7 @@ class HordeWorkerProcessManager:
             alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
             pending_jobs=self._build_pending_jobs_list(),
             whole_card_residency=self._whole_card_residency_status(),
+            per_card=self._build_card_snapshots(),
             system_memory=SystemMemorySnapshot.from_summary(self._sample_system_memory()),
         )
 

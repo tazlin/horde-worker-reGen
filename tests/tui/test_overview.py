@@ -169,7 +169,8 @@ def test_process_table_shows_resolution_and_batch_by_default() -> None:
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
         processes=[_busy_process()],
     )
-    text = _render(OverviewView()._render_process_table(snapshot))
+    # Rendered wide enough to carry the WIDE Size column alongside the per-process GPU column.
+    text = _render(OverviewView()._render_process_table(snapshot), width=200)
     assert "832×1216 ×2" in text
     # The lean view does not include the heartbeat-type column.
     assert "HB type" not in text

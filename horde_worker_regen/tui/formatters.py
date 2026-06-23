@@ -189,6 +189,22 @@ def shorten(text: str | None, length: int = 28) -> str:
     return text if len(text) <= length else text[: length - 1] + "…"
 
 
+def gpu_label(device_index: int, device_name: str | None, kind: str = "cuda") -> str:
+    """A compact per-card label: the device index with its trimmed model name (or backend kind).
+
+    Drops the common ``NVIDIA GeForce`` / ``NVIDIA`` vendor prefix so a 4090 reads as ``RTX 4090`` rather
+    than eating the column, and falls back to the accelerator kind when the device map carried no name.
+    """
+    if device_name:
+        trimmed = device_name
+        for prefix in ("NVIDIA GeForce ", "NVIDIA "):
+            if trimmed.startswith(prefix):
+                trimmed = trimmed[len(prefix) :]
+                break
+        return f"{device_index} · {trimmed}"
+    return f"{device_index} · {kind}"
+
+
 def mini_bar(fraction: float, width: int) -> str:
     """Render a fixed-width filled/unfilled block bar (no percentage label).
 

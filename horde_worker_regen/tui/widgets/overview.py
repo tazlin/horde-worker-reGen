@@ -21,6 +21,7 @@ from horde_worker_regen.process_management.process_temperature import (
     temperature_phrase,
 )
 from horde_worker_regen.process_management.supervisor_channel import (
+    CardSnapshot,
     JobQueueEntry,
     ProcessSnapshot,
     RecentJobRecord,
@@ -30,6 +31,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
 from horde_worker_regen.tui.formatters import (
     format_its,
     format_percent,
+    gpu_label,
     human_bytes,
     human_duration,
     human_mb,
@@ -111,6 +113,7 @@ class OverviewView(VerticalScroll):
         yield Static(id="overview-thin")
         yield Static(id="overview-hero")
         yield Static(id="overview-health")
+        yield Static(id="overview-gpus")
         yield Static(id="overview-trends")
         yield Static(id="overview-pipeline")
         yield Static(id="overview-processes")
@@ -161,6 +164,11 @@ class OverviewView(VerticalScroll):
         show_residency = detailed and residency is not None and (residency.active or residency.possible)
         self.query_one("#overview-residency", Static).display = show_residency
 
+        # The per-card strip rides the normal/details modes (hidden in thin, where the compact bar stands in)
+        # and only appears once the worker reports per-card data, so an older worker's overview is unchanged.
+        show_gpus = not thin and snapshot is not None and bool(snapshot.per_card)
+        self.query_one("#overview-gpus", Static).display = show_gpus
+
         if snapshot is not None:
             self._maybe_record_trends(snapshot)
 
@@ -175,6 +183,8 @@ class OverviewView(VerticalScroll):
         self.query_one("#overview-hero", Static).update(self._render_hero(report, snapshot, frame))
         self.query_one("#overview-health", Static).update(self._render_health(report))
         if snapshot is not None:
+            if show_gpus:
+                self.query_one("#overview-gpus", Static).update(self._render_gpus_strip(snapshot, detailed=detailed))
             self.query_one("#overview-trends", Static).update(self._render_trends(snapshot))
             self.query_one("#overview-pipeline", Static).update(self._render_pipeline_strip(snapshot))
             self.query_one("#overview-processes", Static).update(
@@ -688,6 +698,48 @@ class OverviewView(VerticalScroll):
         rate = (completed / elapsed * 3600.0) if elapsed > 0 else None
         return rate, deltas
 
+    @staticmethod
+    def _gpus_strip_vram(card: CardSnapshot) -> Text:
+        """A compact used-fraction bar plus free/total VRAM for one card, reddened under VRAM pressure."""
+        if card.free_vram_mb is None or not card.total_vram_mb:
+            return Text("VRAM ?", style="grey50")
+        fraction = card.vram_headroom_fraction
+        used_fraction = 1.0 - fraction if fraction is not None else 0.0
+        style = "red" if card.is_vram_pressured else "green"
+        text = Text()
+        text.append(mini_bar(used_fraction, 6), style=style)
+        text.append(f" {card.free_vram_mb / 1024:.1f}/{card.total_vram_mb / 1024:.1f}G", style="")
+        return text
+
+    def _render_gpus_strip(self, snapshot: WorkerStateSnapshot, *, detailed: bool) -> Panel:
+        """Render the per-card strip: one compact row per card, with residency/fault detail in details mode.
+
+        The single collapsed card on a single-GPU host is intentional (presentational consistency). In
+        details mode each row also names the whole-card residency it holds and flags any models gone
+        locally unservable on it, so a pressured or quarantining card stands out without leaving the tab.
+        """
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(style="bold", no_wrap=True)
+        grid.add_column(no_wrap=True)
+        grid.add_column(justify="right", no_wrap=True)
+        grid.add_column(no_wrap=True)
+        for card in snapshot.per_card:
+            tail = Text(f"{card.busy_contexts} job{'s' if card.busy_contexts != 1 else ''}", style="green")
+            if detailed:
+                if card.residency_model:
+                    tail.append_text(
+                        Text(f"  ★ {shorten(card.residency_model, 14)} ({card.residency_phase})", style="#f0beff"),
+                    )
+                if card.unservable_models:
+                    tail.append_text(Text(f"  ⚠ {len(card.unservable_models)} unservable", style="bold red"))
+            grid.add_row(
+                gpu_label(card.device_index, card.device_name, card.kind),
+                self._gpus_strip_vram(card),
+                f"{card.loaded_contexts}/{card.target_process_count} ctx",
+                tail,
+            )
+        return Panel(grid, title="GPUs", title_align="left", border_style="grey37", padding=(0, 1))
+
     def _render_trends(self, snapshot: WorkerStateSnapshot) -> Panel:
         """Render recent kudos/hr, jobs/hr, and GPU-duty trends: a value, direction, and sparkline.
 
@@ -861,7 +913,9 @@ class OverviewView(VerticalScroll):
         now = time.time()
         residency = snapshot.whole_card_residency
         pending_models = frozenset(entry.model for entry in snapshot.pending_jobs if entry.model)
-        for process in snapshot.processes:
+        # Group each card's slots together (then by slot id), so the GPU column reads as contiguous blocks on
+        # a multi-GPU host; single-GPU is unaffected (every slot is device 0, leaving slot-id order intact).
+        for process in sorted(snapshot.processes, key=lambda p: (p.device_index, p.process_id)):
             row = _ProcessRow(process=process, now=now, residency=residency, pending_models=pending_models)
             table.add_row(*[spec.render(row) for spec in layout.columns])
 
@@ -1088,6 +1142,7 @@ def _heartbeat_age(row: _ProcessRow) -> float | None:
 _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
     ColumnSpec("ID", DensityTier.ESSENTIAL, lambda r: str(r.process.process_id), justify="right", width=3),
     ColumnSpec("Type", DensityTier.ESSENTIAL, lambda r: r.process.process_type.title(), width=9),
+    ColumnSpec("GPU", DensityTier.NORMAL, lambda r: str(r.process.device_index), justify="right", width=4),
     ColumnSpec("State", DensityTier.ESSENTIAL, OverviewView._process_state_cell, width=18, no_wrap=True),
     ColumnSpec("Job", DensityTier.ESSENTIAL, lambda r: job_id_text(r.process.current_job_id), width=8, no_wrap=True),
     ColumnSpec(

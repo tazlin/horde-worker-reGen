@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 7
+SUPERVISOR_PROTOCOL_VERSION = 8
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -44,6 +44,9 @@ v6 added the snapshot's ``system_memory`` field (:class:`SystemMemorySnapshot`):
 the worker's per-role RSS share.
 v7 added ``DownloadStatusSnapshot.active`` (the full set of concurrent in-flight downloads) for
 host-parallel downloading; ``current`` is retained as the primary entry for single-download consumers.
+v8 added per-card multi-GPU data: ``ProcessSnapshot.device_index`` (which card each slot is pinned to)
+and the snapshot's ``per_card`` list of :class:`CardSnapshot` (per-card VRAM, contexts, residency, and
+fault/unservable-model health). Additive: a single-GPU host reports exactly one ``CardSnapshot``.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -154,6 +157,10 @@ class ProcessSnapshot(BaseModel):
     process_id: int
     process_type: str
     """The ``HordeProcessType`` name (e.g. ``INFERENCE`` / ``SAFETY``)."""
+    device_index: int = 0
+    """The stable index of the GPU this slot is pinned to (0 on a single-GPU host).
+
+    Lets the dashboard group a card's slots together and show a per-process GPU column on multi-GPU hosts."""
     last_process_state: str
     """The ``HordeProcessState`` name (e.g. ``WAITING_FOR_JOB`` / ``INFERENCE_STARTING``)."""
     is_alive: bool
@@ -214,6 +221,7 @@ class ProcessSnapshot(BaseModel):
         return cls(
             process_id=info.process_id,
             process_type=info.process_type.name,
+            device_index=info.device_index,
             last_process_state=info.last_process_state.name,
             is_alive=info.is_process_alive(),
             is_busy=info.is_process_busy(),
@@ -459,6 +467,74 @@ class WholeCardResidencyStatus(BaseModel):
     """The forecast's largest co-resident process count that still avoids streaming."""
 
 
+_CARD_VRAM_PRESSURE_FLOOR_MB = 1024.0
+"""Free VRAM below this (or below ~8% of the card) reads as VRAM pressure (a near-OOM heads-up)."""
+
+
+class CardSnapshot(BaseModel):
+    """A serializable per-card view of one GPU this worker drives, for the multi-GPU dashboard.
+
+    One entry per driven card (a single-GPU host reports exactly one). Carries what an operator needs to
+    judge a single card at a glance: its VRAM headroom, how many inference contexts it is running against its
+    target, the whole-card residency it may be holding, and any models that have gone locally unservable on
+    it. Per-card it/s and jobs/hr are derived on the receiving side (from the card's processes and successive
+    ``jobs_completed`` deltas) so the math lives with the other throughput trends.
+    """
+
+    device_index: int
+    """The stable (PCI-bus) index of this card."""
+    device_name: str | None = None
+    """The human GPU name (e.g. ``NVIDIA GeForce RTX 4090``), or None when the device map has no entry."""
+    kind: str = "cuda"
+    """The accelerator backend (``cuda``/``rocm``/``xpu``/...)."""
+
+    total_vram_mb: float | None = None
+    """This card's total VRAM (MB); None until a process reports and the device map lacks a capacity."""
+    free_vram_mb: float | None = None
+    """Measured free VRAM (MB) on this card; None until a process on it has reported memory."""
+
+    loaded_contexts: int = 0
+    """Inference processes on this card with an allocated device context right now."""
+    busy_contexts: int = 0
+    """This card's inference processes currently mid-inference (a duty proxy and 'card is active' signal)."""
+    target_process_count: int = 0
+    """How many inference processes this card aims to run (its queue/concurrency-derived target)."""
+    max_concurrent_inference: int = 0
+    """This card's concurrent-sampling ceiling."""
+
+    jobs_completed: int = 0
+    """Cumulative jobs this card has finished; the receiver derives jobs/hr from successive deltas."""
+
+    residency_model: str | None = None
+    """The model holding whole-card residency on this card, or None when none is held."""
+    residency_phase: str = ""
+    """``establishing`` / ``holding`` while a residency is active on this card, else empty."""
+
+    unservable_models: list[str] = Field(default_factory=list)
+    """Models currently treated as locally unservable on this card (its over-budget circuit-breaker tripped)."""
+    worst_fault_streak: int = 0
+    """The worst per-model consecutive over-budget fault streak on this card (0 when none)."""
+
+    @property
+    def vram_headroom_fraction(self) -> float | None:
+        """Free VRAM as a fraction of this card's total (0.0-1.0), or None when either figure is unknown."""
+        if self.free_vram_mb is None or not self.total_vram_mb:
+            return None
+        return max(0.0, min(self.free_vram_mb / self.total_vram_mb, 1.0))
+
+    @property
+    def is_vram_pressured(self) -> bool:
+        """Whether this card is low on VRAM (a near-OOM heads-up): under a small floor or a small fraction.
+
+        The fraction guard catches a large card with proportionally little left; the absolute floor catches
+        a small card where even a healthy-looking fraction is too few MB to load another model safely.
+        """
+        if self.free_vram_mb is None:
+            return False
+        fraction = self.vram_headroom_fraction
+        return self.free_vram_mb < _CARD_VRAM_PRESSURE_FLOOR_MB or (fraction is not None and fraction < 0.08)
+
+
 class SystemMemorySnapshot(BaseModel):
     """The system-RAM picture and the worker's per-role share of it, for the supervisor/TUI.
 
@@ -605,6 +681,9 @@ class WorkerStateSnapshot(BaseModel):
 
     whole_card_residency: WholeCardResidencyStatus = Field(default_factory=WholeCardResidencyStatus)
     """Whole-card exclusive-residency posture: whether it can engage, and live detail when it has."""
+
+    per_card: list[CardSnapshot] = Field(default_factory=list)
+    """Per-card multi-GPU view, one entry per driven card (exactly one on a single-GPU host)."""
 
 
 class SupervisorCommand(enum.Enum):

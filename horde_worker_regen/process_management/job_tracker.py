@@ -216,6 +216,10 @@ class JobTracker:
         self._model_last_overbudget_fault_time: dict[tuple[str, int | None], float] = {}
         self._recent_resource_fault_times: list[float] = []
 
+        # Cumulative completed inference results per card, for the dashboard's per-card jobs/hr trend. Keyed
+        # like the fault streaks (device_index, None on a single-GPU host); monotonic across the session.
+        self._card_inference_results: dict[int | None, int] = {}
+
         # Defaults to one attempt (no retry: the pre-resiliency behaviour) so a directly-constructed
         # tracker faults terminally; the worker opts into bounded retry via set_retry_policy().
         self._max_inference_attempts = 1
@@ -305,6 +309,14 @@ class JobTracker:
         current = time.time() if now is None else now
         cutoff = current - window_seconds
         return sum(1 for t in self._recent_resource_fault_times if t >= cutoff)
+
+    def note_card_inference_result(self, device_index: int | None) -> None:
+        """Count one completed inference result against the card it ran on (the per-card jobs/hr source)."""
+        self._card_inference_results[device_index] = self._card_inference_results.get(device_index, 0) + 1
+
+    def get_card_inference_results(self, device_index: int | None) -> int:
+        """Return cumulative completed inference results on ``device_index`` this session (0 if none)."""
+        return self._card_inference_results.get(device_index, 0)
 
     # endregion
 
@@ -668,6 +680,9 @@ class JobTracker:
             job_info.sdk_api_job_info.model,
             device_index=tracked.last_dispatched_device_index,
         )
+        # One inference result landed on this card; feed the per-card jobs/hr trend (keyed like the streak,
+        # None on a single-GPU host). Counted on the result message so a per-card rate excludes crash faults.
+        self.note_card_inference_result(tracked.last_dispatched_device_index)
 
     async def queue_for_submit(self, job_info: HordeJobInfo) -> None:
         """Queue a job for submission."""
