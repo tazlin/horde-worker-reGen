@@ -72,7 +72,10 @@ def _make_scheduler(
         process_map=process_map if process_map is not None else ProcessMap({}),
         horde_model_map=HordeModelMap(root={}),
         job_tracker=job_tracker if job_tracker is not None else JobTracker(),
-        process_lifecycle=Mock(get_processes_with_model_for_queued_job=Mock(return_value=[])),
+        process_lifecycle=Mock(
+            get_processes_with_model_for_queued_job=Mock(return_value=[]),
+            is_model_load_quarantined=Mock(return_value=False),
+        ),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         model_metadata=make_test_model_metadata(reference),
         max_concurrent_inference_processes=max_concurrent,

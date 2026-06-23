@@ -982,9 +982,8 @@ class ProcessLifecycleManager:
         """
         now = time.time()
         self._recent_load_failure_by_process[process_id] = (model_name, now)
-        recent = [
-            t for t in self._model_load_failure_history.get(model_name, []) if now - t <= MODEL_LOAD_FAILURE_WINDOW_SECONDS
-        ]
+        prior = self._model_load_failure_history.get(model_name, [])
+        recent = [t for t in prior if now - t <= MODEL_LOAD_FAILURE_WINDOW_SECONDS]
         recent.append(now)
         self._model_load_failure_history[model_name] = recent
         if len(recent) >= MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD and model_name not in self._quarantined_models:

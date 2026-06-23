@@ -1477,6 +1477,17 @@ class InferenceScheduler:
             if job.model is None:
                 raise ValueError(f"job.model is None ({job})")
 
+            # A model quarantined for repeatedly failing to load must never be preloaded again: doing so only
+            # re-arms the crash/recovery loop it was quarantined to stop. Fault the job so the horde reissues
+            # it elsewhere rather than letting an unservable head wedge the queue.
+            if self._process_lifecycle.is_model_load_quarantined(job.model):
+                if job not in self._job_tracker.jobs_in_progress:
+                    logger.warning(
+                        f"Skipping preload of quarantined model {job.model}; faulting its job for reissue.",
+                    )
+                    self._job_tracker.handle_job_fault_now(job, retryable=False)
+                continue
+
             if job.model in loaded_models:
                 continue
 
@@ -2001,6 +2012,10 @@ class InferenceScheduler:
         next_n_jobs: list[ImageGenerateJobPopResponse] = []
         for job in self._job_tracker.jobs_pending_inference:
             if job in self._job_tracker.jobs_in_progress:
+                continue
+            # Never make a quarantined model the dispatch head: it can never become resident (preload_models
+            # skips it and faults it for reissue), so selecting it here would only stall the scheduler.
+            if self._process_lifecycle.is_model_load_quarantined(job.model):
                 continue
             if next_job is None:
                 next_job = job

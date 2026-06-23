@@ -90,6 +90,69 @@ def test_non_spawn_context_is_rejected_on_posix(monkeypatch: pytest.MonkeyPatch)
         _make_plm(ctx=fork_ctx)
 
 
+class TestModelLoadFailureQuarantine:
+    """A model that deterministically fails to load is quarantined, instead of churning the process pool."""
+
+    def test_quarantines_only_after_threshold(self) -> None:
+        from horde_worker_regen.process_management.process_lifecycle import (
+            MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD,
+        )
+
+        plm = _make_plm()
+        model = "Z-Image-Turbo"
+        # Each failure lands on a different slot, mirroring the round-robin re-dispatch that the per-slot
+        # crash-loop breaker cannot catch.
+        for attempt in range(1, MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD):
+            assert plm.record_model_load_failure(process_id=attempt, model_name=model) is False
+            assert plm.is_model_load_quarantined(model) is False
+        assert plm.record_model_load_failure(process_id=99, model_name=model) is True
+        assert plm.is_model_load_quarantined(model) is True
+        assert model in plm.quarantined_models()
+
+    def test_distinct_models_do_not_pool_failures(self) -> None:
+        plm = _make_plm()
+        # Two different models each failing under the threshold must not combine to a quarantine.
+        plm.record_model_load_failure(process_id=1, model_name="model_a")
+        plm.record_model_load_failure(process_id=2, model_name="model_b")
+        assert plm.is_model_load_quarantined("model_a") is False
+        assert plm.is_model_load_quarantined("model_b") is False
+
+    def test_none_model_is_never_quarantined(self) -> None:
+        plm = _make_plm()
+        assert plm.is_model_load_quarantined(None) is False
+
+    def test_load_failure_reap_is_labelled_and_skips_slot_breaker(self) -> None:
+        """A reported load failure labels the recovery as a model-load failure and spares the slot breaker.
+
+        The fault is the model's, not the slot's, so a poison model must not quarantine a healthy slot.
+        """
+        from horde_worker_regen.process_management.process_lifecycle import CRASH_LOOP_MAX_REPLACEMENTS
+
+        plm = _make_plm()
+        # Don't touch real OS processes; only the recovery-classification logic is under test.
+        plm._end_inference_process = Mock()  # type: ignore[method-assign]
+        plm._start_inference_process = Mock()  # type: ignore[method-assign]
+        captured: list[str] = []
+        plm.set_process_recovery_observer(lambda _info, reason: captured.append(reason))
+
+        # Many consecutive load-failure replacements of the SAME slot must never trip its crash-loop breaker.
+        for _ in range(CRASH_LOOP_MAX_REPLACEMENTS + 2):
+            process_info = make_mock_process_info(
+                3,
+                model_name=None,
+                state=HordeProcessState.PROCESS_ENDED,
+            )
+            process_info.mp_process = Mock(is_alive=Mock(return_value=False), exitcode=0)
+            plm.record_model_load_failure(process_id=3, model_name="Z-Image-Turbo")
+            plm._replace_inference_process(process_info)
+
+        assert captured, "a recovery should have been reported"
+        assert all("failed to load model" in reason for reason in captured)
+        assert 3 not in plm._quarantined_inference_slots
+        # The slot's crash-loop counter must be untouched: load failures are the model's fault, not the slot's.
+        assert plm._slot_recovery_history.get(3, []) == []
+
+
 def test_empty_process_map_is_not_declared_all_unresponsive() -> None:
     """With no inference/safety process running, the hung-detector must not fire (``all([])`` is True).
 

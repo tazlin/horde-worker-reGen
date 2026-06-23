@@ -66,7 +66,10 @@ def _make_inference_scheduler(
         process_map=process_map,
         horde_model_map=horde_model_map,
         job_tracker=job_tracker,
-        process_lifecycle=Mock(get_processes_with_model_for_queued_job=Mock(return_value=[])),
+        process_lifecycle=Mock(
+            get_processes_with_model_for_queued_job=Mock(return_value=[]),
+            is_model_load_quarantined=Mock(return_value=False),
+        ),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         model_metadata=make_test_model_metadata(),
         max_concurrent_inference_processes=max_concurrent,
@@ -135,6 +138,28 @@ class TestPreloadModels:
         result = inference_scheduler.preload_models()
         assert result is True
         assert process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+
+    async def test_quarantined_model_is_not_preloaded_and_its_job_is_faulted(self) -> None:
+        """A model quarantined for repeated load failures must never be preloaded; its job is faulted instead."""
+        from horde_worker_regen.process_management.job_tracker import JobStage
+
+        process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: process_info})
+        job_tracker = JobTracker()
+
+        job = make_job_pop_response("Z-Image-Turbo")
+        await track_popped_job_async(job_tracker, job)
+
+        inference_scheduler = _make_inference_scheduler(process_map=process_map, job_tracker=job_tracker)
+        inference_scheduler._process_lifecycle.is_model_load_quarantined = Mock(return_value=True)
+
+        result = inference_scheduler.preload_models()
+
+        assert result is False
+        assert process_info.last_control_flag != HordeControlFlag.PRELOAD_MODEL
+        assert job.id_ is not None
+        # Faulted for reissue to the horde, not left wedging the queue.
+        assert job_tracker.get_stage(job.id_) == JobStage.PENDING_SUBMIT
 
     async def test_preload_expires_stale_loading_entry_for_idle_process(self) -> None:
         """A stale loading model-map entry must not prevent a queued model from being preloaded."""

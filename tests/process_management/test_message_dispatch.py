@@ -180,6 +180,35 @@ class TestReceiveAndHandleProcessMessages:
 
         assert hmm.root.get("test_model") is not None
 
+    async def test_model_load_failed_invokes_handler_and_does_not_record_residency(self) -> None:
+        """A FAILED model state hands the failure to the registered handler and never records the model loaded."""
+        from horde_worker_regen.process_management.messages import HordeModelStateChangeMessage, ModelLoadState
+
+        process_info = make_mock_process_info(0, model_name="Z-Image-Turbo")
+        process_info.process_launch_identifier = 0
+        process_map = ProcessMap({0: process_info})
+        hmm = HordeModelMap(root={})
+
+        message_dispatcher = _make_dispatcher(process_map=process_map, horde_model_map=hmm)
+        seen: list[tuple[int, str]] = []
+        message_dispatcher.set_model_load_failure_handler(lambda pid, model: seen.append((pid, model)))
+
+        msg = Mock(spec=HordeModelStateChangeMessage)
+        msg.process_id = 0
+        msg.process_launch_identifier = 0
+        msg.horde_model_name = "Z-Image-Turbo"
+        msg.horde_model_state = ModelLoadState.FAILED
+        msg.process_state = HordeProcessState.PRELOADING_FAILED
+        msg.info = "failed to load"
+        msg.time_elapsed = None
+
+        _enqueue(message_dispatcher, msg)
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert seen == [(0, "Z-Image-Turbo")]
+        # The failed model must not be left recorded as resident anywhere.
+        assert hmm.root.get("Z-Image-Turbo") is None or not hmm.root["Z-Image-Turbo"].horde_model_load_state.is_active()
+
     async def test_mismatched_launch_identifier_is_ignored(self) -> None:
         """Ignore if a message is received with a launch identifier that doesn't match the process's current one."""
         process_info = make_mock_process_info(0)

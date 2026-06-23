@@ -115,7 +115,10 @@ def _build_scheduler_at_idle_residency() -> InferenceScheduler:
         process_map=process_map,
         horde_model_map=HordeModelMap(root={}),
         job_tracker=JobTracker(),
-        process_lifecycle=Mock(get_processes_with_model_for_queued_job=Mock(return_value=[])),
+        process_lifecycle=Mock(
+            get_processes_with_model_for_queued_job=Mock(return_value=[]),
+            is_model_load_quarantined=Mock(return_value=False),
+        ),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         model_metadata=make_test_model_metadata(),
         max_concurrent_inference_processes=1,
