@@ -109,7 +109,18 @@ def _make_download_process(
 
     from horde_worker_regen.process_management.download_process import HordeDownloadProcess
 
-    fake_manager = SimpleNamespace(compvis=compvis)
+    # Mirror hordelib's ModelManager surface: every category manager is an attribute, None when not loaded.
+    # The feature-presence refresh reads them by name (no defensive getattr), so a bare stand-in would raise.
+    fake_manager = SimpleNamespace(
+        compvis=compvis,
+        lora=None,
+        gfpgan=None,
+        esrgan=None,
+        codeformer=None,
+        miscellaneous=None,
+        controlnet=None,
+        controlnet_annotator=None,
+    )
     fake_api = types.ModuleType("hordelib.api")
     fake_api.SharedModelManager = SimpleNamespace(manager=fake_manager)  # type: ignore[attr-defined]
     hordelib_stub = sys.modules.get("hordelib") or types.ModuleType("hordelib")
