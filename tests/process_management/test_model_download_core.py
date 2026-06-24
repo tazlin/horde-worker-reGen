@@ -26,7 +26,9 @@ from horde_worker_regen.model_download_core import (
     DownloadAborted,
     ModelProgress,
     download_one_model,
+    ensure_aux_model_present,
     ensure_models_present,
+    validate_present_file,
 )
 from tests.download_test_helpers import FakeModelServer, RealDownloadCompVis, deterministic_bytes
 
@@ -317,5 +319,64 @@ def test_ensure_reports_failure_for_unservable_model(tmp_path: Path) -> None:
         assert outcome.downloaded == 1
         assert outcome.failed == 1
         assert outcome.failures == ["Gone"]
+    finally:
+        server.stop()
+
+
+# --- aux validation: sha256-where-known else presence, re-download on mismatch -------------------------
+
+
+class _NoChecksumManager:
+    """A manager whose checksum validation cannot decide (None), so presence is the fallback."""
+
+    def __init__(self, *, available: bool) -> None:
+        self._available = available
+
+    def validate_model(self, model_name: str, skip_checksum: bool = False) -> bool | None:
+        return None
+
+    def is_model_available(self, model_name: str) -> bool:
+        return self._available
+
+    def download_model(
+        self,
+        model_name: str,
+        *,
+        callback: Callable[[int, int], None] | None = None,
+        connections: int = 1,
+    ) -> bool:
+        return True
+
+
+def test_validate_present_file_uses_checksum_when_it_decides() -> None:
+    """A definitive checksum verdict (False) is returned without falling back to the presence check."""
+    assert validate_present_file(_FlakyManager(), "M") is False  # first validate is the seeded False
+
+
+def test_validate_present_file_falls_back_to_presence_without_a_checksum() -> None:
+    """When the checksum cannot decide (None), the on-disk presence is the answer."""
+    assert validate_present_file(_NoChecksumManager(available=True), "M") is True
+    assert validate_present_file(_NoChecksumManager(available=False), "M") is False
+
+
+def test_ensure_aux_model_present_redownloads_once_on_invalid() -> None:
+    """An auxiliary model whose first file fails validation is re-downloaded exactly once."""
+    flaky = _FlakyManager()
+    assert ensure_aux_model_present(flaky, "M") is True
+    assert flaky.download_calls == 2  # initial fetch + one forced re-download on the failed checksum
+
+
+def test_ensure_aux_model_present_real_download(tmp_path: Path) -> None:
+    """An auxiliary model is genuinely fetched once and accepted when it validates (no re-download)."""
+    server = FakeModelServer()
+    server.add("aux.safetensors", deterministic_bytes("aux", 2048))
+    server.start()
+    try:
+        records = {"Aux": _record("Aux", "aux.safetensors", server.base_url)}
+        compvis = RealDownloadCompVis(tmp_path, records)
+
+        assert ensure_aux_model_present(compvis, "Aux") is True
+        assert (tmp_path / "compvis" / "aux.safetensors").exists()
+        assert server.hits["/aux.safetensors"] == 1  # validated on the first fetch; no re-download
     finally:
         server.stop()

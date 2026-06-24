@@ -35,7 +35,9 @@ __all__ = [
     "UNKNOWN_DOWNLOAD_HOST",
     "download_host_for_url",
     "download_one_model",
+    "ensure_aux_model_present",
     "ensure_models_present",
+    "validate_present_file",
 ]
 
 UNKNOWN_DOWNLOAD_HOST = "unknown"
@@ -312,6 +314,48 @@ def download_one_model(
     if succeeded and compvis.validate_model(model_name) is False:
         # The record changed or the file is corrupt: fetch it again.
         succeeded = bool(compvis.download_model(model_name, callback=callback, connections=connections))
+    return succeeded
+
+
+def validate_present_file(manager: CompVisLike, model_name: str) -> bool | None:
+    """Whether *model_name* on disk matches its reference: sha256 when the record has one, else presence.
+
+    Prefers the manager's checksum validation (``validate_model``, which verifies the sha256 when the
+    record provides one); when that cannot decide (no checksum, or it raises) it falls back to a presence
+    check (``is_model_available``, existence plus declared files). Returns True/False when a determination
+    is possible, or None when neither route can decide, so a caller trusts the download's own success.
+    """
+    try:
+        checksum_result = manager.validate_model(model_name)
+    except Exception:  # noqa: BLE001 - a probe failure must not crash the download; fall back to presence
+        checksum_result = None
+    if checksum_result is not None:
+        return bool(checksum_result)
+    try:
+        return bool(manager.is_model_available(model_name))
+    except Exception:  # noqa: BLE001 - presence is best-effort; an undeterminable file is reported as None
+        return None
+
+
+def ensure_aux_model_present(
+    manager: CompVisLike,
+    model_name: str,
+    *,
+    callback: Callable[[int, int], None] | None = None,
+    connections: int = 1,
+) -> bool:
+    """Download an auxiliary model and re-fetch once if the on-disk file fails validation.
+
+    Generalizes :func:`download_one_model` to any compvis-style manager (ControlNet, GFPGAN, ESRGAN, ...):
+    after the fetch it validates the file via :func:`validate_present_file` (sha256 when the record has a
+    checksum, else a presence check) and re-downloads once on a definitive mismatch. This closes the gap
+    where the auxiliary download path reported success unconditionally, so a truncated or corrupt aux file
+    was trusted and a job that used it would fault.
+    """
+    succeeded = bool(manager.download_model(model_name, callback=callback, connections=connections))
+    if succeeded and validate_present_file(manager, model_name) is False:
+        # The file is corrupt or its record changed: fetch it again (validation None/True is accepted).
+        succeeded = bool(manager.download_model(model_name, callback=callback, connections=connections))
     return succeeded
 
 

@@ -54,6 +54,24 @@ download process can never wedge startup: the worker can still run inference on
 whatever is already present. It is started and stopped by the
 `ProcessLifecycleManager` (`start_download_process` / `end_download_process`).
 
+Every per-file fetch (image **and** auxiliary) goes through the same validated
+download in
+[`model_download_core`][horde_worker_regen.model_download_core]: after the fetch it
+verifies the on-disk file (sha256 when the record carries a checksum, otherwise a
+presence check) and re-downloads once on a mismatch, via
+[`ensure_aux_model_present`][horde_worker_regen.model_download_core.ensure_aux_model_present].
+Previously only image checkpoints were validated and the auxiliary path reported
+success unconditionally, so a truncated ControlNet/post-processing file was trusted
+and a job that used it would fault.
+
+The ControlNet annotators are fetched as one **exclusive** task (they need a full
+ComfyUI init, which must not race other downloads). Because that preload is
+un-interruptible and can wedge, the
+[scheduler][horde_worker_regen.process_management.download_scheduler.HostAwareDownloadScheduler]
+bounds how long an exclusive task may block the queue: past the bound it relaxes
+exclusivity so the image-model downloads a worker needs to serve jobs proceed, while
+the stuck task harmlessly keeps running. The relaxation is logged once.
+
 ## Model availability and the pop gate
 
 [`ModelAvailability`][horde_worker_regen.process_management.model_availability.ModelAvailability]

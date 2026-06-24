@@ -47,6 +47,7 @@ from horde_worker_regen.model_download_core import (
     ModelProgress,
     download_host_for_url,
     download_one_model,
+    ensure_aux_model_present,
 )
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.download_scheduler import (
@@ -974,8 +975,14 @@ class HordeDownloadProcess(HordeProcess):
             if aux_manager is None:
                 return False
             with self._manager_lock(task.manager_key):
-                aux_manager.download_model(task.model_name, callback=callback, connections=self._connections_per_file)
-            return True
+                # Validated fetch (sha256-where-known, else presence) with a re-download on mismatch, so a
+                # truncated aux file is repaired here instead of being trusted and faulting a later job.
+                return ensure_aux_model_present(
+                    aux_manager,
+                    task.model_name,
+                    callback=callback,
+                    connections=self._connections_per_file,
+                )
         if task.kind is DownloadKind.SAFETY:
             return self._ensure_safety_models()
         if task.kind is DownloadKind.DEFAULT_LORAS:

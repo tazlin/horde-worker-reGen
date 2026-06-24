@@ -24,11 +24,11 @@ from .conftest import (
 )
 
 
-def test_protocol_version_is_8() -> None:
-    """The per-card additions bump the supervisor protocol to v8 (the TUI checks it on connect)."""
-    assert SUPERVISOR_PROTOCOL_VERSION == 8
+def test_protocol_version_is_9() -> None:
+    """The supervisor protocol is at v9 (per-card data landed at v8; feature readiness bumped it to v9)."""
+    assert SUPERVISOR_PROTOCOL_VERSION == 9
     snapshot = WorkerStateSnapshot(config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"))
-    assert snapshot.protocol_version == 8
+    assert snapshot.protocol_version == 9
     assert snapshot.per_card == []
 
 

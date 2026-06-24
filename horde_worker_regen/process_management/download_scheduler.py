@@ -19,15 +19,27 @@ from __future__ import annotations
 
 import enum
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
+
+from loguru import logger
 
 __all__ = [
     "DownloadKind",
     "DownloadTask",
     "HostAwareDownloadScheduler",
 ]
+
+_DEFAULT_EXCLUSIVE_TIMEOUT_SECONDS = 1800.0
+"""How long an exclusive task may hold exclusivity before the scheduler stops letting it block others.
+
+Exclusivity exists so the ControlNet-annotator preload (a full ComfyUI/torch init) does not race other
+downloads. That preload is un-interruptible and can wedge (a stuck network read inside hordelib), which
+would otherwise starve the entire download queue forever, including the image-model fetches a worker needs
+to serve jobs. Generous on purpose: only a genuine hang, not a slow-but-progressing preload, should trip
+it. Past the bound the stuck task keeps running but no longer blocks the queue."""
 
 
 class DownloadKind(enum.Enum):
@@ -83,6 +95,10 @@ class _State:
     in_flight_keys: set[tuple[DownloadKind, str, str]] = field(default_factory=set)
     active_count: int = 0
     exclusive_in_flight: int = 0
+    exclusive_started_at: float | None = None
+    """Monotonic time the current exclusive task was admitted, for the exclusivity time bound."""
+    exclusive_timeout_logged: bool = False
+    """Whether the one-shot "relaxing exclusivity" warning has been emitted for the current exclusive task."""
 
 
 class HostAwareDownloadScheduler:
@@ -93,12 +109,23 @@ class HostAwareDownloadScheduler:
     and may retune the limits live via :meth:`set_limits`.
     """
 
-    def __init__(self, *, max_parallel_downloads: int = 4, per_host_concurrency: int = 1) -> None:
-        """Initialise with the global and per-host concurrency ceilings (each clamped to >= 1)."""
+    def __init__(
+        self,
+        *,
+        max_parallel_downloads: int = 4,
+        per_host_concurrency: int = 1,
+        exclusive_timeout_seconds: float = _DEFAULT_EXCLUSIVE_TIMEOUT_SECONDS,
+    ) -> None:
+        """Initialise with the global and per-host concurrency ceilings (each clamped to >= 1).
+
+        ``exclusive_timeout_seconds`` bounds how long an exclusive task may keep blocking other downloads
+        before the scheduler relaxes its exclusivity (see :data:`_DEFAULT_EXCLUSIVE_TIMEOUT_SECONDS`).
+        """
         self._cond = threading.Condition()
         self._state = _State()
         self._max_parallel = max(1, max_parallel_downloads)
         self._per_host = max(1, per_host_concurrency)
+        self._exclusive_timeout = exclusive_timeout_seconds
         self._closed = False
 
     def set_limits(
@@ -177,26 +204,51 @@ class HostAwareDownloadScheduler:
             self._state.active_count += 1
             if task.exclusive:
                 self._state.exclusive_in_flight += 1
+                self._state.exclusive_started_at = time.monotonic()
+                self._state.exclusive_timeout_logged = False
             return task
 
     def _find_admissible(self) -> DownloadTask | None:
         """Return the first pending task that fits the limits and exclusivity rules (caller holds the lock).
 
         An exclusive task runs alone: it is admissible only once nothing is in flight, and while it runs no
-        other task is admitted. A non-exclusive task is held while any exclusive task is in flight.
+        other task is admitted, up to the exclusivity time bound. A non-exclusive task is held while an
+        exclusive task is in flight and still within that bound (see :meth:`_exclusivity_active`).
         """
         if self._state.active_count >= self._max_parallel:
             return None
+        exclusivity_active = self._exclusivity_active()
         for task in self._state.pending:
             if task.exclusive:
                 if self._state.active_count == 0:
                     return task
                 continue
-            if self._state.exclusive_in_flight > 0:
+            if exclusivity_active:
                 continue
             if self._state.in_flight_by_host[task.host] < self._per_host:
                 return task
         return None
+
+    def _exclusivity_active(self) -> bool:
+        """Whether an in-flight exclusive task should still block other downloads (caller holds the lock).
+
+        Returns False once nothing exclusive is in flight, and also once the in-flight exclusive task has
+        exceeded ``exclusive_timeout``: a wedged annotator preload then stops starving the queue while it
+        (harmlessly) keeps running. The relaxation is logged once so it is diagnosable.
+        """
+        if self._state.exclusive_in_flight <= 0:
+            return False
+        started = self._state.exclusive_started_at
+        if started is not None and (time.monotonic() - started) >= self._exclusive_timeout:
+            if not self._state.exclusive_timeout_logged:
+                self._state.exclusive_timeout_logged = True
+                logger.warning(
+                    "Download scheduler: an exclusive task has held exclusivity for over "
+                    f"{self._exclusive_timeout:.0f}s (likely a wedged annotator preload); relaxing "
+                    "exclusivity so other downloads can proceed.",
+                )
+            return False
+        return True
 
     def release(self, task: DownloadTask) -> None:
         """Mark *task* finished, freeing its host and global slots, and wake any waiting executor."""
@@ -204,6 +256,9 @@ class HostAwareDownloadScheduler:
             self._state.active_count = max(0, self._state.active_count - 1)
             if task.exclusive:
                 self._state.exclusive_in_flight = max(0, self._state.exclusive_in_flight - 1)
+                if self._state.exclusive_in_flight == 0:
+                    self._state.exclusive_started_at = None
+                    self._state.exclusive_timeout_logged = False
             self._state.in_flight_keys.discard(task.dedup_key)
             remaining = self._state.in_flight_by_host[task.host] - 1
             if remaining > 0:

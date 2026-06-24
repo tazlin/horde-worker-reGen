@@ -7,6 +7,8 @@ the global cap, live retuning, and prune/close - are proven in isolation.
 
 from __future__ import annotations
 
+import pytest
+
 from horde_worker_regen.model_download_core import UNKNOWN_DOWNLOAD_HOST, download_host_for_url
 from horde_worker_regen.process_management.download_scheduler import (
     DownloadKind,
@@ -163,6 +165,50 @@ class TestHostAwareScheduler:
         assert scheduler.acquire(timeout=0.05) is None
 
         scheduler.release(exclusive)
+        other = scheduler.acquire(timeout=0.05)
+        assert other is not None and other.model_name == "a"
+
+    def test_stuck_exclusive_stops_blocking_after_the_time_bound(self) -> None:
+        """A wedged exclusive task stops starving the queue once it exceeds the exclusivity time bound.
+
+        Guards the annotator-monopoly fix: an un-interruptible annotator preload that hangs must not block
+        the image-model downloads a worker needs to serve jobs forever. A zero bound relaxes immediately.
+        """
+        scheduler = HostAwareDownloadScheduler(
+            max_parallel_downloads=4,
+            per_host_concurrency=1,
+            exclusive_timeout_seconds=0.0,
+        )
+        scheduler.enqueue(_exclusive_task("annotators", "unknown"))
+        scheduler.enqueue(_task("a", "h1"))
+
+        exclusive = scheduler.acquire(timeout=0.05)
+        assert exclusive is not None and exclusive.exclusive is True
+        # The exclusive task is still in flight, but its bound is already exceeded, so "a" is admitted.
+        other = scheduler.acquire(timeout=0.05)
+        assert other is not None and other.model_name == "a"
+
+    def test_exclusivity_blocks_within_the_bound_then_relaxes_past_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Within the bound the exclusive task blocks others; once the bound elapses they are admitted."""
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.download_scheduler.time.monotonic",
+            lambda: clock["now"],
+        )
+        scheduler = HostAwareDownloadScheduler(
+            max_parallel_downloads=4,
+            per_host_concurrency=1,
+            exclusive_timeout_seconds=300.0,
+        )
+        scheduler.enqueue(_exclusive_task("annotators", "unknown"))
+        scheduler.enqueue(_task("a", "h1"))
+
+        exclusive = scheduler.acquire(timeout=0.05)
+        assert exclusive is not None and exclusive.exclusive is True
+        # Still within the bound: "a" is held back behind the running exclusive task.
+        assert scheduler.acquire(timeout=0.05) is None
+        # Advance past the bound: "a" becomes admissible even though the exclusive task is still in flight.
+        clock["now"] += 301.0
         other = scheduler.acquire(timeout=0.05)
         assert other is not None and other.model_name == "a"
 
