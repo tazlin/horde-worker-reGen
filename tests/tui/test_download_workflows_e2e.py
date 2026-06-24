@@ -34,7 +34,9 @@ from horde_worker_regen.process_management.supervisor_channel import (
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
-from horde_worker_regen.tui.app import HordeWorkerTUI
+from horde_worker_regen.tui.app import BenchmarkOverWorkerModal, HordeWorkerTUI
+from horde_worker_regen.tui.benchmark_launcher import BenchmarkOptions
+from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
 from horde_worker_regen.tui.widgets.download_picker import DownloadPickerModal, DownloadPickerRow
 from horde_worker_regen.tui.widgets.onboarding import WorkerStartModal
 from tests.tui._fake_supervisor import FakeSupervisor
@@ -262,3 +264,88 @@ async def test_feature_readiness_panel_appears_when_the_worker_reports_it(tmp_pa
         app._tick()
         await pilot.pause()
         assert readiness_panel.display is True
+
+
+async def test_benchmark_over_a_serving_worker_asks_before_stopping_it(tmp_path: Path) -> None:
+    """Requesting a benchmark while the worker serves pops a confirm modal instead of silently stopping it."""
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        launched: list[BenchmarkOptions] = []
+        app._launch_benchmark = launched.append  # type: ignore[method-assign]  # observe without spawning a run
+
+        app.on_benchmark_view_run_requested(BenchmarkView.RunRequested(BenchmarkOptions(tiers=["sd15"])))
+        await pilot.pause()
+
+        assert isinstance(app.screen, BenchmarkOverWorkerModal)  # the operator is asked first
+        assert launched == []  # nothing launched yet
+        assert app._supervisor.is_alive()  # the worker is still serving
+
+
+async def test_cancelling_the_benchmark_prompt_keeps_the_worker_serving(tmp_path: Path) -> None:
+    """Cancelling the confirm leaves the worker running and launches no benchmark."""
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        launched: list[BenchmarkOptions] = []
+        app._launch_benchmark = launched.append  # type: ignore[method-assign]
+
+        app.on_benchmark_view_run_requested(BenchmarkView.RunRequested(BenchmarkOptions(tiers=["sd15"])))
+        await pilot.pause()
+        await pilot.click("#bench-over-worker-cancel")
+        await pilot.pause()
+
+        assert launched == []  # cancel never starts the benchmark
+        assert app._supervisor.is_alive()  # and never stops the worker
+        assert not isinstance(app.screen, BenchmarkOverWorkerModal)  # the modal is dismissed
+
+
+async def test_confirming_the_benchmark_prompt_launches_it(tmp_path: Path) -> None:
+    """Confirming the prompt proceeds to launch the benchmark (which stops the worker)."""
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        launched: list[BenchmarkOptions] = []
+        app._launch_benchmark = launched.append  # type: ignore[method-assign]  # avoid spawning a real run
+
+        app.on_benchmark_view_run_requested(BenchmarkView.RunRequested(BenchmarkOptions(tiers=["sd15"])))
+        await pilot.pause()
+        await pilot.click("#bench-over-worker-confirm")
+        await pilot.pause()
+
+        assert [options.tiers for options in launched] == [["sd15"]]  # the confirmed options reach the launch
+
+
+async def test_benchmark_with_no_live_worker_skips_the_prompt(tmp_path: Path) -> None:
+    """With the worker stopped there is nothing to tear down, so the benchmark launches without a prompt."""
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        fake._alive = False  # the worker is not running; a benchmark takes the GPU with nothing to stop
+        launched: list[BenchmarkOptions] = []
+        app._launch_benchmark = launched.append  # type: ignore[method-assign]
+
+        app.on_benchmark_view_run_requested(BenchmarkView.RunRequested(BenchmarkOptions(tiers=["sd15"])))
+        await pilot.pause()
+
+        assert not isinstance(app.screen, BenchmarkOverWorkerModal)  # no teardown -> no prompt
+        assert [options.tiers for options in launched] == [["sd15"]]  # launched straight away
+
+
+def test_benchmark_download_delegate_routes_to_a_live_worker(tmp_path: Path) -> None:
+    """The benchmark download delegates to the worker only while it is live, requesting models with aux.
+
+    Folds the benchmark's download phase into the running worker's single download surface: no delegate
+    (and so a self-download) when the worker is stopped; a delegate that calls request_download_models
+    when it is up.
+    """
+    fake, app = _make_app(tmp_path, auto_start=True)
+    # The app is not mounted here, so on_mount's auto-start has not run: the worker is not live yet.
+    assert app._benchmark_download_delegate() is None
+
+    fake.start()  # the worker is now running
+    delegate = app._benchmark_download_delegate()
+    assert delegate is not None
+    assert delegate(["ModelA", "ModelB"]) is True
+    assert fake.download_requests[-1].model_names == ["ModelA", "ModelB"]
+    assert fake.download_requests[-1].include_aux is True

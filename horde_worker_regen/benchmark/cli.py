@@ -303,26 +303,38 @@ def _ladder_control_types(ladder: list[RampLevel]) -> list[str]:
     return sorted({job.control_type for level in ladder for job in level.scenario.image_jobs if job.control_type})
 
 
-def _controlnet_annotator_row(control_types: list[str], *, on_disk: bool = False) -> DownloadModelRow | None:
-    """Build the synthetic annotator plan row (ROM size) for *control_types*, or None when none apply.
+def _ladder_post_processors(ladder: list[RampLevel]) -> list[str]:
+    """Return the distinct post-processor names any level in the ladder exercises (may be empty)."""
+    return sorted(
+        {
+            post_processor
+            for level in ladder
+            for job in level.scenario.image_jobs
+            for post_processor in (job.post_processing or ())
+        },
+    )
 
-    ``on_disk`` reflects whether the annotator checkpoints are already downloaded, so the plan shows them
-    as present rather than always implying a pending fetch.
+
+def _controlnet_annotator_row(
+    control_types: list[str],
+    *,
+    on_disk: bool = False,
+    size_bytes: int | None = None,
+) -> DownloadModelRow | None:
+    """Build the synthetic annotator plan row for *control_types*, or None when none apply.
+
+    Pure and import-light on purpose: ``on_disk`` (resolved torch-free from the annotator catalog) and the
+    optional ``size_bytes`` (a hordelib ROM figure the caller supplies only on the real-download path) are
+    passed in, so the dry-run preview can build this row without the cold hordelib import that once timed the
+    preview out.
     """
     if not control_types:
         return None
     from horde_worker_regen.benchmark.download_progress import DownloadModelRow
 
-    try:
-        from hordelib.pipeline.constants import controlnet_annotator_download_bytes
-
-        size = controlnet_annotator_download_bytes(control_types)
-    except Exception as e:  # noqa: BLE001 - sizing is informational; show the row without a size
-        logger.debug(f"Could not size controlnet annotators: {e}")
-        size = None
     return DownloadModelRow(
         name="ControlNet annotators",
-        size_bytes=size or None,
+        size_bytes=size_bytes or None,
         on_disk=on_disk,
         target_path="(annotator cache)",
     )
@@ -378,12 +390,32 @@ def _download_compvis_models(
     json_progress: bool,
     controls: DownloadControls | None = None,
 ) -> int:
-    """Download each named checkpoint via the shared download core; return how many failed.
+    """Download each named image checkpoint; a thin alias for the compvis category of the shared core."""
+    return _download_category_models(
+        "compvis",
+        model_names,
+        emit=emit,
+        json_progress=json_progress,
+        controls=controls,
+    )
 
-    Uses the same dedup + validate/retry routine as the worker's download process
-    (:func:`horde_worker_regen.model_download_core.ensure_models_present`), so the benchmark fetch and the
-    worker fetch are one code path. Checkpoints need only the model managers, not a full
-    ``hordelib.initialise()`` (no torch/ComfyUI), which keeps this phase light and GPU-free.
+
+def _download_category_models(
+    category: str,
+    model_names: list[str],
+    *,
+    emit: Callable[[DownloadEvent], None],
+    json_progress: bool,
+    controls: DownloadControls | None = None,
+) -> int:
+    """Download each named *category* model via the shared download core; return how many failed.
+
+    The category name is also the ``SharedModelManager`` attribute that owns it (``compvis``, ``controlnet``,
+    ``esrgan``, ...), so one path fetches image checkpoints and aux feature checkpoints alike with the same
+    dedup + validate/retry the worker's download process uses
+    (:func:`horde_worker_regen.model_download_core.ensure_models_present`). Checkpoints need only the model
+    managers, not a full ``hordelib.initialise()`` (no torch/ComfyUI), which keeps this phase light and
+    GPU-free.
     """
     from hordelib.api import SharedModelManager
 
@@ -391,9 +423,9 @@ def _download_compvis_models(
     from horde_worker_regen.model_download_core import ModelProgress, ensure_models_present
 
     SharedModelManager.load_model_managers()
-    compvis = SharedModelManager.manager.compvis
-    if compvis is None:
-        logger.error("Failed to load the compvis (Stable Diffusion) model manager; cannot download.")
+    manager = getattr(SharedModelManager.manager, category, None)
+    if manager is None:
+        logger.error(f"Failed to load the {category!r} model manager; cannot download {model_names}.")
         return len(model_names)
 
     def on_start(name: str, index: int, total: int) -> None:
@@ -423,7 +455,7 @@ def _download_compvis_models(
         emit(DownloadEvent(kind="model_finished", name=name, index=index, total=total, ok=ok))
 
     outcome = ensure_models_present(
-        compvis,
+        manager,
         list(model_names),
         controls=controls,
         on_model_start=on_start,
@@ -440,7 +472,12 @@ def _run_download(args: argparse.Namespace) -> int:
         DownloadModelRow,
         encode_download_event,
     )
-    from horde_worker_regen.benchmark.requirements import models_disk_plan
+    from horde_worker_regen.benchmark.requirements import (
+        annotators_present_offline,
+        controlnet_checkpoint_files,
+        models_disk_plan,
+        post_processor_model_files,
+    )
 
     tiers = _parse_tiers(args.tiers)
     if tiers is None:
@@ -461,33 +498,53 @@ def _run_download(args: argparse.Namespace) -> int:
     json_progress: bool = args.json_progress
     controls = _start_stdin_control_thread() if getattr(args, "control_stdin", False) else None
 
-    # Controlnet annotators are lazily-downloaded checkpoints distinct from the image models; surface them
-    # as an explicit plan row (ROM size) and fetch them too, so a controlnet level does not cold-load the
-    # annotator mid-run (the cause of the spurious step-timeout recovery the benchmark used to mask).
+    # A feature exercises more than image checkpoints: controlnet needs its control-type checkpoints AND the
+    # annotator ROMs, and post-processing needs its own models. Surface every such file as an explicit plan
+    # row with real on-disk state, resolved torch-free from the model reference (no cold hordelib import), so
+    # the preview never tells an operator with partially-present controlnets that nothing is missing.
     control_types = _ladder_control_types(ladder)
+    post_processors = _ladder_post_processors(ladder)
+    feature_files = controlnet_checkpoint_files(control_types) + post_processor_model_files(post_processors)
+
+    # Annotator presence is now answered torch-free via the reference's annotator catalog (the dry-run no
+    # longer has to hardcode them missing to dodge a cold hordelib import). The controlnet *extra*
+    # (onnxruntime) is only checkable through hordelib, so that one probe stays on the real-download path.
+    annotators_present = annotators_present_offline(control_types) if control_types else None
+    annotator_size: int | None = None
     if args.dry_run:
-        # The dry-run plan preview must not import hordelib: a cold hordelib/torch import is what made the
-        # plan time out on .exe installs. Show that ControlNet levels also pull annotator checkpoints, but
-        # resolve their exact installed/on-disk state and size only when actually downloading (below).
         cn_installed = None
-        annotators_present = None
-        annotator_row = DownloadModelRow(name="ControlNet annotators", on_disk=False) if control_types else None
     else:
-        from horde_worker_regen.benchmark.requirements import controlnet_annotators_present, controlnet_installed
+        from horde_worker_regen.benchmark.requirements import _controlnet_annotator_bytes, controlnet_installed
 
         cn_installed = controlnet_installed() if control_types else None
-        # Presence is only meaningful with the extra installed (the annotators are never fetched otherwise).
-        annotators_present = controlnet_annotators_present() if control_types and cn_installed else None
-        annotator_row = (
-            _controlnet_annotator_row(control_types, on_disk=annotators_present is True)
-            if cn_installed is not False
-            else None
-        )
+        # Size the ROMs only here (the hordelib import that would slow the dry-run preview is off that path).
+        if control_types and cn_installed is not False:
+            annotator_size = _controlnet_annotator_bytes(control_types) or None
+    annotator_row = (
+        _controlnet_annotator_row(control_types, on_disk=annotators_present is True, size_bytes=annotator_size)
+        if control_types and cn_installed is not False
+        else None
+    )
 
     def emit(event: DownloadEvent) -> None:
         if json_progress:
             # Sentinel-wrapped so the TUI can isolate each event from interleaved log lines on this stdout.
             print(encode_download_event(event))  # noqa: T201
+
+    # Feature checkpoints are real model files (unlike the lazy annotator ROMs): a confidently-absent one is
+    # fetched alongside the image checkpoints. ``on_disk is True`` keeps an undeterminable file (no reference)
+    # out of the present set without claiming it missing.
+    feature_rows = [
+        DownloadModelRow(
+            name=feature.name,
+            size_bytes=feature.size_bytes,
+            on_disk=feature.on_disk is True,
+            target_path=feature.target_path,
+        )
+        for feature in feature_files
+    ]
+    feature_missing = [feature for feature in feature_files if feature.on_disk is False]
+    feature_missing_bytes = sum(feature.size_bytes or 0 for feature in feature_missing)
 
     if plan is not None:
         rows = [
@@ -503,6 +560,7 @@ def _run_download(args: argparse.Namespace) -> int:
         annotator_bytes = (
             annotator_row.size_bytes or 0 if annotator_row is not None and not annotator_row.on_disk else 0
         )
+        rows.extend(feature_rows)
         if annotator_row is not None:
             rows.append(annotator_row)
         emit(
@@ -510,9 +568,9 @@ def _run_download(args: argparse.Namespace) -> int:
                 kind="planned",
                 models=rows,
                 present_bytes=plan.present_bytes,
-                # Fold the annotator ROM into the displayed "to download" so the count and the byte figure
-                # agree; the fits/shortfall below stay checkpoint-based (the real, sized disk constraint).
-                to_download_bytes=plan.to_download_bytes + annotator_bytes,
+                # Fold the feature checkpoints and the annotator ROM into the displayed "to download" so the
+                # count and the byte figure agree; fits/shortfall stay checkpoint-based (the sized constraint).
+                to_download_bytes=plan.to_download_bytes + feature_missing_bytes + annotator_bytes,
                 free_disk_bytes=plan.free_disk_bytes,
                 fits=plan.fits,
                 shortfall_bytes=plan.shortfall_bytes,
@@ -521,6 +579,7 @@ def _run_download(args: argparse.Namespace) -> int:
         missing = [info.name for info in plan.models if not info.on_disk]
     else:
         unsized_rows = [DownloadModelRow(name=name) for name in model_names]
+        unsized_rows.extend(feature_rows)
         if annotator_row is not None:
             unsized_rows.append(annotator_row)
         emit(DownloadEvent(kind="planned", models=unsized_rows))
@@ -545,7 +604,7 @@ def _run_download(args: argparse.Namespace) -> int:
     # is what lets "all required models already on disk" be reported truthfully.
     fetch_annotators = bool(control_types) and cn_installed is not False and annotators_present is not True
 
-    if not missing and not fetch_annotators:
+    if not missing and not feature_missing and not fetch_annotators:
         logger.success("All required models are already on disk; nothing to download.")
         emit(DownloadEvent(kind="complete", downloaded=0, failed=0))
         return 0
@@ -553,6 +612,8 @@ def _run_download(args: argparse.Namespace) -> int:
     if args.dry_run:
         if not json_progress:
             todo = [f"{len(missing)} model(s)"] if missing else []
+            if feature_missing:
+                todo.append(f"{len(feature_missing)} feature model(s)")
             if fetch_annotators:
                 todo.append("controlnet annotators")
             print(f"\nDry run: would fetch {', '.join(todo)}. Re-run without --dry-run to fetch.")  # noqa: T201
@@ -576,6 +637,21 @@ def _run_download(args: argparse.Namespace) -> int:
             controls=controls,
         )
 
+    # Fetch the absent feature checkpoints through the same shared core, one model manager per category, so a
+    # controlnet/post-processing level finds its weights present rather than cold-loading them mid-run.
+    feature_failed = 0
+    feature_missing_by_category: dict[str, list[str]] = {}
+    for feature in feature_missing:
+        feature_missing_by_category.setdefault(feature.category, []).append(feature.name)
+    for category, names in feature_missing_by_category.items():
+        feature_failed += _download_category_models(
+            category,
+            names,
+            emit=emit,
+            json_progress=json_progress,
+            controls=controls,
+        )
+
     annotators_failed = 0
     if fetch_annotators:
         emit(DownloadEvent(kind="model_started", name="ControlNet annotators", index=1, total=1))
@@ -593,8 +669,8 @@ def _run_download(args: argparse.Namespace) -> int:
             logger.success("Controlnet annotators: done.")
         emit(DownloadEvent(kind="model_finished", name="ControlNet annotators", index=1, total=1, ok=annotators_ok))
 
-    total_failed = failed + annotators_failed
-    total_items = len(missing) + (1 if fetch_annotators else 0)
+    total_failed = failed + feature_failed + annotators_failed
+    total_items = len(missing) + len(feature_missing) + (1 if fetch_annotators else 0)
     emit(DownloadEvent(kind="complete", downloaded=total_items - total_failed, failed=total_failed))
     if total_failed:
         logger.error(f"{total_failed} of {total_items} item(s) failed to download.")

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import contextlib
 import subprocess
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from rich.console import Group, RenderableType
 from rich.table import Table
@@ -33,8 +35,31 @@ from horde_worker_regen.tui.benchmark_launcher import BenchmarkOptions
 from horde_worker_regen.tui.formatters import human_bytes, human_duration
 from horde_worker_regen.tui.widgets.downloads import DownloadsView
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 _PLAN_TIMEOUT_SECONDS = 240.0
 """Cap on the dry-run plan subprocess: it imports the inference stack and probes the GPU (slow, cold)."""
+
+_STATUS_PRESENT = "present"
+_STATUS_DOWNLOADING = "downloading"
+_STATUS_TO_DOWNLOAD = "to_download"
+
+
+@dataclass(frozen=True)
+class DownloadLiveState:
+    """A running worker's authoritative view of which models are on disk versus being fetched right now.
+
+    Lets the benchmark plan reflect what a live worker is actually doing instead of an independent disk scan.
+    A model the worker reports present is shown present; one it is fetching shows as *downloading* (neither
+    "ready" nor "to download") and is excluded from the missing set, so the operator is never told a
+    mid-download model is ready, nor asked to re-fetch something already in flight.
+    """
+
+    present: frozenset[str] = frozenset()
+    """Names the worker reports fully on disk."""
+    in_flight: frozenset[str] = frozenset()
+    """Names the worker is downloading or has queued to download."""
 
 
 def _gb(num_bytes: int | None) -> str:
@@ -92,10 +117,28 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
 
     BINDINGS = [("escape", "dismiss_modal", "Close")]
 
-    def __init__(self, options: BenchmarkOptions) -> None:
-        """Store the benchmark options whose models this modal will plan and download."""
+    def __init__(
+        self,
+        options: BenchmarkOptions,
+        *,
+        delegate: Callable[[list[str]], bool] | None = None,
+        live_state: Callable[[], DownloadLiveState | None] | None = None,
+    ) -> None:
+        """Store the benchmark options to plan, an optional delegate, and an optional live-worker state reader.
+
+        When ``delegate`` is set (a worker is live), confirming hands the missing models to the worker's
+        download process instead of spawning a second, contending out-of-process downloader; the operator
+        then tracks progress on the Downloads tab. When None, the modal self-downloads out-of-process.
+
+        ``live_state`` (when a worker is live) returns the worker's authoritative present/in-flight model set
+        so the plan reflects reality: a model the worker is fetching shows as downloading, not "ready" or "to
+        download", and is excluded from the missing set the confirm would request. Read lazily on each render
+        so it tracks the latest snapshot; it must never raise (a flaky read falls back to the disk scan).
+        """
         super().__init__()
         self._options = options
+        self._delegate = delegate
+        self._live_state = live_state
         self._plan: DownloadEvent | None = None
         self._downloaded_any = False
         self._progress: dict[str, str] = {}
@@ -161,22 +204,64 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
             return
         self.app.call_from_thread(self._render_plan, planned)
 
+    def _resolve_live_state(self) -> DownloadLiveState | None:
+        """Read the live-worker state for this render, or None (no worker / read failed: fall back to the scan)."""
+        if self._live_state is None:
+            return None
+        try:
+            return self._live_state()
+        except Exception:  # noqa: BLE001 - a flaky snapshot read must never break the plan view
+            return None
+
+    @staticmethod
+    def _row_status(row: DownloadModelRow, live: DownloadLiveState | None) -> str:
+        """Classify a plan row as present / downloading / to-download, with a live worker overriding the scan.
+
+        The live worker is authoritative: a model it reports present is present even if the offline scan
+        disagreed, and a model it is fetching is *downloading* (so it is neither offered for download again
+        nor mislabelled "ready"). With no live state, the row's own scanned ``on_disk`` decides.
+        """
+        if live is not None:
+            if row.name in live.present:
+                return _STATUS_PRESENT
+            if row.name in live.in_flight:
+                return _STATUS_DOWNLOADING
+        return _STATUS_PRESENT if row.on_disk else _STATUS_TO_DOWNLOAD
+
+    def _missing_model_names(self) -> list[str]:
+        """The names a confirm would actually fetch: rows that are neither present nor already in flight."""
+        if self._plan is None:
+            return []
+        live = self._resolve_live_state()
+        return [row.name for row in self._plan.models if self._row_status(row, live) == _STATUS_TO_DOWNLOAD]
+
     def _render_plan(self, plan: DownloadEvent) -> None:
-        """(UI thread) render the per-model plan and enable Download when there is something that fits."""
+        """(UI thread) render the per-model plan and enable Download when there is something that fits.
+
+        When a worker is live its snapshot overlays the offline scan, so an in-flight model reads as
+        downloading and drops out of the missing set rather than appearing as a fresh fetch the operator
+        could redundantly request.
+        """
         self._plan = plan
-        missing = [model for model in plan.models if not model.on_disk]
-        self._set_body(Group(_plan_table(plan.models), Text(""), _plan_footer(plan)))
+        live = self._resolve_live_state()
+        statuses = [(row, self._row_status(row, live)) for row in plan.models]
+        missing = [row for row, status in statuses if status == _STATUS_TO_DOWNLOAD]
+        in_flight = [row for row, status in statuses if status == _STATUS_DOWNLOADING]
+        self._set_body(Group(_plan_table(statuses), Text(""), _plan_footer(plan)))
 
         start = self.query_one("#download-start", Button)
         if not missing:
             start.disabled = True
-            start.label = "Nothing to download"
+            # Distinguish "the worker is already fetching these" from "you genuinely have everything".
+            start.label = "Worker is fetching these" if in_flight else "Nothing to download"
         elif not plan.fits:
             start.disabled = True
             start.label = "Not enough disk space"
         else:
             start.disabled = False
-            start.label = f"Download {len(missing)} model(s) ({_gb(plan.to_download_bytes)})"
+            verb = "Request" if self._delegate is not None else "Download"
+            to_download_bytes = sum(row.size_bytes or 0 for row in missing)
+            start.label = f"{verb} {len(missing)} model(s) ({_gb(to_download_bytes)})"
 
     def _render_error(self, message: str) -> None:
         """(UI thread) explain why the plan could not be computed."""
@@ -223,13 +308,19 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
             self.dismiss(self._downloaded_any)
 
     def _start_download(self) -> None:
-        """Begin fetching the missing models, streaming live per-model progress into the body."""
+        """Fetch the missing models: delegate to a running worker when one is live, else self-download."""
         if self._plan is None or self._busy:
+            return
+        missing = self._missing_model_names()
+        if not missing:
+            return
+        if self._delegate is not None:
+            self._delegate_to_worker(missing)
             return
         self._busy = True
         self._paused = False
         self._current_progress = None
-        self._progress = {model.name: "downloading" for model in self._plan.models if not model.on_disk}
+        self._progress = dict.fromkeys(missing, "downloading")
         self.query_one("#download-start", Button).disabled = True
         self.query_one("#download-close", Button).disabled = True
         controls = self.query_one("#download-controls")
@@ -237,6 +328,30 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
         self.query_one("#download-pause", Button).label = "Pause"
         self._render_progress(header="Downloading models…")
         self.run_worker(self._run_download, thread=True, exclusive=True, group="bench-dl-run")
+
+    def _delegate_to_worker(self, missing: list[str]) -> None:
+        """Hand the missing models to the running worker's download process and point at the Downloads tab.
+
+        The live worker keeps serving (a download takes no GPU); it just adds these to its background
+        download set, fetched into the same shared cache the benchmark reads, so no second downloader
+        contends for bandwidth or the same files. The benchmark reuses them on disk when it later runs.
+        """
+        delegate = self._delegate
+        if delegate is None:
+            return
+        sent = delegate(missing)
+        if sent:
+            self.query_one("#download-start", Button).disabled = True
+            self._set_body(
+                Text(
+                    f"Requested {len(missing)} model(s) from the running worker. They download in the "
+                    "background while the worker keeps serving; track progress on the Downloads tab, then "
+                    "close this window. The benchmark reuses them once they finish.",
+                    style="green",
+                ),
+            )
+        else:
+            self._set_body(Text("Could not reach the worker to delegate the download; try again.", style="red"))
 
     def _run_download(self) -> None:
         """(Worker thread) stream the real download subprocess, parsing progress events line by line."""
@@ -335,22 +450,30 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
         self.query_one("#download-body", Static).update(renderable)
 
 
-def _plan_table(models: list[DownloadModelRow]) -> Table:
-    """Render every needed model with its size, on-disk state, and where it lives or will be written."""
+def _plan_table(statuses: list[tuple[DownloadModelRow, str]]) -> Table:
+    """Render every needed model with its size, resolved status, and where it lives or will be written."""
     table = Table(expand=True)
     table.add_column("Model")
     table.add_column("Size", justify="right")
     table.add_column("Status")
     table.add_column("Location")
-    for model in models:
-        status = Text("on disk", style="green") if model.on_disk else Text("will download", style="yellow")
+    for model, status in statuses:
         table.add_row(
             model.name,
             _gb(model.size_bytes),
-            status,
+            _plan_status_text(status),
             model.target_path or "(destination undetermined)",
         )
     return table
+
+
+def _plan_status_text(status: str) -> Text:
+    """Colour a resolved plan-row status (present / downloading / to-download)."""
+    if status == _STATUS_PRESENT:
+        return Text("on disk", style="green")
+    if status == _STATUS_DOWNLOADING:
+        return Text("downloading…", style="cyan")
+    return Text("will download", style="yellow")
 
 
 def _plan_footer(plan: DownloadEvent) -> Text:
@@ -380,4 +503,4 @@ def _status_text(status: str) -> Text:
     return Text("downloading…", style="yellow")
 
 
-__all__ = ["BenchmarkDownloadModal"]
+__all__ = ["BenchmarkDownloadModal", "DownloadLiveState"]

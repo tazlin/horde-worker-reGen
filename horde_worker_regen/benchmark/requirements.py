@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -29,6 +30,10 @@ from horde_worker_regen.benchmark.ladder import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    from horde_model_reference.model_reference_records import GenericModelRecord
+
     from horde_worker_regen.benchmark.enums import BenchTier
     from horde_worker_regen.benchmark.report import MachineInfo
     from horde_worker_regen.model_download_plan import DownloadPlan
@@ -127,6 +132,188 @@ def model_present_on_disk(model_name: str) -> bool | None:
         return is_model_present(model_name, records)
     except Exception as e:  # noqa: BLE001 - presence is best-effort; fail open
         logger.debug(f"Could not determine on-disk presence of {model_name!r}: {e}")
+        return None
+
+
+_CONTROLNET_RECORD_PREFIX = "control_"
+"""SD1.5 controlnet records are named ``control_<type>`` (canny -> ``control_canny``); the ``_sd2``/``_xl``
+suffixed siblings are other baselines the benchmark's SD1.5 controlnet sweep does not exercise."""
+
+_POST_PROCESSOR_CATEGORIES = ("esrgan", "gfpgan", "codeformer")
+"""The model-reference categories a post-processor's weights can live in (rembg/strip_background has none)."""
+
+
+class FeatureModelFile(BaseModel):
+    """One model a feature needs, with where it lives and whether it is on disk (tri-state).
+
+    Unlike :class:`MissingModel`, a feature plan must also surface files that ARE present (so the operator
+    sees the whole picture) and an undeterminable state (``on_disk=None`` when the reference or record is
+    unavailable, never a confident-but-wrong claim). ``category`` is the model-reference category (e.g.
+    ``controlnet``, ``esrgan``); for a real model it doubles as the model-manager attribute the
+    self-download fetches it through.
+    """
+
+    name: str
+    category: str
+    size_bytes: int | None = None
+    on_disk: bool | None = None
+    target_path: str = ""
+
+
+def _coerce_root_paths(extra_model_directories: Sequence[str | os.PathLike[str]] | None) -> list[Path]:
+    """Normalise extra model directories to a list of Paths (empty when none)."""
+    return [Path(directory) for directory in (extra_model_directories or ())]
+
+
+def _offline_category_reference(category: str) -> Mapping[str, GenericModelRecord] | None:
+    """Read a category's reference offline (disk-only), or None when it cannot be loaded (torch-free).
+
+    Mirrors :func:`model_present_on_disk`'s offline discipline: a short-lived benchmark subprocess must
+    never block on a PRIMARY-API fetch, so the read is forced offline. Fails open to None ("unknown"), so a
+    surface shows the feature's files as undeterminable rather than wrongly claiming them missing or present.
+    """
+    try:
+        from horde_model_reference.meta_consts import MODEL_REFERENCE_CATEGORY
+
+        from horde_worker_regen.reference_helper import ensure_offline_reference_manager
+
+        manager = ensure_offline_reference_manager()
+        return manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY(category)) or {}
+    except Exception as e:  # noqa: BLE001 - reference is best-effort; fail open to "unknown"
+        logger.debug(f"Could not load the offline {category!r} reference: {e}")
+        return None
+
+
+def _feature_model_file(
+    record_name: str,
+    reference: Mapping[str, GenericModelRecord],
+    category: str,
+    *,
+    cache_home: str | None,
+    extra_model_directories: Sequence[str | os.PathLike[str]] | None,
+) -> FeatureModelFile:
+    """Build a :class:`FeatureModelFile` for *record_name* with its size, on-disk state, and primary path."""
+    from horde_model_reference.on_disk_layout import file_paths_for, resolve_weights_root
+
+    from horde_worker_regen.model_download_plan import is_model_present
+
+    record = reference[record_name]
+    size = getattr(record, "size_on_disk_bytes", None) or (
+        sum(download.size_bytes or 0 for download in record.config.download) or None
+    )
+    on_disk = is_model_present(
+        record_name,
+        reference,
+        cache_home=cache_home,
+        extra_model_directories=extra_model_directories,
+    )
+    paths = file_paths_for(
+        record,
+        resolve_weights_root(cache_home),
+        extra_roots=_coerce_root_paths(extra_model_directories),
+    )
+    return FeatureModelFile(
+        name=record_name,
+        category=category,
+        size_bytes=size,
+        on_disk=on_disk,
+        target_path=str(paths[0]) if paths else "",
+    )
+
+
+def controlnet_checkpoint_files(
+    control_types: list[str],
+    *,
+    cache_home: str | None = None,
+    extra_model_directories: Sequence[str | os.PathLike[str]] | None = None,
+) -> list[FeatureModelFile]:
+    """The SD1.5 controlnet checkpoint records the given control types need, with on-disk presence (torch-free).
+
+    A control type whose ``control_<type>`` record is absent from the reference (e.g. an SDXL-only tier with
+    no matching SD1.5 record) is dropped: the benchmark cannot plan a file the reference does not describe.
+    When the whole reference cannot be read, each row is returned with ``on_disk=None`` (undeterminable),
+    never a false "missing".
+    """
+    reference = _offline_category_reference("controlnet")
+    rows: list[FeatureModelFile] = []
+    seen: set[str] = set()
+    for control_type in control_types:
+        record_name = f"{_CONTROLNET_RECORD_PREFIX}{control_type}"
+        if record_name in seen:
+            continue
+        seen.add(record_name)
+        if reference is None:
+            rows.append(FeatureModelFile(name=record_name, category="controlnet", on_disk=None))
+        elif record_name in reference:
+            rows.append(
+                _feature_model_file(
+                    record_name,
+                    reference,
+                    "controlnet",
+                    cache_home=cache_home,
+                    extra_model_directories=extra_model_directories,
+                ),
+            )
+    return rows
+
+
+def post_processor_model_files(
+    post_processors: list[str],
+    *,
+    cache_home: str | None = None,
+    extra_model_directories: Sequence[str | os.PathLike[str]] | None = None,
+) -> list[FeatureModelFile]:
+    """The post-processing model records the given post-processors need, with on-disk presence (torch-free).
+
+    Each post-processor name is looked up across the esrgan/gfpgan/codeformer references (its name IS its
+    record name). A post-processor with no model record (``strip_background``/rembg, whose weights are
+    fetched lazily by the library at first use) contributes no row: there is no horde-managed file to plan.
+    """
+    references = {category: _offline_category_reference(category) for category in _POST_PROCESSOR_CATEGORIES}
+    rows: list[FeatureModelFile] = []
+    seen: set[str] = set()
+    for post_processor in post_processors:
+        if post_processor in seen:
+            continue
+        seen.add(post_processor)
+        for category in _POST_PROCESSOR_CATEGORIES:
+            reference = references[category]
+            if reference is not None and post_processor in reference:
+                rows.append(
+                    _feature_model_file(
+                        post_processor,
+                        reference,
+                        category,
+                        cache_home=cache_home,
+                        extra_model_directories=extra_model_directories,
+                    ),
+                )
+                break
+    return rows
+
+
+def annotators_present_offline(
+    control_types: list[str],
+    *,
+    cache_home: str | None = None,
+    extra_model_directories: Sequence[str | os.PathLike[str]] | None = None,
+) -> bool | None:
+    """Whether the controlnet annotators for *control_types* are on disk, torch-free via HMR (no hordelib).
+
+    The single offline counterpart to the worker's annotator check that does NOT pay a cold hordelib import
+    (the cost the dry-run plan was deliberately avoiding when it hardcoded annotators as missing). Weightless
+    control types are vacuously present; returns None only when the weights root cannot be resolved.
+    """
+    try:
+        from horde_model_reference.on_disk_layout import annotators_present_for_control_types, resolve_weights_root
+
+        return annotators_present_for_control_types(
+            control_types,
+            resolve_weights_root(cache_home),
+            extra_roots=_coerce_root_paths(extra_model_directories),
+        )
+    except Exception as e:  # noqa: BLE001 - presence is best-effort; fail open to "unknown"
+        logger.debug(f"Could not determine controlnet annotator presence offline: {e}")
         return None
 
 

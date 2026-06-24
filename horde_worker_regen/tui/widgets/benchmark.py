@@ -269,6 +269,14 @@ class BenchmarkView(VerticalScroll):
             super().__init__()
             self.options = options
 
+    class DownloadRequested(Message):
+        """Posted when the user opens the benchmark's model-download modal (the app supplies the delegate)."""
+
+        def __init__(self, options: BenchmarkOptions) -> None:
+            """Carry the option selection whose models the modal will plan and (self- or worker-) download."""
+            super().__init__()
+            self.options = options
+
     class CancelRequested(Message):
         """Posted when the user asks to cancel the running benchmark."""
 
@@ -611,19 +619,18 @@ class BenchmarkView(VerticalScroll):
         self.app.push_screen(BenchmarkHistoryModal())
 
     def _open_download(self) -> None:
-        """Open the Download models modal for the current tier/option selection.
+        """Ask the app to open the Download models modal for the current tier/option selection.
 
-        When the modal reports it downloaded something, re-run the plan preview so the operator sees the
-        levels flip from "to download" to RUN: visible proof the problem is solved. Imported lazily to keep
-        the modal's subprocess plumbing off the TUI's hot path.
+        The app owns the worker supervisor, so it decides whether the download is delegated to a running
+        worker (its download process fetches into the shared cache) or self-downloaded out-of-process when
+        no worker is live. Routed through a message rather than pushed here so that decision stays with the
+        app instead of this widget reaching into the supervisor.
         """
-        from horde_worker_regen.tui.widgets.benchmark_download import BenchmarkDownloadModal
+        self.post_message(self.DownloadRequested(self._collect_options()))
 
-        def _after(downloaded_any: bool | None) -> None:
-            if downloaded_any:
-                self._start_plan_preview()
-
-        self.app.push_screen(BenchmarkDownloadModal(self._collect_options()), _after)
+    def refresh_plan_preview(self) -> None:
+        """Re-run the plan preview (public entry for the app to call after a self-download landed models)."""
+        self._start_plan_preview()
 
     def _start_plan_preview(self) -> None:
         """Shell ``horde-benchmark plan --json`` in a worker thread and render the result.

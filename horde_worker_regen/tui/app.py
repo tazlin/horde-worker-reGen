@@ -14,7 +14,10 @@ import multiprocessing
 import os
 import sys
 import time
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loguru import logger
 from rich.text import Text
@@ -73,6 +76,11 @@ from horde_worker_regen.tui.widgets.overview import OverviewView
 from horde_worker_regen.tui.wizard import SetupWizardModal, WizardOutcome, is_setup_incomplete
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode, WorkerSupervisor
 
+if TYPE_CHECKING:
+    # Imported for annotations only; the modal module is imported lazily at use (its subprocess plumbing
+    # stays off the TUI hot path), so the live-state type must not pull it in at module load.
+    from horde_worker_regen.tui.widgets.benchmark_download import DownloadLiveState
+
 
 class WebQuitWarningModal(ModalScreen[bool]):
     """Warn the user that closing this browser tab leaves the worker running in the background."""
@@ -127,6 +135,64 @@ class WebQuitWarningModal(ModalScreen[bool]):
         if event.button.id == "web-quit-close":
             self.dismiss(True)
         elif event.button.id == "web-quit-stay":
+            self.dismiss(False)
+
+
+class BenchmarkOverWorkerModal(ModalScreen[bool]):
+    """Confirm that starting a benchmark will stop the running worker and pause its in-flight downloads.
+
+    The benchmark needs the GPU to itself, so launching it tears the worker down. That is destructive to a
+    serving worker (jobs in flight are abandoned, background downloads pause), so it must never happen on a
+    single click without the operator agreeing to it.
+    """
+
+    DEFAULT_CSS = """
+    BenchmarkOverWorkerModal {
+        align: center middle;
+    }
+    BenchmarkOverWorkerModal #bench-over-worker-dialog {
+        width: 72;
+        height: auto;
+        padding: 1 2;
+        border: thick $warning;
+        background: $surface;
+    }
+    BenchmarkOverWorkerModal #bench-over-worker-dialog Button {
+        width: 100%;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        """Lay out the warning text and the stop-and-benchmark / cancel choices."""
+        with Vertical(id="bench-over-worker-dialog"):
+            yield Static(self._message(), id="bench-over-worker-message")
+            yield Button("Stop worker & run benchmark", id="bench-over-worker-confirm", variant="warning")
+            yield Button("Cancel (keep serving)", id="bench-over-worker-cancel", variant="primary")
+
+    @staticmethod
+    def _message() -> Text:
+        return Text.assemble(
+            ("Start benchmark?\n\n", "bold"),
+            (
+                "The worker is running and serving jobs. Starting the benchmark stops it to free the GPU "
+                "and pauses any in-flight downloads; the worker stays stopped until the benchmark finishes. "
+                "Cancel to keep serving.",
+                "grey70",
+            ),
+        )
+
+    def action_cancel(self) -> None:
+        """Dismiss as False (keep serving) when Escape is pressed."""
+        self.dismiss(False)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Confirm stops the worker and benchmarks; cancel leaves it serving."""
+        if event.button.id == "bench-over-worker-confirm":
+            self.dismiss(True)
+        elif event.button.id == "bench-over-worker-cancel":
             self.dismiss(False)
 
 
@@ -805,11 +871,27 @@ class HordeWorkerTUI(App[None]):
             self.action_restart_worker()
 
     def on_benchmark_view_run_requested(self, message: BenchmarkView.RunRequested) -> None:
-        """Stop the worker (freeing the GPU) and launch the benchmark, off the UI thread."""
+        """Launch the benchmark, first confirming the GPU takeover when a worker is actively serving."""
         if self._benchmark_supervisor.is_active:
             self.notify("A benchmark is already running.", severity="warning")
             return
-        self._pending_benchmark_options = message.options
+        if self._supervisor.is_alive():
+            # Stopping a serving worker mid-flight is destructive; require an explicit yes before doing it.
+            self.push_screen(
+                BenchmarkOverWorkerModal(),
+                partial(self._on_benchmark_over_worker_choice, message.options),
+            )
+            return
+        self._launch_benchmark(message.options)
+
+    def _on_benchmark_over_worker_choice(self, options: BenchmarkOptions, confirmed: bool | None) -> None:
+        """Proceed with the benchmark only when the operator agreed to stop the running worker."""
+        if confirmed:
+            self._launch_benchmark(options)
+
+    def _launch_benchmark(self, options: BenchmarkOptions) -> None:
+        """Stop the worker (freeing the GPU) and launch the benchmark, off the UI thread."""
+        self._pending_benchmark_options = options
         # Show the PREPARING state immediately: the stop below blocks for up to ~100s, and without a
         # visible phase on the Benchmark tab that wait is indistinguishable from a hang.
         self._benchmark_supervisor.mark_preparing()
@@ -821,6 +903,73 @@ class HordeWorkerTUI(App[None]):
             self.query_one("#main-tabs", TabbedContent).active = "tab-benchmark"
         self.notify("Stopping worker to free the GPU for the benchmark…")
         self.run_worker(self._start_benchmark_flow, thread=True, exclusive=True, group="lifecycle")
+
+    def on_benchmark_view_download_requested(self, message: BenchmarkView.DownloadRequested) -> None:
+        """Open the benchmark model-download modal, delegating to a live worker's downloads when one runs.
+
+        Imported lazily to keep the modal's subprocess plumbing off the TUI's hot path. The delegate folds
+        the benchmark's download phase into a running worker's single download surface (no second, contending
+        downloader); when no worker is live the modal self-downloads out-of-process.
+        """
+        from horde_worker_regen.tui.widgets.benchmark_download import BenchmarkDownloadModal
+
+        self.push_screen(
+            BenchmarkDownloadModal(
+                message.options,
+                delegate=self._benchmark_download_delegate(),
+                live_state=self._benchmark_live_state(),
+            ),
+            self._after_benchmark_download,
+        )
+
+    def _benchmark_download_delegate(self) -> Callable[[list[str]], bool] | None:
+        """A delegate that hands models to the running worker's download process, or None when none is live.
+
+        The worker keeps serving (a download takes no GPU); it just background-fetches the benchmark's
+        models into the shared cache. Auxiliary models are included since a benchmark level may exercise
+        controlnet/post-processing.
+        """
+        if not self._supervisor.is_alive():
+            return None
+
+        def _delegate(model_names: list[str]) -> bool:
+            return self._supervisor.request_download_models(model_names, include_aux=True)
+
+        return _delegate
+
+    def _benchmark_live_state(self) -> Callable[[], DownloadLiveState | None] | None:
+        """A reader of the live worker's present/in-flight model set for the benchmark plan, or None.
+
+        Bound to a *live* worker only: with none running, the plan must fall back to its own disk scan, so a
+        stale last-snapshot from a previous run does not masquerade as current truth. Returns a closure read
+        lazily on each render, folding the worker's queued, in-flight and current downloads into one
+        in-flight set so a model being fetched is never shown as ready nor offered for a redundant fetch.
+        """
+        from horde_worker_regen.tui.widgets.benchmark_download import DownloadLiveState
+
+        def _read() -> DownloadLiveState | None:
+            if not self._supervisor.is_alive():
+                return None
+            snapshot = self._supervisor.latest_snapshot
+            downloads = snapshot.downloads if snapshot is not None else None
+            if downloads is None:
+                return None
+            in_flight = {item.model_name for item in downloads.pending}
+            in_flight.update(active.model_name for active in downloads.active)
+            if downloads.current is not None:
+                in_flight.add(downloads.current.model_name)
+            return DownloadLiveState(
+                present=frozenset(downloads.present_model_names),
+                in_flight=frozenset(in_flight),
+            )
+
+        return _read
+
+    def _after_benchmark_download(self, downloaded_any: bool | None) -> None:
+        """Refresh the benchmark plan preview when a self-download actually landed models on disk."""
+        if downloaded_any:
+            with contextlib.suppress(NoMatches):
+                self.query_one(BenchmarkView).refresh_plan_preview()
 
     def _start_benchmark_flow(self) -> None:
         """Stop the worker, then start the benchmark subprocess (runs in a thread)."""
@@ -889,8 +1038,11 @@ class HordeWorkerTUI(App[None]):
             return
         self._do_quit()
 
-    def _on_web_quit_choice(self, confirmed: bool) -> None:
-        """Proceed with quitting only when the user confirmed the web-session close warning."""
+    def _on_web_quit_choice(self, confirmed: bool | None) -> None:
+        """Proceed with quitting only when the user confirmed the web-session close warning.
+
+        ``None`` (the modal dismissed without a choice, e.g. Escape) is treated as "do not quit".
+        """
         if confirmed:
             self._do_quit()
 

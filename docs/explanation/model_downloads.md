@@ -288,6 +288,34 @@ through this unified engine (gated mirror, then HuggingFace origin) into the exa
 paths the package expects, so the detectors find them present and skip their own
 download. The set is cataloged in `horde_model_reference.annotator_catalog`.
 
+## Benchmark downloads: one coherent picture
+
+The benchmark needs the same models on disk that the worker does, so its "Download
+models" surface is folded into this subsystem rather than scanning disk on its own.
+
+**What a feature needs is reckoned in full.** The benchmark plan accounts for every
+file a selected level exercises, not just the image checkpoint: the ControlNet
+*model checkpoints* for the control types it sweeps (canny, depth, openpose), the
+ControlNet annotators, and the post-processing models (upscalers, face restorers).
+Presence for each is resolved torch-free from the model reference (the same
+`horde_model_reference` on-disk-layout helpers the worker uses, plus the annotator
+catalog), so the dry-run preview never pays a cold inference-stack import and a
+machine whose ControlNet files are only partly present is correctly told what is
+still missing rather than that nothing is.
+
+**A running worker is the source of truth.** When a worker is live, the benchmark's
+download view reflects the worker's own snapshot: a model the worker reports present
+reads present, and one it is actively fetching reads *downloading* (not "ready", and
+not offered for a second, redundant fetch). The fetch itself is delegated to that
+worker's download process (it keeps serving; a download takes no GPU), so there is
+never a second downloader contending for the same files. With no worker running, the
+benchmark fetches the missing models itself through the shared download core.
+
+**Starting a benchmark is never a silent teardown.** A benchmark needs the GPU to
+itself, so launching one stops a running worker and pauses its in-flight downloads.
+When a worker is serving, the TUI asks first: an explicit confirm explains the
+takeover, and cancelling leaves the worker serving untouched.
+
 ## See also
 
 - [Add custom models](../how-to/add-custom-models.md): configuring extra models
