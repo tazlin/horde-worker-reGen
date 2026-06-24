@@ -211,3 +211,6 @@ hf_transformers/*
 horde_model_reference/*
 custom_models.json
 .abort
+
+# Local source-overlay deploy tool (paramiko helper, secrets, build artifact, pulled logs)
+/.deploy/
