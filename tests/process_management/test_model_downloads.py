@@ -434,12 +434,12 @@ class TestConfigReloadTriggersDownloads:
         assert args[0] == ["b"]
         assert kwargs["desired_image_models"] == ["a", "b"]
 
-    def test_reload_changing_an_aux_flag_restarts_the_download_process(self) -> None:
-        """Toggling a construction-time download flag (e.g. allow_controlnet) restarts the download process."""
+    def test_reload_changing_an_aux_flag_forwards_gating_live(self) -> None:
+        """Toggling a gating flag (e.g. allow_controlnet) is forwarded to the download process live, no restart."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
         self._mark_present(manager, {"a"})
-        # Normalize to a known baseline, then flip exactly one construction-time download flag. (purge is
-        # pinned because the mock bridge data leaves it an auto-Mock that would never compare equal.)
+        # Normalize to a known baseline, then flip exactly one gating flag. (purge is pinned because the mock
+        # bridge data leaves it an auto-Mock that would never compare equal.)
         manager._apply_reloaded_bridge_data(
             make_mock_bridge_data(
                 image_models_to_load=["a"],
@@ -448,8 +448,7 @@ class TestConfigReloadTriggersDownloads:
                 dry_run_skip_inference=True,
             ),
         )
-        manager._process_lifecycle.restart_download_process.reset_mock()
-        manager._initial_download_requested = True
+        manager._process_lifecycle.set_download_gating.reset_mock()
 
         manager._apply_reloaded_bridge_data(
             make_mock_bridge_data(
@@ -460,12 +459,13 @@ class TestConfigReloadTriggersDownloads:
             ),
         )
 
-        manager._process_lifecycle.restart_download_process.assert_called_once()
-        # The fresh scan must be allowed to re-trigger the initial download + aux pass.
-        assert manager._initial_download_requested is False
+        manager._process_lifecycle.set_download_gating.assert_called_once()
+        assert manager._process_lifecycle.set_download_gating.call_args.kwargs["allow_controlnet"] is True
+        # The disruptive restart is gone: a newly-enabled category is fetched by the live aux re-arm.
+        manager._process_lifecycle.restart_download_process.assert_not_called()
 
-    def test_reload_without_download_flag_change_does_not_restart(self) -> None:
-        """A reload that leaves the download flags unchanged never cycles the download process."""
+    def test_reload_without_download_flag_change_does_not_forward_gating(self) -> None:
+        """A reload that leaves the gating flags unchanged forwards nothing (and never restarts)."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
         self._mark_present(manager, {"a"})
         # Establish the baseline flags, then reload with the same flags (only the model set changes).
@@ -477,7 +477,7 @@ class TestConfigReloadTriggersDownloads:
                 dry_run_skip_inference=True,
             ),
         )
-        manager._process_lifecycle.restart_download_process.reset_mock()
+        manager._process_lifecycle.set_download_gating.reset_mock()
 
         manager._apply_reloaded_bridge_data(
             make_mock_bridge_data(
@@ -488,6 +488,7 @@ class TestConfigReloadTriggersDownloads:
             ),
         )
 
+        manager._process_lifecycle.set_download_gating.assert_not_called()
         manager._process_lifecycle.restart_download_process.assert_not_called()
 
 
@@ -899,6 +900,29 @@ class TestRealDownloadProcessReconcile:
         process._handle_control_message(HordeDownloadControlMessage(desired_image_models=["a", "b"]))
 
         assert runtime.cancelled is False
+
+    def test_live_gating_enable_rearms_the_aux_pass(self) -> None:
+        """Flipping a gating flag on live updates it and re-arms the one-shot aux pass (replaces the restart)."""
+        process = self._make_process()
+        process._allow_lora = False
+        process._aux_requested = False
+        process._aux_enqueued = True  # the aux pass already ran once
+
+        process._handle_control_message(HordeDownloadControlMessage(set_allow_lora=True))
+
+        assert process._allow_lora is True
+        assert process._aux_requested is True
+        assert process._aux_enqueued is False
+
+    def test_live_gating_unchanged_value_does_not_rearm_aux(self) -> None:
+        """A gating flag set to its current value is a no-op: the aux pass is not needlessly replayed."""
+        process = self._make_process()
+        process._allow_lora = True
+        process._aux_enqueued = True
+
+        process._handle_control_message(HordeDownloadControlMessage(set_allow_lora=True))
+
+        assert process._aux_enqueued is True
 
     def _process_with_controlnet_only_aux(self) -> HordeDownloadProcess:
         """A download process whose only enabled aux category is ControlNet (isolates the annotator task)."""

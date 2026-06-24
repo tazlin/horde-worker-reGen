@@ -291,6 +291,37 @@ class HordeDownloadProcess(HordeProcess):
                 return
             time.sleep(0.05)
 
+    def _apply_live_gating(self, message: HordeDownloadControlMessage) -> bool:
+        """Apply any download-gating flags carried live in a control message; return whether any changed.
+
+        These (nsfw / allow_lora / allow_controlnet / allow_sdxl_controlnet / allow_post_processing / purge)
+        were once construction-time only, so a config change to them restarted the process. They are applied
+        live instead; the caller re-arms the one-shot aux pass when this returns True, so a newly-enabled
+        category (e.g. allow_lora flipped on) is fetched without a restart. Caller holds ``self._lock``.
+        """
+        changed = False
+        if message.set_nsfw is not None and message.set_nsfw != self._nsfw:
+            self._nsfw = message.set_nsfw
+            changed = True
+        if message.set_allow_lora is not None and message.set_allow_lora != self._allow_lora:
+            self._allow_lora = message.set_allow_lora
+            changed = True
+        if message.set_allow_controlnet is not None and message.set_allow_controlnet != self._allow_controlnet:
+            self._allow_controlnet = message.set_allow_controlnet
+            changed = True
+        new_sdxl = message.set_allow_sdxl_controlnet
+        if new_sdxl is not None and new_sdxl != self._allow_sdxl_controlnet:
+            self._allow_sdxl_controlnet = new_sdxl
+            changed = True
+        new_pp = message.set_allow_post_processing
+        if new_pp is not None and new_pp != self._allow_post_processing:
+            self._allow_post_processing = new_pp
+            changed = True
+        if message.set_purge_loras is not None and message.set_purge_loras != self._purge_loras:
+            self._purge_loras = message.set_purge_loras
+            changed = True
+        return changed
+
     def _handle_control_message(self, message: object) -> None:
         if isinstance(message, HordeControlMessage) and message.control_flag == HordeControlFlag.END_PROCESS:
             self._end_process = True
@@ -337,6 +368,12 @@ class HordeDownloadProcess(HordeProcess):
                 changed = True
             if message.set_rate_limit_kbps is not None:
                 self._rate_limit_kbps = message.set_rate_limit_kbps if message.set_rate_limit_kbps > 0 else None
+                changed = True
+            if self._apply_live_gating(message):
+                # Re-arm the one-shot aux pass so a newly-enabled category downloads without a process
+                # restart; the pass is idempotent (present models are skipped), so replaying a toggle is safe.
+                self._aux_requested = True
+                self._aux_enqueued = False
                 changed = True
 
         if message.set_max_parallel_downloads is not None or message.set_per_host_concurrency is not None:

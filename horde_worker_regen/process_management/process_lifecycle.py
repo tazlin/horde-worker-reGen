@@ -559,6 +559,42 @@ class ProcessLifecycleManager:
             ),
         )
 
+    def set_download_gating(
+        self,
+        *,
+        nsfw: bool | None = None,
+        allow_lora: bool | None = None,
+        allow_controlnet: bool | None = None,
+        allow_sdxl_controlnet: bool | None = None,
+        allow_post_processing: bool | None = None,
+        purge_loras: bool | None = None,
+    ) -> None:
+        """Forward changed download-gating flags to the download process, applied live (no restart).
+
+        These gate which auxiliary categories the download process fetches (and the nsfw/purge behaviour of
+        the default-LoRa pass). They were once construction-time only, so a change to them restarted the
+        process; the download process now applies them live and re-arms its one-shot aux pass when a category
+        is newly enabled. A ``None`` argument leaves that flag unchanged; a no-op if no download process is
+        running or every argument is ``None``.
+        """
+        if self._download_process_info is None:
+            return
+        gating = (nsfw, allow_lora, allow_controlnet, allow_sdxl_controlnet, allow_post_processing, purge_loras)
+        if all(arg is None for arg in gating):
+            return
+        self._download_process_info.safe_send_message(
+            HordeDownloadControlMessage(
+                model_names=[],
+                download_aux=False,
+                set_nsfw=nsfw,
+                set_allow_lora=allow_lora,
+                set_allow_controlnet=allow_controlnet,
+                set_allow_sdxl_controlnet=allow_sdxl_controlnet,
+                set_allow_post_processing=allow_post_processing,
+                set_purge_loras=purge_loras,
+            ),
+        )
+
     def broadcast_reload_model_database(self) -> None:
         """Tell every subprocess to reload its model managers' references from disk (no download).
 
@@ -589,12 +625,11 @@ class ProcessLifecycleManager:
         self._download_process_info = None
 
     def restart_download_process(self) -> None:
-        """Stop and restart the download process so it picks up changed download config.
+        """Stop and restart the download process (a hard reset that re-reads the current bridge data).
 
-        The aux gating (nsfw / allow_lora / allow_controlnet / allow_post_processing / purge) is baked
-        into the process at construction; ``start_download_process`` reads the current (reloaded) bridge
-        data, so a stop-then-start is how a config change to those flags takes effect without a worker
-        restart. Live controls (pause / rate / parallelism) do not need this; they are forwarded directly.
+        The download-gating flags (nsfw / allow_lora / allow_controlnet / allow_post_processing / purge) are
+        now applied live via :meth:`set_download_gating`, so a config change to them no longer needs this.
+        It remains for the cases that genuinely need a fresh process (e.g. a structural restart).
         """
         self.end_download_process()
         self.start_download_process()

@@ -420,6 +420,19 @@ class HordeDownloadControlMessage(HordeControlMessage):
     """If not None, retune how many concurrent downloads to a single host are allowed, applied live."""
     set_connections_per_file: int | None = None
     """If not None, retune the max concurrent connections used to fetch a single large file, applied live."""
+    set_nsfw: bool | None = None
+    """If not None, retune nsfw filtering of the default-LoRa pass live (replaces a download-process restart)."""
+    set_allow_lora: bool | None = None
+    """If not None, enable/disable the LoRa aux category live. Enabling re-arms the one-shot aux pass so the
+    newly-permitted category downloads without restarting the process; disabling just stops future enqueues."""
+    set_allow_controlnet: bool | None = None
+    """If not None, enable/disable the ControlNet aux category live (re-arms the aux pass when enabling)."""
+    set_allow_sdxl_controlnet: bool | None = None
+    """If not None, enable/disable the SDXL-ControlNet aux category live (re-arms the aux pass when enabling)."""
+    set_allow_post_processing: bool | None = None
+    """If not None, enable/disable the post-processing aux category live (re-arms the aux pass when enabling)."""
+    set_purge_loras: bool | None = None
+    """If not None, retune whether the default-LoRa pass purges unused LoRas, applied live."""
 
 
 class HordePreloadInferenceModelMessage(HordeControlModelMessage):

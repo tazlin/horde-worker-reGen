@@ -1653,11 +1653,11 @@ class HordeWorkerProcessManager:
         )
 
     def _download_process_flags(self) -> tuple[object, ...]:
-        """The bridge-data fields baked into the download process at construction (for change detection).
+        """The download-gating bridge-data fields, snapshotted for change detection across a reload.
 
-        These gate *which* models the download process fetches (aux categories, nsfw filtering, LoRa
-        purging); unlike pause/rate/parallelism they are constructor arguments, so a change to any of them
-        only takes effect by restarting the process. Order is irrelevant; only equality is compared.
+        These gate *which* auxiliary categories the download process fetches (plus nsfw filtering and LoRa
+        purging). They seed the process at construction but are forwarded live when they change, so the
+        process never has to restart to pick them up. Order is irrelevant; only equality is compared.
         """
         return (
             self.bridge_data.nsfw,
@@ -1668,38 +1668,28 @@ class HordeWorkerProcessManager:
             self.bridge_data.purge_loras_on_download,
         )
 
-    def _reload_download_process_if_flags_changed(self, previous_flags: tuple[object, ...]) -> None:
-        """Restart the download process when a reload changed its construction-time download gating.
+    def _forward_download_gating_if_changed(self, previous_flags: tuple[object, ...]) -> None:
+        """Apply changed download-gating flags to the download process live, without a restart.
 
-        Live controls (pause/rate/parallelism) are forwarded without a restart; the aux/nsfw/purge flags
-        cannot be, so a change to them stops the current process and starts a fresh one with the new
-        config, then lets the next scan-complete re-trigger the configured downloads (including a fresh
-        aux pass). Inference and safety keep running throughout: only the (jobless) download process
-        cycles, and the present-set is held across the brief gap so popping is unaffected.
+        The aux/nsfw/purge flags gate which auxiliary categories the download process fetches. They were once
+        construction-time only, so a change to them restarted the (jobless) download process; they are now
+        forwarded live, and the download process re-arms its one-shot aux pass when a category is newly
+        enabled, so a newly-permitted category downloads without the disruptive cycle. ``previous_flags`` is
+        the gating tuple before the reload; an unchanged reload is a no-op.
         """
         if not self._enable_background_downloads:
             return
         if self._download_process_flags() == previous_flags:
             return
-        logger.info("Download-affecting config changed on reload; restarting the background download process.")
-        # A download-process restart failure must not abort the rest of the config reload (or wedge the
-        # worker): the worker keeps serving whatever is present, and the next reload can retry the restart.
-        try:
-            self._process_lifecycle.restart_download_process()
-            # The fresh process must be told the live controls (its constructor took the config defaults, but
-            # a prior live TUI override is intentionally re-asserted from config on every reload anyway).
-            self._process_lifecycle.set_download_controls(
-                paused=self.bridge_data.downloads_paused,
-                rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
-                max_parallel_downloads=self.bridge_data.download_max_parallel_downloads,
-                per_host_concurrency=self.bridge_data.download_per_host_concurrency,
-                connections_per_file=self.bridge_data.download_connections_per_file,
-            )
-            # Let the restarted process's first authoritative scan re-request configured-missing models plus
-            # a fresh aux pass (one-shot guard reset), so newly-enabled aux categories actually download.
-            self._initial_download_requested = False
-        except Exception as e:  # noqa: BLE001 - a reload must never crash on a download-process restart
-            logger.error(f"Failed to restart the download process on reload (continuing): {type(e).__name__}: {e}")
+        logger.info("Download-affecting config changed on reload; applying the new gating live.")
+        self._process_lifecycle.set_download_gating(
+            nsfw=self.bridge_data.nsfw,
+            allow_lora=self.bridge_data.allow_lora,
+            allow_controlnet=self.bridge_data.allow_controlnet,
+            allow_sdxl_controlnet=self.bridge_data.allow_sdxl_controlnet,
+            allow_post_processing=self.bridge_data.allow_post_processing,
+            purge_loras=self.bridge_data.purge_loras_on_download,
+        )
 
     def _enter_downloads_only_hold(self) -> None:
         """Enter the download-only posture: keep fetching models but hold inference/safety/popping.
@@ -3195,9 +3185,9 @@ class HordeWorkerProcessManager:
             run_aux_if_incomplete=False,
             previously_configured=previously_configured,
         )
-        # A change to the download process's construction-time gating (aux flags, nsfw, purge) is applied
-        # by restarting it; live controls were already forwarded above.
-        self._reload_download_process_if_flags_changed(previous_download_flags)
+        # A change to the download process's gating (aux flags, nsfw, purge) is forwarded live; live controls
+        # were already forwarded above. Neither needs a download-process restart.
+        self._forward_download_gating_if_changed(previous_download_flags)
 
     def get_bridge_data_from_disk(self) -> None:
         """Load the bridge data from disk (blocking).
