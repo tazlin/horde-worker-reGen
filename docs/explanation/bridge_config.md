@@ -32,10 +32,21 @@ every second and calls `RuntimeConfig.update()` if it changed. Components read
 notifications. The hot-reload is best-effort; there is no atomicity guarantee
 across multiple reads.
 
+A file reload is applied live, including the download subsystem: the pause /
+bandwidth / parallelism controls and the download-gating flags
+(`allow_lora`, `allow_controlnet`, `allow_sdxl_controlnet`,
+`allow_post_processing`, `nsfw`, `purge_loras_on_download`) are forwarded to the
+running download process, which re-arms its one-shot auxiliary pass when a
+category is newly enabled. None of these require a worker or download-process
+restart. The set of fields that genuinely cannot change live (worker identity,
+GPU selection, and other structural choices) is small; those need a restart.
+
 If configuration was provided via environment variables, the `_bridge_data_loop`
-is **not started** and the config is effectively immutable. This reflects
-the typical use case of env var config (e.g. Docker) where dynamic updates are
-less common and file-watching would add unnecessary complexity for little benefit.
+is **not started** and the config is **restart-only**: change the environment
+variables and restart the worker to apply them. This reflects the typical use
+case of env var config (e.g. Docker), where dynamic updates are less common and
+file-watching would add complexity for little benefit. Operators who want live
+config changes should run from `bridgeData.yaml` rather than environment variables.
 
 ## Critical sections
 
