@@ -13,7 +13,7 @@ from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.job_tracker import JobTracker
 from horde_worker_regen.process_management.lru_cache import LRUCache
-from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
@@ -24,6 +24,7 @@ from .conftest import (
     make_test_card_runtimes,
     make_test_model_metadata,
     make_test_runtime_config,
+    track_popped_job_async,
 )
 
 
@@ -49,7 +50,10 @@ def _make_scheduler(
         process_map=process_map,
         horde_model_map=HordeModelMap(root={}),
         job_tracker=JobTracker(),
-        process_lifecycle=Mock(is_model_load_quarantined=Mock(return_value=False)),
+        process_lifecycle=Mock(
+            is_model_load_quarantined=Mock(return_value=False),
+            get_processes_with_model_for_queued_job=Mock(return_value=[]),
+        ),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         model_metadata=make_test_model_metadata(),
         card_runtimes=card_runtimes,
@@ -287,3 +291,71 @@ class TestPreloadCardPlacement:
         chosen = scheduler._select_preload_process(job, [])
         assert chosen is not None
         assert chosen.device_index == 0
+
+
+def _preloading_slot(process_id: int, *, device_index: int, model_name: str) -> Mock:
+    """A process mid-preload of ``model_name`` on ``device_index`` (busy, not available for a new load)."""
+    return make_mock_process_info(
+        process_id,
+        model_name=model_name,
+        state=HordeProcessState.PRELOADING_MODEL,
+        device_index=device_index,
+    )
+
+
+class TestPerCardPreloadSerialization:
+    """The preload-serialization gate is per-card: one card mid-load must not starve an idle other card.
+
+    Reproduction of the live two-1070 starvation: the gate exists so two checkpoints do not load onto the
+    *same* device at once, but it counted preloading processes worker-wide. The busy card was almost always
+    mid-preload, so every attempt to stage a model onto the idle second card was deferred and that card never
+    received its first model -- it sat ``WAITING_FOR_JOB`` forever while the other card did all the work.
+    """
+
+    async def test_idle_card_preloads_while_other_card_is_mid_preload(self) -> None:
+        """With card 0 mid-preload and card 1 idle, the pending job stages onto card 1 (not deferred)."""
+        idle_card1 = _empty_slot(2, device_index=1)
+        process_map = ProcessMap(
+            {
+                # Card 0's only slot is busy loading another model; card 1 has a free slot.
+                0: _preloading_slot(0, device_index=0, model_name="other_model"),
+                2: idle_card1,
+            },
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000),
+        )
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        admitted = scheduler.preload_models()
+
+        assert admitted is True, "the idle card must get the preload, not be blocked by the busy card"
+        assert idle_card1.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        assert idle_card1.loaded_horde_model_name == "stable_diffusion"
+
+    async def test_same_card_preload_still_serialized(self) -> None:
+        """Guard: two slots on the *same* card keep one-at-a-time serialization (the gate's real purpose)."""
+        idle_same_card = _empty_slot(1, device_index=0)
+        process_map = ProcessMap(
+            {
+                0: _preloading_slot(0, device_index=0, model_name="other_model"),
+                1: idle_same_card,
+            },
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            # One card only: routing inactive, so the count is worker-wide exactly as before.
+            card_runtimes=make_test_card_runtimes(
+                device_indices=(0,),
+                config=_card_config(models=["stable_diffusion"], max_pixels=5_000_000),
+            ),
+        )
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        admitted = scheduler.preload_models()
+
+        assert admitted is False, "a same-card preload must wait for the in-flight one to finish"
+        assert idle_same_card.last_control_flag != HordeControlFlag.PRELOAD_MODEL

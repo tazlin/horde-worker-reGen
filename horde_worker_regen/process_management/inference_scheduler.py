@@ -1850,7 +1850,16 @@ class InferenceScheduler:
                 self._process_lifecycle._replace_inference_process(available_process)
                 return False
 
-            num_preloading_processes = self._process_map.num_preloading_processes()
+            # Serialize preloads per card, not worker-wide: the gate exists so two checkpoints do not load
+            # onto the same device at once (disk-read + VRAM-allocation spike). On a multi-GPU host a load
+            # onto an idle card is independent of one happening on another card, so scope the in-flight count
+            # to the card this preload would land on. Worker-wide (device_index=None) on a single-GPU host
+            # keeps the original behavior byte-identical. Without this, a card that is almost always mid-load
+            # (the busy card) perpetually blocks the idle card from ever getting its first model -> starvation.
+            preload_scope_device = available_process.device_index if self._multi_gpu_routing_active else None
+            num_preloading_processes = self._process_map.num_preloading_processes(
+                device_index=preload_scope_device,
+            )
 
             at_least_one_preloading_process = num_preloading_processes >= 1
             very_fast_disk_mode_enabled = bridge_data.very_fast_disk_mode

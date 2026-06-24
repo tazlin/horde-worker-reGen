@@ -867,10 +867,18 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             count += 1
         return count
 
-    def num_preloading_processes(self) -> int:
-        """Return the number of processes that are preloading models."""
+    def num_preloading_processes(self, *, device_index: int | None = None) -> int:
+        """Return the number of processes that are preloading models.
+
+        Args:
+            device_index: When given, count only processes pinned to that card. The preload-serialization
+                gate is per-card on a multi-GPU host: one card loading a checkpoint must not block a load
+                onto a different, idle card (separate VRAM, independent of each other's disk-read spike).
+        """
         count = 0
         for p in self.values():
+            if device_index is not None and p.device_index != device_index:
+                continue
             if p.last_process_state == HordeProcessState.PRELOADING_MODEL:
                 count += 1
         return count
