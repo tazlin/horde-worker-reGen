@@ -133,7 +133,7 @@ class WebQuitWarningModal(ModalScreen[bool]):
 class HordeWorkerTUI(App[None]):
     """A Textual dashboard that owns and visualises the reGen worker."""
 
-    TITLE = "AI Horde Worker"
+    TITLE = f"AI Horde Worker - {__version__}"
 
     HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (100, "-normal"), (150, "-wide")]
     """Width bands Textual stamps onto the Screen as classes, mirroring the table column tiers.
