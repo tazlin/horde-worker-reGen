@@ -329,6 +329,41 @@ async def test_plan_table_states_readiness_in_plain_language(tmp_path: Path, mon
         assert "RUN" not in table  # the old command-like verdict cell is gone
 
 
+async def test_plan_table_shows_download_first_for_runnable_but_incomplete_levels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A level that fits the machine but lacks models/checkpoints/annotators reads as an actionable third state.
+
+    Not a green ``Ready`` (it would otherwise download mid-run and skew the timing) and not a grey ``Skip``
+    (it runs once fetched): the operator sees ``Download first`` with what to fetch, and the summary nags to
+    pre-download. Guards the reported bug where a controlnet level read ``Ready`` despite missing checkpoints.
+    """
+    monkeypatch.chdir(tmp_path)
+    app = _BenchmarkHarness()
+    async with app.run_test():
+        view = app.query_one(BenchmarkView)
+        rows = [
+            LevelPlanRow(
+                level_id="sd15-controlnet",
+                stage="controlnet",
+                tier="sd15",
+                estimated_vram_mb=4096,
+                will_run=True,
+                needs_download=True,
+                download_summary="controlnet checkpoints, controlnet annotators",
+            ),
+        ]
+
+        table = _render_to_text(view._plan_table(rows))
+        assert "Download first" in table
+        assert "controlnet checkpoints" in table  # the status names what must be fetched
+        assert "Ready" not in table  # it must never read as ready while required artifacts are missing
+
+        summary = _render_to_text(view._plan_summary(rows))
+        assert "Download models" in summary  # the unified pre-download nag points at the action
+
+
 async def test_stepper_marks_the_current_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The phase spine names every step and marks earlier ones done once the screen reaches a later phase."""
     monkeypatch.chdir(tmp_path)

@@ -102,6 +102,10 @@ class LevelRequirements(BaseModel):
     """
     controlnet_install_hint: str = ""
     """How to enable controlnet when the level needs it but the extra is absent (empty otherwise)."""
+    controlnet_checkpoints_missing: list[str] = Field(default_factory=list)
+    """The level's SD1.5 ``control_<type>`` checkpoint records confirmed absent on disk (empty when none, or
+    when the presence-only path skipped the reference read). These are feature models the image-model disk
+    plan does not cover, so a level that fits the machine but lacks them is "download first", not "ready"."""
     features: list[str] = Field(default_factory=list)
     """Human-readable feature tags exercised by the level (hires_fix, controlnet, post_processing, ...)."""
 
@@ -300,10 +304,21 @@ def annotators_present_offline(
 ) -> bool | None:
     """Whether the controlnet annotators for *control_types* are on disk, torch-free via HMR (no hordelib).
 
-    The single offline counterpart to the worker's annotator check that does NOT pay a cold hordelib import
-    (the cost the dry-run plan was deliberately avoiding when it hardcoded annotators as missing). Weightless
-    control types are vacuously present; returns None only when the weights root cannot be resolved.
+    Prefers hordelib's torch-free, existence-based ``annotators_resolvable`` (which consults the checkpoint
+    directory the engine actually uses *and* the HuggingFace hub cache a fetch would resolve from), and falls
+    back to the model reference's own existence check only when hordelib is too old to expose the resolver.
+    Both are torch-free, so the dry-run preview stays cheap. Weightless control types are vacuously present;
+    returns None only when presence cannot be determined.
     """
+    try:
+        from hordelib.preload import annotators_resolvable
+
+        resolved = annotators_resolvable(control_types)
+        if resolved is not None:
+            return resolved
+    except Exception as e:  # noqa: BLE001 - prefer hordelib, but fall back rather than fail
+        logger.debug(f"hordelib annotator resolver unavailable; falling back to reference existence check: {e}")
+
     try:
         from horde_model_reference.on_disk_layout import annotators_present_for_control_types, resolve_weights_root
 
@@ -396,20 +411,18 @@ def controlnet_installed() -> bool | None:
         return None
 
 
-def controlnet_annotators_present() -> bool | None:
-    """Whether the controlnet annotator checkpoints are already downloaded, or None when undeterminable.
+def controlnet_annotators_present(control_types: list[str]) -> bool | None:
+    """Whether the controlnet annotators for *control_types* are on disk/cached, or None when undeterminable.
 
-    Thin wrapper over hordelib's on-disk marker check (import-safe, no ``initialise``/GPU needed). Fails
-    open (None) when the engine is too old to expose the check or the marker directory cannot be resolved,
-    so a surface treats an unknown as "do not claim missing" rather than nagging spuriously.
+    A thin default-rooted alias over the single offline annotator-presence entry point,
+    :func:`annotators_present_offline`, kept for the in-process callers that do not pass a cache root.
+    Existence-based (hordelib's torch-free ``annotators_resolvable`` with a model-reference fallback), *not*
+    the pin-keyed preload marker: a level is nagged to pre-download annotators only when the files are
+    genuinely absent, never merely because a full preload-verify has not yet run for the current pin (the
+    bug that made a machine with the annotators on disk read as missing). Fails open (None) when presence
+    cannot be determined, so a surface treats an unknown as "do not claim missing".
     """
-    try:
-        from hordelib.preload import controlnet_annotators_present as _present
-
-        return _present()
-    except Exception as e:  # noqa: BLE001 - presence is best-effort; fail open to "unknown"
-        logger.debug(f"Could not determine controlnet annotator presence: {e}")
-        return None
+    return annotators_present_offline(control_types)
 
 
 def _controlnet_annotator_bytes(control_types: list[str]) -> int:
@@ -474,7 +487,9 @@ def compute_level_requirements(
     cn_installed = controlnet_installed() if requires_controlnet else None
     # Only meaningful when the extra is present: without onnxruntime the annotators are never fetched, so
     # "present" stays None (the install gate, not the download gate, is what a surface should surface).
-    cn_annotators_present = controlnet_annotators_present() if requires_controlnet and cn_installed else None
+    cn_annotators_present = (
+        controlnet_annotators_present(control_types) if requires_controlnet and cn_installed else None
+    )
     cn_install_hint = ""
     if requires_controlnet and cn_installed is False:
         try:
@@ -504,6 +519,15 @@ def compute_level_requirements(
         present_bytes = 0
         free_disk_bytes = None
 
+    # Controlnet checkpoints are feature models the image-model plan above does not cover; a level that fits
+    # the machine but lacks them must read as "download first", not "ready". The cheap present_resolver path
+    # (tests/offline) skips the reference read, leaving this empty.
+    controlnet_checkpoints_missing = (
+        [checkpoint.name for checkpoint in controlnet_checkpoint_files(control_types) if checkpoint.on_disk is False]
+        if requires_controlnet and present_resolver is None
+        else []
+    )
+
     return LevelRequirements(
         level_id=level.id,
         stage=str(level.stage),
@@ -526,6 +550,7 @@ def compute_level_requirements(
         controlnet_annotators_present=cn_annotators_present,
         controlnet_annotator_bytes=_controlnet_annotator_bytes(control_types),
         controlnet_install_hint=cn_install_hint,
+        controlnet_checkpoints_missing=controlnet_checkpoints_missing,
         features=_level_features(level),
     )
 

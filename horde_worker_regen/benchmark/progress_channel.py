@@ -124,6 +124,12 @@ class LevelPlanRow(BaseModel):
     will_run: bool = True
     verdict: str = ""
     """Empty when the level will run; otherwise the skip reason."""
+    needs_download: bool = False
+    """True when the level fits this machine but must download models/checkpoints/annotators before it can
+    run -- a distinct, actionable state between green "ready" and a grey "skip", surfaced as "Download first"."""
+    download_summary: str = ""
+    """A short phrase naming what a ``needs_download`` level must fetch (e.g. ``2 models, controlnet
+    annotators``); empty when nothing is missing."""
 
 
 _PLAN_JSON_BEGIN = "<<<HORDE_BENCHMARK_PLAN_JSON>>>"

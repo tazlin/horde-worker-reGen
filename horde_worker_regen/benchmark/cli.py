@@ -337,6 +337,7 @@ def _controlnet_annotator_row(
         size_bytes=size_bytes or None,
         on_disk=on_disk,
         target_path="(annotator cache)",
+        is_aux=True,  # a synthetic feature row; fetched via the annotator preload, never as an image model
     )
 
 
@@ -540,6 +541,7 @@ def _run_download(args: argparse.Namespace) -> int:
             size_bytes=feature.size_bytes,
             on_disk=feature.on_disk is True,
             target_path=feature.target_path,
+            is_aux=True,  # controlnet/post-proc checkpoints: fetched via the aux pass, never as image models
         )
         for feature in feature_files
     ]

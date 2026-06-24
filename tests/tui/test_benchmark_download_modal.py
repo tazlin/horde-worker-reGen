@@ -1,9 +1,9 @@
-"""Pilot tests for the benchmark download modal's live controls and progress rendering.
+"""Pilot tests for the benchmark download modal: plan rendering, live-worker overlay, and delegation.
 
-Drives the real :class:`BenchmarkDownloadModal` under Textual's ``run_test``: the plan subprocess is
-faked so no real benchmark runs, and the modal's Pause/Resume + rate-limit buttons are asserted to write
-the right control lines to the (captured) subprocess stdin, while a ``model_progress`` event is shown as a
-live progress bar.
+Drives the real :class:`BenchmarkDownloadModal` under Textual's ``run_test``: the plan subprocess is faked so
+no real benchmark runs. The modal is confirmation-only -- it never downloads in-process -- so the tests assert
+that the plan reflects a live worker's authoritative state and that confirming hands the missing models to the
+download delegate (the worker's own orchestration).
 """
 
 from __future__ import annotations
@@ -14,37 +14,20 @@ from types import SimpleNamespace
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Button, Input
+from textual.widgets import Button
 
 from horde_worker_regen.benchmark.download_progress import (
-    DownloadControl,
     DownloadEvent,
     DownloadModelRow,
-    decode_download_control,
     encode_download_event,
 )
 from horde_worker_regen.tui.benchmark_launcher import BenchmarkOptions
 from horde_worker_regen.tui.widgets.benchmark_download import BenchmarkDownloadModal, DownloadLiveState
 
 
-class _FakeStdin:
-    """Captures the control lines the modal writes to the subprocess."""
-
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-
-    def write(self, data: str) -> None:
-        self.lines.append(data)
-
-    def flush(self) -> None:
-        """No-op; the modal flushes after each control write."""
-
-
-class _FakePopen:
-    """A stand-in for the download subprocess that only needs a capturing stdin."""
-
-    def __init__(self) -> None:
-        self.stdin = _FakeStdin()
+def _accept_all(model_names: list[str]) -> bool:
+    """Return True for any request: the default delegate for tests that do not inspect what was requested."""
+    return True
 
 
 class _ModalHost(App[None]):
@@ -54,7 +37,7 @@ class _ModalHost(App[None]):
         self,
         options: BenchmarkOptions,
         *,
-        delegate: Callable[[list[str]], bool] | None = None,
+        delegate: Callable[[list[str]], bool] = _accept_all,
         live_state: Callable[[], DownloadLiveState | None] | None = None,
     ) -> None:
         super().__init__()
@@ -86,100 +69,8 @@ def _fake_plan_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-@pytest.mark.e2e
-async def test_modal_controls_write_control_lines_to_stdin() -> None:
-    """Pause/Resume and Apply-limit write the matching control commands to the subprocess stdin."""
-    app = _ModalHost(BenchmarkOptions(tiers=["sd15"]))
-    async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
-        modal = app.modal
-        # Simulate an in-flight download: a live process with capturing stdin and the controls shown.
-        fake = _FakePopen()
-        modal._process = fake  # type: ignore[assignment]
-        modal.query_one("#download-controls").display = True
-        await pilot.pause()
-
-        await pilot.click("#download-pause")
-        await pilot.pause()
-
-        modal.query_one("#download-rate", Input).value = "500"
-        await pilot.click("#download-rate-apply")
-        await pilot.pause()
-
-        # Pause (a no-arg command) and Apply-limit (a parameterized one) both reach the subprocess stdin.
-        commands = [decode_download_control(line) for line in fake.stdin.lines]
-        assert DownloadControl(cmd="pause") in commands
-        assert DownloadControl(cmd="rate", kbps=500) in commands
-
-        # Resume maps correctly off the toggled state (same _write_control path as Pause, flag flipped).
-        fake.stdin.lines.clear()
-        modal._toggle_pause()
-        await pilot.pause()
-        assert decode_download_control(fake.stdin.lines[-1]) == DownloadControl(cmd="resume")
-
-
-@pytest.mark.e2e
-async def test_modal_renders_live_progress_bar() -> None:
-    """A model_progress event is folded into a live progress line for the current model."""
-    app = _ModalHost(BenchmarkOptions(tiers=["sd15"]))
-    async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
-        modal = app.modal
-
-        modal._apply_event(DownloadEvent(kind="model_started", name="Deliberate", index=1, total=1))
-        modal._apply_event(
-            DownloadEvent(
-                kind="model_progress",
-                name="Deliberate",
-                index=1,
-                total=1,
-                downloaded_bytes=512,
-                total_bytes=1024,
-                speed_bps=1024.0,
-                eta_seconds=0.5,
-            ),
-        )
-        await pilot.pause()
-
-        assert modal._current_progress is not None
-        line = modal._progress_line(modal._current_progress)
-        assert "Deliberate" in line.plain
-        assert "50.0%" in line.plain  # 512 / 1024
-
-
-@pytest.mark.e2e
-async def test_modal_delegates_missing_models_to_the_worker_when_a_delegate_is_supplied() -> None:
-    """With a delegate (a live worker), confirming hands the missing models off instead of self-downloading.
-
-    The benchmark's download phase folds into the running worker's single download surface: the model
-    names reach the delegate and no out-of-process download subprocess is spawned.
-    """
-    requested: list[list[str]] = []
-    app = _ModalHost(BenchmarkOptions(tiers=["sd15"]), delegate=lambda names: requested.append(names) or True)
-    async with app.run_test(size=(120, 40)) as pilot:
-        await pilot.pause()
-        modal = app.modal
-        # Seed the computed plan directly (the on-mount dry-run is faked elsewhere), with one missing model.
-        modal._plan = DownloadEvent(
-            kind="planned",
-            models=[DownloadModelRow(name="Deliberate", size_bytes=100, on_disk=False, target_path="x")],
-            to_download_bytes=100,
-            free_disk_bytes=10_000_000,
-            fits=True,
-        )
-        modal.query_one("#download-start", Button).disabled = False
-        await pilot.pause()
-
-        await pilot.click("#download-start")
-        await pilot.pause()
-
-        assert requested == [["Deliberate"]]  # the missing model reached the worker delegate
-        assert modal._process is None  # no self-download subprocess was spawned
-        assert modal.query_one("#download-start", Button).disabled is True
-
-
 def _plan(*models: DownloadModelRow, fits: bool = True) -> DownloadEvent:
-    """A planned event over *models* with a benign disk budget, for driving the modal's render."""
+    """Return a planned event over *models* with a benign disk budget, for driving the modal's render."""
     to_download = sum(model.size_bytes or 0 for model in models if not model.on_disk)
     return DownloadEvent(
         kind="planned",
@@ -191,8 +82,71 @@ def _plan(*models: DownloadModelRow, fits: bool = True) -> DownloadEvent:
 
 
 def _row(name: str, *, on_disk: bool = False, size_bytes: int = 100) -> DownloadModelRow:
-    """A single plan row; ``on_disk`` is the offline scan's verdict, which a live worker may override."""
+    """Return a single plan row; ``on_disk`` is the offline scan's verdict, which a live worker may override."""
     return DownloadModelRow(name=name, size_bytes=size_bytes, on_disk=on_disk, target_path="x")
+
+
+async def test_confirming_requests_the_missing_models_via_the_delegate() -> None:
+    """Confirming hands the missing models to the download delegate and never downloads in-process.
+
+    The benchmark's download phase folds into the worker's single download surface: the model names reach the
+    delegate, the modal records that a request was made, and the Request button disables to prevent re-asking.
+    """
+    requested: list[list[str]] = []
+    app = _ModalHost(BenchmarkOptions(tiers=["sd15"]), delegate=lambda names: requested.append(names) or True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        modal = app.modal
+        modal._render_plan(_plan(_row("Deliberate", on_disk=False)))
+        await pilot.pause()
+
+        await pilot.click("#download-start")
+        await pilot.pause()
+
+        assert requested == [["Deliberate"]]  # the missing model reached the download orchestration
+        assert modal._requested_download is True
+        assert modal.query_one("#download-start", Button).disabled is True
+
+
+async def test_feature_models_are_not_requested_as_image_models() -> None:
+    """Controlnet/post-proc checkpoint rows (``is_aux``) are fetched via the aux pass, never requested by name.
+
+    Requesting an aux model by name routes it to the image manager, which has no record of it and fails (the
+    live-worker "Cannot download model without a reference record" bug). The fix keeps aux rows out of the
+    by-name image request while the delegate's ``include_aux`` still fetches them through their own managers.
+    """
+    requested: list[list[str]] = []
+    app = _ModalHost(BenchmarkOptions(tiers=["sd15"]), delegate=lambda names: requested.append(names) or True)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        modal = app.modal
+        image_row = _row("SD15Checkpoint", on_disk=False)
+        aux_row = DownloadModelRow(name="control_canny", on_disk=False, target_path="x", is_aux=True)
+        modal._render_plan(_plan(image_row, aux_row))
+        await pilot.pause()
+
+        # The plan still shows both, so the operator sees the full picture of what will be fetched.
+        assert modal._missing_model_names() == ["SD15Checkpoint", "control_canny"]
+
+        await pilot.click("#download-start")
+        await pilot.pause()
+        # ...but only the image model is requested by name; the controlnet checkpoint is left to the aux pass.
+        assert requested == [["SD15Checkpoint"]]
+
+
+async def test_a_rejected_request_surfaces_an_error_and_does_not_mark_requested() -> None:
+    """If the download subsystem cannot be reached, the modal says so and stays re-tryable (not 'requested')."""
+    app = _ModalHost(BenchmarkOptions(tiers=["sd15"]), delegate=lambda names: False)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        modal = app.modal
+        modal._render_plan(_plan(_row("Deliberate", on_disk=False)))
+        await pilot.pause()
+
+        await pilot.click("#download-start")
+        await pilot.pause()
+
+        assert modal._requested_download is False  # nothing was accepted, so the run can still be retried
 
 
 async def test_live_present_overrides_a_scanned_missing_model() -> None:
@@ -239,7 +193,7 @@ async def test_live_in_flight_shows_downloading_and_is_not_offered() -> None:
 async def test_mixed_live_state_offers_only_the_genuinely_missing() -> None:
     """With one model present, one in-flight and one truly absent, only the absent one is offered."""
     live = DownloadLiveState(present=frozenset({"A"}), in_flight=frozenset({"B"}))
-    app = _ModalHost(BenchmarkOptions(tiers=["sd15"]), delegate=lambda names: True, live_state=lambda: live)
+    app = _ModalHost(BenchmarkOptions(tiers=["sd15"]), live_state=lambda: live)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
         modal = app.modal
@@ -249,11 +203,11 @@ async def test_mixed_live_state_offers_only_the_genuinely_missing() -> None:
         assert modal._missing_model_names() == ["C"]
         start = modal.query_one("#download-start", Button)
         assert start.disabled is False
-        assert "Request 1 model(s)" in str(start.label)  # a live worker phrases it as a request, not a download
+        assert "Request 1 model(s)" in str(start.label)
 
 
 async def test_delegate_requests_only_models_not_already_in_flight() -> None:
-    """Contrived: the plan lists two missing models but the worker is already fetching one; only the other ships.
+    """Contrived: the plan lists two missing models but the worker is fetching one; only the other ships.
 
     Guards against re-requesting an in-flight model (the scheduler would dedupe it, but the UI must not even
     ask), which would otherwise look like a redundant action to the operator.
@@ -277,7 +231,7 @@ async def test_delegate_requests_only_models_not_already_in_flight() -> None:
 
 
 async def test_no_live_state_falls_back_to_the_offline_scan() -> None:
-    """With no worker (no live_state), the row's own scanned on_disk decides, and the verb is 'Download'."""
+    """With no worker (no live_state), the row's own scanned on_disk decides which models are missing."""
     app = _ModalHost(BenchmarkOptions(tiers=["sd15"]))
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.pause()
@@ -288,7 +242,7 @@ async def test_no_live_state_falls_back_to_the_offline_scan() -> None:
         assert modal._missing_model_names() == ["A"]
         start = modal.query_one("#download-start", Button)
         assert start.disabled is False
-        assert "Download 1 model(s)" in str(start.label)  # no live worker -> a self-download, not a request
+        assert "Request 1 model(s)" in str(start.label)
 
 
 async def test_a_raising_live_state_reader_falls_back_to_the_scan() -> None:

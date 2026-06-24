@@ -35,7 +35,7 @@ dependencies = [
     # weight-streaming telemetry (get_loaded_weights_offloaded_mb) the worker's streaming forecast and
     # whole-card exclusive residency depend on.
     "horde_engine[layerdiffuse,upscale-extra]>=3.7.0,<4.0.0",
-    "horde_model_reference>=6.0.0,<7.0.0",
+    "horde_model_reference>=7.0.2,<8.0.0",
     "python-dotenv",
     "ruamel.yaml",
     "semver",

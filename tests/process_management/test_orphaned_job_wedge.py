@@ -161,6 +161,25 @@ def test_repeated_orphan_punts_escalate_to_wedge() -> None:
     assert pm._assess_wedge() is True
 
 
+def test_download_only_hold_suppresses_the_wedge_verdict() -> None:
+    """A worker held for downloads is never assessed as wedged, so no watchdog reaps it for lack of inference.
+
+    Even with a genuine wedge condition present (an orphan-punt storm), the explicit download-only hold
+    short-circuits the verdict: a worker pre-fetching models by design runs no inference and pops no jobs, so
+    it must not be soft-reset or aborted (which would also reap its download process). The guard lifts when the
+    worker goes live or starts, restoring the normal wedge detection.
+    """
+    pm = make_testable_process_manager()
+    pm._orphan_punt_history = [time.time()] * pm._ORPHAN_PUNT_WEDGE_THRESHOLD
+    assert pm._assess_wedge() is True  # the wedge condition is genuinely present
+
+    pm._state.downloads_only_hold = True
+    assert pm._assess_wedge() is False  # ...but the download-only hold suppresses any wedge-driven reap
+
+    pm._state.downloads_only_hold = False  # cleared on go-live / start
+    assert pm._assess_wedge() is True  # ...and normal wedge detection resumes
+
+
 async def test_detected_deadlock_escalates_to_recovery_wedge() -> None:
     """A detected scheduler deadlock must be visible to the recovery supervisor."""
     pm = make_testable_process_manager()

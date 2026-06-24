@@ -76,6 +76,17 @@ class SupervisorLike(Protocol):
     def request_resume(self) -> bool:
         """Ask the worker to resume popping jobs."""
 
+    def request_drain(self) -> bool:
+        """Ask the worker to stop popping new jobs and let in-flight work finish (without exiting)."""
+
+    def request_set_concurrency(
+        self,
+        *,
+        target_processes: int | None = None,
+        target_threads: int | None = None,
+    ) -> bool:
+        """Ask the worker to scale running inference processes and/or the concurrent-inference cap."""
+
     def request_reload_config(self) -> bool:
         """Ask the worker to reload bridgeData.yaml."""
 
@@ -195,6 +206,25 @@ class AttachedWorkerSupervisor:
     def request_resume(self) -> bool:
         """Ask the worker to resume popping jobs."""
         return self.send_command(SupervisorControlMessage(command=SupervisorCommand.RESUME))
+
+    def request_drain(self) -> bool:
+        """Ask the worker to stop popping new jobs and let in-flight work finish (without exiting)."""
+        return self.send_command(SupervisorControlMessage(command=SupervisorCommand.DRAIN))
+
+    def request_set_concurrency(
+        self,
+        *,
+        target_processes: int | None = None,
+        target_threads: int | None = None,
+    ) -> bool:
+        """Ask the worker to scale running inference processes and/or the concurrent-inference cap."""
+        return self.send_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_CONCURRENCY,
+                target_processes=target_processes,
+                target_threads=target_threads,
+            ),
+        )
 
     def request_reload_config(self) -> bool:
         """Ask the worker to re-read bridgeData.yaml and hot-swap the runtime config."""

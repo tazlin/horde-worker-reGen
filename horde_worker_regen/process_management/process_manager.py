@@ -61,6 +61,7 @@ from horde_worker_regen.process_management.desired_state import DesiredState
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.duty_cycle import DutyCycleSummary, summarize_duty_cycle
 from horde_worker_regen.process_management.feature_readiness import (
+    CONTROLNET_ANNOTATOR_FAILED_DETAIL,
     FeatureInputs,
     GatedFeature,
     build_feature_readiness,
@@ -1590,6 +1591,7 @@ class HordeWorkerProcessManager:
             controlnet_present=message.controlnet_present,
             sdxl_controlnet_present=message.sdxl_controlnet_present,
             post_processing_present=message.post_processing_present,
+            controlnet_failed=message.controlnet_failed,
         )
 
         # A completed download changed the on-disk reference (a new image model, or the LoRa/TI/aux
@@ -1728,6 +1730,14 @@ class HordeWorkerProcessManager:
             return
         self._state.downloads_only_hold = False
         logger.info("Leaving download-only mode (GO_LIVE): starting inference/safety and resuming job popping.")
+        # A benchmark drain scales the inference pool to zero while the hold is active and latches
+        # ``_inference_processes_started`` (a side effect of SET_CONCURRENCY). The lazy starter short-circuits
+        # on that latch, so without clearing it here go-live would resume popping with an empty pool -- the
+        # worker would accept jobs it has no process to run. Clear the latch only when the pool is genuinely
+        # empty, so a hold that never shed inference (e.g. a manual download-only hold on a serving worker)
+        # does not spawn a duplicate set.
+        if self._inference_processes_started and self._process_map.num_inference_processes() == 0:
+            self._inference_processes_started = False
         self._maybe_start_safety_processes()
         self._maybe_start_inference_processes()
 
@@ -2003,6 +2013,12 @@ class HordeWorkerProcessManager:
         ``DeadlockSnapshot.indicates_structural_wedge``).
         """
         if self._state.shutting_down:
+            return False
+        if self._state.downloads_only_hold:
+            # A worker deliberately held for downloads runs no inference and pops no jobs by design, so it can
+            # never be "wedged" for lack of progress on work it is not accepting. Suppressing the verdict here
+            # keeps the save-our-ship recovery (soft resets, abandon-ship abort) from reaping the worker and
+            # its download process during a long pre-fetch. The hold is cleared on go-live / start.
             return False
         structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
         if structural_queue_wedge and (
@@ -3110,12 +3126,16 @@ class HordeWorkerProcessManager:
                     present=availability.controlnet_present,
                     deps_available=controlnet_deps,
                     deps_hint=controlnet_hint,
+                    failed=availability.controlnet_failed,
+                    failed_detail=CONTROLNET_ANNOTATOR_FAILED_DETAIL,
                 ),
                 GatedFeature.SDXL_CONTROLNET: FeatureInputs(
                     enabled=bridge_data.allow_sdxl_controlnet,
                     present=availability.sdxl_controlnet_present,
                     deps_available=controlnet_deps,
                     deps_hint=controlnet_hint,
+                    failed=availability.controlnet_failed,
+                    failed_detail=CONTROLNET_ANNOTATOR_FAILED_DETAIL,
                 ),
                 GatedFeature.POST_PROCESSING: FeatureInputs(
                     enabled=bridge_data.allow_post_processing,

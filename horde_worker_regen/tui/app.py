@@ -35,7 +35,7 @@ from horde_worker_regen.app_state import (
     benchmark_status_summary,
     should_prompt_onboarding,
 )
-from horde_worker_regen.process_management.supervisor_channel import WorkerStateSnapshot
+from horde_worker_regen.process_management.supervisor_channel import DownloadPhase, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.tui import socket_protocol as sp
@@ -54,7 +54,7 @@ from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.update_check import check_for_update
-from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
+from horde_worker_regen.tui.widgets.benchmark import BenchmarkView, BenchmarkWaitingState
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, ConfigLeaveChoice, ConfigLeaveModal
 from horde_worker_regen.tui.widgets.download_picker import (
     DownloadPickerModal,
@@ -80,6 +80,20 @@ if TYPE_CHECKING:
     # Imported for annotations only; the modal module is imported lazily at use (its subprocess plumbing
     # stays off the TUI hot path), so the live-state type must not pull it in at module load.
     from horde_worker_regen.tui.widgets.benchmark_download import DownloadLiveState
+
+
+_BENCHMARK_DRAIN_TIMEOUT_SECONDS = 150.0
+"""How long to let a live worker drain its in-flight jobs before falling back to a hard stop. Sized above the
+worker's own drain backstop (a job plus its grace) so a normally-finishing job is never cut short."""
+_BENCHMARK_SCALE_TIMEOUT_SECONDS = 45.0
+"""How long to wait for the scaled-down inference processes (and their GPU contexts) to actually exit."""
+_BENCHMARK_DRAIN_POLL_SECONDS = 0.5
+"""How often the drain wait re-checks the worker's latest snapshot."""
+
+
+def _no_inference_contexts(snapshot: WorkerStateSnapshot) -> bool:
+    """Whether no inference process is alive (so its GPU VRAM is released and the benchmark can take the card)."""
+    return not any(process.process_type == "INFERENCE" and process.is_alive for process in snapshot.processes)
 
 
 class WebQuitWarningModal(ModalScreen[bool]):
@@ -139,11 +153,11 @@ class WebQuitWarningModal(ModalScreen[bool]):
 
 
 class BenchmarkOverWorkerModal(ModalScreen[bool]):
-    """Confirm that starting a benchmark will stop the running worker and pause its in-flight downloads.
+    """Confirm handing the GPU to a benchmark while the worker is serving jobs.
 
-    The benchmark needs the GPU to itself, so launching it tears the worker down. That is destructive to a
-    serving worker (jobs in flight are abandoned, background downloads pause), so it must never happen on a
-    single click without the operator agreeing to it.
+    The benchmark needs the GPU to itself. Rather than tear the worker down, the app drains its queue (letting
+    in-flight jobs finish) and frees the GPU while keeping the worker alive and ready to resume with Go live.
+    That still interrupts serving, so it must never happen on a single click without the operator agreeing.
     """
 
     DEFAULT_CSS = """
@@ -165,34 +179,105 @@ class BenchmarkOverWorkerModal(ModalScreen[bool]):
 
     BINDINGS = [("escape", "cancel", "Cancel")]
 
+    def __init__(self, *, serving: bool) -> None:
+        """Store whether the worker is currently serving jobs, so the warning describes the real disruption.
+
+        Args:
+            serving: True when the worker has live inference (jobs would be interrupted); False when it is
+                alive but not serving (e.g. held while downloading), where the benchmark only takes the idle GPU.
+        """
+        super().__init__()
+        self._serving = serving
+
     def compose(self) -> ComposeResult:
-        """Lay out the warning text and the stop-and-benchmark / cancel choices."""
+        """Lay out the warning text and the run / cancel choices."""
         with Vertical(id="bench-over-worker-dialog"):
             yield Static(self._message(), id="bench-over-worker-message")
-            yield Button("Stop worker & run benchmark", id="bench-over-worker-confirm", variant="warning")
-            yield Button("Cancel (keep serving)", id="bench-over-worker-cancel", variant="primary")
+            confirm_label = "Drain worker & run benchmark" if self._serving else "Use the GPU & run benchmark"
+            yield Button(confirm_label, id="bench-over-worker-confirm", variant="warning")
+            yield Button("Cancel (keep worker as-is)", id="bench-over-worker-cancel", variant="primary")
 
-    @staticmethod
-    def _message() -> Text:
-        return Text.assemble(
-            ("Start benchmark?\n\n", "bold"),
-            (
-                "The worker is running and serving jobs. Starting the benchmark stops it to free the GPU "
-                "and pauses any in-flight downloads; the worker stays stopped until the benchmark finishes. "
-                "Cancel to keep serving.",
-                "grey70",
-            ),
-        )
+    def _message(self) -> Text:
+        if self._serving:
+            body = (
+                "The worker is running and serving jobs. Starting the benchmark drains its queue, lets "
+                "in-flight jobs finish, then frees the GPU for the benchmark while keeping the worker alive "
+                "(its downloads keep running). It will not serve jobs again until you press Go live. "
+                "Cancel to keep serving."
+            )
+        else:
+            body = (
+                "The worker is running but not serving jobs (it is held, e.g. while downloading). Starting the "
+                "benchmark takes the idle GPU while the worker stays alive and keeps downloading; it resumes "
+                "serving when you press Go live. Cancel to leave the worker as it is."
+            )
+        return Text.assemble(("Start benchmark?\n\n", "bold"), (body, "grey70"))
 
     def action_cancel(self) -> None:
-        """Dismiss as False (keep serving) when Escape is pressed."""
+        """Dismiss as False (leave the worker as it is) when Escape is pressed."""
         self.dismiss(False)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Confirm stops the worker and benchmarks; cancel leaves it serving."""
+        """Confirm frees the GPU for the benchmark; cancel leaves the worker as it is."""
         if event.button.id == "bench-over-worker-confirm":
             self.dismiss(True)
         elif event.button.id == "bench-over-worker-cancel":
+            self.dismiss(False)
+
+
+class BenchmarkActionConfirmModal(ModalScreen[bool]):
+    """Confirm an action that would interfere with an in-progress benchmark download, with a plain explanation.
+
+    A reusable yes/no for the benchmark↔download coordination guards (running before the models finish, or
+    going live while benchmark-only downloads are still in flight): the body spells out the consequence so the
+    operator chooses with the trade-off in front of them, rather than a contradictory action happening silently.
+    """
+
+    DEFAULT_CSS = """
+    BenchmarkActionConfirmModal {
+        align: center middle;
+    }
+    BenchmarkActionConfirmModal #bench-confirm-dialog {
+        width: 72;
+        height: auto;
+        padding: 1 2;
+        border: thick $warning;
+        background: $surface;
+    }
+    BenchmarkActionConfirmModal #bench-confirm-dialog Button {
+        width: 100%;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, *, title: str, body: str, confirm_label: str) -> None:
+        """Store the dialog's title, explanatory body, and the label for its affirmative button."""
+        super().__init__()
+        self._title = title
+        self._body = body
+        self._confirm_label = confirm_label
+
+    def compose(self) -> ComposeResult:
+        """Lay out the explanation and the confirm / cancel choices."""
+        with Vertical(id="bench-confirm-dialog"):
+            yield Static(
+                Text.assemble((f"{self._title}\n\n", "bold"), (self._body, "grey70")),
+                id="bench-confirm-message",
+            )
+            yield Button(self._confirm_label, id="bench-confirm-confirm", variant="warning")
+            yield Button("Cancel", id="bench-confirm-cancel", variant="primary")
+
+    def action_cancel(self) -> None:
+        """Dismiss as False (do not proceed) when Escape is pressed."""
+        self.dismiss(False)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Proceed on confirm; cancel leaves things unchanged."""
+        if event.button.id == "bench-confirm-confirm":
+            self.dismiss(True)
+        elif event.button.id == "bench-confirm-cancel":
             self.dismiss(False)
 
 
@@ -271,6 +356,20 @@ class HordeWorkerTUI(App[None]):
         self._frame = 0
         self._last_benchmark_status = BenchmarkSupervisorStatus.IDLE
         self._pending_benchmark_options = BenchmarkOptions()
+        # True when the benchmark freed the GPU by gracefully draining a live worker (which stays alive, held)
+        # rather than hard-stopping it. Drives the post-run guidance: "Go live" to resume vs "restart".
+        self._benchmark_drained_worker = False
+        # True while a benchmark download is in progress: the "waiting for benchmark models" mode that shows
+        # the banner, gates Run, and warns before actions that would interrupt the fetch. Tracked as a flag
+        # (not just a non-empty set) so a features-only request -- whose image-model set is empty because the
+        # controlnet/post-proc checkpoints fetch via the aux pass -- still engages the mode.
+        self._benchmark_waiting_active = False
+        # The image model names a benchmark download requested, for the banner's N/M progress and the
+        # config-subset check; feature models are not named here (the aux pass fetches them).
+        self._benchmark_waiting_models: set[str] = set()
+        # Set once the download subsystem is observed busy after a benchmark request, so the wait does not
+        # complete on an initial idle snapshot taken before the fetch has actually started.
+        self._benchmark_download_seen_active = False
         # Set when "Download only" starts a stopped worker: the hold command is sent once its pipe is up
         # (see _tick), since send_command would otherwise race the child's connection.
         self._pending_downloads_only_hold = False
@@ -536,6 +635,7 @@ class HordeWorkerTUI(App[None]):
                 frame=self._frame,
                 mode=self._view_mode,
             )
+            self._update_benchmark_waiting()
         except NoMatches:
             # The refresh interval can fire during mount or teardown; skip until the DOM is ready.
             pass
@@ -569,11 +669,14 @@ class HordeWorkerTUI(App[None]):
             return
         self._last_benchmark_status = status
         if status is BenchmarkSupervisorStatus.FINISHED:
-            self.notify("Benchmark finished. Apply the suggested config, or press F9 to restart the worker.")
+            if self._benchmark_drained_worker and self._supervisor.is_alive():
+                self.notify("Benchmark finished. Apply the suggested config, or press Go live to resume serving.")
+            else:
+                self.notify("Benchmark finished. Apply the suggested config, or press F9 to restart the worker.")
         elif status is BenchmarkSupervisorStatus.FAILED:
-            self.notify("Benchmark failed; see the run's console.log.", severity="error")
+            self.notify(f"Benchmark failed; see the run's console.log.{self._resume_hint()}", severity="error")
         elif status is BenchmarkSupervisorStatus.CANCELLED:
-            self.notify("Benchmark cancelled.")
+            self.notify(f"Benchmark cancelled.{self._resume_hint()}")
         if status in (BenchmarkSupervisorStatus.FINISHED, BenchmarkSupervisorStatus.FAILED):
             with contextlib.suppress(NoMatches):
                 self.query_one(BenchmarkView).refresh_app_state_summary()
@@ -637,7 +740,33 @@ class HordeWorkerTUI(App[None]):
             self.notify("Could not enter download-only mode (worker not reachable).", severity="warning")
 
     def on_downloads_view_go_live_requested(self, _message: DownloadsView.GoLiveRequested) -> None:
-        """Leave download-only mode so the worker starts serving jobs."""
+        """Leave download-only mode so the worker serves jobs, warning first if it would strand a benchmark fetch."""
+        if self._benchmark_waiting_incomplete() and self._benchmark_waiting_outside_config():
+            # Going live resumes serving, which can stop benchmark-only downloads that the config would not
+            # re-fetch. (When every waited-for model IS in the config, serving downloads them anyway: no warning.)
+            self.push_screen(
+                BenchmarkActionConfirmModal(
+                    title="Go live while benchmark models download?",
+                    body=(
+                        "Going live resumes serving and may stop the benchmark-only model downloads still in "
+                        "progress -- they are not in this worker's config, so serving will not re-fetch them. "
+                        "Continue, or cancel and let them finish first?"
+                    ),
+                    confirm_label="Go live anyway",
+                ),
+                self._on_go_live_while_waiting_choice,
+            )
+            return
+        self._do_go_live()
+
+    def _on_go_live_while_waiting_choice(self, confirmed: bool | None) -> None:
+        """Go live only if the operator accepted interrupting the in-progress benchmark download."""
+        if confirmed:
+            self._clear_benchmark_waiting()  # serving may stop the benchmark-only fetch; leave the waiting mode
+            self._do_go_live()
+
+    def _do_go_live(self) -> None:
+        """Send the go-live request and report whether the worker will start serving."""
         sent = self._supervisor.request_go_live()
         self.notify(
             "Going live: the worker will start serving jobs as models finish downloading."
@@ -871,18 +1000,46 @@ class HordeWorkerTUI(App[None]):
             self.action_restart_worker()
 
     def on_benchmark_view_run_requested(self, message: BenchmarkView.RunRequested) -> None:
-        """Launch the benchmark, first confirming the GPU takeover when a worker is actively serving."""
+        """Launch the benchmark, first gating on an in-progress download and the GPU takeover of a live worker."""
         if self._benchmark_supervisor.is_active:
             self.notify("A benchmark is already running.", severity="warning")
             return
-        if self._supervisor.is_alive():
-            # Stopping a serving worker mid-flight is destructive; require an explicit yes before doing it.
+        if self._benchmark_waiting_incomplete():
+            # The benchmark's own models are still downloading; running now fetches them mid-run (slow, skewed).
             self.push_screen(
-                BenchmarkOverWorkerModal(),
-                partial(self._on_benchmark_over_worker_choice, message.options),
+                BenchmarkActionConfirmModal(
+                    title="Benchmark models still downloading",
+                    body=(
+                        "The benchmark's models are still downloading in the background. Run now anyway? They "
+                        "will be fetched mid-run, which slows and skews the measurement. Or cancel and wait for "
+                        "the waiting banner to clear, then run."
+                    ),
+                    confirm_label="Run anyway",
+                ),
+                partial(self._on_run_while_waiting_choice, message.options),
             )
             return
-        self._launch_benchmark(message.options)
+        self._proceed_with_run_request(message.options)
+
+    def _on_run_while_waiting_choice(self, options: BenchmarkOptions, confirmed: bool | None) -> None:
+        """Proceed with the run only if the operator chose to run despite the in-progress download."""
+        if confirmed:
+            self._clear_benchmark_waiting()  # the operator abandoned the wait to run now
+            self._proceed_with_run_request(options)
+
+    def _proceed_with_run_request(self, options: BenchmarkOptions) -> None:
+        """Run the benchmark, confirming the GPU takeover first when a worker is alive."""
+        if self._supervisor.is_alive():
+            # Freeing a live worker's GPU interrupts it; require an explicit yes, and describe the real
+            # disruption (a serving worker loses its queue; a held one only yields the idle GPU).
+            snapshot = self._supervisor.latest_snapshot
+            serving = snapshot is None or not _no_inference_contexts(snapshot)
+            self.push_screen(
+                BenchmarkOverWorkerModal(serving=serving),
+                partial(self._on_benchmark_over_worker_choice, options),
+            )
+            return
+        self._launch_benchmark(options)
 
     def _on_benchmark_over_worker_choice(self, options: BenchmarkOptions, confirmed: bool | None) -> None:
         """Proceed with the benchmark only when the operator agreed to stop the running worker."""
@@ -891,6 +1048,8 @@ class HordeWorkerTUI(App[None]):
 
     def _launch_benchmark(self, options: BenchmarkOptions) -> None:
         """Stop the worker (freeing the GPU) and launch the benchmark, off the UI thread."""
+        # The run is past the download stage: leave the waiting mode so its banner and gate do not linger.
+        self._clear_benchmark_waiting()
         self._pending_benchmark_options = options
         # Show the PREPARING state immediately: the stop below blocks for up to ~100s, and without a
         # visible phase on the Benchmark tab that wait is indistinguishable from a hang.
@@ -922,20 +1081,113 @@ class HordeWorkerTUI(App[None]):
             self._after_benchmark_download,
         )
 
-    def _benchmark_download_delegate(self) -> Callable[[list[str]], bool] | None:
-        """A delegate that hands models to the running worker's download process, or None when none is live.
+    def _benchmark_download_delegate(self) -> Callable[[list[str]], bool]:
+        """Return a delegate that routes the benchmark's missing models through the download orchestration.
 
-        The worker keeps serving (a download takes no GPU); it just background-fetches the benchmark's
-        models into the shared cache. Auxiliary models are included since a benchmark level may exercise
+        Always available, so the benchmark never runs a second, contending downloader. A live worker
+        background-fetches the models into the shared cache while it keeps serving (a download takes no GPU);
+        a stopped worker is started into a download-only hold (GPU idle) and the request is sent once its
+        control pipe is up. Auxiliary models are included since a benchmark level may exercise
         controlnet/post-processing.
         """
-        if not self._supervisor.is_alive():
-            return None
 
         def _delegate(model_names: list[str]) -> bool:
-            return self._supervisor.request_download_models(model_names, include_aux=True)
+            if self._supervisor.is_alive():
+                if not self._supervisor.request_download_models(model_names, include_aux=True):
+                    return False
+                self._enter_benchmark_waiting(model_names)
+                return True
+            # A stopped worker: start it GPU-idle, then send the hold and the request once the pipe is up
+            # (see _tick); a cold install has nothing present, so inference will not start in the meantime.
+            self._supervisor.start()
+            self._pending_downloads_only_hold = True
+            self._pending_download_models = DownloadSelection(model_names=list(model_names), include_aux=True)
+            self._enter_benchmark_waiting(model_names)
+            return True
 
         return _delegate
+
+    def _enter_benchmark_waiting(self, model_names: list[str]) -> None:
+        """Enter the "waiting for benchmark models" mode for a freshly requested download set.
+
+        Records the requested image models (so the run gate and the start/go-live warnings can reckon them
+        against the live download state) and arms the "seen active" guard, so the wait does not complete on an
+        idle snapshot captured before the worker has begun fetching. The mode engages even when *model_names*
+        is empty (a features-only request), since the feature files still download via the aux pass.
+        """
+        self._benchmark_waiting_active = True
+        self._benchmark_waiting_models = set(model_names)
+        self._benchmark_download_seen_active = False
+
+    def _clear_benchmark_waiting(self) -> None:
+        """Leave the waiting mode and clear its banner (the models are ready, or the wait was abandoned)."""
+        if not self._benchmark_waiting_active:
+            return
+        self._benchmark_waiting_active = False
+        self._benchmark_waiting_models = set()
+        self._benchmark_download_seen_active = False
+        with contextlib.suppress(NoMatches):
+            self.query_one(BenchmarkView).set_benchmark_waiting(None)
+
+    def _benchmark_waiting_incomplete(self) -> bool:
+        """Whether a benchmark download is still in progress (the waiting mode is active)."""
+        return self._benchmark_waiting_active
+
+    def _benchmark_waiting_outside_config(self) -> bool:
+        """Whether any waited-for model is NOT in the worker config's would-download set.
+
+        When every benchmark-requested model is already in the configured set, starting/serving the worker
+        would download them anyway, so an action that resumes serving need not warn. Only models outside that
+        set are genuinely "benchmark-only" downloads an action could strand, which is what the warning guards.
+        Fails safe to True (warn) when the configured set cannot be read.
+        """
+        if not self._benchmark_waiting_models:
+            return False
+        try:
+            manager = self.query_one(ModelManagerView)
+        except NoMatches:
+            return True
+        configured = {model.name for model in manager.configured_included_models()}
+        return not self._benchmark_waiting_models <= configured
+
+    def _update_benchmark_waiting(self) -> None:
+        """Reflect background benchmark-download progress into the banner, completing the wait when done.
+
+        Completion is judged by the download subsystem rather than per-model presence: the requested set may
+        include feature models (controlnet checkpoints, annotators) the worker's present-set never names, so a
+        name-by-name wait would stall. The wait ends when the requested image models are all present, or when
+        the subsystem -- having been seen busy -- returns to idle (everything it was asked to fetch is done).
+        """
+        if not self._benchmark_waiting_active:
+            return
+        try:
+            view = self.query_one(BenchmarkView)
+        except NoMatches:
+            return
+        snapshot = self._supervisor.latest_snapshot
+        downloads = snapshot.downloads if snapshot is not None else None
+        total = len(self._benchmark_waiting_models)
+        if downloads is None:
+            view.set_benchmark_waiting(BenchmarkWaitingState(total=total, ready=0))
+            return
+        if downloads.phase in (DownloadPhase.SCANNING, DownloadPhase.DOWNLOADING, DownloadPhase.PAUSED):
+            self._benchmark_download_seen_active = True
+        present = set(downloads.present_model_names)
+        ready = len(self._benchmark_waiting_models & present)
+        # An empty requested set (a features-only request) is never "all present" -- those files do not appear
+        # in the present-set, so completion must come from the subsystem settling, not a vacuous subset check.
+        all_present = bool(self._benchmark_waiting_models) and self._benchmark_waiting_models <= present
+        subsystem_settled = self._benchmark_download_seen_active and downloads.phase is DownloadPhase.IDLE
+        if all_present or subsystem_settled:
+            self._clear_benchmark_waiting()
+            view.refresh_plan_preview()
+            self.notify("Benchmark models ready. You can run the benchmark now.")
+            return
+        if self._benchmark_download_seen_active and downloads.phase is DownloadPhase.ERROR:
+            self._clear_benchmark_waiting()
+            self.notify("Some benchmark model downloads failed; see the Downloads tab.", severity="warning")
+            return
+        view.set_benchmark_waiting(BenchmarkWaitingState(total=total, ready=ready))
 
     def _benchmark_live_state(self) -> Callable[[], DownloadLiveState | None] | None:
         """A reader of the live worker's present/in-flight model set for the benchmark plan, or None.
@@ -965,23 +1217,94 @@ class HordeWorkerTUI(App[None]):
 
         return _read
 
-    def _after_benchmark_download(self, downloaded_any: bool | None) -> None:
-        """Refresh the benchmark plan preview when a self-download actually landed models on disk."""
-        if downloaded_any:
+    def _after_benchmark_download(self, download_requested: bool | None) -> None:
+        """Refresh the benchmark plan preview once a download has been requested through the orchestration.
+
+        The fetch itself runs in the background (tracked on the Downloads tab); refreshing here updates the
+        plan's live overlay so the requested models read as downloading rather than still-missing.
+        """
+        if download_requested:
             with contextlib.suppress(NoMatches):
                 self.query_one(BenchmarkView).refresh_plan_preview()
 
     def _start_benchmark_flow(self) -> None:
-        """Stop the worker, then start the benchmark subprocess (runs in a thread)."""
-        self._supervisor.stop()
+        """Free the GPU for the benchmark, then start it (runs in a thread).
+
+        A running worker is freed *gracefully* first: drain its queue, let in-flight jobs finish, and scale
+        its inference processes to nothing while keeping the worker alive (its downloads keep running). That
+        leaves it cheaply resumable with Go live afterwards, instead of a full stop/restart. The hard stop is
+        the backstop only when the graceful drain cannot free the GPU within the time budget.
+        """
+        self._benchmark_drained_worker = False
+        if self._supervisor.is_alive():
+            self._benchmark_drained_worker = self._drain_worker_for_benchmark()
+        if not self._benchmark_drained_worker:
+            # No worker was running, or the graceful drain timed out: hard-stop so a wedged job never blocks
+            # the run. (stop() on an already-stopped worker is a harmless no-op.)
+            self._supervisor.stop()
         self._benchmark_supervisor.start(self._pending_benchmark_options)
         self.call_from_thread(self._after_benchmark_started)
+
+    def _drain_worker_for_benchmark(self) -> bool:
+        """Gracefully free the GPU from a live worker without stopping it; True only if the GPU came free.
+
+        Three bounded steps: stop popping and let in-flight inference finish; hold the worker (so the
+        scheduler will not re-grow inference) and scale its inference processes to zero; then wait for those
+        GPU contexts to actually go away. Any step exceeding its budget returns False so the caller falls back
+        to a hard stop -- the GPU must be free before the benchmark can use it.
+        """
+        self._supervisor.request_drain()
+        if not self._wait_for_worker(
+            lambda snapshot: snapshot.jobs_in_progress == 0 and snapshot.jobs_pending_inference == 0,
+            timeout=_BENCHMARK_DRAIN_TIMEOUT_SECONDS,
+        ):
+            return False
+        # The hold keeps inference/popping deferred (so nothing re-grows) while the worker -- and its download
+        # process -- stay alive; scaling to 0 sheds the now-idle inference processes that hold GPU VRAM.
+        self._supervisor.request_downloads_only_hold()
+        self._supervisor.request_set_concurrency(target_processes=0)
+        return self._wait_for_worker(_no_inference_contexts, timeout=_BENCHMARK_SCALE_TIMEOUT_SECONDS)
+
+    def _wait_for_worker(
+        self,
+        predicate: Callable[[WorkerStateSnapshot], bool],
+        *,
+        timeout: float,
+    ) -> bool:
+        """Poll the worker's latest snapshot until *predicate* holds or *timeout* elapses (worker thread).
+
+        Ticks on the UI thread keep draining fresh snapshots while this blocks, so a simple poll observes the
+        worker's progress. Returns False on timeout (the caller treats that as "could not free the GPU").
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            snapshot = self._supervisor.latest_snapshot
+            if snapshot is not None and predicate(snapshot):
+                return True
+            if not self._supervisor.is_alive():
+                # The worker exited from under us (crash/operator stop): nothing to drain, let the caller stop.
+                return False
+            time.sleep(_BENCHMARK_DRAIN_POLL_SECONDS)
+        return False
+
+    def _resume_hint(self) -> str:
+        """A trailing ' Press Go live...' hint when the worker was left held by the graceful drain, else ''.
+
+        Keeps the post-run messaging honest: a drained worker is alive but not serving, so the operator is
+        told how to resume rather than being left to wonder why it sits idle.
+        """
+        if self._benchmark_drained_worker and self._supervisor.is_alive():
+            return " The worker is held; press Go live to resume serving."
+        return ""
 
     def _after_benchmark_started(self) -> None:
         """Focus the Benchmark tab once the run is launched (UI thread)."""
         with contextlib.suppress(NoMatches):
             self.query_one("#main-tabs", TabbedContent).active = "tab-benchmark"
-        self.notify("Benchmark started; the worker is stopped until it completes.")
+        if self._benchmark_drained_worker:
+            self.notify("Benchmark started; the worker is held (GPU freed) and resumes with Go live when it finishes.")
+        else:
+            self.notify("Benchmark started; the worker is stopped until it completes.")
 
     def on_benchmark_view_cancel_requested(self, message: BenchmarkView.CancelRequested) -> None:
         """Cancel the running benchmark, off the UI thread."""

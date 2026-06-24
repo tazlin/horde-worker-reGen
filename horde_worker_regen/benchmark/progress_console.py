@@ -127,6 +127,19 @@ def _format_controlnet(row: LevelPlanRow) -> str:
     return size or "ok"
 
 
+def _format_verdict(row: LevelPlanRow) -> str:
+    """Render a level's plan verdict: ``RUN``, ``DOWNLOAD FIRST (...)``, or ``SKIP (reason)``.
+
+    Three states so the console matches the TUI: a level that fits the machine but is missing downloadable
+    artifacts reads ``DOWNLOAD FIRST`` (runnable once fetched), distinct from a ``RUN`` or a hard ``SKIP``.
+    """
+    if row.needs_download:
+        return f"DOWNLOAD FIRST ({row.download_summary})" if row.download_summary else "DOWNLOAD FIRST"
+    if row.will_run:
+        return "RUN"
+    return f"SKIP ({row.verdict})"
+
+
 def format_plan_table(rows: list[LevelPlanRow]) -> str:
     """Render the resource plan as an aligned text table (LEVEL / VRAM / DISK / NET / KEY / CN / VERDICT).
 
@@ -146,7 +159,7 @@ def format_plan_table(rows: list[LevelPlanRow]) -> str:
                 "yes" if row.requires_network else "-",
                 "civitai" if row.requires_civitai_key else "-",
                 _format_controlnet(row),
-                "RUN" if row.will_run else f"SKIP ({row.verdict})",
+                _format_verdict(row),
             ),
         )
 
@@ -159,16 +172,13 @@ def format_plan_table(rows: list[LevelPlanRow]) -> str:
 
     lines = ["Resource plan (verdicts reflect the detected machine):", _line(header)]
     lines.extend(_line(cells) for cells in body)
-    needs_models = any(row.num_models_missing for row in rows)
-    # Only nag when the annotators are confirmed absent on disk (present is False). A static ROM size > 0
-    # is not evidence they are missing; keying off it nagged on every controlnet run even once they were
-    # downloaded. Unknown presence (None) stays silent: the level still pre-warms before the timed run.
-    needs_annotators = any(row.requires_controlnet and row.controlnet_annotators_present is False for row in rows)
-    if needs_models or needs_annotators:
-        what = "models" if needs_models and not needs_annotators else "models/controlnet annotators"
+    # A single nag from the per-row download-first verdict (which reckons missing image models, controlnet
+    # checkpoints, and confirmed-absent annotators); unknown presence stays silent (the level pre-warms first).
+    if any(row.needs_download for row in rows):
         lines.append(
-            f"Some levels need {what} that are not downloaded yet. Run `horde-benchmark download` first so "
-            "the timed run is not slowed (and skewed) by downloading mid-benchmark.",
+            "Some levels need models, controlnet checkpoints, or annotators that are not downloaded yet. Run "
+            "`horde-benchmark download` first so the timed run is not slowed (and skewed) by downloading "
+            "mid-benchmark.",
         )
     return "\n".join(lines)
 

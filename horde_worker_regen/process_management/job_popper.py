@@ -20,6 +20,7 @@ from loguru import logger
 from horde_worker_regen.process_management._canned_scenarios import CannedJobSource, make_default_dry_run_source
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.feature_readiness import (
+    CONTROLNET_ANNOTATOR_FAILED_DETAIL,
     FeatureInputs,
     GatedFeature,
     build_feature_readiness,
@@ -632,10 +633,14 @@ class JobPopper:
                     GatedFeature.CONTROLNET: FeatureInputs(
                         enabled=pop_allow_controlnet,
                         present=self._model_availability.controlnet_present,
+                        failed=self._model_availability.controlnet_failed,
+                        failed_detail=CONTROLNET_ANNOTATOR_FAILED_DETAIL,
                     ),
                     GatedFeature.SDXL_CONTROLNET: FeatureInputs(
                         enabled=pop_allow_sdxl_controlnet,
                         present=self._model_availability.sdxl_controlnet_present,
+                        failed=self._model_availability.controlnet_failed,
+                        failed_detail=CONTROLNET_ANNOTATOR_FAILED_DETAIL,
                     ),
                     GatedFeature.POST_PROCESSING: FeatureInputs(
                         enabled=pop_allow_post_processing,

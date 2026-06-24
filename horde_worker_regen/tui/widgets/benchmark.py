@@ -12,6 +12,7 @@ import contextlib
 import enum
 import subprocess
 import typing
+from dataclasses import dataclass
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
@@ -38,6 +39,23 @@ from horde_worker_regen.tui.benchmark_launcher import (
     BenchmarkSupervisorStatus,
     LevelState,
 )
+
+
+@dataclass(frozen=True)
+class BenchmarkWaitingState:
+    """Represents the progress of the benchmark's models downloading in the background before a run.
+
+    Set on the view while the benchmark is waiting for the download subsystem to fetch the models it needs; the
+    view shows a banner from it and gates the run. ``ready``/``total`` count the image models the worker reports
+    present versus requested (feature models, which the present set does not name, are reckoned by the overall
+    download subsystem returning to idle, not by this count).
+    """
+
+    total: int
+    """How many models the benchmark requested be downloaded."""
+    ready: int
+    """How many of those the worker now reports present on disk."""
+
 
 _OUTCOME_COLOURS: dict[str, str] = {
     "passed": "green",
@@ -297,6 +315,8 @@ class BenchmarkView(VerticalScroll):
         self._phase: _Phase = _Phase.SETUP
         """Tracked so the auto-collapse of setup/plan only fires on a phase change, not every tick: the
         operator stays free to expand or collapse a section by hand within a phase."""
+        self._waiting: BenchmarkWaitingState | None = None
+        """Set while the benchmark's models download in the background; drives the waiting banner and gates Run."""
 
     def compose(self) -> ComposeResult:
         """Lay out the guided steps, the primary controls, the collapsed advanced options, and the body.
@@ -306,6 +326,7 @@ class BenchmarkView(VerticalScroll):
         setup chrome and the per-level plan auto-demote once a run starts so the live progress leads.
         """
         yield Static(id="benchmark-stepper")
+        yield Static(id="benchmark-waiting-banner")
         with Horizontal(id="benchmark-actions"):
             yield Button("Preview plan", id="benchmark-preview", variant="primary")
             yield Button("Download models", id="benchmark-download", variant="default")
@@ -712,16 +733,14 @@ class BenchmarkView(VerticalScroll):
             headline.append(f"  {skipped} skipped: {detail}.", style="grey62")
 
         lines: list[RenderableType] = [headline]
-        needs_models = any(row.num_models_missing for row in rows)
-        # Only nag when annotators are confirmed absent on disk (present is False); a static ROM size is
-        # not evidence they are missing. Unknown presence stays silent (the level pre-warms before timing).
-        needs_annotators = any(row.requires_controlnet and row.controlnet_annotators_present is False for row in rows)
-        if needs_models or needs_annotators:
-            what = "models" if needs_models and not needs_annotators else "models or controlnet annotators"
+        # A single, unified nag from the per-row download-first verdict (which already reckons missing image
+        # models, controlnet checkpoints, and confirmed-absent annotators): the operator should pre-fetch so
+        # the timed run is not slowed by downloading mid-benchmark.
+        if any(row.needs_download for row in rows):
             lines.append(
                 Text(
-                    f"⚠ Some levels need {what} you have not downloaded yet. Use “Download models” first so the "
-                    "timed run is not slowed by downloading mid-benchmark.",
+                    "⚠ Some levels need models, controlnet checkpoints, or annotators you have not downloaded "
+                    "yet. Use “Download models” first so the timed run is not slowed by downloading mid-benchmark.",
                     style="yellow",
                 ),
             )
@@ -766,15 +785,20 @@ class BenchmarkView(VerticalScroll):
 
     @staticmethod
     def _plan_status_cell(row: LevelPlanRow) -> Text:
-        """The readiness verdict in plain language: ``✓ Ready`` to run, or ``⊘ Skip`` with the gist.
+        """The readiness verdict in plain language: ``✓ Ready``, ``⬇ Download first``, or ``⊘ Skip``.
 
-        A skip is a prediction, not a failure, so it reads grey (yellow only when the remedy is a
-        download the operator can act on). The full diagnostic sentence stays in the resource detail.
+        Three states, not two: a level that fits this machine but is missing models, controlnet checkpoints,
+        or annotators is not "ready" (it would download mid-run) nor a "skip" (it runs once fetched), so it
+        reads as an actionable yellow "Download first". A genuine skip is a prediction, not a failure, so it
+        reads grey -- yellow only when its remedy is itself a download the operator can act on (a huge-tier
+        checkpoint real-mode will not fetch mid-run). The full diagnostic sentence stays in the resource detail.
         """
+        if row.needs_download:
+            return Text(f"⬇ Download first · {row.download_summary or 'models'}", style="yellow")
         if row.will_run:
             return Text("✓ Ready", style="green")
         reason = _short_verdict(row.verdict)
-        style = "yellow" if "download" in reason else "grey50"
+        style = "yellow" if "download" in reason.lower() else "grey50"
         return Text(f"⊘ Skip · {reason}", style=style)
 
     @staticmethod
@@ -791,7 +815,12 @@ class BenchmarkView(VerticalScroll):
         table.add_column("Verdict")
         for row in rows:
             vram = "-" if row.estimated_vram_mb is None else f"{row.estimated_vram_mb / 1024:.1f}G"
-            verdict = Text("ready", style="green") if row.will_run else Text(row.verdict or "skip", style="grey50")
+            if row.needs_download:
+                verdict = Text("download first", style="yellow")
+            elif row.will_run:
+                verdict = Text("ready", style="green")
+            else:
+                verdict = Text(row.verdict or "skip", style="grey50")
             table.add_row(
                 row.level_id,
                 f"{row.stage}/{row.tier}",
@@ -820,6 +849,35 @@ class BenchmarkView(VerticalScroll):
             return Text("ok", style="green")
         return Text(size or "ok", style="green" if not size else "")
 
+    def set_benchmark_waiting(self, state: BenchmarkWaitingState | None) -> None:
+        """Set (or clear) the waiting-for-benchmark-models banner and re-gate the download button.
+
+        Called by the app each tick while the benchmark's models download in the background. Passing ``None``
+        clears the banner (the models are ready, or the wait was cancelled), restoring the normal controls.
+        """
+        self._waiting = state
+        with contextlib.suppress(NoMatches):
+            banner = self.query_one("#benchmark-waiting-banner", Static)
+            banner.display = state is not None
+            if state is not None:
+                banner.update(self._waiting_banner(state))
+            # Re-gate the download button immediately so it does not lag a tick behind the banner.
+            self.query_one("#benchmark-download", Button).disabled = state is not None
+
+    @staticmethod
+    def _waiting_banner(state: BenchmarkWaitingState) -> Text:
+        """Render the waiting banner: progress through the benchmark's background model downloads.
+
+        A features-only download (controlnet checkpoints / annotators, fetched via the aux pass) has no named
+        image models to count, so it reads as a plain in-progress message rather than an ``N of M`` tally.
+        """
+        progress = f"— {state.ready} of {state.total} downloaded. " if state.total else "in the background. "
+        return Text.assemble(
+            ("⏳ Waiting for benchmark models ", "bold yellow"),
+            (progress, "yellow"),
+            ("Track progress on the Downloads tab; Run is held until they finish.", "grey70"),
+        )
+
     def _update_buttons(self, status: BenchmarkSupervisorStatus, run_state: BenchmarkRunState) -> None:
         """Enable only the actions valid for the current status."""
         running = status is BenchmarkSupervisorStatus.RUNNING
@@ -829,8 +887,9 @@ class BenchmarkView(VerticalScroll):
         has_suggestion = bool(run_state.suggested_bridge_data_yaml)
         self.query_one("#benchmark-run", Button).disabled = active
         self.query_one("#benchmark-preview", Button).disabled = active
-        # Downloading contends with the GPU-exclusive run and stops a level mid-flight, so gate it while busy.
-        self.query_one("#benchmark-download", Button).disabled = active
+        # Downloading contends with the GPU-exclusive run and stops a level mid-flight, so gate it while busy;
+        # also gate it while the benchmark is already waiting on a background download (no double-request).
+        self.query_one("#benchmark-download", Button).disabled = active or self._waiting is not None
         # History only reads completed runs from disk, so it is safe (and useful) at any time.
         self.query_one("#benchmark-history", Button).disabled = False
         self.query_one("#benchmark-cancel", Button).disabled = not running

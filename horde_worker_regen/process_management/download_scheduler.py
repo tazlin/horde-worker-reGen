@@ -53,8 +53,11 @@ class DownloadKind(enum.Enum):
     """The required safety models (DeepDanbooru + CLIP); a one-shot ensure, not a per-file fetch."""
     DEFAULT_LORAS = enum.auto()
     """The curated default-LoRa set (CivitAI ad-hoc engine, coarse progress)."""
-    ANNOTATORS = enum.auto()
-    """ControlNet annotators (need a ComfyUI init; no clean per-file URL)."""
+    ANNOTATOR_VERIFY = enum.auto()
+    """Run each ControlNet preprocessor once to confirm the (already per-file-downloaded) annotators load.
+
+    A full ComfyUI init, so it runs exclusively. On failure it re-downloads the detector checkpoints once and
+    re-verifies; a second failure disables ControlNet and notifies the operator."""
 
 
 @dataclass(frozen=True)
@@ -211,22 +214,30 @@ class HostAwareDownloadScheduler:
     def _find_admissible(self) -> DownloadTask | None:
         """Return the first pending task that fits the limits and exclusivity rules (caller holds the lock).
 
-        An exclusive task runs alone: it is admissible only once nothing is in flight, and while it runs no
-        other task is admitted, up to the exclusivity time bound. A non-exclusive task is held while an
-        exclusive task is in flight and still within that bound (see :meth:`_exclusivity_active`).
+        An exclusive task runs alone *and last*: it is admissible only once nothing is in flight **and no
+        ordinary download is still pending**, so it drains into the idle tail rather than jumping ahead of
+        the image/aux fetches a worker needs to serve jobs. Deferring it this way means a wedged exclusive
+        task (the annotator preload verify) can never starve a needed download. While an exclusive task is
+        in flight no other task is admitted, up to the exclusivity time bound; a non-exclusive task is held
+        during that window (see :meth:`_exclusivity_active`).
         """
         if self._state.active_count >= self._max_parallel:
             return None
         exclusivity_active = self._exclusivity_active()
+        first_exclusive: DownloadTask | None = None
+        pending_non_exclusive = False
         for task in self._state.pending:
             if task.exclusive:
-                if self._state.active_count == 0:
-                    return task
+                if first_exclusive is None:
+                    first_exclusive = task
                 continue
+            pending_non_exclusive = True
             if exclusivity_active:
                 continue
             if self._state.in_flight_by_host[task.host] < self._per_host:
                 return task
+        if first_exclusive is not None and not pending_non_exclusive and self._state.active_count == 0:
+            return first_exclusive
         return None
 
     def _exclusivity_active(self) -> bool:

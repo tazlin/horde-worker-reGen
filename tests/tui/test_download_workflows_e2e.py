@@ -14,11 +14,14 @@ child.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+import pytest
 from textual.pilot import Pilot
 from textual.widgets import Button, Input, Static, TabbedContent
 
+import horde_worker_regen.tui.app as app_module
 from horde_worker_regen.app_state import AppStateStore, OnboardingChoice
 from horde_worker_regen.process_management.feature_readiness import (
     FeatureReadiness,
@@ -31,13 +34,15 @@ from horde_worker_regen.process_management.supervisor_channel import (
     DownloadPlanSummary,
     DownloadStatusSnapshot,
     FeatureReadinessSummary,
+    ProcessSnapshot,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
-from horde_worker_regen.tui.app import BenchmarkOverWorkerModal, HordeWorkerTUI
+from horde_worker_regen.tui.app import BenchmarkActionConfirmModal, BenchmarkOverWorkerModal, HordeWorkerTUI
 from horde_worker_regen.tui.benchmark_launcher import BenchmarkOptions
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView
 from horde_worker_regen.tui.widgets.download_picker import DownloadPickerModal, DownloadPickerRow
+from horde_worker_regen.tui.widgets.downloads import DownloadsView
 from horde_worker_regen.tui.widgets.onboarding import WorkerStartModal
 from tests.tui._fake_supervisor import FakeSupervisor
 
@@ -333,19 +338,317 @@ async def test_benchmark_with_no_live_worker_skips_the_prompt(tmp_path: Path) ->
 
 
 def test_benchmark_download_delegate_routes_to_a_live_worker(tmp_path: Path) -> None:
-    """The benchmark download delegates to the worker only while it is live, requesting models with aux.
-
-    Folds the benchmark's download phase into the running worker's single download surface: no delegate
-    (and so a self-download) when the worker is stopped; a delegate that calls request_download_models
-    when it is up.
-    """
+    """A live worker's delegate requests the missing models (with aux) straight through its download process."""
     fake, app = _make_app(tmp_path, auto_start=True)
-    # The app is not mounted here, so on_mount's auto-start has not run: the worker is not live yet.
-    assert app._benchmark_download_delegate() is None
+    fake.start()  # the worker is running
 
-    fake.start()  # the worker is now running
     delegate = app._benchmark_download_delegate()
-    assert delegate is not None
     assert delegate(["ModelA", "ModelB"]) is True
     assert fake.download_requests[-1].model_names == ["ModelA", "ModelB"]
     assert fake.download_requests[-1].include_aux is True
+
+
+def test_benchmark_download_delegate_starts_a_stopped_worker_into_a_download_only_hold(tmp_path: Path) -> None:
+    """With the worker stopped, the delegate starts it GPU-idle and queues the hold + request for the pipe.
+
+    The benchmark never self-downloads: a stopped worker is brought up into a download-only hold (so the GPU
+    stays uncommitted) and the chosen models -- with aux -- are queued to be sent once its control pipe is up.
+    """
+    fake, app = _make_app(tmp_path, auto_start=True)
+    # The app is not mounted here, so on_mount's auto-start has not run: the worker is not live yet.
+    assert not fake.is_alive()
+
+    delegate = app._benchmark_download_delegate()
+    assert delegate(["ModelA", "ModelB"]) is True
+
+    assert fake.start_calls == 1  # the worker was started to download, GPU idle
+    assert app._pending_downloads_only_hold is True  # held until the operator goes live
+    assert app._pending_download_models is not None
+    assert app._pending_download_models.model_names == ["ModelA", "ModelB"]
+    assert app._pending_download_models.include_aux is True
+
+
+_EXPECTED_GRACEFUL_HANDOFF_REQUESTS = ["drain", "downloads_only_hold", "set_concurrency:processes=0:threads=None"]
+"""The exact control sequence a successful graceful handoff sends: stop popping, hold, then scale to zero."""
+
+
+def _inference_process(*, busy: bool) -> ProcessSnapshot:
+    """Return a live inference process snapshot, either mid-job (busy) or idle (awaiting work)."""
+    return ProcessSnapshot(
+        process_id=0,
+        process_type="INFERENCE",
+        last_process_state="INFERENCE_STARTING" if busy else "WAITING_FOR_JOB",
+        is_alive=True,
+        is_busy=busy,
+    )
+
+
+def _serving_snapshot() -> WorkerStateSnapshot:
+    """Return a snapshot of a worker mid-job: one inference in flight on a live inference process."""
+    return WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
+        jobs_in_progress=1,
+        jobs_pending_inference=0,
+        processes=[_inference_process(busy=True)],
+    )
+
+
+def _drained_but_inference_up_snapshot() -> WorkerStateSnapshot:
+    """Return a snapshot drained of jobs whose inference process is still up, holding the GPU."""
+    return WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
+        jobs_in_progress=0,
+        jobs_pending_inference=0,
+        processes=[_inference_process(busy=False)],
+    )
+
+
+def _idle_drained_snapshot() -> WorkerStateSnapshot:
+    """Return a snapshot fully drained and scaled down: no job in flight and no inference process alive."""
+    return WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
+        jobs_in_progress=0,
+        jobs_pending_inference=0,
+        processes=[],
+    )
+
+
+async def test_benchmark_drains_a_serving_worker_step_by_step_then_frees_the_gpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker mid-job is drained, held, and scaled to zero in order, the handoff waiting on each transition.
+
+    The fake worker responds the way a real one would: it reports its in-flight job finished only after DRAIN,
+    and its inference process gone only after SET_CONCURRENCY(0). The handoff must observe each transition
+    before taking the next step, must keep the worker alive, and must never hard-stop it.
+    """
+    monkeypatch.setattr(app_module, "_BENCHMARK_DRAIN_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(app_module, "_BENCHMARK_DRAIN_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(app_module, "_BENCHMARK_SCALE_TIMEOUT_SECONDS", 5.0)
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        started: list[BenchmarkOptions] = []
+        app._benchmark_supervisor.start = lambda options: started.append(options)  # type: ignore[method-assign]
+        app._pending_benchmark_options = BenchmarkOptions(tiers=["sd15"])
+        fake.latest_snapshot = _serving_snapshot()
+        fake.requests.clear()
+
+        async def _worker_responds_to_commands() -> None:
+            """Advance the worker's reported state in response to the handoff's commands, like a real worker."""
+            while "drain" not in fake.requests:
+                await asyncio.sleep(0.01)
+            fake.latest_snapshot = _drained_but_inference_up_snapshot()  # the job finished
+            while not fake.set_concurrency_calls:
+                await asyncio.sleep(0.01)
+            fake.latest_snapshot = _idle_drained_snapshot()  # the inference process exited
+
+        responder = asyncio.create_task(_worker_responds_to_commands())
+        await asyncio.to_thread(app._start_benchmark_flow)
+        await responder
+        await pilot.pause()
+
+        assert app._supervisor.is_alive()  # kept alive, not torn down
+        assert fake.stop_calls == 0  # no hard stop
+        assert app._benchmark_drained_worker is True
+        assert fake.requests == _EXPECTED_GRACEFUL_HANDOFF_REQUESTS
+        assert fake.set_concurrency_calls == [(0, None)]
+        assert [options.tiers for options in started] == [["sd15"]]  # launched only after the GPU freed
+
+
+async def test_benchmark_hard_stops_when_an_in_flight_job_will_not_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A job that never finishes makes the drain wait time out before any hold/scale, so the handoff hard-stops.
+
+    Proves the drain step genuinely gates on the worker's reported state: with the job stuck in flight, the
+    worker is never held or scaled (that would strand the operator), and the backstop stop frees the GPU.
+    """
+    monkeypatch.setattr(app_module, "_BENCHMARK_DRAIN_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(app_module, "_BENCHMARK_DRAIN_TIMEOUT_SECONDS", 0.1)
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        started: list[BenchmarkOptions] = []
+        app._benchmark_supervisor.start = lambda options: started.append(options)  # type: ignore[method-assign]
+        app._pending_benchmark_options = BenchmarkOptions(tiers=["sd15"])
+        fake.latest_snapshot = _serving_snapshot()  # the job stays in flight forever
+        fake.requests.clear()
+
+        await asyncio.to_thread(app._start_benchmark_flow)
+        await pilot.pause()
+
+        assert app._benchmark_drained_worker is False
+        assert fake.stop_calls == 1  # backstop fired
+        assert fake.requests == ["drain"]  # only the drain was attempted; never hold/scale an undrained worker
+        assert fake.set_concurrency_calls == []
+        assert [options.tiers for options in started] == [["sd15"]]  # the benchmark still launched
+
+
+async def test_benchmark_hard_stops_when_inference_will_not_scale_down(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inference process that never exits makes the scale-down wait time out, so the handoff hard-stops.
+
+    Proves the scale step gates on the GPU actually freeing: the job drains and the worker is held and asked to
+    scale to zero, but its inference process lingers, so the backstop stop frees the GPU for the run.
+    """
+    monkeypatch.setattr(app_module, "_BENCHMARK_DRAIN_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(app_module, "_BENCHMARK_SCALE_TIMEOUT_SECONDS", 0.1)
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        started: list[BenchmarkOptions] = []
+        app._benchmark_supervisor.start = lambda options: started.append(options)  # type: ignore[method-assign]
+        app._pending_benchmark_options = BenchmarkOptions(tiers=["sd15"])
+        fake.latest_snapshot = _drained_but_inference_up_snapshot()  # drained, but inference never sheds
+        fake.requests.clear()
+
+        await asyncio.to_thread(app._start_benchmark_flow)
+        await pilot.pause()
+
+        assert app._benchmark_drained_worker is False
+        assert fake.stop_calls == 1  # backstop fired
+        assert fake.requests == _EXPECTED_GRACEFUL_HANDOFF_REQUESTS  # drain + hold + scale were all attempted
+        assert [options.tiers for options in started] == [["sd15"]]  # the benchmark still launched
+
+
+def _downloads_snapshot(*, phase: DownloadPhase, present: tuple[str, ...] = ()) -> WorkerStateSnapshot:
+    """A worker snapshot whose download subsystem is in *phase* with *present* models already on disk."""
+    return WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="TestWorker", worker_version="0.0.0"),
+        downloads=DownloadStatusSnapshot(phase=phase, present_model_names=list(present)),
+    )
+
+
+def _enter_benchmark_download_wait(app: HordeWorkerTUI, fake: FakeSupervisor, names: list[str]) -> None:
+    """Drive the benchmark download delegate on a live worker so the app enters its waiting-for-models mode."""
+    fake.start()
+    delegate = app._benchmark_download_delegate()
+    assert delegate(names) is True
+    assert app._benchmark_waiting_models == set(names)
+
+
+async def test_benchmark_waiting_banner_tracks_progress_then_clears_when_downloads_settle(tmp_path: Path) -> None:
+    """The waiting banner reflects download progress and clears once the subsystem finishes, re-enabling Run.
+
+    The completion is judged by the subsystem returning to idle (not per-name), so a requested set that
+    includes un-named feature models still resolves rather than waiting forever.
+    """
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        _enter_benchmark_download_wait(app, fake, ["ModelA", "ModelB"])
+        view = app.query_one(BenchmarkView)
+
+        # The worker reports an active download with one model already present: the banner shows 1 of 2.
+        fake.latest_snapshot = _downloads_snapshot(phase=DownloadPhase.DOWNLOADING, present=("ModelA",))
+        app._tick()
+        await pilot.pause()
+        assert view._waiting is not None
+        assert (view._waiting.ready, view._waiting.total) == (1, 2)
+        assert app.query_one("#benchmark-waiting-banner", Static).display is True
+        assert app.query_one("#benchmark-download", Button).disabled is True  # no double-request while waiting
+
+        # The subsystem settles to idle: the wait completes, the banner clears, and Run is no longer gated.
+        fake.latest_snapshot = _downloads_snapshot(phase=DownloadPhase.IDLE, present=("ModelA", "ModelB"))
+        app._tick()
+        await pilot.pause()
+        assert app._benchmark_waiting_models == set()
+        assert view._waiting is None
+        assert app.query_one("#benchmark-waiting-banner", Static).display is False
+
+
+async def test_benchmark_waiting_does_not_complete_on_an_idle_snapshot_before_downloads_start(
+    tmp_path: Path,
+) -> None:
+    """A worker still idle right after the request must not be read as "done" before the fetch has begun."""
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        _enter_benchmark_download_wait(app, fake, ["ModelA"])
+
+        # The download has not started yet (still idle, nothing present): the wait must persist, not complete.
+        fake.latest_snapshot = _downloads_snapshot(phase=DownloadPhase.IDLE, present=())
+        app._tick()
+        await pilot.pause()
+        assert app._benchmark_waiting_models == {"ModelA"}  # still waiting, not a false completion
+
+
+async def test_running_while_benchmark_models_download_warns_first(tmp_path: Path) -> None:
+    """Pressing Run while the models still download pops a confirm; confirming abandons the wait and proceeds."""
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        _enter_benchmark_download_wait(app, fake, ["ModelA"])
+        proceeded: list[BenchmarkOptions] = []
+        app._proceed_with_run_request = proceeded.append  # type: ignore[method-assign]
+
+        app.on_benchmark_view_run_requested(BenchmarkView.RunRequested(BenchmarkOptions(tiers=["sd15"])))
+        await pilot.pause()
+        assert isinstance(app.screen, BenchmarkActionConfirmModal)  # gated: the operator is asked first
+        assert proceeded == []  # nothing launched while the dialog is up
+
+        await pilot.click("#bench-confirm-confirm")
+        await pilot.pause()
+        assert app._benchmark_waiting_models == set()  # the wait was abandoned to run now
+        assert [options.tiers for options in proceeded] == [["sd15"]]  # and the run proceeded
+
+
+async def test_cancelling_the_run_while_waiting_keeps_waiting(tmp_path: Path) -> None:
+    """Cancelling the run-while-downloading confirm leaves the wait intact and launches nothing."""
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        _enter_benchmark_download_wait(app, fake, ["ModelA"])
+        proceeded: list[BenchmarkOptions] = []
+        app._proceed_with_run_request = proceeded.append  # type: ignore[method-assign]
+
+        app.on_benchmark_view_run_requested(BenchmarkView.RunRequested(BenchmarkOptions(tiers=["sd15"])))
+        await pilot.pause()
+        await pilot.click("#bench-confirm-cancel")
+        await pilot.pause()
+        assert app._benchmark_waiting_models == {"ModelA"}  # still waiting
+        assert proceeded == []  # the run did not proceed
+
+
+async def test_go_live_while_benchmark_only_downloads_run_warns_then_clears_on_confirm(tmp_path: Path) -> None:
+    """Going live while benchmark-only models download warns; confirming abandons the wait and goes live."""
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        _enter_benchmark_download_wait(app, fake, ["ModelA"])
+        app._benchmark_waiting_outside_config = lambda: True  # type: ignore[method-assign]  # not in config
+        fake.requests.clear()
+
+        app.on_downloads_view_go_live_requested(DownloadsView.GoLiveRequested())
+        await pilot.pause()
+        assert isinstance(app.screen, BenchmarkActionConfirmModal)  # warned before stranding the fetch
+        assert "go_live" not in fake.requests  # not sent until the operator agrees
+
+        await pilot.click("#bench-confirm-confirm")
+        await pilot.pause()
+        assert app._benchmark_waiting_models == set()  # the wait is abandoned (serving may stop the fetch)
+        assert "go_live" in fake.requests
+
+
+async def test_go_live_does_not_warn_when_benchmark_models_are_in_config(tmp_path: Path) -> None:
+    """When every waited-for model is in the worker config, going live re-fetches them anyway: no warning.
+
+    The wait is left intact (the config-driven download continues), so the banner keeps tracking them.
+    """
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        _enter_benchmark_download_wait(app, fake, ["ModelA"])
+        app._benchmark_waiting_outside_config = lambda: False  # type: ignore[method-assign]  # all in config
+        fake.requests.clear()
+
+        app.on_downloads_view_go_live_requested(DownloadsView.GoLiveRequested())
+        await pilot.pause()
+        assert not isinstance(app.screen, BenchmarkActionConfirmModal)  # no warning needed
+        assert "go_live" in fake.requests  # went live straight away
+        assert app._benchmark_waiting_models == {"ModelA"}  # the config-driven fetch is still tracked

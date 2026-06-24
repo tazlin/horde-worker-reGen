@@ -37,6 +37,7 @@ def _host_label(item: CurrentDownloadStatus) -> str:
     """The source host for one download, for grouping/counting; a placeholder when it is not tracked."""
     return item.host or "?"
 
+
 _PHASE_STYLE: dict[DownloadPhase, str] = {
     DownloadPhase.INITIALIZING: "yellow",
     DownloadPhase.SCANNING: "yellow",
@@ -56,6 +57,11 @@ _PHASE_DETAIL: dict[DownloadPhase, str] = {
 }
 
 _BAR_WIDTH = 32
+
+_ANNOTATOR_DOWNLOAD_FEATURE = "ControlNet annotators"
+"""The feature label the download process tags its annotator-preload task with (mirrors
+``download_process.FEATURE_CONTROLNET_ANNOTATORS``). That task is a one-time ComfyUI init with no byte
+progress, so the view renders it as a setup step rather than a frozen 0%/100% bar."""
 
 
 @dataclass(frozen=True)
@@ -433,13 +439,40 @@ class DownloadsView(VerticalScroll):
         current: CurrentDownloadStatus,
         rate_limit_kbps: int | None,
     ) -> list[RenderableType]:
-        """Render one download's header, target, and progress line (shared by the concurrent list)."""
+        """Render one download's header, target, and progress line (shared by the concurrent list).
+
+        Two phases have no byte progress and would otherwise read as a frozen bar, so they are surfaced as
+        what they actually are: the one-time annotator preload (a ComfyUI init, no file transfer) and the
+        post-download sha256 verify window (the bytes are all down; the time left is the checksum).
+        """
         header = Text.assemble(
             (shorten(current.model_name, 40), "bold"),
             ("   ", ""),
             (current.feature, "cyan"),
         )
         where = Text.assemble(("→ ", "grey50"), (current.target_dir, "grey70"))
+
+        if current.feature == _ANNOTATOR_DOWNLOAD_FEATURE:
+            return [
+                header,
+                where,
+                Text(
+                    "Preparing controlnet annotators — one-time setup (initialising the inference engine and "
+                    "verifying each preprocessor). This can take several minutes and runs only once.",
+                    style="yellow",
+                ),
+            ]
+        if self._is_verifying_checksum(current):
+            sizes = f"{human_bytes(current.downloaded_bytes)} / {human_bytes(current.total_bytes)}"
+            return [
+                header,
+                where,
+                Text.assemble(
+                    ("Downloaded — verifying checksum (sha256)… ", "yellow"),
+                    (sizes, "grey70"),
+                    ("   (large files take a while to verify)", "grey50 italic"),
+                ),
+            ]
 
         bar = self._progress_bar(current.percent)
         sizes = f"{human_bytes(current.downloaded_bytes)} / {human_bytes(current.total_bytes)}"
@@ -466,6 +499,16 @@ class DownloadsView(VerticalScroll):
                 )
             )
         return renderables
+
+    @staticmethod
+    def _is_verifying_checksum(current: CurrentDownloadStatus) -> bool:
+        """Whether the file's bytes are all on disk and it is now in the (callback-less) checksum verify.
+
+        Once every byte is down the only work left is the sha256 verify, which reports no progress, so the
+        frozen 100% bar is replaced by an honest "verifying" line. A still-transferring file (a non-zero
+        speed) is never treated as verifying, so a momentary 100% mid-transfer does not flicker the label.
+        """
+        return current.total_bytes > 0 and current.downloaded_bytes >= current.total_bytes and not current.speed_bps
 
     @staticmethod
     def _progress_bar(percent: float | None) -> str:

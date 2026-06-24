@@ -52,6 +52,8 @@ def test_plan_table_renders_controlnet_column() -> None:
             controlnet_annotators_present=False,  # extra installed but the weights are not on disk yet
             controlnet_annotator_bytes=800 * 1024**2,
             will_run=True,
+            needs_download=True,  # runnable once the annotators are fetched -> "download first", not "ready"
+            download_summary="controlnet annotators",
         ),
         LevelPlanRow(
             level_id="C-sd15-cn-absent",
@@ -68,7 +70,58 @@ def test_plan_table_renders_controlnet_column() -> None:
     assert "CN" in table
     assert "MISSING" in table
     assert "~0.8G" in table
-    assert "controlnet annotators" in table
+    assert "DOWNLOAD FIRST" in table  # the annotators-missing level reads as a third, actionable state
+    assert "controlnet annotators" in table  # named both in its verdict and the trailing download prompt
+
+
+def test_plan_row_marks_a_fitting_but_incomplete_level_as_download_first() -> None:
+    """A level with no skip verdict but missing models/checkpoints/annotators becomes ``needs_download``.
+
+    Names each kind of missing artifact in the summary so the operator sees what to fetch; this is the
+    derivation behind the reported bug where such a level wrongly read ``Ready``.
+    """
+    from horde_worker_regen.benchmark.controller import _plan_row
+    from horde_worker_regen.benchmark.requirements import LevelRequirements
+
+    req = LevelRequirements(
+        level_id="C-sd15",
+        stage="controlnet",
+        tier="sd15",
+        axis="controlnet",
+        baseline="stable_diffusion_1",
+        models_missing=["AbsentModel"],
+        controlnet_checkpoints_missing=["control_canny"],
+        controlnet_annotators_present=False,
+    )
+
+    row = _plan_row(req, None)  # verdict None: the level fits this machine
+
+    assert row.will_run is True
+    assert row.needs_download is True
+    assert "1 model" in row.download_summary
+    assert "controlnet checkpoints" in row.download_summary
+    assert "controlnet annotators" in row.download_summary
+
+
+def test_plan_row_never_marks_a_hard_skip_as_download_first() -> None:
+    """A skipped level (a verdict is present) is never ``download first``, even with missing artifacts."""
+    from horde_worker_regen.benchmark.controller import _plan_row
+    from horde_worker_regen.benchmark.requirements import LevelRequirements
+
+    req = LevelRequirements(
+        level_id="F-flux",
+        stage="baseline",
+        tier="flux",
+        axis="baseline",
+        baseline="flux_1",
+        models_missing=["AbsentModel"],
+    )
+
+    row = _plan_row(req, "insufficient VRAM: estimated 16384 MB needed, 12000 MB available")
+
+    assert row.will_run is False
+    assert row.needs_download is False
+    assert row.download_summary == ""
 
 
 def test_plan_table_omits_annotator_prompt_when_already_downloaded() -> None:

@@ -28,9 +28,13 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import override
+from typing import TYPE_CHECKING, override
+
+if TYPE_CHECKING:
+    from hordelib.model_manager.base import BaseModelManager
+    from hordelib.model_manager.hyper import ModelManager
 
 try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
@@ -48,6 +52,7 @@ from horde_worker_regen.model_download_core import (
     download_host_for_url,
     download_one_model,
     ensure_aux_model_present,
+    validate_present_file,
 )
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.download_scheduler import (
@@ -88,6 +93,30 @@ FEATURE_CONTROLNET = "ControlNet"
 FEATURE_CONTROLNET_ANNOTATORS = "ControlNet annotators"
 FEATURE_MISCELLANEOUS = "miscellaneous (SDXL)"
 FEATURE_SAFETY = "safety models"
+
+
+def _aux_sub_manager(manager: ModelManager, manager_key: str) -> BaseModelManager | None:
+    """Return the aux sub-manager for *manager_key* (the fixed set of fetchable categories), or None.
+
+    Centralises the manager-key-to-attribute mapping so the keyed download paths read a typed attribute on
+    hordelib's real ``ModelManager`` instead of a dynamic ``getattr``; an unrecognised key (never expected
+    from a worker-built task) is None.
+    """
+    match manager_key:
+        case "gfpgan":
+            return manager.gfpgan
+        case "esrgan":
+            return manager.esrgan
+        case "codeformer":
+            return manager.codeformer
+        case "miscellaneous":
+            return manager.miscellaneous
+        case "controlnet":
+            return manager.controlnet
+        case "controlnet_annotator":
+            return manager.controlnet_annotator
+        case _:
+            return None
 
 
 def _post_processing_feature(name: str) -> str:
@@ -219,6 +248,22 @@ class HordeDownloadProcess(HordeProcess):
         self._controlnet_present: bool | None = None
         self._sdxl_controlnet_present: bool | None = None
         self._post_processing_present: bool | None = None
+        # A feature is offered only once its models are on disk *and* validate: existence alone would offer
+        # against a truncated or corrupt pre-existing file (which then faults at job time). A feature model
+        # counts as present for readiness only after its checksum verifies (or it has no checksum to verify),
+        # cached here per session keyed by (manager_key, model_name) so the event-driven presence refresh
+        # never re-hashes. ``_invalid_feature_files`` debounces the operator warning for a file that is on
+        # disk but fails its checksum (so its feature stays withheld until the file is re-fetched).
+        self._validated_feature_files: set[tuple[str, str]] = set()
+        self._invalid_feature_files: set[tuple[str, str]] = set()
+        # The annotator verify (running each preprocessor once) and its bounded recovery. The verify is
+        # enqueued once the annotator files are present (``_annotator_verify_enqueued`` guards the one-shot
+        # enqueue; ``_annotator_verify_done`` stops it re-running after success or a permanent kill). A
+        # permanent failure (the files download but do not run, even after one re-fetch) sets
+        # ``_controlnet_killed``: ControlNet is then withheld and the operator notified, until a restart.
+        self._annotator_verify_enqueued = False
+        self._annotator_verify_done = False
+        self._controlnet_killed = False
         self._reload_requested = False
         # Set after a completed download that changed on-disk references; emitted once on the next
         # status snapshot so the parent can broadcast a reload to the inference subprocesses.
@@ -278,6 +323,7 @@ class HordeDownloadProcess(HordeProcess):
             controlnet_present=self._controlnet_present,
             sdxl_controlnet_present=self._sdxl_controlnet_present,
             post_processing_present=self._post_processing_present,
+            controlnet_failed=self._controlnet_killed,
             status=status,
             reference_changed=reference_changed,
         )
@@ -681,27 +727,22 @@ class HordeDownloadProcess(HordeProcess):
             )
         if self._allow_post_processing:
             for manager_key, label in (("gfpgan", "GFPGAN"), ("esrgan", "ESRGAN"), ("codeformer", "CodeFormer")):
-                post_processor = getattr(manager, manager_key, None)
+                post_processor = _aux_sub_manager(manager, manager_key)
                 if post_processor is not None:
                     tasks.extend(self._aux_model_tasks(post_processor, manager_key, _post_processing_feature(label)))
         if self._allow_sdxl_controlnet and manager.miscellaneous is not None:
             tasks.extend(self._aux_model_tasks(manager.miscellaneous, "miscellaneous", FEATURE_MISCELLANEOUS))
         if self._allow_controlnet and manager.controlnet is not None:
             tasks.extend(self._controlnet_tasks(manager.controlnet))
-            # The annotator task does a full ComfyUI init + preload; only enqueue it when the annotators
-            # are not already on disk, so a warm worker neither reports a phantom "annotators" download
-            # nor pays for an unnecessary init. Presence-unknown falls through to enqueue (preload is
-            # idempotent), matching the prior always-ensure behaviour without the false display.
-            if not self._annotators_present():
-                tasks.append(
-                    DownloadTask(
-                        kind=DownloadKind.ANNOTATORS,
-                        model_name="annotators",
-                        host=UNKNOWN_DOWNLOAD_HOST,
-                        feature=FEATURE_CONTROLNET_ANNOTATORS,
-                        # Runs a full ComfyUI/torch init that mutates global state, so it must not run
-                        # alongside other downloads sharing the model managers.
-                        exclusive=True,
+            # Each annotator detector checkpoint is a per-file aux download (size, progress, checksum, and
+            # on-disk presence reported like every other model). The one-time verify that the preprocessors
+            # actually run is enqueued separately, once the files are present (see _maybe_enqueue_annotator_verify).
+            if manager.controlnet_annotator is not None:
+                tasks.extend(
+                    self._aux_model_tasks(
+                        manager.controlnet_annotator,
+                        "controlnet_annotator",
+                        FEATURE_CONTROLNET_ANNOTATORS,
                     ),
                 )
         if tasks:
@@ -710,21 +751,19 @@ class HordeDownloadProcess(HordeProcess):
         # disk is reported ready immediately, rather than only after the first completed download.
         self._refresh_feature_presence()
 
-    @staticmethod
-    def _annotators_present() -> bool:
-        """Whether the ControlNet annotators are already on disk (False when undeterminable).
+    def _annotators_present_now(self, manager: ModelManager) -> bool | None:
+        """On-disk readiness of the ControlNet annotators (existence-only), tri-state.
 
-        Uses hordelib's import-safe on-disk marker check (no ComfyUI init / GPU). Failing to False means
-        an unknown is treated as "not present", so the idempotent preload still runs and fetches them if
-        actually missing; it just avoids skipping a genuinely-needed fetch.
+        Reads the first-class ``controlnet_annotator`` manager's per-record existence (the same on-disk
+        authority used for every other category): ``True``/``False`` once that manager is loaded, ``None``
+        only when it is absent (ControlNet not enabled). A permanently failed verify (the annotators do not
+        run) is treated as not-present so ControlNet is withheld until recovery.
         """
-        try:
-            from hordelib.preload import controlnet_annotators_present
-
-            return bool(controlnet_annotators_present())
-        except Exception as e:  # noqa: BLE001 - presence is best-effort; a probe failure must not crash
-            logger.debug(f"Download process: could not determine annotator presence: {type(e).__name__} {e}")
+        if self._controlnet_killed:
             return False
+        if manager.controlnet_annotator is None:
+            return None
+        return self._manager_all_present(manager, "controlnet_annotator")
 
     def _refresh_feature_presence(self) -> None:
         """Recompute on-disk readiness for the gated aux features from the loaded managers (cached).
@@ -745,7 +784,7 @@ class HordeDownloadProcess(HordeProcess):
         if manager is None:
             return
 
-        annotators = self._annotators_present()
+        annotators = self._annotators_present_now(manager)
 
         controlnet_models = self._manager_all_present(manager, "controlnet", exclude_substring="sdxl")
         controlnet = None if controlnet_models is None else (controlnet_models and annotators)
@@ -766,9 +805,46 @@ class HordeDownloadProcess(HordeProcess):
             self._sdxl_controlnet_present = sdxl_controlnet
             self._post_processing_present = post_processing
 
+        # Once the annotator checkpoints are on disk, confirm (once) that the preprocessors actually run.
+        self._maybe_enqueue_annotator_verify(manager, annotators)
+
+    def _maybe_enqueue_annotator_verify(
+        self,
+        manager: ModelManager,
+        annotators_present: bool | None,
+    ) -> None:
+        """Enqueue the one-shot annotator verify when the files are present and it has not yet run.
+
+        Guarded so the verify is enqueued at most once per session, and never after it has succeeded or
+        permanently disabled ControlNet.
+
+        ControlNet is already offered on the annotators' on-disk-and-validated presence; this verify is a
+        background confirmation that runs asynchronously and only ever *demotes* (a permanent failure sets
+        ``_controlnet_killed``). It is scheduled ``exclusive`` so the scheduler runs it after the ordinary
+        downloads drain, so a slow or wedged preprocessor preload blocks neither readiness nor the queue.
+        """
+        if not self._allow_controlnet or annotators_present is not True:
+            return
+        if manager.controlnet_annotator is None:
+            return
+        with self._lock:
+            if self._annotator_verify_enqueued or self._annotator_verify_done or self._controlnet_killed:
+                return
+            self._annotator_verify_enqueued = True
+        self._scheduler.enqueue(
+            DownloadTask(
+                kind=DownloadKind.ANNOTATOR_VERIFY,
+                model_name="annotator verify",
+                host=UNKNOWN_DOWNLOAD_HOST,
+                feature=FEATURE_CONTROLNET_ANNOTATORS,
+                # A full ComfyUI/torch init that mutates global state: must not run alongside other downloads.
+                exclusive=True,
+            ),
+        )
+
     def _manager_all_present(
         self,
-        manager: object,
+        manager: ModelManager,
         manager_key: str,
         *,
         require_substring: str | None = None,
@@ -780,30 +856,77 @@ class HordeDownloadProcess(HordeProcess):
         falsely "not present"). Reads under the per-manager lock the downloads take, so the on-disk
         check never races a sibling fetch mutating the manager's available set.
         """
-        sub_manager = getattr(manager, manager_key, None)
+        sub_manager = _aux_sub_manager(manager, manager_key)
         if sub_manager is None:
             return None
         try:
             with self._manager_lock(manager_key):
-                for model_name in sub_manager.model_reference:  # type: ignore[attr-defined]
+                for model_name in sub_manager.model_reference:
                     lowered = model_name.lower()
                     if require_substring is not None and require_substring not in lowered:
                         continue
                     if exclude_substring is not None and exclude_substring in lowered:
                         continue
-                    if not sub_manager.is_model_available(model_name):  # type: ignore[attr-defined]
+                    if not self._feature_model_present(sub_manager, manager_key, model_name):
                         return False
             return True
         except Exception as e:  # noqa: BLE001 - presence is best-effort; a probe failure must not crash
             logger.debug(f"Download process: presence probe for {manager_key} failed: {type(e).__name__}: {e}")
             return None
 
-    def _aux_model_tasks(self, manager: object, manager_key: str, feature: str) -> list[DownloadTask]:
+    def _feature_model_present(self, sub_manager: BaseModelManager, manager_key: str, model_name: str) -> bool:
+        """Whether one feature model is on disk *and* validates (sha256 where the record has one), cached.
+
+        Existence is necessary but not sufficient to offer a feature: a truncated or corrupt pre-existing
+        file passes an ``exists()`` check yet faults at job time. A model counts as present only once it
+        validates; the result is cached for the session so the event-driven presence refresh never re-hashes
+        a known-good file. A definitive checksum mismatch reports not-present (so the feature is withheld)
+        and warns the operator once, since the normal download path will not re-fetch a file that is already
+        on disk without an explicit re-download. Validation that cannot decide (no checksum, or a probe
+        error) is treated as present, since existence is all that path can offer. The caller holds the
+        relevant per-manager lock; this never acquires it (the lock is not reentrant).
+        """
+        key = (manager_key, model_name)
+        if key in self._validated_feature_files:
+            return True
+        try:
+            if not sub_manager.is_model_available(model_name):
+                return False
+        except Exception as e:  # noqa: BLE001 - presence probe is best-effort; treat a failure as absent
+            logger.debug(f"Download process: availability probe for {manager_key}/{model_name} failed: {e}")
+            return False
+        if validate_present_file(sub_manager, model_name) is False:
+            if key not in self._invalid_feature_files:
+                self._invalid_feature_files.add(key)
+                logger.warning(
+                    f"Download process: {manager_key} model {model_name!r} is on disk but fails checksum "
+                    "validation; its feature is withheld until the file is re-fetched (delete it under the "
+                    "model directory and restart the worker, or re-run the download).",
+                )
+            return False
+        self._validated_feature_files.add(key)
+        self._invalid_feature_files.discard(key)
+        return True
+
+    def _invalidate_feature_validation_cache(self, manager_key: str, model_names: Iterable[str]) -> None:
+        """Drop cached validation verdicts for re-fetched feature files so they are re-validated, not trusted.
+
+        The per-file validation cache (:meth:`_feature_model_present`) assumes a validated file stays valid
+        for the session. A taint + re-download deliberately replaces the bytes, so the cached verdict is stale
+        and must be evicted; otherwise the next presence refresh reports the re-fetched file from the old
+        entry without ever re-checking it. The caller holds the relevant per-manager lock.
+        """
+        for model_name in model_names:
+            key = (manager_key, model_name)
+            self._validated_feature_files.discard(key)
+            self._invalid_feature_files.discard(key)
+
+    def _aux_model_tasks(self, manager: BaseModelManager, manager_key: str, feature: str) -> list[DownloadTask]:
         """Build host-tagged AUX_MODEL tasks for every not-yet-present model in *manager*'s reference."""
-        target_dir = str(manager.model_folder_path)  # type: ignore[attr-defined]
+        target_dir = str(manager.model_folder_path)
         tasks: list[DownloadTask] = []
-        for model_name in manager.model_reference:  # type: ignore[attr-defined]
-            if manager.is_model_available(model_name):  # type: ignore[attr-defined]
+        for model_name in manager.model_reference:
+            if manager.is_model_available(model_name):
                 continue
             tasks.append(
                 DownloadTask(
@@ -817,12 +940,12 @@ class HordeDownloadProcess(HordeProcess):
             )
         return tasks
 
-    def _controlnet_tasks(self, controlnet: object) -> list[DownloadTask]:
+    def _controlnet_tasks(self, controlnet: BaseModelManager) -> list[DownloadTask]:
         """Build ControlNet model tasks, honouring the SDXL-controlnet opt-in gate."""
-        target_dir = str(controlnet.model_folder_path)  # type: ignore[attr-defined]
+        target_dir = str(controlnet.model_folder_path)
         tasks: list[DownloadTask] = []
-        for cn_model in controlnet.model_reference:  # type: ignore[attr-defined]
-            if controlnet.is_model_available(cn_model):  # type: ignore[attr-defined]
+        for cn_model in controlnet.model_reference:
+            if controlnet.is_model_available(cn_model):
                 continue
             if "sdxl" in cn_model.lower() and not self._allow_sdxl_controlnet:
                 continue
@@ -839,10 +962,10 @@ class HordeDownloadProcess(HordeProcess):
         return tasks
 
     @staticmethod
-    def _host_for(manager: object, model_name: str) -> str:
+    def _host_for(manager: BaseModelManager, model_name: str) -> str:
         """Resolve a model's source host from its first download URL (for per-host scheduling)."""
         try:
-            downloads = manager.get_model_download(model_name)  # type: ignore[attr-defined]
+            downloads = manager.get_model_download(model_name)
         except Exception:  # noqa: BLE001 - a host lookup must never crash; fall back to the unknown bucket
             return UNKNOWN_DOWNLOAD_HOST
         for entry in downloads:
@@ -971,7 +1094,7 @@ class HordeDownloadProcess(HordeProcess):
                     return True
             return False
         if task.kind is DownloadKind.AUX_MODEL:
-            aux_manager = getattr(manager, task.manager_key, None)
+            aux_manager = _aux_sub_manager(manager, task.manager_key)
             if aux_manager is None:
                 return False
             with self._manager_lock(task.manager_key):
@@ -988,8 +1111,8 @@ class HordeDownloadProcess(HordeProcess):
         if task.kind is DownloadKind.DEFAULT_LORAS:
             self._download_default_loras(manager)
             return True
-        if task.kind is DownloadKind.ANNOTATORS:
-            self._download_annotators(manager)
+        if task.kind is DownloadKind.ANNOTATOR_VERIFY:
+            self._verify_annotators(manager)
             return True
         return False
 
@@ -1169,9 +1292,9 @@ class HordeDownloadProcess(HordeProcess):
             with self._lock:
                 self._safety_ensured = True
 
-    def _download_default_loras(self, manager: object) -> None:
+    def _download_default_loras(self, manager: ModelManager) -> None:
         """Fetch the curated default-LoRa set via the CivitAI ad-hoc engine (coarse progress only)."""
-        lora = manager.lora  # type: ignore[attr-defined]
+        lora = manager.lora
         if lora is None:
             return
         lora.reset_adhoc_cache()
@@ -1181,16 +1304,85 @@ class HordeDownloadProcess(HordeProcess):
         if self._purge_loras:
             lora.delete_unused_models(30)
 
-    def _download_annotators(self, manager: object) -> None:
-        """Initialise ComfyUI and preload the ControlNet annotators (they need a ComfyUI init)."""
+    def _run_annotator_preload(self) -> bool:
+        """Initialise ComfyUI and run each ControlNet preprocessor once; return whether they all loaded.
+
+        With the detector checkpoints already on disk (the per-file aux pass placed them) this is a verify:
+        ``preload_annotators`` runs every preprocessor and reports success. A failure here means an annotator
+        downloaded but does not load/run, which the caller turns into a bounded recovery.
+        """
         import hordelib
         from hordelib.api import SharedModelManager
 
-        if manager.controlnet is None:  # type: ignore[attr-defined]
-            return
         extra_comfyui_args = [f"--directml={self._directml}"] if self._directml is not None else []
         hordelib.initialise(extra_comfyui_args=extra_comfyui_args)
-        SharedModelManager.preload_annotators()
+        try:
+            return bool(SharedModelManager.preload_annotators())
+        except Exception as e:  # noqa: BLE001 - a verify crash is a verify failure, not a process crash
+            logger.error(f"Download process: annotator preload raised: {type(e).__name__}: {e}")
+            return False
+
+    def _verify_annotators(self, manager: ModelManager) -> None:
+        """Verify the annotators run; on failure re-download once, and disable ControlNet if it still fails.
+
+        The detector checkpoints are already on disk (per-file aux downloads), so the first call just runs
+        each preprocessor. If that fails, the files are re-fetched once (a corrupt download is the likely
+        cause) and re-verified. A second failure permanently disables ControlNet for this session and
+        notifies the operator, rather than leaving the worker to fault every ControlNet job.
+        """
+        annotator_manager = manager.controlnet_annotator
+        if annotator_manager is None:
+            return
+
+        if self._run_annotator_preload():
+            with self._lock:
+                self._annotator_verify_done = True
+            return
+
+        logger.warning(
+            "Download process: ControlNet annotator verify failed; re-downloading the detector checkpoints "
+            "once and re-verifying (ControlNet is withheld until it recovers).",
+        )
+        self._redownload_annotators(annotator_manager)
+        # The re-download cleared and refetched the files; report the interim presence so ControlNet is
+        # withheld during the recovery window rather than offered against unverified annotators.
+        self._refresh_feature_presence()
+
+        recovered = self._run_annotator_preload()
+        with self._lock:
+            self._annotator_verify_done = True
+            self._controlnet_killed = not recovered
+        if recovered:
+            logger.info("Download process: ControlNet annotators recovered after re-download; ControlNet re-enabled.")
+        else:
+            logger.error(
+                "Download process: ControlNet annotators still fail to run after a re-download. ControlNet is "
+                "now DISABLED for this session. Operator action needed: check the download log for the failing "
+                "preprocessor, verify disk space and the annotator files under controlnet/annotators/, then "
+                "restart the worker to retry.",
+            )
+        self._refresh_feature_presence()
+
+    def _redownload_annotators(self, annotator_manager: BaseModelManager) -> None:
+        """Force a clean re-fetch of every annotator checkpoint (taint clears the on-disk files first)."""
+        names = list(annotator_manager.model_reference)
+        try:
+            with self._manager_lock("controlnet_annotator"):
+                annotator_manager.taint_models(names)
+                # The taint clears the on-disk files, so any cached "validated"/"invalid" verdict now
+                # describes bytes that no longer exist. Drop those entries so the re-fetched checkpoints are
+                # re-validated by the next presence refresh instead of being trusted (or condemned) stale.
+                self._invalidate_feature_validation_cache("controlnet_annotator", names)
+                for name in names:
+                    ensure_aux_model_present(
+                        annotator_manager,
+                        name,
+                        connections=self._connections_per_file,
+                    )
+        except Exception as e:  # noqa: BLE001 - a re-download failure is handled by the re-verify that follows
+            logger.error(
+                f"Download process: annotator re-download error (continuing to re-verify): {type(e).__name__}: {e}"
+            )
 
     # endregion
 

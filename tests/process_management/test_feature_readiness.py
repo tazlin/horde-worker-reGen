@@ -64,6 +64,35 @@ def test_missing_deps_surfaces_the_install_hint() -> None:
     assert "post-processing" in readiness[0].detail
 
 
+def test_failed_verify_disables_even_with_models_present() -> None:
+    """A permanent verify failure withholds the feature in a distinct FAILED state, overriding presence.
+
+    The annotator checkpoints are on disk (``present=True``) but do not run, so ControlNet must not be
+    advertised: a job for it would only fault. FAILED is distinct from WAITING (which recovers itself).
+    """
+    readiness = build_feature_readiness(
+        {
+            GatedFeature.CONTROLNET: FeatureInputs(
+                enabled=True,
+                present=True,
+                failed=True,
+                failed_detail="annotators failed to load; restart to retry",
+            ),
+        },
+    )
+    assert readiness[0].state is FeatureReadinessState.FAILED
+    assert readiness[0].offered is False
+    assert "annotators failed to load" in readiness[0].detail
+
+
+def test_failed_takes_precedence_over_waiting() -> None:
+    """When both signals are set, FAILED (operator action needed) wins over WAITING (self-recovering)."""
+    readiness = build_feature_readiness(
+        {GatedFeature.CONTROLNET: FeatureInputs(enabled=True, present=False, failed=True)},
+    )
+    assert readiness[0].state is FeatureReadinessState.FAILED
+
+
 def test_build_preserves_feature_order_and_subset() -> None:
     """Readiness is returned in the GatedFeature declaration order, for exactly the supplied features."""
     readiness = build_feature_readiness(

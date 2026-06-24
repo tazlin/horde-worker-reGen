@@ -70,6 +70,8 @@ class FakeSupervisor:
         self.rate_limits_kbps: list[int] = []
         self.download_requests: list[RecordedDownloadRequest] = []
         self.server_maintenance: list[bool] = []
+        self.set_concurrency_calls: list[tuple[int | None, int | None]] = []
+        """Every ``request_set_concurrency`` call as ``(target_processes, target_threads)``."""
 
     # region lifecycle and status
 
@@ -134,6 +136,22 @@ class FakeSupervisor:
         """Record a pop-resume request; True only when the worker is running."""
         self.requests.append("resume")
         self.resume_calls += 1
+        return self._alive
+
+    def request_drain(self) -> bool:
+        """Record a drain request (stop popping, finish in-flight); True only when the worker is running."""
+        self.requests.append("drain")
+        return self._alive
+
+    def request_set_concurrency(
+        self,
+        *,
+        target_processes: int | None = None,
+        target_threads: int | None = None,
+    ) -> bool:
+        """Record an inference-scaling request; True only when the worker is running."""
+        self.requests.append(f"set_concurrency:processes={target_processes}:threads={target_threads}")
+        self.set_concurrency_calls.append((target_processes, target_threads))
         return self._alive
 
     def request_reload_config(self) -> bool:

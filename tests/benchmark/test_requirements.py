@@ -213,7 +213,7 @@ def _sd15_controlnet_level() -> RampLevel:
 def test_controlnet_level_surfaces_installed_and_annotator_size(monkeypatch: pytest.MonkeyPatch) -> None:
     """A controlnet level reports requires_controlnet, the installed flag, and a non-zero annotator ROM."""
     monkeypatch.setattr(requirements_mod, "controlnet_installed", lambda: True)
-    monkeypatch.setattr(requirements_mod, "controlnet_annotators_present", lambda: True)
+    monkeypatch.setattr(requirements_mod, "controlnet_annotators_present", lambda control_types: True)
     monkeypatch.setattr(requirements_mod, "_controlnet_annotator_bytes", lambda control_types: 800 * 1024**2)
 
     req = compute_level_requirements(_sd15_controlnet_level(), present_resolver=_present)
@@ -234,7 +234,7 @@ def test_controlnet_annotator_presence_probed_only_when_extra_installed(monkeypa
     """
     monkeypatch.setattr(requirements_mod, "controlnet_installed", lambda: False)
 
-    def _should_not_be_called() -> bool | None:
+    def _should_not_be_called(control_types: list[str]) -> bool | None:
         raise AssertionError("annotator presence must not be probed when the controlnet extra is absent")
 
     monkeypatch.setattr(requirements_mod, "controlnet_annotators_present", _should_not_be_called)

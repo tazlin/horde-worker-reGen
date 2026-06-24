@@ -635,7 +635,9 @@ class InferenceScheduler:
         if (
             self._measured_effective_idle_used_mb is None
             or process_count > self._effective_idle_process_count
-            or (process_count == self._effective_idle_process_count and used_mb > self._measured_effective_idle_used_mb)
+            or (
+                process_count == self._effective_idle_process_count and used_mb > self._measured_effective_idle_used_mb
+            )
         ):
             self._measured_effective_idle_used_mb = used_mb
             self._effective_idle_process_count = process_count
@@ -1157,8 +1159,7 @@ class InferenceScheduler:
         if state is None or state.model is None:
             return None, ""
         establishing = (
-            state.established_at != 0.0
-            and (time.time() - state.established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
+            state.established_at != 0.0 and (time.time() - state.established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
         )
         return state.model, ("establishing" if establishing else "holding")
 
@@ -2840,9 +2841,7 @@ class InferenceScheduler:
         ):
             # Record the card this job runs on (None on a single-GPU host) so its over-budget fault streak is
             # kept per card: a model unservable on a small card can still be advertised and run on a larger one.
-            dispatched_device_index = (
-                process_with_model.device_index if self._multi_gpu_routing_active else None
-            )
+            dispatched_device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
             await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)
             horde_model_baseline = self._model_metadata.get_baseline(next_job.model)
 

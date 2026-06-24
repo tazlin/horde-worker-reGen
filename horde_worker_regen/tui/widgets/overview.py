@@ -511,6 +511,7 @@ class OverviewView(VerticalScroll):
         FeatureReadinessState.OFFERED: "green",
         FeatureReadinessState.WAITING: "yellow",
         FeatureReadinessState.MISSING_DEPS: "red",
+        FeatureReadinessState.FAILED: "red",
         FeatureReadinessState.DISABLED: "grey50",
     }
 
@@ -518,6 +519,7 @@ class OverviewView(VerticalScroll):
         FeatureReadinessState.OFFERED: "offered",
         FeatureReadinessState.WAITING: "downloading",
         FeatureReadinessState.MISSING_DEPS: "no deps",
+        FeatureReadinessState.FAILED: "failed",
     }
 
     def _feature_readiness_line(self, summary: FeatureReadinessSummary | None) -> Text | None:

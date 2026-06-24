@@ -263,9 +263,7 @@ class JobTracker:
         if device_index is None:
             keys_to_clear = [key for key in self._model_overbudget_fault_counts if key[0] == model]
             keys_to_clear += [
-                key
-                for key in self._model_last_overbudget_fault_time
-                if key[0] == model and key not in keys_to_clear
+                key for key in self._model_last_overbudget_fault_time if key[0] == model and key not in keys_to_clear
             ]
         else:
             keys_to_clear = [(model, device_index)]

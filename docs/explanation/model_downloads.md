@@ -64,13 +64,27 @@ Previously only image checkpoints were validated and the auxiliary path reported
 success unconditionally, so a truncated ControlNet/post-processing file was trusted
 and a job that used it would fault.
 
-The ControlNet annotators are fetched as one **exclusive** task (they need a full
-ComfyUI init, which must not race other downloads). Because that preload is
-un-interruptible and can wedge, the
+The ControlNet annotators are **first-class models**, not an opaque side-channel.
+`horde_model_reference` models each detector checkpoint as a `controlnet_annotator`
+record and hordelib exposes a `controlnet_annotator` model manager, so the worker
+fetches each annotator file as its own per-file aux download: it gets the same size,
+progress, checksum verification, and on-disk presence reporting as every other model,
+instead of a single opaque "annotators" line that froze through a full ComfyUI init.
+
+Once the files are present, a single **exclusive** `ANNOTATOR_VERIFY` task runs each
+preprocessor once (a ComfyUI init) to confirm they actually load. A verify failure is
+recovered, not ignored: the detector checkpoints are re-downloaded once (a corrupt
+file is the likely cause) and re-verified; if it **still** fails, ControlNet is
+disabled for the session and the operator is notified with a remediation hint, rather
+than leaving the worker to fault every ControlNet job. Because that verify can wedge
+inside hordelib, the
 [scheduler][horde_worker_regen.process_management.download_scheduler.HostAwareDownloadScheduler]
 bounds how long an exclusive task may block the queue: past the bound it relaxes
 exclusivity so the image-model downloads a worker needs to serve jobs proceed, while
 the stuck task harmlessly keeps running. The relaxation is logged once.
+
+(A hordelib without the first-class `controlnet_annotator` manager falls back to the
+legacy single exclusive preload that both fetches and verifies in one ComfyUI init.)
 
 ## Model availability and the pop gate
 
@@ -118,18 +132,23 @@ The two halves are tracked separately and fused parent-side:
   are missing. So by the time a flag is still on, the deps are present.
 - The **presence** half is reported up from the download process, the only
   torch-free authority on what is on disk. It probes the loaded managers
-  (the same per-model availability the aux download builder uses, plus the
-  annotator on-disk marker) and reports a tri-state per feature: present,
-  not-yet-present, or unknown.
+  (the same per-model availability the aux download builder uses, including the
+  `controlnet_annotator` manager's per-record on-disk presence) and reports a
+  tri-state per feature: present, not-yet-present, or unknown.
 
 [`feature_readiness.py`][horde_worker_regen.process_management.feature_readiness]
 is a pure function that combines these into a per-feature state: `offered`,
-`waiting` (enabled, deps present, models still downloading), `missing_deps`, or
-`disabled`. The job popper withholds a gated feature from the pop request until it
-is `offered`, so the worker never advertises a capability whose aux downloads are
-still in flight. Mirroring image-model availability, an **unknown** presence (no
-download process, or no report yet) never withholds a feature, so a worker that
-pre-downloaded everything keeps its long-standing behaviour.
+`waiting` (enabled, deps present, models still downloading), `missing_deps`,
+`disabled`, or `failed`. The job popper withholds a gated feature from the pop
+request until it is `offered`, so the worker never advertises a capability whose aux
+downloads are still in flight. Mirroring image-model availability, an **unknown**
+presence (no download process, or no report yet) never withholds a feature, so a
+worker that pre-downloaded everything keeps its long-standing behaviour.
+
+`failed` is distinct from `waiting`: it is the terminal state for a feature whose
+models are present but cannot run (the annotator verify above), so it withholds
+ControlNet until the operator restarts, rather than implying it will recover on its
+own. `waiting` clears itself once a download lands; `failed` does not.
 
 The same readiness drives the display, so the table can never disagree with what
 the worker advertises: the Downloads tab shows the full per-feature table
@@ -192,9 +211,10 @@ Downloads tab lists every concurrent download, grouped by host.
 Two correctness invariants underpin the threading. First, the hordelib calls that
 mutate one model manager's shared state (its on-disk model lists) are serialized
 **per manager**, so two downloads on different managers run truly in parallel while
-two on the same manager never corrupt that shared state; the ControlNet annotators,
-which need a full ComfyUI init, run **exclusively** (no other download alongside
-them). Second, a per-file fetch (image or aux) that fails transiently is re-queued a
+two on the same manager never corrupt that shared state; the annotator **verify**
+(`ANNOTATOR_VERIFY`), which needs a full ComfyUI init, runs **exclusively** (no other
+download alongside it), while the annotator *files* download per-file like any other
+aux model. Second, a per-file fetch (image or aux) that fails transiently is re-queued a
 bounded number of times rather than abandoned until the next config reload, and a
 recorded failure is cleared once a later attempt for that model succeeds.
 
@@ -286,7 +306,11 @@ The same path now also covers the **controlnet annotators** (the
 HuggingFace by the annotator package on first use; hordelib now pre-fetches them
 through this unified engine (gated mirror, then HuggingFace origin) into the exact
 paths the package expects, so the detectors find them present and skip their own
-download. The set is cataloged in `horde_model_reference.annotator_catalog`.
+download. They are a first-class `controlnet_annotator` model-reference category
+(verified in `horde_model_reference.annotator_catalog`, bridged to records by
+`annotator_records`), and hordelib registers an `AnnotatorModelProvider` so the set
+is also queryable as `source="comfyui_controlnet_aux"` — no longer an opaque
+side-channel.
 
 ## Benchmark downloads: one coherent picture
 

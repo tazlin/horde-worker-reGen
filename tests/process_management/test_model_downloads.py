@@ -8,12 +8,14 @@ import sys
 import threading
 import time
 import types
+from collections import Counter
 from types import SimpleNamespace
+from typing import Protocol
 from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.model_download_core import ChunkPacer, DownloadAborted
+from horde_worker_regen.model_download_core import ChunkPacer, CompVisLike, DownloadAborted
 from horde_worker_regen.process_management.action_ledger import ActionLedger
 from horde_worker_regen.process_management.download_process import (
     DOWNLOAD_PROCESS_ID,
@@ -54,8 +56,16 @@ from .conftest import (
 )
 
 
-def _drain_availability(message_queue: queue.Queue) -> list[HordeDownloadAvailabilityMessage]:  # type: ignore[type-arg]
-    """Pull every queued ``HordeDownloadAvailabilityMessage`` off a (stdlib) queue."""
+class _DrainableQueue(Protocol):
+    """The minimal queue surface :func:`_drain_availability` reads; stdlib and multiprocessing queues both fit."""
+
+    def empty(self) -> bool: ...
+
+    def get_nowait(self) -> object: ...
+
+
+def _drain_availability(message_queue: _DrainableQueue) -> list[HordeDownloadAvailabilityMessage]:
+    """Pull every queued ``HordeDownloadAvailabilityMessage`` off a stdlib or multiprocessing queue."""
     messages: list[HordeDownloadAvailabilityMessage] = []
     while not message_queue.empty():
         item = message_queue.get_nowait()
@@ -924,8 +934,17 @@ class TestRealDownloadProcessReconcile:
 
         assert process._aux_enqueued is True
 
-    def _process_with_controlnet_only_aux(self) -> HordeDownloadProcess:
-        """A download process whose only enabled aux category is ControlNet (isolates the annotator task)."""
+
+class TestFirstClassAnnotators:
+    """The first-class ``controlnet_annotator`` manager path: per-file downloads, then a verify with recovery.
+
+    With a hordelib that exposes a ``controlnet_annotator`` manager, each detector checkpoint is a per-file
+    aux download (size/progress/checksum/presence like any model), and a single ComfyUI verify confirms the
+    preprocessors run. A verify failure re-downloads once and, if it still fails, disables ControlNet and
+    notifies the operator instead of faulting every ControlNet job.
+    """
+
+    def _process(self) -> HordeDownloadProcess:
         return HordeDownloadProcess(
             process_id=DOWNLOAD_PROCESS_ID,
             process_message_queue=queue.Queue(),  # type: ignore[arg-type]
@@ -940,8 +959,20 @@ class TestRealDownloadProcessReconcile:
         )
 
     @staticmethod
-    def _inject_controlnet_manager(monkeypatch: pytest.MonkeyPatch) -> None:
-        """Make ``from hordelib.api import SharedModelManager`` yield a manager with only ControlNet (no models)."""
+    def _annotator_manager(*, present: bool, names: tuple[str, ...] = ("annotator_hed", "annotator_depth")) -> object:
+        """A fake first-class annotator manager: per-record presence plus the taint/download recovery hooks."""
+        return SimpleNamespace(
+            model_reference={name: object() for name in names},
+            model_folder_path="/cn",
+            is_model_available=lambda _name: present,
+            get_model_download=lambda _name: [{"file_url": "https://huggingface.co/lllyasviel/Annotators"}],
+            taint_models=lambda _names: None,
+            download_model=lambda _name, callback=None, connections=1: True,
+        )
+
+    def _inject(self, monkeypatch: pytest.MonkeyPatch, *, annotators_present: bool) -> object:
+        """Inject a SharedModelManager exposing ControlNet plus a first-class annotator manager; return it."""
+        annotator_manager = self._annotator_manager(present=annotators_present)
         controlnet = SimpleNamespace(
             model_reference={},
             model_folder_path="/cn",
@@ -955,30 +986,202 @@ class TestRealDownloadProcessReconcile:
             codeformer=None,
             miscellaneous=None,
             controlnet=controlnet,
+            controlnet_annotator=annotator_manager,
         )
         fake_api = types.ModuleType("hordelib.api")
         fake_api.SharedModelManager = SimpleNamespace(manager=manager)  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "hordelib.api", fake_api)
+        return manager
 
-    def test_annotator_task_skipped_when_already_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A warm worker with annotators on disk must not enqueue (or display) an annotator download."""
-        process = self._process_with_controlnet_only_aux()
-        self._inject_controlnet_manager(monkeypatch)
-        monkeypatch.setattr(HordeDownloadProcess, "_annotators_present", staticmethod(lambda: True))
-
-        process._enqueue_aux_tasks()
-
-        assert not any(task.kind is DownloadKind.ANNOTATORS for task in process._scheduler.pending_snapshot())
-
-    def test_annotator_task_enqueued_when_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When the annotators are not on disk, the annotator task is enqueued so they are fetched."""
-        process = self._process_with_controlnet_only_aux()
-        self._inject_controlnet_manager(monkeypatch)
-        monkeypatch.setattr(HordeDownloadProcess, "_annotators_present", staticmethod(lambda: False))
+    def test_missing_annotators_enqueue_per_file_aux_tasks_not_the_opaque_preload(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Each missing annotator checkpoint becomes its own AUX_MODEL task (no opaque preload task)."""
+        process = self._process()
+        self._inject(monkeypatch, annotators_present=False)
 
         process._enqueue_aux_tasks()
 
-        assert any(task.kind is DownloadKind.ANNOTATORS for task in process._scheduler.pending_snapshot())
+        tasks = process._scheduler.pending_snapshot()
+        annotator_tasks = [task for task in tasks if task.manager_key == "controlnet_annotator"]
+        assert {task.model_name for task in annotator_tasks} == {"annotator_hed", "annotator_depth"}
+        # Every annotator fetch is a per-file aux download; the coarse preload task no longer exists.
+        assert all(task.kind is DownloadKind.AUX_MODEL for task in annotator_tasks)
+
+    def test_present_annotators_enqueue_a_single_verify(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Once the files are on disk, exactly one ANNOTATOR_VERIFY is enqueued (idempotent)."""
+        process = self._process()
+        manager = self._inject(monkeypatch, annotators_present=True)
+
+        process._maybe_enqueue_annotator_verify(manager, True)
+        process._maybe_enqueue_annotator_verify(manager, True)  # second call must not re-enqueue
+
+        verifies = [t for t in process._scheduler.pending_snapshot() if t.kind is DownloadKind.ANNOTATOR_VERIFY]
+        assert len(verifies) == 1
+        assert verifies[0].exclusive is True
+
+    def test_verify_success_marks_done_without_killing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A passing verify records completion and never touches the kill switch (no re-download)."""
+        process = self._process()
+        manager = self._inject(monkeypatch, annotators_present=True)
+        redownloaded: list[bool] = []
+        monkeypatch.setattr(process, "_run_annotator_preload", lambda: True)
+        monkeypatch.setattr(process, "_redownload_annotators", lambda _m: redownloaded.append(True))
+        monkeypatch.setattr(process, "_refresh_feature_presence", lambda: None)
+
+        process._verify_annotators(manager)
+
+        assert process._annotator_verify_done is True
+        assert process._controlnet_killed is False
+        assert redownloaded == []  # success path does not re-download
+
+    def test_verify_failure_then_recovers_after_one_redownload(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A first-pass failure re-downloads once and, if the re-verify passes, re-enables ControlNet."""
+        process = self._process()
+        manager = self._inject(monkeypatch, annotators_present=True)
+        results = iter([False, True])  # fail, then pass after the re-download
+        redownloaded: list[bool] = []
+        monkeypatch.setattr(process, "_run_annotator_preload", lambda: next(results))
+        monkeypatch.setattr(process, "_redownload_annotators", lambda _m: redownloaded.append(True))
+        monkeypatch.setattr(process, "_refresh_feature_presence", lambda: None)
+
+        process._verify_annotators(manager)
+
+        assert redownloaded == [True]  # exactly one re-download (max retry of 1)
+        assert process._annotator_verify_done is True
+        assert process._controlnet_killed is False
+
+    def test_verify_permanent_failure_kills_controlnet_and_reports_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two failures (even after a re-download) disable ControlNet and report the failure to the parent."""
+        process = self._process()
+        manager = self._inject(monkeypatch, annotators_present=True)
+        redownloaded: list[bool] = []
+        monkeypatch.setattr(process, "_run_annotator_preload", lambda: False)
+        monkeypatch.setattr(process, "_redownload_annotators", lambda _m: redownloaded.append(True))
+        monkeypatch.setattr(process, "_refresh_feature_presence", lambda: None)
+
+        process._verify_annotators(manager)
+
+        assert redownloaded == [True]  # tried recovery exactly once
+        assert process._controlnet_killed is True
+        assert process._annotator_verify_done is True  # do not keep retrying a dead feature
+        # The kill is surfaced to the parent as ``controlnet_failed`` (drives the FAILED readiness + pop gate).
+        process._send_status(DownloadPhase.IDLE, force=True)
+        messages = _drain_availability(process.process_message_queue)
+        assert messages and messages[-1].controlnet_failed is True
+
+    def test_killed_controlnet_is_reported_absent_to_the_parent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A killed ControlNet reports annotators not-present, so the pop gate and TUI withhold it."""
+        process = self._process()
+        manager = self._inject(monkeypatch, annotators_present=True)
+        process._controlnet_killed = True
+
+        assert process._annotators_present_now(manager) is False
+
+
+class TestFeaturePresenceValidation:
+    """The feature 'offer' gate is existence + sha256, and it stays coherent with the offline plan.
+
+    A feature is offered only once its models are on disk *and* validate: an existence-only check would
+    wrongly offer a truncated or corrupt pre-existing file (which then faults at job time). The live
+    presence check and the offline existence authority agree on present/absent; the one intended divergence
+    is that the live gate additionally withholds a file that is on disk but fails its checksum.
+    """
+
+    def _process(self) -> HordeDownloadProcess:
+        return HordeDownloadProcess(
+            process_id=DOWNLOAD_PROCESS_ID,
+            process_message_queue=queue.Queue(),  # type: ignore[arg-type]
+            pipe_connection=Mock(),
+            disk_lock=Mock(),
+            download_bandwidth_semaphore=Mock(),
+            process_launch_identifier=0,
+            allow_controlnet=True,
+        )
+
+    @staticmethod
+    def _manager(*, on_disk: dict[str, bool], checksum: dict[str, bool | None]) -> tuple[CompVisLike, Counter[str]]:
+        """A fake feature manager plus a per-name validate counter.
+
+        ``on_disk`` is the existence answer (``is_model_available``); ``checksum`` is what ``validate_model``
+        returns per name (True passes, False is a corrupt file, None means the record has no checksum).
+        """
+        validate_calls: Counter[str] = Counter()
+
+        def validate_model(name: str, skip_checksum: bool = False) -> bool | None:
+            validate_calls[name] += 1
+            return checksum.get(name)
+
+        manager = SimpleNamespace(
+            model_reference={name: object() for name in on_disk},
+            model_folder_path="/cn",
+            is_model_available=lambda name: on_disk.get(name, False),
+            validate_model=validate_model,
+        )
+        return manager, validate_calls  # type: ignore[return-value]  # duck-typed fake satisfies CompVisLike
+
+    def test_present_and_valid_model_is_offered(self) -> None:
+        """A model on disk whose checksum verifies counts as present."""
+        process = self._process()
+        manager, _ = self._manager(on_disk={"cn_a": True}, checksum={"cn_a": True})
+        assert process._feature_model_present(manager, "controlnet", "cn_a") is True
+
+    def test_present_but_corrupt_model_is_withheld(self) -> None:
+        """A model on disk whose checksum fails is reported not-present and recorded as invalid, not cached."""
+        process = self._process()
+        manager, _ = self._manager(on_disk={"cn_a": True}, checksum={"cn_a": False})
+        assert process._feature_model_present(manager, "controlnet", "cn_a") is False
+        assert ("controlnet", "cn_a") in process._invalid_feature_files
+        assert ("controlnet", "cn_a") not in process._validated_feature_files
+
+    def test_no_checksum_falls_back_to_existence(self) -> None:
+        """A record without a checksum cannot be hashed, so existence alone makes it present."""
+        process = self._process()
+        manager, _ = self._manager(on_disk={"cn_a": True}, checksum={"cn_a": None})
+        assert process._feature_model_present(manager, "controlnet", "cn_a") is True
+
+    def test_absent_model_is_not_present_and_never_hashed(self) -> None:
+        """A model not on disk is not present, and its (nonexistent) bytes are never hashed."""
+        process = self._process()
+        manager, calls = self._manager(on_disk={"cn_a": False}, checksum={"cn_a": True})
+        assert process._feature_model_present(manager, "controlnet", "cn_a") is False
+        assert calls["cn_a"] == 0
+
+    def test_validation_is_cached_after_first_success(self) -> None:
+        """A known-good file is validated once; later presence reads are served from the session cache."""
+        process = self._process()
+        manager, calls = self._manager(on_disk={"cn_a": True}, checksum={"cn_a": True})
+        assert process._feature_model_present(manager, "controlnet", "cn_a") is True
+        assert process._feature_model_present(manager, "controlnet", "cn_a") is True
+        assert calls["cn_a"] == 1
+
+    def test_manager_all_present_withholds_when_any_file_is_corrupt(self) -> None:
+        """One corrupt file is enough to withhold the whole feature (all-or-nothing presence)."""
+        process = self._process()
+        controlnet, _ = self._manager(
+            on_disk={"cn_a": True, "cn_b": True},
+            checksum={"cn_a": True, "cn_b": False},
+        )
+        manager_obj = SimpleNamespace(controlnet=controlnet)
+        assert process._manager_all_present(manager_obj, "controlnet") is False
+
+    def test_offline_and_live_agree_when_no_file_is_corrupt(self) -> None:
+        """Coherence lock: with every present file valid, the live verdict matches the offline existence one.
+
+        The offline plan reports a feature present iff all its files are on disk; the live composite reaches
+        the same answer when nothing is corrupt, so the two presence paths cannot silently drift apart.
+        """
+        on_disk = {"cn_a": True, "cn_b": True}
+        process = self._process()
+        controlnet, _ = self._manager(on_disk=on_disk, checksum={"cn_a": True, "cn_b": None})
+        manager_obj = SimpleNamespace(controlnet=controlnet)
+
+        offline_present = all(on_disk.values())  # the existence authority the offline plan uses
+        assert process._manager_all_present(manager_obj, "controlnet") is offline_present
 
 
 class TestDownloadProcessConcurrencyFixes:

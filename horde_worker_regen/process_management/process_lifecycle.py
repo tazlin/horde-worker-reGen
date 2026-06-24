@@ -1698,10 +1698,16 @@ class ProcessLifecycleManager:
         # ``all(...)`` over an empty map is vacuously True, which would falsely declare "all processes
         # unresponsive" whenever no inference/safety process is running yet: during the startup
         # download-and-scan window and, deliberately, throughout download-only mode. Require at least one
-        # process to exist before the all-timed-out verdict can hold.
-        all_processes_timed_out = bool(self._process_map) and all(
-            ((now - process_info.last_received_timestamp) > bridge_data.process_timeout)
-            for process_info in self._process_map.values()
+        # process to exist before the all-timed-out verdict can hold, and never declare it while the worker
+        # is explicitly held for downloads (it runs no inference by design; the hold is the authority that
+        # this is intentional, not a wedge -- it is cleared on go-live / start).
+        all_processes_timed_out = (
+            bool(self._process_map)
+            and not self._state.downloads_only_hold
+            and all(
+                ((now - process_info.last_received_timestamp) > bridge_data.process_timeout)
+                for process_info in self._process_map.values()
+            )
         )
 
         shutdown_timed_out = self._state.shutting_down and (now - self._state.shutting_down_time) > (60 * 5)

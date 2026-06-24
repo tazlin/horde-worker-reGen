@@ -47,6 +47,13 @@ class FeatureReadinessState(enum.StrEnum):
     """The backing packages are not installed, so the feature cannot run and is not advertised."""
     DISABLED = "disabled"
     """Not enabled in the worker config."""
+    FAILED = "failed"
+    """Enabled with models present, but a runtime verify failed (e.g. annotators download but do not run),
+    so the feature is disabled until the operator intervenes. Distinct from WAITING, which recovers itself."""
+
+
+CONTROLNET_ANNOTATOR_FAILED_DETAIL = "annotators failed to load; ControlNet disabled — restart the worker to retry"
+"""Operator-facing reason for a ControlNet feature withheld by a permanent annotator verify failure."""
 
 
 _FEATURE_LABELS: dict[GatedFeature, str] = {
@@ -70,6 +77,11 @@ class FeatureInputs:
     present: bool | None
     deps_available: bool = True
     deps_hint: str = ""
+    failed: bool = False
+    """A runtime verify permanently failed (the models are present but do not run). Overrides presence to
+    withhold the feature in a distinct FAILED state until the operator acts. Defaults False."""
+    failed_detail: str = ""
+    """Operator-facing reason shown in the FAILED state (e.g. which verify failed and what to do)."""
 
 
 class FeatureReadiness(BaseModel):
@@ -109,6 +121,15 @@ def _readiness_for(feature: GatedFeature, inputs: FeatureInputs) -> FeatureReadi
             label=label,
             state=FeatureReadinessState.DISABLED,
             detail="not enabled in config",
+        )
+    # A runtime verify that permanently failed disables the feature outright, regardless of on-disk
+    # presence: the models are there but do not run, so advertising would only fault every job.
+    if inputs.failed:
+        return FeatureReadiness(
+            feature=feature,
+            label=label,
+            state=FeatureReadinessState.FAILED,
+            detail=inputs.failed_detail or "verification failed; disabled until restart",
         )
     # Enabled implies the deps are present (coercion would have disabled it otherwise). Withhold only
     # when the models are confirmed not on disk; an unknown presence advertises, so the worker is never

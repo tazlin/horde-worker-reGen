@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 __all__ = [
     "ChunkPacer",
@@ -112,6 +112,15 @@ class CompVisLike(Protocol):
 
     def is_model_available(self, model_name: str) -> bool:
         """Return whether *model_name*'s files are all present on disk."""
+        ...
+
+    @property
+    def model_reference(self) -> Mapping[str, object]:
+        """The manager's reference, keyed by model name (iterated to enumerate every model it manages)."""
+        ...
+
+    def taint_models(self, models: list[str]) -> None:
+        """Mark *models* invalid so the next ``download_model`` clears their on-disk files and re-fetches."""
         ...
 
 

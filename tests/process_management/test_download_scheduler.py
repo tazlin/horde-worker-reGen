@@ -23,7 +23,7 @@ def _task(model: str, host: str) -> DownloadTask:
 
 def _exclusive_task(model: str, host: str) -> DownloadTask:
     return DownloadTask(
-        kind=DownloadKind.ANNOTATORS,
+        kind=DownloadKind.ANNOTATOR_VERIFY,
         model_name=model,
         host=host,
         feature="annotators",
@@ -153,15 +153,37 @@ class TestHostAwareScheduler:
         exclusive = scheduler.acquire(timeout=0.05)
         assert exclusive is not None and exclusive.exclusive is True
 
+    def test_exclusive_task_runs_last_after_ordinary_downloads_drain(self) -> None:
+        """An exclusive task yields to every pending ordinary download and runs only in the idle tail.
+
+        Guards the wedge fix: the annotator preload verify must never jump ahead of the image/aux fetches a
+        worker needs to serve jobs, so a momentary lull cannot let it grab exclusivity and block them. Even
+        enqueued first, it waits until nothing ordinary is pending and nothing is in flight.
+        """
+        scheduler = HostAwareDownloadScheduler(max_parallel_downloads=4, per_host_concurrency=1)
+        scheduler.enqueue(_exclusive_task("annotators", "unknown"))
+        scheduler.enqueue_many([_task("a", "h1"), _task("b", "h2")])
+
+        first = scheduler.acquire(timeout=0.05)
+        second = scheduler.acquire(timeout=0.05)
+        assert first is not None and second is not None
+        assert {first.model_name, second.model_name} == {"a", "b"}  # ordinary downloads go first
+
+        scheduler.release(first)
+        scheduler.release(second)
+        # Queue now holds only the exclusive task and nothing is in flight: it is finally admitted.
+        admitted = scheduler.acquire(timeout=0.05)
+        assert admitted is not None and admitted.exclusive is True
+
     def test_exclusive_in_flight_blocks_others(self) -> None:
         """While an exclusive task runs, no other task is admitted (it runs alone)."""
         scheduler = HostAwareDownloadScheduler(max_parallel_downloads=4, per_host_concurrency=1)
         scheduler.enqueue(_exclusive_task("annotators", "unknown"))
-        scheduler.enqueue(_task("a", "h1"))
 
         exclusive = scheduler.acquire(timeout=0.05)
         assert exclusive is not None and exclusive.exclusive is True
-        # Nothing else may start alongside the exclusive task.
+        # An ordinary task arriving mid-flight may not start alongside the exclusive task.
+        scheduler.enqueue(_task("a", "h1"))
         assert scheduler.acquire(timeout=0.05) is None
 
         scheduler.release(exclusive)
@@ -180,11 +202,12 @@ class TestHostAwareScheduler:
             exclusive_timeout_seconds=0.0,
         )
         scheduler.enqueue(_exclusive_task("annotators", "unknown"))
-        scheduler.enqueue(_task("a", "h1"))
 
         exclusive = scheduler.acquire(timeout=0.05)
         assert exclusive is not None and exclusive.exclusive is True
-        # The exclusive task is still in flight, but its bound is already exceeded, so "a" is admitted.
+        # The exclusive task is still in flight, but its bound is already exceeded, so a later-arriving
+        # image download is admitted instead of being starved.
+        scheduler.enqueue(_task("a", "h1"))
         other = scheduler.acquire(timeout=0.05)
         assert other is not None and other.model_name == "a"
 
@@ -201,10 +224,10 @@ class TestHostAwareScheduler:
             exclusive_timeout_seconds=300.0,
         )
         scheduler.enqueue(_exclusive_task("annotators", "unknown"))
-        scheduler.enqueue(_task("a", "h1"))
 
         exclusive = scheduler.acquire(timeout=0.05)
         assert exclusive is not None and exclusive.exclusive is True
+        scheduler.enqueue(_task("a", "h1"))
         # Still within the bound: "a" is held back behind the running exclusive task.
         assert scheduler.acquire(timeout=0.05) is None
         # Advance past the bound: "a" becomes admissible even though the exclusive task is still in flight.

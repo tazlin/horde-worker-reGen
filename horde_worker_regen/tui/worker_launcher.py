@@ -544,6 +544,21 @@ class WorkerSupervisor:
         """Ask the worker to drain (stop popping; finish in-flight work)."""
         return self.send_command(SupervisorControlMessage(command=SupervisorCommand.DRAIN))
 
+    def request_set_concurrency(
+        self,
+        *,
+        target_processes: int | None = None,
+        target_threads: int | None = None,
+    ) -> bool:
+        """Ask the worker to scale running inference processes and/or the concurrent-inference cap."""
+        return self.send_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_CONCURRENCY,
+                target_processes=target_processes,
+                target_threads=target_threads,
+            ),
+        )
+
     def request_reload_config(self) -> bool:
         """Ask the worker to re-read bridgeData.yaml and hot-swap the runtime config."""
         return self.send_command(SupervisorControlMessage(command=SupervisorCommand.RELOAD_CONFIG))

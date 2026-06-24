@@ -248,6 +248,53 @@ def test_render_current_falls_back_to_single_current() -> None:
     assert "Deliberate" in text
 
 
+def test_annotator_preload_renders_as_a_setup_step_not_a_progress_bar() -> None:
+    """The one-time annotator preload (a ComfyUI init with no byte transfer) reads as setup, not a frozen bar."""
+    downloads = DownloadStatusSnapshot(
+        phase=DownloadPhase.DOWNLOADING,
+        current=CurrentDownloadStatus(model_name="annotators", feature="ControlNet annotators", target_dir="/m"),
+    )
+    text = _render(DownloadsView()._render_current(downloads))
+    assert "one-time setup" in text  # explained as a setup step, not a download
+    assert "█" not in text and "░" not in text  # and never as a (frozen) progress bar
+
+
+def test_fully_downloaded_file_renders_as_verifying_checksum() -> None:
+    """A file with every byte on disk but still active reads as a sha256 verify, not a frozen 100% bar.
+
+    This is the verify window the operator saw as "stuck at 100%": the bytes are all down and the time left
+    is the (callback-less) checksum, so the bar is replaced by an honest "verifying" line.
+    """
+    downloads = DownloadStatusSnapshot(
+        phase=DownloadPhase.DOWNLOADING,
+        current=CurrentDownloadStatus(
+            model_name="control_qr_xl",
+            feature="ControlNet",
+            target_dir="/m",
+            downloaded_bytes=5_000_000_000,
+            total_bytes=5_000_000_000,
+            speed_bps=0.0,
+        ),
+    )
+    text = _render(DownloadsView()._render_current(downloads))
+    assert "verifying checksum" in text
+    assert "█" not in text and "░" not in text  # the frozen 100% bar is gone
+
+    # A file still actively transferring (a non-zero speed) at a momentary 100% is NOT treated as verifying.
+    still_transferring = DownloadStatusSnapshot(
+        phase=DownloadPhase.DOWNLOADING,
+        current=CurrentDownloadStatus(
+            model_name="control_qr_xl",
+            feature="ControlNet",
+            target_dir="/m",
+            downloaded_bytes=5_000_000_000,
+            total_bytes=5_000_000_000,
+            speed_bps=1024.0,
+        ),
+    )
+    assert "verifying checksum" not in _render(DownloadsView()._render_current(still_transferring))
+
+
 def _readiness(feature: GatedFeature, state: FeatureReadinessState, detail: str = "") -> FeatureReadiness:
     return FeatureReadiness(feature=feature, label=feature.value, state=state, detail=detail)
 

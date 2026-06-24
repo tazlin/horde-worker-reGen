@@ -36,6 +36,7 @@ class ModelAvailability:
     _controlnet_present: bool | None
     _sdxl_controlnet_present: bool | None
     _post_processing_present: bool | None
+    _controlnet_failed: bool
 
     def __init__(self) -> None:
         """Initialise with availability unknown (no report received yet)."""
@@ -50,6 +51,7 @@ class ModelAvailability:
         self._controlnet_present = None
         self._sdxl_controlnet_present = None
         self._post_processing_present = None
+        self._controlnet_failed = False
 
     @property
     def is_known(self) -> bool:
@@ -87,6 +89,11 @@ class ModelAvailability:
         return self._post_processing_present
 
     @property
+    def controlnet_failed(self) -> bool:
+        """Whether the ControlNet annotator verify permanently failed (feature disabled until restart)."""
+        return self._controlnet_failed
+
+    @property
     def status(self) -> DownloadStatusSnapshot | None:
         """The latest rich download-status snapshot, if any has been reported."""
         return self._status
@@ -106,9 +113,7 @@ class ModelAvailability:
         """
         if self._status is None or self._status.phase.value != _DOWNLOADING_PHASE_VALUE:
             return False
-        in_flight = self._status.active or (
-            [self._status.current] if self._status.current is not None else []
-        )
+        in_flight = self._status.active or ([self._status.current] if self._status.current is not None else [])
         return any(download.percent is None or download.percent < 100.0 for download in in_flight)
 
     @property
@@ -145,6 +150,7 @@ class ModelAvailability:
         controlnet_present: bool | None = None,
         sdxl_controlnet_present: bool | None = None,
         post_processing_present: bool | None = None,
+        controlnet_failed: bool = False,
     ) -> None:
         """Replace the availability snapshot with a fresh report from the download process."""
         self._present = set(present)
@@ -158,6 +164,7 @@ class ModelAvailability:
         self._controlnet_present = controlnet_present
         self._sdxl_controlnet_present = sdxl_controlnet_present
         self._post_processing_present = post_processing_present
+        self._controlnet_failed = controlnet_failed
 
     def is_present(self, model_name: str) -> bool:
         """Return whether ``model_name`` is present on disk.

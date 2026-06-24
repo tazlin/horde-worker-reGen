@@ -120,8 +120,27 @@ def _weights_root_has_checkpoint(root: Path, *, budget_seconds: float = _MODEL_S
     return False
 
 
+def _download_summary(req: LevelRequirements) -> str:
+    """Return a short phrase naming what a runnable-but-incomplete level must fetch, or '' when nothing is.
+
+    Lists the distinct kinds of missing artifact (image models, controlnet checkpoints, controlnet annotators)
+    so the operator reads *what* a "download first" level needs at a glance, without opening the detail table.
+    """
+    parts: list[str] = []
+    if req.models_missing:
+        parts.append(f"{len(req.models_missing)} model{'s' if len(req.models_missing) != 1 else ''}")
+    if req.controlnet_checkpoints_missing:
+        parts.append("controlnet checkpoints")
+    if req.controlnet_annotators_present is False:
+        parts.append("controlnet annotators")
+    return ", ".join(parts)
+
+
 def _plan_row(req: LevelRequirements, verdict: str | None) -> LevelPlanRow:
     """Project a level's requirements and pre-flight verdict into a compact plan row."""
+    # A level that fits this machine (no skip verdict) but lacks downloadable artifacts is "download first":
+    # runnable once fetched, so neither a green "ready" nor a grey "skip". A hard skip is never download-first.
+    download_summary = _download_summary(req) if verdict is None else ""
     return LevelPlanRow(
         level_id=req.level_id,
         stage=req.stage,
@@ -140,6 +159,8 @@ def _plan_row(req: LevelRequirements, verdict: str | None) -> LevelPlanRow:
         features=req.features,
         will_run=verdict is None,
         verdict=verdict or "",
+        needs_download=bool(download_summary),
+        download_summary=download_summary,
     )
 
 

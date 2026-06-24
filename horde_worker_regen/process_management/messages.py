@@ -273,6 +273,10 @@ class HordeDownloadAvailabilityMessage(HordeProcessMessage):
     post_processing_present: bool | None = None
     """On-disk readiness of the post-processing feature (the GFPGAN/ESRGAN/CodeFormer models), or None
     when undeterminable."""
+    controlnet_failed: bool = False
+    """True once the ControlNet annotator verify has permanently failed (the detector checkpoints download
+    but do not run, even after one re-fetch). ControlNet is then withheld and the operator is notified;
+    distinct from ``controlnet_present=False`` (still downloading), which recovers on its own."""
     status: DownloadStatusSnapshot | None = None
     """Rich, display-oriented status (phase, current download, queue, failures) for the TUI/console."""
     reference_changed: bool = False
