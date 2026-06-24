@@ -83,6 +83,42 @@ fully on disk are kept (removing a model from config has never deleted weights;
 that remains the job of the purge / `only_models_on_disk` controls). Required
 safety and auxiliary downloads are never pruned by a model removal.
 
+## Feature readiness: deps plus models on disk
+
+Image models are not the only thing a worker advertises. ControlNet,
+SDXL-ControlNet, and post-processing each need **two** things before the worker
+can actually serve a job that asks for them: the Python packages that back them
+(`onnxruntime` for the ControlNet annotators, `rembg` for background removal), and
+the models/annotators themselves on disk. Advertising a feature before either is
+in place only earns a job the worker will fault.
+
+The two halves are tracked separately and fused parent-side:
+
+- The **deps** half is enforced at config load by
+  [`coerce_bridge_data_to_capabilities`][horde_worker_regen.capabilities.coerce_bridge_data_to_capabilities],
+  which turns the opt-in flag off (with a loud, actionable hint) when the packages
+  are missing. So by the time a flag is still on, the deps are present.
+- The **presence** half is reported up from the download process, the only
+  torch-free authority on what is on disk. It probes the loaded managers
+  (the same per-model availability the aux download builder uses, plus the
+  annotator on-disk marker) and reports a tri-state per feature: present,
+  not-yet-present, or unknown.
+
+[`feature_readiness.py`][horde_worker_regen.process_management.feature_readiness]
+is a pure function that combines these into a per-feature state: `offered`,
+`waiting` (enabled, deps present, models still downloading), `missing_deps`, or
+`disabled`. The job popper withholds a gated feature from the pop request until it
+is `offered`, so the worker never advertises a capability whose aux downloads are
+still in flight. Mirroring image-model availability, an **unknown** presence (no
+download process, or no report yet) never withholds a feature, so a worker that
+pre-downloaded everything keeps its long-standing behaviour.
+
+The same readiness drives the display, so the table can never disagree with what
+the worker advertises: the Downloads tab shows the full per-feature table
+(with the install hint when deps are missing), and the Overview health panel
+carries a compact one-line summary of the engaged features. LoRA (fetched per job)
+and the safety models keep their own gating and appear as read-only rows.
+
 ## Planning: what a config implies for disk
 
 [`model_download_plan.py`][horde_worker_regen.model_download_plan] answers, without

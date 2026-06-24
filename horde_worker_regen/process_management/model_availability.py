@@ -33,6 +33,9 @@ class ModelAvailability:
     _scan_complete: bool
     _safety_present: bool
     _safety_attempted: bool
+    _controlnet_present: bool | None
+    _sdxl_controlnet_present: bool | None
+    _post_processing_present: bool | None
 
     def __init__(self) -> None:
         """Initialise with availability unknown (no report received yet)."""
@@ -44,6 +47,9 @@ class ModelAvailability:
         self._scan_complete = False
         self._safety_present = False
         self._safety_attempted = False
+        self._controlnet_present = None
+        self._sdxl_controlnet_present = None
+        self._post_processing_present = None
 
     @property
     def is_known(self) -> bool:
@@ -64,6 +70,21 @@ class ModelAvailability:
     def safety_attempted(self) -> bool:
         """Whether the download process has finished its one-shot ensure of the safety models."""
         return self._safety_attempted
+
+    @property
+    def controlnet_present(self) -> bool | None:
+        """On-disk readiness of the ControlNet feature (models + annotators); None until reported."""
+        return self._controlnet_present
+
+    @property
+    def sdxl_controlnet_present(self) -> bool | None:
+        """On-disk readiness of SDXL-ControlNet (models + annotators + miscellaneous); None until reported."""
+        return self._sdxl_controlnet_present
+
+    @property
+    def post_processing_present(self) -> bool | None:
+        """On-disk readiness of the post-processing feature (GFPGAN/ESRGAN/CodeFormer); None until reported."""
+        return self._post_processing_present
 
     @property
     def status(self) -> DownloadStatusSnapshot | None:
@@ -121,6 +142,9 @@ class ModelAvailability:
         scan_complete: bool = True,
         safety_present: bool = False,
         safety_attempted: bool = False,
+        controlnet_present: bool | None = None,
+        sdxl_controlnet_present: bool | None = None,
+        post_processing_present: bool | None = None,
     ) -> None:
         """Replace the availability snapshot with a fresh report from the download process."""
         self._present = set(present)
@@ -131,6 +155,9 @@ class ModelAvailability:
         self._scan_complete = scan_complete
         self._safety_present = safety_present
         self._safety_attempted = safety_attempted
+        self._controlnet_present = controlnet_present
+        self._sdxl_controlnet_present = sdxl_controlnet_present
+        self._post_processing_present = post_processing_present
 
     def is_present(self, model_name: str) -> bool:
         """Return whether ``model_name`` is present on disk.

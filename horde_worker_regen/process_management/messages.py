@@ -263,6 +263,16 @@ class HordeDownloadAvailabilityMessage(HordeProcessMessage):
     succeeded or failed. Lets the main process tell 'not tried yet' (a transient post-scan idle report,
     keep waiting) apart from 'tried and could not provide them' (start the safety process so it self-fetches
     and surfaces the real error). Always True alongside ``safety_models_present``."""
+    controlnet_present: bool | None = None
+    """On-disk readiness of the ControlNet feature (its models plus the annotators), or None until probed.
+    None means undeterminable (the manager is not loaded, e.g. the feature is not opted in), which the
+    parent treats as "do not gate", mirroring image-model availability."""
+    sdxl_controlnet_present: bool | None = None
+    """On-disk readiness of the SDXL-ControlNet feature (its ControlNet models, the annotators, and the
+    auxiliary miscellaneous models), or None when undeterminable."""
+    post_processing_present: bool | None = None
+    """On-disk readiness of the post-processing feature (the GFPGAN/ESRGAN/CodeFormer models), or None
+    when undeterminable."""
     status: DownloadStatusSnapshot | None = None
     """Rich, display-oriented status (phase, current download, queue, failures) for the TUI/console."""
     reference_changed: bool = False

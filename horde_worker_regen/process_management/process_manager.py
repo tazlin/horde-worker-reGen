@@ -60,6 +60,11 @@ from horde_worker_regen.process_management.card_runtime import CardRuntime
 from horde_worker_regen.process_management.desired_state import DesiredState
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.duty_cycle import DutyCycleSummary, summarize_duty_cycle
+from horde_worker_regen.process_management.feature_readiness import (
+    FeatureInputs,
+    GatedFeature,
+    build_feature_readiness,
+)
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
@@ -105,6 +110,8 @@ from horde_worker_regen.process_management.supervisor_channel import (
     RECENT_JOBS_IN_SNAPSHOT,
     CardSnapshot,
     DownloadPlanSummary,
+    FeatureInfoRow,
+    FeatureReadinessSummary,
     JobFeatureSummary,
     JobQueueEntry,
     ProcessSnapshot,
@@ -1580,6 +1587,9 @@ class HordeWorkerProcessManager:
             scan_complete=message.scan_complete,
             safety_present=message.safety_models_present,
             safety_attempted=message.safety_models_attempted,
+            controlnet_present=message.controlnet_present,
+            sdxl_controlnet_present=message.sdxl_controlnet_present,
+            post_processing_present=message.post_processing_present,
         )
 
         # A completed download changed the on-disk reference (a new image model, or the LoRa/TI/aux
@@ -3056,6 +3066,7 @@ class HordeWorkerProcessManager:
             ],
             downloads=self._model_availability.status,
             download_plan=self._get_download_plan_summary(),
+            feature_readiness=self._build_feature_readiness_summary(bridge_data),
             lora_pops_blocked_by_downloads=(
                 bridge_data.allow_lora and self._model_availability.background_download_active
             ),
@@ -3070,6 +3081,74 @@ class HordeWorkerProcessManager:
             per_card=self._build_card_snapshots(),
             system_memory=SystemMemorySnapshot.from_summary(self._sample_system_memory()),
         )
+
+    def _build_feature_readiness_summary(self, bridge_data: reGenBridgeData) -> FeatureReadinessSummary:
+        """Build the per-feature readiness shown in the TUI, matching the pop gate's offer decision.
+
+        The gated rows fuse the (post-coercion) opt-in flag, the live dependency probe, and the on-disk
+        presence reported by the download process; the informational rows surface LoRA and safety, which
+        keep their own gating. Built from the same inputs the pop gate uses, so the table never disagrees
+        with what the worker actually advertises.
+        """
+        from horde_worker_regen.capabilities import (
+            controlnet_available,
+            controlnet_install_hint,
+            post_processing_install_hint,
+            strip_background_available,
+        )
+
+        availability = self._model_availability
+        controlnet_deps = controlnet_available()
+        post_processing_deps = strip_background_available()
+        controlnet_hint = controlnet_install_hint() if not controlnet_deps else ""
+        post_processing_hint = post_processing_install_hint() if not post_processing_deps else ""
+
+        gated = build_feature_readiness(
+            {
+                GatedFeature.CONTROLNET: FeatureInputs(
+                    enabled=bridge_data.allow_controlnet,
+                    present=availability.controlnet_present,
+                    deps_available=controlnet_deps,
+                    deps_hint=controlnet_hint,
+                ),
+                GatedFeature.SDXL_CONTROLNET: FeatureInputs(
+                    enabled=bridge_data.allow_sdxl_controlnet,
+                    present=availability.sdxl_controlnet_present,
+                    deps_available=controlnet_deps,
+                    deps_hint=controlnet_hint,
+                ),
+                GatedFeature.POST_PROCESSING: FeatureInputs(
+                    enabled=bridge_data.allow_post_processing,
+                    present=availability.post_processing_present,
+                    deps_available=post_processing_deps,
+                    deps_hint=post_processing_hint,
+                ),
+            },
+        )
+
+        informational = [
+            self._lora_info_row(bridge_data),
+            self._safety_info_row(),
+        ]
+        return FeatureReadinessSummary(gated=list(gated), informational=informational)
+
+    def _lora_info_row(self, bridge_data: reGenBridgeData) -> FeatureInfoRow:
+        """Read-only LoRA readiness: enabled, or paused by the download/disk guards (its own gating)."""
+        if not bridge_data.allow_lora:
+            return FeatureInfoRow(label="LoRA", status="not enabled in config", ok=False)
+        if self._state.lora_disk_exhausted:
+            return FeatureInfoRow(label="LoRA", status="paused: low disk on the LoRA volume", ok=False)
+        if self._model_availability.background_download_active:
+            return FeatureInfoRow(label="LoRA", status="paused while models download", ok=False)
+        return FeatureInfoRow(label="LoRA", status="enabled (fetched per job)", ok=True)
+
+    def _safety_info_row(self) -> FeatureInfoRow:
+        """Read-only safety-model readiness: present (image jobs can run) or still being fetched."""
+        if self._model_availability.safety_present:
+            return FeatureInfoRow(label="Safety models", status="present", ok=True)
+        if self._model_availability.safety_attempted:
+            return FeatureInfoRow(label="Safety models", status="unavailable (see logs)", ok=False)
+        return FeatureInfoRow(label="Safety models", status="verifying / downloading", ok=False)
 
     def build_run_record(self) -> WorkerRunRecord:
         """Return a durable summary of this worker session for app-state persistence.

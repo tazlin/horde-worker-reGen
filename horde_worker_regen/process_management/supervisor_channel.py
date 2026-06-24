@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
+from horde_worker_regen.process_management.feature_readiness import FeatureReadiness
+
 if TYPE_CHECKING:
     from multiprocessing.connection import Connection
 
@@ -29,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 8
+SUPERVISOR_PROTOCOL_VERSION = 9
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -47,6 +49,8 @@ host-parallel downloading; ``current`` is retained as the primary entry for sing
 v8 added per-card multi-GPU data: ``ProcessSnapshot.device_index`` (which card each slot is pinned to)
 and the snapshot's ``per_card`` list of :class:`CardSnapshot` (per-card VRAM, contexts, residency, and
 fault/unservable-model health). Additive: a single-GPU host reports exactly one ``CardSnapshot``.
+v9 added the snapshot's ``feature_readiness`` (:class:`FeatureReadinessSummary`): the per-feature
+deps+on-disk readiness the worker uses to decide which gated features it offers to the Horde.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -400,6 +404,33 @@ class DownloadPlanSummary(BaseModel):
     """False when some configured models lack size metadata, so the byte totals are a lower bound."""
 
 
+class FeatureInfoRow(BaseModel):
+    """A read-only readiness line for a feature the worker does not gate on disk presence (LoRA, safety).
+
+    These keep their own existing gating (per-job ad-hoc LoRA, the startup safety-model ensure); the row
+    only surfaces their state alongside the gated features so the readiness table is a complete picture.
+    """
+
+    label: str
+    status: str
+    """A short human status, e.g. 'present', 'enabled', 'verifying downloads'."""
+    ok: bool = True
+    """Whether the line reads as healthy/ready (green) versus pending/blocked (muted), for styling."""
+
+
+class FeatureReadinessSummary(BaseModel):
+    """The worker's per-feature readiness: what it offers to the Horde and why anything is withheld.
+
+    ``gated`` carries the features the worker withholds until their models/annotators are on disk
+    (ControlNet, SDXL-ControlNet, post-processing); ``informational`` carries read-only lines for
+    features with their own gating (LoRA, safety). Built parent-side from the same readiness the pop gate
+    enforces, so the table can never disagree with what the worker actually advertises.
+    """
+
+    gated: list[FeatureReadiness] = Field(default_factory=list)
+    informational: list[FeatureInfoRow] = Field(default_factory=list)
+
+
 class WorkerLivenessFrame(BaseModel):
     """A tiny liveness heartbeat, emitted on its own cadence independent of full-snapshot production.
 
@@ -654,6 +685,8 @@ class WorkerStateSnapshot(BaseModel):
     """Live download-subsystem state (None when background downloads are disabled)."""
     download_plan: DownloadPlanSummary | None = None
     """The one-time disk implications of the configured models (None when not computed)."""
+    feature_readiness: FeatureReadinessSummary | None = None
+    """Per-feature deps+on-disk readiness driving which gated features the worker offers (None until built)."""
     lora_pops_blocked_by_downloads: bool = False
     """Configured LoRA support is temporarily suppressed because background downloads are active."""
     lora_pops_blocked_by_disk: bool = False

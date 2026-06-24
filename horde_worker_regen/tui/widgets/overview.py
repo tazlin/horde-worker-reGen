@@ -15,6 +15,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from horde_worker_regen.app_state import OverviewViewMode
+from horde_worker_regen.process_management.feature_readiness import FeatureReadinessState
 from horde_worker_regen.process_management.process_temperature import (
     ProcessTemperature,
     classify_process_temperature,
@@ -22,6 +23,7 @@ from horde_worker_regen.process_management.process_temperature import (
 )
 from horde_worker_regen.process_management.supervisor_channel import (
     CardSnapshot,
+    FeatureReadinessSummary,
     JobQueueEntry,
     ProcessSnapshot,
     RecentJobRecord,
@@ -181,7 +183,9 @@ class OverviewView(VerticalScroll):
         width = self.content_size.width or None
 
         self.query_one("#overview-hero", Static).update(self._render_hero(report, snapshot, frame))
-        self.query_one("#overview-health", Static).update(self._render_health(report))
+        self.query_one("#overview-health", Static).update(
+            self._render_health(report, snapshot.feature_readiness if snapshot is not None else None),
+        )
         if snapshot is not None:
             if show_gpus:
                 self.query_one("#overview-gpus", Static).update(self._render_gpus_strip(snapshot, detailed=detailed))
@@ -484,8 +488,8 @@ class OverviewView(VerticalScroll):
             expand=False,
         )
 
-    def _render_health(self, report: HealthReport) -> Panel:
-        """Render the health checklist."""
+    def _render_health(self, report: HealthReport, feature_readiness: FeatureReadinessSummary | None = None) -> Panel:
+        """Render the health checklist, with a compact feature-readiness line when any feature is engaged."""
         table = Table.grid(padding=(0, 2))
         table.add_column(width=2)
         table.add_column(style="bold", no_wrap=True)
@@ -498,7 +502,43 @@ class OverviewView(VerticalScroll):
                 Text(check.name, style=check.status.colour),
                 Text(check.detail, style="grey70"),
             )
+        features_line = self._feature_readiness_line(feature_readiness)
+        if features_line is not None:
+            table.add_row(Text("⊟", style="grey62"), Text("Features", style="bold"), features_line)
         return Panel(table, title="Health", title_align="left", border_style="grey37", padding=(0, 1))
+
+    _COMPACT_READINESS_STYLE: dict[FeatureReadinessState, str] = {
+        FeatureReadinessState.OFFERED: "green",
+        FeatureReadinessState.WAITING: "yellow",
+        FeatureReadinessState.MISSING_DEPS: "red",
+        FeatureReadinessState.DISABLED: "grey50",
+    }
+
+    _COMPACT_READINESS_VERB: dict[FeatureReadinessState, str] = {
+        FeatureReadinessState.OFFERED: "offered",
+        FeatureReadinessState.WAITING: "downloading",
+        FeatureReadinessState.MISSING_DEPS: "no deps",
+    }
+
+    def _feature_readiness_line(self, summary: FeatureReadinessSummary | None) -> Text | None:
+        """A one-line summary of the engaged gated features, or None when none are engaged.
+
+        Purely-disabled features are omitted so an operator who uses none of them sees no noise; the full
+        per-feature table lives on the Downloads tab.
+        """
+        if summary is None:
+            return None
+        shown = [feature for feature in summary.gated if feature.state is not FeatureReadinessState.DISABLED]
+        if not shown:
+            return None
+        line = Text()
+        for index, feature in enumerate(shown):
+            if index:
+                line.append("  ·  ", style="grey37")
+            verb = self._COMPACT_READINESS_VERB.get(feature.state, feature.state.value)
+            line.append(f"{feature.label} ", style="grey70")
+            line.append(verb, style=self._COMPACT_READINESS_STYLE.get(feature.state, "grey62"))
+        return line
 
     def _render_worker_table(self, snapshot: WorkerStateSnapshot) -> Table:
         """Build a key/value table of worker identity and configuration."""

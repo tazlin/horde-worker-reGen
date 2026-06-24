@@ -6,6 +6,11 @@ import random
 
 from rich.console import Console
 
+from horde_worker_regen.process_management.feature_readiness import (
+    FeatureReadiness,
+    FeatureReadinessState,
+    GatedFeature,
+)
 from horde_worker_regen.process_management.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadFailure,
@@ -13,6 +18,8 @@ from horde_worker_regen.process_management.supervisor_channel import (
     DownloadPhase,
     DownloadPlanSummary,
     DownloadStatusSnapshot,
+    FeatureInfoRow,
+    FeatureReadinessSummary,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -239,3 +246,51 @@ def test_render_current_falls_back_to_single_current() -> None:
     downloads = DownloadStatusSnapshot(phase=DownloadPhase.DOWNLOADING, current=_current("Deliberate"))
     text = _render(DownloadsView()._render_current(downloads))
     assert "Deliberate" in text
+
+
+def _readiness(feature: GatedFeature, state: FeatureReadinessState, detail: str = "") -> FeatureReadiness:
+    return FeatureReadiness(feature=feature, label=feature.value, state=state, detail=detail)
+
+
+def test_readiness_panel_shows_offered_and_withheld_features() -> None:
+    """The readiness panel reports which gated features are offered and which are still downloading."""
+    summary = FeatureReadinessSummary(
+        gated=[
+            _readiness(GatedFeature.CONTROLNET, FeatureReadinessState.WAITING, "models still downloading"),
+            _readiness(GatedFeature.POST_PROCESSING, FeatureReadinessState.OFFERED),
+        ],
+    )
+    text = _render(DownloadsView()._render_readiness(summary))
+    assert "offered" in text
+    assert "downloading" in text
+
+
+def test_readiness_panel_surfaces_missing_deps_hint() -> None:
+    """A feature with absent packages reads as missing-deps and shows the actionable install hint."""
+    summary = FeatureReadinessSummary(
+        gated=[
+            _readiness(
+                GatedFeature.POST_PROCESSING,
+                FeatureReadinessState.MISSING_DEPS,
+                "install horde-worker-reGen[post-processing]",
+            ),
+        ],
+    )
+    # Render wide so the long install hint is not wrapped at its hyphen (which would split the token).
+    console = Console(width=240)
+    with console.capture() as capture:
+        console.print(DownloadsView()._render_readiness(summary))
+    text = capture.get()
+    assert "missing deps" in text
+    assert "post-processing" in text
+
+
+def test_readiness_panel_renders_informational_rows() -> None:
+    """The read-only LoRA/safety rows appear alongside the gated features."""
+    summary = FeatureReadinessSummary(
+        gated=[_readiness(GatedFeature.CONTROLNET, FeatureReadinessState.OFFERED)],
+        informational=[FeatureInfoRow(label="Safety models", status="present", ok=True)],
+    )
+    text = _render(DownloadsView()._render_readiness(summary))
+    assert "Safety models" in text
+    assert "present" in text

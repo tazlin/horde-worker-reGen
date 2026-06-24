@@ -21,11 +21,13 @@ from textual.message import Message
 from textual.widgets import Button, Input, Static
 
 from horde_worker_regen.app_state import OverviewViewMode
+from horde_worker_regen.process_management.feature_readiness import FeatureReadinessState
 from horde_worker_regen.process_management.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadPhase,
     DownloadPlanSummary,
     DownloadStatusSnapshot,
+    FeatureReadinessSummary,
     WorkerStateSnapshot,
 )
 from horde_worker_regen.tui.formatters import human_bytes, human_duration, shorten
@@ -166,6 +168,7 @@ class DownloadsView(VerticalScroll):
             yield Button("Go live", id="downloads-go-live")
         yield Static(id="downloads-banner")
         yield Static(id="downloads-plan")
+        yield Static(id="downloads-readiness")
         yield Static(id="downloads-current")
         yield Static(id="downloads-queue")
         yield Static(id="downloads-failures")
@@ -196,6 +199,11 @@ class DownloadsView(VerticalScroll):
             self.query_one("#downloads-plan", Static).update(self._render_plan_compact(plan))
         else:
             self.query_one("#downloads-plan", Static).update(self._render_plan(plan, downloads))
+        readiness_widget = self.query_one("#downloads-readiness", Static)
+        feature_readiness = snapshot.feature_readiness if snapshot is not None else None
+        readiness_widget.display = not thin and feature_readiness is not None
+        if feature_readiness is not None:
+            readiness_widget.update(self._render_readiness(feature_readiness))
         self.query_one("#downloads-current", Static).update(self._render_current(downloads))
         self.query_one("#downloads-queue", Static).update(self._render_queue(downloads))
         self.query_one("#downloads-failures", Static).update(self._render_failures(downloads))
@@ -364,6 +372,38 @@ class DownloadsView(VerticalScroll):
         line.append_text(fit)
         border = "green" if plan.fits else "red"
         return Panel(line, title="Disk plan", title_align="left", border_style=border, padding=(0, 1))
+
+    _READINESS_STYLE: dict[FeatureReadinessState, tuple[str, str]] = {
+        FeatureReadinessState.OFFERED: ("green", "offered"),
+        FeatureReadinessState.WAITING: ("yellow", "downloading…"),
+        FeatureReadinessState.MISSING_DEPS: ("red", "missing deps"),
+        FeatureReadinessState.DISABLED: ("grey50", "off"),
+    }
+
+    def _render_readiness(self, summary: FeatureReadinessSummary) -> Panel:
+        """Render which gated features the worker offers to the horde, and why anything is withheld.
+
+        Each gated feature shows its offer state (offered / still downloading / missing deps / off) and a
+        short reason; the informational rows below carry LoRA and safety, which keep their own gating. The
+        table mirrors the worker's actual pop decision, so 'offered' here means the horde is being told the
+        worker can serve that feature right now.
+        """
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="bold", no_wrap=True)
+        table.add_column(no_wrap=True)
+        table.add_column(style="grey62")
+        # Details/status are wrapped in Text (not raw strings) so an install hint like
+        # ``horde-worker-reGen[post-processing]`` is shown literally rather than parsed as console markup.
+        for feature in summary.gated:
+            style, label = self._READINESS_STYLE.get(feature.state, ("grey62", feature.state.value))
+            table.add_row(feature.label, Text(label, style=style), Text(feature.detail))
+        for info in summary.informational:
+            table.add_row(
+                Text(info.label, style="bold"),
+                Text("ready" if info.ok else "waiting", style="green" if info.ok else "grey62"),
+                Text(info.status),
+            )
+        return Panel(table, title="Feature readiness", title_align="left", border_style="grey37", padding=(0, 1))
 
     def _render_current(self, downloads: DownloadStatusSnapshot | None) -> Panel:
         """Render the in-progress downloads (one block per concurrent download) with bars, speed, and ETA.

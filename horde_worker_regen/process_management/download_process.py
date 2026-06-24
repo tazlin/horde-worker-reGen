@@ -211,6 +211,13 @@ class HordeDownloadProcess(HordeProcess):
         self._safety_present = False
         self._safety_ensured = False
         self._safety_enqueued = False
+        # On-disk readiness of the gated aux features, recomputed event-driven (after the scan, after each
+        # download, and when the aux pass is enqueued) and reported to the parent so it offers a feature to
+        # the Horde only once its models/annotators have landed. None means undeterminable (manager not
+        # loaded), which the parent reads as "do not gate".
+        self._controlnet_present: bool | None = None
+        self._sdxl_controlnet_present: bool | None = None
+        self._post_processing_present: bool | None = None
         self._reload_requested = False
         # Set after a completed download that changed on-disk references; emitted once on the next
         # status snapshot so the parent can broadcast a reload to the inference subprocesses.
@@ -267,6 +274,9 @@ class HordeDownloadProcess(HordeProcess):
             scan_complete=scan_complete,
             safety_models_present=self._safety_present,
             safety_models_attempted=self._safety_ensured,
+            controlnet_present=self._controlnet_present,
+            sdxl_controlnet_present=self._sdxl_controlnet_present,
+            post_processing_present=self._post_processing_present,
             status=status,
             reference_changed=reference_changed,
         )
@@ -437,6 +447,9 @@ class HordeDownloadProcess(HordeProcess):
         if self._safety_models_present_on_disk():
             self._safety_present = True
             self._safety_ensured = True
+        # Probe gated-feature presence too, so a warm worker reports its features ready in the first
+        # authoritative report and the parent advertises them without waiting for an aux pass.
+        self._refresh_feature_presence()
         self._send_status(DownloadPhase.IDLE, scan_complete=True, force=True)
 
         logger.info(
@@ -692,6 +705,9 @@ class HordeDownloadProcess(HordeProcess):
                 )
         if tasks:
             self._scheduler.enqueue_many(tasks)
+        # The aux managers are now loaded; probe their presence so a feature whose models are already on
+        # disk is reported ready immediately, rather than only after the first completed download.
+        self._refresh_feature_presence()
 
     @staticmethod
     def _annotators_present() -> bool:
@@ -708,6 +724,78 @@ class HordeDownloadProcess(HordeProcess):
         except Exception as e:  # noqa: BLE001 - presence is best-effort; a probe failure must not crash
             logger.debug(f"Download process: could not determine annotator presence: {type(e).__name__} {e}")
             return False
+
+    def _refresh_feature_presence(self) -> None:
+        """Recompute on-disk readiness for the gated aux features from the loaded managers (cached).
+
+        Cheap and event-driven (run after the disk scan, after each download completes, and when the aux
+        pass is enqueued), so the half-second status emit can report presence without re-statting every
+        model on every tick. A manager that is not loaded (its feature is not opted in) leaves that
+        feature's presence None, so the parent does not gate on an unknown. ControlNet readiness also
+        requires the annotators; SDXL-ControlNet additionally requires the miscellaneous models.
+        """
+        try:
+            from hordelib.api import SharedModelManager
+
+            manager = SharedModelManager.manager
+        except Exception as e:  # noqa: BLE001 - presence is best-effort; a probe failure must not crash
+            logger.debug(f"Download process: feature-presence probe failed: {type(e).__name__}: {e}")
+            return
+        if manager is None:
+            return
+
+        annotators = self._annotators_present()
+
+        controlnet_models = self._manager_all_present(manager, "controlnet", exclude_substring="sdxl")
+        controlnet = None if controlnet_models is None else (controlnet_models and annotators)
+
+        sdxl_models = self._manager_all_present(manager, "controlnet", require_substring="sdxl")
+        miscellaneous = self._manager_all_present(manager, "miscellaneous")
+        if sdxl_models is None or miscellaneous is None:
+            sdxl_controlnet = None
+        else:
+            sdxl_controlnet = sdxl_models and miscellaneous and annotators
+
+        post_results = [self._manager_all_present(manager, key) for key in ("gfpgan", "esrgan", "codeformer")]
+        loaded_post = [result for result in post_results if result is not None]
+        post_processing = all(loaded_post) if loaded_post else None
+
+        with self._lock:
+            self._controlnet_present = controlnet
+            self._sdxl_controlnet_present = sdxl_controlnet
+            self._post_processing_present = post_processing
+
+    def _manager_all_present(
+        self,
+        manager: object,
+        manager_key: str,
+        *,
+        require_substring: str | None = None,
+        exclude_substring: str | None = None,
+    ) -> bool | None:
+        """Whether every (optionally name-filtered) model in ``manager.<key>``'s reference is on disk.
+
+        Returns None when that sub-manager is not loaded (so the feature is undeterminable rather than
+        falsely "not present"). Reads under the per-manager lock the downloads take, so the on-disk
+        check never races a sibling fetch mutating the manager's available set.
+        """
+        sub_manager = getattr(manager, manager_key, None)
+        if sub_manager is None:
+            return None
+        try:
+            with self._manager_lock(manager_key):
+                for model_name in sub_manager.model_reference:  # type: ignore[attr-defined]
+                    lowered = model_name.lower()
+                    if require_substring is not None and require_substring not in lowered:
+                        continue
+                    if exclude_substring is not None and exclude_substring in lowered:
+                        continue
+                    if not sub_manager.is_model_available(model_name):  # type: ignore[attr-defined]
+                        return False
+            return True
+        except Exception as e:  # noqa: BLE001 - presence is best-effort; a probe failure must not crash
+            logger.debug(f"Download process: presence probe for {manager_key} failed: {type(e).__name__}: {e}")
+            return None
 
     def _aux_model_tasks(self, manager: object, manager_key: str, feature: str) -> list[DownloadTask]:
         """Build host-tagged AUX_MODEL tasks for every not-yet-present model in *manager*'s reference."""
@@ -816,6 +904,9 @@ class HordeDownloadProcess(HordeProcess):
         finally:
             self._end_task(task)
             self._refresh_present()
+            # A completed aux download may have made a gated feature ready; recompute so the next report
+            # advertises it (or, on a failure mid-set, keeps withholding it).
+            self._refresh_feature_presence()
             with self._lock:
                 self._reference_changed_pending = True
 

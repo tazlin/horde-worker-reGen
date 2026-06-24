@@ -106,6 +106,17 @@ def controlnet_install_hint() -> str:
     return _install_hint(FEATURE_KIND.controlnet)
 
 
+def post_processing_install_hint() -> str:
+    """Build the actionable "install the post-processing extra" fragment naming the missing packages.
+
+    Public wrapper around :func:`_install_hint` for the feature-readiness table, so a post-processing
+    feature that cannot run on this install surfaces the same remedy the runtime coercion logs.
+    """
+    from hordelib.feature_impact import FEATURE_KIND
+
+    return _install_hint(FEATURE_KIND.strip_background)
+
+
 def _install_hint(feature: FEATURE_KIND) -> str:
     """Build an actionable "install this extra" fragment naming the missing packages for *feature*."""
     from hordelib.feature_requirements import missing_packages

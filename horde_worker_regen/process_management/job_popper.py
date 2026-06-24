@@ -19,6 +19,12 @@ from loguru import logger
 
 from horde_worker_regen.process_management._canned_scenarios import CannedJobSource, make_default_dry_run_source
 from horde_worker_regen.process_management.api_sessions import ApiSessions
+from horde_worker_regen.process_management.feature_readiness import (
+    FeatureInputs,
+    GatedFeature,
+    build_feature_readiness,
+    is_offered,
+)
 from horde_worker_regen.process_management.gpu_eligibility import eligible_card_indices_for
 from horde_worker_regen.process_management.gpu_pop_shaping import (
     AdvertisedCapabilities,
@@ -614,6 +620,32 @@ class JobPopper:
             if advertised is not None
             else self._effective_allow_lora(bridge_data)
         )
+
+        # First-class feature readiness: withhold a gated feature (ControlNet, SDXL-ControlNet,
+        # post-processing) until its models/annotators are actually on disk, so the worker never
+        # advertises a capability whose aux downloads are still in flight (a job for it would only fault).
+        # While availability is unknown (no download process / no report yet) this is a no-op, preserving
+        # the behaviour of workers that pre-download everything.
+        if self._model_availability is not None:
+            readiness = build_feature_readiness(
+                {
+                    GatedFeature.CONTROLNET: FeatureInputs(
+                        enabled=pop_allow_controlnet,
+                        present=self._model_availability.controlnet_present,
+                    ),
+                    GatedFeature.SDXL_CONTROLNET: FeatureInputs(
+                        enabled=pop_allow_sdxl_controlnet,
+                        present=self._model_availability.sdxl_controlnet_present,
+                    ),
+                    GatedFeature.POST_PROCESSING: FeatureInputs(
+                        enabled=pop_allow_post_processing,
+                        present=self._model_availability.post_processing_present,
+                    ),
+                },
+            )
+            pop_allow_controlnet = is_offered(readiness, GatedFeature.CONTROLNET)
+            pop_allow_sdxl_controlnet = is_offered(readiness, GatedFeature.SDXL_CONTROLNET)
+            pop_allow_post_processing = is_offered(readiness, GatedFeature.POST_PROCESSING)
 
         try:
             job_pop_request = ImageGenerateJobPopRequest(

@@ -250,6 +250,88 @@ class TestApiJobPopGuardClauses:
         session.submit_request.assert_awaited_once()
 
 
+class TestFeatureReadinessGate:
+    """A pop withholds a gated feature until its models/annotators are on disk (first-class readiness)."""
+
+    @staticmethod
+    async def _pop_and_capture_request(availability: ModelAvailability, **bridge_overrides: object) -> object:
+        """Drive one full pop with the given availability and return the built job-pop request."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()  # clear the session warm-up gate so a pop happens
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(**bridge_overrides),
+            model_availability=availability,
+        )
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
+        return session.submit_request.call_args.args[0]
+
+    async def test_controlnet_withheld_while_its_models_download(self) -> None:
+        """ControlNet is enabled but its models are not yet on disk, so the pop must not advertise it.
+
+        Post-processing, whose models are present, is still advertised in the same pop, proving the gate
+        is per-feature rather than an all-or-nothing switch.
+        """
+        availability = ModelAvailability()
+        availability.update(
+            present={"stable_diffusion"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            controlnet_present=False,
+            post_processing_present=True,
+        )
+
+        request = await self._pop_and_capture_request(
+            availability,
+            allow_controlnet=True,
+            allow_post_processing=True,
+            allow_sdxl_controlnet=False,
+        )
+
+        assert request.allow_controlnet is False
+        assert request.allow_post_processing is True
+
+    async def test_controlnet_offered_once_its_models_are_present(self) -> None:
+        """Once ControlNet's models are reported on disk, the pop advertises it again."""
+        availability = ModelAvailability()
+        availability.update(
+            present={"stable_diffusion"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            controlnet_present=True,
+            post_processing_present=True,
+        )
+
+        request = await self._pop_and_capture_request(availability, allow_controlnet=True)
+
+        assert request.allow_controlnet is True
+
+    async def test_unknown_presence_does_not_withhold(self) -> None:
+        """With no presence reported yet (None), an enabled feature is advertised, as before readiness."""
+        availability = ModelAvailability()
+        availability.update(
+            present={"stable_diffusion"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            controlnet_present=None,
+        )
+
+        request = await self._pop_and_capture_request(availability, allow_controlnet=True)
+
+        assert request.allow_controlnet is True
+
+
 class TestPopAhead:
     """Tests for hunger detection and the urgent (throttle-bypassing) pop path."""
 

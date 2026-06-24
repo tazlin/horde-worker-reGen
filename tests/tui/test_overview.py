@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from rich.console import Console
 
+from horde_worker_regen.process_management.feature_readiness import (
+    FeatureReadiness,
+    FeatureReadinessState,
+    GatedFeature,
+)
 from horde_worker_regen.process_management.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadPhase,
     DownloadPlanSummary,
     DownloadStatusSnapshot,
+    FeatureReadinessSummary,
     JobQueueEntry,
     ProcessSnapshot,
     SystemMemorySnapshot,
@@ -27,6 +33,37 @@ def _render(renderable: object, width: int = 160) -> str:
     with console.capture() as capture:
         console.print(renderable)
     return capture.get()
+
+
+def _gated(feature: GatedFeature, state: FeatureReadinessState) -> FeatureReadiness:
+    return FeatureReadiness(feature=feature, label=feature.value.replace("_", " ").title(), state=state)
+
+
+def test_compact_readiness_line_names_engaged_features() -> None:
+    """The overview's compact line summarizes engaged gated features with their offer verbs."""
+    summary = FeatureReadinessSummary(
+        gated=[
+            _gated(GatedFeature.CONTROLNET, FeatureReadinessState.WAITING),
+            _gated(GatedFeature.POST_PROCESSING, FeatureReadinessState.OFFERED),
+        ],
+    )
+    line = OverviewView()._feature_readiness_line(summary)
+    assert line is not None
+    text = _render(line)
+    assert "downloading" in text
+    assert "offered" in text
+
+
+def test_compact_readiness_line_omits_fully_disabled_features() -> None:
+    """An operator using none of the gated features sees no readiness line (no noise)."""
+    summary = FeatureReadinessSummary(
+        gated=[
+            _gated(GatedFeature.CONTROLNET, FeatureReadinessState.DISABLED),
+            _gated(GatedFeature.POST_PROCESSING, FeatureReadinessState.DISABLED),
+        ],
+    )
+    assert OverviewView()._feature_readiness_line(summary) is None
+    assert OverviewView()._feature_readiness_line(None) is None
 
 
 def _busy_process() -> ProcessSnapshot:

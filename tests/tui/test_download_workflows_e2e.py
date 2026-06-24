@@ -17,14 +17,20 @@ from __future__ import annotations
 from pathlib import Path
 
 from textual.pilot import Pilot
-from textual.widgets import Button, Input, TabbedContent
+from textual.widgets import Button, Input, Static, TabbedContent
 
 from horde_worker_regen.app_state import AppStateStore, OnboardingChoice
+from horde_worker_regen.process_management.feature_readiness import (
+    FeatureReadiness,
+    FeatureReadinessState,
+    GatedFeature,
+)
 from horde_worker_regen.process_management.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadPhase,
     DownloadPlanSummary,
     DownloadStatusSnapshot,
+    FeatureReadinessSummary,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -224,3 +230,35 @@ async def test_reload_config_key_reaches_the_worker(tmp_path: Path) -> None:
         await pilot.press("f5")
         await pilot.pause()
         assert fake.reload_config_calls == 1
+
+
+async def test_feature_readiness_panel_appears_when_the_worker_reports_it(tmp_path: Path) -> None:
+    """The Downloads feature-readiness panel stays hidden until the worker reports readiness, then shows.
+
+    Workflow (c) at the UI seam: a gated feature whose models are still downloading is surfaced to the
+    operator (rather than silently advertised), and the panel only appears once the worker has something
+    to say about feature readiness.
+    """
+    fake, app = _make_app(tmp_path, auto_start=True)
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        await _open_downloads_tab(app, pilot)
+
+        readiness_panel = app.query_one("#downloads-readiness", Static)
+        assert readiness_panel.display is False  # nothing reported yet
+
+        snapshot = WorkerStateSnapshot(config=WorkerConfigSummary(dreamer_name="T", worker_version="0.0.0"))
+        snapshot.feature_readiness = FeatureReadinessSummary(
+            gated=[
+                FeatureReadiness(
+                    feature=GatedFeature.CONTROLNET,
+                    label="ControlNet",
+                    state=FeatureReadinessState.WAITING,
+                    detail="models still downloading",
+                ),
+            ],
+        )
+        fake.latest_snapshot = snapshot
+        app._tick()
+        await pilot.pause()
+        assert readiness_panel.display is True
