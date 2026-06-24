@@ -622,6 +622,7 @@ class HordeWorkerTUI(App[None]):
             config_editor.update_worker_models(
                 snapshot.active_models if snapshot is not None else [],
             )
+            config_editor.update_cards(snapshot.per_card if snapshot is not None else [])
             if snapshot is not None:
                 self.query_one(LiveView).update_snapshot(
                     snapshot,

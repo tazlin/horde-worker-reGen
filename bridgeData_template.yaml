@@ -592,6 +592,42 @@ capture_kudos_training_data: false
 # kudos_training_data_file:
 
 #############################
+## Multi-GPU (per-card)    ##
+#############################
+
+# SINGLE-GPU USERS: ignore this whole section. It only takes effect when one worker drives more than
+# one card; on a single-GPU machine these settings are unused and the global config above applies as-is.
+#
+# One worker can drive every GPU on the machine under a single horde identity. By default it auto-detects
+# and uses all of them. The settings below are far easier to manage from the TUI's Config > Per-GPU tab,
+# which exposes every per-card knob with inherit/override toggles; this block documents the file format.
+
+# Which physical cards this worker drives, by stable PCI index (CUDA_DEVICE_ORDER=PCI_BUS_ID). Leave unset
+# to drive every detected GPU; set an explicit list to pin or subset them.
+# gpu_device_indices:
+#   - 0
+#   - 1
+
+# Local-queue imbalance fraction (0.0-1.0) that switches the next job pop from the union of all cards to a
+# single under-fed card. 0 always targets the most starved card; 1 disables targeting. Default 0.5.
+# gpu_pop_balance_threshold: 0.5
+
+# Per-card deltas over the global config, keyed by the same stable device index. Each card sets ONLY the
+# fields it wants to differ; everything else inherits the global value. A card with no entry inherits
+# wholesale. Overridable per card: max_threads, queue_size, high_performance_mode, moderate_performance_mode,
+# extra_slow_worker, preload_timeout, models_to_load, models_to_skip, dynamic_models, allow_lora,
+# allow_controlnet, allow_sdxl_controlnet, allow_post_processing, allow_painting, allow_img2img, nsfw,
+# max_power, enable_vram_budget, vram_reserve_mb, vram_to_leave_free, whole_card_exclusive_residency.
+# gpu_overrides:
+#   0:
+#     max_threads: 2
+#     high_performance_mode: true
+#   1:
+#     allow_lora: false
+#     models_to_load:
+#       - "top 3"
+
+#############################
 ## Dry-Run / Testing       ##
 #############################
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import enum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -18,6 +19,8 @@ from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
     CONFIG_SUBTABS,
     DEFAULT_CONFIG_PATH,
+    GPU_GLOBAL_FIELDS,
+    GPU_OVERRIDE_FIELDS,
     MODELS_TO_LOAD_KEY,
     MODELS_TO_SKIP_KEY,
     SECTION_GUIDANCE,
@@ -29,11 +32,23 @@ from horde_worker_regen.tui.config_form import (
     load_config,
     save_config,
 )
+from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
 from horde_worker_regen.tui.widgets.model_list_editor import ModelListEditor
 from horde_worker_regen.tui.widgets.model_manager import ModelManagerView
 
+if TYPE_CHECKING:
+    from horde_worker_regen.process_management.supervisor_channel import CardSnapshot
+
 _FIELD_BY_KEY = {field.key: field for field in CONFIG_FIELDS}
 _MODELS_SECTION = "Models"
+
+# The per-card multi-GPU editor is its own sub-tab, mounted after the catalog-driven tabs rather than
+# composed from flat ConfigFields (it edits the nested gpu_overrides block, not top-level keys).
+_GPU_SUBTAB_LABEL = "Per-GPU"
+_GPU_SUBTAB_ID = "cfgtab-per-gpu"
+# Field keys owned by the Per-GPU sub-tab, so a validation error routes there rather than to a flat tab
+# that happens to share a section name (e.g. "Features").
+_GPU_FIELD_KEYS = {field.key for field in (*GPU_GLOBAL_FIELDS, *GPU_OVERRIDE_FIELDS)}
 
 # Which sub-tab a section lives on, so a validation error can name (and jump to) the right page.
 _SECTION_TO_SUBTAB: dict[str, str] = {section: label for label, sections in CONFIG_SUBTABS for section in sections}
@@ -221,6 +236,8 @@ class ConfigEditorView(Vertical):
                 with TabPane(label, id=_subtab_id(label)), VerticalScroll(classes="config-subtab-scroll"):
                     for section in sections:
                         yield from self._compose_section(section)
+            with TabPane(_GPU_SUBTAB_LABEL, id=_GPU_SUBTAB_ID), VerticalScroll(classes="config-subtab-scroll"):
+                yield GpuOverridesEditor(self._data)
 
     def _compose_section(self, section: str) -> ComposeResult:
         """Yield the heading, guidance, and field widgets for one section (the model panel for Models)."""
@@ -325,14 +342,23 @@ class ConfigEditorView(Vertical):
         not run validation and a malformed in-progress entry cannot make this throw. A failure to read
         the widgets is reported as clean, so a glitch here can never trap the user on the Config tab.
         """
+        gpu_editor = self._gpu_editor()
+        gpu_dirty = gpu_editor.is_dirty() if gpu_editor is not None else False
         try:
             current = self._widget_state()
         except Exception:  # noqa: BLE001 - dirty detection must never block navigation
-            return False
+            return gpu_dirty
         if self._clean_state is None:
             self._clean_state = current
-            return False
-        return current != self._clean_state
+            return gpu_dirty
+        return gpu_dirty or current != self._clean_state
+
+    def _gpu_editor(self) -> GpuOverridesEditor | None:
+        """The per-card override editor, or None if it has not mounted yet."""
+        try:
+            return self.query_one(GpuOverridesEditor)
+        except Exception:  # noqa: BLE001 - queried before mount during early dirty checks
+            return None
 
     def _widget_state(self) -> dict[str, object]:
         """A raw, uncoerced snapshot of every editable widget keyed by field, for change detection."""
@@ -384,12 +410,22 @@ class ConfigEditorView(Vertical):
                 else:
                     tabs.show_tab(tab_id)
             if thin:
+                tabs.hide_tab(_GPU_SUBTAB_ID)
                 tabs.active = essentials_id
+            else:
+                tabs.show_tab(_GPU_SUBTAB_ID)
 
     def update_worker_models(self, active_models: list[str]) -> None:
         """Forward the running worker's currently-loaded model list to the model panel (best-effort)."""
         with contextlib.suppress(Exception):
             self.query_one(ModelManagerView).update_worker_models(active_models)
+
+    def update_cards(self, per_card: list[CardSnapshot]) -> None:
+        """Forward the live per-card snapshot to the multi-GPU editor (best-effort)."""
+        gpu_editor = self._gpu_editor()
+        if gpu_editor is not None:
+            with contextlib.suppress(Exception):
+                gpu_editor.update_cards(per_card)
 
     def reload_from_disk(self) -> None:
         """Re-read the config file and refresh every widget (e.g. after the setup wizard writes it)."""
@@ -414,6 +450,9 @@ class ConfigEditorView(Vertical):
                     widget.text = "\n".join(str(item) for item in value)
                 elif isinstance(widget, Input):
                     widget.value = str(value)
+        gpu_editor = self._gpu_editor()
+        if gpu_editor is not None:
+            gpu_editor.reload(self._data)
         with contextlib.suppress(Exception):
             self._clean_state = self._widget_state()
         self._set_status("Reloaded from disk.", "green")
@@ -449,10 +488,15 @@ class ConfigEditorView(Vertical):
             except ValueError as error:
                 errors.append((field, str(error)))
 
-        if errors:
-            self._report_save_errors(errors)
+        gpu_editor = self._gpu_editor()
+        gpu_dirty = gpu_editor.is_dirty() if gpu_editor is not None else False
+        # The per-card editor validates and writes its own nested block; an error here aborts the save
+        # alongside any flat-field error so the operator sees both at once.
+        gpu_errors = gpu_editor.apply_to(self._data) if gpu_editor is not None else []
+        if errors or gpu_errors:
+            self._report_save_errors(errors + gpu_errors)
             return False
-        if not coerced:
+        if not coerced and not gpu_dirty:
             self._set_status("No changes to save.", "green")
             return True
 
@@ -467,6 +511,8 @@ class ConfigEditorView(Vertical):
             return False
         with contextlib.suppress(Exception):
             self._clean_state = self._widget_state()
+        if gpu_editor is not None:
+            gpu_editor.mark_saved()
         self._set_status(
             f"Saved {self._config_path}. A running worker reloads it automatically; restart only for ⟳ fields.",
             "green",
@@ -503,11 +549,16 @@ class ConfigEditorView(Vertical):
         field).
         """
         first_field = errors[0][0]
-        tab_label = _SECTION_TO_SUBTAB.get(first_field.section)
-        with contextlib.suppress(Exception):
-            if tab_label is not None:
-                self.query_one("#config-subtabs", TabbedContent).active = _subtab_id(tab_label)
-            self.query_one(f"#cfg-{first_field.key}").focus()
+        if first_field.key in _GPU_FIELD_KEYS:
+            tab_label: str | None = _GPU_SUBTAB_LABEL
+            with contextlib.suppress(Exception):
+                self.query_one("#config-subtabs", TabbedContent).active = _GPU_SUBTAB_ID
+        else:
+            tab_label = _SECTION_TO_SUBTAB.get(first_field.section)
+            with contextlib.suppress(Exception):
+                if tab_label is not None:
+                    self.query_one("#config-subtabs", TabbedContent).active = _subtab_id(tab_label)
+                self.query_one(f"#cfg-{first_field.key}").focus()
         details = "; ".join(message for _field, message in errors)
         location = f"  See the {tab_label} tab." if tab_label else ""
         self._set_status(f"Couldn't save: {details}.{location}", "red")

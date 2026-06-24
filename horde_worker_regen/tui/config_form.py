@@ -944,6 +944,279 @@ CONFIG_FIELDS: list[ConfigField] = [
 ]
 
 
+# ---------------------------------------------------------------------------------------------------
+# Per-card (multi-GPU) override catalog and nested-YAML helpers.
+#
+# One worker can drive every GPU on the machine; gpu_overrides lets each card take a delta over the
+# global config. The keys below use the bridgeData/alias spelling (models_to_load, allow_painting) so
+# they map straight onto the YAML and onto the GpuOverride aliases. Every field is optional per card:
+# absent means the card inherits the global value. tests/tui/test_gpu_override_form.py is the parity
+# guard that keeps this catalog in lockstep with the GpuOverride model.
+# ---------------------------------------------------------------------------------------------------
+
+GPU_OVERRIDES_KEY = "gpu_overrides"
+GPU_DEVICE_INDICES_KEY = "gpu_device_indices"
+GPU_POP_BALANCE_THRESHOLD_KEY = "gpu_pop_balance_threshold"
+
+# Default for gpu_pop_balance_threshold on reGenBridgeData; only a non-default value is written out.
+GPU_POP_BALANCE_THRESHOLD_DEFAULT = 0.5
+
+# Per-card subsection order within a card's collapsible block.
+GPU_OVERRIDE_SECTIONS = ("Concurrency", "Models", "Features", "VRAM budget")
+
+# Machine-wide multi-GPU coordination knobs, shown above the per-card sections.
+GPU_GLOBAL_FIELDS: list[ConfigField] = [
+    ConfigField(
+        GPU_DEVICE_INDICES_KEY,
+        "GPU device indices",
+        FieldKind.STR_LIST,
+        "Multi-GPU",
+        "Which physical cards this one worker drives, by stable PCI index (one per line, e.g. 0 then 1). "
+        "Leave empty to auto-detect and drive every GPU on the machine.",
+        requires_restart=True,
+    ),
+    ConfigField(
+        GPU_POP_BALANCE_THRESHOLD_KEY,
+        "Pop balance threshold",
+        FieldKind.FLOAT,
+        "Multi-GPU",
+        "Local-queue imbalance fraction that switches the next job pop from the union of all cards to a "
+        "single under-fed card. 0 always targets the most starved card; 1 disables targeting. No effect "
+        "on a single-GPU worker.",
+        minimum=0.0,
+        maximum=1.0,
+        explicit_default=GPU_POP_BALANCE_THRESHOLD_DEFAULT,
+    ),
+]
+
+GPU_OVERRIDE_FIELDS: list[ConfigField] = [
+    # -- Concurrency --
+    ConfigField(
+        "max_threads",
+        "Max threads",
+        FieldKind.INT,
+        "Concurrency",
+        "Parallel jobs on this card (global default applies if not overridden).",
+        minimum=1,
+        maximum=16,
+    ),
+    ConfigField(
+        "queue_size",
+        "Queue size",
+        FieldKind.INT,
+        "Concurrency",
+        "Extra jobs buffered for this card. Raises system RAM use.",
+        minimum=0,
+        maximum=4,
+    ),
+    ConfigField(
+        "high_performance_mode",
+        "High performance mode",
+        FieldKind.BOOL,
+        "Concurrency",
+        "Fill this card's local queue much faster (24 GB+ cards).",
+    ),
+    ConfigField(
+        "moderate_performance_mode",
+        "Moderate performance mode",
+        FieldKind.BOOL,
+        "Concurrency",
+        "Fill this card's queue somewhat faster (12-16 GB cards).",
+    ),
+    ConfigField(
+        "extra_slow_worker",
+        "Extra slow worker",
+        FieldKind.BOOL,
+        "Concurrency",
+        "Treat this card as a very slow GPU (triples its timeouts, clamps concurrency).",
+    ),
+    ConfigField(
+        "preload_timeout",
+        "Preload timeout",
+        FieldKind.INT,
+        "Concurrency",
+        "Max seconds to load a model into this card's VRAM before the process is killed.",
+        minimum=15,
+        maximum=600,
+        unit="s",
+    ),
+    # -- Models & baselines --
+    ConfigField(
+        "models_to_load",
+        "Models to load",
+        FieldKind.STR_LIST,
+        "Models",
+        "Models this card offers (one per line; concrete names and/or meta commands like 'top 5'). "
+        "Overrides the global list entirely for this card.",
+    ),
+    ConfigField(
+        "models_to_skip",
+        "Models to skip",
+        FieldKind.STR_LIST,
+        "Models",
+        "Models to exclude from this card's meta selection (one per line).",
+    ),
+    ConfigField(
+        "dynamic_models",
+        "Dynamic models",
+        FieldKind.BOOL,
+        "Models",
+        "Let this card swap in popular models on demand beyond its configured list.",
+    ),
+    # -- Feature flags --
+    ConfigField("allow_lora", "Allow LoRA", FieldKind.BOOL, "Features", "Accept LoRA jobs on this card."),
+    ConfigField(
+        "allow_controlnet", "Allow ControlNet", FieldKind.BOOL, "Features", "Accept ControlNet jobs on this card."
+    ),
+    ConfigField(
+        "allow_sdxl_controlnet",
+        "Allow SDXL ControlNet",
+        FieldKind.BOOL,
+        "Features",
+        "Accept SDXL ControlNet jobs on this card (heavy; requires allow_controlnet).",
+    ),
+    ConfigField(
+        "allow_post_processing",
+        "Allow post-processing",
+        FieldKind.BOOL,
+        "Features",
+        "Accept upscaling / face-fixing jobs on this card.",
+    ),
+    ConfigField(
+        "allow_painting",
+        "Allow inpainting",
+        FieldKind.BOOL,
+        "Features",
+        "Accept inpainting jobs on this card (forced off if img2img is off).",
+    ),
+    ConfigField(
+        "allow_img2img", "Allow img2img", FieldKind.BOOL, "Features", "Accept jobs that supply a source image."
+    ),
+    ConfigField("nsfw", "Allow NSFW", FieldKind.BOOL, "Features", "Serve NSFW requests on this card."),
+    ConfigField(
+        "max_power",
+        "Max power",
+        FieldKind.INT,
+        "Features",
+        "Max resolution for this card = 64*64*8*max_power px (8=512², 32=1024²).",
+        minimum=1,
+        maximum=512,
+    ),
+    # -- VRAM / memory budget --
+    ConfigField(
+        "enable_vram_budget",
+        "Enable VRAM budget",
+        FieldKind.BOOL,
+        "VRAM budget",
+        "Gate this card's preloads/dispatch on measured VRAM.",
+    ),
+    ConfigField(
+        "vram_reserve_mb",
+        "VRAM reserve",
+        FieldKind.INT,
+        "VRAM budget",
+        "Free VRAM (MB) kept in reserve above a job's estimated peak on this card.",
+        minimum=0,
+        maximum=49152,
+        unit="MB",
+    ),
+    ConfigField(
+        "vram_to_leave_free",
+        "VRAM to leave free",
+        FieldKind.STR,
+        "VRAM budget",
+        "Headroom to leave free on this card, as a percentage ('20%') or a flat MB count ('2048').",
+    ),
+    ConfigField(
+        "whole_card_exclusive_residency",
+        "Whole-card exclusive residency",
+        FieldKind.BOOL,
+        "VRAM budget",
+        "Proactively give a model that needs most of this card sole residency before it streams.",
+    ),
+]
+
+
+def read_gpu_device_indices(data: Any) -> list[int]:  # noqa: ANN401 - ruamel CommentedMap
+    """Read gpu_device_indices from the loaded YAML as a list of ints (empty when unset/invalid)."""
+    try:
+        raw = data.get(GPU_DEVICE_INDICES_KEY)
+    except AttributeError:
+        return []
+    if not raw:
+        return []
+    indices: list[int] = []
+    for item in raw:
+        try:
+            indices.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return indices
+
+
+def read_gpu_pop_balance_threshold(data: Any) -> float:  # noqa: ANN401 - ruamel CommentedMap
+    """Read gpu_pop_balance_threshold from the loaded YAML, falling back to the worker default."""
+    try:
+        raw = data.get(GPU_POP_BALANCE_THRESHOLD_KEY)
+    except AttributeError:
+        return GPU_POP_BALANCE_THRESHOLD_DEFAULT
+    if raw is None:
+        return GPU_POP_BALANCE_THRESHOLD_DEFAULT
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return GPU_POP_BALANCE_THRESHOLD_DEFAULT
+
+
+def read_gpu_overrides(data: Any) -> dict[int, dict[str, Any]]:  # noqa: ANN401 - ruamel CommentedMap
+    """Read gpu_overrides from the loaded YAML as ``{device_index: {field_key: value}}``."""
+    try:
+        raw = data.get(GPU_OVERRIDES_KEY)
+    except AttributeError:
+        return {}
+    if not raw:
+        return {}
+    overrides: dict[int, dict[str, Any]] = {}
+    for key, value in raw.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            continue
+        overrides[index] = {str(k): v for k, v in value.items()} if isinstance(value, dict) else {}
+    return overrides
+
+
+def apply_gpu_config(
+    data: Any,  # noqa: ANN401 - ruamel CommentedMap
+    *,
+    device_indices: list[int],
+    pop_threshold: float,
+    overrides: dict[int, dict[str, Any]],
+) -> None:
+    """Write the multi-GPU block into the YAML mapping in place, omitting empty pieces.
+
+    A card with no set fields is dropped and the whole ``gpu_overrides`` key is removed when no card
+    has an override, so a single-GPU config stays clean. ``gpu_device_indices`` and a non-default
+    ``gpu_pop_balance_threshold`` are written only when meaningful, mirroring the flat editor's
+    "write only when present-or-non-default" rule.
+    """
+    if device_indices:
+        data[GPU_DEVICE_INDICES_KEY] = device_indices
+    elif GPU_DEVICE_INDICES_KEY in data:
+        del data[GPU_DEVICE_INDICES_KEY]
+
+    if pop_threshold != GPU_POP_BALANCE_THRESHOLD_DEFAULT:
+        data[GPU_POP_BALANCE_THRESHOLD_KEY] = pop_threshold
+    elif GPU_POP_BALANCE_THRESHOLD_KEY in data:
+        del data[GPU_POP_BALANCE_THRESHOLD_KEY]
+
+    cleaned = {index: fields for index, fields in overrides.items() if fields}
+    if cleaned:
+        data[GPU_OVERRIDES_KEY] = {index: cleaned[index] for index in sorted(cleaned)}
+    elif GPU_OVERRIDES_KEY in data:
+        del data[GPU_OVERRIDES_KEY]
+
+
 def _yaml() -> YAML:
     """A ruamel YAML instance configured to preserve quotes and structure."""
     yaml = YAML()
