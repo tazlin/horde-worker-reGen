@@ -400,7 +400,7 @@ class TestConfigReloadTriggersDownloads:
         manager._process_lifecycle = Mock()
         self._mark_present(manager, {"a"})
 
-        manager._request_downloads_for_configured_missing(run_aux_if_incomplete=False)
+        manager._reconcile_downloads(run_aux_if_incomplete=False)
 
         manager._process_lifecycle.request_downloads.assert_not_called()
 
@@ -533,9 +533,12 @@ class TestDownloadsOnlyMode:
         assert manager._state.downloads_only_hold is False
         manager._process_lifecycle.start_inference_processes.assert_called_once()
 
-    def test_on_demand_download_is_additive_and_kicks_aux(self) -> None:
-        """An on-demand request enqueues the chosen models (no desired-set prune) and can run aux."""
+    def test_on_demand_download_adds_to_desired_set_and_kicks_aux(self) -> None:
+        """A picker request joins the one desired set and fetches what is missing, optionally running aux."""
         manager = self._manager(image_models_to_load=["a"])
+        # The configured model is already on disk (the picker is used after the first scan), so only the
+        # picker's own models are still to fetch.
+        self._mark_present(manager, {"a"})
 
         manager._download_models_on_demand(["x", "y"], include_aux=True)
 
@@ -543,8 +546,29 @@ class TestDownloadsOnlyMode:
         args, kwargs = manager._process_lifecycle.request_downloads.call_args
         assert args[0] == ["x", "y"]
         assert kwargs["download_aux"] is True
-        # Additive: it must NOT carry an authoritative desired set (which would prune configured downloads).
-        assert "desired_image_models" not in kwargs or kwargs["desired_image_models"] is None
+        # Declarative: the authoritative desired set now carries the picker's models alongside config, so a
+        # later config reconcile keeps fetching them instead of pruning them.
+        assert kwargs["desired_image_models"] == ["a", "x", "y"]
+
+    def test_picker_additions_survive_a_config_reconcile(self) -> None:
+        """The bug fix: a config reconcile after a picker add must not prune the picker's models.
+
+        The former additive picker sent no desired set, so the very next config reconcile (which sends the
+        configured-only authoritative set) cancelled the picker's still-queued downloads. Now both share one
+        desired set, so the picker's models stay in the authoritative set the config reconcile sends.
+        """
+        manager = self._manager(image_models_to_load=["a"])
+        self._mark_present(manager, {"a"})
+
+        manager._download_models_on_demand(["x"], include_aux=False)
+        # A subsequent config-driven reconcile (e.g. the reload path) with no config change at all.
+        manager._process_lifecycle.request_downloads.reset_mock()
+        manager._reconcile_downloads(run_aux_if_incomplete=False)
+
+        manager._process_lifecycle.request_downloads.assert_called_once()
+        kwargs = manager._process_lifecycle.request_downloads.call_args.kwargs
+        assert kwargs["desired_image_models"] == ["a", "x"]
+        assert manager._process_lifecycle.request_downloads.call_args.args[0] == ["x"]
 
 
 class TestDownloadEntryPointSignatures:

@@ -191,6 +191,18 @@ optionally include the auxiliary models; confirming issues a
 when the worker was not already running, so the picker can start a stopped worker
 purely to download).
 
+The picker does not fetch a parallel, throwaway list: the chosen names are folded
+into the worker's *one* authoritative desired-on-disk set (the
+[`DesiredState`][horde_worker_regen.process_management.desired_state] held by the
+process manager, the union of the configured models and the operator's picker
+additions). Every download trigger reconciles against that one set, so a config
+reload no longer cancels a picker-added download. Removing a model from the desired
+set only prunes its queued or in-flight download (it stops being fetched and
+offered); on-disk files are left in place, since reclaiming disk is a separate,
+explicit action. Picker additions are in-memory only: a model the picker fetched
+stays on disk across a restart, but the desired set then reverts to whatever the
+configuration resolves to.
+
 ## Standalone download CLI
 
 `download_models.py` is a standalone entry point to pre-fetch the configured

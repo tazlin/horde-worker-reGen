@@ -23,6 +23,7 @@ import pytest
 _TORCH_FREE_IMPORT_MODULES = [
     "horde_worker_regen.process_management.process_manager",
     "horde_worker_regen.process_management.inference_scheduler",
+    "horde_worker_regen.process_management.desired_state",
     "horde_worker_regen.process_management.resource_budget",
     "horde_worker_regen.process_management.job_popper",
     "horde_worker_regen.process_management.process_map",

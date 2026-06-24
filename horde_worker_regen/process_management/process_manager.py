@@ -57,6 +57,7 @@ from horde_worker_regen.process_management.action_ledger import ActionLedger, Le
 from horde_worker_regen.process_management.alchemy_popper import DEFAULT_ALCHEMY_FORMS, AlchemyCoordinator
 from horde_worker_regen.process_management.api_sessions import ApiSessions
 from horde_worker_regen.process_management.card_runtime import CardRuntime
+from horde_worker_regen.process_management.desired_state import DesiredState
 from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.duty_cycle import DutyCycleSummary, summarize_duty_cycle
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
@@ -622,6 +623,7 @@ class HordeWorkerProcessManager:
         self._api_sessions = ApiSessions()
         self._model_metadata = ModelMetadata()
         self._model_availability = ModelAvailability()
+        self._desired_state = DesiredState()
         self._enable_background_downloads = enable_background_downloads
         self._inference_processes_started = False
         self._safety_processes_started = False
@@ -1593,50 +1595,61 @@ class HordeWorkerProcessManager:
                 StatusReporter.log_startup_download_plan(plan)
             # Only run the (heavier) auxiliary pass on a genuinely incomplete install; a worker that
             # already has all its image models almost certainly has its aux models too.
-            self._request_downloads_for_configured_missing(run_aux_if_incomplete=True)
+            self._reconcile_downloads(run_aux_if_incomplete=True)
 
         self._maybe_start_safety_processes()
         self._maybe_start_inference_processes()
 
-    def _request_downloads_for_configured_missing(
+    def _reconcile_downloads(
         self,
         *,
-        run_aux_if_incomplete: bool,
+        run_aux_if_incomplete: bool = False,
+        force_aux: bool = False,
         previously_configured: set[str] | None = None,
     ) -> None:
-        """Background-download any configured image models not yet on disk, and prune ones config dropped.
+        """Drive the download process toward the one desired on-disk set, fetching and pruning as needed.
 
-        Shared by the initial scan-complete trigger and the config-reload path, so a config change that
-        adds a model fetches it without restarting the worker. The download process dedups against what it
-        already has or is in-flight on, so re-sending the full missing set on every reload is safe. The
-        auxiliary pass (LoRa/ControlNet/post-processing/safety) is one-shot in the download process, so
-        ``run_aux_if_incomplete`` only matters for the very first request.
+        The desired set is the resolved configured models unioned with the operator's picker additions (held
+        in ``self._desired_state``), so the picker and config share one authoritative set and cannot diverge:
+        a config reload no longer prunes a picker-added download. Shared by the initial scan-complete trigger,
+        the config-reload path, and the picker. The download process dedups against what it already has or is
+        in-flight on, so re-sending the full missing set is safe.
 
-        ``previously_configured`` is the image-model set before a reload; when a reload *removes* a model
-        we send the now-authoritative configured set so the download process stops any queued/in-flight
-        download of the dropped model. The configured set is sent only when there is work or a removal, so
-        an unchanged reload stays a no-op (it never sends a redundant reconcile).
+        The auxiliary pass (LoRa/ControlNet/post-processing/safety) is one-shot in the download process.
+        ``run_aux_if_incomplete`` runs it only when image models are still missing (the first-install case);
+        ``force_aux`` runs it unconditionally (the picker's "include auxiliary models").
+
+        ``previously_configured`` is the image-model set before a reload; a removal still sends the
+        now-authoritative desired set so the download process stops any queued/in-flight download of the
+        dropped model. Files are never deleted, since pruning is queue-only.
         """
         if not self._enable_background_downloads:
             return
         present = self._model_availability.present or set()
-        configured = set(self.bridge_data.image_models_to_load)
-        missing = sorted(configured - present)
-        removed = (previously_configured or set()) - configured
-        download_aux = run_aux_if_incomplete and len(missing) > 0
-        if not missing and not removed and not download_aux:
+        in_flight = set(self._model_availability.pending)
+        if self._model_availability.currently_downloading is not None:
+            in_flight.add(self._model_availability.currently_downloading)
+        plan = self._desired_state.reconcile(
+            configured=self.bridge_data.image_models_to_load,
+            present=present,
+            in_flight=in_flight,
+        )
+        removed = (previously_configured or set()) - plan.desired
+        download_aux = force_aux or (run_aux_if_incomplete and len(plan.to_fetch) > 0)
+        if not plan.has_work and not removed and not download_aux:
             return
         if removed:
             logger.info(f"Config removed {len(removed)} image model(s); stopping their downloads: {sorted(removed)}")
-        if missing:
+        if plan.to_fetch:
+            desired_present = len(plan.desired) - len(plan.to_fetch)
             logger.info(
-                f"Worker has {len(present)} of {len(configured)} configured models on disk; "
-                f"background-downloading {len(missing)} missing: {missing}",
+                f"Worker has {desired_present} of {len(plan.desired)} desired models on disk; "
+                f"background-downloading {len(plan.to_fetch)} missing: {list(plan.to_fetch)}",
             )
         self._process_lifecycle.request_downloads(
-            missing,
+            list(plan.to_fetch),
             download_aux=download_aux,
-            desired_image_models=sorted(configured),
+            desired_image_models=sorted(plan.desired),
         )
 
     def _download_process_flags(self) -> tuple[object, ...]:
@@ -1719,11 +1732,13 @@ class HordeWorkerProcessManager:
         self._maybe_start_inference_processes()
 
     def _download_models_on_demand(self, model_names: list[str], *, include_aux: bool) -> None:
-        """Fetch an operator-chosen set of models now, without changing config (drives the TUI picker).
+        """Add operator-chosen models to the desired set and fetch them now (drives the TUI picker).
 
-        Additive only: the names are enqueued into the background download process alongside whatever the
-        config already requested (no authoritative-set reconcile, so this never prunes configured
-        downloads). ``include_aux`` also kicks the one-time aux/default pass.
+        The names join the one authoritative desired set held in ``self._desired_state``, so a later config
+        reconcile keeps fetching them instead of pruning them. (The former additive path sent no desired set,
+        so the next config reconcile cancelled the picker's downloads.) ``include_aux`` also forces the
+        one-time aux/default pass. Picker additions are transient: a downloaded model stays on disk, but a
+        restart reverts the desired set to whatever config resolves to.
         """
         if not self._enable_background_downloads:
             logger.warning("On-demand download requested but background downloads are disabled; ignoring.")
@@ -1731,8 +1746,10 @@ class HordeWorkerProcessManager:
         if not model_names and not include_aux:
             return
         self._process_lifecycle.start_download_process()
-        logger.info(f"On-demand download of {len(model_names)} model(s) (aux={include_aux}): {sorted(model_names)}")
-        self._process_lifecycle.request_downloads(list(model_names), download_aux=include_aux)
+        if model_names:
+            self._desired_state.add_picker_models(model_names)
+            logger.info(f"Picker added {len(model_names)} model(s) to the desired set: {sorted(model_names)}")
+        self._reconcile_downloads(force_aux=include_aux)
 
     def _maybe_start_safety_processes(self) -> None:
         """Start safety processes once the required safety models are on disk (background-download mode).
@@ -3174,7 +3191,7 @@ class HordeWorkerProcessManager:
         # A config change can add image models that are not yet on disk (fetch them in the background so a
         # newly-configured model becomes servable without a restart) or remove models (stop their queued/
         # in-flight downloads); the startup trigger is one-shot, so the reload owns both directions.
-        self._request_downloads_for_configured_missing(
+        self._reconcile_downloads(
             run_aux_if_incomplete=False,
             previously_configured=previously_configured,
         )
