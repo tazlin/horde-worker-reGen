@@ -1384,7 +1384,7 @@ requires-dist = [
     { name = "ruamel-yaml" },
     { name = "semver" },
     { name = "strenum" },
-    { name = "textual", specifier = ">=2.1.0" },
+    { name = "textual", specifier = ">=8.2.7" },
     { name = "textual-serve", specifier = ">=1.1.1" },
     { name = "torch", marker = "extra == 'cpu'", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "horde-worker-regen", extra = "cpu" } },
     { name = "torch", marker = "extra == 'cu126'", index = "https://download.pytorch.org/whl/cu126", conflict = { package = "horde-worker-regen", extra = "cu126" } },
