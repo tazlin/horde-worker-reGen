@@ -132,10 +132,17 @@ def load_env_vars_from_config() -> None:  # FIXME: there is a dynamic way to do 
             )
             os.environ["AI_HORDE_URL"] = custom_horde_url
 
-    if "load_large_models" in config and os.getenv("AI_HORDE_MODEL_META_LARGE_MODELS") is None:
-        config_value = config["load_large_models"]
-        if config_value is True:
+    # The config field is authoritative for large-model loading (see data_model.py's load_env_vars). Set the
+    # env var when the config opts in, and clear any pre-existing value when it opts out, so a stale env var
+    # (a prior True run, or an exported shell/Docker value) cannot silently defeat `load_large_models: false`.
+    if "load_large_models" in config:
+        if config["load_large_models"] is True:
             os.environ["AI_HORDE_MODEL_META_LARGE_MODELS"] = "1"
+        elif os.environ.pop("AI_HORDE_MODEL_META_LARGE_MODELS", None) is not None:
+            logger.warning(
+                "AI_HORDE_MODEL_META_LARGE_MODELS was set but `load_large_models` is false; clearing it so "
+                "large models (e.g. Flux, Stable Cascade) are not loaded.",
+            )
 
     if "limited_console_messages" in config and os.getenv("AIWORKER_LIMITED_CONSOLE_MESSAGES") is None:
         config_value = config["limited_console_messages"]

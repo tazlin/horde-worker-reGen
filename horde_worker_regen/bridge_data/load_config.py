@@ -350,17 +350,35 @@ class BridgeDataLoader:
         """
         load_resolver = _make_image_model_load_resolver(horde_model_reference_manager)
 
+        # Reconcile the SDK's env-var transport to the config here, the one chokepoint every resolution path
+        # flows through (startup, env-var config, and config reload). The SDK's remove_large_models gates the
+        # `all` instruction on AI_HORDE_MODEL_META_LARGE_MODELS being unset regardless of the param below, and
+        # that env var is never otherwise cleared, so a reload from large-models-on to off (e.g. via the TUI)
+        # would keep the stale value and keep loading Flux/Stable Cascade. Make the config authoritative every
+        # time models are resolved.
+        if bridge_data.load_large_models:
+            os.environ["AI_HORDE_MODEL_META_LARGE_MODELS"] = "1"
+        elif os.environ.pop("AI_HORDE_MODEL_META_LARGE_MODELS", None) is not None:
+            logger.warning(
+                "AI_HORDE_MODEL_META_LARGE_MODELS was set but `load_large_models` is false; clearing it so "
+                "large models (e.g. Flux, Stable Cascade) are not loaded.",
+            )
+
         # The SDK resolver only sees the canonical reference (get_all_model_references never includes a
         # PRIMARY's pending-queue / beta models), so anything beta would be silently dropped both from the
         # meta-instruction expansion below and the known-models filter further down. Build the beta-merged
         # records once and use them to keep opted-in beta models (e.g. qwen, Z-Image) advertised.
         beta_records = beta_aware_image_records(horde_model_reference_manager)
 
+        # Pass the config flag through so the resolver strips large baselines (Flux, Stable Cascade) for the
+        # stats-based families (`top N`/`bottom N`) too, not only the `all` instruction. Without this the SDK
+        # param defaults to True and those families could surface a large model even with the flag off.
         resolved_models = None
         if bridge_data.meta_load_instructions is not None:
             resolved_models = load_resolver.resolve_meta_instructions(
                 list(bridge_data.meta_load_instructions),
                 AIHordeAPIManualClient(),
+                load_large_models=bridge_data.load_large_models,
             )
             resolved_models |= _beta_models_for_meta_instructions(bridge_data.meta_load_instructions, beta_records)
 
@@ -368,6 +386,7 @@ class BridgeDataLoader:
             skip_models: set[str] = load_resolver.resolve_meta_instructions(
                 list(bridge_data.meta_skip_instructions),
                 AIHordeAPIManualClient(),
+                load_large_models=bridge_data.load_large_models,
             )
             skip_models |= _beta_models_for_meta_instructions(bridge_data.meta_skip_instructions, beta_records)
             existing_skip_models = set(bridge_data.image_models_to_skip)

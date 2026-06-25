@@ -7,6 +7,7 @@ resolver's canonical-only ``resolve_all_model_names``, which never includes pend
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -38,6 +39,7 @@ def _make_bridge(
     meta_load_instructions: list[str] | None = None,
     meta_skip_instructions: list[str] | None = None,
     image_models_to_skip: list[str] | None = None,
+    load_large_models: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         meta_load_instructions=meta_load_instructions,
@@ -45,6 +47,7 @@ def _make_bridge(
         image_models_to_load=image_models_to_load,
         image_models_to_skip=image_models_to_skip if image_models_to_skip is not None else [],
         only_models_on_disk=False,
+        load_large_models=load_large_models,
     )
 
 
@@ -135,3 +138,54 @@ def test_meta_all_instruction_includes_beta_model() -> None:
 
     assert "Z-Image-Turbo" in result
     assert "Canonical-Model" in result
+
+
+def _resolve_with_stub_resolver(bridge: SimpleNamespace) -> Mock:
+    """Run ``_resolve_meta_instructions`` over ``bridge`` with the SDK resolver/beta records stubbed out.
+
+    Returns the stub resolver so callers can assert how it was invoked.
+    """
+    fake_resolver = Mock()
+    fake_resolver.resolve_meta_instructions.return_value = set()
+    with (
+        patch.object(load_config, "beta_aware_image_records", return_value={}),
+        patch.object(load_config, "_make_image_model_load_resolver", return_value=fake_resolver),
+        patch.object(load_config, "AIHordeAPIManualClient", Mock()),
+    ):
+        BridgeDataLoader._resolve_meta_instructions(bridge, Mock())
+    return fake_resolver
+
+
+def test_load_large_models_false_clears_stale_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reload (e.g. from the TUI) to ``load_large_models: false`` clears a previously-set env var.
+
+    The SDK reads ``AI_HORDE_MODEL_META_LARGE_MODELS`` and it is never otherwise cleared, so without this
+    reconciliation a value left by an earlier large-models-on run would keep loading Flux/Stable Cascade.
+    """
+    monkeypatch.setenv("AI_HORDE_MODEL_META_LARGE_MODELS", "1")
+    bridge = _make_bridge(image_models_to_load=[], meta_load_instructions=["all"], load_large_models=False)
+
+    _resolve_with_stub_resolver(bridge)
+
+    assert "AI_HORDE_MODEL_META_LARGE_MODELS" not in os.environ
+
+
+def test_load_large_models_true_sets_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``load_large_models: true`` sets the env var the SDK resolver reads."""
+    monkeypatch.delenv("AI_HORDE_MODEL_META_LARGE_MODELS", raising=False)
+    bridge = _make_bridge(image_models_to_load=[], meta_load_instructions=["all"], load_large_models=True)
+
+    _resolve_with_stub_resolver(bridge)
+
+    assert os.environ["AI_HORDE_MODEL_META_LARGE_MODELS"] == "1"
+
+
+def test_load_large_models_passed_through_to_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The config flag is forwarded to the SDK resolver so non-``all`` families honor it too."""
+    monkeypatch.delenv("AI_HORDE_MODEL_META_LARGE_MODELS", raising=False)
+    bridge = _make_bridge(image_models_to_load=[], meta_load_instructions=["top 5"], load_large_models=False)
+
+    resolver = _resolve_with_stub_resolver(bridge)
+
+    _, kwargs = resolver.resolve_meta_instructions.call_args
+    assert kwargs["load_large_models"] is False

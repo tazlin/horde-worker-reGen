@@ -785,8 +785,18 @@ class reGenBridgeData(CombinedHordeBridgeData):
         if os.getenv("AIWORKER_LORA_MIN_DISK_FREE_MB") is None:
             os.environ["AIWORKER_LORA_MIN_DISK_FREE_MB"] = str(round(self.min_lora_disk_free_gb * 1024))
 
+        # The config field is authoritative for large-model loading: the env var is only the transport to
+        # the SDK resolver. Because the env var is read process-wide and is never otherwise cleared, setting
+        # it only on True would let a stale value (an earlier True run in this process, a TUI reload after
+        # True, or an exported shell/Docker value) silently defeat a later `load_large_models: false`. Clear
+        # it on False so the config always wins, and surface when a pre-existing value is being overridden.
         if self.load_large_models:
             os.environ["AI_HORDE_MODEL_META_LARGE_MODELS"] = "1"
+        elif os.environ.pop("AI_HORDE_MODEL_META_LARGE_MODELS", None) is not None:
+            logger.warning(
+                "AI_HORDE_MODEL_META_LARGE_MODELS was set but `load_large_models` is false; clearing it so "
+                "large models (e.g. Flux, Stable Cascade) are not loaded.",
+            )
 
     def save(self, file_path: str) -> None:
         """Save the config model to a file.
