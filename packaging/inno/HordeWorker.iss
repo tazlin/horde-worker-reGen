@@ -37,6 +37,12 @@ AppPublisherURL=https://github.com/Haidra-Org/horde-worker-reGen
 ; .venv + PyTorch floor is ~10-15 GB, and models add far more). PrivilegesRequired=lowest keeps it that
 ; way, while ...OverridesAllowed=dialog still lets an admin opt into a machine-wide location.
 DefaultDirName={autopf}\AIHordeWorker
+; Default Inno behavior on a re-run is to silently reuse the prior directory and skip the destination
+; page, so a user can never relocate or choose to remove an existing install. We turn that off and drive
+; the decision explicitly from the custom "existing installation" choice page in [Code] instead, which
+; either pins {app} to the previous folder (update in place) or lets the destination page show normally
+; (move to a new location).
+UsePreviousAppDir=no
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 DisableProgramGroupPage=yes
@@ -92,8 +98,66 @@ Type: filesandordirs; Name: "{app}\.venv"
 Type: filesandordirs; Name: "{app}\bin"
 
 [Code]
+// The uninstall registry subkey Inno writes for this AppId. Keep in sync with AppId above (the literal
+// braces are part of the key name; do not pass this through ExpandConstant, which would treat them as
+// Inno constants).
+const
+  UninstallSubkey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{2A6B13F1-1070-4369-A40F-4132AE735E60}_is1';
+
 var
   DetectedBackend: String;
+  HasPrior: Boolean;
+  PriorDir: String;
+  PriorUninstaller: String;
+  ChoicePage: TInputOptionWizardPage;
+  WantsExit: Boolean;
+
+function ReadPriorFromRoot(RootKey: Integer): Boolean;
+var
+  Path, Uninst: String;
+begin
+  Result := False;
+  if RegQueryStringValue(RootKey, UninstallSubkey, 'Inno Setup: App Path', Path) and (Path <> '') then
+  begin
+    PriorDir := Path;
+    if RegQueryStringValue(RootKey, UninstallSubkey, 'UninstallString', Uninst) then
+      PriorUninstaller := RemoveQuotes(Uninst);
+    Result := True;
+  end;
+end;
+
+function DetectPriorInstall(): Boolean;
+begin
+  // A per-user (lowest-privilege) install lands in HKCU; an admin machine-wide install lands in the
+  // 64-bit HKLM view (ArchitecturesInstallIn64BitMode). Check both so a re-run finds either one.
+  Result := ReadPriorFromRoot(HKCU)
+            or ReadPriorFromRoot(HKLM64)
+            or ReadPriorFromRoot(HKLM);
+end;
+
+function RunPriorUninstaller(const Params: String; Show: Integer; WaitForFinish: Boolean): Boolean;
+var
+  ResultCode, Waited: Integer;
+begin
+  Result := True;
+  if PriorUninstaller = '' then
+    exit;
+  Exec(PriorUninstaller, Params, '', Show, ewWaitUntilTerminated, ResultCode);
+  if WaitForFinish then
+  begin
+    // The Inno uninstaller relaunches itself from a temp copy so it can delete its own exe, and the first
+    // process returns immediately. Exec's wait is therefore not enough; poll until the original unins exe is
+    // actually gone (it is deleted only when uninstall completes), bounded so a failed/cancelled uninstall
+    // cannot hang the wizard. Removing the ~10-15 GB .venv can take a while, hence the generous bound.
+    Waited := 0;
+    while FileExists(PriorUninstaller) and (Waited < 600000) do
+    begin
+      Sleep(500);
+      Waited := Waited + 500;
+    end;
+    Result := not FileExists(PriorUninstaller);
+  end;
+end;
 
 function RunDetection(): String;
 var
@@ -117,6 +181,7 @@ end;
 function InitializeSetup(): Boolean;
 begin
   Result := True;
+  HasPrior := DetectPriorInstall();
   DetectedBackend := RunDetection();
 
   if DetectedBackend = 'amd-unsupported' then
@@ -145,9 +210,84 @@ begin
   end;
 end;
 
+procedure InitializeWizard();
+begin
+  // Only meaningful when a prior install exists (ShouldSkipPage hides it otherwise), but the page must be
+  // created unconditionally because page IDs are assigned here.
+  ChoicePage := CreateInputOptionPage(wpWelcome,
+    'Existing installation found',
+    'AI Horde Worker is already installed on this computer.',
+    'Choose what to do, then click Next.',
+    True,    // Exclusive: radio buttons
+    False);  // Render as radio buttons, not a list box
+  ChoicePage.Add('Update the existing installation in place (recommended)');
+  ChoicePage.Add('Move to a new location (removes the current install first)');
+  ChoicePage.Add('Uninstall the existing installation and exit');
+  ChoicePage.SelectedValueIndex := 0;
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  // Hide the choice page entirely on a clean machine.
+  if (PageID = ChoicePage.ID) and (not HasPrior) then
+    Result := True;
+  // "Update in place" reuses the previous folder, so the destination page would only be confusing.
+  if (PageID = wpSelectDir) and HasPrior and (ChoicePage.SelectedValueIndex = 0) then
+    Result := True;
+end;
+
+procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
+begin
+  // Suppress the "Exit Setup?" prompt for the programmatic exit after an "uninstall and exit" choice.
+  if WantsExit then
+    Confirm := False;
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
+
+  if (HasPrior) and (CurPageID = ChoicePage.ID) then
+  begin
+    case ChoicePage.SelectedValueIndex of
+      0: // Update in place: pin {app} to the previous folder; the destination page is then skipped.
+        WizardForm.DirEdit.Text := PriorDir;
+      1: // Move to a new location: remove the old install now so its files are not orphaned (a single
+         // AppId means the new install would otherwise re-point Add/Remove Programs and strand the old
+         // folder). The destination page follows so the user picks the new folder.
+        begin
+          if MsgBox('The existing installation at:' + #13#10 + '    ' + PriorDir + #13#10#13#10
+                    + 'will be removed first, then you can choose a new folder. Downloaded models and the'
+                    + ' dependency cache live in the sibling "' + ExtractFileName(PriorDir) + '-data" folder'
+                    + ' and are NOT moved, so the new location will re-download them on first launch.'
+                    + #13#10#13#10 + 'Continue?', mbConfirmation, MB_YESNO) = IDYES then
+          begin
+            if RunPriorUninstaller('/SILENT /SUPPRESSMSGBOXES /NORESTART', SW_HIDE, True) then
+              HasPrior := False // The old install is gone; treat the rest of setup as a fresh install.
+            else
+            begin
+              // Bail rather than install a second copy on top of a half-removed one (which would also leave
+              // the Add/Remove Programs entry pointing at the wrong folder).
+              MsgBox('The existing installation could not be removed automatically. Please uninstall it from'
+                     + ' Settings > Apps, then run this installer again.', mbError, MB_OK);
+              Result := False;
+            end;
+          end
+          else
+            Result := False; // Stay on the choice page.
+        end;
+      2: // Uninstall and exit: run the existing uninstaller interactively, then close the wizard.
+        begin
+          RunPriorUninstaller('', SW_SHOW, False);
+          WantsExit := True;
+          Result := False;
+          WizardForm.Close;
+        end;
+    end;
+    Exit;
+  end;
+
   if CurPageID = wpSelectDir then
   begin
     // PyTorch and uv fail on paths containing spaces, so reject one early rather than after a long install.

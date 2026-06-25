@@ -9,6 +9,12 @@ CI staging directory), so there is no second copy of the install logic to keep i
 - Per-user install (no administrator / UAC prompt) under `%LOCALAPPDATA%\Programs\AIHordeWorker` by
   default; the user can pick another drive on the destination page. Paths containing spaces are rejected
   (PyTorch and uv fail on them).
+- On a re-run with an existing install, presents an "existing installation found" choice page: **update in
+  place** (reuses the previous folder, skips the destination page), **move to a new location** (removes the
+  current install first, then lets the user pick a new folder), or **uninstall and exit**. Inno's default of
+  silently reusing the previous folder is disabled (`UsePreviousAppDir=no`) so this choice is always offered.
+  Models and the dependency cache live in the sibling `…-data` folder and are not moved when relocating, so a
+  new location re-downloads them on first launch.
 - Detects the GPU once during the wizard via the shared `detect-backend.ps1`, warns on CPU-only, and offers
   a CPU-only path (or cancels) for unsupported AMD-on-Windows. It writes the result to `bin\backend`, which
   the deferred first-launch bootstrap reads so the correct PyTorch build is installed.
