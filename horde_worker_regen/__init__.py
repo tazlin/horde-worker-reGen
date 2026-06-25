@@ -8,4 +8,4 @@ from pathlib import Path  # noqa: E402
 
 ASSETS_FOLDER_PATH = Path(__file__).parent / "assets"
 
-__version__ = "12.30.1"
+__version__ = "13.0.0"
