@@ -55,6 +55,17 @@ class TestLineParsing:
         """A line without a leading timestamp yields None rather than raising."""
         assert parse_ts("no timestamp here") is None
 
+    def test_parse_ts_matches_strptime_semantics(self) -> None:
+        """The fast integer-slice parser must agree with the strptime it replaced (incl. fractionals).
+
+        loguru's millisecond fraction is right-padded to microseconds (``.847`` -> 847000 us), exactly
+        as ``%f`` did; this pins that the hand-rolled parser keeps that contract on a heavy hot path.
+        """
+        from datetime import datetime
+
+        assert parse_ts("2026-06-24 18:30:38.847 | rest") == datetime(2026, 6, 24, 18, 30, 38, 847000)
+        assert parse_ts("2026-06-24 18:30:38.847123 | rest") == datetime(2026, 6, 24, 18, 30, 38, 847123)
+
 
 class TestReadingFiles:
     """Reading from the real on-disk shapes: NUL bytes, plain files, zip rotations, and gzip."""

@@ -79,10 +79,8 @@ class InsightsView(VerticalScroll):
                 "robustness findings), open the ",
                 "grey70",
             ),
-            ("Benchmark", "bold green"),
-            (" tab (", "grey70"),
-            ("F8", "bold green"),
-            (") to run it live here, or from a shell:\n\n", "grey70"),
+            ("Benchmark tab "),
+            ("to run it live here, or from a shell:\n\n", "grey70"),
             ("    horde-benchmark\n", "bold green"),
         )
         return Panel(body, title="Deeper analysis", title_align="left", border_style="grey37")

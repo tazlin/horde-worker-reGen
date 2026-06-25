@@ -56,6 +56,7 @@ from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.update_check import check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView, BenchmarkWaitingState
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, ConfigLeaveChoice, ConfigLeaveModal
+from horde_worker_regen.tui.widgets.diagnostics import DiagnosticsView
 from horde_worker_regen.tui.widgets.download_picker import (
     DownloadPickerModal,
     DownloadPickerRow,
@@ -331,8 +332,8 @@ class HordeWorkerTUI(App[None]):
         ("f5", "reload_config", "Reload config"),
         ("f6", "cycle_view_mode", "View mode"),
         ("f7", "toggle_download_pause", "Pause downloads"),
-        ("f8", "show_benchmark", "Benchmark"),
-        ("f9", "restart_worker", "Restart worker"),
+        ("f11", "restart_worker", "Restart worker"),
+        ("f10", "show_diagnostics", "Diagnostics"),
         ("m", "toggle_server_maintenance", "Maintenance (horde)"),
         ("ctrl+q", "quit", "Quit"),
         ("ctrl+c", "quit", "Quit"),
@@ -408,6 +409,8 @@ class HordeWorkerTUI(App[None]):
                 yield ConfigEditorView(self._config_path)
             with TabPane("Insights", id="tab-insights"):
                 yield InsightsView()
+            with TabPane("Diagnostics", id="tab-diagnostics"):
+                yield DiagnosticsView()
             with TabPane("Benchmark", id="tab-benchmark"):
                 yield BenchmarkView(worker_mode=self._supervisor.mode.value)
         yield Footer()
@@ -716,6 +719,11 @@ class HordeWorkerTUI(App[None]):
         """Switch to the Benchmark tab."""
         with contextlib.suppress(NoMatches):
             self.query_one("#main-tabs", TabbedContent).active = "tab-benchmark"
+
+    def action_show_diagnostics(self) -> None:
+        """Switch to the Diagnostics tab (the activation handler kicks off its first analysis)."""
+        with contextlib.suppress(NoMatches):
+            self.query_one("#main-tabs", TabbedContent).active = "tab-diagnostics"
 
     def action_toggle_download_pause(self) -> None:
         """Pause or resume background downloads based on the latest reported state."""

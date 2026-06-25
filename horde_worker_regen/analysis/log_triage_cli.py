@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .bundle import LogBundle
 from .correlate import build_session_context, build_timeline
-from .detectors import run_detectors
+from .diagnose import diagnose, select_sessions
 from .sessions import WorkerSession, segment_sessions
 from .support_bundle import build_support_bundle
 from .triage_report import (
@@ -43,24 +43,10 @@ def _load_sessions(path: Path) -> tuple[LogBundle, list[WorkerSession]]:
     return bundle, sessions
 
 
-def _select_sessions(
-    sessions: list[WorkerSession],
-    *,
-    last: bool,
-    index: int | None,
-) -> list[WorkerSession]:
-    """Apply ``--last`` / ``--session N`` selection to a session list."""
-    if index is not None:
-        return [s for s in sessions if s.index == index]
-    if last and sessions:
-        return sessions[-1:]
-    return sessions
-
-
 def _run_sessions(args: argparse.Namespace) -> int:
     """List the worker sessions in a log path with their end-reason and peak recoveries."""
     bundle, sessions = _load_sessions(args.path)
-    selected = _select_sessions(sessions, last=args.last, index=args.session)
+    selected = select_sessions(sessions, last=args.last, session_index=args.session)
     if args.json:
         print(json.dumps([session_to_dict(s) for s in selected], indent=2))
     else:
@@ -70,27 +56,25 @@ def _run_sessions(args: argparse.Namespace) -> int:
 
 def _run_diagnose(args: argparse.Namespace) -> int:
     """Run all detectors over the selected session(s) and print ranked findings with remediation."""
-    bundle, sessions = _load_sessions(args.path)
-    selected = _select_sessions(sessions, last=args.last, index=args.session)
-    if not selected:
+    results = diagnose(args.path, last=args.last, session_index=args.session)
+    if not results:
         print("No matching sessions.")
         return 1
-    results = [(session, run_detectors(build_session_context(session, bundle))) for session in selected]
     if args.json:
         payload = [
-            {"session": session_to_dict(session), "findings": [finding_to_dict(f) for f in findings]}
-            for session, findings in results
+            {"session": session_to_dict(r.session), "findings": [finding_to_dict(f) for f in r.findings]}
+            for r in results
         ]
         print(json.dumps(payload, indent=2))
     else:
-        print("\n\n".join(render_findings(session, findings) for session, findings in results))
+        print("\n\n".join(render_findings(r.session, r.findings) for r in results))
     return 0
 
 
 def _run_timeline(args: argparse.Namespace) -> int:
     """Print the merged parent/child/ledger event stream for the selected session(s)."""
     bundle, sessions = _load_sessions(args.path)
-    selected = _select_sessions(sessions, last=args.last, index=args.session)
+    selected = select_sessions(sessions, last=args.last, session_index=args.session)
     if not selected:
         print("No matching sessions.")
         return 1
@@ -154,8 +138,7 @@ def _run_bundle(args: argparse.Namespace) -> int:
     )
     size_mb = result.size_bytes / (1024 * 1024)
     print(
-        f"Wrote {result.out_path} ({size_mb:.1f} MB, {result.member_count} files, "
-        f"{result.session_count} session(s)).",
+        f"Wrote {result.out_path} ({size_mb:.1f} MB, {result.member_count} files, {result.session_count} session(s)).",
     )
     print(
         f"Redacted {result.redaction_count} secret/identifier occurrence(s). "

@@ -45,15 +45,34 @@ _HEAD_RE = re.compile(
 )
 
 
+def _ts_from_prefix(ts: str) -> datetime | None:
+    """Build a datetime from a fixed-width ``YYYY-MM-DD HH:MM:SS.ffffff`` prefix by integer slicing.
+
+    Hand-rolled rather than ``datetime.strptime`` because this runs once per log line over multi-MB
+    logs, and ``strptime`` (with its format re-parse and locale machinery) dominated the parse. The
+    prefix shape is guaranteed by :data:`TS_RE` / :data:`_HEAD_RE`, so the slices are safe; loguru's
+    fractional part is milliseconds but may be any width, so it is right-padded to microseconds.
+    """
+    try:
+        return datetime(
+            int(ts[0:4]),
+            int(ts[5:7]),
+            int(ts[8:10]),
+            int(ts[11:13]),
+            int(ts[14:16]),
+            int(ts[17:19]),
+            int(ts[20:].ljust(6, "0")[:6]),
+        )
+    except (ValueError, IndexError):
+        return None
+
+
 def parse_ts(text: str) -> datetime | None:
     """Parse a loguru timestamp prefix from the start of ``text``, or None if it has none."""
     match = TS_RE.match(text)
     if match is None:
         return None
-    try:
-        return datetime.strptime(match.group("ts"), TS_FORMAT)
-    except ValueError:
-        return None
+    return _ts_from_prefix(match.group("ts"))
 
 
 @dataclass
@@ -142,7 +161,8 @@ def parse_lines(lines: Iterable[str], source_path: Path) -> list[LogRecord]:
         name, function, lineno = _split_location(head.group("loc"))
         records.append(
             LogRecord(
-                timestamp=parse_ts(line),
+                # Reuse the head match's ts group instead of re-running TS_RE + strptime on the line.
+                timestamp=_ts_from_prefix(head.group("ts")),
                 level=head.group("level"),
                 name=name,
                 function=function,

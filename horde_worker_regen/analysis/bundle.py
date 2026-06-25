@@ -111,6 +111,22 @@ class LogBundle:
         """All parsed orchestrator (``bridge.log``) records, active plus rotations, in time order."""
         return read_records(*self.orchestrator_paths)
 
+    def active_orchestrator_paths(self) -> list[Path]:
+        """Only the live ``bridge.log`` (no zipped/rotated archives): where the most recent sessions live.
+
+        A bounded "recent sessions" pass can read just this and skip decompressing the whole rotation
+        history, which is the bulk of the disk I/O and parse cost on a long-running worker.
+        """
+        return [
+            path
+            for path in self.orchestrator_paths
+            if path.suffix.lower() == ".log" and not _ROTATION_TS_RE.search(path.name)
+        ]
+
+    def active_orchestrator_records(self) -> list[LogRecord]:
+        """Parsed records from only the live ``bridge.log`` (skips rotations); see ``active_orchestrator_paths``."""
+        return read_records(*self.active_orchestrator_paths())
+
     def child_records(self, process_id: int) -> list[LogRecord]:
         """Parsed loop-log records for one slot, in time order (empty if that slot has no loop log)."""
         return read_records(*self.child_loop_paths.get(process_id, []))

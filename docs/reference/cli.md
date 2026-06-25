@@ -181,6 +181,23 @@ class (an inference pool crashing on start, a recovery storm that never gives up
 "no images produced" OOM, an orphaned-job storm) and emits the child's exception as the root cause where
 it can. See [Troubleshoot](../how-to/troubleshoot.md#diagnose-a-crash-or-recovery-storm-from-the-logs).
 
+The dashboard exposes the same `diagnose` analysis without a shell: the **Diagnostics** tab (`F10`)
+runs the detectors over `logs/` and renders the ranked findings, with a selector to pick which worker
+session to view. It reads the log files directly, so it **works whether or not the worker is running**.
+Each finding separates the *diagnosis* (what went wrong) from the *suggested fix*, and a timing line
+dates the analysis, shows the current time, and flips to a clear **stale** warning once the displayed
+analysis is more than five minutes old.
+
+A **scope** selector (left of the session/Run cluster) chooses how much history a pass reads:
+*Current session* and *Last 3 sessions* read only the live `bridge.log` (fast); *All logs* also
+decompresses every rotation. Analysis is **only started by pressing Run analysis** — opening the tab or
+changing the scope does not run anything (changing the scope shows a "press Run analysis to apply"
+hint), so a slow pass is never triggered just by browsing. The parse and detectors are CPU-bound, so
+the work runs in a **separate worker process** (only a lightweight, record-free summary is returned)
+and the TUI stays responsive while it runs. It calls the same `diagnose()` facade the CLI does, so the
+two never disagree. See [How the diagnostics stay in sync](../explanation/log_diagnostics_contract.md)
+for the contract that keeps the detectors, the logs they read, and this tab from drifting apart.
+
 ### `bundle`: a redacted archive for a maintainer
 
 `horde-log bundle` collects everything a maintainer needs into one shareable `.zip`: the diagnosis

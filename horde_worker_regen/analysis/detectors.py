@@ -32,7 +32,10 @@ _OOM_RE = re.compile(
     r"CUDA out of memory|OutOfMemoryError|torch\.cuda\.OutOfMemoryError|RuntimeError: .*out of memory",
 )
 _NO_IMAGES_RE = re.compile(r"no images were produced|no images produced")
-_ORPHAN_RE = re.compile(r"orphaned? in-progress|punt(?:ing|ed) (?:an? )?orphan")
+# The in-progress orphan watchdog names itself in its punt line ("...(orphaned-job watchdog).") rather
+# than using the words "orphaned in-progress", so the watchdog tag is the signature that actually
+# matches the emitted text; the other alternatives stay for forward-compatibility and the ledger reason.
+_ORPHAN_RE = re.compile(r"orphaned? in-progress|punt(?:ing|ed) (?:an? )?orphan|orphaned-job watchdog")
 # The horde rejecting a pop because it forced the worker into maintenance, and the (server-supplied)
 # reason it gives. "dropping too many jobs" is the worker's own fault and the actionable case; any other
 # maintenance (operator-set, key issue) is informational.

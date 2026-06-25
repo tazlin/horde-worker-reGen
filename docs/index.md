@@ -69,6 +69,10 @@ Want to know how it works under the hood, or contribute a change? The
     and attributed (per-job phase gaps and reload churn), the
     `horde-duty-report` log analyzer, the tuning levers, and the structural
     ceiling on VRAM-constrained cards.
+15. **[Log diagnostics contract](explanation/log_diagnostics_contract.md)**: how
+    the worker's log lines, the `horde-log` detectors that read them, and the
+    dashboard's Diagnostics tab are kept in sync with one shared facade and a
+    contract test, so a new detector needs the fewest manual touches.
 
 The **[codebase map](reference/codebase-map.md)** is a file-to-responsibility
 quick reference, and the auto-generated API reference for every module lives

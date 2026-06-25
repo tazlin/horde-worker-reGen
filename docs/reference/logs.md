@@ -1,6 +1,10 @@
 # Logs
 
-The worker writes logs to the `logs/` directory. The dashboard's **Logs** tab reads these same files.
+The worker writes logs to the `logs/` directory. The dashboard's **Logs** tab reads these same files,
+and the **Diagnostics** tab (`F10`) runs the [`horde-log diagnose`](cli.md#horde-log) detectors over
+them to surface what went wrong, without you needing a shell. See
+[How the diagnostics stay in sync](../explanation/log_diagnostics_contract.md) for how a detector, the
+log line it reads, and the dashboard are kept from drifting apart.
 
 | File | Contents |
 |------|----------|

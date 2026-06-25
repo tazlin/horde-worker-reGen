@@ -256,6 +256,7 @@ extend-exclude = ["conda", "model-stats.py", "amd_go_fast.py"]
 "test_support_bundle.py" = ["E501"]
 "test_redaction.py" = ["E501"]
 "test_system_info.py" = ["E501"]
+"test_detector_contract.py" = ["E501"]
 
 
 [tool.ruff.lint.pydocstyle]
