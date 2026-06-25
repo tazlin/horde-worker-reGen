@@ -20,7 +20,7 @@ uniformly with the flat fields.
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -277,7 +277,11 @@ class GpuOverridesEditor(Vertical):
             if existing is not None:
                 existing.variant = self._chip_variant(index)
                 continue
-            button = Button(f"GPU {index}", id=f"gpu-chip-{index}", variant=self._chip_variant(index))
+            button = Button(
+                f"GPU {index}",
+                id=f"gpu-chip-{index}",
+                variant=self._chip_variant(index),
+            )
             self._chip_buttons[index] = button
             # Keep numbered chips ordered and always ahead of the trailing add button.
             later = [other for other in sorted(self._chip_buttons) if other > index and other in self._chip_buttons]
@@ -287,7 +291,7 @@ class GpuOverridesEditor(Vertical):
         with contextlib.suppress(Exception):
             self.query_one("#gpu-drive-summary", Static).update(self._drive_summary())
 
-    def _chip_variant(self, index: int) -> str:
+    def _chip_variant(self, index: int) -> Literal["primary", "success", "default"]:
         """A chip's colour: blue when explicitly driven, green when the worker detected the card, else grey.
 
         Colour (not a glyph) carries the detected state because the marker characters that read as "present"

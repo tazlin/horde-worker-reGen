@@ -1,0 +1,15 @@
+project-excludes = [
+    "**/tests",
+    "**/dist*",
+    "**/build*",
+    "**/env*",
+    "**/venv*",
+    "**/conda*",
+]
+search-path = ["."]
+preset = "legacy"
+ignore-missing-imports = [
+    "xformers.*",
+    "ruamel.*",
+    "pystray.*",
+]
