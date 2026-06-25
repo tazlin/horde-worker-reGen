@@ -224,7 +224,7 @@ elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
                 ;;
             [Tt])
                 echo "Starting the in-terminal UI..."
-                exec ./horde-worker.sh --terminal
+                exec ./horde-worker.sh --terminal </dev/tty
                 ;;
             [Hh])
                 echo "Starting the worker in headless mode..."
