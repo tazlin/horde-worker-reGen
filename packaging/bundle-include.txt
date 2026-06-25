@@ -41,3 +41,6 @@ preload-models.sh
 # in worker_bootstrap/detect.py; this stays as the wizard's pre-uv equivalent. Staging flattens it to the
 # bundle root so the installer sources it from the same staging as the zip.
 packaging/detect-backend.ps1
+# Logs bundler for debugging
+create-logs-bundle.cmd
+create-logs-bundle.sh
