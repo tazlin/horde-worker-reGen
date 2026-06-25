@@ -105,6 +105,7 @@ horde-worker-web = "horde_worker_regen.tui.web:main"
 horde-worker-host = "horde_worker_regen.tui.worker_host:main"
 horde-benchmark = "horde_worker_regen.benchmark.cli:main"
 horde-duty-report = "horde_worker_regen.analysis.duty_log_report:main"
+horde-log = "horde_worker_regen.analysis.log_triage_cli:main"
 
 [dependency-groups]
 dev = [

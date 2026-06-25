@@ -72,7 +72,17 @@ progress, checksum verification, and on-disk presence reporting as every other m
 instead of a single opaque "annotators" line that froze through a full ComfyUI init.
 
 Once the files are present, a single **exclusive** `ANNOTATOR_VERIFY` task runs each
-preprocessor once (a ComfyUI init) to confirm they actually load. A verify failure is
+preprocessor once (a ComfyUI init) to confirm they actually load. That verify is the
+one place the otherwise-offline download process boots a full ComfyUI/torch/CUDA
+stack, so it is **gated on a persistent marker**: hordelib records a marker (keyed to
+the pinned `comfyui_controlnet_aux` commit) once every preprocessor has run, and the
+worker reads it *before* booting (the read needs neither `hordelib.initialise` nor a
+GPU). A warm marker means a prior session already verified this pin, so the verify is
+skipped outright and no boot is paid. The verify therefore runs only when it is
+genuinely due: a fresh install, or an annotator pin bump. (File integrity across
+sessions is covered separately by the per-file `.sha256` sidecars, so a warm marker
+never trusts changed bytes: a corrupt file fails its checksum and withholds the
+feature before the verify is ever considered.) A verify failure is
 recovered, not ignored: the detector checkpoints are re-downloaded once (a corrupt
 file is the likely cause) and re-verified; if it **still** fails, ControlNet is
 disabled for the session and the operator is notified with a remediation hint, rather

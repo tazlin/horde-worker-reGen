@@ -105,6 +105,61 @@ class TestSchedulerDiagnosticThrottle:
         assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("new",)) == 1
 
 
+class TestLineSkipRejectionLogThrottle:
+    """The line-skip rejection log is rate-limited per (candidate, reason) without losing fidelity."""
+
+    def _capture(self, fn) -> list[str]:  # noqa: ANN001
+        """Run ``fn`` with a temporary loguru sink and return the line-skip messages it emitted."""
+        from loguru import logger
+
+        messages: list[str] = []
+        sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="DEBUG")
+        try:
+            fn()
+        finally:
+            logger.remove(sink_id)
+        return [m for m in messages if "Line-skip candidate" in m]
+
+    def test_identical_rejection_repeats_are_throttled(self) -> None:
+        """Re-evaluating the same (candidate, reason) within the interval logs only once."""
+        scheduler = _make_inference_scheduler()
+
+        def emit() -> None:
+            for _ in range(5):
+                scheduler._log_line_skip_rejection("abc12345", "has_loras", "rejected: candidate has LoRAs.")
+
+        emitted = self._capture(emit)
+        assert len(emitted) == 1
+        assert "rejected: candidate has LoRAs." in emitted[0]
+
+    def test_distinct_reason_or_candidate_logs_immediately(self) -> None:
+        """A changed reason or a different candidate is not suppressed (full fidelity preserved)."""
+        scheduler = _make_inference_scheduler()
+
+        def emit() -> None:
+            scheduler._log_line_skip_rejection("abc12345", "has_loras", "rejected: candidate has LoRAs.")
+            scheduler._log_line_skip_rejection("abc12345", "same_model", "rejected: same model as blocked job head.")
+            scheduler._log_line_skip_rejection("def67890", "has_loras", "rejected: candidate has LoRAs.")
+
+        emitted = self._capture(emit)
+        assert len(emitted) == 3
+
+    def test_throttle_lifts_after_interval(self) -> None:
+        """Once the interval elapses, the same rejection logs again."""
+        from horde_worker_regen.process_management.inference_scheduler import _LINE_SKIP_REJECTION_LOG_INTERVAL
+
+        scheduler = _make_inference_scheduler()
+
+        def emit() -> None:
+            scheduler._log_line_skip_rejection("abc12345", "has_loras", "rejected: candidate has LoRAs.")
+            # Age the recorded timestamp past the interval so the next call re-emits.
+            scheduler._line_skip_rejection_log_state["abc12345:has_loras"] -= _LINE_SKIP_REJECTION_LOG_INTERVAL + 1
+            scheduler._log_line_skip_rejection("abc12345", "has_loras", "rejected: candidate has LoRAs.")
+
+        emitted = self._capture(emit)
+        assert len(emitted) == 2
+
+
 class TestPreloadModels:
     """Tests for preload_models."""
 

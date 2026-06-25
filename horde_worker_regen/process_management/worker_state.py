@@ -11,6 +11,8 @@ import dataclasses
 import time
 from collections import deque
 
+from horde_worker_regen.process_management.lora_download_backoff import LoraDownloadBackoff
+
 
 @dataclasses.dataclass
 class WorkerState:
@@ -54,6 +56,14 @@ class WorkerState:
     While true the worker stops advertising LoRA support on job pops (see the job popper's
     ``_effective_allow_lora``) so it isn't handed jobs whose LoRAs it cannot download, and the TUI
     surfaces a prominent warning. Cleared automatically once free space recovers above the floor."""
+
+    lora_download_backoff: LoraDownloadBackoff = dataclasses.field(default_factory=LoraDownloadBackoff)
+    """Escalating suppression of LoRA pops after repeated ad-hoc download teardowns.
+
+    The process lifecycle records a strike whenever it reaps an inference slot stuck downloading
+    auxiliary models; while the resulting window is active the job popper stops advertising LoRA
+    support (see ``_lora_disk_permits``) so the worker stops feeding jobs into a failing download
+    path. Windows double per consecutive strike and reset after a healthy stretch."""
 
     consecutive_failed_jobs: int = 0
     too_many_consecutive_failed_jobs: bool = False

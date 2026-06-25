@@ -9,6 +9,7 @@ import pytest
 
 from horde_worker_regen.process_management.child_crash_capture import (
     enable_child_faulthandler,
+    read_last_startup_crash,
     write_startup_crash,
 )
 from horde_worker_regen.tui.log_tailer import discover_bridge_logs_grouped
@@ -34,6 +35,36 @@ def test_write_startup_crash_creates_discoverable_log(monkeypatch: pytest.Monkey
     # The Logs tab globs bridge*.log; the file must show up as its own process entry.
     grouped = discover_bridge_logs_grouped(tmp_path / "logs")
     assert "main_startup" in grouped
+
+
+def test_write_startup_crash_embeds_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The os pid and launch id are stamped into the line so an offline tool can join it exactly."""
+    monkeypatch.chdir(tmp_path)
+    try:
+        raise AssertionError("Torch not compiled with CUDA enabled")
+    except AssertionError as error:
+        write_startup_crash("inference_1", error, os_pid=4600, launch_identifier=2)
+
+    contents = (tmp_path / "logs" / "bridge_inference_1_startup.log").read_text(encoding="utf-8")
+    assert "(os_pid=4600, launch=2)" in contents
+    assert "Torch not compiled with CUDA enabled" in contents
+
+
+def test_read_last_startup_crash_returns_exception(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The reader lifts the most recent crash's exception summary from the appended startup file."""
+    monkeypatch.chdir(tmp_path)
+    try:
+        raise AssertionError("Torch not compiled with CUDA enabled")
+    except AssertionError as error:
+        write_startup_crash("inference_1", error, os_pid=4600, launch_identifier=2)
+
+    assert read_last_startup_crash("inference_1") == "AssertionError: Torch not compiled with CUDA enabled"
+
+
+def test_read_last_startup_crash_missing_file_is_none(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A slot that never wrote a startup crash yields None, not an error."""
+    monkeypatch.chdir(tmp_path)
+    assert read_last_startup_crash("inference_9") is None
 
 
 def test_write_startup_crash_is_lazy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

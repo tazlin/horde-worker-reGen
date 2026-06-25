@@ -23,6 +23,7 @@ from horde_worker_regen.consts import VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.card_runtime import CardRuntime
+from horde_worker_regen.process_management.child_crash_capture import read_last_startup_crash
 from horde_worker_regen.process_management.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.horde_process import HordeProcessType, WorkerCapability
@@ -106,6 +107,15 @@ STEP_TIMEOUT_WORK_FACTOR: float = 2.0
 applies. A heavier job (more steps, larger pixels, hires) has longer legitimate heartbeat-silent stretches
 than a light one, so the budget tracks its expected work, floored at ``inference_step_timeout`` and capped
 at ``contended_step_timeout`` so a light job stays tight and a genuine wedge is still reaped."""
+
+FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS: float = 60.0
+"""Shortened stuck-aux-download grace applied while a LoRA-download backoff is active.
+
+The first stall is reaped at the configured ``download_timeout`` and registers a backoff strike; once
+the download path is known to be failing there is no value in letting a *requeued* job ride the full
+window again, so further stalls are reaped at this much shorter grace (floored against an
+unusually-low configured ``download_timeout``). This is the fast-fault half of the backoff: it bounds
+how long a job that keeps timing out can hold a slot, instead of burning the full window per attempt."""
 
 
 def _job_is_feature_heavy(process_info: HordeProcessInfo) -> bool:
@@ -1266,10 +1276,30 @@ class ProcessLifecycleManager:
 
         self._release_held_primitives(process_info)
 
-        if process_info.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL and job_to_remove is not None:
-            logger.error(
-                f"Job {job_to_remove.id_ or job_to_remove.ids} was in aux model preload on process "
-                f"{process_info.process_id} but it failed. Removing.",
+        aux_download_stall = (
+            process_info.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL and not intentional_reclaim
+        )
+        # Decide retryability against the incident state *before* this strike is recorded: a lone transient
+        # stall (no incident yet) still earns its one ordinary retry, but a stall while a download outage is
+        # already active is faulted terminally below instead of requeued straight back into the same failing
+        # download -- which the logs show just stalls and tears the slot down a second time (every doomed job
+        # was costing two process recoveries, not one).
+        aux_stall_retryable = not self._state.lora_download_backoff.is_escalation_active(time.time())
+
+        if aux_download_stall:
+            if job_to_remove is not None:
+                logger.error(
+                    f"Job {job_to_remove.id_ or job_to_remove.ids} was in aux model preload on process "
+                    f"{process_info.process_id} but it failed. Removing.",
+                )
+            # A slot torn down mid aux-download is the reliable signal that the ad-hoc download path is
+            # failing; register a strike so the popper stops feeding new LoRA jobs (escalating window)
+            # and the aux-download watchdog reaps further stalls sooner.
+            window = self._state.lora_download_backoff.register_timeout(time.time())
+            logger.warning(
+                f"Auxiliary (LoRA) download stalled and was torn down (strike "
+                f"{self._state.lora_download_backoff.strikes}); withholding LoRA job pops for "
+                f"{window:.0f}s while downloads recover.",
             )
 
         if process_info.loaded_horde_model_name is not None:
@@ -1285,14 +1315,17 @@ class ProcessLifecycleManager:
             )
 
         if job_to_remove is not None:
-            # A slot crash/hang mid-job is retryable: the job is requeued to a fresh slot (bounded by
-            # max_inference_attempts) rather than faulted outright. The crash gives no resource signal,
-            # so it takes the ordinary retry, not the degraded path.
+            # A slot crash/hang mid-job is normally retryable: the job is requeued to a fresh slot (bounded
+            # by max_inference_attempts) rather than faulted outright. The crash gives no resource signal,
+            # so it takes the ordinary retry, not the degraded path. The exception is an aux-download stall
+            # during an active download outage: an immediate retry only re-enters the same failing download
+            # and tears down a second slot, so it is faulted terminally (the horde reassigns the job) -- the
+            # job outcome is the same as the eventual out-of-attempts fault, at half the process churn.
             self._job_tracker.handle_job_fault_now(
                 faulted_job=job_to_remove,
                 process_info=process_info,
                 process_timeout=bridge_data.process_timeout,
-                retryable=True,
+                retryable=not (aux_download_stall and not aux_stall_retryable),
             )
 
         if intentional_reclaim:
@@ -1354,6 +1387,17 @@ class ProcessLifecycleManager:
         self._log_recovery_diagnostics(process_info, recovery_reason)
         raw_exitcode = getattr(process_info.mp_process, "exitcode", None)
         exitcode = raw_exitcode if isinstance(raw_exitcode, int) else None
+        detail: dict[str, str | int | float | bool | None] = {
+            "last_state": process_info.last_process_state.name,
+            "exitcode": exitcode,
+        }
+        # A nonzero exit means the child actually crashed (vs. a hang, exitcode None): lift the why from
+        # its startup-crash file into the ledger so the structured record explains itself even when the
+        # per-subprocess human logs are not kept. Only on a real crash, to avoid attributing a stale crash.
+        if exitcode not in (0, None):
+            crash_signature = read_last_startup_crash(f"inference_{process_info.process_id}")
+            if crash_signature is not None:
+                detail["crash_signature"] = crash_signature
         self._action_ledger.record(
             LedgerEventType.PROCESS_REPLACED,
             process_id=process_info.process_id,
@@ -1361,7 +1405,7 @@ class ProcessLifecycleManager:
             launch_identifier=process_info.process_launch_identifier,
             job_id=str(job_to_remove.id_) if job_to_remove is not None else None,
             reason=recovery_reason,
-            detail={"last_state": process_info.last_process_state.name, "exitcode": exitcode},
+            detail=detail,
         )
         self._notify_process_recovery(process_info, recovery_reason)
 
@@ -1575,6 +1619,20 @@ class ProcessLifecycleManager:
             return max(base, min(ceiling, scaled))
         return base
 
+    def _effective_aux_download_timeout(self, bridge_data: reGenBridgeData) -> float:
+        """Stuck-aux-download grace, shortened once the LoRA-download backoff is active.
+
+        A healthy worker reaps a stalled aux download at the configured ``download_timeout``. While a
+        backoff incident is active the download path is known to be failing, so a requeued job that
+        keeps timing out is reaped at the much shorter ``FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS`` (never
+        above the configured timeout) rather than holding a slot for the full window again. The
+        shortening self-expires with the incident, so a recovered worker reverts to the full grace.
+        """
+        configured = bridge_data.download_timeout
+        if not self._state.lora_download_backoff.is_escalation_active(time.time()):
+            return configured
+        return min(configured, FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS)
+
     def replace_hung_processes(self) -> bool:
         """Replaces processes that haven't checked in since `process_timeout` seconds in bridgeData."""
         import threading
@@ -1654,7 +1712,7 @@ class ProcessLifecycleManager:
                         False,
                     ),
                     (
-                        bridge_data.download_timeout,
+                        self._effective_aux_download_timeout(bridge_data),
                         HordeProcessState.DOWNLOADING_AUX_MODEL,
                         "seems to be stuck downloading an auxiliary model (LoRa, etc)",
                         True,

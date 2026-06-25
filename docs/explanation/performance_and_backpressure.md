@@ -422,6 +422,41 @@ This division means a tight-but-recoverable disk quietly trims the cache and kee
 while a genuinely full disk stops the worker accepting LoRA jobs it could not fulfil, instead of
 crashing on a failed write.
 
+## LoRA download stalls: backoff, cap, and fast-fault
+
+A full disk is not the only way LoRA work goes wrong. When the ad-hoc download source itself is slow or
+flaky (CivitAI `ReadTimeout`s, an over-loaded mirror), a LoRA-bearing job can sit minutes in
+`DOWNLOADING_AUX_MODEL` before the orchestrator's stuck-aux watchdog tears the slot down and requeues
+it. Three mechanisms keep one bad download path from collapsing worker throughput, since the
+[line-skip](#the-line-skip-cache) path deliberately rejects LoRA candidates (a skip job must be quick,
+not one that itself blocks on a download) and so cannot route around a LoRA job stuck at the head.
+
+- **Escalating pop backoff**
+  ([`LoraDownloadBackoff`][horde_worker_regen.process_management.lora_download_backoff.LoraDownloadBackoff]):
+  every time the lifecycle reaps a slot stuck downloading aux models it registers a *strike*. While a
+  strike's window is active the popper stops advertising LoRA support (folded into `_lora_disk_permits`
+  alongside the disk guard), so the worker stops feeding jobs into a failing download path. The window
+  starts at 60 s and doubles per consecutive strike up to 30 min, then resets after a trouble-free
+  stretch -- a brief blip pauses LoRA work briefly, a sustained outage pauses it for a long time.
+- **Concurrent-LoRA cap** (`JobPopper._lora_queue_cap_reached`): independent of any stall, the popper
+  withholds LoRA support once the local queue already holds `max(1, inference_processes - 1)` LoRA
+  jobs. This guarantees at least one slot's worth of room for a non-LoRA job, which *can* line-skip past
+  a LoRA job blocked at the head -- so the GPU keeps working even while one slot waits on a download.
+- **Fast-fault watchdog** (`ProcessLifecycleManager._effective_aux_download_timeout`): the first stall
+  is reaped at the configured `download_timeout`; once a backoff strike exists, further stalls are
+  reaped at a much shorter grace, so a requeued job that keeps timing out gives up its slot quickly
+  instead of burning the full window on every attempt.
+- **No futile retry during an outage**: a slot reaped mid aux-download normally requeues its job for
+  another attempt (slot crashes are usually transient). But when a download outage is already active,
+  an immediate retry just re-enters the same failing download and tears down a *second* slot, so the
+  job is instead faulted terminally and handed back to the horde to reassign. The job outcome is the
+  same as the eventual out-of-attempts fault, at half the process churn -- this is what stops one bad
+  job from costing two process recoveries. A lone transient stall (no active incident) keeps its retry.
+
+Together these turn an all-LoRA queue facing a flaky source from a near-total stall (every slot idle
+behind one choking download) into a graceful degradation: LoRA intake pauses and escalates, non-LoRA
+work keeps flowing, and stuck slots are freed promptly without doubling up on process recoveries.
+
 ## Multi-GPU pop shaping
 
 A worker driving several cards presents one identity and pops one job stream, so per-card capability

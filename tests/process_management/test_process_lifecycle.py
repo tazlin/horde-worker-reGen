@@ -18,6 +18,7 @@ from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.worker_state import WorkerState
 
 from .conftest import (
+    make_job_pop_response,
     make_mock_process_info,
     make_test_card_runtimes,
     make_test_runtime_config,
@@ -261,6 +262,80 @@ def test_crash_replacement_still_counts_as_a_recovery() -> None:
 
     assert plm._num_process_recoveries == 1
     assert len(plm._slot_recovery_history.get(1, [])) == 1
+
+
+def test_aux_download_teardown_registers_backoff_strike() -> None:
+    """Reaping a slot stuck downloading aux models arms the LoRA-pop backoff."""
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+
+    stuck = make_mock_process_info(1, model_name="CyberRealistic Pony", state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+    plm._process_map[1] = stuck
+
+    assert plm._state.lora_download_backoff.strikes == 0
+
+    plm._replace_inference_process(stuck)
+
+    assert plm._state.lora_download_backoff.strikes == 1
+    assert plm._state.lora_download_backoff.pops_suppressed(time.time())
+
+
+async def test_aux_stall_retryable_first_then_dropped_during_incident() -> None:
+    """The first aux stall keeps its ordinary retry; a stall during the active incident is dropped."""
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+    plm._job_tracker.handle_job_fault_now = Mock()  # type: ignore[method-assign]
+
+    job = make_job_pop_response()
+    await track_popped_job_async(plm._job_tracker, job)
+
+    first = make_mock_process_info(1, model_name="WAI", state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+    first.last_job_referenced = job
+    plm._process_map[1] = first
+    plm._replace_inference_process(first)
+
+    # No incident was active before this strike, so the lone stall keeps its ordinary retry.
+    assert plm._job_tracker.handle_job_fault_now.call_args.kwargs["retryable"] is True
+
+    # The strike above made the incident active; a subsequent aux stall is faulted terminally.
+    second = make_mock_process_info(1, model_name="WAI", state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+    second.last_job_referenced = job
+    plm._process_map[1] = second
+    plm._replace_inference_process(second)
+
+    assert plm._job_tracker.handle_job_fault_now.call_args.kwargs["retryable"] is False
+
+
+def test_intentional_reclaim_does_not_register_backoff_strike() -> None:
+    """A deliberate idle-slot reclaim is not a download failure and must not arm the backoff."""
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+
+    idle = make_mock_process_info(1, model_name=None, state=HordeProcessState.DOWNLOADING_AUX_MODEL)
+    plm._process_map[1] = idle
+
+    plm._replace_inference_process(idle, intentional_reclaim=True)
+
+    assert plm._state.lora_download_backoff.strikes == 0
+
+
+def test_effective_aux_download_timeout_shortens_under_backoff() -> None:
+    """The stuck-aux grace is the configured timeout until a strike, then the shortened fast-fault value."""
+    from horde_worker_regen.process_management.process_lifecycle import FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS
+
+    plm = _make_plm()
+    bridge_data = plm._runtime_config.bridge_data
+
+    assert plm._effective_aux_download_timeout(bridge_data) == bridge_data.download_timeout
+
+    plm._state.lora_download_backoff.register_timeout(time.time())
+    assert plm._effective_aux_download_timeout(bridge_data) == min(
+        bridge_data.download_timeout,
+        FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS,
+    )
 
 
 def test_get_processes_with_model_for_queued_job_empty() -> None:

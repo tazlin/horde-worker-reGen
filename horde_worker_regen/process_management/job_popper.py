@@ -398,11 +398,33 @@ class JobPopper:
         """
         if self._state.lora_disk_exhausted:
             return False
+        # Repeated ad-hoc download teardowns withhold LoRA support for an escalating window; popping
+        # more LoRA jobs while the download path is failing only churns slots (see LoraDownloadBackoff).
+        if self._state.lora_download_backoff.pops_suppressed(time.time()):
+            return False
         return not (self._model_availability is not None and self._model_availability.background_download_active)
 
     def _effective_allow_lora(self, bridge_data: reGenBridgeData) -> bool:
         """Return whether this pop should advertise LoRA support (config flag and the worker-wide disk guard)."""
         return bool(bridge_data.allow_lora) and self._lora_disk_permits
+
+    def _lora_queue_cap_reached(self) -> bool:
+        """Whether the local queue already holds the most concurrently-queued LoRA jobs we allow.
+
+        Each LoRA job blocks its slot on an ad-hoc download before it can sample, so letting LoRA jobs
+        fill every queue slot leaves no non-LoRA job for the scheduler to slip past a blocked LoRA head
+        (the line-skip path rejects LoRA candidates). Capping concurrently-queued LoRA jobs to one fewer
+        than the inference-process count keeps at least one slot's worth of room for a skippable
+        non-LoRA job, while always allowing at least one LoRA job so single-process workers still serve
+        them.
+        """
+        cap = max(1, self._max_inference_processes - 1)
+        queued_lora_jobs = sum(
+            1
+            for job in self._job_tracker.jobs_pending_inference
+            if job.payload.loras is not None and len(job.payload.loras) > 0
+        )
+        return queued_lora_jobs >= cap
 
     def _is_hungry(self, bridge_data: reGenBridgeData) -> bool:
         """Whether the worker should pop again immediately instead of waiting the poll interval.
@@ -621,6 +643,10 @@ class JobPopper:
             if advertised is not None
             else self._effective_allow_lora(bridge_data)
         )
+        # Stop advertising LoRA support once the queue is already carrying its allowed share of LoRA
+        # jobs, so a non-LoRA job can still be popped and line-skip past a blocked LoRA head.
+        if pop_allow_lora and self._lora_queue_cap_reached():
+            pop_allow_lora = False
 
         # First-class feature readiness: withhold a gated feature (ControlNet, SDXL-ControlNet,
         # post-processing) until its models/annotators are actually on disk, so the worker never

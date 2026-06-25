@@ -827,6 +827,16 @@ class HordeDownloadProcess(HordeProcess):
             return
         if manager.controlnet_annotator is None:
             return
+        # Marker fast-path: when a prior process already ran every preprocessor for the pinned annotator
+        # commit, the verify would boot a whole ComfyUI/torch/CUDA stack in this (otherwise offline)
+        # download process only to re-confirm the on-disk marker. Read the marker here -- import-safe, needing
+        # neither ``hordelib.initialise`` nor a GPU -- so the expensive boot is paid only when a verify is
+        # genuinely due (a fresh install or an annotator pin bump). File integrity is covered separately by the
+        # per-file sidecar validation that already gates ``annotators_present`` above.
+        if self._annotators_verified_for_pin() is True:
+            with self._lock:
+                self._annotator_verify_done = True
+            return
         with self._lock:
             if self._annotator_verify_enqueued or self._annotator_verify_done or self._controlnet_killed:
                 return
@@ -1304,6 +1314,23 @@ class HordeDownloadProcess(HordeProcess):
         if self._purge_loras:
             lora.delete_unused_models(30)
 
+    def _annotators_verified_for_pin(self) -> bool | None:
+        """Whether the on-disk marker records the pinned annotators as already verified (no boot needed).
+
+        Reads hordelib's import-safe preload marker (keyed to the pinned ``comfyui_controlnet_aux`` commit),
+        which needs neither :func:`hordelib.initialise` nor a GPU. ``True`` means a prior process already ran
+        every preprocessor for this pin, so the (ComfyUI-booting) verify has nothing left to do; ``False``/
+        ``None`` mean a verify is due (or the marker is undeterminable), so the verify runs as before. An older
+        hordelib without the helper degrades to ``None`` (verify runs), never crashing the probe.
+        """
+        try:
+            from hordelib.preload import controlnet_annotators_present
+
+            return controlnet_annotators_present()
+        except Exception as e:  # noqa: BLE001 - an older hordelib without the helper just runs the verify
+            logger.debug(f"Download process: annotator marker pre-check unavailable: {type(e).__name__}: {e}")
+            return None
+
     def _run_annotator_preload(self) -> bool:
         """Initialise ComfyUI and run each ControlNet preprocessor once; return whether they all loaded.
 
@@ -1311,6 +1338,13 @@ class HordeDownloadProcess(HordeProcess):
         ``preload_annotators`` runs every preprocessor and reports success. A failure here means an annotator
         downloaded but does not load/run, which the caller turns into a bounded recovery.
         """
+        # The boot is the dominant cost of the verify, so honor the marker before paying it: a warm marker
+        # means a prior process already ran every preprocessor for this pin and ``preload_annotators`` would
+        # return immediately anyway -- but only after ``initialise`` had already booted ComfyUI. (The enqueue
+        # gate normally skips a warm-marker verify outright; this also protects any direct/raced caller.)
+        if self._annotators_verified_for_pin() is True:
+            return True
+
         import hordelib
         from hordelib.api import SharedModelManager
 

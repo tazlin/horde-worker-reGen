@@ -12,6 +12,7 @@ import time
 from unittest.mock import AsyncMock, Mock, patch
 
 from horde_sdk import RequestErrorResponse
+from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
 from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.job_popper import JobPopper
@@ -1085,6 +1086,69 @@ class TestApiJobPopFullFlow:
         await popper.api_job_pop()
 
         assert mock_req_cls.call_args.kwargs["allow_lora"] is False
+
+    @_full_flow_patches
+    async def test_allow_lora_false_while_download_backoff_active(self, mock_req_cls: Mock) -> None:
+        """A live LoRA-download backoff withholds LoRA advertisement from new pops."""
+        state = WorkerState(last_job_pop_time=0.0)
+        state.lora_download_backoff.register_timeout(now=time.time())
+        popper = self._make_ready_popper(api_response=make_job_pop_response(), state=state)
+
+        await popper.api_job_pop()
+
+        assert mock_req_cls.call_args.kwargs["allow_lora"] is False
+
+    @_full_flow_patches
+    async def test_allow_lora_true_after_backoff_window_elapses(self, mock_req_cls: Mock) -> None:
+        """Once the backoff window has passed, LoRA advertisement resumes."""
+        state = WorkerState(last_job_pop_time=0.0)
+        # A strike far in the past: its window has long since elapsed.
+        state.lora_download_backoff.register_timeout(now=time.time() - 10_000)
+        popper = self._make_ready_popper(api_response=make_job_pop_response(), state=state)
+
+        await popper.api_job_pop()
+
+        assert mock_req_cls.call_args.kwargs["allow_lora"] is True
+
+
+class TestLoraQueueCap:
+    """Direct tests for the N-1 LoRA-queue cap helper.
+
+    The full pop flow's queue-full guard makes pre-enqueuing jobs an awkward fixture, so the cap logic
+    is exercised here; its one-line wiring into ``pop_allow_lora`` is straightforward.
+    """
+
+    def _lora_job(self) -> object:
+        """Build a minimal job carrying a single LoRA."""
+        return make_job_pop_response(loras=[LorasPayloadEntry(name="123", is_version=False)])
+
+    async def test_non_lora_jobs_do_not_count(self) -> None:
+        """A queue of non-LoRA jobs never reaches the LoRA cap."""
+        job_tracker = JobTracker()
+        popper = _make_popper(job_tracker=job_tracker, max_inference_processes=2)
+        await popper._enqueue_popped_job(make_job_pop_response())
+        await popper._enqueue_popped_job(make_job_pop_response())
+        assert popper._lora_queue_cap_reached() is False
+
+    async def test_cap_is_processes_minus_one(self) -> None:
+        """Three inference processes allow two queued LoRA jobs before the cap is reached."""
+        job_tracker = JobTracker()
+        popper = _make_popper(job_tracker=job_tracker, max_inference_processes=3)
+
+        await popper._enqueue_popped_job(self._lora_job())
+        assert popper._lora_queue_cap_reached() is False
+
+        await popper._enqueue_popped_job(self._lora_job())
+        assert popper._lora_queue_cap_reached() is True
+
+    async def test_cap_floors_at_one(self) -> None:
+        """A single-inference-process worker still allows one LoRA job, capping at the next."""
+        job_tracker = JobTracker()
+        popper = _make_popper(job_tracker=job_tracker, max_inference_processes=1)
+
+        assert popper._lora_queue_cap_reached() is False
+        await popper._enqueue_popped_job(self._lora_job())
+        assert popper._lora_queue_cap_reached() is True
 
 
 class TestJobPopFrequency:

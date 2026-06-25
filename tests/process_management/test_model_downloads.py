@@ -1010,9 +1010,10 @@ class TestFirstClassAnnotators:
         assert all(task.kind is DownloadKind.AUX_MODEL for task in annotator_tasks)
 
     def test_present_annotators_enqueue_a_single_verify(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Once the files are on disk, exactly one ANNOTATOR_VERIFY is enqueued (idempotent)."""
+        """With a cold marker (verify due), exactly one ANNOTATOR_VERIFY is enqueued (idempotent)."""
         process = self._process()
         manager = self._inject(monkeypatch, annotators_present=True)
+        monkeypatch.setattr(process, "_annotators_verified_for_pin", lambda: False)  # marker cold: verify is due
 
         process._maybe_enqueue_annotator_verify(manager, True)
         process._maybe_enqueue_annotator_verify(manager, True)  # second call must not re-enqueue
@@ -1020,6 +1021,36 @@ class TestFirstClassAnnotators:
         verifies = [t for t in process._scheduler.pending_snapshot() if t.kind is DownloadKind.ANNOTATOR_VERIFY]
         assert len(verifies) == 1
         assert verifies[0].exclusive is True
+
+    def test_warm_marker_skips_the_verify_without_booting(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A warm marker (already verified for the pin) marks the verify done and never enqueues the boot.
+
+        The verify boots a whole ComfyUI/torch stack in the otherwise-offline download process, so a marker
+        that records a prior successful run for the pinned annotator commit must short-circuit it entirely.
+        """
+        process = self._process()
+        manager = self._inject(monkeypatch, annotators_present=True)
+        monkeypatch.setattr(process, "_annotators_verified_for_pin", lambda: True)  # marker warm: nothing to do
+
+        process._maybe_enqueue_annotator_verify(manager, True)
+
+        verifies = [t for t in process._scheduler.pending_snapshot() if t.kind is DownloadKind.ANNOTATOR_VERIFY]
+        assert verifies == []  # no verify task, so no ComfyUI boot is ever paid
+        assert process._annotator_verify_done is True  # recorded as done so it is not re-evaluated this session
+        assert process._annotator_verify_enqueued is False
+
+    def test_run_annotator_preload_honors_warm_marker_before_initialise(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``_run_annotator_preload`` returns True on a warm marker without importing/booting hordelib."""
+        process = self._process()
+        monkeypatch.setattr(process, "_annotators_verified_for_pin", lambda: True)
+        # If the marker is honored first, hordelib is never imported; make any import of it explode so a
+        # regression that boots anyway fails loudly rather than silently paying the cost.
+        monkeypatch.setitem(sys.modules, "hordelib", None)  # ``import hordelib`` -> ImportError if reached
+
+        assert process._run_annotator_preload() is True
 
     def test_verify_success_marks_done_without_killing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A passing verify records completion and never touches the kill switch (no re-download)."""
