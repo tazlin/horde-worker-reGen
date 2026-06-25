@@ -110,9 +110,16 @@ if (-not (Get-Option "HORDE_WORKER_DIR" "") -and $args.Count -eq 0 -and (Test-Pa
 Write-Host ""
 Write-Host "=== AI Horde Worker installer ===" -ForegroundColor Cyan
 Write-Host "Install location: $InstallDir"
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-$tmpZip = Join-Path ([System.IO.Path]::GetTempPath()) ("horde-worker-" + [System.Guid]::NewGuid().ToString() + ".zip")
+# Download and extract the release into a temp dir, then lay it down and overlay it onto the install with
+# the same mirror-pruning logic the self-updater uses (runtime.cmd apply-bundle, below). Expanding straight
+# into the install only overwrites files and never removes ones the new release dropped, so a reinstall over
+# an older version would leave a renamed/removed module on the import path to shadow the new code.
+$tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("horde-worker-" + [System.Guid]::NewGuid().ToString())
+$bundleDir = Join-Path $tmpDir "bundle"
+New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+$tmpZip = Join-Path $tmpDir "horde-worker.zip"
+
 Write-Host "Downloading the latest release..."
 $curl = Join-Path $env:SystemRoot "System32\curl.exe"
 if (Test-Path $curl) {
@@ -123,8 +130,14 @@ if (Test-Path $curl) {
 }
 
 Write-Host "Extracting..."
-Expand-ReleaseZip -ZipPath $tmpZip -Destination $InstallDir
-Remove-Item $tmpZip -Force
+Expand-ReleaseZip -ZipPath $tmpZip -Destination $bundleDir
+
+# Lay the bundle down (shims, bootstrap, source). This overwrites in place but, like a plain expand, does
+# not by itself prune modules the new release dropped; the apply-bundle overlay below removes those. The
+# shims must be written here, not by the overlay, so the overlay can run *through* runtime.cmd without
+# overwriting the running launcher mid-run.
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+Copy-Item -Path (Join-Path $bundleDir "*") -Destination $InstallDir -Recurse -Force
 
 # Record how this worker was installed and from where, so the in-place self-updater pulls future releases
 # from the same origin (this fork/account) rather than a hardcoded default. Lives under bin/ (preserved
@@ -154,6 +167,13 @@ if (-not (Get-Option "HORDE_WORKER_ASSUME_YES" "")) {
         exit 1
     }
 }
+
+# Overlay the freshly downloaded bundle through the shared, mirror-pruning overlay (same as the self-updater)
+# so a reinstall prunes modules renamed/removed since the installed version, while .venv, bin, models, and
+# bridgeData.yaml are preserved. This also fetches uv (into bin\), which the dependency sync below reuses.
+& (Join-Path $InstallDir "runtime.cmd") apply-bundle "$bundleDir"
+if ($LASTEXITCODE -ne 0) { Write-Error "Could not lay down the worker files (see the output above)."; exit 1 }
+Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
 
 # Everything else (install uv, detect the GPU, seed bridgeData.yaml, sync dependencies) is the bootstrap's
 # job now, so the exact same logic runs for the one-liner, the graphical installer and winget. runtime.cmd

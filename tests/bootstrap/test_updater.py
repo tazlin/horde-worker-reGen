@@ -366,6 +366,55 @@ def test_overlay_prunes_stale_import_root_files_but_merges_other_dirs(tmp_path: 
     assert (docs / "new.md").exists()
 
 
+def test_apply_bundle_prunes_imports_keeps_state_and_shims(tmp_path: Path) -> None:
+    """The installer overlay prunes stale modules, keeps user state and existing shims, clears the stamp.
+
+    This is the operation the one-line installers hand off to (``runtime.sh apply-bundle``): it must behave
+    exactly like the self-updater's overlay so a reinstall and an in-place update converge on the same tree.
+    The installer lays the shims down itself beforehand, so apply_bundle leaving the existing shim untouched
+    (rather than overwriting the launcher mid-run) is the correct, safe behavior here too.
+    """
+    extracted = tmp_path / "extracted"
+    install = tmp_path / "install"
+    (extracted / "horde_worker_regen").mkdir(parents=True)
+    (extracted / "horde_worker_regen" / "__init__.py").write_text('__version__ = "2.0.0"\n', encoding="utf-8")
+    (extracted / "runtime.sh").write_text("NEW SHIM\n", encoding="utf-8")  # skipped by the overlay
+
+    pkg = install / "horde_worker_regen"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text('__version__ = "1.0.0"\n', encoding="utf-8")
+    (pkg / "renamed_away.py").write_text("stale\n", encoding="utf-8")  # absent from the new bundle
+    (install / "runtime.sh").write_text("OLD SHIM\n", encoding="utf-8")
+    (install / "bridgeData.yaml").write_text("api_key: secret\n", encoding="utf-8")
+    stamp = updater.paths.sync_stamp_file(install)
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text("old-fingerprint", encoding="utf-8")
+
+    updater.apply_bundle(extracted, install)
+
+    assert updater.installed_version(install) == "2.0.0"  # source updated
+    assert not (pkg / "renamed_away.py").exists()  # stale module pruned from the import root
+    assert (install / "runtime.sh").read_text(encoding="utf-8") == "OLD SHIM\n"  # shim left for the caller
+    assert (install / "bridgeData.yaml").read_text(encoding="utf-8") == "api_key: secret\n"  # user state kept
+    assert not stamp.exists()  # invalidated so a moved uv.lock re-syncs
+
+
+def test_apply_bundle_descends_a_wrapper_dir(tmp_path: Path) -> None:
+    """apply_bundle accepts the extraction dir directly, descending a single wrapping folder if present."""
+    extracted = tmp_path / "extracted"
+    inner = extracted / "horde-worker-reGen"
+    (inner / "horde_worker_regen").mkdir(parents=True)
+    (inner / "horde_worker_regen" / "__init__.py").write_text('__version__ = "3.0.0"\n', encoding="utf-8")
+    (inner / "pyproject.toml").write_text("x\n", encoding="utf-8")
+
+    install = tmp_path / "install"
+    (install / "horde_worker_regen").mkdir(parents=True)
+    (install / "horde_worker_regen" / "__init__.py").write_text('__version__ = "1.0.0"\n', encoding="utf-8")
+
+    updater.apply_bundle(extracted, install)
+    assert updater.installed_version(install) == "3.0.0"
+
+
 def test_perform_update_invalidates_sync_stamp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The overlay clears the venv sync stamp so an interrupted update still reconciles on the next launch."""
     install = tmp_path / "install"

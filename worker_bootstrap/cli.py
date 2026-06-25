@@ -520,6 +520,28 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
     return 0
 
 
+def _cmd_apply_bundle(args: argparse.Namespace, root: Path, uv: str) -> int:  # noqa: ARG001  (uv unused here)
+    """Overlay an already-extracted release bundle onto this install, mirror-pruning the import roots.
+
+    The one-line installers extract the downloaded release to a temp dir, copy it into place (so the shims
+    and this bootstrap exist to run), then call this so a reinstall over an older version applies through
+    the SAME pruning overlay the self-updater uses, rather than a plain unzip that would leave a renamed or
+    removed module behind to shadow the new code. Stdlib-only, so it runs in the bare bootstrap environment
+    before the venv exists.
+    """
+    bundle = Path(args.bundle).expanduser()
+    if not bundle.is_dir():
+        print(f"ERROR: bundle directory not found: {bundle}", file=sys.stderr)
+        return 1
+    try:
+        updater.apply_bundle(bundle, root)
+    except OSError as error:
+        print(f"ERROR: could not apply the release bundle: {error}", file=sys.stderr)
+        return 1
+    print(f"Applied the release bundle to {root} (stale modules pruned from the import roots).")
+    return 0
+
+
 def _cmd_install(args: argparse.Namespace, root: Path, uv: str) -> int:
     """One-shot first run: detect + persist backend, sync, then launch the web dashboard."""
     token = backend_mod.resolve_backend(
@@ -633,6 +655,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="Run an arbitrary command in the worker venv (uv run --no-sync).")
     p_run.add_argument("rest", nargs=argparse.REMAINDER, help="The command and its arguments.")
 
+    p_apply = sub.add_parser(
+        "apply-bundle",
+        help="Overlay an extracted release bundle onto this install, pruning stale modules (installer use).",
+    )
+    p_apply.add_argument("bundle", help="Path to the extracted release bundle directory.")
+
     p_update = sub.add_parser("update", help="Update the worker to the latest release in place, then re-sync.")
     p_update.add_argument("--check", action="store_true", help="Only report whether an update is available.")
     p_update.add_argument("--yes", action="store_true", help="Apply without prompting (for non-interactive use).")
@@ -648,6 +676,7 @@ _HANDLERS = {
     "install": _cmd_install,
     "run": _cmd_run,
     "update": _cmd_update,
+    "apply-bundle": _cmd_apply_bundle,
 }
 
 

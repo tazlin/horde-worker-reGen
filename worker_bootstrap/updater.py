@@ -574,6 +574,25 @@ def _invalidate_sync_stamp(root: Path) -> None:
         paths.sync_stamp_file(root).unlink(missing_ok=True)
 
 
+def apply_bundle(extracted: Path, install_root: Path) -> None:
+    """Overlay an already-extracted release bundle onto *install_root*, mirror-pruning the import roots.
+
+    This is the overlay half of an update, factored out so the one-line installers can apply a freshly
+    downloaded release through the same logic the self-updater uses, instead of a plain unzip that leaves a
+    renamed or deleted module behind to shadow the new code (the failure this exists to prevent). The
+    worker's import roots (``_MIRROR_DIRS``) are mirrored so a dropped module is pruned; ``.venv``, ``bin``,
+    models, and ``bridgeData.yaml`` are preserved; the running shims are deliberately left untouched
+    (``_overlay`` skips them, so this is safe to invoke *through* ``runtime.sh``/``runtime.cmd`` without
+    overwriting the launcher mid-run). The sync stamp is invalidated first so a (re)install that moved
+    ``uv.lock`` re-syncs even if the overlay is interrupted. Stdlib-only: safe before the venv exists.
+
+    The caller is responsible for laying the shims down (the installer copies the whole bundle into place
+    before calling this; the self-updater keeps the existing shims on purpose).
+    """
+    _invalidate_sync_stamp(install_root)
+    _overlay(_bundle_root(extracted), install_root)
+
+
 def perform_update(root: Path, info: UpdateInfo) -> UpdateResult:
     """Download, verify, and overlay the release named by *info*. Returns a result; never raises.
 
@@ -609,9 +628,9 @@ def perform_update(root: Path, info: UpdateInfo) -> UpdateResult:
         try:
             with zipfile.ZipFile(zip_path) as archive:
                 archive.extractall(extracted)
-            # Invalidate the sync stamp before touching the install, so a crash mid-overlay still reconciles.
-            _invalidate_sync_stamp(root)
-            _overlay(_bundle_root(extracted), root)
+            # The same overlay the one-line installers use: mirror-prune the import roots, preserve user
+            # state and the running shims, and invalidate the sync stamp so a crash mid-overlay reconciles.
+            apply_bundle(extracted, root)
         except (OSError, zipfile.BadZipFile) as error:
             return UpdateResult(False, f"Could not apply the update: {error}", info.current, info.latest)
 

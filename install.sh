@@ -58,10 +58,17 @@ fi
 echo ""
 echo "=== AI Horde Worker installer ==="
 echo "Install location: $INSTALL_DIR"
-mkdir -p "$INSTALL_DIR"
 
+# Download and extract the release into a temp dir, then lay it down and overlay it onto the install with
+# the same mirror-pruning logic the self-updater uses (runtime.sh apply-bundle, below). Extracting straight
+# into the install with a plain `unzip -o` only overwrites files and never removes ones the new release
+# dropped, so a reinstall over an older version would leave a renamed/removed module on the import path to
+# shadow the new code.
 tmp_dir="$(mktemp -d)"
 zip_path="$tmp_dir/horde-worker.zip"
+bundle_dir="$tmp_dir/bundle"
+mkdir -p "$bundle_dir"
+
 echo "Downloading the latest release..."
 if command -v curl >/dev/null 2>&1; then
     curl -LsSf "$RELEASE_URL" -o "$zip_path"
@@ -74,14 +81,20 @@ fi
 
 echo "Extracting..."
 if command -v unzip >/dev/null 2>&1; then
-    unzip -oq "$zip_path" -d "$INSTALL_DIR"
+    unzip -oq "$zip_path" -d "$bundle_dir"
 elif command -v python3 >/dev/null 2>&1; then
-    python3 -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$zip_path" "$INSTALL_DIR"
+    python3 -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$zip_path" "$bundle_dir"
 else
     echo "ERROR: need unzip or python3 to extract the release." >&2
     exit 1
 fi
-rm -rf "$tmp_dir"
+
+# Lay the bundle down (shims, bootstrap, source). This overwrites in place but, like the old plain unzip,
+# does not by itself prune modules the new release dropped; the apply-bundle overlay below removes those.
+# The shims must be written here, not by the overlay, so the overlay can run *through* runtime.sh without
+# overwriting the running launcher mid-run.
+mkdir -p "$INSTALL_DIR"
+cp -R "$bundle_dir/." "$INSTALL_DIR/"
 
 # Record how this worker was installed and from where, so the in-place self-updater pulls future releases
 # from the same origin (this fork/account) rather than a hardcoded default. Lives under bin/ (preserved
@@ -120,6 +133,16 @@ if [ -z "${HORDE_WORKER_ASSUME_YES:-}" ]; then
         exit 1
     fi
 fi
+
+# Overlay the freshly downloaded bundle onto the install through the shared, mirror-pruning overlay so the
+# one-line (re)install and the in-place self-updater behave identically: a module renamed or removed since
+# the installed version is pruned from the import roots, while .venv, bin, models, and bridgeData.yaml are
+# preserved. This also fetches uv (into bin/), which the dependency sync below reuses.
+if ! ./runtime.sh apply-bundle "$bundle_dir"; then
+    echo "ERROR: could not lay down the worker files (see the output above)." >&2
+    exit 1
+fi
+rm -rf "$tmp_dir"
 
 # Everything else (install uv, detect the GPU, seed bridgeData.yaml, sync dependencies) is the bootstrap's
 # job now, so the one-liner, the regular launchers and every platform run identical logic. runtime.sh

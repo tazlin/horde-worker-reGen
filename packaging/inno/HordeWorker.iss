@@ -69,6 +69,16 @@ UninstallDisplayName=AI Horde Worker
 Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Shortcuts (optional):"; Flags: unchecked
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts (optional):"; Flags: unchecked
 
+[InstallDelete]
+; Remove the worker's Python import roots before [Files] lays down the new bundle, so a reinstall/upgrade
+; over an older release cannot leave a renamed or deleted module behind to shadow the new code. Inno's
+; [Files] only adds/overwrites; it never prunes files dropped between versions, so without this a stale
+; module would persist and be imported. These dirs hold only bundled source (no user state) and are exactly
+; the set the self-updater and one-line installers mirror-prune (worker_bootstrap\updater.py _MIRROR_DIRS).
+; User state, .venv, bin, and the peered "-data" models/cache live elsewhere and are untouched.
+Type: filesandordirs; Name: "{app}\horde_worker_regen"
+Type: filesandordirs; Name: "{app}\worker_bootstrap"
+
 [Files]
 ; Everything in the staged bundle, minus detect-backend.ps1 which is handled explicitly below.
 Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "detect-backend.ps1"; Flags: recursesubdirs ignoreversion
