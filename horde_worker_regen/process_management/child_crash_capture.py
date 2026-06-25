@@ -27,11 +27,17 @@ writes behave the same on both; there are no POSIX-only paths here).
 from __future__ import annotations
 
 import faulthandler
+import re
 import traceback
 from datetime import datetime
 from pathlib import Path
 
 _LOG_DIR = Path("logs")
+
+# The conventional final "ExceptionClass: message" line of a Python traceback, for lifting the root
+# cause out of a startup-crash file. Kept here (not imported from the analysis package) so the worker's
+# recovery path stays dependency-light.
+_EXCEPTION_LINE_RE = re.compile(r"^(?P<exc>[A-Za-z_][\w.]*(?:Error|Exception|Warning|Interrupt|Exit)): ?(?P<msg>.*)$")
 
 _FAULTHANDLER_FILES: list[object] = []
 """Open faulthandler file handles, kept referenced for the process lifetime.
@@ -62,7 +68,13 @@ def enable_child_faulthandler(role: str) -> None:
         return
 
 
-def write_startup_crash(role: str, exc: BaseException) -> None:
+def write_startup_crash(
+    role: str,
+    exc: BaseException,
+    *,
+    os_pid: int | None = None,
+    launch_identifier: int | None = None,
+) -> None:
     """Append a full traceback for ``exc`` to a discoverable ``logs/bridge_{role}_startup.log``.
 
     This is the loguru-independent backstop for the no-sink startup window: it writes with a plain
@@ -71,18 +83,61 @@ def write_startup_crash(role: str, exc: BaseException) -> None:
     TUI Logs tab precisely when there is something to show. The line uses the same ``| LEVEL |`` shape
     as the other bridge logs so the Logs tab's level parser styles it.
 
+    The OS pid and launch identifier are embedded in the line when known. That startup log is appended
+    across every relaunch of a slot, so without them an offline triage tool can only tie this crash to
+    the parent's recovery diagnostics by timestamp proximity; with them the join is exact (the parent
+    logs the same ``os_pid``/``launch`` for the slot it reaps).
+
     Args:
         role: Short identifier for the writing process (matches :func:`enable_child_faulthandler`).
         exc: The exception to record, including its traceback chain.
+        os_pid: This process's OS pid, if known, for an exact parent<->child join.
+        launch_identifier: The parent-assigned launch counter for this slot, if known.
     """
     try:
         _LOG_DIR.mkdir(exist_ok=True)
         path = _LOG_DIR / f"bridge_{role}_startup.log"
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        identity = ""
+        if os_pid is not None or launch_identifier is not None:
+            identity = f" (os_pid={os_pid}, launch={launch_identifier})"
         with path.open("a", encoding="utf-8") as handle:
             handle.write(
-                f"{stamp} | CRITICAL | {role}:startup - worker child crashed before its log was ready:\n{tb}\n",
+                f"{stamp} | CRITICAL | {role}:startup - worker child{identity} crashed before its log was "
+                f"ready:\n{tb}\n",
             )
     except Exception:  # noqa: BLE001 - the emergency writer must never raise over the original crash
         return
+
+
+def read_last_startup_crash(role: str, *, max_bytes: int = 8192) -> str | None:
+    """Return the exception summary of the most recent crash in ``logs/bridge_{role}_startup.log``.
+
+    Lets the parent stamp the *why* of a crash into the structured action ledger at reap time, so the
+    root cause survives even when the per-subprocess human logs are not. Only the file's tail is read
+    (the file is appended across relaunches and can be large), and every error is swallowed: this runs on
+    the recovery path and must never add a failure of its own. Returns None when there is no crash file
+    or no recognizable exception line.
+
+    Args:
+        role: Short identifier for the crashed process (e.g. ``"inference_1"``).
+        max_bytes: How many trailing bytes of the crash file to scan.
+    """
+    try:
+        path = _LOG_DIR / f"bridge_{role}_startup.log"
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+            tail = handle.read().decode("utf-8", errors="replace")
+        for line in reversed(tail.splitlines()):
+            match = _EXCEPTION_LINE_RE.match(line.strip())
+            if match is not None:
+                message = match.group("msg").strip()
+                return f"{match.group('exc')}: {message}" if message else match.group("exc")
+        return None
+    except Exception:  # noqa: BLE001 - never let crash-cause reading disrupt the recovery path
+        return None

@@ -29,6 +29,8 @@ Installed as console scripts (defined in `pyproject.toml`):
 | `horde-worker-web` | `horde_worker_regen.tui.web:main` | Serve the dashboard over the web. |
 | `horde-worker-host` | `horde_worker_regen.tui.worker_host:main` | Background worker host the web dashboard attaches to. |
 | `horde-benchmark` | `horde_worker_regen.benchmark.cli:main` | Progressive benchmark. |
+| `horde-duty-report` | `horde_worker_regen.analysis.duty_log_report:main` | Per-session GPU duty-cycle report over a `bridge.log`. |
+| `horde-log` | `horde_worker_regen.analysis.log_triage_cli:main` | Triage worker logs: sessions, timelines, and what-went-wrong findings. |
 
 ## `horde-worker` (dashboard)
 
@@ -152,6 +154,59 @@ matches exactly what the ramp would run. The same plan table is also printed
 at the top of every `ramp` (emitted on the progress channel as a `RampPlanned` event), so `monitor` and
 the dashboard show it too. Pass `--force` to see levels that do not fit (or lack a token) reported as
 `RUN` instead of `SKIP`.
+
+## `horde-log`
+
+Post-mortem triage of worker logs. A `bridge.log` is appended across every restart (so one file holds
+many worker lifetimes), the per-subprocess logs are separate files, rotations are zipped, and the real
+crash cause is usually a traceback in a child's `bridge_inference_<N>_startup.log`. `horde-log` does that
+archeology for you: it segments the file into per-launch sessions, stitches the orchestrator log to the
+subprocess that actually crashed (and to the `action_ledger.jsonl` when present), and reports what went
+wrong. It is pure-stdlib and read-only; point it at a `logs/` directory, a single log file, or a `.zip`
+an operator sent you.
+
+| Subcommand | Purpose |
+|------------|---------|
+| `sessions [PATH]` | List each worker launch in the log with its span, version, end-reason, and peak process recoveries. |
+| `diagnose [PATH]` | Run the detectors and print ranked findings (root cause + remediation) per session. |
+| `timeline [PATH]` | Merged, time-ordered parent + child + ledger event stream for a session. |
+| `job <ID> [PATH]` | Trace one job across the parent and the inference slot that ran it. |
+| `watch [PATH]` | Live-poll the logs and alert when a new warning/critical finding or a rising recovery count appears. |
+| `bundle [PATH]` | Build a single redacted `.zip` (logs + diagnosis + config + system/cache info) to send a maintainer. |
+
+`PATH` defaults to `logs/`. `sessions`, `diagnose`, and `timeline` take `--session N` or `--last` to
+select a session and `--json` for machine-readable output; `timeline` also takes `--process N`,
+`--grep RE`, and `--child` (include verbose child-loop records). Each detector recognizes one incident
+class (an inference pool crashing on start, a recovery storm that never gives up, GPU OOM, the swallowed
+"no images produced" OOM, an orphaned-job storm) and emits the child's exception as the root cause where
+it can. See [Troubleshoot](../how-to/troubleshoot.md#diagnose-a-crash-or-recovery-storm-from-the-logs).
+
+### `bundle`: a redacted archive for a maintainer
+
+`horde-log bundle` collects everything a maintainer needs into one shareable `.zip`: the diagnosis
+(`diagnose.txt`), the worker's logs, the action ledger, the redacted config, and a system/cache report
+(OS, worker version, RAM/disk, on-disk model listing). **Every text artifact is scrubbed before it is
+written** — the horde `api_key` and CivitAI token always, and (by default) personal identifiers (home
+path, username, worker name) too. The command prints how many occurrences it redacted and reminds you to
+skim the result before sending; redaction is best-effort, not a guarantee.
+
+```bash
+# The usual: bundle the current logs into horde_support_<timestamp>.zip
+horde-log bundle
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--out FILE.zip` | Output path (default `horde_support_<timestamp>.zip`). |
+| `--last` / `--session N` | Diagnose only the most recent / a specific session (the logs are still included). |
+| `--full-logs` | Include rotation archives and do not tail-cap large logs (a much larger bundle). By default only the active logs are bundled, with oversized files tail-trimmed; the active `bridge.log` already spans many sessions. |
+| `--no-cache-inventory` | Skip the on-disk model listing. |
+| `--probe-gpu` | Run the GPU probe for the system-info block (slower; the logs already record the GPUs). |
+| `--keep-identifiers` | Do not scrub home path / username / worker name (the keys are still redacted). |
+| `--config PATH` | Worker config to redact and source secrets/cache from (default `bridgeData.yaml`). |
+
+The same generator is available in the dashboard: the **Logs** tab has a **Support bundle** button
+(also `Ctrl+B`) that writes the zip and reports the path.
 
 ## Environment variables
 

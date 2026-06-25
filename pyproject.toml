@@ -248,6 +248,13 @@ extend-exclude = ["conda", "model-stats.py", "amd_go_fast.py"]
 "convert_config_to_env.py" = ["E402"]
 # Verbatim bridge.log lines under test must match the real (long) log format exactly.
 "test_duty_log_report.py" = ["E501"]
+"test_sessions.py" = ["E501"]
+"test_detectors.py" = ["E501"]
+"test_watch.py" = ["E501"]
+"test_log_ingest.py" = ["E501"]
+"test_support_bundle.py" = ["E501"]
+"test_redaction.py" = ["E501"]
+"test_system_info.py" = ["E501"]
 
 
 [tool.ruff.lint.pydocstyle]

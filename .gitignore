@@ -19,6 +19,8 @@ benchmark_results/*_validate/*
 logs/remote_logs/*
 logs/*.zip
 
+horde_support*.zip
+
 .horde_worker_regen/*
 
 packages.svg

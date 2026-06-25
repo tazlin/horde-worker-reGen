@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import datetime
 from pathlib import Path
 
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Input, RichLog, Select, Static
+from textual.widgets import Button, Input, RichLog, Select, Static
 
 from horde_worker_regen.app_state import OverviewViewMode
-from horde_worker_regen.tui.log_tailer import BridgeLog, LogFollower, discover_bridge_logs_grouped
+from horde_worker_regen.tui.log_tailer import LOG_DIR, BridgeLog, LogFollower, discover_bridge_logs_grouped
 
 _LEVEL_RANK: dict[str, int] = {
     "TRACE": 5,
@@ -43,6 +44,7 @@ class LogsView(Vertical):
 
     BINDINGS = [
         Binding("end", "jump_to_latest", "Jump to latest"),
+        Binding("ctrl+b", "support_bundle", "Support bundle"),
     ]
 
     DEFAULT_CSS = """
@@ -64,6 +66,10 @@ class LogsView(Vertical):
     }
     LogsView #log-search {
         width: 1fr;
+    }
+    LogsView #log-bundle {
+        width: auto;
+        margin-left: 1;
     }
     LogsView #log-output {
         border: round $foreground 20%;
@@ -125,6 +131,7 @@ class LogsView(Vertical):
                 id="log-level",
             )
             yield Input(placeholder="filter text…", id="log-search")
+            yield Button("Support bundle", id="log-bundle")
         yield Static(id="log-tally")
         yield RichLog(id="log-output", highlight=False, markup=False, wrap=False, max_lines=5000)
         yield Static(id="log-scroll-hint")
@@ -344,6 +351,55 @@ class LogsView(Vertical):
         log.scroll_end(animate=False)
         self._unseen_below = 0
         self._render_scroll_hint()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Dispatch the controls-row buttons."""
+        if event.button.id == "log-bundle":
+            self.action_support_bundle()
+
+    def action_support_bundle(self) -> None:
+        """Generate a redacted support bundle for a maintainer, off the UI thread."""
+        button = self.query_one("#log-bundle", Button)
+        if button.disabled:
+            return
+        button.disabled = True
+        self.notify("Generating support bundle… this can take ~15s.", title="Support bundle")
+        self.run_worker(self._build_support_bundle, thread=True, exclusive=True, group="support-bundle")
+
+    def _build_support_bundle(self) -> None:
+        """Build the bundle on a worker thread, then notify the result on the UI thread.
+
+        Imported lazily so the (torch-free but heavier) analysis package is only pulled in when an
+        operator actually asks for a bundle, not on every TUI start.
+        """
+        from horde_worker_regen.analysis.support_bundle import build_support_bundle
+
+        out = Path(f"horde_support_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+        try:
+            result = build_support_bundle(LOG_DIR, out)
+        except Exception as error:  # noqa: BLE001 - report any failure to the operator, never crash the TUI
+            self.app.call_from_thread(self._notify_bundle_error, error)
+            return
+        self.app.call_from_thread(self._notify_bundle_done, result.out_path, result.redaction_count)
+
+    def _notify_bundle_done(self, out_path: Path, redaction_count: int) -> None:
+        """UI-thread callback: announce the written bundle and re-enable the button."""
+        self.query_one("#log-bundle", Button).disabled = False
+        self.notify(
+            f"Wrote {out_path.name}. Redacted {redaction_count} secret/identifier occurrence(s); "
+            "skim it before sending.",
+            title="Support bundle",
+            timeout=12,
+        )
+
+    def _notify_bundle_error(self, error: Exception) -> None:
+        """UI-thread callback: report a bundle failure and re-enable the button."""
+        self.query_one("#log-bundle", Button).disabled = False
+        self.notify(
+            f"Support bundle failed: {type(error).__name__}: {error}",
+            title="Support bundle",
+            severity="error",
+        )
 
     def _style_line(self, line: str) -> Text | None:
         """Apply level and search filters, returning a styled line or None to drop it.

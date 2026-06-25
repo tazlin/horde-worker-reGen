@@ -79,6 +79,17 @@ _DEFAULT_RAM_RESERVE_MB = 4096.0
 _STALE_RAM_UNLOAD_REPLACE_BYTES = 1024 * 1024 * 1024
 """RSS threshold above which a model-less idle process is still materially holding RAM after unload."""
 
+_LINE_SKIP_REJECTION_LOG_INTERVAL = 5.0
+"""Minimum seconds between repeats of an identical line-skip rejection log line.
+
+Line-skip is re-evaluated every (sub-second) scheduling pass while a head job is blocked, so an
+unthrottled per-candidate rejection log floods the file with thousands of identical lines during a
+stall. Repeats of the same (candidate, reason) are collapsed to one per this interval; a new candidate
+or a changed reason still logs immediately, so no distinct information is lost."""
+
+_LINE_SKIP_REJECTION_LOG_MAX_KEYS = 256
+"""Cap on remembered (candidate, reason) throttle keys before stale ones are pruned."""
+
 _HEAD_STARVATION_FORCE_ADMIT_SECONDS = 15.0
 """How long the head-of-queue job may be budget-deferred onto an otherwise-idle device before it is
 force-admitted best-effort. Deliberately under the recovery supervisor's
@@ -317,6 +328,9 @@ class InferenceScheduler:
         self._scheduler_diagnostic_log_state = {}
         # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
         self._unservable_admit_notified: dict[str, bool] = {}
+        # Rate-limit state for line-skip rejection logs, keyed by "candidate_id:reason"; see
+        # _log_line_skip_rejection. Maps the key to the monotonic time it was last emitted.
+        self._line_skip_rejection_log_state: dict[str, float] = {}
         # Startup-measured per-process VRAM overhead (one torch/CUDA context, no model), set by the manager
         # via set_measured_per_process_overhead_mb. The streaming forecast subtracts it from total VRAM to
         # estimate the free achievable under sole residency. 0 until measured (free-if-alone == total then).
@@ -2416,6 +2430,29 @@ class InferenceScheduler:
                 return candidate
         return None
 
+    def _log_line_skip_rejection(self, candidate_id: str, reason_key: str, message: str) -> None:
+        """Emit a line-skip rejection at DEBUG, rate-limited per (candidate, reason).
+
+        Line-skip is re-evaluated every (sub-second) scheduling pass while a head job is blocked, so an
+        unthrottled rejection log floods the file with thousands of identical lines during a stall. This
+        keeps full fidelity (every distinct candidate and reason is still logged, and a changed reason
+        logs immediately) while collapsing the repeats to at most one per
+        ``_LINE_SKIP_REJECTION_LOG_INTERVAL``.
+        """
+        now = time.monotonic()
+        key = f"{candidate_id}:{reason_key}"
+        last = self._line_skip_rejection_log_state.get(key)
+        if last is not None and (now - last) < _LINE_SKIP_REJECTION_LOG_INTERVAL:
+            return
+        self._line_skip_rejection_log_state[key] = now
+        # Prune stale keys so a long-running worker's churn of candidate ids cannot grow this unboundedly.
+        if len(self._line_skip_rejection_log_state) > _LINE_SKIP_REJECTION_LOG_MAX_KEYS:
+            cutoff = now - _LINE_SKIP_REJECTION_LOG_INTERVAL
+            self._line_skip_rejection_log_state = {
+                k: t for k, t in self._line_skip_rejection_log_state.items() if t >= cutoff
+            }
+        logger.debug(f"Line-skip candidate {candidate_id} {message}")
+
     async def get_next_job_and_process(
         self,
         information_only: bool = False,
@@ -2482,41 +2519,49 @@ class InferenceScheduler:
                     candidate_small_job.payload.loras is not None and len(candidate_small_job.payload.loras) > 0
                 )
                 if candidate_small_job.model is None:
-                    logger.debug(f"Line-skip candidate {candidate_id} rejected: missing model.")
+                    self._log_line_skip_rejection(candidate_id, "missing_model", "rejected: missing model.")
                     continue
                 if candidate_small_job.model == displaced_job.model:
-                    logger.debug(
-                        f"Line-skip candidate {candidate_id} rejected: same model as blocked job "
-                        f"{str(displaced_job.id_)[:8]}.",
+                    self._log_line_skip_rejection(
+                        candidate_id,
+                        "same_model",
+                        f"rejected: same model as blocked job {str(displaced_job.id_)[:8]}.",
                     )
                     continue
                 if job_has_loras:
-                    logger.debug(f"Line-skip candidate {candidate_id} rejected: candidate has LoRAs.")
+                    self._log_line_skip_rejection(candidate_id, "has_loras", "rejected: candidate has LoRAs.")
                     continue
                 if self._job_tracker.is_degraded_dispatch_pending(candidate_small_job):
-                    logger.debug(f"Line-skip candidate {candidate_id} rejected: degraded retry must run isolated.")
+                    self._log_line_skip_rejection(
+                        candidate_id,
+                        "degraded",
+                        "rejected: degraded retry must run isolated.",
+                    )
                     continue
 
                 candidate_process_with_model = self._resident_process_for_job(candidate_small_job)
                 if candidate_process_with_model is None:
-                    logger.debug(
-                        f"Line-skip candidate {candidate_id} rejected: model {candidate_small_job.model} "
-                        "is not resident.",
+                    self._log_line_skip_rejection(
+                        candidate_id,
+                        "not_resident",
+                        f"rejected: model {candidate_small_job.model} is not resident.",
                     )
                     continue
 
                 candidate_effective_mps = self.get_single_job_effective_megapixelsteps(candidate_small_job)
                 if candidate_effective_mps > candidate_job_size:
-                    logger.debug(
-                        f"Line-skip candidate {candidate_id} rejected: {candidate_effective_mps} eMPS exceeds "
-                        f"{candidate_job_size} eMPS limit.",
+                    self._log_line_skip_rejection(
+                        candidate_id,
+                        "emps",
+                        f"rejected: {candidate_effective_mps} eMPS exceeds {candidate_job_size} eMPS limit.",
                     )
                     continue
 
                 if not candidate_process_with_model.can_accept_job():
-                    logger.debug(
-                        f"Line-skip candidate {candidate_id} rejected: process "
-                        f"{candidate_process_with_model.process_id} is "
+                    self._log_line_skip_rejection(
+                        candidate_id,
+                        "process_state",
+                        f"rejected: process {candidate_process_with_model.process_id} is "
                         f"{candidate_process_with_model.last_process_state.name}.",
                     )
                     continue

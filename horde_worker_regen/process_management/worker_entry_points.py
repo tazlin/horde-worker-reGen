@@ -336,7 +336,12 @@ def start_inference_process(
             # logger.critical reaches nowhere when the crash precedes HordeLog.initialise (no sink yet);
             # the startup file is the loguru-independent backstop for that window.
             logger.critical(f"Failed to initialise hordelib: {type(e).__name__} {e}")
-            write_startup_crash(f"inference_{process_id}", e)
+            write_startup_crash(
+                f"inference_{process_id}",
+                e,
+                os_pid=os.getpid(),
+                launch_identifier=process_launch_identifier,
+            )
             sys.exit(1)
 
         _spawn_timing_mark(process_id, "inference", "hordelib-initialised")
@@ -452,7 +457,12 @@ def start_safety_process(
 
         except Exception as e:
             logger.critical(f"Failed to initialise: {type(e).__name__} {e}")
-            write_startup_crash(f"safety_{process_id}", e)
+            write_startup_crash(
+                f"safety_{process_id}",
+                e,
+                os_pid=os.getpid(),
+                launch_identifier=process_launch_identifier,
+            )
             sys.exit(1)
 
         from horde_worker_regen.process_management.safety_process import HordeSafetyProcess
@@ -544,7 +554,12 @@ def start_download_process(
             configure_child_telemetry(process_id)
         except Exception as e:
             logger.critical(f"Failed to initialise download process: {type(e).__name__} {e}")
-            write_startup_crash(f"download_{process_id}", e)
+            write_startup_crash(
+                f"download_{process_id}",
+                e,
+                os_pid=os.getpid(),
+                launch_identifier=process_launch_identifier,
+            )
             sys.exit(1)
 
         from horde_worker_regen.process_management.download_process import HordeDownloadProcess
