@@ -23,7 +23,7 @@ from pathlib import Path
 import psutil
 import pytest
 
-from horde_worker_regen.process_management.owned_process_registry import OwnedProcessRegistry
+from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from tests.tui import _host_stop_workers
 
 

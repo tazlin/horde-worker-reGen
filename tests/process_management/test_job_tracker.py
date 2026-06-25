@@ -6,9 +6,9 @@ from unittest.mock import Mock
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
-from horde_worker_regen.process_management.job_models import HordeJobInfo
-from horde_worker_regen.process_management.job_tracker import JobStage, JobTracker
-from horde_worker_regen.process_management.messages import HordeImageResult
+from horde_worker_regen.process_management.ipc.messages import HordeImageResult
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 
 from .conftest import (
     make_mock_job,

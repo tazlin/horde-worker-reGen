@@ -17,7 +17,7 @@ from unittest.mock import Mock
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 
-from horde_worker_regen.process_management.inference_process import (
+from horde_worker_regen.process_management.workers.inference_process import (
     AuxDownloadDeadlineExceeded,
     HordeInferenceProcess,
 )
@@ -118,7 +118,7 @@ def test_aux_download_completes_within_deadline() -> None:
 
 def test_fault_job_for_aux_deadline_sends_faulted_result_and_idles() -> None:
     """The graceful-abort handler reports a faulted result (with the marker) and returns to WAITING_FOR_JOB."""
-    from horde_worker_regen.process_management.messages import AUX_DOWNLOAD_FAILED_INFO
+    from horde_worker_regen.process_management.ipc.messages import AUX_DOWNLOAD_FAILED_INFO
 
     proc = object.__new__(HordeInferenceProcess)
     proc.process_id = 1

@@ -10,7 +10,7 @@ from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
-from horde_worker_regen.process_management.supervisor_channel import WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot
 from horde_worker_regen.tui.formatters import human_duration
 from horde_worker_regen.tui.recommendations import analyze
 

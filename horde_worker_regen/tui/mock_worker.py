@@ -14,7 +14,7 @@ import time
 import uuid
 from collections import deque
 
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadItem,
     DownloadPhase,

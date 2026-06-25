@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.recovery_supervisor import RecoveryAction, RecoverySupervisor
+from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoveryAction, RecoverySupervisor
 
 
 class _FakeClock:

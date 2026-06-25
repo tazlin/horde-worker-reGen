@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.model_affinity import (
+from horde_worker_regen.process_management.scheduling.model_affinity import (
     affinity_active,
     compute_protected_processes,
 )

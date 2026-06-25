@@ -32,8 +32,8 @@ from unittest.mock import Mock
 
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
-from horde_worker_regen.process_management.inference_process import HordeInferenceProcess
-from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 
 from .conftest import make_job_pop_response
 

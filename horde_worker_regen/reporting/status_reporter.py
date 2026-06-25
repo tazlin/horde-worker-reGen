@@ -17,13 +17,13 @@ if TYPE_CHECKING:
     from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, UserDetailsResponse
 
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-    from horde_worker_regen.process_management.device_info import TorchDeviceMap
-    from horde_worker_regen.process_management.job_models import APIWorkerMessage
-    from horde_worker_regen.process_management.supervisor_channel import (
+    from horde_worker_regen.process_management.ipc.supervisor_channel import (
         DownloadPlanSummary,
         DownloadStatusSnapshot,
     )
-    from horde_worker_regen.process_management.system_memory import SystemMemorySummary
+    from horde_worker_regen.process_management.jobs.job_models import APIWorkerMessage
+    from horde_worker_regen.process_management.resources.device_info import TorchDeviceMap
+    from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
 
 def _human_bytes(num_bytes: float | None) -> str:
@@ -413,7 +413,7 @@ class StatusReporter:
         if system_memory is None or system_memory.total_bytes <= 0:
             return False
 
-        from horde_worker_regen.process_management.system_memory import ROLE_LABELS
+        from horde_worker_regen.process_management.resources.system_memory import ROLE_LABELS
 
         used_fraction = system_memory.used_fraction
         used_pct = f" ({used_fraction * 100:.0f}%)" if used_fraction is not None else ""

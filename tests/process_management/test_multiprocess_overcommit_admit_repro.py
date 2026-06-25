@@ -37,8 +37,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.process_management import resource_budget
-from horde_worker_regen.process_management.resource_budget import StreamForecast
+from horde_worker_regen.process_management.resources import resource_budget
+from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 
 from .conftest import make_job_pop_response, track_popped_job_async
 from .test_whole_card_residency_repro import _build_context_overcommit_scheduler

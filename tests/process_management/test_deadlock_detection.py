@@ -6,13 +6,13 @@ import queue
 import time
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management.action_ledger import ActionLedger
-from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
-from horde_worker_regen.process_management.messages import HordeProcessMemoryMessage, HordeProcessState
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
+from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
+from horde_worker_regen.process_management.ipc.messages import HordeProcessMemoryMessage, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 
 from .conftest import (
     make_mock_bridge_data,

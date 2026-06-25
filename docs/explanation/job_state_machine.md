@@ -13,16 +13,16 @@
 
 Where the [job lifecycle](job_lifecycle.md) page traces a job *across* subsystems, this page is about
 the one place that records *where a job is*: the
-[`JobTracker`][horde_worker_regen.process_management.job_tracker.JobTracker]. Every **image** job the
+[`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker]. Every **image** job the
 worker knows about is exactly one
-[`TrackedJob`][horde_worker_regen.process_management.job_tracker.TrackedJob] in a single
+[`TrackedJob`][horde_worker_regen.process_management.jobs.job_tracker.TrackedJob] in a single
 `dict[GenerationID, TrackedJob]`, carrying an explicit
-[`JobStage`][horde_worker_regen.process_management.job_tracker.JobStage]. All stage changes go through
+[`JobStage`][horde_worker_regen.process_management.jobs.job_tracker.JobStage]. All stage changes go through
 one transition method that validates legality against a fixed table, so "a job is in exactly one stage"
 is enforced **structurally, not by convention**. That property is what makes the pipeline debuggable
 and is the backstop for the no-loss invariant the rest of the worker relies on. (Alchemy forms are
 tracked separately by
-[`AlchemyCoordinator`][horde_worker_regen.process_management.alchemy_popper.AlchemyCoordinator] and
+[`AlchemyCoordinator`][horde_worker_regen.process_management.jobs.alchemy_popper.AlchemyCoordinator] and
 never enter this machine.)
 
 Each `TrackedJob` also records a `stage_timestamps` map: the first time it entered each stage (plus a
@@ -124,7 +124,7 @@ matters:
   explicitly cleared via `clear_faults_for_job`, which prevents a fault recorded just after finalization
   from being lost.
 - **A faulted inference attempt** is resolved by the tracker into one of three outcomes
-  ([`InferenceFailureResolution`][horde_worker_regen.process_management.job_tracker.InferenceFailureResolution]):
+  ([`InferenceFailureResolution`][horde_worker_regen.process_management.jobs.job_tracker.InferenceFailureResolution]):
   `RETRY` or `RETRY_DEGRADED` requeue the job to `PENDING_INFERENCE` for another (for `RETRY_DEGRADED`,
   more conservative and isolated) attempt; `FAULTED` is terminal and moves the job straight to
   `PENDING_SUBMIT`. There is no fault path to `PENDING_SAFETY_CHECK`: a fault either retries or skips
@@ -153,13 +153,13 @@ that rebuilds the response, and it runs before the job is recorded; see [Job lif
 - [Job lifecycle](job_lifecycle.md): how these stages connect to the subsystems that drive the
   transitions
 - [Architecture](architecture.md): where
-  [`JobTracker`][horde_worker_regen.process_management.job_tracker.JobTracker] fits in the shared-state
+  [`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker] fits in the shared-state
   pattern
 - [Performance and backpressure](performance_and_backpressure.md#queue-sizing-and-the-hold-back-gate):
   the queue accounting that depends on the dual-presence rule
 - [Resilience and recovery](resilience_and_recovery.md): the retry/degraded/quarantine policy behind
   the fault outcomes
 - [Shutdown and faults](shutdown_and_faults.md): fault propagation across stages during drain and abort
-- [`JobStage`][horde_worker_regen.process_management.job_tracker.JobStage],
-  [`TrackedJob`][horde_worker_regen.process_management.job_tracker.TrackedJob], and
-  [`InferenceFailureResolution`][horde_worker_regen.process_management.job_tracker.InferenceFailureResolution]
+- [`JobStage`][horde_worker_regen.process_management.jobs.job_tracker.JobStage],
+  [`TrackedJob`][horde_worker_regen.process_management.jobs.job_tracker.TrackedJob], and
+  [`InferenceFailureResolution`][horde_worker_regen.process_management.jobs.job_tracker.InferenceFailureResolution]

@@ -31,7 +31,9 @@ no longer depends on the pool being quarantined at the exact give-up tick.
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.recovery_supervisor import (
+import pytest
+
+from horde_worker_regen.process_management.lifecycle.recovery_supervisor import (
     _DEFAULT_CLEAN_STREAK_SECONDS,
     RecoverySupervisor,
 )
@@ -61,7 +63,7 @@ _SLOW_RESTART_SECONDS = _DEFAULT_CLEAN_STREAK_SECONDS + 6.0
 class TestDoomedPoolEventuallyAborts:
     """The whole point of give-up: a pool that can never serve must stop the worker, not loop forever."""
 
-    def test_doomed_pool_with_slow_restart_eventually_aborts(self, monkeypatch) -> None:
+    def test_doomed_pool_with_slow_restart_eventually_aborts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A doomed pool whose respawn is slower than the clean streak must still abort, not flap forever."""
         pm = make_testable_process_manager()
         lifecycle = pm._process_lifecycle
@@ -115,7 +117,7 @@ class TestDoomedPoolEventuallyAborts:
             "the soft reset's un-quarantine keeps that from ever coinciding."
         )
 
-    def test_give_up_after_soft_reset_unquarantine_does_not_abort(self, monkeypatch) -> None:
+    def test_give_up_after_soft_reset_unquarantine_does_not_abort(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Isolated phase mismatch: GIVE_UP arriving just after a soft-reset un-quarantine skips the abort.
 
         This is the single tick at the heart of the loop above. The supervisor has decided the episode is

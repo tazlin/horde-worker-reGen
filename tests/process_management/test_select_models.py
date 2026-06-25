@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.job_popper import _select_models_for_pop
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.jobs.job_popper import _select_models_for_pop
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 
 from .conftest import make_mock_bridge_data, make_mock_job, make_mock_process_info, track_popped_job_async
 
@@ -173,7 +173,7 @@ class TestStickyModels:
             image_models_to_load=["model_a", "model_b", "model_c"],
             horde_model_stickiness=1.0,
         )
-        from horde_worker_regen.process_management.messages import HordeProcessState
+        from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 
         process_info = make_mock_process_info(0, model_name="model_a", state=HordeProcessState.WAITING_FOR_JOB)
         process_map = ProcessMap({0: process_info})

@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from horde_worker_regen.process_management._canned_scenarios import make_canned_job
-from horde_worker_regen.process_management.performance_model import (
+from horde_worker_regen.process_management.scheduling.performance_model import (
     BENCHMARK_BASELINE_STEPS,
     PERF_MODEL_SCHEMA_VERSION,
     BatchBucket,
@@ -17,6 +16,7 @@ from horde_worker_regen.process_management.performance_model import (
     load_seed_its_by_signature,
     signature_from_job,
 )
+from horde_worker_regen.process_management.testing._canned_scenarios import make_canned_job
 
 _SD15_BASELINE = "stable_diffusion_1"
 
@@ -186,8 +186,8 @@ def test_metrics_then_finalize_calibrates() -> None:
 
     from hordelib.metrics import JobPhaseMetrics, SamplingStats
 
-    from horde_worker_regen.process_management.job_tracker import JobStage, TrackedJob
-    from horde_worker_regen.process_management.messages import HordeJobMetricsMessage
+    from horde_worker_regen.process_management.ipc.messages import HordeJobMetricsMessage
+    from horde_worker_regen.process_management.jobs.job_tracker import JobStage, TrackedJob
 
     job = make_canned_job(width=512, height=512, ddim_steps=30, n_iter=1)
     assert job.id_ is not None
@@ -215,7 +215,7 @@ def test_alchemy_metrics_are_ignored() -> None:
     """Alchemy forms have no sampling signature and must not be cached for calibration."""
     from hordelib.metrics import JobPhaseMetrics, SamplingStats
 
-    from horde_worker_regen.process_management.messages import HordeJobMetricsMessage
+    from horde_worker_regen.process_management.ipc.messages import HordeJobMetricsMessage
 
     model = PerformanceModel()
     sampling = SamplingStats(steps_completed=10, total_steps=10, duration_seconds=2.0, iterations_per_second=5.0)
@@ -235,7 +235,7 @@ def test_forget_job_drops_cached_rate() -> None:
     """A job that will not finalize can have its cached it/s discarded to bound the cache."""
     from hordelib.metrics import JobPhaseMetrics, SamplingStats
 
-    from horde_worker_regen.process_management.messages import HordeJobMetricsMessage
+    from horde_worker_regen.process_management.ipc.messages import HordeJobMetricsMessage
 
     model = PerformanceModel()
     sampling = SamplingStats(steps_completed=30, total_steps=30, duration_seconds=5.0, iterations_per_second=6.0)

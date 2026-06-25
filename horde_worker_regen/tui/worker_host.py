@@ -29,8 +29,8 @@ import time
 from loguru import logger
 
 from horde_worker_regen.app_state import default_app_state_dir
-from horde_worker_regen.process_management.owned_process_registry import OwnedProcessRegistry
-from horde_worker_regen.process_management.supervisor_channel import SupervisorControlMessage
+from horde_worker_regen.process_management.ipc.supervisor_channel import SupervisorControlMessage
+from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui import socket_protocol as sp
 from horde_worker_regen.tui import tray as tray_module

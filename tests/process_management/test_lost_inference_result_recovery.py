@@ -28,14 +28,14 @@ from unittest.mock import Mock
 
 from horde_model_reference import KNOWN_IMAGE_GENERATION_BASELINE
 
-from horde_worker_regen.process_management.job_tracker import JobStage, JobTracker
-from horde_worker_regen.process_management.messages import (
+from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeInferenceResultMessage,
     HordeProcessState,
     HordeProcessStateChangeMessage,
 )
-from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 
 from .conftest import (
     make_job_pop_response,

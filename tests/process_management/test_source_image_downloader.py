@@ -5,8 +5,8 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, Mock
 
 from horde_worker_regen.consts import MAX_SOURCE_IMAGE_RETRIES
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.source_image_downloader import SourceImageDownloader
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.source_image_downloader import SourceImageDownloader
 
 from .conftest import add_job_fault_async, make_test_api_sessions
 

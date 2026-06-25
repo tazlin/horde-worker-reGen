@@ -10,7 +10,7 @@ import pytest
 from textual.widgets import TabbedContent
 
 from horde_worker_regen.app_state import AppStateStore, OverviewViewMode
-from horde_worker_regen.process_management.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.health import WorkerPhase, derive
@@ -174,7 +174,7 @@ async def test_tick_judges_responsiveness_on_liveness_not_snapshot_age(
 
 async def test_downloads_tab_label_badges_active_download(tmp_path: Path) -> None:
     """The Downloads tab label gains a live ready/total badge while a download is in flight, then clears."""
-    from horde_worker_regen.process_management.supervisor_channel import (
+    from horde_worker_regen.process_management.ipc.supervisor_channel import (
         CurrentDownloadStatus,
         DownloadPhase,
         DownloadPlanSummary,

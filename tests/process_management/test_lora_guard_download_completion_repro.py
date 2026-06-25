@@ -21,18 +21,18 @@ import queue
 from unittest.mock import Mock
 
 from horde_worker_regen.model_download_core import ChunkPacer
-from horde_worker_regen.process_management.download_process import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    CurrentDownloadStatus,
+    DownloadPhase,
+    DownloadStatusSnapshot,
+)
+from horde_worker_regen.process_management.models.download_scheduler import DownloadKind
+from horde_worker_regen.process_management.models.model_availability import ModelAvailability
+from horde_worker_regen.process_management.workers.download_process import (
     DOWNLOAD_PROCESS_ID,
     FEATURE_IMAGE_MODEL,
     HordeDownloadProcess,
     _TaskRuntime,
-)
-from horde_worker_regen.process_management.download_scheduler import DownloadKind
-from horde_worker_regen.process_management.model_availability import ModelAvailability
-from horde_worker_regen.process_management.supervisor_channel import (
-    CurrentDownloadStatus,
-    DownloadPhase,
-    DownloadStatusSnapshot,
 )
 
 

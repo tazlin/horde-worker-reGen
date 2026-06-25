@@ -6,8 +6,8 @@ import time
 
 from loguru import logger
 
-from horde_worker_regen.process_management.duty_cycle import summarize_duty_cycle
-from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
+from horde_worker_regen.process_management.resources.duty_cycle import summarize_duty_cycle
+from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
 
 from .conftest import make_testable_process_manager
 

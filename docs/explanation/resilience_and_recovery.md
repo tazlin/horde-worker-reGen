@@ -38,7 +38,7 @@ When inference faults (a slot crash, a hung timeout, a failed dispatch, or an
 error reported by the child), the job is **not** immediately reported faulted to
 the horde. `JobTracker` resolves the fault via `handle_job_fault` /
 `handle_job_fault_now`, which returns an
-[`InferenceFailureResolution`][horde_worker_regen.process_management.job_tracker.InferenceFailureResolution]:
+[`InferenceFailureResolution`][horde_worker_regen.process_management.jobs.job_tracker.InferenceFailureResolution]:
 
 - **Retry**: the job has attempts left, so it returns to `PENDING_INFERENCE` for
   a fresh dispatch. The attempt budget is `max_inference_attempts` (bridge config,
@@ -54,7 +54,7 @@ the horde. `JobTracker` resolves the fault via `handle_job_fault` /
   never formally queued. The job is reported faulted to the API **with
   diagnostics**, so the horde reissues it elsewhere.
 
-[`failure_classification.is_resource_failure`][horde_worker_regen.process_management.failure_classification.is_resource_failure]
+[`failure_classification.is_resource_failure`][horde_worker_regen.process_management.jobs.failure_classification.is_resource_failure]
 decides resource-vs-other by substring-matching the faulted result's `info`
 string (it recognises both real allocator messages and the chaos harness's
 injected OOM marker). It is deliberately dependency-free so it cannot itself
@@ -126,9 +126,9 @@ question: *the worker as a whole has stopped making progress on work it has
 accepted: now what?* This is split into a pure **policy** object and the
 manager-side **actions**:
 
-- [`RecoverySupervisor`][horde_worker_regen.process_management.recovery_supervisor.RecoverySupervisor]
+- [`RecoverySupervisor`][horde_worker_regen.process_management.lifecycle.recovery_supervisor.RecoverySupervisor]
   is the policy. It tracks how long the worker has been wedged and returns a
-  [`RecoveryAction`][horde_worker_regen.process_management.recovery_supervisor.RecoveryAction].
+  [`RecoveryAction`][horde_worker_regen.process_management.lifecycle.recovery_supervisor.RecoveryAction].
   Keeping it pure (it takes a wedge boolean and a clock) makes the escalation
   timing unit-testable with a fake clock.
 - `HordeWorkerProcessManager` owns the wedge **assessment** and the **actions**.
@@ -161,7 +161,7 @@ the default-on alternative that prioritises continued operation.
 
 ## The action ledger
 
-[`ActionLedger`][horde_worker_regen.process_management.action_ledger.ActionLedger]
+[`ActionLedger`][horde_worker_regen.process_management.ipc.action_ledger.ActionLedger]
 is an append-only, self-audited record of the lifecycle actions the parent takes
 on its children: when each slot was spawned (and its OS pid), when inference was
 dispatched, when a held semaphore was released on its behalf, when a timeout
@@ -176,7 +176,7 @@ itself wedge the worker. (Mirroring is disabled under `AI_HORDE_TESTING`.)
 
 ## The owned-PID registry
 
-[`OwnedProcessRegistry`][horde_worker_regen.process_management.owned_process_registry.OwnedProcessRegistry]
+[`OwnedProcessRegistry`][horde_worker_regen.process_management.lifecycle.owned_process_registry.OwnedProcessRegistry]
 persists which OS pids the worker started, so the *next* startup can find and
 kill any that are still alive after a hard parent death (SIGKILL, OOM-kill, power
 loss) that skipped the graceful shutdown path. Orphaned children otherwise keep a
@@ -194,7 +194,7 @@ unwind cleanly.
 
 Because this machinery only matters when things go wrong, the worker ships a
 typed fault-injection harness to exercise it without a GPU or a real failure.
-[`FaultProfile`][horde_worker_regen.process_management.fault_injection.FaultProfile]
+[`FaultProfile`][horde_worker_regen.process_management.testing.fault_injection.FaultProfile]
 tells one of the [fake worker processes](architecture.md#dry-run-mode) to
 misbehave in a specific, reproducible way: hang, crash, drop heartbeats, run
 slow, exhaust resources, or emit a malformed message. Profiles are plain pydantic
@@ -213,6 +213,6 @@ semaphore is orphaned, and the worker keeps running.
   graceful-vs-abort shutdown
 - [Job State Machine](job_state_machine.md): the stages a retried or faulted job
   moves through
-- [`RecoverySupervisor`][horde_worker_regen.process_management.recovery_supervisor.RecoverySupervisor]
-- [`ActionLedger`][horde_worker_regen.process_management.action_ledger.ActionLedger]
-- [`OwnedProcessRegistry`][horde_worker_regen.process_management.owned_process_registry.OwnedProcessRegistry]
+- [`RecoverySupervisor`][horde_worker_regen.process_management.lifecycle.recovery_supervisor.RecoverySupervisor]
+- [`ActionLedger`][horde_worker_regen.process_management.ipc.action_ledger.ActionLedger]
+- [`OwnedProcessRegistry`][horde_worker_regen.process_management.lifecycle.owned_process_registry.OwnedProcessRegistry]

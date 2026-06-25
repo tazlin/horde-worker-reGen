@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 
-from horde_worker_regen.process_management.gpu_eligibility import (
+from horde_worker_regen.process_management.gpu.gpu_eligibility import (
     CardProfile,
     JobRequirements,
     card_can_serve,

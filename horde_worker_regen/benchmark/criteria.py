@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from horde_worker_regen.process_management.duty_cycle import format_phase_gaps
+from horde_worker_regen.process_management.resources.duty_cycle import format_phase_gaps
 
 
 class LevelCriteria(BaseModel):

@@ -62,12 +62,12 @@ Five long-lived asyncio tasks are started by
 | `AlchemyCoordinator.run()`  | 1s      | Pop, dispatch, and submit alchemy forms (only when `alchemist: true`)    |
 
 A sixth (`_bridge_data_loop`, 1s) hot-reloads `bridgeData.yaml` into
-[`RuntimeConfig`][horde_worker_regen.process_management.runtime_config.RuntimeConfig] unless config
+[`RuntimeConfig`][horde_worker_regen.process_management.config.runtime_config.RuntimeConfig] unless config
 came from environment variables.
 
 This page traces an **image** job. Alchemy jobs follow a parallel but separate pop→dispatch→submit
 loop owned entirely by
-[`AlchemyCoordinator`][horde_worker_regen.process_management.alchemy_popper.AlchemyCoordinator]; they
+[`AlchemyCoordinator`][horde_worker_regen.process_management.jobs.alchemy_popper.AlchemyCoordinator]; they
 do **not** pass through the `JobTracker` or the stages below. See
 [Architecture](architecture.md#what-this-program-does),
 [Bridge Configuration → Alchemy](bridge_config.md#alchemy), and
@@ -82,15 +82,15 @@ flows through.
 
 | Object                    | File                   | Owns                                                                                                           |
 | ------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------- |
-| [`JobTracker`][horde_worker_regen.process_management.job_tracker.JobTracker] | `job_tracker.py` | Per-ID `TrackedJob` state (one `JobStage` each); faults, pop timestamps, counters. The legacy stage collections (`jobs_pending_inference`, …) are now read-only derived views over the `TrackedJob` map. See [Job State Machine](job_state_machine.md). |
-| [`ProcessMap`][horde_worker_regen.process_management.process_map.ProcessMap] | `process_map.py` | `HordeProcessInfo` per child process: last reported state, loaded model, last control flag sent, batch amount. |
-| [`HordeModelMap`][horde_worker_regen.process_management.horde_model_map.HordeModelMap] | `horde_model_map.py` | Model name → load state (`ModelLoadState`) + owning process id.                                                |
-| [`WorkerState`][horde_worker_regen.process_management.worker_state.WorkerState] | `worker_state.py` | Cross-cutting flags: shutdown, last pop times, consecutive failures, kudos events.                             |
-| [`RuntimeConfig`][horde_worker_regen.process_management.runtime_config.RuntimeConfig] | `runtime_config.py` | Current `reGenBridgeData` snapshot (hot-reloadable).                                                           |
-| [`ApiSessions`][horde_worker_regen.process_management.api_sessions.ApiSessions] | `api_sessions.py` | The aiohttp and horde-sdk client sessions.                                                                     |
-| [`ModelMetadata`][horde_worker_regen.process_management.model_metadata.ModelMetadata] | `model_metadata.py` | The stable-diffusion model reference and baseline lookups.                                                     |
-| [`ProcessLifecycleManager`][horde_worker_regen.process_management.process_lifecycle.ProcessLifecycleManager] | `process_lifecycle.py` | Start/stop/replace child processes, hung-process detection.                                                    |
-| [`ShutdownManager`][horde_worker_regen.process_management.shutdown_manager.ShutdownManager] | `shutdown_manager.py` | Shutdown/abort coordination.                                                                                   |
+| [`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker] | `job_tracker.py` | Per-ID `TrackedJob` state (one `JobStage` each); faults, pop timestamps, counters. The legacy stage collections (`jobs_pending_inference`, …) are now read-only derived views over the `TrackedJob` map. See [Job State Machine](job_state_machine.md). |
+| [`ProcessMap`][horde_worker_regen.process_management.lifecycle.process_map.ProcessMap] | `process_map.py` | `HordeProcessInfo` per child process: last reported state, loaded model, last control flag sent, batch amount. |
+| [`HordeModelMap`][horde_worker_regen.process_management.models.horde_model_map.HordeModelMap] | `horde_model_map.py` | Model name → load state (`ModelLoadState`) + owning process id.                                                |
+| [`WorkerState`][horde_worker_regen.process_management.config.worker_state.WorkerState] | `worker_state.py` | Cross-cutting flags: shutdown, last pop times, consecutive failures, kudos events.                             |
+| [`RuntimeConfig`][horde_worker_regen.process_management.config.runtime_config.RuntimeConfig] | `runtime_config.py` | Current `reGenBridgeData` snapshot (hot-reloadable).                                                           |
+| [`ApiSessions`][horde_worker_regen.process_management.ipc.api_sessions.ApiSessions] | `api_sessions.py` | The aiohttp and horde-sdk client sessions.                                                                     |
+| [`ModelMetadata`][horde_worker_regen.process_management.models.model_metadata.ModelMetadata] | `model_metadata.py` | The stable-diffusion model reference and baseline lookups.                                                     |
+| [`ProcessLifecycleManager`][horde_worker_regen.process_management.lifecycle.process_lifecycle.ProcessLifecycleManager] | `process_lifecycle.py` | Start/stop/replace child processes, hung-process detection.                                                    |
+| [`ShutdownManager`][horde_worker_regen.process_management.lifecycle.shutdown_manager.ShutdownManager] | `shutdown_manager.py` | Shutdown/abort coordination.                                                                                   |
 
 ## IPC model
 
@@ -102,7 +102,7 @@ This is the short version; the [IPC and messaging](ipc_and_messaging.md) page is
   updates `ProcessMap`/`HordeModelMap` immediately after a successful send, before the child confirms.
 - **Child → parent:** status messages (`HordeProcessMessage` subclasses) on a single shared
   `multiprocessing.Queue`, drained by
-  [`MessageDispatcher`][horde_worker_regen.process_management.message_dispatcher.MessageDispatcher]'s
+  [`MessageDispatcher`][horde_worker_regen.process_management.ipc.message_dispatcher.MessageDispatcher]'s
   `receive_and_handle_process_messages` twice per control-loop tick. Messages carry a
   `process_launch_identifier` so messages from a replaced process incarnation are discarded.
 
@@ -110,7 +110,7 @@ This is the short version; the [IPC and messaging](ipc_and_messaging.md) page is
 
 ### 1. Pop (`job_popper.py`)
 
-[`JobPopper`][horde_worker_regen.process_management.job_popper.JobPopper]'s `api_job_pop` runs a
+[`JobPopper`][horde_worker_regen.process_management.jobs.job_popper.JobPopper]'s `api_job_pop` runs a
 gauntlet of gates before any network call, so the worker never pulls work it cannot place. In brief:
 
 1. Not shutting down; not in consecutive-failure backoff (`_handle_consecutive_failures`, 3 failures →
@@ -130,7 +130,7 @@ stickiness](performance_and_backpressure.md#model-stickiness), removes models th
 queued jobs, and adds custom models. The pop response then goes through `_apply_sdk_workarounds`
 (seed/denoise fixups; note this _rebuilds_ the response object, which the [identity-stability
 invariant](#pipeline-invariants) depends on),
-[`SourceImageDownloader`][horde_worker_regen.process_management.source_image_downloader.SourceImageDownloader]'s
+[`SourceImageDownloader`][horde_worker_regen.process_management.jobs.source_image_downloader.SourceImageDownloader]'s
 `download_source_images` (img2img source fetch, faults recorded as `GenMetadataEntry` keyed by
 `GenerationID`), and finally `JobTracker.record_popped_job`, which registers a `TrackedJob` in stage
 `PENDING_INFERENCE` (surfaced through the `jobs_pending_inference`, `jobs_lookup`, and
@@ -142,7 +142,7 @@ identical.
 ### 2. Schedule and dispatch to a process (`inference_scheduler.py`)
 
 `_process_control_loop` invokes
-[`InferenceScheduler`][horde_worker_regen.process_management.inference_scheduler.InferenceScheduler]'s
+[`InferenceScheduler`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler]'s
 `run_scheduling_cycle` when there are pending jobs and a free process or preloaded model. One cycle:
 
 1. **`preload_models()`**: for the first pending job whose model isn't loaded anywhere, pick an
@@ -170,7 +170,7 @@ priorities](performance_and_backpressure.md#inference-scheduling-priorities).
 
 ### 3. Inference (child process, `inference_process.py`)
 
-[`HordeInferenceProcess`][horde_worker_regen.process_management.inference_process.HordeInferenceProcess]
+[`HordeInferenceProcess`][horde_worker_regen.process_management.workers.inference_process.HordeInferenceProcess]
 receives the control message, runs hordelib, and streams back heartbeats, memory reports, and state
 changes, ending with `HordeInferenceResultMessage` (state `ok`/`censored`/`faulted` + base64 images).
 A job that stops reporting progress is graded and recovered by the watchdogs in [Resilience and
@@ -189,10 +189,10 @@ jobs](resilience_and_recovery.md#stranded-in-progress-jobs).
 
 ### 5. Safety (`safety_orchestrator.py` → child → dispatcher)
 
-[`SafetyOrchestrator`][horde_worker_regen.process_management.safety_orchestrator.SafetyOrchestrator]'s
+[`SafetyOrchestrator`][horde_worker_regen.process_management.workers.safety_orchestrator.SafetyOrchestrator]'s
 `start_evaluate_safety` takes the head of `jobs_pending_safety_check`, validates required fields
 (faulting the job on any `None`), and sends `EVALUATE_SAFETY` to the
-[`HordeSafetyProcess`][horde_worker_regen.process_management.safety_process.HordeSafetyProcess]; on
+[`HordeSafetyProcess`][horde_worker_regen.process_management.workers.safety_process.HordeSafetyProcess]; on
 send success `begin_safety_check` moves it to `SAFETY_CHECKING`. If the safety process died, jobs are
 requeued and the process flagged for replacement.
 
@@ -202,7 +202,7 @@ The reply (`HordeSafetyResultMessage`) is handled by `_handle_safety_result`:
 
 ### 6. Submit (`job_submitter.py`)
 
-[`JobSubmitter`][horde_worker_regen.process_management.job_submitter.JobSubmitter]'s `api_submit_job`
+[`JobSubmitter`][horde_worker_regen.process_management.jobs.job_submitter.JobSubmitter]'s `api_submit_job`
 takes the head of `jobs_pending_submit` and fans out one `PendingSubmitJob` task per image: PUT the
 PNG to the job's `r2_upload` URL (10s timeout, retry on 500/timeouts), then a `JobSubmitRequest` to
 the API. `PendingSubmitJob` owns retry/fault bookkeeping. Kudos are recorded into `WorkerState`;

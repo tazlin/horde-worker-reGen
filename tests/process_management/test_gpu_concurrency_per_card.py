@@ -13,14 +13,14 @@ from unittest.mock import Mock
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 
-from horde_worker_regen.process_management.card_runtime import CardRuntime
-from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.lru_cache import LRUCache
-from horde_worker_regen.process_management.messages import HordeProcessState
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.models.lru_cache import LRUCache
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 
 from .conftest import (
     make_job_pop_response,
@@ -92,7 +92,7 @@ async def _attach_in_flight_job(
     device_index: int,
     steps_done: int,
     total_steps: int = 20,
-):  # noqa: ANN201 - returns the SDK pop response; mirrors the headway-repro helper
+) -> None:
     """Register a heavy (SDXL) job in-flight on ``process_id`` pinned to ``device_index``."""
     model = f"m{process_id}_{_SDXL.value}"
     proc = make_mock_process_info(

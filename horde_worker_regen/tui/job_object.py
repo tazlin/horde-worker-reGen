@@ -8,8 +8,7 @@ holds; when the host ends for any reason the OS closes that handle and terminate
 job. Children a job member spawns join the job automatically, so binding the worker covers its grandchildren.
 
 Best-effort and Windows-only: off Windows, or if any Win32 call fails, every method is an inert no-op and
-the [`OwnedProcessRegistry`][horde_worker_regen.process_management.owned_process_registry.OwnedProcessRegistry]
-startup sweep remains the backstop.
+the `OwnedProcessRegistry` startup sweep remains the backstop.
 """
 
 from __future__ import annotations

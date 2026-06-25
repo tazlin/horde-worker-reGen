@@ -15,12 +15,12 @@ from collections import deque
 import pytest
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-from horde_worker_regen.process_management import alchemy_popper as alchemy_popper_module
-from horde_worker_regen.process_management.alchemy_popper import AlchemyCoordinator, AlchemyHeadroomEstimator
-from horde_worker_regen.process_management.horde_process import WorkerCapability
-from horde_worker_regen.process_management.messages import AlchemyFormSpec
-from horde_worker_regen.process_management.resource_budget import CommittedReserveLedger
-from horde_worker_regen.process_management.workload_flow import FlowCoordinator, WorkloadKind
+from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec
+from horde_worker_regen.process_management.jobs import alchemy_popper as alchemy_popper_module
+from horde_worker_regen.process_management.jobs.alchemy_popper import AlchemyCoordinator, AlchemyHeadroomEstimator
+from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
+from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.scheduling.workload_flow import FlowCoordinator, WorkloadKind
 
 from .conftest import make_testable_process_manager
 from .test_inference_scheduling import _make_inference_scheduler

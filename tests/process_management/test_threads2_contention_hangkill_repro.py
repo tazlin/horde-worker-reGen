@@ -48,14 +48,14 @@ from unittest.mock import Mock
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeHeartbeatType, HordeProcessState
-from horde_worker_regen.process_management.performance_model import signature_from_job
-from horde_worker_regen.process_management.process_lifecycle import (
+from horde_worker_regen.process_management.ipc.messages import HordeHeartbeatType, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     SLOWDOWN_WARN_RATIO,
     ProcessLifecycleManager,
 )
-from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.scheduling.performance_model import signature_from_job
 
 from .conftest import make_job_pop_response, make_mock_bridge_data, make_mock_process_info
 

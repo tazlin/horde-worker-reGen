@@ -41,7 +41,7 @@ from horde_worker_regen.benchmark.progress_channel import (
     RampStarting,
     SuggestionDecisionRow,
 )
-from horde_worker_regen.process_management.owned_process_registry import kill_process_tree
+from horde_worker_regen.process_management.lifecycle.owned_process_registry import kill_process_tree
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH, load_config, save_config
 
 if TYPE_CHECKING:

@@ -6,12 +6,7 @@ import random
 
 from rich.console import Console
 
-from horde_worker_regen.process_management.feature_readiness import (
-    FeatureReadiness,
-    FeatureReadinessState,
-    GatedFeature,
-)
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadFailure,
     DownloadItem,
@@ -22,6 +17,11 @@ from horde_worker_regen.process_management.supervisor_channel import (
     FeatureReadinessSummary,
     WorkerConfigSummary,
     WorkerStateSnapshot,
+)
+from horde_worker_regen.process_management.models.feature_readiness import (
+    FeatureReadiness,
+    FeatureReadinessState,
+    GatedFeature,
 )
 from horde_worker_regen.tui.widgets.downloads import DownloadsView, summarize_download_activity
 

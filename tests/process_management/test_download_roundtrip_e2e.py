@@ -40,9 +40,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from multiprocessing.connection import Connection
 
-    from horde_worker_regen.process_management.download_process import HordeDownloadProcess
-    from horde_worker_regen.process_management.messages import HordeDownloadControlMessage
-    from horde_worker_regen.process_management.supervisor_channel import WorkerStateSnapshot
+    from horde_worker_regen.process_management.ipc.messages import HordeDownloadControlMessage
+    from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot
+    from horde_worker_regen.process_management.workers.download_process import HordeDownloadProcess
 
 # (file_name, file_purpose, size_bytes) for the real Z-Image-Turbo layout, shrunk to test sizes.
 _FILES: tuple[tuple[str, str, int], ...] = (
@@ -107,7 +107,7 @@ def _make_download_process(
     """Construct a real HordeDownloadProcess wired to a fake, real-downloading SharedModelManager."""
     import multiprocessing as mp
 
-    from horde_worker_regen.process_management.download_process import HordeDownloadProcess
+    from horde_worker_regen.process_management.workers.download_process import HordeDownloadProcess
 
     # Mirror hordelib's ModelManager surface: every category manager is an attribute, None when not loaded.
     # The feature-presence refresh reads them by name (no defensive getattr), so a bare stand-in would raise.
@@ -257,7 +257,7 @@ def _control_message(
     model_names: list[str] | None = None,
     set_paused: bool | None = None,
 ) -> HordeDownloadControlMessage:
-    from horde_worker_regen.process_management.messages import HordeDownloadControlMessage
+    from horde_worker_regen.process_management.ipc.messages import HordeDownloadControlMessage
 
     return HordeDownloadControlMessage(
         model_names=list(model_names or []),
@@ -303,7 +303,7 @@ def _downloads_host() -> _DownloadsHost:
 
 
 def _downloading_snapshot(present: list[str]) -> WorkerStateSnapshot:
-    from horde_worker_regen.process_management.supervisor_channel import (
+    from horde_worker_regen.process_management.ipc.supervisor_channel import (
         CurrentDownloadStatus,
         DownloadPhase,
         DownloadStatusSnapshot,

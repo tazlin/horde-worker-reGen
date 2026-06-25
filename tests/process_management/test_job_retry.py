@@ -7,7 +7,7 @@ diagnosed exactly once. The end-to-end recovery behaviour is covered by the chao
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.job_tracker import (
+from horde_worker_regen.process_management.jobs.job_tracker import (
     InferenceFailureResolution,
     JobStage,
     JobTracker,

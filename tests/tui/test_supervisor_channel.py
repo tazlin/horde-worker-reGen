@@ -7,7 +7,7 @@ import pickle
 import time
 from types import SimpleNamespace
 
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SUPERVISOR_PROTOCOL_VERSION,
     ProcessSnapshot,
     RecentJobRecord,
@@ -55,7 +55,7 @@ def test_snapshot_json_roundtrip() -> None:
 
 def test_recent_job_record_from_metrics_record() -> None:
     """RecentJobRecord projects the lean fields (including job features) from a metrics record."""
-    from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
+    from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
 
     record = JobMetricsRecord(
         job_id="abc",
@@ -81,7 +81,7 @@ def test_recent_job_record_from_metrics_record() -> None:
 
 def test_recent_job_record_without_features() -> None:
     """A plain job (no LoRAs/controlnet/etc.) projects with no feature summary."""
-    from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
+    from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
 
     record = JobMetricsRecord(job_id="plain", e2e_seconds=3.0, steps=20)
     lean = RecentJobRecord.from_metrics_record(record)
@@ -91,7 +91,7 @@ def test_recent_job_record_without_features() -> None:
 
 def test_recent_job_record_carries_caller_supplied_baseline() -> None:
     """The process manager resolves a baseline the metrics record lacks; the projection carries it."""
-    from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
+    from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
 
     record = JobMetricsRecord(job_id="b", model_name="AlbedoBase XL", e2e_seconds=2.0)
     lean = RecentJobRecord.from_metrics_record(record, baseline="stable_diffusion_xl")
@@ -102,7 +102,7 @@ def test_recent_job_record_carries_caller_supplied_baseline() -> None:
 
 def test_queue_and_recent_baseline_survive_json_roundtrip() -> None:
     """The new baseline field on queue and recent records round-trips over the wire."""
-    from horde_worker_regen.process_management.supervisor_channel import JobQueueEntry
+    from horde_worker_regen.process_management.ipc.supervisor_channel import JobQueueEntry
 
     snapshot = _make_snapshot()
     snapshot.pending_jobs = [JobQueueEntry(job_id="q", model="Deliberate", baseline="stable_diffusion_1")]

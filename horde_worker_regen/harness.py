@@ -39,7 +39,15 @@ from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-from horde_worker_regen.process_management._canned_scenarios import (
+from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.process_manager import (
+    HordeWorkerProcessManager,
+    SystemResources,
+)
+from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot
+from horde_worker_regen.process_management.testing._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
     CannedJobSource,
@@ -50,19 +58,11 @@ from horde_worker_regen.process_management._canned_scenarios import (
     make_canned_job,
     make_simple_scenario,
 )
-from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
-from horde_worker_regen.process_management.fake_worker_processes import (
+from horde_worker_regen.process_management.testing.fake_worker_processes import (
     start_fake_inference_process,
     start_fake_safety_process,
 )
-from horde_worker_regen.process_management.fault_injection import FaultProfile
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.messages import AlchemyFormSpec
-from horde_worker_regen.process_management.process_manager import (
-    HordeWorkerProcessManager,
-    SystemResources,
-)
-from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
+from horde_worker_regen.process_management.testing.fault_injection import FaultProfile
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
 

@@ -24,7 +24,7 @@ At startup, `BridgeDataLoader` reads `bridgeData.yaml` (or
 `bridgeData_template.yaml`) and validates it against the pydantic
 [`reGenBridgeData`][horde_worker_regen.bridge_data.data_model.reGenBridgeData]
 model. The validated model is stored in
-[`RuntimeConfig`][horde_worker_regen.process_management.runtime_config.RuntimeConfig].
+[`RuntimeConfig`][horde_worker_regen.process_management.config.runtime_config.RuntimeConfig].
 
 During normal operation, the `_bridge_data_loop` asyncio task re-reads the file
 every second and calls `RuntimeConfig.update()` if it changed. Components read
@@ -194,4 +194,4 @@ understand.
   fields drive throttling and scheduling
 - [`BRIDGE_CONFIG_FILENAME`][horde_worker_regen.consts.BRIDGE_CONFIG_FILENAME]
 - [`reGenBridgeData`][horde_worker_regen.bridge_data.data_model.reGenBridgeData]
-- [`RuntimeConfig`][horde_worker_regen.process_management.runtime_config.RuntimeConfig]
+- [`RuntimeConfig`][horde_worker_regen.process_management.config.runtime_config.RuntimeConfig]

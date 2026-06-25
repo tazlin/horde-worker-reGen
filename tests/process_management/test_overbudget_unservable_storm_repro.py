@@ -35,15 +35,15 @@ from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.process_management import resource_budget
-from horde_worker_regen.process_management.job_popper import _select_models_for_pop
-from horde_worker_regen.process_management.job_tracker import (
+from horde_worker_regen.process_management.jobs.job_popper import _select_models_for_pop
+from horde_worker_regen.process_management.jobs.job_tracker import (
     InferenceFailureResolution,
     JobTracker,
 )
-from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.resource_budget import (
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources import resource_budget
+from horde_worker_regen.process_management.resources.resource_budget import (
     is_model_locally_unservable,
     predict_job_vram_mb,
 )

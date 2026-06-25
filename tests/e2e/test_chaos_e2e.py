@@ -14,8 +14,8 @@ import sys
 import pytest
 
 from horde_worker_regen.harness import HarnessConfig, run_harness_async
-from horde_worker_regen.process_management._canned_scenarios import make_simple_scenario
-from horde_worker_regen.process_management.fault_injection import FaultProfile
+from horde_worker_regen.process_management.testing._canned_scenarios import make_simple_scenario
+from horde_worker_regen.process_management.testing.fault_injection import FaultProfile
 
 # Spawning a fresh child re-imports the whole stack and is several times slower on Windows than on the
 # Linux CI runner. A wedge/recovery probe pays that cost once per re-spawn, so any budget sized for CI is

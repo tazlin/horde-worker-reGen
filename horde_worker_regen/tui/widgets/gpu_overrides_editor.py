@@ -45,7 +45,7 @@ from horde_worker_regen.tui.config_form import (
 from horde_worker_regen.tui.formatters import gpu_label
 
 if TYPE_CHECKING:
-    from horde_worker_regen.process_management.supervisor_channel import CardSnapshot
+    from horde_worker_regen.process_management.ipc.supervisor_channel import CardSnapshot
 
 _GLOBAL_FIELD_BY_KEY: dict[str, ConfigField] = {field.key: field for field in CONFIG_FIELDS}
 

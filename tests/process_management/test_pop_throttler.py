@@ -7,8 +7,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.pop_throttler import (
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.scheduling.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
     PopThrottler,
 )

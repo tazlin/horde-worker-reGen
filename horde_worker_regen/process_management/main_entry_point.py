@@ -15,8 +15,8 @@ from horde_worker_regen.app_state import (
 )
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities
+from horde_worker_regen.process_management.config.worker_identity import WorkerNameConfigError, verify_worker_identity
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
-from horde_worker_regen.process_management.worker_identity import WorkerNameConfigError, verify_worker_identity
 
 _KNOWN_GOOD_MIN_SESSION_SECONDS = 600.0
 """A session must run at least this long (cleanly, with jobs done) to be trusted as known-good."""

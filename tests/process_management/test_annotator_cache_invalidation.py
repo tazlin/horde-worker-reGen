@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from horde_worker_regen.model_download_core import CompVisLike
-from horde_worker_regen.process_management.download_process import (
+from horde_worker_regen.process_management.workers.download_process import (
     DOWNLOAD_PROCESS_ID,
     HordeDownloadProcess,
 )

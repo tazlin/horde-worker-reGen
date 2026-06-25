@@ -7,14 +7,14 @@ import time
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics, ModelLoadEvent, SamplingStats
 
-from horde_worker_regen.process_management._dummy_jobs import dummy_job_factory
-from horde_worker_regen.process_management.job_models import HordeJobInfo
-from horde_worker_regen.process_management.job_tracker import JobStage, TrackedJob
-from horde_worker_regen.process_management.messages import (
+from horde_worker_regen.process_management.ipc.messages import (
     HordeDownloadMetricsMessage,
     HordeJobMetricsMessage,
 )
-from horde_worker_regen.process_management.run_metrics import WorkerRunMetrics
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, TrackedJob
+from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
+from horde_worker_regen.process_management.testing._dummy_jobs import dummy_job_factory
 
 
 def _make_phase_metrics(*, vram_high_water: int | None = 5000) -> JobPhaseMetrics:

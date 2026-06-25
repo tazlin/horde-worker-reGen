@@ -11,7 +11,7 @@ import pytest
 from hordelib.feature_impact import FEATURE_KIND
 
 from horde_worker_regen import capabilities
-from horde_worker_regen.process_management.alchemy_popper import expand_offered_forms
+from horde_worker_regen.process_management.jobs.alchemy_popper import expand_offered_forms
 
 _ALL_FEATURES = frozenset(FEATURE_KIND)
 _NO_FEATURES: frozenset[FEATURE_KIND] = frozenset()

@@ -8,22 +8,22 @@ from unittest.mock import Mock
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 
-from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.inference_scheduler import (
-    _RESIDENCY_GRACE_SECONDS,
-    InferenceScheduler,
-)
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.lru_cache import LRUCache
-from horde_worker_regen.process_management.messages import (
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeProcessState,
     ModelInfo,
     ModelLoadState,
 )
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.models.lru_cache import LRUCache
+from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+    _RESIDENCY_GRACE_SECONDS,
+    InferenceScheduler,
+)
 
 from .conftest import (
     make_job_pop_response,
@@ -147,7 +147,9 @@ class TestLineSkipRejectionLogThrottle:
 
     def test_throttle_lifts_after_interval(self) -> None:
         """Once the interval elapses, the same rejection logs again."""
-        from horde_worker_regen.process_management.inference_scheduler import _LINE_SKIP_REJECTION_LOG_INTERVAL
+        from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+            _LINE_SKIP_REJECTION_LOG_INTERVAL,
+        )
 
         scheduler = _make_inference_scheduler()
 
@@ -197,7 +199,7 @@ class TestPreloadModels:
 
     async def test_quarantined_model_is_not_preloaded_and_its_job_is_faulted(self) -> None:
         """A model quarantined for repeated load failures must never be preloaded; its job is faulted instead."""
-        from horde_worker_regen.process_management.job_tracker import JobStage
+        from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 
         process_info = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         process_map = ProcessMap({0: process_info})

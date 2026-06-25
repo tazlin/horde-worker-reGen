@@ -5,8 +5,8 @@ from __future__ import annotations
 import uuid
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 
 from .conftest import (
     make_mock_model_reference_record,

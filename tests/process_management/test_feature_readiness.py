@@ -7,7 +7,7 @@ still downloading; and an unknown presence (no download process yet) never withh
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.feature_readiness import (
+from horde_worker_regen.process_management.models.feature_readiness import (
     FeatureInputs,
     FeatureReadinessState,
     GatedFeature,

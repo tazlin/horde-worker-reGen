@@ -27,11 +27,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.process_management import resource_budget
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState
-from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources import resource_budget
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 
 from .conftest import (
     make_job_pop_response,

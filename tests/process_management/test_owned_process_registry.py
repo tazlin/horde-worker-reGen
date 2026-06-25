@@ -17,7 +17,7 @@ from pathlib import Path
 import psutil
 import pytest
 
-from horde_worker_regen.process_management.owned_process_registry import (
+from horde_worker_regen.process_management.lifecycle.owned_process_registry import (
     OwnedProcessRecord,
     OwnedProcessRegistry,
     kill_process_tree,

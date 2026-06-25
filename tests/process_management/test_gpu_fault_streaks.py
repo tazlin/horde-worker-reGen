@@ -8,10 +8,10 @@ keying.
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.card_runtime import CardRuntime
-from horde_worker_regen.process_management.job_popper import _select_models_for_pop
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.jobs.job_popper import _select_models_for_pop
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 
 from .conftest import make_job_pop_response, make_mock_bridge_data, make_test_card_runtimes, track_popped_job_async
 

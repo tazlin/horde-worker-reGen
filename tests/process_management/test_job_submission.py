@@ -6,11 +6,11 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
-from horde_worker_regen.process_management.job_models import HordeJobInfo, PendingSubmitJob
-from horde_worker_regen.process_management.job_submitter import JobSubmitter
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeImageResult
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.messages import HordeImageResult
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo, PendingSubmitJob
+from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 
 from .conftest import (
     make_job_pop_response,
@@ -137,7 +137,7 @@ class TestApiSubmitJob:
         """If a job submission results in a faulted job, the consecutive_failed_jobs counter should be incremented."""
         from horde_sdk.ai_horde_api import GENERATION_STATE
 
-        from horde_worker_regen.process_management.job_models import HordeJobInfo
+        from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 
         state = WorkerState()
         job_tracker = JobTracker()

@@ -51,62 +51,21 @@ from horde_worker_regen.consts import (
     BRIDGE_CONFIG_FILENAME,
     VRAM_HEAVY_MODELS,
 )
-from horde_worker_regen.process_management._aliased_types import ProcessQueue
-from horde_worker_regen.process_management._canned_scenarios import CannedAlchemySource, CannedJobSource
-from horde_worker_regen.process_management.action_ledger import ActionLedger, LedgerEventType
-from horde_worker_regen.process_management.alchemy_popper import DEFAULT_ALCHEMY_FORMS, AlchemyCoordinator
-from horde_worker_regen.process_management.api_sessions import ApiSessions
-from horde_worker_regen.process_management.card_runtime import CardRuntime
-from horde_worker_regen.process_management.desired_state import DesiredState
-from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
-from horde_worker_regen.process_management.duty_cycle import DutyCycleSummary, summarize_duty_cycle
-from horde_worker_regen.process_management.feature_readiness import (
-    CONTROLNET_ANNOTATOR_FAILED_DETAIL,
-    FeatureInputs,
-    GatedFeature,
-    build_feature_readiness,
-)
-from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.job_popper import JobPopper
-from horde_worker_regen.process_management.job_submitter import JobSubmitter
-from horde_worker_regen.process_management.job_tracker import JobStage, JobTracker
-from horde_worker_regen.process_management.lora_disk_guard import (
-    free_mb,
-    is_lora_disk_exhausted,
-    read_evictable_adhoc_mb,
-)
-from horde_worker_regen.process_management.lru_cache import LRUCache
-from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
-from horde_worker_regen.process_management.messages import (
+from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
+from horde_worker_regen.process_management.config.worker_identity import lookup_worker_by_name
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
+from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
+from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
+from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
     HordeControlFlag,
     HordeDownloadAvailabilityMessage,
     HordeProcessState,
 )
-from horde_worker_regen.process_management.model_availability import ModelAvailability
-from horde_worker_regen.process_management.model_metadata import ModelMetadata
-from horde_worker_regen.process_management.owned_process_registry import OwnedProcessRegistry
-from horde_worker_regen.process_management.performance_model import (
-    PERF_MODEL_FILENAME,
-    PerformanceModel,
-    load_seed_its_by_signature,
-)
-from horde_worker_regen.process_management.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.process_temperature import classify_process_temperature
-from horde_worker_regen.process_management.recovery_supervisor import RecoveryAction, RecoverySupervisor
-from horde_worker_regen.process_management.resource_budget import (
-    CommittedReserveLedger,
-    is_model_locally_unservable_for,
-)
-from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot, WorkerRunMetrics
-from horde_worker_regen.process_management.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.safety_orchestrator import SafetyOrchestrator
-from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PENDING_JOBS_IN_SNAPSHOT,
     RECENT_JOBS_IN_SNAPSHOT,
     CardSnapshot,
@@ -125,9 +84,50 @@ from horde_worker_regen.process_management.supervisor_channel import (
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.process_management.jobs.alchemy_popper import DEFAULT_ALCHEMY_FORMS, AlchemyCoordinator
+from horde_worker_regen.process_management.jobs.job_popper import JobPopper
+from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.process_temperature import classify_process_temperature
+from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoveryAction, RecoverySupervisor
+from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
+from horde_worker_regen.process_management.models.desired_state import DesiredState
+from horde_worker_regen.process_management.models.feature_readiness import (
+    CONTROLNET_ANNOTATOR_FAILED_DETAIL,
+    FeatureInputs,
+    GatedFeature,
+    build_feature_readiness,
+)
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.models.lora_disk_guard import (
+    free_mb,
+    is_lora_disk_exhausted,
+    read_evictable_adhoc_mb,
+)
+from horde_worker_regen.process_management.models.lru_cache import LRUCache
+from horde_worker_regen.process_management.models.model_availability import ModelAvailability
+from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.resources.duty_cycle import DutyCycleSummary, summarize_duty_cycle
+from horde_worker_regen.process_management.resources.resource_budget import (
+    CommittedReserveLedger,
+    is_model_locally_unservable_for,
+)
+from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot, WorkerRunMetrics
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.performance_model import (
+    PERF_MODEL_FILENAME,
+    PerformanceModel,
+    load_seed_its_by_signature,
+)
+from horde_worker_regen.process_management.testing._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
-from horde_worker_regen.process_management.worker_identity import lookup_worker_by_name
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.workers.safety_orchestrator import SafetyOrchestrator
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.reporting.status_reporter import StatusReporter
@@ -137,10 +137,10 @@ from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
 
 if TYPE_CHECKING:
-    from horde_worker_regen.process_management.job_models import HordeJobInfo
-    from horde_worker_regen.process_management.job_tracker import TrackedJob
-    from horde_worker_regen.process_management.messages import HordeJobMetricsMessage
-    from horde_worker_regen.process_management.system_memory import SystemMemorySummary
+    from horde_worker_regen.process_management.ipc.messages import HordeJobMetricsMessage
+    from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
+    from horde_worker_regen.process_management.jobs.job_tracker import TrackedJob
+    from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3029,7 +3029,7 @@ class HordeWorkerProcessManager:
         """
         import psutil
 
-        from horde_worker_regen.process_management.system_memory import (
+        from horde_worker_regen.process_management.resources.system_memory import (
             ROLE_DOWNLOAD,
             ROLE_INFERENCE,
             ROLE_ORCHESTRATOR,

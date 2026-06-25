@@ -19,7 +19,7 @@ _WORKER = "tazlin-tui-example"
 def _recovery(ts: str) -> str:
     """A parent recovery-diagnostics line for slot 1 crashing on start (os_pid matches the child log)."""
     return (
-        f"2026-06-24 {ts} | ERROR | horde_worker_regen.process_management.process_lifecycle:_log_recovery_diagnostics:367 - "
+        f"2026-06-24 {ts} | ERROR | horde_worker_regen.process_management.lifecycle.process_lifecycle:_log_recovery_diagnostics:367 - "
         "Recovery diagnostics for process 1 (os_pid=4600, launch=2): reason='inference process replaced (crashed or hung)'; "
         "last_state=PROCESS_STARTING; exitcode=1; last_heartbeat_type=OTHER; since_last_heartbeat=8.0s; "
         "since_last_message=8.0s; last_job=None; recent_actions=[]"

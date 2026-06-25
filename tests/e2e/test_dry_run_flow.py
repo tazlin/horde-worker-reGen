@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management._canned_scenarios import (
+from horde_worker_regen.process_management.testing._canned_scenarios import (
     SCENARIO_BASIC,
     SCENARIO_TRIVIAL,
     CannedJobSource,

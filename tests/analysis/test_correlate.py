@@ -27,7 +27,7 @@ AssertionError: Torch not compiled with CUDA enabled
 
 _RECOVERY = (
     "2026-06-24 18:29:31.575 | ERROR    | "
-    "horde_worker_regen.process_management.process_lifecycle:_log_recovery_diagnostics:367 - "
+    "horde_worker_regen.process_management.lifecycle.process_lifecycle:_log_recovery_diagnostics:367 - "
     "Recovery diagnostics for process 1 (os_pid=4600, launch=2): "
     "reason='inference process replaced (crashed or hung)'; last_state=PROCESS_STARTING; exitcode=1; "
     "last_heartbeat_type=OTHER; since_last_heartbeat=8.2s; since_last_message=8.2s; last_job=None; recent_actions=[]"

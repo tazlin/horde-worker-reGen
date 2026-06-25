@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.supervisor_channel import SystemMemorySnapshot
-from horde_worker_regen.process_management.system_memory import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import SystemMemorySnapshot
+from horde_worker_regen.process_management.resources.system_memory import (
     ROLE_DOWNLOAD,
     ROLE_INFERENCE,
     ROLE_ORCHESTRATOR,

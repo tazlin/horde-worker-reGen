@@ -8,8 +8,8 @@ format they share.
 
 Frames are a 4-byte big-endian length followed by a UTF-8 JSON object with a ``type`` field. The payloads
 reuse the already-JSON-round-trippable channel models
-([`WorkerStateSnapshot`][horde_worker_regen.process_management.supervisor_channel.WorkerStateSnapshot],
-[`SupervisorControlMessage`][horde_worker_regen.process_management.supervisor_channel.SupervisorControlMessage]),
+([`WorkerStateSnapshot`][horde_worker_regen.process_management.ipc.supervisor_channel.WorkerStateSnapshot],
+[`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]),
 so the snapshot/command schema stays defined in one place.
 """
 
@@ -20,7 +20,7 @@ import socket
 import struct
 from typing import Any
 
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SUPERVISOR_PROTOCOL_VERSION,
     SupervisorControlMessage,
     WorkerStateSnapshot,

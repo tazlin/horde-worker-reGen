@@ -2,7 +2,7 @@
 
 The worker mirrors every lifecycle action it takes on its children to ``.horde_worker_regen/
 action_ledger.jsonl`` (size-rotated to ``.jsonl.1``); see
-``horde_worker_regen.process_management.action_ledger``. That file is the structured spine of an
+``horde_worker_regen.process_management.ipc.action_ledger``. That file is the structured spine of an
 incident: spawn/replace/quarantine/give-up events with ``os_pid``/``launch_identifier``/``job_id`` and
 a free-form ``reason``/``detail``. This module locates and parses it.
 
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from horde_worker_regen.process_management.action_ledger import LedgerEvent
+from horde_worker_regen.process_management.ipc.action_ledger import LedgerEvent
 
 _LEDGER_FILENAME = "action_ledger.jsonl"
 _APP_STATE_DIRNAME = ".horde_worker_regen"

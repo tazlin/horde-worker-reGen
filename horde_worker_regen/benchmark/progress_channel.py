@@ -23,10 +23,10 @@ from typing import TYPE_CHECKING, Annotated, Literal
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
-from horde_worker_regen.process_management.duty_cycle import format_phase_gaps, phase_breakdown
+from horde_worker_regen.process_management.resources.duty_cycle import format_phase_gaps, phase_breakdown
 
 if TYPE_CHECKING:
-    from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
+    from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot
 
 PROGRESS_FILENAME = "progress.jsonl"
 """The progress event log written into a run's output directory."""

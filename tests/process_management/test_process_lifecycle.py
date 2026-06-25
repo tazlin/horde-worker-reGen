@@ -9,13 +9,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState
-from horde_worker_regen.process_management.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 
 from .conftest import (
     make_job_pop_response,
@@ -97,7 +97,8 @@ class TestModelLoadFailureQuarantine:
     """A model that deterministically fails to load is quarantined, instead of churning the process pool."""
 
     def test_quarantines_only_after_threshold(self) -> None:
-        from horde_worker_regen.process_management.process_lifecycle import (
+        """A model is quarantined only after the configured failure threshold."""
+        from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
             MODEL_LOAD_FAILURE_QUARANTINE_THRESHOLD,
         )
 
@@ -113,6 +114,7 @@ class TestModelLoadFailureQuarantine:
         assert model in plm.quarantined_models()
 
     def test_distinct_models_do_not_pool_failures(self) -> None:
+        """Failures for different models are counted independently."""
         plm = _make_plm()
         # Two different models each failing under the threshold must not combine to a quarantine.
         plm.record_model_load_failure(process_id=1, model_name="model_a")
@@ -121,6 +123,7 @@ class TestModelLoadFailureQuarantine:
         assert plm.is_model_load_quarantined("model_b") is False
 
     def test_none_model_is_never_quarantined(self) -> None:
+        """A missing model name is never treated as a quarantine candidate."""
         plm = _make_plm()
         assert plm.is_model_load_quarantined(None) is False
 
@@ -129,7 +132,7 @@ class TestModelLoadFailureQuarantine:
 
         The fault is the model's, not the slot's, so a poison model must not quarantine a healthy slot.
         """
-        from horde_worker_regen.process_management.process_lifecycle import CRASH_LOOP_MAX_REPLACEMENTS
+        from horde_worker_regen.process_management.lifecycle.process_lifecycle import CRASH_LOOP_MAX_REPLACEMENTS
 
         plm = _make_plm()
         # Don't touch real OS processes; only the recovery-classification logic is under test.
@@ -172,7 +175,7 @@ def test_empty_process_map_is_not_declared_all_unresponsive() -> None:
 
 def test_broadcast_reload_model_database_targets_inference_and_download() -> None:
     """The reload broadcast reaches every inference process and the download process."""
-    from horde_worker_regen.process_management.messages import HordeControlFlag, HordeControlMessage
+    from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeControlMessage
 
     process_map = ProcessMap({})
     inf0 = make_mock_process_info(0)
@@ -351,7 +354,7 @@ def test_intentional_reclaim_does_not_register_backoff_strike() -> None:
 
 def test_effective_aux_download_timeout_shortens_under_backoff() -> None:
     """The stuck-aux grace is the configured timeout until a strike, then the shortened fast-fault value."""
-    from horde_worker_regen.process_management.process_lifecycle import FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS
+    from horde_worker_regen.process_management.lifecycle.process_lifecycle import FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS
 
     plm = _make_plm()
     bridge_data = plm._runtime_config.bridge_data
@@ -367,7 +370,7 @@ def test_effective_aux_download_timeout_shortens_under_backoff() -> None:
 
 def test_aux_download_deadline_for_dispatch_tracks_watchdog_minus_margin() -> None:
     """The child-side deadline is the (backoff-aware) watchdog timeout minus the safety margin, floored."""
-    from horde_worker_regen.process_management.process_lifecycle import (
+    from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
         AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS,
         FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS,
         MIN_AUX_DOWNLOAD_DEADLINE_SECONDS,

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from horde_worker_regen.process_management.supervisor_channel import WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot
 from horde_worker_regen.tui.attach import SupervisorLike
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode
 

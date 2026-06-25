@@ -28,16 +28,13 @@ instead of the exclusive-evict-all admit.
 
 from __future__ import annotations
 
-from unittest.mock import Mock
-
 import pytest
 
-from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState, ModelLoadState
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.resource_budget import StreamForecast
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 
 from .conftest import (
     make_job_pop_response,
@@ -76,7 +73,7 @@ def _idle_context_map(num_processes: int, *, free_mb: float) -> ProcessMap:
     return ProcessMap(procs)
 
 
-def _coreside_scheduler(num_processes: int, *, free_mb: float):
+def _coreside_scheduler(num_processes: int, *, free_mb: float) -> tuple[object, ProcessMap]:
     """A budget-active scheduler over ``num_processes`` idle contexts pinning device-free to ``free_mb``."""
     process_map = _idle_context_map(num_processes, free_mb=free_mb)
     bridge_data = make_mock_bridge_data(
@@ -203,7 +200,7 @@ class TestNoEvictAllThrash:
         scheduler.set_measured_marginal_overhead_mb(_PROBE_MARGINAL_MB)
         scheduler._maybe_capture_idle_context_residency()
         monkeypatch.setattr(
-            "horde_worker_regen.process_management.resource_budget.predict_job_weight_mb",
+            "horde_worker_regen.process_management.resources.resource_budget.predict_job_weight_mb",
             lambda job, baseline: _SDXL_WEIGHTS_MB,
         )
 

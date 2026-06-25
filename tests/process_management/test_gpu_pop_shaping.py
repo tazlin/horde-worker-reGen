@@ -8,7 +8,7 @@ one card's config.
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.gpu_pop_shaping import advertised_capabilities, under_fed_card
+from horde_worker_regen.process_management.gpu.gpu_pop_shaping import advertised_capabilities, under_fed_card
 
 from .conftest import make_mock_bridge_data, make_test_card_runtimes
 

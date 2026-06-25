@@ -35,7 +35,7 @@ from horde_worker_regen.app_state import (
     benchmark_status_summary,
     should_prompt_onboarding,
 )
-from horde_worker_regen.process_management.supervisor_channel import DownloadPhase, WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import DownloadPhase, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.tui import socket_protocol as sp
@@ -604,9 +604,12 @@ class HordeWorkerTUI(App[None]):
         self._frame += 1
         snapshot = self._supervisor.latest_snapshot
         # Clear the "m" intent once the advisory poll confirms the horde reflects the requested state.
-        if self._intended_server_maintenance is not None and snapshot is not None:
-            if snapshot.worker_details_maintenance == self._intended_server_maintenance:
-                self._intended_server_maintenance = None
+        if (
+            self._intended_server_maintenance is not None
+            and snapshot is not None
+            and snapshot.worker_details_maintenance == self._intended_server_maintenance
+        ):
+            self._intended_server_maintenance = None
         # Toast exactly once when the pop loop first sees a maintenance-mode error from the horde.
         pop_maint = snapshot.last_pop_maintenance_mode if snapshot is not None else False
         if pop_maint and not self._prev_pop_maintenance_mode:

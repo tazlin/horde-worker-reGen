@@ -20,13 +20,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.process_management import resource_budget
-from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState
-from horde_worker_regen.process_management.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources import resource_budget
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 
 from .conftest import make_job_pop_response, make_mock_bridge_data, make_mock_process_info, track_popped_job_async
 from .test_deadlock_detection import _make_message_dispatcher

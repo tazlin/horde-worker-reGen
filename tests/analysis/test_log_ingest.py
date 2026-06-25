@@ -14,7 +14,7 @@ from horde_worker_regen.analysis.log_ingest import parse_lines, parse_ts, read_r
 
 _GOOD = (
     "2026-06-24 18:30:38.847 | ERROR    | "
-    "horde_worker_regen.process_management.process_lifecycle:_reap_if_crashed:962 - "
+    "horde_worker_regen.process_management.lifecycle.process_lifecycle:_reap_if_crashed:962 - "
     "process 1 exited unexpectedly (exitcode=1)"
 )
 _STARTUP = "2026-06-24 18:09:40.795 | CRITICAL | inference_1:startup - worker child crashed before its log was ready:"
@@ -27,7 +27,7 @@ class TestLineParsing:
         """A normal orchestrator line yields all structured fields."""
         (record,) = parse_lines([_GOOD], Path("bridge.log"))
         assert record.level == "ERROR"
-        assert record.name == "horde_worker_regen.process_management.process_lifecycle"
+        assert record.name == "horde_worker_regen.process_management.lifecycle.process_lifecycle"
         assert record.function == "_reap_if_crashed"
         assert record.lineno == 962
         assert "exitcode=1" in record.message

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.messages import HordeProcessState
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.process_temperature import (
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.process_temperature import (
     ProcessTemperature,
     classify_process_temperature,
     temperature_phrase,

@@ -6,7 +6,7 @@ import socket
 
 import pytest
 
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SupervisorCommand,
     SupervisorControlMessage,
     WorkerConfigSummary,
@@ -92,7 +92,7 @@ def test_snapshot_full_fidelity_roundtrip() -> None:
     (which stringifies dict keys). This guards that the dashboard sees identical data in attach mode:
     int-keyed per-process maps, nested process/download models, enum fields, and derived properties.
     """
-    from horde_worker_regen.process_management.supervisor_channel import (
+    from horde_worker_regen.process_management.ipc.supervisor_channel import (
         CurrentDownloadStatus,
         DownloadPhase,
         DownloadStatusSnapshot,

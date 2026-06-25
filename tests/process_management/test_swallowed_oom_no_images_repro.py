@@ -38,8 +38,8 @@ from __future__ import annotations
 
 import pytest
 
-from horde_worker_regen.process_management.failure_classification import is_resource_failure
-from horde_worker_regen.process_management.job_tracker import InferenceFailureResolution, JobTracker
+from horde_worker_regen.process_management.jobs.failure_classification import is_resource_failure
+from horde_worker_regen.process_management.jobs.job_tracker import InferenceFailureResolution, JobTracker
 
 from .conftest import make_job_pop_response, make_mock_process_info
 

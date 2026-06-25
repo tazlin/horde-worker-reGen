@@ -30,7 +30,7 @@ opposite responses:
 The worker draws this line for you. A window where no completed jobs ran and at least 10% of the time
 had no work available is reported as *demand-limited* and logged calmly; a low reading *with* jobs
 queued escalates to a warning. The split is computed in
-[`DutyCycleSummary.is_demand_limited`][horde_worker_regen.process_management.duty_cycle.DutyCycleSummary.is_demand_limited],
+[`DutyCycleSummary.is_demand_limited`][horde_worker_regen.process_management.resources.duty_cycle.DutyCycleSummary.is_demand_limited],
 and it is the first thing to check before reaching for any tuning knob.
 
 ## How it is measured
@@ -72,7 +72,7 @@ out. That signature points you at the inter-job phases rather than at the sample
 
 On a backend that cannot report utilization, the worker still produces a duty figure from the job
 timings alone.
-[`span_derived_busy_ratio`][horde_worker_regen.process_management.duty_cycle.span_derived_busy_ratio]
+[`span_derived_busy_ratio`][horde_worker_regen.process_management.resources.duty_cycle.span_derived_busy_ratio]
 divides the GPU-touching phases of a typical job (`vram_load`, `sampling`, `vae`, `encode`) by its
 whole wall-clock, giving a phase-attributed duty estimate that needs no tracing backend. The log line's
 `source=` field tells you which signal backed the headline: `nvml` for a measured figure or
@@ -87,12 +87,12 @@ spam the log; everything rides on the one throttled line. Two attributions are f
 
 ### Phase breakdown
 
-[`phase_breakdown`][horde_worker_regen.process_management.duty_cycle.phase_breakdown] reports the
+[`phase_breakdown`][horde_worker_regen.process_management.resources.duty_cycle.phase_breakdown] reports the
 median seconds a job spent in each lifecycle phase, in pipeline order: `queue_wait`, `model_unload`,
 `disk_load` (disk to RAM), `vram_load` (RAM to VRAM), `sampling`, `vae` (VAE decode), `encode`
 (CLIP/VAE prompt and image encode), `graph_overhead` (ComfyUI graph build, validate, and teardown),
 `other_inference` (node and IPC residual), `safety`, and `submit`. Only the four phases in
-[`GPU_BUSY_PHASES`][horde_worker_regen.process_management.duty_cycle.GPU_BUSY_PHASES] (`vram_load`,
+[`GPU_BUSY_PHASES`][horde_worker_regen.process_management.resources.duty_cycle.GPU_BUSY_PHASES] (`vram_load`,
 `sampling`, `vae`, `encode`) put the GPU core to work; the rest are worker-side hand-off the
 [scheduler](performance_and_backpressure.md) can try to shrink, and the line surfaces the two largest
 of them as the "biggest worker-side gaps".
@@ -119,7 +119,7 @@ levers, [model stickiness](#tuning-levers-and-what-they-cannot-do) and residency
 
 ## Where to read it
 
-The same [`DutyCycleSummary`][horde_worker_regen.process_management.duty_cycle.DutyCycleSummary]
+The same [`DutyCycleSummary`][horde_worker_regen.process_management.resources.duty_cycle.DutyCycleSummary]
 surfaces in three places, so you can watch it live or reconstruct it after the fact.
 
 ### The live log line
@@ -241,8 +241,8 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
 - [Configure for your GPU](../how-to/configure-for-your-gpu.md): choosing models, modes, and the
   benchmark that sets them
 - [Telemetry](telemetry.md): the broader run-metrics and tracing layer this builds on
-- [`DutyCycleSummary`][horde_worker_regen.process_management.duty_cycle.DutyCycleSummary] and
-  [`summarize_duty_cycle`][horde_worker_regen.process_management.duty_cycle.summarize_duty_cycle]: the
+- [`DutyCycleSummary`][horde_worker_regen.process_management.resources.duty_cycle.DutyCycleSummary] and
+  [`summarize_duty_cycle`][horde_worker_regen.process_management.resources.duty_cycle.summarize_duty_cycle]: the
   shared summary used by both the live worker and the benchmark
 - [`GpuUtilizationSampler`][horde_worker_regen.utils.gpu_monitor.GpuUtilizationSampler]: the background
   utilization sampler

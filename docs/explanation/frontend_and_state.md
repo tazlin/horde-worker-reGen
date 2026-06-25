@@ -28,15 +28,15 @@ The headless path is fully self-sufficient; the TUI is purely additive. See
 ## The supervisor channel
 
 A supervising frontend launches the worker as a child and holds one end of a
-duplex pipe. [`supervisor_channel.py`][horde_worker_regen.process_management.supervisor_channel]
+duplex pipe. [`supervisor_channel.py`][horde_worker_regen.process_management.ipc.supervisor_channel]
 defines the structured protocol over it:
 
 - The worker pushes
-  [`WorkerStateSnapshot`][horde_worker_regen.process_management.supervisor_channel.WorkerStateSnapshot]
+  [`WorkerStateSnapshot`][horde_worker_regen.process_management.ipc.supervisor_channel.WorkerStateSnapshot]
   objects at a steady cadence (the same data the overview, per-process view, and
   Downloads tab render), including a `SystemMemorySnapshot` (machine total/available
   RAM plus per-role worker RSS) and a `per_card` list of
-  [`CardSnapshot`][horde_worker_regen.process_management.supervisor_channel.CardSnapshot]
+  [`CardSnapshot`][horde_worker_regen.process_management.ipc.supervisor_channel.CardSnapshot]
   (one per driven GPU: VRAM headroom, inference contexts, whole-card residency, and
   per-card fault/unservable-model health) that the GPUs tab and the Overview per-card
   strip render. Each `ProcessSnapshot` also carries the `device_index` of the card its
@@ -44,7 +44,7 @@ defines the structured protocol over it:
   is versioned by `SUPERVISOR_PROTOCOL_VERSION` (currently 8) so a frontend can detect a
   mismatch with a worker built from different code.
 - The worker drains
-  [`SupervisorControlMessage`][horde_worker_regen.process_management.supervisor_channel.SupervisorControlMessage]
+  [`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate
   limit, etc.).
 
@@ -115,7 +115,7 @@ the host holds the only handle and a job member's children join the job
 automatically, the OS terminates the whole tree the instant the host process
 ends, however it ends. Second, the host records the worker pid it owns in a
 dedicated registry
-([`OwnedProcessRegistry`][horde_worker_regen.process_management.owned_process_registry.OwnedProcessRegistry],
+([`OwnedProcessRegistry`][horde_worker_regen.process_management.lifecycle.owned_process_registry.OwnedProcessRegistry],
 in `host_owned_pids.json`) and, on startup, reaps any tree a previous host
 orphaned before serving (`reap_orphans_from_previous_run(kill_tree=True)`). The
 job object is the immediate guarantee; the registry sweep is the backstop for
@@ -156,7 +156,7 @@ Worker names are unique horde-wide and tied to the API key that first registers
 them, and each worker *type* (the image "dreamer" and the alchemy "alchemist")
 registers as a separate, uniquely-named worker. Getting this wrong otherwise
 surfaces only as a late, cryptic "Wrong credentials to submit as this worker" at
-pop time. [`worker_identity.py`][horde_worker_regen.process_management.worker_identity]
+pop time. [`worker_identity.py`][horde_worker_regen.process_management.config.worker_identity]
 fails fast *before* any process spawns:
 
 1. A **local** check (no network): names must not be the reserved template

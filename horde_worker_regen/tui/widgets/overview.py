@@ -15,13 +15,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from horde_worker_regen.app_state import OverviewViewMode
-from horde_worker_regen.process_management.feature_readiness import FeatureReadinessState
-from horde_worker_regen.process_management.process_temperature import (
-    ProcessTemperature,
-    classify_process_temperature,
-    temperature_phrase,
-)
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CardSnapshot,
     FeatureReadinessSummary,
     JobQueueEntry,
@@ -30,6 +24,12 @@ from horde_worker_regen.process_management.supervisor_channel import (
     WholeCardResidencyStatus,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.process_management.lifecycle.process_temperature import (
+    ProcessTemperature,
+    classify_process_temperature,
+    temperature_phrase,
+)
+from horde_worker_regen.process_management.models.feature_readiness import FeatureReadinessState
 from horde_worker_regen.tui.formatters import (
     format_its,
     format_percent,
@@ -320,7 +320,7 @@ class OverviewView(VerticalScroll):
         wire = snapshot.system_memory
         if wire is None or wire.total_bytes <= 0:
             return None
-        from horde_worker_regen.process_management.system_memory import ROLE_LABELS
+        from horde_worker_regen.process_management.resources.system_memory import ROLE_LABELS
 
         summary = wire.to_summary()
         used_fraction = summary.used_fraction

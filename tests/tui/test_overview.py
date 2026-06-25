@@ -4,12 +4,7 @@ from __future__ import annotations
 
 from rich.console import Console
 
-from horde_worker_regen.process_management.feature_readiness import (
-    FeatureReadiness,
-    FeatureReadinessState,
-    GatedFeature,
-)
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadPhase,
     DownloadPlanSummary,
@@ -21,6 +16,11 @@ from horde_worker_regen.process_management.supervisor_channel import (
     WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerStateSnapshot,
+)
+from horde_worker_regen.process_management.models.feature_readiness import (
+    FeatureReadiness,
+    FeatureReadinessState,
+    GatedFeature,
 )
 from horde_worker_regen.tui.health import derive
 from horde_worker_regen.tui.widgets.overview import OverviewView
@@ -328,7 +328,7 @@ def test_queue_table_sheds_wide_columns_when_cramped() -> None:
 
 def test_recent_jobs_table_shows_baseline_size_and_timings() -> None:
     """Recent jobs surface baseline, size, and the queue/safety/E2E timings (favouring more data)."""
-    from horde_worker_regen.process_management.supervisor_channel import RecentJobRecord
+    from horde_worker_regen.process_management.ipc.supervisor_channel import RecentJobRecord
 
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),

@@ -11,20 +11,20 @@ from horde_model_reference.model_reference_records import ImageGenerationModelRe
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 from pydantic import JsonValue
 
-from horde_worker_regen.process_management.api_sessions import ApiSessions
-from horde_worker_regen.process_management.card_runtime import CardRuntime
-from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeProcessState
-from horde_worker_regen.process_management.model_metadata import ModelMetadata
-from horde_worker_regen.process_management.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.process_manager import (
     HordeWorkerProcessManager,
     MultiprocessingPrimitives,
     SystemResources,
 )
-from horde_worker_regen.process_management.runtime_config import RuntimeConfig
+from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 
 
 async def track_popped_job_async(

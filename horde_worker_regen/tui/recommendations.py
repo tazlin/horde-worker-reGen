@@ -11,7 +11,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 
-from horde_worker_regen.process_management.supervisor_channel import WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot
 
 
 class Severity(enum.IntEnum):

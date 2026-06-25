@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from horde_worker_regen.process_management.child_crash_capture import (
+from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
     enable_child_faulthandler,
     read_last_startup_crash,
     write_startup_crash,

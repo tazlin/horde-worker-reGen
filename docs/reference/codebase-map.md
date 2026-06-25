@@ -9,33 +9,31 @@ these files, read [Architecture](../explanation/architecture.md) first.
 > touches a GPU; it drives child **inference** and **safety** processes over
 > IPC.
 
-## Where do I look for…?
+## Where do I look for...?
 
-| If you're working on…                 | Start in…                                             |
-| ------------------------------------- | ----------------------------------------------------- |
-| Job popping / pop gates               | `job_popper.py` (`JobPopper`)                         |
-| Pop-rate & megapixelstep throttling   | `pop_throttler.py` (`PopThrottler`)                   |
-| Job stages, faults, invariants        | `job_tracker.py` (`JobTracker`)                       |
-| Scheduling inference & model preloads | `inference_scheduler.py` (`InferenceScheduler`)       |
-| Safety-check dispatch                 | `safety_orchestrator.py` (`SafetyOrchestrator`)       |
-| Alchemy pop / dispatch / submit       | `alchemy_popper.py` (`AlchemyCoordinator`)            |
-| Parsing child→parent messages         | `message_dispatcher.py` (`MessageDispatcher`)         |
-| Starting / replacing child processes  | `process_lifecycle.py` (`ProcessLifecycleManager`)    |
-| Result upload & submission            | `job_submitter.py` (`JobSubmitter`)                   |
-| Run metrics / disk / telemetry        | `run_metrics.py`, `utils/disk_monitor.py`, `telemetry.py`, `telemetry_spans.py` |
-| Shutdown / abort / signals            | `shutdown_manager.py` (`ShutdownManager`)             |
-| Bounded/degraded retry & SOS recovery | `job_tracker.py`, `failure_classification.py`, `recovery_supervisor.py` |
-| Crash audit & orphan reaping          | `action_ledger.py`, `owned_process_registry.py`      |
-| Job-cost / "slow job" scoring         | `performance_model.py`; model→process pinning: `model_affinity.py` |
-| Background model downloads            | `download_process.py`, `model_availability.py`, `model_download_plan.py` |
-| Chaos / fault-injection testing       | `fault_injection.py`, `fake_worker_processes.py`     |
-| Config fields & hot-reload            | `bridge_data/`, `runtime_config.py` (`RuntimeConfig`) |
-| IPC message & enum definitions        | `messages.py`                                         |
-| What runs inside a child process      | `inference_process.py`, `safety_process.py`           |
-| The dashboard / TUI                   | `tui/` (`horde-worker`); state channel: `supervisor_channel.py` |
-| Durable cross-run state               | `app_state.py` (`.horde_worker_regen/state.json`)    |
-| Worker-name preflight                 | `worker_identity.py`                                  |
-| Progressive benchmark / ramp CLI      | `benchmark/` (`horde-benchmark`)                      |
+| If you're working on...                | Start in...                                                        |
+| -------------------------------------- | ------------------------------------------------------------------ |
+| Top-level orchestration                | `process_management/process_manager.py` (`HordeWorkerProcessManager`) |
+| Process startup                        | `process_management/main_entry_point.py`, `worker_entry_points.py` |
+| Job popping / pop gates                | `process_management/jobs/job_popper.py` (`JobPopper`)              |
+| Job stages, faults, invariants         | `process_management/jobs/job_tracker.py` (`JobTracker`)            |
+| Scheduling inference & model preloads  | `process_management/scheduling/inference_scheduler.py` (`InferenceScheduler`) |
+| Pop-rate & megapixelstep throttling    | `process_management/scheduling/pop_throttler.py` (`PopThrottler`)  |
+| Safety-check dispatch                  | `process_management/workers/safety_orchestrator.py` (`SafetyOrchestrator`) |
+| Alchemy pop / dispatch / submit        | `process_management/jobs/alchemy_popper.py` (`AlchemyCoordinator`) |
+| Parsing child-to-parent messages       | `process_management/ipc/message_dispatcher.py` (`MessageDispatcher`) |
+| IPC message and enum definitions       | `process_management/ipc/messages.py`                               |
+| Starting / replacing child processes   | `process_management/lifecycle/process_lifecycle.py` (`ProcessLifecycleManager`) |
+| Live process state                     | `process_management/lifecycle/process_map.py`, `process_info.py`   |
+| Result upload & submission             | `process_management/jobs/job_submitter.py` (`JobSubmitter`)        |
+| Config fields & hot-reload             | `bridge_data/`, `process_management/config/runtime_config.py`      |
+| Dashboard state channel                | `process_management/ipc/supervisor_channel.py`                     |
+| What runs inside a child process       | `process_management/workers/inference_process.py`, `safety_process.py`, `download_process.py` |
+| Model availability and downloads       | `process_management/models/`, `process_management/workers/download_process.py` |
+| VRAM/RAM budgeting and metrics         | `process_management/resources/`                                    |
+| Multi-GPU routing                      | `process_management/gpu/`                                          |
+| Dry-run / test doubles                 | `process_management/testing/`                                      |
+| Progressive benchmark / ramp CLI       | `benchmark/` (`horde-benchmark`)                                   |
 
 ## Program entry points
 
@@ -43,100 +41,35 @@ The startup path, in order:
 
 | Step                  | Location                                                                                     | Role                                                                                                                                 |
 | --------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| 1. Process launch     | `run_worker.py` (`init` → `main`)                                                            | Sets the `spawn` start method, clears a stale `.abort`, parses CLI args, validates config, ensures the model reference DB is present |
-| 2. Driver bootstrap   | `main_entry_point.py` (`start_working`)                                                      | Builds and runs the main-process orchestrator                                                                                        |
-| 3. Main orchestrator  | `process_manager.py` (`HordeWorkerProcessManager._main_loop`)                                | Owns the asyncio event loop and the long-lived tasks                                                                                 |
-| 4. Child entry points | `worker_entry_points.py` (`ProcessEntryPoints`)                                              | The callables each spawned child process runs                                                                                        |
-| 5. Child workloads    | `inference_process.py` (`HordeInferenceProcess`), `safety_process.py` (`HordeSafetyProcess`) | The actual GPU/classifier work, subclassing `HordeProcess` (`horde_process.py`)                                                      |
+| 1. Process launch     | `run_worker.py` (`init` -> `main`)                                                           | Sets the `spawn` start method, clears a stale `.abort`, parses CLI args, validates config, ensures the model reference DB is present |
+| 2. Driver bootstrap   | `process_management/main_entry_point.py` (`start_working`)                                   | Builds and runs the main-process orchestrator                                                                                        |
+| 3. Main orchestrator  | `process_management/process_manager.py` (`HordeWorkerProcessManager._main_loop`)             | Owns the asyncio event loop and the long-lived tasks                                                                                 |
+| 4. Child entry points | `process_management/worker_entry_points.py` (`ProcessEntryPoints`)                           | The callables each spawned child process runs                                                                                        |
+| 5. Child workloads    | `process_management/workers/inference_process.py`, `workers/safety_process.py`               | The actual GPU/classifier work, subclassing `HordeProcess` (`lifecycle/horde_process.py`)                                            |
 
 ## Core orchestration: `process_management/`
 
 The main process is a set of single-responsibility sub-managers that all share
 state by reference (see
 [Architecture](../explanation/architecture.md#the-shared-state-pattern)).
+`process_manager.py`, `main_entry_point.py`, and `worker_entry_points.py` stay
+at the top level because they are the facade and entry points. The other
+process-management modules live in canonical subpackages; import those grouped
+module paths directly.
 
-### Coordination
-
-| File                    | Primary type                | Responsibility                                                                                        |
-| ----------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `process_manager.py`    | `HordeWorkerProcessManager` | Top-level orchestrator; the asyncio loop, the long-lived tasks, signal registration, performance-mode setup, run-metrics/disk-monitor wiring |
-| `message_dispatcher.py` | `MessageDispatcher`         | Drains the child→parent queue, applies results, discards stale messages, logs deadlock diagnostics    |
-
-### Job pipeline
-
-| File                         | Primary type            | Responsibility                                                                                         |
-| ---------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------ |
-| `job_popper.py`              | `JobPopper`             | The "pop gauntlet" of gates; consecutive-failure backoff                                               |
-| `pop_throttler.py`           | `PopThrottler`          | Pop-rate frequencies and megapixelstep wait timing (`CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS` lives here) |
-| `inference_scheduler.py`     | `InferenceScheduler`    | Decides which job/model to preload and launch; the line-skip cache, size/progress-aware concurrent-overlap gating, idle-thread diversity dispatch, and the VRAM-aware co-resident-context teardown |
-| `safety_orchestrator.py`     | `SafetyOrchestrator`    | Dispatches completed images to the safety process                                                      |
-| `alchemy_popper.py`          | `AlchemyCoordinator`    | The separate alchemy pop/dispatch/submit loop and its concurrency gating (`AlchemyHeadroomEstimator`)  |
-| `job_submitter.py`           | `JobSubmitter`          | Uploads images to R2 and submits results to the API                                                    |
-| `source_image_downloader.py` | `SourceImageDownloader` | Fetches source images for img2img / remix jobs                                                         |
-
-### Process & IPC management
-
-| File                   | Primary type              | Responsibility                                                                                         |
-| ---------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `process_lifecycle.py` | `ProcessLifecycleManager` | Starts, stops, replaces, and hung-checks child processes; owns the shared semaphores/locks             |
-| `process_map.py`       | `ProcessMap`              | The live `HordeProcessInfo` per process; validates state transitions                                   |
-| `process_info.py`      | `HordeProcessInfo`        | Per-process bookkeeping record                                                                         |
-| `process_temperature.py` | `ProcessTemperature`    | Pure classifier turning a slot's raw state + resident/pending models into a "temperature" (hot/next/warm/priming/cold/down) for the status line and TUI |
-| `messages.py`          | message classes + enums   | All IPC message types, `HordeProcessState`, `ModelLoadState`, `HordeControlFlag`, `HordeHeartbeatType` |
-| `shutdown_manager.py`  | `ShutdownManager`         | Graceful shutdown, abort, and the signal handler                                                       |
-
-### State, config, and models
-
-| File                 | Primary type                                         | Responsibility                                                                       |
-| -------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `job_tracker.py`     | `JobTracker` (+ `JobStage`, `TrackedJob`)            | The single source of truth for job stages, faults, counters, and megapixelstep state |
-| `job_models.py`      | `HordeJobInfo`, `PendingJob`, `NextJobAndProcess`, … | Job-related data models passed between sub-managers                                  |
-| `worker_state.py`    | `WorkerState`                                        | Cross-cutting flags: shutdown, pop times, consecutive failures, kudos                |
-| `runtime_config.py`  | `RuntimeConfig`                                      | Live, hot-reloadable `reGenBridgeData` snapshot                                      |
-| `horde_model_map.py` | `HordeModelMap`                                      | Model name → load state + owning process                                             |
-| `model_metadata.py`  | `ModelMetadata`                                      | Stable-diffusion model reference lookups                                             |
-| `api_sessions.py`    | `ApiSessions`                                        | aiohttp and horde-sdk client sessions                                                |
-| `lru_cache.py`       | `LRUCache`                                           | Recency ordering used by model eviction                                              |
-| `run_metrics.py`     | `WorkerRunMetrics` (+ `RunMetricsSnapshot`)          | Aggregates per-job latencies, child phase/download metrics, and crashes for the benchmark/e2e harness |
-| `system_memory.py`   | `SystemMemorySummary`                                | Samples total/available system RAM and per-role RSS (orchestrator/inference/safety/download) via psutil, for the supervisor snapshot and TUI |
-
-### Resilience and recovery
-
-| File                        | Primary type           | Responsibility                                                                                  |
-| --------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------- |
-| `failure_classification.py` | (functions)            | Classify a faulted result as a resource (OOM) failure vs other, to choose the retry strategy    |
-| `recovery_supervisor.py`    | `RecoverySupervisor`   | Pure save-our-ship escalation policy: soft-reset (limp-by) vs give-up timing                     |
-| `action_ledger.py`          | `ActionLedger`         | Append-only audit ring (+ optional JSONL) of lifecycle actions for crash diagnosis              |
-| `owned_process_registry.py` | `OwnedProcessRegistry` | Durable record of owned OS pids so orphans can be reaped after a hard parent death              |
-| `performance_model.py`      | `PerformanceModel`     | Expected sampling it/s per job signature (benchmark-seeded + self-calibrating) to grade "slow"  |
-| `model_affinity.py`         | (functions)            | Compute which processes hold the last copy of a wanted model, to protect them from displacement |
-| `fault_injection.py`        | `FaultProfile`         | Typed misbehaviour profiles for the fake processes (hang/crash/slow/OOM/malformed)              |
-
-### Downloads and model availability
-
-| File                      | Primary type        | Responsibility                                                                       |
-| ------------------------- | ------------------- | ------------------------------------------------------------------------------------ |
-| `download_process.py`     | (process entry)     | Dedicated background weight-download process (outside the process map); phase/pause/rate reporting |
-| `model_availability.py`   | `ModelAvailability` | On-disk model set + live download status; gates the popper's advertised models       |
-| `model_download_plan.py`  | (top-level)         | Torch-free planning: which configured models are on disk, disk usage, and fit        |
-| `reference_helper.py`     | (top-level)         | Offline (never-download) reference manager for subprocesses; parent owns downloading |
-
-### Frontend and durable state
-
-| Path                    | Primary type            | Responsibility                                                                  |
-| ----------------------- | ----------------------- | ------------------------------------------------------------------------------- |
-| `tui/`                  | Textual app (`horde-worker`) | The dashboard: launches/supervises the worker, renders live state, wizard, config editor |
-| `supervisor_channel.py` | `WorkerStateSnapshot`, `SupervisorControlMessage` | Structured state/control protocol between a frontend and the worker (`SUPERVISOR_PROTOCOL_VERSION`, currently 6; snapshot carries `SystemMemorySnapshot`) |
-| `app_state.py`          | (top-level)             | Durable cross-run state (`.horde_worker_regen/state.json`)                       |
-| `worker_identity.py`    | (functions)             | Startup fail-fast checks that configured worker names are valid and owned        |
-
-### Dry-run / test doubles
-
-`fake_worker_processes.py` (`FakeInferenceProcess`, `FakeSafetyProcess`),
-`_canned_scenarios.py` (`CannedJobSource`, `CannedAlchemySource`),
-`_dummy_images.py`, and `_dummy_jobs.py` substitute synthetic jobs and results so
-the pipeline can run without the network or a GPU (see
-[Architecture](../explanation/architecture.md#dry-run-mode)).
+| Subpackage | Responsibility |
+| ---------- | -------------- |
+| `lifecycle/` | Parent-side process machinery: spawn, supervise, reap, replace, shutdown, recovery, crash capture, process maps, and process metadata. |
+| `workers/` | Child-process bodies and worker-side orchestration: inference, safety, safety dispatch, and background downloads. |
+| `scheduling/` | What to run, when, where, and why: inference scheduling, pop throttling, model affinity, performance model, and workload flow routing. |
+| `jobs/` | The unit of work: pop, submit, track, classify failures, alchemy coordination, job data models, and source-image downloads. |
+| `models/` | On-disk model state and feature readiness: desired state, availability, metadata, load map, cache, LoRA guards/backoff, and download scheduling. |
+| `resources/` | Runtime resource accounting: VRAM/RAM budgets, device info, system memory, duty-cycle summaries, and run metrics. |
+| `gpu/` | Multi-GPU routing primitives: card runtime state, eligibility checks, and advertised pop-shaping capabilities. |
+| `ipc/` | Message types, channels, dispatch, supervisor protocol, action ledger, and API sessions. |
+| `config/` | Live runtime config, mutable worker state, and worker identity preflight. |
+| `testing/` | Dry-run and test-double modules that are imported by both tests and the harness. |
+| `_internal/` | Cross-cutting internal helpers that do not belong to a domain package. |
 
 ## Supporting top-level packages
 

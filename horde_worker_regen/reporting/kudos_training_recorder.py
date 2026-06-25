@@ -10,7 +10,7 @@ from horde_model_reference.model_reference_records import ImageGenerationModelRe
 from loguru import logger
 
 if TYPE_CHECKING:
-    from horde_worker_regen.process_management.job_models import HordeJobInfo
+    from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 
 
 _excludes_for_job_dump = {

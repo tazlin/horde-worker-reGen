@@ -1,7 +1,7 @@
 """Durable, app-managed state that persists across worker runs.
 
 This is the structured, on-disk counterpart to the in-memory
-[`WorkerState`][horde_worker_regen.process_management.worker_state.WorkerState]: it records what the
+[`WorkerState`][horde_worker_regen.process_management.config.worker_state.WorkerState]: it records what the
 application needs to remember *between* invocations: the last benchmark and where its results live,
 the last worker run, the last-known-good settings, and which worker version last ran (so that a
 version bump can mark a stale benchmark for re-running).

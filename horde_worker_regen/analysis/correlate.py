@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from horde_worker_regen.process_management.action_ledger import LedgerEvent
+from horde_worker_regen.process_management.ipc.action_ledger import LedgerEvent
 
 from .bundle import LogBundle
 from .log_ingest import LogRecord

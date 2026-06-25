@@ -12,9 +12,12 @@ from multiprocessing.synchronize import Lock, Semaphore
 
 from loguru import logger
 
-from horde_worker_regen.process_management._aliased_types import ProcessQueue
-from horde_worker_regen.process_management.child_crash_capture import enable_child_faulthandler, write_startup_crash
-from horde_worker_regen.process_management.debug_attach import maybe_wait_for_process_debugger
+from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
+    enable_child_faulthandler,
+    write_startup_crash,
+)
+from horde_worker_regen.process_management.lifecycle.debug_attach import maybe_wait_for_process_debugger
 
 # Env var the parent process sets (from its own ``-v`` count) so spawned workers inherit the
 # operator's verbosity intent instead of a hardcoded value. Read by ``resolve_worker_log_verbosity``.
@@ -346,7 +349,7 @@ def start_inference_process(
 
         _spawn_timing_mark(process_id, "inference", "hordelib-initialised")
 
-        from horde_worker_regen.process_management.inference_process import HordeInferenceProcess
+        from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 
         worker_process = HordeInferenceProcess(
             process_id=process_id,
@@ -465,7 +468,7 @@ def start_safety_process(
             )
             sys.exit(1)
 
-        from horde_worker_regen.process_management.safety_process import HordeSafetyProcess
+        from horde_worker_regen.process_management.workers.safety_process import HordeSafetyProcess
 
         logger.debug(
             f"Initialising hordelib with process_id={process_id}, "
@@ -562,7 +565,7 @@ def start_download_process(
             )
             sys.exit(1)
 
-        from horde_worker_regen.process_management.download_process import HordeDownloadProcess
+        from horde_worker_regen.process_management.workers.download_process import HordeDownloadProcess
 
         worker_process = HordeDownloadProcess(
             process_id=process_id,

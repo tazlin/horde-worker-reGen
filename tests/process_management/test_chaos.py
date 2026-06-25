@@ -15,17 +15,17 @@ from unittest.mock import Mock
 
 import pytest
 
-import horde_worker_regen.process_management.process_lifecycle as process_lifecycle_module
-from horde_worker_regen.process_management.action_ledger import LedgerEventType
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeHeartbeatType, HordeProcessState
-from horde_worker_regen.process_management.process_lifecycle import (
+import horde_worker_regen.process_management.lifecycle.process_lifecycle as process_lifecycle_module
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
+from horde_worker_regen.process_management.ipc.messages import HordeHeartbeatType, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     CRASH_LOOP_MAX_START_FAILURES,
     CRASH_LOOP_WINDOW_SECONDS,
     ProcessLifecycleManager,
 )
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 
 from .conftest import make_mock_process_info, make_test_card_runtimes, make_test_runtime_config
 

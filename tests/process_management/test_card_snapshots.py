@@ -7,14 +7,14 @@ multi-GPU host reports one per card with the streak/jobs/residency facts keyed b
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
-from horde_worker_regen.process_management.messages import HordeProcessState
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SUPERVISOR_PROTOCOL_VERSION,
     ProcessSnapshot,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 
 from .conftest import (
     make_mock_bridge_data,

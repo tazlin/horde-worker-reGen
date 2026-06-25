@@ -454,7 +454,7 @@ def init() -> None:
         gpu_device_indices=args.gpu_device_indices,
     )
 
-    from horde_worker_regen.process_management.child_crash_capture import (
+    from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
         enable_child_faulthandler,
         write_startup_crash,
     )
@@ -486,7 +486,7 @@ def run_supervised(supervisor_connection: Connection, options: WorkerLaunchOptio
     console redirected to a file and a supervisor pipe wired in for state snapshots and control.
     This must be a top-level function so it is picklable as a ``multiprocessing`` spawn target.
     """
-    from horde_worker_regen.process_management.child_crash_capture import (
+    from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
         enable_child_faulthandler,
         write_startup_crash,
     )

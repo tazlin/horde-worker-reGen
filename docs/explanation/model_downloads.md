@@ -35,7 +35,7 @@ The worker downloads two distinct things, owned by different places:
 
 ## The dedicated download process
 
-[`download_process.py`][horde_worker_regen.process_management.download_process]
+[`download_process.py`][horde_worker_regen.process_management.workers.download_process]
 runs a hordelib `SharedModelManager` **without** a full ComfyUI init (listing and
 downloading checkpoints needs only the model managers, not the inference stack).
 It reports a rich, labelled status so the TUI and console can show exactly when,
@@ -88,7 +88,7 @@ file is the likely cause) and re-verified; if it **still** fails, ControlNet is
 disabled for the session and the operator is notified with a remediation hint, rather
 than leaving the worker to fault every ControlNet job. Because that verify can wedge
 inside hordelib, the
-[scheduler][horde_worker_regen.process_management.download_scheduler.HostAwareDownloadScheduler]
+[scheduler][horde_worker_regen.process_management.models.download_scheduler.HostAwareDownloadScheduler]
 bounds how long an exclusive task may block the queue: past the bound it relaxes
 exclusivity so the image-model downloads a worker needs to serve jobs proceed, while
 the stuck task harmlessly keeps running. The relaxation is logged once.
@@ -98,7 +98,7 @@ legacy single exclusive preload that both fetches and verifies in one ComfyUI in
 
 ## Model availability and the pop gate
 
-[`ModelAvailability`][horde_worker_regen.process_management.model_availability.ModelAvailability]
+[`ModelAvailability`][horde_worker_regen.process_management.models.model_availability.ModelAvailability]
 holds the set of image models currently present on disk plus the live download
 status. It is single-writer (the message dispatcher, on download-process reports)
 and many-reader (the job popper, process lifecycle, snapshot builder).
@@ -146,7 +146,7 @@ The two halves are tracked separately and fused parent-side:
   `controlnet_annotator` manager's per-record on-disk presence) and reports a
   tri-state per feature: present, not-yet-present, or unknown.
 
-[`feature_readiness.py`][horde_worker_regen.process_management.feature_readiness]
+[`feature_readiness.py`][horde_worker_regen.process_management.models.feature_readiness]
 is a pure function that combines these into a per-feature state: `offered`,
 `waiting` (enabled, deps present, models still downloading), `missing_deps`,
 `disabled`, or `failed`. The job popper withholds a gated feature from the pop
@@ -197,7 +197,7 @@ The download process fetches several models at once rather than one at a time,
 parallelizing across **distinct source hosts** (e.g. `civitai.com` ‖
 `huggingface.co` ‖ the aux R2 mirror). A small executor-thread pool drains a
 host-aware scheduler
-([`download_scheduler.py`][horde_worker_regen.process_management.download_scheduler]):
+([`download_scheduler.py`][horde_worker_regen.process_management.models.download_scheduler]):
 every pending download (generation checkpoints *and* the aux models: CLIP/BLIP,
 controlnets, post-processors) is tagged with the hostname of its download URL, and
 the scheduler admits work under two live limits:
@@ -277,7 +277,7 @@ purely to download).
 
 The picker does not fetch a parallel, throwaway list: the chosen names are folded
 into the worker's *one* authoritative desired-on-disk set (the
-[`DesiredState`][horde_worker_regen.process_management.desired_state] held by the
+[`DesiredState`][horde_worker_regen.process_management.models.desired_state] held by the
 process manager, the union of the configured models and the operator's picker
 additions). Every download trigger reconciles against that one set, so a config
 reload no longer cancels a picker-added download. Removing a model from the desired
@@ -357,4 +357,4 @@ takeover, and cancelling leaves the worker serving untouched.
   supervisor control channel
 - [Performance and Backpressure](performance_and_backpressure.md): how popping is
   gated, including by model availability
-- [`ModelAvailability`][horde_worker_regen.process_management.model_availability.ModelAvailability]
+- [`ModelAvailability`][horde_worker_regen.process_management.models.model_availability.ModelAvailability]

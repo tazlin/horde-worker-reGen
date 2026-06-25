@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from horde_worker_regen.process_management.system_memory import build_system_memory_summary
+from horde_worker_regen.process_management.resources.system_memory import build_system_memory_summary
 from horde_worker_regen.reporting.status_reporter import StatusReporter
 
 _GB = 1024**3

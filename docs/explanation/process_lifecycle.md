@@ -169,5 +169,5 @@ on an LRU-informed heuristic, sends `UNLOAD_MODELS_FROM_VRAM` /
   eviction and LRU policy
 - [Shutdown and Faults](shutdown_and_faults.md): how processes are killed
   during shutdown
-- [`ProcessLifecycleManager`][horde_worker_regen.process_management.process_lifecycle.ProcessLifecycleManager]
-- [`ProcessMap`][horde_worker_regen.process_management.process_map.ProcessMap]
+- [`ProcessLifecycleManager`][horde_worker_regen.process_management.lifecycle.process_lifecycle.ProcessLifecycleManager]
+- [`ProcessMap`][horde_worker_regen.process_management.lifecycle.process_map.ProcessMap]

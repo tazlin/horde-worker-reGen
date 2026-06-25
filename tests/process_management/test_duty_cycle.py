@@ -6,12 +6,12 @@ import time
 
 from hordelib.metrics import JobPhaseMetrics, ModelLoadEvent, SamplingStats
 
-from horde_worker_regen.process_management.duty_cycle import (
+from horde_worker_regen.process_management.resources.duty_cycle import (
     format_phase_gaps,
     phase_breakdown,
     summarize_duty_cycle,
 )
-from horde_worker_regen.process_management.run_metrics import JobMetricsRecord
+from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
 
 
 def _phase_rich_job(job_id: str = "a") -> JobMetricsRecord:

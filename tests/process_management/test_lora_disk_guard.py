@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from horde_worker_regen.process_management import lora_disk_guard
-from horde_worker_regen.process_management.lora_disk_guard import (
+from horde_worker_regen.process_management.models import lora_disk_guard
+from horde_worker_regen.process_management.models.lora_disk_guard import (
     configured_lora_budget_mb_from_env,
     constrain_lora_cache_to_disk,
     is_lora_disk_exhausted,

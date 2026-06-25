@@ -37,7 +37,7 @@ from horde_worker_regen.tui.widgets.model_list_editor import ModelListEditor
 from horde_worker_regen.tui.widgets.model_manager import ModelManagerView
 
 if TYPE_CHECKING:
-    from horde_worker_regen.process_management.supervisor_channel import CardSnapshot
+    from horde_worker_regen.process_management.ipc.supervisor_channel import CardSnapshot
 
 _FIELD_BY_KEY = {field.key: field for field in CONFIG_FIELDS}
 _MODELS_SECTION = "Models"

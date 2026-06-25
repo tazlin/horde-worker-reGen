@@ -16,8 +16,10 @@ from horde_worker_regen.benchmark.report import (
     render_markdown,
     synthesize_bridge_data,
 )
-from horde_worker_regen.process_management.duty_cycle import span_derived_busy_ratio as _span_derived_busy_ratio
-from horde_worker_regen.process_management.run_metrics import JobMetricsRecord, RunMetricsSnapshot
+from horde_worker_regen.process_management.resources.duty_cycle import (
+    span_derived_busy_ratio as _span_derived_busy_ratio,
+)
+from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord, RunMetricsSnapshot
 
 
 def _run_result(*, faulted: int = 0, its: list[float] | None = None) -> LevelRunResult:

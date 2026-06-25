@@ -26,10 +26,10 @@ from unittest.mock import Mock
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.job_models import HordeJobInfo
-from horde_worker_regen.process_management.job_tracker import JobStage
-from horde_worker_regen.process_management.messages import HordeImageResult, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeImageResult, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 
 from .conftest import (
     make_job_pop_response,

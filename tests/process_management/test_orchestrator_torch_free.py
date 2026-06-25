@@ -22,12 +22,12 @@ import pytest
 # they run in the orchestrator (or the no-boot benchmark ``plan`` preview), which is torch-free.
 _TORCH_FREE_IMPORT_MODULES = [
     "horde_worker_regen.process_management.process_manager",
-    "horde_worker_regen.process_management.inference_scheduler",
-    "horde_worker_regen.process_management.desired_state",
-    "horde_worker_regen.process_management.feature_readiness",
-    "horde_worker_regen.process_management.resource_budget",
-    "horde_worker_regen.process_management.job_popper",
-    "horde_worker_regen.process_management.process_map",
+    "horde_worker_regen.process_management.scheduling.inference_scheduler",
+    "horde_worker_regen.process_management.models.desired_state",
+    "horde_worker_regen.process_management.models.feature_readiness",
+    "horde_worker_regen.process_management.resources.resource_budget",
+    "horde_worker_regen.process_management.jobs.job_popper",
+    "horde_worker_regen.process_management.lifecycle.process_map",
     "horde_worker_regen.capabilities",
     "horde_worker_regen.utils.gpu_monitor",
     "horde_worker_regen.utils.accelerator_probe",

@@ -23,7 +23,7 @@ from textual.containers import VerticalScroll
 from textual.widgets import Static
 
 from horde_worker_regen.app_state import OverviewViewMode
-from horde_worker_regen.process_management.supervisor_channel import CardSnapshot, WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import CardSnapshot, WorkerStateSnapshot
 from horde_worker_regen.tui.formatters import (
     format_its,
     gpu_label,

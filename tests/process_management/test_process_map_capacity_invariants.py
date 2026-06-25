@@ -16,15 +16,15 @@ of latent bug as the original wedge, so these lock the intended semantics down:
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.messages import HordeProcessState
-from horde_worker_regen.process_management.process_info import HordeProcessType
-from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 
 from .conftest import make_mock_process_info
 
 
 class TestNumAvailableInferenceProcesses:
-    """ "Available" must equal "can accept a job", not merely "not actively busy"."""
+    """Available must equal can accept a job, not merely not actively busy."""
 
     def test_idle_and_preloaded_and_complete_slots_are_available(self) -> None:
         """The three between-jobs states a job can actually be dispatched into all count as available."""

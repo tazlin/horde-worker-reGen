@@ -27,16 +27,16 @@ from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
 from horde_worker_regen.consts import VRAM_HEAVY_MODELS
-from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.inference_scheduler import (
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.models.lru_cache import LRUCache
+from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     InferenceScheduler,
     _ModelSizeTier,
 )
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.lru_cache import LRUCache
-from horde_worker_regen.process_management.messages import HordeProcessState
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.worker_state import WorkerState
 
 from .conftest import (
     make_job_pop_response,

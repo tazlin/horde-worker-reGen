@@ -7,8 +7,8 @@ from unittest.mock import Mock
 import pytest
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-from horde_worker_regen.process_management import worker_identity
-from horde_worker_regen.process_management.worker_identity import WorkerNameConfigError, verify_worker_identity
+from horde_worker_regen.process_management.config import worker_identity
+from horde_worker_regen.process_management.config.worker_identity import WorkerNameConfigError, verify_worker_identity
 
 _DREAMER_DEFAULT = reGenBridgeData.model_fields["dreamer_worker_name"].default
 _ALCHEMIST_DEFAULT = reGenBridgeData.model_fields["alchemist_name"].default

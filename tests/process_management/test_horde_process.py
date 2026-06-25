@@ -14,9 +14,7 @@ from unittest.mock import Mock
 import pytest
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
-from horde_worker_regen.process_management.horde_process import HordeProcess
-from horde_worker_regen.process_management.inference_process import HordeInferenceProcess
-from horde_worker_regen.process_management.messages import (
+from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeControlMessage,
     HordeHeartbeatType,
@@ -24,6 +22,8 @@ from horde_worker_regen.process_management.messages import (
     HordeProcessHeartbeatMessage,
     HordeProcessState,
 )
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess
+from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 
 from .conftest import make_job_pop_response
 

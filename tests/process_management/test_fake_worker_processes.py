@@ -14,11 +14,7 @@ from unittest.mock import Mock
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.fields import GenerationID
 
-from horde_worker_regen.process_management.fake_worker_processes import (
-    FakeInferenceProcess,
-    FakeSafetyProcess,
-)
-from horde_worker_regen.process_management.messages import (
+from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeInferenceControlMessage,
     HordeInferenceResultMessage,
@@ -29,6 +25,10 @@ from horde_worker_regen.process_management.messages import (
     HordeSafetyControlMessage,
     HordeSafetyResultMessage,
     ModelLoadState,
+)
+from horde_worker_regen.process_management.testing.fake_worker_processes import (
+    FakeInferenceProcess,
+    FakeSafetyProcess,
 )
 from tests.process_management.conftest import make_job_pop_response
 

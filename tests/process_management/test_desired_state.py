@@ -11,7 +11,7 @@ import dataclasses
 
 import pytest
 
-from horde_worker_regen.process_management.desired_state import DesiredState, ReconcilePlan
+from horde_worker_regen.process_management.models.desired_state import DesiredState, ReconcilePlan
 
 
 class TestReconcileWithoutPickerAdditions:

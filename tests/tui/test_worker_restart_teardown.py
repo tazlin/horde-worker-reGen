@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from horde_worker_regen.process_management.shutdown_manager import (
+from horde_worker_regen.process_management.lifecycle.shutdown_manager import (
     _FAULT_REPORT_GRACE_SECONDS,
     MAX_SHUTDOWN_GRACE_SECONDS,
 )

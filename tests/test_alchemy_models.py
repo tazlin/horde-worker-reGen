@@ -5,7 +5,13 @@ from collections import deque
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-from horde_worker_regen.process_management.alchemy_popper import (
+from horde_worker_regen.process_management.ipc.messages import (
+    AlchemyFormSpec,
+    HordeAlchemyControlMessage,
+    HordeAlchemyResultMessage,
+    HordeControlFlag,
+)
+from horde_worker_regen.process_management.jobs.alchemy_popper import (
     AlchemyCoordinator,
     AlchemyHeadroomEstimator,
     _AlchemyPopRequest,
@@ -13,15 +19,9 @@ from horde_worker_regen.process_management.alchemy_popper import (
     expand_offered_forms,
     required_capability,
 )
-from horde_worker_regen.process_management.horde_process import WorkerCapability
-from horde_worker_regen.process_management.job_models import PendingAlchemySubmitJob
-from horde_worker_regen.process_management.messages import (
-    AlchemyFormSpec,
-    HordeAlchemyControlMessage,
-    HordeAlchemyResultMessage,
-    HordeControlFlag,
-)
-from horde_worker_regen.process_management.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.jobs.job_models import PendingAlchemySubmitJob
+from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
+from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 
 
 def _result_message(

@@ -10,8 +10,8 @@ import time
 import uuid
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 
 from .conftest import (

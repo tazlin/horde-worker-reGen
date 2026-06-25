@@ -7,8 +7,8 @@ multi-GPU existed (one runtime, no masking, the same process count).
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.process_manager import SystemResources
+from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 
 from .conftest import make_test_mp_primitives, make_testable_process_manager
 

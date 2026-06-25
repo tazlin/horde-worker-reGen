@@ -16,7 +16,8 @@ from horde_sdk.ai_horde_api.apimodels import (
 )
 from pydantic import BaseModel, Field
 
-from horde_worker_regen.process_management._canned_scenarios import (
+from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec
+from horde_worker_regen.process_management.testing._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
     CannedJobSource,
@@ -25,7 +26,6 @@ from horde_worker_regen.process_management._canned_scenarios import (
     make_alchemy_scenario,
     make_canned_job,
 )
-from horde_worker_regen.process_management.messages import AlchemyFormSpec
 
 
 class CannedImageJobSpec(BaseModel):

@@ -8,12 +8,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.process_management._aliased_types import ProcessQueue
-from horde_worker_regen.process_management.action_ledger import ActionLedger
-from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
-from horde_worker_regen.process_management.messages import (
+from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
+from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
+from horde_worker_regen.process_management.ipc.messages import (
     HordeHeartbeatType,
     HordeInferenceResultMessage,
     HordeProcessHeartbeatMessage,
@@ -22,8 +21,9 @@ from horde_worker_regen.process_management.messages import (
     HordeProcessStateChangeMessage,
     ModelLoadState,
 )
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 
 from .conftest import (
     make_job_pop_response,
@@ -183,7 +183,7 @@ class TestReceiveAndHandleProcessMessages:
 
     async def test_model_load_failed_invokes_handler_and_does_not_record_residency(self) -> None:
         """A FAILED model state hands the failure to the registered handler and never records the model loaded."""
-        from horde_worker_regen.process_management.messages import HordeModelStateChangeMessage, ModelLoadState
+        from horde_worker_regen.process_management.ipc.messages import HordeModelStateChangeMessage, ModelLoadState
 
         process_info = make_mock_process_info(0, model_name="Z-Image-Turbo")
         process_info.process_launch_identifier = 0
@@ -451,7 +451,7 @@ class TestHandleInferenceResult:
         """Drive a single aux-download-marker faulted result through the dispatcher."""
         from horde_sdk.ai_horde_api import GENERATION_STATE
 
-        from horde_worker_regen.process_management.messages import AUX_DOWNLOAD_FAILED_INFO
+        from horde_worker_regen.process_management.ipc.messages import AUX_DOWNLOAD_FAILED_INFO
 
         process_info = make_mock_process_info(0)
         process_info.process_launch_identifier = 0

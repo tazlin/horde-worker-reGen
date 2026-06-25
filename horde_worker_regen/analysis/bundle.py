@@ -20,7 +20,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from horde_worker_regen.process_management.action_ledger import LedgerEvent
+from horde_worker_regen.process_management.ipc.action_ledger import LedgerEvent
 
 from . import ledger_ingest
 from .log_ingest import LogRecord, read_records

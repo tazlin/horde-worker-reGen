@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from horde_worker_regen.process_management.failure_classification import is_resource_failure
-from horde_worker_regen.process_management.fault_injection import FAULT_INFO_PREFIX, FaultKind
+from horde_worker_regen.process_management.jobs.failure_classification import is_resource_failure
+from horde_worker_regen.process_management.testing.fault_injection import FAULT_INFO_PREFIX, FaultKind
 
 
 @pytest.mark.parametrize(

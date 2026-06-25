@@ -23,12 +23,12 @@ from pydantic import BaseModel, Field
 from horde_worker_regen.benchmark.criteria import LevelStats
 from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage, BenchTier, FindingKind, LevelOutcome
 from horde_worker_regen.benchmark.ladder import BENCH_TIER_MODELS, RampLevel
-from horde_worker_regen.process_management.duty_cycle import (
+from horde_worker_regen.process_management.resources.duty_cycle import (
     PHASE_ORDER,
     phase_breakdown,
     span_derived_busy_ratio,
 )
-from horde_worker_regen.process_management.run_metrics import JobMetricsRecord, RunMetricsSnapshot
+from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord, RunMetricsSnapshot
 
 BENCHMARK_REPORT_SCHEMA_VERSION = 4
 """Bumped when the report schema changes incompatibly; stamped into every report for later reads.

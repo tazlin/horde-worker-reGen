@@ -35,11 +35,9 @@ snapshot-age trigger previously caused.
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ProcessSnapshot,
     WorkerConfigSummary,
     WorkerLivenessFrame,

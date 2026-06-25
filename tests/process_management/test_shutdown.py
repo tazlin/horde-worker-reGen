@@ -8,19 +8,19 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.job_models import HordeJobInfo
-from horde_worker_regen.process_management.job_submitter import JobSubmitter
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeImageResult, HordeProcessState
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.shutdown_manager import (
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.messages import HordeImageResult, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
+from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.shutdown_manager import (
     _SHUTDOWN_GRACE_BASE_SECONDS,
     _SHUTDOWN_GRACE_PER_JOB_SECONDS,
     MAX_SHUTDOWN_GRACE_SECONDS,
     ShutdownManager,
 )
-from horde_worker_regen.process_management.worker_state import WorkerState
 
 from .conftest import (
     make_job_pop_response,
@@ -342,7 +342,7 @@ class TestStartTimedShutdownIdempotent:
                 pass
 
         monkeypatch.setattr(
-            "horde_worker_regen.process_management.shutdown_manager.threading.Thread",
+            "horde_worker_regen.process_management.lifecycle.shutdown_manager.threading.Thread",
             _FakeThread,
         )
 

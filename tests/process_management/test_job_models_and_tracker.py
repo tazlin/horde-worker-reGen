@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.job_models import APIWorkerMessage
-from horde_worker_regen.process_management.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.job_models import APIWorkerMessage
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 
 from .conftest import make_mock_job, track_popped_job_async
 

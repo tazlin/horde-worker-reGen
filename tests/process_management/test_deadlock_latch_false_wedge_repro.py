@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import time
 
-from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 
 from .conftest import (
     make_job_pop_response,

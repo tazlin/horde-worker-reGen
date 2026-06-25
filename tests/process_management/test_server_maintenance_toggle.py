@@ -19,7 +19,7 @@ from unittest.mock import Mock
 import pytest
 
 from horde_worker_regen.process_management import process_manager as process_manager_module
-from horde_worker_regen.process_management.supervisor_channel import SupervisorCommand, SupervisorControlMessage
+from horde_worker_regen.process_management.ipc.supervisor_channel import SupervisorCommand, SupervisorControlMessage
 
 from .conftest import make_testable_process_manager
 
@@ -176,7 +176,7 @@ class TestSnapshotMaintenanceFields:
         assert snapshot.maintenance_mode is True
 
     def test_last_pop_maintenance_mode_surfaces_as_own_field_and_in_aggregate(self) -> None:
-        """A pop-response maintenance error sets last_pop_maintenance_mode and maintenance_mode but not supervisor_paused."""
+        """A pop-response maintenance error sets maintenance fields without supervisor pause."""
         manager = make_testable_process_manager()
         manager._state.last_pop_maintenance_mode = True
         manager._state.supervisor_paused = False

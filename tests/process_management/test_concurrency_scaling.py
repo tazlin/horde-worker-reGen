@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.supervisor_channel import SupervisorCommand, SupervisorControlMessage
+from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
+from horde_worker_regen.process_management.ipc.supervisor_channel import SupervisorCommand, SupervisorControlMessage
 
 from .conftest import make_mock_bridge_data, make_testable_process_manager
 

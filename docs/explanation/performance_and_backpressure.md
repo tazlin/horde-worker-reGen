@@ -29,7 +29,7 @@ worker stable under load.
 
 ## The pop gauntlet
 
-Before [`JobPopper`][horde_worker_regen.process_management.job_popper.JobPopper] makes any network
+Before [`JobPopper`][horde_worker_regen.process_management.jobs.job_popper.JobPopper] makes any network
 call, it runs a series of gates:
 
 1. **Shutdown check**: if `WorkerState.shutting_down`, skip.
@@ -64,9 +64,9 @@ model is treated as present. See
 
 "Megapixelsteps" are a rough measure of GPU work:
 `width × height × steps / 1,000,000`. The
-[`JobTracker`][horde_worker_regen.process_management.job_tracker.JobTracker] sums the megapixelsteps of
+[`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker] sums the megapixelsteps of
 pending jobs; when that sum exceeds a threshold,
-[`PopThrottler`][horde_worker_regen.process_management.pop_throttler.PopThrottler] pauses popping
+[`PopThrottler`][horde_worker_regen.process_management.scheduling.pop_throttler.PopThrottler] pauses popping
 until the backlog drains. The threshold is **not** a config field; it is
 derived from the active performance mode: `15` (normal), `60`
 (`moderate_performance_mode`), or `80` (`high_performance_mode`). How long
@@ -94,7 +94,7 @@ max(2 × num_safety, int(ttl × 0.5 × num_safety / avg_safety_seconds))
 ```
 
 where `avg_safety_seconds` is an exponential moving average of measured safety
-checks ([`WorkerState.record_safety_duration`][horde_worker_regen.process_management.worker_state.WorkerState.record_safety_duration])
+checks ([`WorkerState.record_safety_duration`][horde_worker_regen.process_management.config.worker_state.WorkerState.record_safety_duration])
 and `ttl` is the most recent horde-supplied deadline (falling back to conservative
 constants before either is known). The cap is self-tuning with no config knob: a
 faster safety stage or longer deadline raises the tolerated backlog; a slower one
@@ -155,7 +155,7 @@ the queue would appear full when it still has capacity.
 
 ## Inference scheduling priorities
 
-[`InferenceScheduler`][horde_worker_regen.process_management.inference_scheduler.InferenceScheduler]'s
+[`InferenceScheduler`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler]'s
 `run_scheduling_cycle` runs every 200 ms and makes decisions in this order:
 
 1. **Preload models**: for the first pending job whose model isn't loaded, pick
@@ -180,7 +180,7 @@ the queue would appear full when it still has capacity.
 
 The worker has no way to tell a genuinely stuck job from a merely large one
 without a reference for how fast a job of that shape *should* sample. The
-[`PerformanceModel`][horde_worker_regen.process_management.performance_model.PerformanceModel]
+[`PerformanceModel`][horde_worker_regen.process_management.scheduling.performance_model.PerformanceModel]
 supplies that reference as expected sampling iterations-per-second, keyed by a
 coarse `JobSignature` (baseline + resolution/steps/batch buckets +
 controlnet/hires flags). It is seeded from a prior benchmark `report.json` and
@@ -197,7 +197,7 @@ When the worker serves at least as many inference processes as distinct models,
 every model can have a permanent home process and never needs reloading. The
 default preload-target picker, however, can fall back to displacing a still-wanted
 model when no empty process is free, forcing a needless disk reload.
-[`model_affinity.compute_protected_processes`][horde_worker_regen.process_management.model_affinity]
+[`model_affinity.compute_protected_processes`][horde_worker_regen.process_management.scheduling.model_affinity]
 identifies the processes holding the *last remaining copy* of a still-wanted
 model and marks them off-limits as displacement targets. Surplus copies and
 processes holding no-longer-wanted models stay displaceable, so spare capacity is
@@ -285,14 +285,14 @@ that if the working set fits the process count it fits the device, which only
 holds for SD1.5-class weights. The budget makes the worker decide on **measured**
 resources instead.
 
-[`VramBudget` and `RamBudget`][horde_worker_regen.process_management.resource_budget]
+[`VramBudget` and `RamBudget`][horde_worker_regen.process_management.resources.resource_budget]
 predict a job's peak VRAM and RAM cost from hordelib's per-job burden estimate
 (`hordelib.feature_impact.estimate_job_burden`, the same estimate the benchmark
 pre-flight trusts) and compare it against:
 
 - **measured device-wide free VRAM**: the conservative minimum across inference
   processes' memory reports
-  ([`ProcessMap.get_free_vram_mb`][horde_worker_regen.process_management.process_map.ProcessMap.get_free_vram_mb]),
+  ([`ProcessMap.get_free_vram_mb`][horde_worker_regen.process_management.lifecycle.process_map.ProcessMap.get_free_vram_mb]),
   plus
 - **measured available system RAM**: read live from the parent via psutil.
 
@@ -315,7 +315,7 @@ recommended on a shared or consumer GPU).
 
 On a multi-GPU worker the whole admission decision is scoped to the card a preload
 would land on (the slot chosen for it). A device-pinned child reports only its own
-card's VRAM, so [`get_free_vram_mb`][horde_worker_regen.process_management.process_map.ProcessMap.get_free_vram_mb]
+card's VRAM, so [`get_free_vram_mb`][horde_worker_regen.process_management.lifecycle.process_map.ProcessMap.get_free_vram_mb]
 and the total/live-context counts take a `device_index` and read just that card;
 the budget compares the job against *that card's* free VRAM plus its own committed
 reserve, eviction reclaims only that card's idle residents, and a whole-card
@@ -379,7 +379,7 @@ it into an evict-all admit.
 ## Alchemy backpressure
 
 When `alchemist: true`,
-[`AlchemyCoordinator`][horde_worker_regen.process_management.alchemy_popper.AlchemyCoordinator] runs
+[`AlchemyCoordinator`][horde_worker_regen.process_management.jobs.alchemy_popper.AlchemyCoordinator] runs
 its own pop loop (≈ every 1 s, popping at most every 4 s) independent of the image pop gauntlet.
 Because alchemy
 shares the inference and safety processes with image work, it has its own gating
@@ -393,7 +393,7 @@ so it never starves image jobs:
 - **VRAM-headroom gate**: a form pops only when *effective* free VRAM exceeds
   `alchemy_vram_headroom_mb`, where effective free is the measured device-wide free
   VRAM minus everything the shared
-  [`CommittedReserveLedger`][horde_worker_regen.process_management.resource_budget.CommittedReserveLedger]
+  [`CommittedReserveLedger`][horde_worker_regen.process_management.resources.resource_budget.CommittedReserveLedger]
   records as already committed by in-flight image and alchemy work. Image generation
   reads the same combined figure, so the two flows cannot independently admit against
   the same free VRAM. An `AlchemyHeadroomEstimator` tracks the rolling median VRAM cost
@@ -435,13 +435,13 @@ cache (hordelib's `LoraModelManager`). Two independent bounds keep that cache fr
 The floor is enforced in two places, split across the processes that can act on it:
 
 - **In the inference process** (which owns the live LoRA manager),
-  [`constrain_lora_cache_to_disk`][horde_worker_regen.process_management.lora_disk_guard.constrain_lora_cache_to_disk]
+  [`constrain_lora_cache_to_disk`][horde_worker_regen.process_management.models.lora_disk_guard.constrain_lora_cache_to_disk]
   runs before each LoRA-bearing job: it shrinks the effective ad-hoc budget to fit free space and
   evicts least-recently-used ad-hoc LoRAs until the floor is clear, *making room for the job's
   LoRAs*. It relies only on measured free space and LRU eviction, so it self-limits correctly even
   if the byte-budget arithmetic is off.
 - **In the main process** (which has no LoRA manager),
-  [`is_lora_disk_exhausted`][horde_worker_regen.process_management.lora_disk_guard.is_lora_disk_exhausted]
+  [`is_lora_disk_exhausted`][horde_worker_regen.process_management.models.lora_disk_guard.is_lora_disk_exhausted]
   decides whether to stop advertising LoRA support at all. Crucially, it suppresses LoRAs **only**
   when evicting every ad-hoc LoRA (read from the persisted `lora.json`) still would not clear the
   floor, so a *recoverable* shortfall is left to the inference-side eviction rather than latching the
@@ -464,7 +464,7 @@ it. Three mechanisms keep one bad download path from collapsing worker throughpu
 not one that itself blocks on a download) and so cannot route around a LoRA job stuck at the head.
 
 - **Escalating pop backoff**
-  ([`LoraDownloadBackoff`][horde_worker_regen.process_management.lora_download_backoff.LoraDownloadBackoff]):
+  ([`LoraDownloadBackoff`][horde_worker_regen.process_management.models.lora_download_backoff.LoraDownloadBackoff]):
   every time the lifecycle reaps a slot stuck downloading aux models it registers a *strike*. While a
   strike's window is active the popper stops advertising LoRA support (folded into `_lora_disk_permits`
   alongside the disk guard), so the worker stops feeding jobs into a failing download path. The window
@@ -502,15 +502,15 @@ A worker driving several cards presents one identity and pops one job stream, so
 differences become pop-side shaping. By default the pop advertises the **union** of every card's
 capabilities (every model any card serves, a feature/NSFW flag if any card allows it, the largest
 `max_power`, the summed thread count;
-[`advertised_capabilities`][horde_worker_regen.process_management.gpu_pop_shaping.advertised_capabilities]),
+[`advertised_capabilities`][horde_worker_regen.process_management.gpu.gpu_pop_shaping.advertised_capabilities]),
 so the horde returns work at least one card can run; the worker then routes each returned job to an
 eligible card (the same
-[`eligible_card_indices_for`][horde_worker_regen.process_management.gpu_eligibility.eligible_card_indices_for]
+[`eligible_card_indices_for`][horde_worker_regen.process_management.gpu.gpu_eligibility.eligible_card_indices_for]
 that preload, dispatch, and placement share) and never dispatches a job to a card that cannot serve it.
 
 When the local queue becomes lopsided - a card cannot serve at least `gpu_pop_balance_threshold` (default
 0.5) of the held work - the next pop is instead **scoped** to that under-fed card's capabilities
-([`under_fed_card`][horde_worker_regen.process_management.gpu_pop_shaping.under_fed_card]), so the horde
+([`under_fed_card`][horde_worker_regen.process_management.gpu.gpu_pop_shaping.under_fed_card]), so the horde
 returns work the starved card can actually run rather than more for the already-fed cards.
 
 The "locally unservable" breaker (above) is likewise **per card**: a model's over-budget fault streak is
@@ -530,7 +530,7 @@ and the streak is worker-wide - identical to before.
 - [Job State Machine](job_state_machine.md): the stages and the dual-presence
   rule the queue accounting depends on
 - [Process Lifecycle](process_lifecycle.md): model preloading lifecycle
-- [`PopThrottler`][horde_worker_regen.process_management.pop_throttler.PopThrottler]
-- [`InferenceScheduler`][horde_worker_regen.process_management.inference_scheduler.InferenceScheduler]
-- [`LRUCache`][horde_worker_regen.process_management.lru_cache.LRUCache]
-- [`VramBudget` / `RamBudget`][horde_worker_regen.process_management.resource_budget]
+- [`PopThrottler`][horde_worker_regen.process_management.scheduling.pop_throttler.PopThrottler]
+- [`InferenceScheduler`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler]
+- [`LRUCache`][horde_worker_regen.process_management.models.lru_cache.LRUCache]
+- [`VramBudget` / `RamBudget`][horde_worker_regen.process_management.resources.resource_budget]

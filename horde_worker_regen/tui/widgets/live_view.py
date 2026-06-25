@@ -12,12 +12,12 @@ from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
-from horde_worker_regen.process_management.process_temperature import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import ProcessSnapshot, WorkerStateSnapshot
+from horde_worker_regen.process_management.lifecycle.process_temperature import (
     ProcessTemperature,
     classify_process_temperature,
     temperature_phrase,
 )
-from horde_worker_regen.process_management.supervisor_channel import ProcessSnapshot, WorkerStateSnapshot
 from horde_worker_regen.tui.formatters import (
     STATE_LABELS,
     format_its,

@@ -15,19 +15,19 @@ from unittest.mock import AsyncMock, Mock, patch
 from horde_sdk import RequestErrorResponse
 from horde_sdk.ai_horde_api.apimodels import LorasPayloadEntry
 
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.job_popper import JobPopper
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeProcessState
-from horde_worker_regen.process_management.model_availability import ModelAvailability
-from horde_worker_regen.process_management.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadPhase,
     DownloadStatusSnapshot,
 )
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.jobs.job_popper import JobPopper
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.model_availability import ModelAvailability
+from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
 
 from .conftest import (
     make_job_pop_response,
@@ -946,8 +946,8 @@ class TestEnqueuePoppedJob:
 
 
 # Patch paths in the module under test to bypass SDK and telemetry dependencies
-_POP_REQUEST_PATH = "horde_worker_regen.process_management.job_popper.ImageGenerateJobPopRequest"
-_SPAN_POP_PATH = "horde_worker_regen.process_management.job_popper.span_job_pop"
+_POP_REQUEST_PATH = "horde_worker_regen.process_management.jobs.job_popper.ImageGenerateJobPopRequest"
+_SPAN_POP_PATH = "horde_worker_regen.process_management.jobs.job_popper.span_job_pop"
 _VERSION_PATH = "horde_worker_regen.__version__"
 
 

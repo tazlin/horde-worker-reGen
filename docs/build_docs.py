@@ -54,6 +54,9 @@ def dynamically_create_library_markdown_stubs() -> None:
             continue
 
         for file in sorted_files_in_folder:
+            if "process-management-legacy-shim" in file.read_text(encoding="utf-8"):
+                continue
+
             with open(relative_folder / f"{file.stem}.md", "w", encoding="utf-8") as f:
                 f.write(f"# {file.stem}\n")
                 file_namespace = pyfile_lookup[file]

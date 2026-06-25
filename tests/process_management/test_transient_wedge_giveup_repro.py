@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 
-from horde_worker_regen.process_management.message_dispatcher import DeadlockSnapshot
+from horde_worker_regen.process_management.ipc.message_dispatcher import DeadlockSnapshot
 
 from .conftest import make_testable_process_manager
 

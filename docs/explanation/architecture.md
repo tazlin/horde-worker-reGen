@@ -29,23 +29,23 @@ A worker can additionally opt into **alchemy** jobs (`alchemist: true`):
 post-processing/interrogation work pulled from `/v2/interrogate/pop`: upscalers,
 face-fixers, background removal, captioning, interrogation, and NSFW
 classification. Alchemy runs on a separate pop→dispatch→submit loop
-([`AlchemyCoordinator`][horde_worker_regen.process_management.alchemy_popper.AlchemyCoordinator])
+([`AlchemyCoordinator`][horde_worker_regen.process_management.jobs.alchemy_popper.AlchemyCoordinator])
 that reuses the same child processes the image pipeline already owns; it does not
 have its own process pool. See [Bridge Configuration](bridge_config.md#alchemy).
 
 ## Workloads (flows)
 
 Image generation and alchemy are two **workload flows** the worker orchestrates over one shared pool
-of child processes ([`WorkloadKind`][horde_worker_regen.process_management.workload_flow.WorkloadKind];
+of child processes ([`WorkloadKind`][horde_worker_regen.process_management.scheduling.workload_flow.WorkloadKind];
 audio and video generation are the intended next flows). Each flow is its own pop→dispatch→submit
 loop. What they share is threefold:
 
 - **The process pool**, routed by capability rather than by process type: each process declares a
-  [`WorkerCapability`][horde_worker_regen.process_management.horde_process.WorkerCapability]
+  [`WorkerCapability`][horde_worker_regen.process_management.lifecycle.horde_process.WorkerCapability]
   (inference processes serve `IMAGE_GEN` and `ALCHEMY_GRAPH`; the safety process serves `SAFETY_EVAL`
   and `ALCHEMY_CLIP`), and work is dispatched to the first process declaring the capability it needs.
 - **One resource budget.** A single
-  [`CommittedReserveLedger`][horde_worker_regen.process_management.resource_budget.CommittedReserveLedger]
+  [`CommittedReserveLedger`][horde_worker_regen.process_management.resources.resource_budget.CommittedReserveLedger]
   records the VRAM (and RAM) each flow has admitted but not yet allocated, so every admission gate
   subtracts the *same* combined figure. This is what stops image generation and alchemy independently
   admitting work against the same free VRAM and over-committing the device. Admission is two layers: a
@@ -53,7 +53,7 @@ loop. What they share is threefold:
   above a *capacity* layer (the shared budget) that decides whether the device can physically hold the
   work at all.
 
-The image pipeline's [`JobTracker`][horde_worker_regen.process_management.job_tracker.JobTracker] still
+The image pipeline's [`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker] still
 owns image-generation job state; the flow abstraction is the seam a future audio/video flow plugs into
 rather than a replacement for it.
 
@@ -173,7 +173,7 @@ Two layers of telemetry run alongside the pipeline:
   high-water marks, ad-hoc download bandwidth); the main process folds these,
   per-job stage latencies (from the `JobTracker` finalize observer), disk
   free-space samples (`DiskSpaceMonitor`), and process-crash events into
-  [`WorkerRunMetrics`][horde_worker_regen.process_management.run_metrics.WorkerRunMetrics],
+  [`WorkerRunMetrics`][horde_worker_regen.process_management.resources.run_metrics.WorkerRunMetrics],
   exposed as a `RunMetricsSnapshot`. This is the foundation the progressive
   benchmark (`horde_worker_regen/benchmark/`) reads.
 
@@ -190,7 +190,7 @@ worker. See [Frontend and Durable State](frontend_and_state.md).
 ## Dry-run mode
 
 When `dry_run_skip_api` is active,
-[`CannedJobSource`][horde_worker_regen.process_management._canned_scenarios.CannedJobSource]
+[`CannedJobSource`][horde_worker_regen.process_management.testing._canned_scenarios.CannedJobSource]
 substitutes synthetic jobs instead of calling the API, and
 `fake_worker_processes` substitutes canned image results instead of running real
 inference. Everything else (the job tracker, the scheduler, the message
@@ -204,7 +204,13 @@ Almost all of the orchestration lives in
 the main-process orchestrator is `HordeWorkerProcessManager` in
 `process_manager.py`.
 
-For a complete file→responsibility map, including the pop pipeline, scheduler,
+The large process-management modules are grouped into responsibility-based
+subpackages (`jobs/`, `scheduling/`, `lifecycle/`, `workers/`, `ipc/`, and so
+on). Top-level files with the old flat names are compatibility shims so existing
+imports continue to resolve while new code can use the canonical subpackage
+paths.
+
+For a complete file-to-responsibility map, including the pop pipeline, scheduler,
 IPC, and process lifecycle, see the **[Codebase Map](../reference/codebase-map.md)**.
 
 ## See also
@@ -212,7 +218,7 @@ IPC, and process lifecycle, see the **[Codebase Map](../reference/codebase-map.m
 - [Codebase Map](../reference/codebase-map.md): file→responsibility map and entry points
 - [Job Lifecycle](job_lifecycle.md): traces a job through every stage
 - [Job State Machine](job_state_machine.md): how
-  [`JobTracker`][horde_worker_regen.process_management.job_tracker.JobTracker]
+  [`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker]
   enforces stage transitions
 - [IPC and Messaging](ipc_and_messaging.md): the pipe/queue model and message
   types

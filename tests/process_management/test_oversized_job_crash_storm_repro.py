@@ -28,13 +28,13 @@ from __future__ import annotations
 
 import pytest
 
-from horde_worker_regen.process_management import resource_budget
-from horde_worker_regen.process_management.job_tracker import (
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import (
     InferenceFailureResolution,
     JobStage,
     JobTracker,
 )
-from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.resources import resource_budget
 
 from .conftest import make_job_pop_response, make_mock_process_info
 from .test_budget_starvation_wedge_repro import (

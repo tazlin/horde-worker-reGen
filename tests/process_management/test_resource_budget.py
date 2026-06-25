@@ -6,13 +6,12 @@ from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.process_management import resource_budget
-from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState, ModelLoadState
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.resource_budget import (
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState, ModelLoadState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.resources import resource_budget
+from horde_worker_regen.process_management.resources.resource_budget import (
     BudgetVerdict,
     CommittedReserveLedger,
     RamBudget,
@@ -20,6 +19,7 @@ from horde_worker_regen.process_management.resource_budget import (
     assess_ram_pressure,
     ram_pressure_floor_mb,
 )
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 
 from .conftest import (
     make_job_pop_response,
@@ -201,7 +201,7 @@ class TestPreloadBudgetGate:
         """
         import time as _time
 
-        from horde_worker_regen.process_management import inference_scheduler as _sched_mod
+        from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 1000.0)
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 50000.0)
@@ -512,7 +512,7 @@ class TestCommittedPostProcessingReserve:
 
     async def test_sums_in_flight_post_processing_peaks(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Each process in the post-processing phase contributes its job's predicted peak."""
-        from horde_worker_regen.process_management import inference_scheduler as scheduler_module
+        from horde_worker_regen.process_management.scheduling import inference_scheduler as scheduler_module
 
         monkeypatch.setattr(scheduler_module, "predict_job_post_processing_vram_mb", lambda job, baseline: 1500.0)
 
@@ -535,7 +535,7 @@ class TestCommittedPostProcessingReserve:
 
     async def test_zero_when_feature_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The reserve is suppressed when post_processing_budget_reserve_enabled is off."""
-        from horde_worker_regen.process_management import inference_scheduler as scheduler_module
+        from horde_worker_regen.process_management.scheduling import inference_scheduler as scheduler_module
 
         monkeypatch.setattr(scheduler_module, "predict_job_post_processing_vram_mb", lambda job, baseline: 1500.0)
 
@@ -718,6 +718,7 @@ class TestWholeCardIntent:
         assert forecast.needs_exclusive_residency is False
 
     def test_intent_forces_sole_residency(self) -> None:
+        """Whole-card intent forces an exclusive residency forecast."""
         forecast = self._coresident_forecast(wants_whole_card=True)
         # Intent wins over the fitting weight estimate: claim the card and collapse to a single context.
         assert forecast.needs_exclusive_residency is True

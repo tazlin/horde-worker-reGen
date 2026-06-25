@@ -32,7 +32,7 @@ _STARTUP = "Setting up logger for main process"
 
 def _recovery(ts: str, pid: int, *, reason: str, last_state: str = "PROCESS_STARTING") -> str:
     return (
-        f"2026-06-24 {ts} | ERROR    | horde_worker_regen.process_management.process_lifecycle:_log_recovery_diagnostics:367 - "
+        f"2026-06-24 {ts} | ERROR    | horde_worker_regen.process_management.lifecycle.process_lifecycle:_log_recovery_diagnostics:367 - "
         f"Recovery diagnostics for process {pid} (os_pid={1000 + pid}, launch={pid}): reason='{reason}'; "
         f"last_state={last_state}; exitcode=1; last_heartbeat_type=OTHER; since_last_heartbeat=8.0s; "
         f"since_last_message=8.0s; last_job=None; recent_actions=[]"
@@ -73,7 +73,7 @@ class TestDoomedPoolNoGiveup:
         lines = [
             f"2026-06-24 18:29:20.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
             "2026-06-24 18:29:21.000 | INFO | horde_worker_regen.reporting.status_reporter:_print_worker_info:442 -   dreamer_name: w | (v12.28.0) | num_models: 113 | max_power: 32 (1024x1024) | max_threads: 1 | queue_size: 3 | safety_on_gpu: True",
-            "2026-06-24 18:29:47.000 | CRITICAL | horde_worker_regen.process_management.process_lifecycle:_quarantine_inference_slot:1182 - Inference slot 1 quarantined (crash on start: 3 consecutive failures before reaching readiness); not respawning it.",
+            "2026-06-24 18:29:47.000 | CRITICAL | horde_worker_regen.process_management.lifecycle.process_lifecycle:_quarantine_inference_slot:1182 - Inference slot 1 quarantined (crash on start: 3 consecutive failures before reaching readiness); not respawning it.",
             "2026-06-24 18:30:30.000 | ERROR | horde_worker_regen.process_management.process_manager:_perform_soft_reset:2070 - Save-our-ship soft reset #1: rebuilding process pools and limping by (effective max_threads -> 1).",
             "2026-06-24 18:31:00.000 | INFO | horde_worker_regen.process_management.process_manager:_run_recovery_supervisor:2062 - Save-our-ship: pools recovered; restored configured concurrency (limp-by cleared).",
             "2026-06-24 18:31:08.000 | INFO | horde_worker_regen.reporting.status_reporter:_print_job_info:295 -   Session job info: ... | process_recoveries: 24 | 0.00 seconds without jobs",
@@ -104,7 +104,7 @@ class TestDoomedPoolNoGiveup:
 def _maintenance_pop(ts: str, *, reason: str = "dropping too many jobs") -> str:
     """The orchestrator line the job popper logs when the horde rejects a pop with maintenance mode."""
     return (
-        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.job_popper:_handle_pop_error_response:475 - "
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.jobs.job_popper:_handle_pop_error_response:475 - "
         f"Failed to pop job (Maintenance Mode): message='Maintenance mode activated because worker is {reason}.' "
         "object_data=None rc='WorkerMaintenance'"
     )
@@ -113,7 +113,7 @@ def _maintenance_pop(ts: str, *, reason: str = "dropping too many jobs") -> str:
 def _force_admit(ts: str, *, starved_seconds: int, free_vram_mb: int, model: str = "AlbedoBase XL (SDXL)") -> str:
     """The head-of-queue starvation force-admit warning (budget deferred a job on an idle, free device)."""
     return (
-        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.inference_scheduler:_log_head_starvation_force_admit:1348 - "
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.scheduling.inference_scheduler:_log_head_starvation_force_admit:1348 - "
         f"Head-of-queue {model} was budget-deferred on an idle device for {starved_seconds}s (reclamation "
         "exhausted); force-admitting it best-effort to break the wedge before the recovery supervisor "
         f"soft-resets the pools and faults the backlog. slots=[#1:-[WAITING_FOR_JOB]] device_free_vram={free_vram_mb}MB"
@@ -137,7 +137,7 @@ def _give_up(ts: str, *, jobs: int) -> str:
 def _server_slow_abort(ts: str, *, job_id: str = "0a69c504-fd18-4474-8f99-3b9587a0fed9") -> str:
     """The verbatim server message the submitter logs when the horde aborts a too-slow generation."""
     return (
-        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.job_submitter:submit_single_generation:291 - "
+        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.jobs.job_submitter:submit_single_generation:291 - "
         f"Processing Generation with ID {job_id} took too long to process and has been aborted! Please check "
         "your worker speed and do not onboard worker which generate slower than 1 it/s!"
     )
@@ -146,7 +146,7 @@ def _server_slow_abort(ts: str, *, job_id: str = "0a69c504-fd18-4474-8f99-3b9587
 def _slowdown_grade(ts: str, *, pid: int = 4, ratio: float = 4.1, free_vram_mb: int = 5395) -> str:
     """The inference grader warning that a job is running N-times its expected sampling time."""
     return (
-        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.process_lifecycle:_grade_running_inference:1564 - "
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.lifecycle.process_lifecycle:_grade_running_inference:1564 - "
         f"Inference on process {pid} is {ratio:.1f}x its expected sampling time (37s vs ~9s); watching for a "
         f"hang. slots=[#1:stable_diffusion[WAITING_FOR_JOB]] device_free_vram={free_vram_mb}MB"
     )
@@ -155,7 +155,7 @@ def _slowdown_grade(ts: str, *, pid: int = 4, ratio: float = 4.1, free_vram_mb: 
 def _submit_latency(ts: str, *, popped_ago: float, gen: float) -> str:
     """A successful-submit line reporting pop->submit latency and generation time."""
     return (
-        f"2026-06-25 {ts} | SUCCESS  | horde_worker_regen.process_management.job_submitter:submit_single_generation:343 - "
+        f"2026-06-25 {ts} | SUCCESS  | horde_worker_regen.process_management.jobs.job_submitter:submit_single_generation:343 - "
         f"Submitted generation abcd1234 (model: stable_diffusion) for 5.76 kudos. Job popped {popped_ago} seconds "
         f"ago and took {gen} to generate. (0.8 kudos/second for the whole batch. 0.4 or greater is ideal)"
     )
@@ -164,14 +164,14 @@ def _submit_latency(ts: str, *, popped_ago: float, gen: float) -> str:
 def _safety_duration(ts: str, *, seconds: float) -> str:
     """A safety-result line reporting how long the safety check took."""
     return (
-        f"2026-06-25 {ts} | DEBUG    | horde_worker_regen.process_management.message_dispatcher:_handle_safety_result:801 - "
+        f"2026-06-25 {ts} | DEBUG    | horde_worker_regen.process_management.ipc.message_dispatcher:_handle_safety_result:801 - "
         f"Job abcd1234-0000-0000-0000-000000000000 had 0 images censored and took {seconds} seconds to check safety"
     )
 
 
 def _consecutive_pause(ts: str) -> str:
     return (
-        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.job_popper:_handle_consecutive_failures:371 - "
+        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.jobs.job_popper:_handle_consecutive_failures:371 - "
         "Too many consecutive failed jobs, pausing job pops. Please look into what happened and let the "
         "devs know. Waiting 180 seconds..."
     )
@@ -448,7 +448,7 @@ class TestResourceFindings:
 def _safety_lost_result(ts: str, *, job_id: str = "ab3164c9") -> str:
     """The dispatcher line emitted when a safety verdict arrives for no tracked job (a lost result)."""
     return (
-        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.message_dispatcher:_handle_safety_result:766 - "
+        f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.ipc.message_dispatcher:_handle_safety_result:766 - "
         f"Expected to find a completed job with ID {job_id} but none was found. This should only happen when "
         "certain process crashes occur."
     )
@@ -486,7 +486,7 @@ def _safety_soft_pause(ts: str) -> str:
 def _safety_backpressure(ts: str, *, backlog: int = 6, cap: int = 2, oldest: int = 145) -> str:
     """The popper withholding pops because the post-inference safety backlog is too deep."""
     return (
-        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.job_popper:api_job_pop:638 - "
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.jobs.job_popper:api_job_pop:638 - "
         f"Withholding job pops: post-inference safety backlog {backlog} >= cap {cap} (oldest waiting safety job "
         f"{oldest}s). The safety stage is slower than inference; if this persists, enable safety_on_gpu or speed "
         "safety up."
@@ -496,7 +496,7 @@ def _safety_backpressure(ts: str, *, backlog: int = 6, cap: int = 2, oldest: int
 def _dispatch_stall(ts: str, *, reason: str, model: str = "AlbedoBase XL (SDXL)", parked: int = 30) -> str:
     """The scheduler explaining why a head-of-queue job is not dispatching."""
     return (
-        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.inference_scheduler:_log_dispatch_stall_if_needed:0 - "
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.scheduling.inference_scheduler:_log_dispatch_stall_if_needed:0 - "
         f"Inference dispatch stalled: head 4006e936 ({model}) has been parked {parked}s -- {reason}."
     )
 

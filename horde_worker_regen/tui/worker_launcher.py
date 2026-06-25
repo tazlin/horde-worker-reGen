@@ -26,12 +26,15 @@ from typing import TextIO
 
 from loguru import logger
 
-from horde_worker_regen.process_management.owned_process_registry import OwnedProcessRegistry, kill_process_tree
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SupervisorCommand,
     SupervisorControlMessage,
     WorkerLivenessFrame,
     WorkerStateSnapshot,
+)
+from horde_worker_regen.process_management.lifecycle.owned_process_registry import (
+    OwnedProcessRegistry,
+    kill_process_tree,
 )
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.job_object import WorkerJobObject

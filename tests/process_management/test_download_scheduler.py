@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from horde_worker_regen.model_download_core import UNKNOWN_DOWNLOAD_HOST, download_host_for_url
-from horde_worker_regen.process_management.download_scheduler import (
+from horde_worker_regen.process_management.models.download_scheduler import (
     DownloadKind,
     DownloadTask,
     HostAwareDownloadScheduler,
@@ -215,7 +215,7 @@ class TestHostAwareScheduler:
         """Within the bound the exclusive task blocks others; once the bound elapses they are admitted."""
         clock = {"now": 1000.0}
         monkeypatch.setattr(
-            "horde_worker_regen.process_management.download_scheduler.time.monotonic",
+            "horde_worker_regen.process_management.models.download_scheduler.time.monotonic",
             lambda: clock["now"],
         )
         scheduler = HostAwareDownloadScheduler(

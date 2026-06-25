@@ -23,12 +23,7 @@ from textual.widgets import Button, Input, Static, TabbedContent
 
 import horde_worker_regen.tui.app as app_module
 from horde_worker_regen.app_state import AppStateStore, OnboardingChoice
-from horde_worker_regen.process_management.feature_readiness import (
-    FeatureReadiness,
-    FeatureReadinessState,
-    GatedFeature,
-)
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadPhase,
     DownloadPlanSummary,
@@ -37,6 +32,11 @@ from horde_worker_regen.process_management.supervisor_channel import (
     ProcessSnapshot,
     WorkerConfigSummary,
     WorkerStateSnapshot,
+)
+from horde_worker_regen.process_management.models.feature_readiness import (
+    FeatureReadiness,
+    FeatureReadinessState,
+    GatedFeature,
 )
 from horde_worker_regen.tui.app import BenchmarkActionConfirmModal, BenchmarkOverWorkerModal, HordeWorkerTUI
 from horde_worker_regen.tui.benchmark_launcher import BenchmarkOptions

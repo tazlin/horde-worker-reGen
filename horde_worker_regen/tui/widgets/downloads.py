@@ -21,8 +21,7 @@ from textual.message import Message
 from textual.widgets import Button, Input, Static
 
 from horde_worker_regen.app_state import OverviewViewMode
-from horde_worker_regen.process_management.feature_readiness import FeatureReadinessState
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadPhase,
     DownloadPlanSummary,
@@ -30,6 +29,7 @@ from horde_worker_regen.process_management.supervisor_channel import (
     FeatureReadinessSummary,
     WorkerStateSnapshot,
 )
+from horde_worker_regen.process_management.models.feature_readiness import FeatureReadinessState
 from horde_worker_regen.tui.formatters import human_bytes, human_duration, shorten
 
 

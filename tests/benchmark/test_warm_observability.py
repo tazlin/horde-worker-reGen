@@ -19,9 +19,9 @@ from horde_worker_regen.harness import (
     WarmHarnessSession,
     _summarize_worker_processes,
 )
-from horde_worker_regen.process_management._canned_scenarios import make_canned_job
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.messages import HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.testing._canned_scenarios import make_canned_job
 
 
 class _StubMpProcess:
@@ -180,7 +180,7 @@ def test_fake_inference_entry_point_records_startup_crash(
     Previously the fake entry points had no crash capture (unlike the real ones), so a startup death
     was completely silent and the warm worker just wedged until the per-level timeout.
     """
-    from horde_worker_regen.process_management import fake_worker_processes as fwp
+    from horde_worker_regen.process_management.testing import fake_worker_processes as fwp
 
     monkeypatch.chdir(tmp_path)  # crash-capture writes under ./logs; isolate it here
     # Don't disturb the global loguru sink state from inside the test process.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from rich.console import Console
 
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ProcessSnapshot,
     WorkerConfigSummary,
     WorkerStateSnapshot,

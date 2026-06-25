@@ -27,7 +27,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from hordelib.feature_impact import BurdenEstimate
 
-    from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
+    from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot
 
 from horde_worker_regen.benchmark.criteria import TierBaseline, evaluate_level
 from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage, BenchTier, FindingKind, LevelOutcome
@@ -78,8 +78,8 @@ from horde_worker_regen.benchmark.requirements import (
     requirement_skip_reason,
 )
 from horde_worker_regen.benchmark.soak import build_validation_level
-from horde_worker_regen.process_management.duty_cycle import format_phase_gaps
-from horde_worker_regen.process_management.owned_process_registry import kill_process_tree
+from horde_worker_regen.process_management.lifecycle.owned_process_registry import kill_process_tree
+from horde_worker_regen.process_management.resources.duty_cycle import format_phase_gaps
 from horde_worker_regen.process_management.worker_entry_points import WORKER_LOG_VERBOSITY_ENV
 
 _SUBPROCESS_GRACE_SECONDS = 120.0

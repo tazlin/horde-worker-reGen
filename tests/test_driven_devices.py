@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.process_manager import _select_driven_devices
+from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 
 
 def _device_map(*indices: int) -> TorchDeviceMap:

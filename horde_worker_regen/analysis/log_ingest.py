@@ -63,7 +63,7 @@ class LogRecord:
     timestamp: datetime | None
     level: str
     name: str
-    """The logger name (dotted module path), e.g. ``horde_worker_regen.process_management.process_lifecycle``."""
+    """The logger name (dotted module path), e.g. the process-lifecycle module path."""
     function: str
     lineno: int | None
     message: str

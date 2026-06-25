@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.lora_download_backoff import (
+from horde_worker_regen.process_management.models.lora_download_backoff import (
     BASE_BACKOFF_SECONDS,
     MAX_BACKOFF_SECONDS,
     STRIKE_DECAY_SECONDS,

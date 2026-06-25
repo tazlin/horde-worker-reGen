@@ -10,10 +10,10 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management.card_runtime import CardRuntime
-from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 
 from .conftest import make_test_card_runtimes, make_test_runtime_config
 

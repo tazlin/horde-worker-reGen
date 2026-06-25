@@ -16,28 +16,15 @@ from unittest.mock import Mock
 import pytest
 
 from horde_worker_regen.model_download_core import ChunkPacer, CompVisLike, DownloadAborted
-from horde_worker_regen.process_management.action_ledger import ActionLedger
-from horde_worker_regen.process_management.download_process import (
-    DOWNLOAD_PROCESS_ID,
-    FEATURE_IMAGE_MODEL,
-    FEATURE_SAFETY,
-    HordeDownloadProcess,
-    _TaskRuntime,
-)
-from horde_worker_regen.process_management.download_scheduler import DownloadKind, DownloadTask
-from horde_worker_regen.process_management.fake_worker_processes import FakeDownloadProcess
-from horde_worker_regen.process_management.horde_model_map import HordeModelMap
-from horde_worker_regen.process_management.job_popper import _select_models_for_pop
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.message_dispatcher import MessageDispatcher
-from horde_worker_regen.process_management.messages import (
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
+from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
+from horde_worker_regen.process_management.ipc.messages import (
     HordeDownloadAvailabilityMessage,
     HordeDownloadControlMessage,
     HordeProcessMessage,
 )
-from horde_worker_regen.process_management.model_availability import ModelAvailability
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.supervisor_channel import (
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
     DownloadFailure,
     DownloadItem,
@@ -46,7 +33,20 @@ from horde_worker_regen.process_management.supervisor_channel import (
     SupervisorCommand,
     SupervisorControlMessage,
 )
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.jobs.job_popper import _select_models_for_pop
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.download_scheduler import DownloadKind, DownloadTask
+from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.models.model_availability import ModelAvailability
+from horde_worker_regen.process_management.testing.fake_worker_processes import FakeDownloadProcess
+from horde_worker_regen.process_management.workers.download_process import (
+    DOWNLOAD_PROCESS_ID,
+    FEATURE_IMAGE_MODEL,
+    FEATURE_SAFETY,
+    HordeDownloadProcess,
+    _TaskRuntime,
+)
 
 from .conftest import (
     make_mock_bridge_data,
@@ -595,8 +595,8 @@ class TestDownloadEntryPointSignatures:
         """``start_download_process`` accepts (and forwards) every keyword-only HordeDownloadProcess arg."""
         import inspect
 
-        from horde_worker_regen.process_management.download_process import HordeDownloadProcess
         from horde_worker_regen.process_management.worker_entry_points import start_download_process
+        from horde_worker_regen.process_management.workers.download_process import HordeDownloadProcess
 
         ctor_kwargs = {
             name
@@ -615,7 +615,7 @@ class TestDownloadEntryPointSignatures:
         """The fake receives the same launch kwargs, so it must accept every real entry-point keyword."""
         import inspect
 
-        from horde_worker_regen.process_management.fake_worker_processes import start_fake_download_process
+        from horde_worker_regen.process_management.testing.fake_worker_processes import start_fake_download_process
         from horde_worker_regen.process_management.worker_entry_points import start_download_process
 
         real_kwargs = {
@@ -1282,7 +1282,10 @@ class TestDownloadProcessConcurrencyFixes:
 
     def test_failed_image_fetch_is_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A failed per-file fetch is re-queued (bounded), so a transient failure is not abandoned."""
-        monkeypatch.setattr("horde_worker_regen.process_management.download_process._RETRY_BACKOFF_SECONDS", 0.0)
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.workers.download_process._RETRY_BACKOFF_SECONDS",
+            0.0,
+        )
         process = self._make_process()
         task = DownloadTask(kind=DownloadKind.IMAGE_MODEL, model_name="m", host="h", feature=FEATURE_IMAGE_MODEL)
 
@@ -1293,8 +1296,11 @@ class TestDownloadProcessConcurrencyFixes:
 
     def test_retry_gives_up_after_max_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """After the attempt ceiling the task is no longer re-queued (no infinite retry loop)."""
-        monkeypatch.setattr("horde_worker_regen.process_management.download_process._RETRY_BACKOFF_SECONDS", 0.0)
-        from horde_worker_regen.process_management import download_process as dp
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.workers.download_process._RETRY_BACKOFF_SECONDS",
+            0.0,
+        )
+        from horde_worker_regen.process_management.workers import download_process as dp
 
         process = self._make_process()
         task = DownloadTask(kind=DownloadKind.IMAGE_MODEL, model_name="m", host="h", feature=FEATURE_IMAGE_MODEL)

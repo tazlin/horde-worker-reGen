@@ -10,7 +10,7 @@ from pydantic import JsonValue
 
 from horde_worker_regen.bridge_data.data_model import GpuOverride, reGenBridgeData
 from horde_worker_regen.bridge_data.gpu_config import resolve_effective_gpu_config
-from horde_worker_regen.process_management.gpu_eligibility import (
+from horde_worker_regen.process_management.gpu.gpu_eligibility import (
     CardProfile,
     card_can_serve,
     describe_job_requirements,

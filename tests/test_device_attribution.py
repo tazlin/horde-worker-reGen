@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management.device_info import TorchDeviceInfo
-from horde_worker_regen.process_management.horde_process import HordeProcessState, HordeProcessType
-from horde_worker_regen.process_management.messages import HordeProcessMemoryMessage
-from horde_worker_regen.process_management.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.ipc.messages import HordeProcessMemoryMessage
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessState, HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_manager import _select_driven_devices
+from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo
 from horde_worker_regen.utils.accelerator_probe import ProbedAccelerator
 
 
@@ -27,7 +27,7 @@ def test_probed_accelerator_kind_default() -> None:
 
 def test_select_driven_devices_preserves_kind() -> None:
     """Filtering the device map to a subset keeps each kept device's backend kind."""
-    from horde_worker_regen.process_management.device_info import TorchDeviceMap
+    from horde_worker_regen.process_management.resources.device_info import TorchDeviceMap
 
     detected = TorchDeviceMap(
         root={

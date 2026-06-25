@@ -8,9 +8,9 @@ from contextlib import contextmanager
 
 from loguru import logger
 
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.messages import HordeHeartbeatType, HordeProcessState
-from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.ipc.messages import HordeHeartbeatType, HordeProcessState
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 
 from .conftest import make_mock_process_info
 

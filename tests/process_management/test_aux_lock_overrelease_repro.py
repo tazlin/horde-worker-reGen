@@ -24,11 +24,11 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management.inference_process import HordeInferenceProcess
-from horde_worker_regen.process_management.messages import (
+from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeInferenceControlMessage,
 )
+from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 
 from .conftest import make_job_pop_response
 

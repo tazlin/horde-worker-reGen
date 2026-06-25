@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, TextIO
 from loguru import logger
 
 if TYPE_CHECKING:
-    from horde_worker_regen.process_management.run_metrics import RunMetricsSnapshot
+    from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot
 
 _HEARTBEAT_INTERVAL_SECONDS = 5.0
 _PROGRESS_INTERVAL_SECONDS = 2.0
@@ -62,7 +62,7 @@ def _annotator_prewarm_entry(directml: int | None) -> None:
     capture mirrors the other spawn targets so a failure leaves a discoverable trace rather than dying
     silently.
     """
-    from horde_worker_regen.process_management.child_crash_capture import (
+    from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
         enable_child_faulthandler,
         write_startup_crash,
     )

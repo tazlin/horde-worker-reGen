@@ -18,11 +18,11 @@ import multiprocessing
 import time
 from unittest.mock import Mock
 
-from horde_worker_regen.process_management.job_tracker import JobStage, JobTracker
-from horde_worker_regen.process_management.messages import HordeProcessState
-from horde_worker_regen.process_management.process_lifecycle import ProcessLifecycleManager
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 
 from .conftest import (
     make_job_pop_response,

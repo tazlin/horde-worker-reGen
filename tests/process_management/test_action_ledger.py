@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from horde_worker_regen.process_management.action_ledger import (
+from horde_worker_regen.process_management.ipc.action_ledger import (
     ActionLedger,
     LedgerEventType,
 )

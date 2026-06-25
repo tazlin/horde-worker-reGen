@@ -19,7 +19,7 @@ from horde_worker_regen.harness import (
     _collect_run_diagnostics,
     _determine_exit_reason,
 )
-from horde_worker_regen.process_management.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
@@ -163,7 +163,7 @@ class TestCollectRunDiagnostics:
         # Populate the tracker's internal lookup so "no jobs popped" diagnostic
         # is not triggered.  `jobs_lookup` filters to entries with non-None job_info.
 
-        from horde_worker_regen.process_management.job_tracker import JobStage, TrackedJob
+        from horde_worker_regen.process_management.jobs.job_tracker import JobStage, TrackedJob
 
         dummy_job = make_job_pop_response()
         tracked = TrackedJob(

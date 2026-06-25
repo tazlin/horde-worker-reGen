@@ -18,19 +18,19 @@ from unittest.mock import Mock
 
 import pytest
 
-from horde_worker_regen.process_management import resource_budget
-from horde_worker_regen.process_management.horde_process import HordeProcessType
-from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
-from horde_worker_regen.process_management.job_tracker import JobTracker
-from horde_worker_regen.process_management.messages import HordeControlFlag, HordeProcessState
-from horde_worker_regen.process_management.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.process_map import ProcessMap
-from horde_worker_regen.process_management.resource_budget import (
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
+from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources import resource_budget
+from horde_worker_regen.process_management.resources.resource_budget import (
     StreamForecast,
     effective_inference_reserve_mb,
     forecast_weight_streaming,
     predict_job_weight_mb,
 )
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 
 from .conftest import (
     make_job_pop_response,
@@ -480,7 +480,7 @@ class TestWholeCardSiblingTeardown:
         assert scheduler.whole_card_residency_grace_active() is True
 
         # Past the bounded grace window the suppression lifts (a genuinely-stuck residency trips the SOS).
-        from horde_worker_regen.process_management import inference_scheduler as _sched_mod
+        from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 
         scheduler._whole_card_established_at = time.time() - (_sched_mod._WHOLE_CARD_ESTABLISH_GRACE_SECONDS + 1.0)
         assert scheduler.whole_card_residency_grace_active() is False
@@ -602,7 +602,7 @@ class TestWholeCardResidencyState:
 
     def test_phase_holding_after_establish_grace(self) -> None:
         """Once the establish grace elapses, an active residency reads as holding (serving), not establishing."""
-        from horde_worker_regen.process_management import inference_scheduler as _sched_mod
+        from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 
         scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
         scheduler._process_lifecycle.is_safety_gpu_paused = False
@@ -811,7 +811,7 @@ class TestHeavyHeadLoadGrace:
 
     def test_grace_active_within_window_then_lifts(self) -> None:
         """The grace is bounded by ``_HEAVY_HEAD_LOAD_GRACE_SECONDS`` so a head that never loads still trips SOS."""
-        from horde_worker_regen.process_management import inference_scheduler as _sched_mod
+        from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 
         scheduler = _make_inference_scheduler(bridge_data=_storm_bridge_data(), max_inference=2)
 

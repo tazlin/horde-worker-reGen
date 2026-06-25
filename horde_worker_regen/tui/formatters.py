@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 from rich.text import Text
 
-from horde_worker_regen.process_management.process_temperature import ProcessTemperature
+from horde_worker_regen.process_management.lifecycle.process_temperature import ProcessTemperature
 
 TEMPERATURE_COLOURS: dict[ProcessTemperature, str] = {
     ProcessTemperature.HOT: "green",

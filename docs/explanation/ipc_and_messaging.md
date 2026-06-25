@@ -111,7 +111,7 @@ stateDiagram-v2
 > (`ALCHEMY_STARTING` → `ALCHEMY_COMPLETE` / `ALCHEMY_FAILED`, reported by both
 > inference and safety processes while running a form) and a few other edges are
 > omitted for clarity; see
-> [`_EXPECTED_PROCESS_STATE_SOURCES`][horde_worker_regen.process_management.process_map._EXPECTED_PROCESS_STATE_SOURCES]
+> [`_EXPECTED_PROCESS_STATE_SOURCES`][horde_worker_regen.process_management.lifecycle.process_map._EXPECTED_PROCESS_STATE_SOURCES]
 > for the complete transition table.
 
 `ProcessMap` tracks the current state of every process and validates transitions
@@ -176,6 +176,6 @@ lost: it is recovered by the
 - [Resilience and Recovery](resilience_and_recovery.md#stranded-in-progress-jobs):
   how a job whose result was discarded here is recovered
 - [Architecture](architecture.md): overview of the IPC channel topology
-- [`HordeProcessState`][horde_worker_regen.process_management.messages.HordeProcessState]
-- [`ModelLoadState`][horde_worker_regen.process_management.messages.ModelLoadState]
-- [`MessageDispatcher`][horde_worker_regen.process_management.message_dispatcher.MessageDispatcher]
+- [`HordeProcessState`][horde_worker_regen.process_management.ipc.messages.HordeProcessState]
+- [`ModelLoadState`][horde_worker_regen.process_management.ipc.messages.ModelLoadState]
+- [`MessageDispatcher`][horde_worker_regen.process_management.ipc.message_dispatcher.MessageDispatcher]
