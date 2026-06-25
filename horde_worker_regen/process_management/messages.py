@@ -18,6 +18,13 @@ from pydantic import BaseModel, Field, model_validator
 
 from horde_worker_regen.process_management.supervisor_channel import DownloadStatusSnapshot
 
+AUX_DOWNLOAD_FAILED_INFO = "aux-download-deadline-exceeded"
+"""Marker placed in a faulted inference result's ``info`` when a child aborted its own stalled aux download.
+
+The child sets it when an aux (LoRa/TI) download blows the dispatch deadline carried on its control message;
+the parent's message dispatcher recognises it to register a LoRA-download backoff strike and apply the
+backoff-aware retry policy -- the same response as a watchdog teardown, but without tearing the process down."""
+
 
 class ModelLoadState(enum.Enum):
     """The state of a model.
@@ -404,6 +411,14 @@ class HordeControlModelMessage(HordeControlMessage):
 
     horde_model_name: str
     """The name of the model as defined in the horde model reference."""
+
+    aux_download_deadline_seconds: float | None = None
+    """Wall-clock budget for this job's auxiliary (LoRa/TI) downloads before the child gives up.
+
+    Set by the parent to its own (backoff-aware) stuck-aux watchdog timeout minus a margin, so the child
+    cancels a stalled download and faults the job *itself* -- keeping the inference process alive -- a beat
+    before the watchdog would otherwise tear the whole process down. ``None`` means no child-side deadline
+    (the watchdog remains the only backstop), preserving behaviour for any sender that does not set it."""
 
 
 class HordeDownloadControlMessage(HordeControlMessage):

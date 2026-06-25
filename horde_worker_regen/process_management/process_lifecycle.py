@@ -117,6 +117,19 @@ window again, so further stalls are reaped at this much shorter grace (floored a
 unusually-low configured ``download_timeout``). This is the fast-fault half of the backoff: it bounds
 how long a job that keeps timing out can hold a slot, instead of burning the full window per attempt."""
 
+AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS: float = 15.0
+"""How far before the stuck-aux watchdog the child's own aux-download deadline is set.
+
+The parent hands each dispatched job a deadline of (its effective aux-download watchdog timeout minus
+this margin); the child cancels a stalled download and faults the job *itself* a beat before the
+watchdog would tear the whole process down, turning a teardown+respawn into a slot-local fault. The
+margin covers the round trip: child cancel -> faulted result -> parent frees the slot, all before the
+next watchdog pass."""
+
+MIN_AUX_DOWNLOAD_DEADLINE_SECONDS: float = 10.0
+"""Floor on the child-side aux-download deadline, so an unusually low configured ``download_timeout``
+cannot drive it to zero (which would fault every LoRA job before it could fetch anything)."""
+
 
 def _job_is_feature_heavy(process_info: HordeProcessInfo) -> bool:
     """Whether the slot's current job carries features that lengthen its heartbeat-silent work.
@@ -1632,6 +1645,16 @@ class ProcessLifecycleManager:
         if not self._state.lora_download_backoff.is_escalation_active(time.time()):
             return configured
         return min(configured, FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS)
+
+    def aux_download_deadline_for_dispatch(self, bridge_data: reGenBridgeData) -> float:
+        """The child-side aux-download budget to hand a job being dispatched now.
+
+        Set to the current (backoff-aware) stuck-aux watchdog timeout minus a margin, floored, so the
+        child gives up on a stalled download and faults the job a beat before the watchdog would tear the
+        process down. Computed at dispatch, so it reflects the backoff state at that moment.
+        """
+        watchdog = self._effective_aux_download_timeout(bridge_data)
+        return max(MIN_AUX_DOWNLOAD_DEADLINE_SECONDS, watchdog - AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS)
 
     def replace_hung_processes(self) -> bool:
         """Replaces processes that haven't checked in since `process_timeout` seconds in bridgeData."""

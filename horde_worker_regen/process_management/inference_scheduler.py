@@ -2231,6 +2231,9 @@ class InferenceScheduler:
                         will_load_loras=will_load_loras,
                         seamless_tiling_enabled=seamless_tiling_enabled,
                         sdk_api_job_info=job,
+                        aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
+                            self._runtime_config.bridge_data,
+                        ),
                     ),
                 )
 
@@ -2882,6 +2885,9 @@ class InferenceScheduler:
                 control_flag=HordeControlFlag.START_INFERENCE,
                 horde_model_name=next_job.model,
                 sdk_api_job_info=next_job,
+                aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
+                    self._runtime_config.bridge_data,
+                ),
             ),
         ):
             # Record the card this job runs on (None on a single-GPU host) so its over-budget fault streak is

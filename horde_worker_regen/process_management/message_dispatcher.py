@@ -18,6 +18,7 @@ from horde_worker_regen.process_management.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.job_models import HordeJobInfo
 from horde_worker_regen.process_management.job_tracker import InferenceFailureResolution, JobTracker
 from horde_worker_regen.process_management.messages import (
+    AUX_DOWNLOAD_FAILED_INFO,
     HordeAlchemyResultMessage,
     HordeAuxModelStateChangeMessage,
     HordeDownloadAvailabilityMessage,
@@ -690,14 +691,31 @@ class MessageDispatcher:
         the tracker has already moved the job to ``PENDING_SUBMIT`` and counted it; here we only emit the
         telemetry, audit, and VRAM cleanup the success path would otherwise have done.
         """
-        resource_failure = is_resource_failure(message.info)
         job_id = str(message.sdk_api_job_info.id_) if message.sdk_api_job_info.id_ is not None else None
+
+        # A child that aborted its own stalled aux download (deadline) reports the fault here instead of
+        # the parent's watchdog tearing the process down. Mirror the teardown path's backoff handling: it
+        # is not a resource/OOM failure, it arms the LoRA-download backoff, and -- once an incident is
+        # active -- it is dropped rather than requeued straight back into the same failing download.
+        # Retryability is read before this strike is recorded so a lone transient stall keeps its retry.
+        is_aux_download_fault = message.info == AUX_DOWNLOAD_FAILED_INFO
+        if is_aux_download_fault:
+            resource_failure = False
+            aux_retryable = not self._state.lora_download_backoff.is_escalation_active(time.time())
+            window = self._state.lora_download_backoff.register_timeout(time.time())
+            logger.warning(
+                f"Job {job_id} aux (LoRA) download was aborted by process {message.process_id} (strike "
+                f"{self._state.lora_download_backoff.strikes}); withholding LoRA job pops for {window:.0f}s.",
+            )
+        else:
+            resource_failure = is_resource_failure(message.info)
+            aux_retryable = True
 
         resolution = await self._job_tracker.handle_job_fault(
             message.sdk_api_job_info,
             process_timeout=message.time_elapsed if message.time_elapsed is not None else 0.0,
             is_resource_failure=resource_failure,
-            retryable=True,
+            retryable=aux_retryable,
         )
 
         if resolution is not InferenceFailureResolution.FAULTED:

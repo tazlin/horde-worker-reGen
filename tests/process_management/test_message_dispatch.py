@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -207,7 +208,9 @@ class TestReceiveAndHandleProcessMessages:
 
         assert seen == [(0, "Z-Image-Turbo")]
         # The failed model must not be left recorded as resident anywhere.
-        assert hmm.root.get("Z-Image-Turbo") is None or not hmm.root["Z-Image-Turbo"].horde_model_load_state.is_active()
+        assert (
+            hmm.root.get("Z-Image-Turbo") is None or not hmm.root["Z-Image-Turbo"].horde_model_load_state.is_active()
+        )
 
     async def test_mismatched_launch_identifier_is_ignored(self) -> None:
         """Ignore if a message is received with a launch identifier that doesn't match the process's current one."""
@@ -438,6 +441,61 @@ class TestHandleInferenceResult:
         _enqueue(message_dispatcher, msg)
         await message_dispatcher.receive_and_handle_process_messages()
 
+        assert job_info in job_tracker.jobs_pending_submit
+
+    async def _run_aux_fault(
+        self,
+        *,
+        state: WorkerState,
+    ) -> tuple[JobTracker, object]:
+        """Drive a single aux-download-marker faulted result through the dispatcher."""
+        from horde_sdk.ai_horde_api import GENERATION_STATE
+
+        from horde_worker_regen.process_management.messages import AUX_DOWNLOAD_FAILED_INFO
+
+        process_info = make_mock_process_info(0)
+        process_info.process_launch_identifier = 0
+        process_map = ProcessMap({0: process_info})
+        job_tracker = JobTracker()
+        job_tracker.set_retry_policy(2)
+
+        job = make_job_pop_response(model="stable_diffusion")
+        job_info = await job_tracker.record_popped_job(job)
+        await mark_job_in_progress_async(job_tracker, job)
+
+        message_dispatcher = _make_dispatcher(process_map=process_map, job_tracker=job_tracker, state=state)
+
+        msg = Mock(spec=HordeInferenceResultMessage)
+        msg.process_id = 0
+        msg.process_launch_identifier = 0
+        msg.sdk_api_job_info = job
+        msg.time_elapsed = 0.0
+        msg.info = AUX_DOWNLOAD_FAILED_INFO
+        msg.state = GENERATION_STATE.faulted
+        msg.job_image_results = None
+        msg.faults_count = 0
+
+        _enqueue(message_dispatcher, msg)
+        await message_dispatcher.receive_and_handle_process_messages()
+        return job_tracker, job_info
+
+    async def test_aux_download_fault_arms_backoff_and_keeps_first_retry(self) -> None:
+        """A child-reported aux-download fault arms the LoRA backoff; a lone one still earns its retry."""
+        state = WorkerState()
+        job_tracker, job_info = await self._run_aux_fault(state=state)
+
+        assert state.lora_download_backoff.strikes == 1
+        assert state.lora_download_backoff.pops_suppressed(time.time())
+        # No prior incident, so the first stall is requeued, not faulted terminally.
+        assert job_info not in job_tracker.jobs_pending_submit
+
+    async def test_aux_download_fault_during_incident_is_terminal(self) -> None:
+        """During an active incident the aux-download fault is dropped instead of requeued."""
+        state = WorkerState()
+        state.lora_download_backoff.register_timeout(time.time())  # an incident is already active
+        job_tracker, job_info = await self._run_aux_fault(state=state)
+
+        assert state.lora_download_backoff.strikes == 2
         assert job_info in job_tracker.jobs_pending_submit
 
     async def test_inference_result_unknown_job_is_handled(self) -> None:

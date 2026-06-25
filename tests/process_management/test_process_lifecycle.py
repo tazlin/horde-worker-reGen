@@ -338,6 +338,26 @@ def test_effective_aux_download_timeout_shortens_under_backoff() -> None:
     )
 
 
+def test_aux_download_deadline_for_dispatch_tracks_watchdog_minus_margin() -> None:
+    """The child-side deadline is the (backoff-aware) watchdog timeout minus the safety margin, floored."""
+    from horde_worker_regen.process_management.process_lifecycle import (
+        AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS,
+        FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS,
+        MIN_AUX_DOWNLOAD_DEADLINE_SECONDS,
+    )
+
+    plm = _make_plm()
+    bridge_data = plm._runtime_config.bridge_data
+
+    expected_idle = bridge_data.download_timeout - AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS
+    assert plm.aux_download_deadline_for_dispatch(bridge_data) == expected_idle
+
+    plm._state.lora_download_backoff.register_timeout(time.time())
+    expected_incident = FAST_AUX_DOWNLOAD_TIMEOUT_SECONDS - AUX_DOWNLOAD_DEADLINE_MARGIN_SECONDS
+    assert plm.aux_download_deadline_for_dispatch(bridge_data) == expected_incident
+    assert plm.aux_download_deadline_for_dispatch(bridge_data) >= MIN_AUX_DOWNLOAD_DEADLINE_SECONDS
+
+
 def test_get_processes_with_model_for_queued_job_empty() -> None:
     """If there are no processes or no jobs pending inference, the result should be empty."""
     plm = _make_plm()

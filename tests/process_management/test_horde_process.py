@@ -238,7 +238,8 @@ def test_start_inference_for_resident_model_still_downloads_aux_models() -> None
     proc._receive_and_handle_control_message(message)
 
     proc.preload_model.assert_not_called()  # pyrefly: ignore
-    proc.download_aux_models.assert_called_once_with(job)  # pyrefly: ignore
+    # The resident path forwards the per-job aux-download deadline carried on the control message (None here).
+    proc.download_aux_models.assert_called_once_with(job, aux_download_deadline_seconds=None)  # pyrefly: ignore
     proc.start_inference.assert_called_once()  # pyrefly: ignore
 
 

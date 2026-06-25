@@ -36,6 +36,7 @@ from loguru import logger
 from horde_worker_regen.process_management._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.horde_process import HordeProcess
 from horde_worker_regen.process_management.messages import (
+    AUX_DOWNLOAD_FAILED_INFO,
     AlchemyFormSpec,
     HordeAlchemyControlMessage,
     HordeAlchemyResultMessage,
@@ -57,6 +58,22 @@ from horde_worker_regen.process_management.messages import (
 
 AUX_DOWNLOAD_HEARTBEAT_INTERVAL_SECONDS = 5.0
 """How often a child reports liveness while blocked in an ad-hoc AUX-model download."""
+
+
+class AuxDownloadDeadlineExceeded(Exception):
+    """Raised inside the child when a job's aux (LoRa/TI) downloads blow their dispatch deadline.
+
+    Caught at the control-message boundary (never propagated to the generic handler, which would end the
+    process): the child cancels the stalled downloads, faults the job back to the parent, and returns to
+    ``WAITING_FOR_JOB`` with its model still resident -- replacing a whole-process teardown with a
+    slot-local fault.
+    """
+
+    def __init__(self, job_info: ImageGenerateJobPopResponse) -> None:
+        """Carry the job whose aux downloads were aborted, so the boundary handler can fault exactly it."""
+        super().__init__("auxiliary model downloads exceeded their dispatch deadline")
+        self.job_info = job_info
+
 
 if TYPE_CHECKING:
     from hordelib.api import HordeLib, ProgressReport, ResultingImageReturn, SharedModelManager
@@ -347,11 +364,19 @@ class HordeInferenceProcess(HordeProcess):
         )
 
     @logger.catch(reraise=True)
-    def download_aux_models(self, job_info: ImageGenerateJobPopResponse) -> float | None:
+    def download_aux_models(
+        self,
+        job_info: ImageGenerateJobPopResponse,
+        aux_download_deadline_seconds: float | None = None,
+    ) -> float | None:
         """Download auxiliary models required for the job.
 
         Args:
             job_info (ImageGenerateJobPopResponse): The job to download auxiliary models for.
+            aux_download_deadline_seconds (float | None): Wall-clock budget for this job's downloads. When
+                exceeded with downloads still pending, the stalled downloads are cancelled and
+                :class:`AuxDownloadDeadlineExceeded` is raised so the job faults without the parent having
+                to tear the process down. ``None`` keeps the old unbounded behaviour (watchdog-only).
 
         Returns:
             float | None: The time elapsed during downloading, or None if no models were downloaded.
@@ -362,6 +387,9 @@ class HordeInferenceProcess(HordeProcess):
         self._aux_model_lock.acquire()
         try:
             time_start = time.time()
+            deadline_at = (
+                time_start + aux_download_deadline_seconds if aux_download_deadline_seconds is not None else None
+            )
 
             lora_manager = self._shared_model_manager.manager.lora
             if lora_manager is None:
@@ -403,20 +431,50 @@ class HordeInferenceProcess(HordeProcess):
                 # pushing the volume past its floor (and into ENOSPC failures).
                 self._enforce_lora_disk_floor(lora_manager)
 
+                def _abort_if_past_deadline() -> None:
+                    """Cancel stalled downloads and fault the job once its dispatch deadline has passed.
+
+                    A no-op when no deadline was given or the downloads have actually finished; otherwise
+                    it stops the shared pool churning on dead work and raises so the job faults slot-locally
+                    instead of riding the parent's watchdog into a whole-process teardown.
+                    """
+                    if deadline_at is None or time.time() < deadline_at or lora_manager.are_downloads_complete():
+                        return
+                    logger.warning(
+                        f"Auxiliary downloads for job {job_info.id_} exceeded their "
+                        f"{aux_download_deadline_seconds:.0f}s deadline; cancelling and faulting the job "
+                        "(inference process kept alive).",
+                    )
+                    cancel = getattr(lora_manager, "cancel_active_downloads", None)
+                    if callable(cancel):
+                        try:
+                            cancel()
+                        except Exception as cancel_error:
+                            logger.warning(
+                                f"Failed to cancel active downloads: {type(cancel_error).__name__} {cancel_error}"
+                            )
+                    raise AuxDownloadDeadlineExceeded(job_info)
+
+                def _bounded_wait(base_wait: float) -> None:
+                    """Wait for downloads, never past the dispatch deadline (so the abort check can fire)."""
+                    wait = base_wait
+                    if deadline_at is not None:
+                        wait = max(0.0, min(base_wait, deadline_at - time.time()))
+                    try:
+                        lora_manager.wait_for_downloads(wait)
+                    except Exception as wait_error:
+                        logger.error(f"Failed to wait for downloads: {type(wait_error).__name__} {wait_error}")
+
                 time_to_wait_for_downloads = 0
                 for lora_entry in loras:
+                    _abort_if_past_deadline()
                     # Already on disk — nothing to fetch, but still drain any in-flight downloads. Bound
                     # the drain by at least the base LoRA budget: a bare 0 (the accumulator's value before
                     # any fetch this job) reaches the manager as "wait forever", which a wedged background
                     # download (e.g. one retrying a full disk) would turn into an unbounded stall.
                     if lora_manager.is_model_available(lora_entry.name):
                         logger.info(f"Model {lora_entry.name} already downloaded")
-                        try:
-                            lora_manager.wait_for_downloads(
-                                max(time_to_wait_for_downloads, BASE_LORA_DOWNLOAD_TIMEOUT)
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to wait for downloads: {type(e).__name__} {e}")
+                        _bounded_wait(max(time_to_wait_for_downloads, BASE_LORA_DOWNLOAD_TIMEOUT))
                         continue
 
                     # --- Model needs downloading ---
@@ -427,10 +485,8 @@ class HordeInferenceProcess(HordeProcess):
                         if time_to_wait_for_downloads == 0
                         else time_to_wait_for_downloads + EXTRA_LORA_DOWNLOAD_TIMEOUT
                     )
-                    try:
-                        lora_manager.wait_for_downloads(time_to_wait_for_downloads)
-                    except Exception as e:
-                        logger.error(f"Failed to wait for downloads: {type(e).__name__} {e}")
+                    _bounded_wait(time_to_wait_for_downloads)
+                    _abort_if_past_deadline()
             finally:
                 aux_heartbeat_stop.set()
                 aux_heartbeat_thread.join(timeout=1.0)
@@ -506,6 +562,7 @@ class HordeInferenceProcess(HordeProcess):
         will_load_loras: bool,
         seamless_tiling_enabled: bool,
         job_info: ImageGenerateJobPopResponse,
+        aux_download_deadline_seconds: float | None = None,
     ) -> None:
         """Preload a model into RAM.
 
@@ -514,6 +571,8 @@ class HordeInferenceProcess(HordeProcess):
             will_load_loras (bool): Whether or not the model will be loaded into VRAM.
             seamless_tiling_enabled (bool): Whether or not seamless tiling is enabled.
             job_info (ImageGenerateJobPopResponse): The job to preload the model for.
+            aux_download_deadline_seconds (float | None): Forwarded to :meth:`download_aux_models` as this
+                job's aux-download budget; ``None`` keeps the watchdog-only behaviour.
         """
         logger.debug(f"Currently active model is {self._active_model_name}. Requested model is {horde_model_name}")
 
@@ -535,7 +594,7 @@ class HordeInferenceProcess(HordeProcess):
                 horde_model_state=ModelLoadState.ON_DISK,
             )
 
-        download_time = self.download_aux_models(job_info)
+        download_time = self.download_aux_models(job_info, aux_download_deadline_seconds=aux_download_deadline_seconds)
 
         if download_time is not None:
             self.send_aux_model_message(
@@ -1133,11 +1192,39 @@ class HordeInferenceProcess(HordeProcess):
     @override
     @logger.catch(reraise=True)
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
-        """Receive and handle a control message from the main process.
+        """Receive a control message, converting an aux-download deadline into a slot-local job fault.
 
-        Args:
-            message (HordeControlMessage): The message to handle.
+        An :class:`AuxDownloadDeadlineExceeded` from the preload/inference aux phase is handled here rather
+        than propagating to the base handler (which would end the process on any unhandled error): the job
+        is faulted back to the parent and the process returns to ``WAITING_FOR_JOB`` with its model resident.
         """
+        try:
+            self._dispatch_control_message(message)
+        except AuxDownloadDeadlineExceeded as aux_failed:
+            self._fault_job_for_aux_deadline(aux_failed.job_info)
+
+    def _fault_job_for_aux_deadline(self, job_info: ImageGenerateJobPopResponse) -> None:
+        """Report a job faulted because its aux downloads blew their deadline, then go idle.
+
+        Routes through the ordinary faulted-result path (so the parent's retry/backoff brain owns the
+        outcome), tagging the result's ``info`` with :data:`AUX_DOWNLOAD_FAILED_INFO` so the parent can
+        register a download-backoff strike. The process is kept alive and returned to ``WAITING_FOR_JOB``.
+        """
+        self._last_inference_error = AUX_DOWNLOAD_FAILED_INFO
+        self.send_inference_result_message(
+            process_state=HordeProcessState.INFERENCE_FAILED,
+            job_info=job_info,
+            results=None,
+            time_elapsed=0.0,
+        )
+        self._last_inference_error = None
+        self.send_process_state_change_message(
+            HordeProcessState.WAITING_FOR_JOB,
+            info="Waiting for job",
+        )
+
+    def _dispatch_control_message(self, message: HordeControlMessage) -> None:
+        """Dispatch one control message to the appropriate handler (preload/inference/alchemy/lifecycle)."""
         logger.debug(f"Received ({type(message)}): {message.control_flag}")
 
         if isinstance(message, HordePreloadInferenceModelMessage):
@@ -1146,6 +1233,7 @@ class HordeInferenceProcess(HordeProcess):
                 will_load_loras=message.will_load_loras,
                 seamless_tiling_enabled=message.seamless_tiling_enabled,
                 job_info=message.sdk_api_job_info,
+                aux_download_deadline_seconds=message.aux_download_deadline_seconds,
             )
         elif isinstance(message, HordeInferenceControlMessage):
             if message.control_flag == HordeControlFlag.START_INFERENCE:
@@ -1165,6 +1253,7 @@ class HordeInferenceProcess(HordeProcess):
                         > 0,
                         seamless_tiling_enabled=message.sdk_api_job_info.payload.tiling,
                         job_info=message.sdk_api_job_info,
+                        aux_download_deadline_seconds=message.aux_download_deadline_seconds,
                     )
                 else:
                     # The model is already resident, so the scheduler dispatched inference without a
@@ -1175,7 +1264,10 @@ class HordeInferenceProcess(HordeProcess):
                     # mistakes it for a hang and kills the process. download_aux_models runs under the
                     # heartbeat-protected DOWNLOADING_AUX_MODEL path and is idempotent (a no-op when
                     # the loras are already on disk or the job has none).
-                    self.download_aux_models(message.sdk_api_job_info)
+                    self.download_aux_models(
+                        message.sdk_api_job_info,
+                        aux_download_deadline_seconds=message.aux_download_deadline_seconds,
+                    )
 
                 if message.horde_model_name != self._active_model_name:
                     error_message = f"Received START_INFERENCE control message for model {message.horde_model_name} "
