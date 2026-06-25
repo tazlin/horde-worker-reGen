@@ -620,6 +620,10 @@ class WorkerStateSnapshot(BaseModel):
     self_throttle_paused: bool = False
     """The worker paused popping itself: resource/OOM faults accumulated fast enough that it backed off to
     avoid the horde forcing maintenance for "dropping too many jobs"."""
+    supervisor_paused: bool = False
+    """The worker is locally paused by operator command (F2 / PAUSE); distinct from any server-side state."""
+    last_pop_maintenance_mode: bool = False
+    """The most recent pop response returned a maintenance-mode error (cleared on the next successful pop)."""
     worker_details_maintenance: bool = False
     """The horde's worker-details API reports this worker in maintenance (polled, advisory)."""
     worker_details_paused: bool = False

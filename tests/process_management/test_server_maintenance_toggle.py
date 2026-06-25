@@ -4,6 +4,10 @@ The worker can put itself into, or out of, *server-side* maintenance on the hord
 resumes sending it jobs), distinct from the local pop-pause. This is exposed as a dedicated supervisor
 command and a TUI key. An operator resume (F2) additionally clears server maintenance only when the
 ``remove_maintenance_on_init`` config opts into it.
+
+Also covers the snapshot maintenance fields: ``supervisor_paused`` and ``last_pop_maintenance_mode`` are
+exposed as separate fields on ``WorkerStateSnapshot`` so the TUI can toggle and display each source of a
+paused state independently.
 """
 
 from __future__ import annotations
@@ -149,3 +153,49 @@ class TestResumeClearsMaintenanceOnlyWhenConfigured:
 
         assert manager._state.supervisor_paused is False
         assert recorded == []
+
+
+class TestSnapshotMaintenanceFields:
+    """``supervisor_paused`` and ``last_pop_maintenance_mode`` surface as their own snapshot fields.
+
+    The TUI needs to distinguish which source is causing the aggregate ``maintenance_mode=True`` so that
+    F2 can toggle the right lever and the status bar can name the source. Both fields must be present in
+    the snapshot independently of the aggregate.
+    """
+
+    def test_supervisor_paused_surfaces_as_own_field_and_in_aggregate(self) -> None:
+        """A local F2 pause sets supervisor_paused and maintenance_mode but not last_pop_maintenance_mode."""
+        manager = make_testable_process_manager()
+        manager._state.supervisor_paused = True
+        manager._state.last_pop_maintenance_mode = False
+
+        snapshot = manager._build_worker_state_snapshot()
+
+        assert snapshot.supervisor_paused is True
+        assert snapshot.last_pop_maintenance_mode is False
+        assert snapshot.maintenance_mode is True
+
+    def test_last_pop_maintenance_mode_surfaces_as_own_field_and_in_aggregate(self) -> None:
+        """A pop-response maintenance error sets last_pop_maintenance_mode and maintenance_mode but not supervisor_paused."""
+        manager = make_testable_process_manager()
+        manager._state.last_pop_maintenance_mode = True
+        manager._state.supervisor_paused = False
+
+        snapshot = manager._build_worker_state_snapshot()
+
+        assert snapshot.last_pop_maintenance_mode is True
+        assert snapshot.supervisor_paused is False
+        assert snapshot.maintenance_mode is True
+
+    def test_neither_paused_flag_leaves_maintenance_mode_false(self) -> None:
+        """When neither local flag is set, maintenance_mode is False and both granular fields are False."""
+        manager = make_testable_process_manager()
+        manager._state.supervisor_paused = False
+        manager._state.last_pop_maintenance_mode = False
+        manager._state.self_throttle_paused = False
+
+        snapshot = manager._build_worker_state_snapshot()
+
+        assert snapshot.supervisor_paused is False
+        assert snapshot.last_pop_maintenance_mode is False
+        assert snapshot.maintenance_mode is False

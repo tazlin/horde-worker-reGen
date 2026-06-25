@@ -283,6 +283,11 @@ def _maintenance_detail(snapshot: WorkerStateSnapshot) -> str:
             f"The horde has this worker set to {what} (server-side); it will not be given new jobs until "
             "cleared. In-flight jobs finish. Press the Maintenance (horde) key to toggle it."
         )
+    if snapshot.last_pop_maintenance_mode:
+        return (
+            "The job-pop response returned a maintenance-mode error; the horde has stopped sending this "
+            "worker jobs. Press the Maintenance (horde) key to clear it, or wait for the horde to lift it."
+        )
     if snapshot.self_throttle_paused:
         return (
             "The worker paused itself: too many resource/OOM faults recently, so it backed off to avoid the "

@@ -51,7 +51,7 @@ from horde_worker_regen.tui.benchmark_launcher import (
 from horde_worker_regen.tui.beta_models import apply_beta_model_env
 from horde_worker_regen.tui.cache_home import apply_cache_home_env
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
-from horde_worker_regen.tui.health import HealthReport, HealthStatus, build_offline_checks, derive
+from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.update_check import check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView, BenchmarkWaitingState
@@ -380,6 +380,13 @@ class HordeWorkerTUI(App[None]):
         self._last_main_tab = "tab-overview"
         self._allow_tab_switch_to: str | None = None
         self._config_leave_warning_suppressed = False
+        # Optimistic intent for the "m" server-maintenance toggle: set to the desired state immediately
+        # after a command is sent, so a rapid second press toggles correctly before the 15 s poll catches up.
+        # Cleared once a snapshot confirms the advisory poll has reflected the new state.
+        self._intended_server_maintenance: bool | None = None
+        # Tracks the previous-tick value of last_pop_maintenance_mode to detect False → True transitions
+        # and fire a toast exactly once when the horde forces maintenance via the pop response.
+        self._prev_pop_maintenance_mode: bool = False
 
     def compose(self) -> ComposeResult:
         """Lay out the header, status bar, tabbed views, and footer."""
@@ -596,6 +603,15 @@ class HordeWorkerTUI(App[None]):
                     self._pending_download_models = None
         self._frame += 1
         snapshot = self._supervisor.latest_snapshot
+        # Clear the "m" intent once the advisory poll confirms the horde reflects the requested state.
+        if self._intended_server_maintenance is not None and snapshot is not None:
+            if snapshot.worker_details_maintenance == self._intended_server_maintenance:
+                self._intended_server_maintenance = None
+        # Toast exactly once when the pop loop first sees a maintenance-mode error from the horde.
+        pop_maint = snapshot.last_pop_maintenance_mode if snapshot is not None else False
+        if pop_maint and not self._prev_pop_maintenance_mode:
+            self.notify("Server maintenance active: the horde has stopped sending jobs.", severity="warning")
+        self._prev_pop_maintenance_mode = pop_maint
         now = time.time()
         snapshot_age = (now - snapshot.timestamp) if snapshot is not None else None
         # Judge responsiveness on liveness (the loop's last tick), not on full-snapshot freshness:
@@ -823,9 +839,28 @@ class HordeWorkerTUI(App[None]):
         else:
             self.notify("Could not request the download (worker not reachable).", severity="warning")
 
+    def _paused_source(self, snapshot: WorkerStateSnapshot | None) -> str:
+        """Return a short source tag for the PAUSED badge (e.g. 'server', 'local', 'auto', 'pop')."""
+        if snapshot is None:
+            return ""
+        if snapshot.worker_details_maintenance or snapshot.worker_details_paused:
+            return "server"
+        if snapshot.last_pop_maintenance_mode:
+            return "pop"
+        if snapshot.self_throttle_paused:
+            return "auto"
+        if snapshot.supervisor_paused:
+            return "local"
+        return ""
+
     def _update_status_bar(self, report: HealthReport, snapshot: WorkerStateSnapshot | None) -> None:
         """Render the top status bar, led by the worker's current lifecycle phase."""
-        badge = f"[black on {self._badge_colour(report.severity)}] {report.phase.value.upper()} [/]"
+        phase_text = report.phase.value.upper()
+        if report.phase is WorkerPhase.PAUSED:
+            source = self._paused_source(snapshot)
+            if source:
+                phase_text = f"PAUSED·{source}"
+        badge = f"[black on {self._badge_colour(report.severity)}] {phase_text} [/]"
         parts = [badge, f"[grey62]mode[/] {self._supervisor.mode.value}"]
         if self._supervisor.restart_attempts:
             parts.append(f"[yellow]restarts {self._supervisor.restart_attempts}[/]")
@@ -878,7 +913,10 @@ class HordeWorkerTUI(App[None]):
         explicit server-side toggle.
         """
         snapshot = self._supervisor.latest_snapshot
-        if snapshot is not None and snapshot.maintenance_mode:
+        # Read supervisor_paused directly: it is the flag F2 controls. Using the aggregate
+        # maintenance_mode here would latch permanently when the horde forces maintenance, because
+        # that flag (last_pop_maintenance_mode) is not cleared by RESUME - only a successful pop clears it.
+        if snapshot is not None and snapshot.supervisor_paused:
             self._supervisor.request_resume()
             self.notify("Resume requested.")
         else:
@@ -893,9 +931,16 @@ class HordeWorkerTUI(App[None]):
         polled worker-details flag.
         """
         snapshot = self._supervisor.latest_snapshot
-        currently_in_maintenance = snapshot is not None and snapshot.worker_details_maintenance
+        # Prefer the pending intent over the (up-to-15-s stale) advisory poll so that a rapid second
+        # press reverses the first instead of duplicating it.
+        if self._intended_server_maintenance is not None:
+            currently_in_maintenance = self._intended_server_maintenance
+        else:
+            currently_in_maintenance = snapshot is not None and snapshot.worker_details_maintenance
         enable = not currently_in_maintenance
         sent = self._supervisor.request_set_server_maintenance(enable)
+        if sent:
+            self._intended_server_maintenance = enable
         if not sent:
             self.notify("Worker not running; maintenance change not sent.")
         elif enable:

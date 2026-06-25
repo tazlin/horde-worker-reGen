@@ -17,6 +17,7 @@ benchmark_results/*_validate/*
 *.faulthandler
 
 logs/remote_logs/*
+logs/external_logs/**
 logs/*.zip
 
 horde_support*.zip

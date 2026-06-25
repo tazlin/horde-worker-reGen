@@ -3037,6 +3037,8 @@ class HordeWorkerProcessManager:
                 or self._state.self_throttle_paused
             ),
             self_throttle_paused=self._state.self_throttle_paused,
+            supervisor_paused=self._state.supervisor_paused,
+            last_pop_maintenance_mode=self._state.last_pop_maintenance_mode,
             worker_details_maintenance=self._worker_details_maintenance,
             worker_details_paused=self._worker_details_paused,
             too_many_consecutive_failed_jobs=self._state.too_many_consecutive_failed_jobs,

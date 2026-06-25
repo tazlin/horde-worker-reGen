@@ -168,6 +168,29 @@ def test_worker_details_maintenance_is_paused_and_names_the_horde() -> None:
     assert "horde" in report.detail.lower()
 
 
+def test_pop_maintenance_mode_detail_is_specific_not_local_pause() -> None:
+    """A pop-response maintenance error produces a distinct detail, not the generic 'locally paused' text.
+
+    There is a gap between when the pop loop first sees a maintenance-mode error and when the 15 s
+    advisory poll confirms it. During that window maintenance_mode is True but worker_details_maintenance
+    is still False. The detail must not mislead the operator into thinking this is a local F2 pause.
+    """
+    report = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            maintenance_mode=True,
+            last_pop_maintenance_mode=True,
+            worker_details_maintenance=False,
+            supervisor_paused=False,
+        ),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    assert report.phase is WorkerPhase.PAUSED
+    assert "locally paused" not in report.detail
+    assert "maintenance" in report.detail.lower()
+
+
 def _residency_check(report: object) -> object | None:
     """Return the Residency health check from a report, or None if it was not added."""
     return next((check for check in report.checks if check.name == "Residency"), None)  # type: ignore[attr-defined]
