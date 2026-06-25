@@ -89,10 +89,7 @@ class DownloadPickerModal(ModalScreen["DownloadSelection | None"]):
             yield Static(self._intro(), id="download-picker-intro")
             if self._rows:
                 yield SelectionList[str](
-                    *[
-                        Selection(self._prompt(row), row.name, initial_state=not row.on_disk)
-                        for row in self._rows
-                    ],
+                    *[Selection(self._prompt(row), row.name, initial_state=not row.on_disk) for row in self._rows],
                     id="download-picker-list",
                 )
             else:

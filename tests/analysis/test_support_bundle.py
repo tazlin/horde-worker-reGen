@@ -16,6 +16,7 @@ _API_KEY = "abcdEFGH1234ijklMNOP56"
 _CIVITAI = "cd92292204eaa0759418fdebc5ae6d79"
 _WORKER = "tazlin-tui-example"
 
+
 def _recovery(ts: str) -> str:
     """A parent recovery-diagnostics line for slot 1 crashing on start (os_pid matches the child log)."""
     return (

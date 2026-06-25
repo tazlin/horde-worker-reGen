@@ -177,9 +177,7 @@ def build_session_context(session: WorkerSession, bundle: LogBundle) -> SessionC
     """Parse the recoveries and ledger window for one session."""
     start, end = session.start_ts, session.end_ts
     ledger_events = [
-        event
-        for event in bundle.ledger_events()
-        if _within(datetime.fromtimestamp(event.timestamp), start, end)
+        event for event in bundle.ledger_events() if _within(datetime.fromtimestamp(event.timestamp), start, end)
     ]
     return SessionContext(
         session=session,

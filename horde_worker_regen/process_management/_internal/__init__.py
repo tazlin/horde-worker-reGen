@@ -1,1 +1,1 @@
-﻿"""Internal cross-cutting plumbing for process management."""
+"""Internal cross-cutting plumbing for process management."""

@@ -1,1 +1,1 @@
-﻿"""Job popping, tracking, submission, and job data models."""
+"""Job popping, tracking, submission, and job data models."""

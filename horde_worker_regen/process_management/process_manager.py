@@ -2082,9 +2082,7 @@ class HordeWorkerProcessManager:
         """
         now = time.time()
         checking = self._job_tracker.jobs_being_safety_checked
-        current_ids = {
-            info.sdk_api_job_info.id_ for info in checking if info.sdk_api_job_info.id_ is not None
-        }
+        current_ids = {info.sdk_api_job_info.id_ for info in checking if info.sdk_api_job_info.id_ is not None}
 
         # Drop the grace clock for jobs no longer in SAFETY_CHECKING so it only runs while a job is
         # continuously stranded. Keep a job's requeue tally while it is cycling back through

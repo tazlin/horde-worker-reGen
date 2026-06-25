@@ -52,12 +52,16 @@ def _make_bridge(
 
 
 class TestMetaInstructionMatchesRecord:
+    """Verify the SDK resolver's ``resolve_meta_instructions``."""
+
     def test_all_matches_non_large_baselines(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``all`` and ``all models`` match the canonical baseline records, but not the large ones."""
         monkeypatch.delenv("AI_HORDE_MODEL_META_LARGE_MODELS", raising=False)
         assert _meta_instruction_matches_record("all", _rec("a", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1))
         assert _meta_instruction_matches_record("all models", _rec("b"))
 
     def test_all_excludes_large_baselines_unless_opted_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``all`` and ``all models`` do not match the large baselines unless the env var is set."""
         flux = _rec("flux", KNOWN_IMAGE_GENERATION_BASELINE.flux_1)
         cascade = _rec("cascade", KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade)
 
@@ -70,6 +74,7 @@ class TestMetaInstructionMatchesRecord:
         assert _meta_instruction_matches_record("all", cascade)
 
     def test_baseline_families(self) -> None:
+        """``all sdxl`` matches only the sdxl record; ``all sd15`` matches only the sd15 record."""
         sdxl = _rec("x", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl)
         sd15 = _rec("y", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1)
         assert _meta_instruction_matches_record("all sdxl", sdxl)
@@ -78,6 +83,7 @@ class TestMetaInstructionMatchesRecord:
         assert not _meta_instruction_matches_record("all sd15", sdxl)
 
     def test_sfw_nsfw_and_inpainting(self) -> None:
+        """``all nsfw`` matches only the nsfw record; ``all sfw`` matches only the sfw record."""
         nsfw = _rec("n", nsfw=True)
         sfw = _rec("s", nsfw=False)
         paint = _rec("p", inpainting=True)
@@ -88,10 +94,15 @@ class TestMetaInstructionMatchesRecord:
         assert not _meta_instruction_matches_record("all inpainting", sfw)
 
     def test_unknown_instruction_matches_nothing(self) -> None:
+        """A meta instruction that is not recognized matches no records."""
         assert not _meta_instruction_matches_record("TOP 5", _rec("a"))
 
 
 def test_beta_models_for_meta_instructions_selects_by_family() -> None:
+    """``all sdxl`` selects only the sdxl record; ``all`` selects both records.
+
+    Tthe canonical SDK resolver would not include the beta sdxl.
+    """
     records = {
         "sdxl": _rec("sdxl", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl),
         "sd15": _rec("sd15", KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1),

@@ -72,10 +72,18 @@ def test_detect_carries_overhead_and_marginal(fake_probe: list[ProbedAccelerator
     fake_probe.extend(
         [
             ProbedAccelerator(
-                index=0, name="GPU0", total_vram_mb=24564, runtime_overhead_mb=4112, marginal_overhead_mb=455,
+                index=0,
+                name="GPU0",
+                total_vram_mb=24564,
+                runtime_overhead_mb=4112,
+                marginal_overhead_mb=455,
             ),
             ProbedAccelerator(
-                index=1, name="GPU1", total_vram_mb=24564, runtime_overhead_mb=3000, marginal_overhead_mb=480,
+                index=1,
+                name="GPU1",
+                total_vram_mb=24564,
+                runtime_overhead_mb=3000,
+                marginal_overhead_mb=480,
             ),
         ],
     )

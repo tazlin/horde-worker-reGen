@@ -1,1 +1,1 @@
-﻿"""IPC message types, channels, dispatch, and audit sessions."""
+"""IPC message types, channels, dispatch, and audit sessions."""

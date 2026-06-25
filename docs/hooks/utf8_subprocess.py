@@ -19,7 +19,7 @@ from typing import Any
 _original_run = subprocess.run
 
 
-def _utf8_run(*args: Any, **kwargs: Any) -> Any:
+def _utf8_run(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
     # Only text-mode pipes carry an encoding; leave binary pipes untouched. setdefault respects an
     # explicit caller-provided encoding.
     if kwargs.get("text") or kwargs.get("universal_newlines"):
@@ -30,5 +30,5 @@ def _utf8_run(*args: Any, **kwargs: Any) -> Any:
 subprocess.run = _utf8_run  # type: ignore[assignment]
 
 
-def on_startup(**kwargs: Any) -> None:
+def on_startup(**kwargs: Any) -> None:  # noqa: ANN401
     """No-op event handler so mkdocs registers this module as a hook; the patch is applied on import."""

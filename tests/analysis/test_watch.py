@@ -31,7 +31,10 @@ def test_new_session_resets_and_announces(tmp_path: Path) -> None:
     _, state = watch_pass(bundle, WatchState())
     bundle = _bundle(
         tmp_path,
-        _STARTUP + "\n" + _OOM + "\n2026-06-24 18:05:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - Setting up logger for main process\n",
+        _STARTUP
+        + "\n"
+        + _OOM
+        + "\n2026-06-24 18:05:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - Setting up logger for main process\n",
     )
     alerts, _ = watch_pass(bundle, state)
     assert any("session #1 started" in a for a in alerts)

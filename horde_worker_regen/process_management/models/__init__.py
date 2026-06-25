@@ -1,1 +1,1 @@
-﻿"""Model availability, metadata, feature readiness, and on-disk cache helpers."""
+"""Model availability, metadata, feature readiness, and on-disk cache helpers."""

@@ -337,9 +337,7 @@ class TestContentionSlowdownDuringSampling:
         proc = _inference_proc(1, "AlbedoBase XL (SDXL)", jobs["AlbedoBase XL (SDXL)"], slowdown_level=2)
 
         effective = _effective_timeout(tracker, bridge_data, proc)
-        assert effective > _STEP_TIMEOUT, (
-            "a job measured at 4x contention slowdown kept the tight per-step timeout"
-        )
+        assert effective > _STEP_TIMEOUT, "a job measured at 4x contention slowdown kept the tight per-step timeout"
         assert effective <= _OVERBUDGET_TIMEOUT, (
             "the contention grace must stay bounded so a true hang is still reaped"
         )

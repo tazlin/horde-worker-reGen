@@ -1,1 +1,1 @@
-﻿"""Multi-GPU routing and pop-shaping primitives."""
+"""Multi-GPU routing and pop-shaping primitives."""

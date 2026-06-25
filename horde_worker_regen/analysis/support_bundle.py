@@ -82,9 +82,7 @@ def _all_log_files(path: Path, *, include_rotations: bool) -> tuple[Path, list[P
     """
     if path.is_file():
         return path.parent, [path]
-    files = sorted(
-        p for p in path.glob("*") if p.is_file() and (include_rotations or not _is_rotation(p))
-    )
+    files = sorted(p for p in path.glob("*") if p.is_file() and (include_rotations or not _is_rotation(p)))
     return path, files
 
 
@@ -181,9 +179,7 @@ def build_support_bundle(
         # Lead with the analysis the maintainer reads first.
         diagnosis = [(s, run_detectors(build_session_context(s, log_bundle))) for s in selected]
         _write(zf, "diagnose.txt", "\n\n".join(render_findings(s, f) for s, f in diagnosis) or "(no sessions)")
-        diagnose_json = [
-            {"session_index": s.index, "findings": [finding_to_dict(x) for x in f]} for s, f in diagnosis
-        ]
+        diagnose_json = [{"session_index": s.index, "findings": [finding_to_dict(x) for x in f]} for s, f in diagnosis]
         _write(zf, "diagnose.json", json.dumps(diagnose_json, indent=2))
         _write(zf, "sessions.txt", render_sessions(sessions, root=log_bundle.root))
 

@@ -1451,9 +1451,10 @@ class InferenceScheduler:
             reason = f"undiagnosed ({type(e).__name__}: {e})"
 
         now = time.monotonic()
-        if reason == self._dispatch_stall_last_reason and (
-            now - self._dispatch_stall_log_time
-        ) < _DISPATCH_STALL_LOG_INTERVAL_SECONDS:
+        if (
+            reason == self._dispatch_stall_last_reason
+            and (now - self._dispatch_stall_log_time) < _DISPATCH_STALL_LOG_INTERVAL_SECONDS
+        ):
             return
         self._dispatch_stall_last_reason = reason
         self._dispatch_stall_log_time = now

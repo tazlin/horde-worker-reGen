@@ -1,1 +1,1 @@
-﻿"""Child-process worker bodies and worker-side orchestration."""
+"""Child-process worker bodies and worker-side orchestration."""
