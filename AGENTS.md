@@ -118,9 +118,9 @@ uv run pytest -m "not e2e"          # skip the slower full-lifecycle tests
 uv run pytest tests/process_management/
 ```
 
-- Tests live in `tests/`. `tests/process_management/` builds a testable manager via
+- Tests live in `tests/`. `tests/process_management/` is grouped by process-manager subsystem and builds a testable manager via
   `make_testable_process_manager()`; `tests/e2e/` exercises the dry-run/fake flow end to end (marked
-  `e2e`). `tests/test_chaos*` drive the fault-injection harness.
+  `e2e`). `tests/process_management/testing/test_chaos.py` drives the fault-injection harness.
 - Most pipeline tests run **without a GPU or network** using dry-run mode (`CannedJobSource` +
   `fake_worker_processes`); see [Architecture → Dry-run mode](docs/explanation/architecture.md#dry-run-mode)
   and `harness.py`. The few tests that need a real accelerator are marked `@pytest.mark.gpu` and
@@ -142,7 +142,7 @@ uv run pytest tests/process_management/
   `hordelib.utils.torch_memory` (device/VRAM helpers). (2) Device *queries* (`enumerate_accelerators`,
   `get_torch_*_vram_mb`) load torch when *called*, even via a torch-free import; run them out-of-process
   via `utils/accelerator_probe.py::probe_accelerators` (used by `SystemResources.detect`, the config
-  wizard, and benchmark machine detection). `tests/process_management/test_orchestrator_torch_free.py` is
+  wizard, and benchmark machine detection). `tests/process_management/manager/test_orchestrator_torch_free.py` is
   the tripwire. (Upstream `hordelib.api` is now lazy for its one torch-heavy re-export,
   `SharedModelManager`, but the worker pins a *published* engine, so don't rely on that here.)
 - **Subprocesses must never download model references.** The parent owns reference downloading; use

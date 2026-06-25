@@ -116,7 +116,7 @@ worker self-limits to what it can serve rather than popping jobs it would fault.
 
 > Verification note: the backend-agnostic paths are tested on **NVIDIA and CPU** directly, and on the
 > other backends by code-path inspection plus mocked-backend unit tests
-> (`tests/test_torch_memory.py` in hordelib, `tests/process_management/test_system_resources.py` in
+> (`tests/test_torch_memory.py` in hordelib, `tests/process_management/resources/test_system_resources.py` in
 > the worker). They are expected to work on ROCm/XPU/MPS but are not yet hardware-verified there.
 
 ## Release coupling
