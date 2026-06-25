@@ -1055,3 +1055,80 @@ class RamBudget:
             available_mb=effective_available_mb,
             reserve_mb=self._reserve_mb,
         )
+
+
+# The defaults a partially-mocked or older config falls back to, so the pressure check never crashes the
+# scheduling cycle on a non-numeric attribute (mirrors how the unservable breaker tolerates a bad threshold).
+_DEFAULT_RAM_PRESSURE_PAUSE_PERCENT = 90.0
+_DEFAULT_RAM_PRESSURE_MIN_FREE_MB = 1024.0
+
+
+def ram_pressure_floor_mb(
+    total_ram_mb: float | None,
+    *,
+    pause_percent: float = _DEFAULT_RAM_PRESSURE_PAUSE_PERCENT,
+    min_free_mb: float = _DEFAULT_RAM_PRESSURE_MIN_FREE_MB,
+) -> float:
+    """Return the absolute available-RAM danger floor (MB): below it the worker must degrade, not load.
+
+    The floor is the *more conservative* (higher) of two readings, so each protects the regime the other
+    misses: ``(100 - pause_percent)%`` of total RAM guards a large-RAM host (where a fixed MB floor would be
+    a negligible sliver), and ``min_free_mb`` guards a small-RAM host (where the percentage can resolve to
+    too few megabytes to load a model's weights safely). With the defaults (90%, 1024 MB) a 32 GB host
+    degrades below ~3.2 GB free and an 8 GB host below 1 GB free. ``min_free_mb`` alone applies when total
+    RAM is unknown.
+    """
+    if total_ram_mb is None or total_ram_mb <= 0:
+        return float(min_free_mb)
+    percent_floor = max(0.0, (100.0 - pause_percent)) / 100.0 * float(total_ram_mb)
+    return max(percent_floor, float(min_free_mb))
+
+
+@dataclass(frozen=True)
+class RamPressureVerdict:
+    """Whether the host is below its absolute system-RAM danger floor, with enough detail to log a reason.
+
+    Distinct from :class:`BudgetVerdict`, which is a marginal per-job admission check: this is the
+    whole-host floor that drives the degrade response (refuse new loads, shed idle processes, throttle
+    pops) the OOM-kill spiral needs, independent of any one job's predicted cost.
+    """
+
+    under_pressure: bool
+    """True when available RAM is below the danger floor (or, conservatively, when no reading exists)."""
+    available_mb: float | None
+    """Measured available system RAM (MB) at check time, or None when no telemetry exists."""
+    floor_mb: float
+    """The absolute available-RAM floor (MB) below which the worker degrades."""
+    total_mb: float | None = None
+    """Total system RAM (MB), or None when unknown."""
+
+    def reason(self) -> str:
+        """Return a short human-readable explanation, for logging a degrade/clear decision."""
+        if self.available_mb is None:
+            return f"no RAM telemetry; floor {self.floor_mb:.0f} MB"
+        verb = "below" if self.under_pressure else "above"
+        return f"available {self.available_mb:.0f} MB {verb} danger floor {self.floor_mb:.0f} MB"
+
+
+def assess_ram_pressure(
+    available_ram_mb: float | None,
+    total_ram_mb: float | None,
+    *,
+    pause_percent: float = _DEFAULT_RAM_PRESSURE_PAUSE_PERCENT,
+    min_free_mb: float = _DEFAULT_RAM_PRESSURE_MIN_FREE_MB,
+) -> RamPressureVerdict:
+    """Return whether the host is below its absolute system-RAM danger floor.
+
+    Pure policy over measured readings: ``under_pressure`` is True when measured available RAM has fallen
+    below :func:`ram_pressure_floor_mb`. A missing available reading yields ``under_pressure=False`` (no
+    telemetry never *fabricates* pressure, so a worker that has not yet measured RAM is not wedged); a
+    missing total only widens the floor to the absolute ``min_free_mb``. Never raises.
+    """
+    floor_mb = ram_pressure_floor_mb(total_ram_mb, pause_percent=pause_percent, min_free_mb=min_free_mb)
+    under = available_ram_mb is not None and available_ram_mb < floor_mb
+    return RamPressureVerdict(
+        under_pressure=under,
+        available_mb=available_ram_mb,
+        floor_mb=floor_mb,
+        total_mb=total_ram_mb,
+    )

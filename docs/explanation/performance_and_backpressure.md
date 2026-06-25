@@ -3,6 +3,7 @@
 - [Performance and Backpressure](#performance-and-backpressure)
     - [The pop gauntlet](#the-pop-gauntlet)
     - [Megapixelstep backpressure](#megapixelstep-backpressure)
+    - [Post-inference (safety) backpressure](#post-inference-safety-backpressure)
     - [Model stickiness](#model-stickiness)
     - [Pop-rate throttling](#pop-rate-throttling)
     - [Queue sizing and the hold-back gate](#queue-sizing-and-the-hold-back-gate)
@@ -16,6 +17,9 @@
     - [The VRAM and RAM budget](#the-vram-and-ram-budget)
         - [Per-context overhead and the effective idle floor](#per-context-overhead-and-the-effective-idle-floor)
     - [Alchemy backpressure](#alchemy-backpressure)
+    - [The LoRA cache and its disk floor](#the-lora-cache-and-its-disk-floor)
+    - [LoRA download stalls: backoff, cap, and fast-fault](#lora-download-stalls-backoff-cap-and-fast-fault)
+    - [Multi-GPU pop shaping](#multi-gpu-pop-shaping)
     - [See also](#see-also)
 
 The worker sits between two external systems: the AI Horde API (which can flood
@@ -38,9 +42,11 @@ call, it runs a series of gates:
    job complete before pulling more.
 5. **Process availability**: at least one safety process and one inference
    process must exist and be healthy.
-6. **Megapixelstep backpressure**: if pending megapixelsteps exceed the
+6. **Post-inference (safety) backpressure**: if the post-inference backlog
+   cannot clear within the job deadline, skip (see below).
+7. **Megapixelstep backpressure**: if pending megapixelsteps exceed the
    configured threshold, skip (see below).
-7. **Pop-rate throttle**: if less than `current_pop_frequency` seconds have
+8. **Pop-rate throttle**: if less than `current_pop_frequency` seconds have
    elapsed since the last pop, skip.
 
 If any gate says "no," the pop is skipped for this cycle. The popper retries on
@@ -68,6 +74,32 @@ popping pauses also scales with the backlog and performance mode.
 
 This prevents the worker from accepting a large number of high-resolution jobs
 that would take hours to complete, starving smaller jobs behind them.
+
+## Post-inference (safety) backpressure
+
+Megapixelstep and queue-size backpressure bound the *pre-inference* queue. The
+*post-inference* queue - jobs that have finished generating and are waiting for
+the safety stage - has a different throughput constraint: safety is often a single
+process, and CPU-bound when `safety_on_gpu` is off. When inference is faster than
+safety, the post-inference backlog grows until jobs exceed the horde-supplied `ttl`
+("seconds before this job is considered stale and aborted") and the horde aborts
+them as "too slow", counting each as a dropped job.
+
+The popper applies backpressure against this stage too: it measures the safety
+stage's average wall-clock cost and stops popping while the current backlog cannot
+drain within the job deadline. The tolerated backlog is
+
+```
+max(2 × num_safety, int(ttl × 0.5 × num_safety / avg_safety_seconds))
+```
+
+where `avg_safety_seconds` is an exponential moving average of measured safety
+checks ([`WorkerState.record_safety_duration`][horde_worker_regen.process_management.worker_state.WorkerState.record_safety_duration])
+and `ttl` is the most recent horde-supplied deadline (falling back to conservative
+constants before either is known). The cap is self-tuning with no config knob: a
+faster safety stage or longer deadline raises the tolerated backlog; a slower one
+tightens it. The practical effect is that throughput settles at the slowest pipeline
+stage's rate rather than at the rate the GPU produces images.
 
 ## Model stickiness
 
@@ -437,13 +469,13 @@ not one that itself blocks on a download) and so cannot route around a LoRA job 
   strike's window is active the popper stops advertising LoRA support (folded into `_lora_disk_permits`
   alongside the disk guard), so the worker stops feeding jobs into a failing download path. The window
   starts at 60 s and doubles per consecutive strike up to 30 min, then resets after a trouble-free
-  stretch -- a brief blip pauses LoRA work briefly, a sustained outage pauses it for a long time.
+  stretch - a brief blip pauses LoRA work briefly, a sustained outage pauses it for a long time.
 - **Concurrent-LoRA cap** (`JobPopper._lora_queue_cap_reached`): independent of any stall, the popper
   withholds LoRA support once the local queue already holds `max(1, inference_processes - 1)` LoRA
   jobs. This guarantees at least one slot's worth of room for a non-LoRA job, which *can* line-skip past
-  a LoRA job blocked at the head -- so the GPU keeps working even while one slot waits on a download.
+  a LoRA job blocked at the head - so the GPU keeps working even while one slot waits on a download.
 - **Child-side graceful abort (no teardown)**: the real cost of a stalled aux download was the response
-  to it -- the parent's watchdog tearing the whole inference process down (losing its resident model and
+  to it - the parent's watchdog tearing the whole inference process down (losing its resident model and
   paying a full hordelib re-init) just because one download was slow. Instead, the parent hands each
   dispatched job an `aux_download_deadline_seconds` (its backoff-aware watchdog timeout minus a margin;
   `ProcessLifecycleManager.aux_download_deadline_for_dispatch`). When the child's `download_aux_models`
@@ -454,7 +486,7 @@ not one that itself blocks on a download) and so cannot route around a LoRA job 
   slot-local fault. The parent's stuck-aux **watchdog stays as the backstop**: it only fires (and tears
   down) if the child fails to self-abort in time (e.g. a genuinely wedged process).
 - **Backoff-aware fault, registered once**: the child-reported aux fault arms the same LoRA-download
-  backoff strike and the same retry policy as a watchdog teardown would have -- not a resource/OOM
+  backoff strike and the same retry policy as a watchdog teardown would have - not a resource/OOM
   failure, and during an active outage dropped (handed back to the horde) rather than requeued straight
   back into the same failing download. A lone transient stall (no active incident) keeps its one retry.
   This is what stops one bad job from costing two process recoveries.
@@ -462,7 +494,7 @@ not one that itself blocks on a download) and so cannot route around a LoRA job 
 Together these turn an all-LoRA queue facing a flaky source from a near-total stall (every slot idle
 behind one choking download, each stall costing a process teardown) into a graceful degradation: LoRA
 intake pauses and escalates, non-LoRA work keeps flowing, and a stalled download faults its single job
-and frees its slot with the model still resident -- no teardown, no respawn, no doubled-up recoveries.
+and frees its slot with the model still resident - no teardown, no respawn, no doubled-up recoveries.
 
 ## Multi-GPU pop shaping
 
@@ -476,8 +508,8 @@ eligible card (the same
 [`eligible_card_indices_for`][horde_worker_regen.process_management.gpu_eligibility.eligible_card_indices_for]
 that preload, dispatch, and placement share) and never dispatches a job to a card that cannot serve it.
 
-When the local queue becomes lopsided -- a card cannot serve at least `gpu_pop_balance_threshold` (default
-0.5) of the held work -- the next pop is instead **scoped** to that under-fed card's capabilities
+When the local queue becomes lopsided - a card cannot serve at least `gpu_pop_balance_threshold` (default
+0.5) of the held work - the next pop is instead **scoped** to that under-fed card's capabilities
 ([`under_fed_card`][horde_worker_regen.process_management.gpu_pop_shaping.under_fed_card]), so the horde
 returns work the starved card can actually run rather than more for the already-fed cards.
 
@@ -485,7 +517,7 @@ The "locally unservable" breaker (above) is likewise **per card**: a model's ove
 keyed to the card it faulted on, so a model the small card cannot run is still advertised and dispatched to a
 larger one, and the popper holds a model back only when *every* card that serves it has flagged it
 unservable. A single-GPU worker has one card, so the union is that card's config, no pop is ever targeted,
-and the streak is worker-wide -- identical to before.
+and the streak is worker-wide - identical to before.
 
 ## See also
 

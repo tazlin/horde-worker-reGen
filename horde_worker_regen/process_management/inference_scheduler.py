@@ -40,9 +40,11 @@ from horde_worker_regen.process_management.process_map import ProcessMap
 from horde_worker_regen.process_management.resource_budget import (
     CommittedReserveLedger,
     RamBudget,
+    RamPressureVerdict,
     StreamForecast,
     VramBudget,
     WholeCardResidencyState,
+    assess_ram_pressure,
     forecast_weight_streaming,
     is_model_locally_unservable_for,
     predict_job_post_processing_vram_mb,
@@ -97,6 +99,23 @@ force-admitted best-effort. Deliberately under the recovery supervisor's
 admitting one head onto an idle card, rather than tripping a save-our-ship soft reset that respawns
 every pool and faults the whole backlog. Only runs while no live job holds the device, so it never
 re-introduces the multi-process over-commit the budget guards against."""
+
+_RAM_PRESSURE_PAUSE_SECONDS = 30.0
+"""How long the worker pauses job pops once system RAM crosses its danger floor.
+
+A short, self-expiring pop-pause (it auto-resumes via the manager's self-throttle cooldown) so intake
+stops adding memory pressure while idle footprint is shed and the host recovers, without wedging a worker
+whose RAM frees up moments later. Re-armed each scheduling pass that still reads under the floor."""
+
+_DISPATCH_STALL_MIN_SECONDS = 10.0
+"""How long the head must be continuously undispatched before the dispatch-stall diagnostic speaks.
+
+Reuses the head-starvation clock so an ordinary one-tick gap between jobs (or a model mid-preload) is
+never reported; only a head that has been parked this long, with nothing dispatching, is explained."""
+
+_DISPATCH_STALL_LOG_INTERVAL_SECONDS = 30.0
+"""Minimum gap between repeats of the dispatch-stall diagnostic for an unchanged reason, so the
+sub-second control loop cannot spam it. A changed reason logs immediately (the stall's cause shifted)."""
 
 _WHOLE_CARD_ESTABLISH_GRACE_SECONDS = 120.0
 """How long after a whole-card residency is established the worker may keep the queue intentionally held
@@ -242,6 +261,7 @@ class InferenceScheduler:
     _reserve_ledger: CommittedReserveLedger
     _vram_budget_defer_notified: bool
     _ram_budget_defer_notified: bool
+    _ram_pressure_notified: bool
     _scheduler_diagnostic_log_state: dict[str, tuple[tuple[object, ...], float, int]]
 
     def __init__(
@@ -325,6 +345,7 @@ class InferenceScheduler:
         self._reserve_ledger = reserve_ledger if reserve_ledger is not None else CommittedReserveLedger()
         self._vram_budget_defer_notified = False
         self._ram_budget_defer_notified = False
+        self._ram_pressure_notified = False
         self._scheduler_diagnostic_log_state = {}
         # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
         self._unservable_admit_notified: dict[str, bool] = {}
@@ -379,6 +400,13 @@ class InferenceScheduler:
         # job takes the device. See _HEAD_STARVATION_FORCE_ADMIT_SECONDS.
         self._head_starvation_job_id: str | None = None
         self._head_starvation_since: float = 0.0
+
+        # Dispatch-stall diagnostic throttle. When the queue has work but nothing dispatches, the scheduler
+        # would otherwise return None silently; this records the last reason logged and when, so the
+        # explanation is emitted at most once per interval (and immediately when the reason changes) rather
+        # than every sub-second control-loop tick.
+        self._dispatch_stall_last_reason: str | None = None
+        self._dispatch_stall_log_time: float = 0.0
 
     def set_churn_observer(self, observer: Callable[[ChurnKind], None]) -> None:
         """Register the sink for between-jobs reload/respawn events (see :data:`ChurnKind`)."""
@@ -1343,6 +1371,94 @@ class InferenceScheduler:
         self._head_starvation_job_id = None
         self._head_starvation_since = 0.0
 
+    def _diagnose_dispatch_stall(
+        self,
+        head: ImageGenerateJobPopResponse,
+        stable_diffusion_reference: dict[str, ImageGenerationModelRecord],
+    ) -> str:
+        """Return why the head-of-queue job is not being dispatched (read-only; never raises into the loop).
+
+        The scheduler returns ``None`` from :meth:`get_next_job_and_process` at several points without saying
+        why, so a stuck queue with idle processes leaves no record of which gate parked the head. This
+        re-derives that reason for the diagnostic, with the most detail for the genuinely suspicious case --
+        the head's model is resident on an *idle* process yet nothing dispatches -- since that is the
+        scheduler-bug-shaped stall that is otherwise invisible.
+        """
+        process = self._resident_process_for_job(head)
+        if process is None:
+            if head.model is not None and self._horde_model_map.is_model_loading(head.model):
+                return "its model is loading (a preload is in progress)"
+            return (
+                "its model is not resident and no preload has been admitted "
+                "(usually a VRAM/RAM budget defer -- see the budget lines above)"
+            )
+        if not process.can_accept_job():
+            return (
+                f"its model is resident on process {process.process_id}, but that process is busy "
+                f"({process.last_process_state.name})"
+            )
+
+        # Resident on an idle process: the interesting case. Name the gate that is holding dispatch.
+        keep_single, single_reason = self._process_map.keep_single_inference(
+            stable_diffusion_model_reference=stable_diffusion_reference,
+            post_process_job_overlap=self._runtime_config.bridge_data.post_process_job_overlap,
+        )
+        pending_and_active = len(self._job_tracker.jobs_pending_inference) + len(self._job_tracker.jobs_in_progress)
+        if keep_single and pending_and_active > 1:
+            return (
+                f"its model is resident and idle on process {process.process_id}, but dispatch is held by "
+                f"keep-single-inference ({single_reason})"
+            )
+        in_progress = len(self._job_tracker.jobs_in_progress)
+        cap = self._max_jobs_in_progress_allowed(0)
+        if in_progress >= cap:
+            return (
+                f"its model is resident and idle on process {process.process_id}, but the concurrency cap is "
+                f"reached (in_progress={in_progress}, cap={cap})"
+            )
+        if not self._concurrent_overlap_allowed(head, target_device_index=process.device_index):
+            return (
+                f"its model is resident and idle on process {process.process_id}, but the overlap-headway gate "
+                "is holding it (the in-flight job has not made enough progress to share the card)"
+            )
+        return (
+            f"its model is resident and idle on process {process.process_id} but dispatch was withheld with no "
+            "matching gate -- this is a scheduler stall worth reporting"
+        )
+
+    def _log_dispatch_stall_if_needed(
+        self,
+        stable_diffusion_reference: dict[str, ImageGenerationModelRecord],
+    ) -> None:
+        """Emit a throttled explanation when a parked head is not dispatching despite pending work.
+
+        Only fires once the head has been undispatched past :data:`_DISPATCH_STALL_MIN_SECONDS` (so a normal
+        between-jobs gap is silent), then at most once per :data:`_DISPATCH_STALL_LOG_INTERVAL_SECONDS` for an
+        unchanged reason. Read-only: it explains the stall, it does not change scheduling.
+        """
+        head = next(
+            (j for j in self._job_tracker.jobs_pending_inference if j not in self._job_tracker.jobs_in_progress),
+            None,
+        )
+        if head is None or self._head_starved_seconds(head) < _DISPATCH_STALL_MIN_SECONDS:
+            return
+        try:
+            reason = self._diagnose_dispatch_stall(head, stable_diffusion_reference)
+        except Exception as e:  # noqa: BLE001 - a diagnostic must never crash the scheduling cycle
+            reason = f"undiagnosed ({type(e).__name__}: {e})"
+
+        now = time.monotonic()
+        if reason == self._dispatch_stall_last_reason and (
+            now - self._dispatch_stall_log_time
+        ) < _DISPATCH_STALL_LOG_INTERVAL_SECONDS:
+            return
+        self._dispatch_stall_last_reason = reason
+        self._dispatch_stall_log_time = now
+        logger.opt(ansi=True).warning(
+            f"<fg #ff8c69>Inference dispatch stalled: head {str(head.id_)[:8]} ({head.model}) has been parked "
+            f"{self._head_starved_seconds(head):.0f}s -- {reason}.</>",
+        )
+
     def _log_head_starvation_force_admit(self, job: ImageGenerateJobPopResponse) -> None:
         """Announce a head-of-queue force-admit, with the residency snapshot for the post-mortem."""
         logger.opt(ansi=True).warning(
@@ -1378,6 +1494,74 @@ class InferenceScheduler:
     def _measured_available_ram_mb(self) -> float:
         """The measured system-wide available RAM (MB), read live in the parent process."""
         return psutil.virtual_memory().available / (1024 * 1024)
+
+    def _measured_total_ram_mb(self) -> float:
+        """The measured system-wide total RAM (MB), read live in the parent process."""
+        return psutil.virtual_memory().total / (1024 * 1024)
+
+    def _ram_pressure_floor_config(self) -> tuple[float, float]:
+        """The configured (pause_percent, min_free_mb) for the absolute RAM danger floor, read defensively.
+
+        Tolerant of a partially-mocked config (the scheduler unit tests): a non-numeric value falls back to
+        the module default so the pressure check never crashes the scheduling cycle on a bad attribute.
+        """
+        bridge_data = self._runtime_config.bridge_data
+        pause = bridge_data.ram_pressure_pause_percent
+        min_free = bridge_data.ram_pressure_min_free_mb
+        pause_ok = isinstance(pause, (int, float)) and not isinstance(pause, bool)
+        min_free_ok = isinstance(min_free, (int, float)) and not isinstance(min_free, bool)
+        pause_pct = float(pause) if pause_ok else 90.0
+        min_free_mb = float(min_free) if min_free_ok else 1024.0
+        return pause_pct, min_free_mb
+
+    def _ram_pressure_verdict(self) -> RamPressureVerdict:
+        """Assess whether the host is below its absolute system-RAM danger floor right now."""
+        pause_pct, min_free_mb = self._ram_pressure_floor_config()
+        return assess_ram_pressure(
+            self._measured_available_ram_mb(),
+            self._measured_total_ram_mb(),
+            pause_percent=pause_pct,
+            min_free_mb=min_free_mb,
+        )
+
+    def _govern_ram_pressure(self, verdict: RamPressureVerdict) -> None:
+        """Degrade the worker's footprint and intake while system RAM is below the danger floor.
+
+        The proactive counterpart to the marginal RAM budget: rather than admit a load that the absolute
+        reading says will trip the kernel OOM-killer, the worker (1) pauses job pops so intake stops adding
+        pressure (self-throttle, auto-resumed on cooldown), (2) evicts idle resident models, and (3) reduces
+        the resident inference-process count so the multi-GB of resident weights each idle context pins is
+        returned to the OS. Together these walk the host back above the floor instead of crash-looping.
+        """
+        now = time.time()
+        until = now + _RAM_PRESSURE_PAUSE_SECONDS
+        if not (self._state.self_throttle_paused and self._state.self_throttle_paused_until >= until):
+            self._state.self_throttle_paused = True
+            self._state.self_throttle_paused_until = until
+            logger.opt(ansi=True).warning(
+                f"<fg #ff8c69>System RAM below the danger floor ({verdict.reason()}); pausing job pops for "
+                f"{_RAM_PRESSURE_PAUSE_SECONDS:.0f}s and shedding idle footprint so the host is not driven into "
+                "an OS OOM kill. In-flight jobs finish; pops resume once RAM recovers.</>",
+            )
+        # Evict idle resident models (their RAM is returned to the OS once the slot respawns), then reduce the
+        # resident process count: each idle context pins GB of resident weights the allocator only frees on exit.
+        self.unload_models(under_pressure=True)
+        self._reduce_processes_under_ram_pressure()
+
+    def _reduce_processes_under_ram_pressure(self) -> None:
+        """Shed idle resident inference processes to return their resident-weight RAM to the OS.
+
+        The RAM analogue of :attr:`StreamForecast.needs_process_count_reduction`: with the host over the
+        danger floor, the structural remedy is fewer resident contexts, not another load on top. Targets the
+        count needed for in-flight work (at least one), shedding at least one idle sibling; only idle
+        processes are stopped (``scale_inference_processes`` never kills a busy slot), so live work is spared.
+        """
+        current = self._process_map.num_loaded_inference_processes()
+        if current <= 1:
+            return
+        needed = max(1, len(self._job_tracker.jobs_in_progress))
+        target = max(1, min(current - 1, needed))
+        self._process_lifecycle.scale_inference_processes(target, device_index=None)
 
     def _committed_post_processing_reserve_mb(self, *, device_index: int | None = None) -> float:
         """Sum the imminent post-processing-phase VRAM peaks of jobs currently in post-processing (MB).
@@ -1793,6 +1977,26 @@ class InferenceScheduler:
 
             if job.model in loaded_models:
                 continue
+
+            # Absolute system-RAM floor (degrade, never crash): loading a new model routes its weights through
+            # system RAM first, so admitting one while the host is already below its danger floor is the OS
+            # OOM kill, not progress. This gates every admit path -- best-effort, head-starvation force-admit,
+            # and whole-card-terminal all sit below this point -- independent of the marginal RAM budget, which
+            # can pass on a job's small estimate while the whole host is on the edge (resident weights + the
+            # safety process + other apps). Instead of loading, shed idle footprint and pause pops until RAM
+            # recovers. Gated on the budget being active (the same switch the rest of the memory machinery uses).
+            if self._budget_active():
+                ram_pressure = self._ram_pressure_verdict()
+                if ram_pressure.under_pressure:
+                    self._govern_ram_pressure(ram_pressure)
+                    if not self._ram_pressure_notified:
+                        logger.opt(ansi=True).warning(
+                            f"<fg #ff8c69>RAM danger floor reached: deferring preload of {job.model} "
+                            f"({ram_pressure.reason()}). Shedding idle footprint and pausing pops.</>",
+                        )
+                        self._ram_pressure_notified = True
+                    return False
+                self._ram_pressure_notified = False
 
             # An exclusively-admitted over-budget job has the whole device; do not stage another model's
             # weights concurrently (a second resident load is exactly what spills the exclusive job's
@@ -3365,4 +3569,8 @@ class InferenceScheduler:
                     started_any = True
 
                 if not started_any:
+                    # Nothing dispatched this cycle though the queue has work: if the head has been parked
+                    # long enough to be a real stall (not a between-jobs gap), explain *why* it is not
+                    # dispatching. Throttled, read-only -- it never changes scheduling.
+                    self._log_dispatch_stall_if_needed(stable_diffusion_reference)
                     self.unload_models()

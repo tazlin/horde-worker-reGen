@@ -108,6 +108,16 @@ for how it works.
 | `enable_vram_budget` | `true`  | Gate preloads and concurrent dispatch on measured free VRAM/RAM, and evict idle resident models under pressure. Disable only to restore the prior availability-only behavior (not recommended on a shared/consumer GPU). |
 | `vram_reserve_mb`    | `2048`  | Free VRAM (MB) kept in reserve on top of a job's estimated peak. Covers transient spikes such as tiled VAE decode. Larger trades throughput for safety.                |
 | `ram_reserve_mb`     | `4096`  | Available system RAM (MB) kept in reserve so resident-in-RAM models do not force the OS to page to disk.                                                               |
+| `ram_pressure_pause_percent` | `90.0` | Absolute whole-host RAM danger floor. At/above this usage percentage the worker degrades (refuses new model loads, sheds idle resident processes, pauses pops) until RAM recovers, rather than loading weights through an out-of-RAM host and being OS OOM-killed. |
+| `ram_pressure_min_free_mb`   | `1024` | Free-RAM (MB) companion floor: the worker also degrades below this many MB free. The effective floor is `max((100 - ram_pressure_pause_percent)% of total RAM, this)`, so the percentage protects large-RAM hosts and the absolute floor protects small ones. |
+
+The `ram_pressure_*` floor is distinct from `ram_reserve_mb`: the reserve is a
+*marginal* per-job admission check, while the pressure floor is the *absolute*
+whole-host guard that drives the degrade response (shed footprint, throttle
+pops) the moment available RAM crosses it, independent of any one job's cost. A
+SIGKill (`exitcode -9`) reaped while RAM is below this floor is classified as an
+OS OOM kill rather than a slot crash, so it is not mislabelled "crashed or hung"
+and does not quarantine an otherwise-healthy slot.
 
 When the budget evicts resident models to reclaim VRAM/RAM under pressure, it
 logs prominently; frequent eviction/reload churn is a signal to reduce the model

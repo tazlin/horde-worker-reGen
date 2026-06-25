@@ -14,6 +14,7 @@ from multiprocessing.synchronize import Lock as Lock_MultiProcessing
 from multiprocessing.synchronize import Semaphore
 from typing import TYPE_CHECKING
 
+import psutil
 from loguru import logger
 
 if TYPE_CHECKING:
@@ -43,6 +44,7 @@ from horde_worker_regen.process_management.performance_model import (
 )
 from horde_worker_regen.process_management.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_map import ProcessMap
+from horde_worker_regen.process_management.resource_budget import ram_pressure_floor_mb
 from horde_worker_regen.process_management.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.worker_state import WorkerState
@@ -1253,13 +1255,48 @@ class ProcessLifecycleManager:
         self._initiate_safety_replacement()
         self._replace_all_safety_process()
 
+    def _looks_like_oom_kill(self, process_info: HordeProcessInfo) -> bool:
+        """Whether a dead slot was SIGKILLed by the OS OOM-killer rather than crashing on its own.
+
+        The fingerprint is a ``SIGKILL`` exit (``exitcode == -9``) while system RAM is below its danger
+        floor: the kernel reaps the largest process to relieve memory pressure, so the slot vanishes with
+        no exception and no fault ``info`` for the ordinary classifier to read. The low-RAM check is what
+        distinguishes this from the worker's own hang-kill (also ``-9``) on a healthy host: when RAM is fine
+        a ``-9`` stays an ordinary crash/hang. Reads the configured floor defensively (a partially-mocked or
+        older config falls back to the module defaults) and never raises -- any error reads False, leaving
+        the slot on its ordinary crash path.
+        """
+        raw_exitcode = getattr(process_info.mp_process, "exitcode", None)
+        if raw_exitcode != -9:
+            return False
+        try:
+            bridge_data = self._runtime_config.bridge_data
+            pause = getattr(bridge_data, "ram_pressure_pause_percent", 90.0)
+            min_free = getattr(bridge_data, "ram_pressure_min_free_mb", 1024.0)
+            pause_pct = float(pause) if isinstance(pause, (int, float)) and not isinstance(pause, bool) else 90.0
+            min_free_mb = (
+                float(min_free) if isinstance(min_free, (int, float)) and not isinstance(min_free, bool) else 1024.0
+            )
+            vm = psutil.virtual_memory()
+            available_mb = vm.available / (1024 * 1024)
+            floor_mb = ram_pressure_floor_mb(
+                vm.total / (1024 * 1024),
+                pause_percent=pause_pct,
+                min_free_mb=min_free_mb,
+            )
+            return available_mb < floor_mb
+        except Exception as e:
+            logger.debug(f"OOM-kill check failed: {type(e).__name__} {e}")
+            return False
+
     def _replace_inference_process(
         self,
         process_info: HordeProcessInfo,
         *,
         intentional_reclaim: bool = False,
+        intentional_reason: str | None = None,
     ) -> None:
-        """Replace an inference process (because it crashed, hung, or timed out).
+        """Replace an inference process (because it crashed, hung, timed out, or by deliberate request).
 
         Frees any shared GPU/disk primitives the dead child may still hold (state-independently; see
         ``_release_held_primitives``), faults its in-flight job, then either respawns the slot or, if
@@ -1274,6 +1311,12 @@ class ProcessLifecycleManager:
                 not fed to the crash-loop / start-failure breakers (which would otherwise quarantine a
                 perfectly healthy slot under sustained RAM pressure, since reclaim-cycles of one slot can
                 exceed ``CRASH_LOOP_MAX_REPLACEMENTS`` within the window).
+            intentional_reason: When set, this is some *other* deliberate replacement of a healthy slot
+                (e.g. the maintenance-mode pool reload), labelled with this reason. It takes the same
+                no-crash-bookkeeping path as ``intentional_reclaim``: labelling a deliberate reload
+                "crashed or hung" both pollutes the recovery diagnostics and feeds a
+                phantom crash into the recovery count and crash-loop breaker. Ignored if
+                ``intentional_reclaim`` is also set.
         """
         bridge_data = self._runtime_config.bridge_data
         logger.debug(f"Replacing {process_info}")
@@ -1341,21 +1384,31 @@ class ProcessLifecycleManager:
                 retryable=not (aux_download_stall and not aux_stall_retryable),
             )
 
-        if intentional_reclaim:
-            # A healthy idle slot is being cycled solely to return RAM to the OS: the in-process model
-            # unload already freed the model, but the allocator keeps the pages, so only a respawn
-            # actually reclaims them. This is not a crash/hang, so it skips the recovery diagnostics,
-            # the process_recoveries count, and the crash-loop / start-failure breakers entirely.
-            logger.info(
-                f"Cycling idle process {process_info.process_id} to reclaim "
-                f"{process_info.ram_usage_bytes} bytes of unreleased RAM.",
-            )
+        if intentional_reclaim or intentional_reason is not None:
+            # A healthy slot is being replaced *deliberately*, not because it crashed or hung: either to
+            # return allocator-retained RAM to the OS (the model unload freed the model, but only a respawn
+            # reclaims the pages), or for an operational reload such as the maintenance-mode pool refresh.
+            # Either way this skips the recovery diagnostics, the process_recoveries count, and the
+            # crash-loop / start-failure breakers entirely, so a deliberate replacement is never mistaken
+            # for (or accumulated toward) a crash.
+            if intentional_reclaim:
+                reason = "idle process cycled to reclaim RAM"
+                logger.info(
+                    f"Cycling idle process {process_info.process_id} to reclaim "
+                    f"{process_info.ram_usage_bytes} bytes of unreleased RAM.",
+                )
+            else:
+                assert intentional_reason is not None
+                reason = intentional_reason
+                logger.info(
+                    f"Replacing process {process_info.process_id} ({reason}); deliberate, not a crash or hang.",
+                )
             self._action_ledger.record(
                 LedgerEventType.PROCESS_REPLACED,
                 process_id=process_info.process_id,
                 os_pid=process_info.os_pid,
                 launch_identifier=process_info.process_launch_identifier,
-                reason="idle process cycled to reclaim RAM",
+                reason=reason,
                 detail={
                     "last_state": process_info.last_process_state.name,
                     "ram_usage_bytes": process_info.ram_usage_bytes,
@@ -1376,6 +1429,16 @@ class ProcessLifecycleManager:
             will_quarantine = False
             quarantine_reason = ""
             recovery_reason = f"inference process replaced (failed to load model {failed_model})"
+        elif self._looks_like_oom_kill(process_info):
+            # A SIGKILL (exitcode -9) while system RAM is critically low is the kernel OOM-killer, not the
+            # slot crashing: labelling it "crashed or hung" both misleads the post-mortem and feeds the
+            # per-slot crash-loop breaker, which would quarantine a healthy slot for a host-wide memory
+            # problem no slot teardown can fix. So it is labelled an OS OOM kill and kept out of the slot
+            # breakers, the same way a poison-model load failure is; the RAM-pressure governor and pop
+            # throttle address the cause. The job still faults retryable (a resource failure earns a retry).
+            will_quarantine = False
+            quarantine_reason = ""
+            recovery_reason = "inference process replaced (likely OS OOM-killed; system RAM critically low)"
         else:
             replacements_in_window = self._record_slot_recovery(process_info.process_id)
             consecutive_start_failures = self._record_start_failure(process_info)

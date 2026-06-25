@@ -245,6 +245,33 @@ def test_intentional_reclaim_is_not_counted_as_a_crash_recovery() -> None:
     plm._start_inference_process.assert_called_once_with(1, device_index=0)
 
 
+def test_maintenance_reload_is_not_counted_or_labelled_as_a_crash() -> None:
+    """A deliberate maintenance-mode pool reload must not masquerade as a crash recovery.
+
+    When the horde forces the worker into maintenance, the manager reloads every (healthy, idle) inference
+    slot. That is an operational replacement, not a crash or hang: it must not bump ``process_recoveries``,
+    must not feed the per-slot crash-loop history, and must be labelled with its real reason in the ledger
+    rather than the misleading "crashed or hung" that would make a routine maintenance episode look like a
+    crash storm in the recovery diagnostics.
+    """
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+    plm._action_ledger = Mock()
+
+    healthy = make_mock_process_info(1, model_name="stable_diffusion", state=HordeProcessState.WAITING_FOR_JOB)
+    plm._process_map[1] = healthy
+
+    plm._replace_inference_process(healthy, intentional_reason="maintenance-mode pool reload")
+
+    assert plm._num_process_recoveries == 0
+    assert plm._slot_recovery_history.get(1, []) == []
+    plm._start_inference_process.assert_called_once_with(1, device_index=0)
+    ledger_reason = plm._action_ledger.record.call_args.kwargs["reason"]
+    assert ledger_reason == "maintenance-mode pool reload"
+    assert "crashed or hung" not in ledger_reason
+
+
 def test_crash_replacement_still_counts_as_a_recovery() -> None:
     """The ordinary (crash/hang) replacement path must still record a recovery and crash-loop history.
 
@@ -736,3 +763,60 @@ def test_reap_if_crashed_recovers_unintended_ended_process() -> None:
     assert plm._reap_if_crashed(crashed) is True
     plm._start_inference_process.assert_called_once_with(3, device_index=0)
     assert plm._num_process_recoveries == 1
+
+
+def test_oom_kill_is_labelled_oom_and_spares_the_slot_crash_breaker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``-9`` exit while system RAM is critically low is an OS OOM kill, not a slot crash or hang.
+
+    When the kernel OOM-killer terminates an inference process (``exitcode=-9``) while system RAM is at or
+    below the danger floor, the current reaper labels it "inference process replaced (crashed or hung)":
+    (a) misleading, because the process was fine -- the *host* ran out of memory -- and (b) harmful, because
+    it feeds the per-slot crash-loop breaker, which would quarantine a perfectly healthy slot for a host-wide
+    RAM problem no slot teardown can fix.
+
+    A ``-9`` exit with critically-low system RAM should be labelled an OS OOM kill (a recoverable resource
+    failure) and kept out of the per-slot crash-loop history -- the host-memory governor and pop throttle
+    address the cause, not slot quarantine. A ``-9`` with healthy RAM stays an ordinary crash (covered by
+    ``test_crash_replacement_still_counts_as_a_recovery``).
+    """
+    import psutil
+
+    plm = _make_plm()
+    plm._end_inference_process = Mock()  # type: ignore[method-assign]
+    plm._start_inference_process = Mock()  # type: ignore[method-assign]
+
+    # Spy on the real ledger's record (a full Mock ledger would break _log_recovery_diagnostics, which
+    # reads recent_actions); capture the PROCESS_REPLACED reason while still recording for real.
+    recorded: list[dict[str, object]] = []
+    real_record = plm._action_ledger.record
+
+    def _capture(*args: object, **kwargs: object) -> object:
+        recorded.append(kwargs)
+        return real_record(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(plm._action_ledger, "record", _capture)
+
+    # The host is out of RAM: ~0.9 GB available of 31.3 GiB (well below any sane danger floor).
+    monkeypatch.setattr(
+        psutil,
+        "virtual_memory",
+        lambda: Mock(available=int(900 * 1024 * 1024), total=int(31.3 * 1024 * 1024 * 1024), percent=97.0),
+    )
+
+    killed = make_mock_process_info(
+        1,
+        model_name="Flux.1-Schnell fp8 (Compact)",
+        state=HordeProcessState.PRELOADING_MODEL,
+    )
+    killed.mp_process = Mock(is_alive=Mock(return_value=False), exitcode=-9, pid=100001)
+    plm._process_map[1] = killed
+
+    plm._replace_inference_process(killed)
+
+    reason = next(str(k["reason"]) for k in recorded if "reason" in k)
+    assert "crashed or hung" not in reason, "an OS OOM-kill must not be mislabelled a slot crash or hang"
+    assert "oom" in reason.lower() or "out of memory" in reason.lower(), (
+        "a -9 exit with critically-low system RAM should be labelled an OS OOM kill"
+    )
+    # A host-RAM OOM is not slot sickness: repeated OOM kills must not quarantine an otherwise-healthy slot.
+    assert plm._slot_recovery_history.get(1, []) == [], "OS OOM kills must not feed the per-slot crash-loop breaker"

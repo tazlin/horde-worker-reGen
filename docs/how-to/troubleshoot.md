@@ -19,7 +19,8 @@ maintainer directly, as we cannot guarantee your API key is not present in them.
 | Job timeouts | Remove large models (Flux, Cascade, SDXL), lower `max_power`, and disable post-processing, controlnet, or LoRA. |
 | Out of memory | The worker's VRAM/RAM budget (`enable_vram_budget`, on by default) guards against this by gating model loads on measured free memory; if you still hit it, lower `max_threads`, `max_batch`, or `queue_size`, reduce your model set, or raise `vram_reserve_mb`, and close other programs. See [Configure for your GPU](configure-for-your-gpu.md) and [the VRAM and RAM budget](../explanation/performance_and_backpressure.md#the-vram-and-ram-budget). |
 | Less kudos than expected | New workers have 50% of job kudos and 100% of uptime kudos held in escrow for around a week, until you become trusted. |
-| Worker stuck in maintenance mode | Log into [artbot](https://tinybots.net/artbot/settings?panel=workers) with the worker running and click "unpause". Check the logs for `ERROR` entries to find the root cause. |
+| Worker stuck in maintenance mode | The horde usually forces this *because the worker dropped too many jobs*, so unpausing alone will re-trigger it. Run `horde-log diagnose --last` to find the drops. They are usually generations the horde aborted as "too slow", but that has two different causes the diagnosis distinguishes: (1) generation itself is slow (lower `max_power`/`max_threads`/`queue_size`/`max_batch`, put models on an SSD); or (2) generation is fast but jobs *age in the pipeline queue* because a downstream stage (typically CPU safety, with `safety_on_gpu` off) is slower than inference. For (2), lowering `max_power` does not help: enable `safety_on_gpu` (or otherwise speed up safety). The worker also applies post-inference backpressure that bounds (2) automatically. Fix the cause, then unpause in [artbot](https://tinybots.net/artbot/settings?panel=workers). |
+| Logs show "requeued it for a fresh safety check" or "Soft-pausing job pops … safety could not check a result" | A completed job was sent to the safety process but its verdict never returned (the safety process was replaced, or a result message was dropped). The worker recovers on its own: it re-checks the job (an image is never submitted without passing safety), and if safety cannot be relied on it briefly soft-pauses popping and reissues the affected job to the horde with no image. No action is needed unless it persists, which points to a failing safety process (check the `bridge_safety_*` logs). |
 
 ## Reading the logs
 
@@ -55,7 +56,10 @@ operator shutdown, or killed/crashed), and peak process-recovery count, so a ses
 stands out. `diagnose` then runs detectors over a session and prints ranked findings: it recognizes an
 inference pool that crashes on start (and surfaces the child's actual exception, e.g. a CPU-only torch
 reporting `Torch not compiled with CUDA enabled`), a recovery storm that never gave up, GPU
-out-of-memory, and more, each with a remediation.
+out-of-memory, the horde forcing the worker into maintenance for dropping too many jobs (and ties it
+back to the local cause), a slow-generation spiral where the horde aborts late submissions as too slow
+until it forces maintenance, a scheduler wedge from an over-conservative VRAM budget deferring
+head-of-queue jobs on an idle device with ample free VRAM, and more, each with a remediation.
 
 For a deeper look, `horde-log timeline --session N` interleaves the parent log, the per-slot child logs,
 and the action ledger into one time-ordered stream, and `horde-log job <id>` traces a single job across

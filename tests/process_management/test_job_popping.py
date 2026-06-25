@@ -9,6 +9,7 @@ higher-level api_job_pop flow.
 from __future__ import annotations
 
 import time
+import uuid
 from unittest.mock import AsyncMock, Mock, patch
 
 from horde_sdk import RequestErrorResponse
@@ -90,20 +91,30 @@ def _make_popper(
     )
 
 
-def _make_process_map_with_available_processes() -> ProcessMap:
-    """Create a process map that has both a safety and an inference process available."""
-    safety_proc = make_mock_process_info(
-        10,
-        model_name=None,
-        state=HordeProcessState.WAITING_FOR_JOB,
-        process_type=HordeProcessType.SAFETY,
-    )
-    inf_proc = make_mock_process_info(
-        0,
-        model_name="stable_diffusion",
-        state=HordeProcessState.WAITING_FOR_JOB,
-    )
-    return ProcessMap({10: safety_proc, 0: inf_proc})
+def _make_process_map_with_available_processes(*, num_safety: int = 1) -> ProcessMap:
+    """Create a process map with an available inference process and ``num_safety`` safety processes."""
+    procs: dict[int, object] = {
+        0: make_mock_process_info(0, model_name="stable_diffusion", state=HordeProcessState.WAITING_FOR_JOB),
+    }
+    for i in range(num_safety):
+        procs[10 + i] = make_mock_process_info(
+            10 + i,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.SAFETY,
+        )
+    return ProcessMap(procs)  # type: ignore[arg-type]
+
+
+async def _queue_n_jobs_for_safety(job_tracker: JobTracker, n: int) -> None:
+    """Place ``n`` jobs into the post-inference safety backlog (PENDING_SAFETY_CHECK)."""
+    for _ in range(n):
+        job = Mock()
+        job.id_ = uuid.uuid4()
+        job.model = "stable_diffusion"
+        job_info = Mock()
+        job_info.sdk_api_job_info = job
+        await job_tracker.queue_for_safety(job_info)
 
 
 class TestApiJobPopGuardClauses:
@@ -410,6 +421,119 @@ class TestPopAhead:
         await popper.api_job_pop(urgent=False)
 
         session.submit_request.assert_not_awaited()
+
+
+class TestPostInferenceBackpressure:
+    """Backpressure from the post-inference (safety) stage onto the popper.
+
+    When the safety stage is slower than inference, the unbounded post-inference queue grows until jobs
+    age past their horde ttl and are server-aborted as too slow (which the horde answers with forced
+    maintenance). The popper must stop popping once the safety backlog can no longer clear within the
+    deadline, sized from the measured safety cost and the ttl so it self-tunes instead of needing an
+    operator knob.
+    """
+
+    async def test_deep_safety_backlog_blocks_pop(self) -> None:
+        """A safety backlog past the deadline-derived cap suppresses popping (the core self-heal)."""
+        job_tracker = JobTracker()
+        # avg_safety 10s, ttl 60s -> budget 30s -> cap int(30/10)=3.
+        state = WorkerState(avg_safety_seconds=10.0, recent_job_ttl=60.0)
+        await _queue_n_jobs_for_safety(job_tracker, 3)
+        popper = _make_popper(state=state, job_tracker=job_tracker)
+        assert popper._is_post_inference_backlogged() is True
+
+    async def test_shallow_safety_backlog_does_not_block(self) -> None:
+        """A backlog below the cap leaves popping unthrottled."""
+        job_tracker = JobTracker()
+        state = WorkerState(avg_safety_seconds=10.0, recent_job_ttl=60.0)  # cap 3
+        await _queue_n_jobs_for_safety(job_tracker, 2)
+        popper = _make_popper(state=state, job_tracker=job_tracker)
+        assert popper._is_post_inference_backlogged() is False
+
+    async def test_empty_backlog_never_blocks(self) -> None:
+        """With nothing waiting for safety the gate is inert regardless of timings."""
+        popper = _make_popper(state=WorkerState(avg_safety_seconds=99.0, recent_job_ttl=1.0))
+        assert popper._is_post_inference_backlogged() is False
+
+    async def test_cap_rises_when_safety_is_faster(self) -> None:
+        """Faster measured safety raises the tolerated backlog (self-tuning, no knob)."""
+        job_tracker = JobTracker()
+        await _queue_n_jobs_for_safety(job_tracker, 5)
+        slow = _make_popper(state=WorkerState(avg_safety_seconds=10.0, recent_job_ttl=60.0), job_tracker=job_tracker)
+        fast = _make_popper(state=WorkerState(avg_safety_seconds=2.0, recent_job_ttl=60.0), job_tracker=job_tracker)
+        # cap_slow = int(30/10)=3 -> 5 blocks; cap_fast = int(30/2)=15 -> 5 is fine.
+        assert slow._is_post_inference_backlogged() is True
+        assert fast._is_post_inference_backlogged() is False
+
+    async def test_cap_tightens_for_shorter_ttl(self) -> None:
+        """A shorter horde deadline lowers the cap so jobs still clear in time."""
+        job_tracker = JobTracker()
+        await _queue_n_jobs_for_safety(job_tracker, 4)
+        long_state = WorkerState(avg_safety_seconds=5.0, recent_job_ttl=300.0)
+        short_state = WorkerState(avg_safety_seconds=5.0, recent_job_ttl=30.0)
+        long_ttl = _make_popper(state=long_state, job_tracker=job_tracker)
+        short_ttl = _make_popper(state=short_state, job_tracker=job_tracker)
+        # long: int(150/5)=30 -> 4 fine; short: int(15/5)=3 -> 4 blocks.
+        assert long_ttl._is_post_inference_backlogged() is False
+        assert short_ttl._is_post_inference_backlogged() is True
+
+    async def test_falls_back_to_defaults_without_measurements(self) -> None:
+        """Before any safety sample or ttl, a conservative default cap still bounds the backlog."""
+        job_tracker = JobTracker()
+        # defaults: 8s safety, 150s ttl -> budget 75s -> cap int(75/8)=9.
+        await _queue_n_jobs_for_safety(job_tracker, 9)
+        popper = _make_popper(state=WorkerState(), job_tracker=job_tracker)
+        assert popper._is_post_inference_backlogged() is True
+
+    async def test_cap_scales_with_safety_process_count(self) -> None:
+        """Two safety processes clear the backlog twice as fast, so the cap doubles."""
+        job_tracker = JobTracker()
+        await _queue_n_jobs_for_safety(job_tracker, 5)
+        state = WorkerState(avg_safety_seconds=10.0, recent_job_ttl=60.0)  # per-process cap 3
+        one = _make_popper(state=state, job_tracker=job_tracker, process_map=ProcessMap({}))
+        two = _make_popper(
+            state=state,
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(num_safety=2),
+        )
+        assert one._is_post_inference_backlogged() is True  # cap 3 < 5
+        assert two._is_post_inference_backlogged() is False  # cap 6 >= 5
+
+    async def test_api_job_pop_records_skip_reason_when_backlogged(self) -> None:
+        """A pop suppressed by backpressure records the reason and sends no request."""
+        job_tracker = JobTracker()
+        state = WorkerState(avg_safety_seconds=10.0, recent_job_ttl=60.0)  # cap 3
+        await _queue_n_jobs_for_safety(job_tracker, 5)
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="should not be called"))
+        popper = _make_popper(
+            state=state,
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_not_awaited()
+        assert state.last_pop_skipped_reasons.get("safety_backlog", 0) >= 1
+
+    def test_hungry_is_false_when_backlogged(self) -> None:
+        """The fast-pop path also yields to backpressure so it cannot bypass the gate."""
+
+        async def _setup() -> JobPopper:
+            job_tracker = JobTracker()
+            await _queue_n_jobs_for_safety(job_tracker, 5)
+            return _make_popper(
+                state=WorkerState(avg_safety_seconds=10.0, recent_job_ttl=60.0),
+                job_tracker=job_tracker,
+                process_map=_make_process_map_with_available_processes(),
+            )
+
+        import asyncio
+
+        popper = asyncio.run(_setup())
+        assert popper._is_hungry(popper._runtime_config.bridge_data) is False
 
 
 class TestHandleConsecutiveFailures:

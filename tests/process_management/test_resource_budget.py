@@ -17,6 +17,8 @@ from horde_worker_regen.process_management.resource_budget import (
     CommittedReserveLedger,
     RamBudget,
     VramBudget,
+    assess_ram_pressure,
+    ram_pressure_floor_mb,
 )
 
 from .conftest import (
@@ -737,3 +739,49 @@ class TestWholeCardIntent:
         assert forecast.fits_alone is False
         assert forecast.needs_exclusive_residency is False
         assert forecast.streams_unavoidably is True
+
+
+class TestRamPressureFloor:
+    """The absolute system-RAM danger floor: the more conservative of the percentage and the MB floor."""
+
+    def test_percentage_floor_binds_on_a_large_ram_host(self) -> None:
+        """On a 32 GB host the 90%-used (10% free) rule binds: floor ~3.2 GB, well above the 1 GB absolute."""
+        floor = ram_pressure_floor_mb(32063.0, pause_percent=90.0, min_free_mb=1024.0)
+        assert floor == pytest.approx(3206.3, abs=1.0)
+
+    def test_absolute_floor_binds_on_a_small_ram_host(self) -> None:
+        """On an 8 GB host 10% free is only ~819 MB, so the 1 GB absolute floor is the more conservative one."""
+        floor = ram_pressure_floor_mb(8192.0, pause_percent=90.0, min_free_mb=1024.0)
+        assert floor == pytest.approx(1024.0)
+
+    def test_both_floors_are_configurable(self) -> None:
+        """A stricter percentage (or absolute floor) raises the danger threshold accordingly."""
+        # 80%-used (20% free) on 32 GB -> ~6.4 GB, above a 2 GB absolute.
+        assert ram_pressure_floor_mb(32063.0, pause_percent=80.0, min_free_mb=2048.0) == pytest.approx(6412.6, abs=1.0)
+        # A large absolute floor wins even against a lenient percentage.
+        assert ram_pressure_floor_mb(32063.0, pause_percent=95.0, min_free_mb=4096.0) == pytest.approx(4096.0)
+
+    def test_unknown_total_falls_back_to_absolute_floor(self) -> None:
+        """With total RAM unknown (cold start), only the absolute MB floor applies."""
+        assert ram_pressure_floor_mb(None, pause_percent=90.0, min_free_mb=1024.0) == pytest.approx(1024.0)
+
+
+class TestAssessRamPressure:
+    """The pressure verdict: under_pressure exactly when measured available falls below the floor."""
+
+    def test_below_floor_is_under_pressure(self) -> None:
+        """The fiery 1.2 GB-free moment on a 32 GB host reads as under pressure (floor ~3.2 GB)."""
+        verdict = assess_ram_pressure(1200.0, 32063.0, pause_percent=90.0, min_free_mb=1024.0)
+        assert verdict.under_pressure is True
+        assert verdict.floor_mb == pytest.approx(3206.3, abs=1.0)
+
+    def test_above_floor_is_not_under_pressure(self) -> None:
+        """Ample available RAM reads clear, so a healthy worker is never throttled."""
+        verdict = assess_ram_pressure(25000.0, 32063.0, pause_percent=90.0, min_free_mb=1024.0)
+        assert verdict.under_pressure is False
+
+    def test_missing_available_never_fabricates_pressure(self) -> None:
+        """No telemetry (cold start) yields not-under-pressure, so the worker is never wedged on a guess."""
+        verdict = assess_ram_pressure(None, 32063.0, pause_percent=90.0, min_free_mb=1024.0)
+        assert verdict.under_pressure is False
+        assert verdict.available_mb is None

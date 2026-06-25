@@ -497,6 +497,21 @@ vram_reserve_mb: 2048
 # the OS to page to disk. Only used when enable_vram_budget is true.
 ram_reserve_mb: 4096
 
+# Absolute system-RAM danger floor (degrade, never crash). Distinct from ram_reserve_mb (a marginal,
+# per-job admission reserve): when whole-host RAM usage reaches this percentage, the worker stops admitting
+# new model loads, sheds idle resident inference processes, and pauses job pops until RAM recovers, instead
+# of loading a model's weights through an out-of-RAM host and being killed by the kernel OOM-killer. The
+# effective floor is the more conservative of this percentage and ram_pressure_min_free_mb, so a large-RAM
+# host is protected by the percentage and a small-RAM host by the absolute floor. Only used with
+# enable_vram_budget.
+ram_pressure_pause_percent: 90.0
+
+# Minimum free system RAM (MB) below which the worker degrades, regardless of ram_pressure_pause_percent.
+# On a small-RAM host the percentage can resolve to too few MB to load safely, so the worker also degrades
+# whenever free RAM drops below this. Effective floor = max((100 - ram_pressure_pause_percent)% of total
+# RAM, this). Only used with enable_vram_budget.
+ram_pressure_min_free_mb: 1024
+
 # Run a model admitted *against* the VRAM budget (a best-effort head-of-queue admit) with the device
 # to itself. On a small-VRAM card a heavy model (e.g. a Flux combined checkpoint) only fits if nothing
 # else is resident; running it exclusively (evicting other residents, suppressing concurrent staging)

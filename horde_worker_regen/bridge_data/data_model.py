@@ -539,6 +539,26 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """Available system RAM (MB) the budget keeps in reserve so resident-in-RAM models do not force
     the OS to page to disk. Only used when `enable_vram_budget` is true."""
 
+    ram_pressure_pause_percent: float = Field(default=90.0, ge=0, le=100)
+    """System-RAM usage percentage at or above which the worker degrades to protect against an OS OOM kill.
+
+    Distinct from `ram_reserve_mb` (a marginal, per-job admission reserve): this is an *absolute* danger
+    floor on the whole host. When system RAM usage reaches this percentage (equivalently, available RAM
+    falls below `100 - this` percent of total) the worker stops admitting new model loads, sheds idle
+    resident inference processes, and pauses job pops until RAM recovers, rather than loading a model's
+    weights through an out-of-RAM host and being killed by the kernel OOM-killer. The effective floor is
+    the *more conservative* of this percentage and `ram_pressure_min_free_mb`, so a large-RAM host is
+    protected by the percentage and a small-RAM host by the absolute floor. Only used when
+    `enable_vram_budget` is true."""
+
+    ram_pressure_min_free_mb: int = Field(default=1024, ge=0)
+    """Minimum free system RAM (MB) below which the worker degrades, regardless of `ram_pressure_pause_percent`.
+
+    The absolute companion to the percentage floor: on a small-RAM host `100 - ram_pressure_pause_percent`
+    percent of total can still be too few megabytes to load safely, so the worker also degrades whenever
+    free RAM drops below this many MB. The effective danger floor is `max((100 -
+    ram_pressure_pause_percent)% of total RAM, this)`. Only used when `enable_vram_budget` is true."""
+
     post_processing_budget_reserve_enabled: bool = Field(default=True)
     """Hold back the imminent post-processing VRAM peak of in-flight jobs when admitting new ones.
 

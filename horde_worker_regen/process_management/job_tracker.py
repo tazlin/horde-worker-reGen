@@ -135,6 +135,12 @@ class TrackedJob:
 
     Together with ``time_popped`` this gives per-job latency breakdowns
     (queue wait, inference, safety, submit)."""
+    current_stage_since: float = 0.0
+    """Epoch time the job entered its *current* stage (updated on every transition).
+
+    Unlike ``stage_timestamps`` (which records only the *first* entry into each stage), this tracks the
+    latest entry, so a job's true time-in-stage is accurate even after it cycles back through a stage (e.g.
+    a safety re-check). Drives the status dump's per-stage aging so a stuck stage shows a growing age."""
     inference_attempts: int = 0
     """How many inference attempts have failed for this job; bounds retry against ``max_inference_attempts``."""
     degraded_retry_used: bool = False
@@ -356,7 +362,9 @@ class JobTracker:
             return False
         tracked.stage = new_stage
         tracked.stage_sequence = self._next_sequence()
-        tracked.stage_timestamps.setdefault(new_stage.name, time.time())
+        now = time.time()
+        tracked.stage_timestamps.setdefault(new_stage.name, now)
+        tracked.current_stage_since = now
         return True
 
     def _register(
@@ -386,7 +394,9 @@ class JobTracker:
             pop_order=self._next_sequence(),
             stage_sequence=self._next_sequence(),
         )
-        tracked.stage_timestamps[stage.name] = time.time()
+        now = time.time()
+        tracked.stage_timestamps[stage.name] = now
+        tracked.current_stage_since = now
         self._jobs[job_id] = tracked
         return tracked
 
@@ -409,6 +419,25 @@ class JobTracker:
         """Return the current stage of a job, or None if it is not tracked."""
         tracked = self._tracked_by_id(job_id)
         return tracked.stage if tracked is not None else None
+
+    def stage_age_summary(self, *, now: float | None = None) -> dict[JobStage, tuple[int, float]]:
+        """Return per-stage ``(count, oldest_age_seconds)`` for every non-empty stage.
+
+        The age is measured from :attr:`TrackedJob.current_stage_since` (the latest entry into the stage),
+        so a job that genuinely sits in a stage shows a growing age while normal throughput stays near
+        zero. Surfaced in the periodic status dump so a downstream stall (e.g. jobs aging in
+        ``SAFETY_CHECKING`` while inference keeps finishing) is visible at a glance instead of having to be
+        reconstructed from raw counts after the fact.
+        """
+        reference = time.time() if now is None else now
+        summary: dict[JobStage, tuple[int, float]] = {}
+        for tracked in self._jobs.values():
+            if tracked.stage == JobStage.DETACHED:
+                continue
+            age = max(0.0, reference - tracked.current_stage_since) if tracked.current_stage_since else 0.0
+            count, oldest = summary.get(tracked.stage, (0, 0.0))
+            summary[tracked.stage] = (count + 1, max(oldest, age))
+        return summary
 
     @property
     def jobs_lookup(self) -> dict[ImageGenerateJobPopResponse, HordeJobInfo]:
@@ -731,6 +760,20 @@ class JobTracker:
         """Requeue all jobs that are currently being safety checked."""
         for tracked in self._jobs_in_stage(JobStage.SAFETY_CHECKING):
             self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
+
+    async def requeue_one_being_safety_checked(self, job_id: GenerationID) -> bool:
+        """Move a single job from SAFETY_CHECKING back to PENDING_SAFETY_CHECK, so it is re-evaluated.
+
+        Used by the safety-orphan watchdog when a job's safety result was lost (the safety process was
+        replaced, or a result message was dropped): the job is sent back to the front of the safety queue
+        for a fresh check rather than being stranded in SAFETY_CHECKING forever. Its images are preserved
+        so they are actually re-checked, not silently submitted unchecked. Returns True if the job was in
+        SAFETY_CHECKING and was requeued, False otherwise.
+        """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.stage != JobStage.SAFETY_CHECKING:
+            return False
+        return self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK)
 
     async def take_being_safety_checked(self, job_id: GenerationID) -> HordeJobInfo | None:
         """Take a job that is currently being safety checked by its ID, detaching it."""

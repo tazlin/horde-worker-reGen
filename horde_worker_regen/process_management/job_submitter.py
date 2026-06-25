@@ -394,6 +394,13 @@ class JobSubmitter:
         punt_reason: str | None = None
         if job_info.id_ is None:
             punt_reason = "job has no generation id"
+        elif completed_job_info.job_image_results is not None and not completed_job_info.safety_evaluated:
+            # The hard safety invariant: an image is uploaded only after the safety process returned a
+            # verdict for it. ``safety_evaluated`` is set in exactly one place (the safety-result handler);
+            # a job whose result was lost reaches here with images but the flag still False, and is faulted
+            # rather than uploaded, so uncensored NSFW/CSAM can never leak. The ``censored is None`` check
+            # below is kept as defence-in-depth (the outcome sentinel and the explicit flag must agree).
+            punt_reason = "job has images but never passed safety (safety_evaluated is False)"
         elif completed_job_info.job_image_results is not None and completed_job_info.censored is None:
             punt_reason = "job has images but never received a safety verdict (censored is None)"
         elif completed_job_info.job_image_results is not None and job_info.r2_upload is None:

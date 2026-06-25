@@ -33,6 +33,16 @@ class HordeJobInfo(BaseModel):
     censored: bool | None = None
     """Whether or not the job was censored. This is set by the safety process."""
 
+    safety_evaluated: bool = False
+    """Whether the safety process returned a verdict for this job's images.
+
+    The authoritative, unforgeable gate for submission: an image must never be sent to the horde unless
+    safety actually ran on it (uncensored NSFW/CSAM would otherwise leak). It is set True in exactly one
+    place, the safety-result handler, after the per-image verdict has been applied; nothing else writes it.
+    It is kept distinct from ``censored`` (which records the *outcome* of the check) so the
+    "was it checked at all" question does not depend on a nullable outcome sentinel that another code path
+    could set incidentally."""
+
     time_popped: float
     time_submitted: float | None = None
 
@@ -43,8 +53,8 @@ class HordeJobInfo(BaseModel):
 
     @property
     def is_job_checked_for_safety(self) -> bool:
-        """Return true if the job has been checked for safety."""
-        return self.censored is not None
+        """Return true if the safety process returned a verdict for this job's images."""
+        return self.safety_evaluated
 
     @property
     def images_base64(self) -> list[str]:

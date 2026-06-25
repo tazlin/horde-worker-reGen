@@ -71,7 +71,7 @@ from horde_worker_regen.process_management.horde_process import HordeProcessType
 from horde_worker_regen.process_management.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.job_popper import JobPopper
 from horde_worker_regen.process_management.job_submitter import JobSubmitter
-from horde_worker_regen.process_management.job_tracker import JobTracker
+from horde_worker_regen.process_management.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lora_disk_guard import (
     free_mb,
     is_lora_disk_exhausted,
@@ -902,6 +902,18 @@ class HordeWorkerProcessManager:
         self._orphan_in_progress_since: dict[GenerationID, float] = {}
         self._orphan_punt_history: list[float] = []
 
+        # Orphaned-safety-check watchdog (the analogue of the in-progress watchdog, for the safety stage):
+        # a job sent to the safety process whose verdict never returns (the process was replaced, or its
+        # result message was dropped) is stranded in SAFETY_CHECKING forever -- nothing retries it, because
+        # the orchestrator only acts on PENDING_SAFETY_CHECK. Such jobs pin pipeline slots and, with the
+        # queue unable to drain, can wedge the pipeline into soft resets and dropped jobs up to
+        # horde-forced maintenance. `_orphan_safety_since` records when each SAFETY_CHECKING job was first
+        # seen (the grace clock); `_safety_requeue_count` counts how many times a job has been requeued for
+        # a fresh check, so a job the safety pipeline cannot ever check (a pathological loop) is escalated
+        # to a no-image fault instead of being requeued forever.
+        self._orphan_safety_since: dict[GenerationID, float] = {}
+        self._safety_requeue_count: dict[GenerationID, int] = {}
+
         self._job_submitter = JobSubmitter(
             state=self._state,
             job_tracker=self._job_tracker,
@@ -1443,7 +1455,14 @@ class HordeWorkerProcessManager:
                 logger.warning("Reloading all process due to maintenance mode")
                 for process_info in self._process_map.values():
                     if process_info.process_type == HordeProcessType.INFERENCE:
-                        self._process_lifecycle._replace_inference_process(process_info)
+                        # This is a deliberate, operational reload of healthy slots, not a crash recovery:
+                        # flag it so each replacement is not mislabelled "crashed or hung" in the recovery
+                        # diagnostics nor counted as a process recovery (which would otherwise make a routine
+                        # maintenance episode look like a crash storm to the recovery diagnostics).
+                        self._process_lifecycle._replace_inference_process(
+                            process_info,
+                            intentional_reason="maintenance-mode pool reload",
+                        )
                     self._job_popper._replaced_due_to_maintenance = True
                 MaintenanceModeMessenger.print_maintenance_mode_messages()
 
@@ -1461,6 +1480,11 @@ class HordeWorkerProcessManager:
             # Backstop the per-slot recovery: punt any job left in-progress with no owning live slot
             # before it can wedge the head of the queue.
             self._reconcile_orphaned_in_progress_jobs()
+
+            # The safety-stage analogue: recover any job stranded in SAFETY_CHECKING whose verdict was lost
+            # (re-check it, or fault it with no image if safety is pathological) before the backlog wedges
+            # the pipeline.
+            await self._reconcile_orphaned_safety_jobs()
 
             # Save-our-ship: above the per-slot recovery, escalate a worker that is wedged as a whole
             # (no live process for pending work) to a soft reset and finally to giving up cleanly.
@@ -2001,6 +2025,139 @@ class HordeWorkerProcessManager:
         ]
         return len(self._orphan_punt_history) >= self._ORPHAN_PUNT_WEDGE_THRESHOLD
 
+    _ORPHAN_SAFETY_GRACE_SECONDS = 45.0
+    """How long a job may sit SAFETY_CHECKING with no verdict returned before it is treated as orphaned.
+
+    A safety check completes in seconds even for a batch, so well past this the verdict is lost (the
+    safety process was replaced, or its result message was dropped). Generous enough to ride out a slow
+    CPU-bound check, short enough that a stranded job is recovered in under a minute instead of pinning a
+    pipeline slot indefinitely."""
+
+    _SAFETY_REQUEUE_MAX = 3
+    """How many times one job may be requeued for a fresh safety check before it is faulted with no image.
+
+    A job whose verdict is lost on every re-send is one the safety pipeline cannot check; rather than loop
+    forever it is faulted (no image submitted, the horde reissues it) and the worker soft-pauses."""
+
+    _SAFETY_SOFT_PAUSE_SECONDS = 60.0
+    """How long the worker soft-pauses popping after an unrecoverable safety failure, before retrying.
+
+    Reuses the self-throttle pause (pops stop; in-flight safety-checked jobs still submit) and auto-resumes,
+    so a transient safety outage self-heals while a persistent one keeps the worker from popping work it
+    cannot safety-check (and therefore from dropping it into horde-forced maintenance)."""
+
+    def _engage_safety_soft_pause(self, reason: str) -> None:
+        """Soft-pause job popping because safety could not be relied on to check results.
+
+        Uses the same worker-initiated pause as the self-maintenance throttle: new pops stop while
+        already-safety-checked jobs keep submitting, and it auto-resumes after a cooldown so a transient
+        safety outage recovers on its own. Never extends an existing, longer pause.
+        """
+        until = time.time() + self._SAFETY_SOFT_PAUSE_SECONDS
+        if self._state.self_throttle_paused and self._state.self_throttle_paused_until >= until:
+            return
+        self._state.self_throttle_paused = True
+        self._state.self_throttle_paused_until = until
+        logger.warning(
+            f"Soft-pausing job pops for {self._SAFETY_SOFT_PAUSE_SECONDS:.0f}s: safety could not check a "
+            f"result ({reason}). In-flight checked jobs still submit; pops resume automatically once safety "
+            "recovers, so the worker does not keep taking on work it cannot safety-check.",
+        )
+
+    async def _reconcile_orphaned_safety_jobs(self) -> None:
+        """Recover jobs stranded in SAFETY_CHECKING whose verdict will never return.
+
+        The safety orchestrator only ever acts on PENDING_SAFETY_CHECK, so a job whose safety result was
+        lost (its process replaced, or a dropped result message) sits in SAFETY_CHECKING forever: nothing
+        re-checks it, it pins a pipeline slot, and -- with the queue then unable to drain -- it drives the
+        structural wedge that ends in dropped jobs and horde-forced maintenance.
+
+        This watchdog is the safety-stage analogue of :meth:`_reconcile_orphaned_in_progress_jobs`. A job
+        continuously in SAFETY_CHECKING past :data:`_ORPHAN_SAFETY_GRACE_SECONDS` is requeued for a fresh
+        check (its images preserved, so they are actually re-evaluated, never submitted unchecked) and a
+        fresh safety process is brought up in case the current one is wedged. A job that keeps being
+        orphaned (:data:`_SAFETY_REQUEUE_MAX` requeues), or any safety orphan while the safety pool is
+        unrecoverable (crash-looping), is escalated: faulted with no image so the horde reissues it, and the
+        worker soft-pauses popping so it stops taking on work it cannot safety-check.
+        """
+        now = time.time()
+        checking = self._job_tracker.jobs_being_safety_checked
+        current_ids = {
+            info.sdk_api_job_info.id_ for info in checking if info.sdk_api_job_info.id_ is not None
+        }
+
+        # Drop the grace clock for jobs no longer in SAFETY_CHECKING so it only runs while a job is
+        # continuously stranded. Keep a job's requeue tally while it is cycling back through
+        # PENDING_SAFETY_CHECK (a re-check in flight), but clear it once the job has left the safety stages
+        # for good (reached submit) so a later, unrelated stall starts from a clean count.
+        for job_id in list(self._orphan_safety_since):
+            if job_id not in current_ids:
+                del self._orphan_safety_since[job_id]
+        for job_id in list(self._safety_requeue_count):
+            if job_id not in current_ids and self._job_tracker.get_stage(job_id) != JobStage.PENDING_SAFETY_CHECK:
+                del self._safety_requeue_count[job_id]
+
+        pool_unrecoverable = self._is_safety_pool_unrecoverable()
+
+        for info in checking:
+            job = info.sdk_api_job_info
+            job_id = job.id_
+            if job_id is None:
+                continue
+            first_seen = self._orphan_safety_since.setdefault(job_id, now)
+            if (now - first_seen) < self._ORPHAN_SAFETY_GRACE_SECONDS:
+                continue
+
+            requeues = self._safety_requeue_count.get(job_id, 0)
+            if pool_unrecoverable or requeues >= self._SAFETY_REQUEUE_MAX:
+                reason = (
+                    "safety pool unrecoverable (crash-looping)"
+                    if pool_unrecoverable
+                    else f"requeued {requeues} times without a verdict"
+                )
+                logger.critical(
+                    f"Job {job_id} could not be safety-checked ({reason}); dropping its images and faulting "
+                    "it so the horde reissues it (an image the safety check never cleared is never "
+                    "submitted). Soft-pausing pops until safety recovers.",
+                )
+                # Drop the images explicitly so nothing unchecked can survive to the submit path, then fault
+                # terminally (no image, reissued by the horde). scheduling_fault keeps this off the per-model
+                # "locally unservable" streak: it is a safety-pipeline failure, not a card-fit verdict.
+                info.fault_job()
+                self._action_ledger.record(
+                    LedgerEventType.INFERENCE_FAULTED,
+                    job_id=str(job_id),
+                    reason=f"safety check unrecoverable ({reason})",
+                    detail={"stuck_seconds": round(now - first_seen, 1), "safety_requeues": requeues},
+                )
+                self._job_tracker.handle_job_fault_now(
+                    faulted_job=job,
+                    process_timeout=self.bridge_data.process_timeout,
+                    retryable=False,
+                    scheduling_fault=True,
+                )
+                self._orphan_safety_since.pop(job_id, None)
+                self._safety_requeue_count.pop(job_id, None)
+                self._engage_safety_soft_pause(reason)
+                continue
+
+            if await self._job_tracker.requeue_one_being_safety_checked(job_id):
+                self._safety_requeue_count[job_id] = requeues + 1
+                self._orphan_safety_since.pop(job_id, None)
+                # Only force a fresh safety process when the current pool cannot serve a check (dead or
+                # wedged). When a ready safety process is already up -- idle, but a
+                # result was lost -- the requeued job is simply re-checked by it; tearing that healthy
+                # process down on every orphan would only churn the pool (and double-rebuild right after a
+                # soft reset). A genuinely broken process is caught by the re-check also being lost, which
+                # escalates to the no-image fault above.
+                if not self._is_safety_pool_ready():
+                    self._process_lifecycle.safety_processes_should_be_replaced = True
+                logger.warning(
+                    f"Job {job_id} awaited a safety verdict for {now - first_seen:.0f}s with none returned; "
+                    f"requeued it for a fresh safety check (attempt {requeues + 1}/{self._SAFETY_REQUEUE_MAX}). "
+                    "Its images are re-checked, never submitted unchecked.",
+                )
+
     def _assess_wedge(self) -> bool:
         """Whether the worker structurally cannot make progress (the SOS/save-our-ship trigger).
 
@@ -2108,9 +2265,17 @@ class HordeWorkerProcessManager:
                 self._job_tracker.handle_job_fault_now(info.sdk_api_job_info, retryable=False)
                 faulted += 1
         if faulted > 0:
+            # Name *why* the jobs were unservable so the give-up is self-explanatory in a bundle: a healthy
+            # pool starved by a queue deadlock (the scheduler-wedge case) reads very differently from a pool
+            # that could not be restored, and both faults count against the worker as dropped jobs that can
+            # provoke horde-forced maintenance.
+            if structural_queue_wedge and self._is_inference_capacity_available():
+                cause = "scheduler wedged with idle processes (queue deadlock) despite a healthy pool"
+            else:
+                cause = "no inference capacity could be restored"
             logger.critical(
-                f"Save-our-ship: gave up on {faulted} unservable job(s) and reported them faulted so the "
-                "horde reissues them.",
+                f"Save-our-ship: gave up on {faulted} unservable job(s) ({cause}) and reported them faulted "
+                "so the horde reissues them. Repeated drops like this can trigger horde-forced maintenance.",
             )
 
         structurally_broken = self._is_inference_pool_unrecoverable() or self._is_safety_pool_unrecoverable()
@@ -2482,6 +2647,30 @@ class HordeWorkerProcessManager:
         else:
             logger.warning(message)
 
+    def _build_stage_age_line(self) -> str | None:
+        """A one-line per-stage census with the oldest age in each stage, or None when nothing is tracked.
+
+        Ordered along the pipeline so a backlog that is *aging* (not just deep) -- e.g. jobs sitting in
+        SAFETY_CHECKING while inference keeps finishing -- is obvious. Emitted only inside the already-rate-
+        limited status dump, so it adds no new log frequency.
+        """
+        summary = self._job_tracker.stage_age_summary()
+        if not summary:
+            return None
+        order = (
+            JobStage.PENDING_INFERENCE,
+            JobStage.INFERENCE_IN_PROGRESS,
+            JobStage.PENDING_SAFETY_CHECK,
+            JobStage.SAFETY_CHECKING,
+            JobStage.PENDING_SUBMIT,
+        )
+        parts = [
+            f"{stage.name.lower()}={summary[stage][0]} (oldest {summary[stage][1]:.0f}s)"
+            for stage in order
+            if stage in summary
+        ]
+        return "Pipeline stages: " + " | ".join(parts) if parts else None
+
     def print_status_method(self) -> None:
         """Print the status of the worker if it's time to do so."""
         reporter = StatusReporter(
@@ -2528,6 +2717,7 @@ class HordeWorkerProcessManager:
             system_memory=self._sample_system_memory(),
             download_status=self._model_availability.status,
             download_plan=self._get_download_plan_summary(),
+            stage_age_line=self._build_stage_age_line(),
         )
 
         self._last_status_message_time = reporter.last_status_message_time

@@ -82,6 +82,32 @@ class WorkerState:
     no-jobs idle tracking) can treat active alchemy work as the worker being busy.
     """
 
+    avg_safety_seconds: float = 0.0
+    """Exponential moving average of the measured wall-clock per safety check (0 until first sample).
+
+    The safety stage is a single (often CPU-bound) process downstream of inference, and nothing bounded
+    its queue: when inference outruns safety the post-inference backlog grew until jobs aged past their
+    horde ttl and were server-aborted as "too slow". The job popper reads this (with
+    ``recent_job_ttl``) to apply post-inference backpressure -- stop popping while the safety backlog
+    can no longer clear within the deadline -- so the pipeline self-limits to its slowest stage instead
+    of spiralling into forced maintenance. See :meth:`record_safety_duration`."""
+
+    recent_job_ttl: float | None = None
+    """The most recent horde-supplied job ttl (seconds before the horde aborts a job as stale), or None.
+
+    Captured on each successful pop; the popper uses it to size the post-inference backpressure budget to
+    the actual deadline. Falls back to a conservative constant when the horde does not supply one."""
+
+    def record_safety_duration(self, seconds: float) -> None:
+        """Fold one measured safety-check wall-clock into the EMA used for post-inference backpressure."""
+        if seconds <= 0:
+            return
+        alpha = 0.2
+        if self.avg_safety_seconds <= 0:
+            self.avg_safety_seconds = seconds
+        else:
+            self.avg_safety_seconds = (1 - alpha) * self.avg_safety_seconds + alpha * seconds
+
     def initiate_shutdown(self) -> None:
         """Mark the worker as shutting down (idempotent)."""
         if not self.shutting_down:

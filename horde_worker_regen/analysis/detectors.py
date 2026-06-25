@@ -33,6 +33,56 @@ _OOM_RE = re.compile(
 )
 _NO_IMAGES_RE = re.compile(r"no images were produced|no images produced")
 _ORPHAN_RE = re.compile(r"orphaned? in-progress|punt(?:ing|ed) (?:an? )?orphan")
+# The horde rejecting a pop because it forced the worker into maintenance, and the (server-supplied)
+# reason it gives. "dropping too many jobs" is the worker's own fault and the actionable case; any other
+# maintenance (operator-set, key issue) is informational.
+_MAINTENANCE_POP_RE = re.compile(r"Failed to pop job \(Maintenance Mode\)")
+_DROPPING_JOBS_RE = re.compile(r"dropping too many jobs")
+# Save-our-ship faulting unservable backlog jobs (the "dropped jobs" the horde counts against the worker).
+_GIVE_UP_RE = re.compile(r"gave up on (\d+) unservable job")
+# The scheduler starving: the VRAM budget deferred the head-of-queue on an idle device, with the
+# starvation duration and the free VRAM that proves the budget was over-conservative.
+_FORCE_ADMIT_RE = re.compile(r"budget-deferred on an idle device for (\d+)s")
+_DEVICE_FREE_VRAM_RE = re.compile(r"device_free_vram=(\d+)MB")
+# The worker self-pausing pops after three consecutive faults.
+_CONSECUTIVE_PAUSE_RE = re.compile(r"Too many consecutive failed jobs, pausing job pops")
+# The horde aborting a generation server-side because the worker submitted it after the per-job deadline
+# (the verbatim server message the submitter logs). Each such abort is a faulted job the horde counts
+# against the worker, and a *sustained* run of them is the slow-generation death spiral that ends in
+# forced maintenance, distinct from save-our-ship give-ups.
+_SERVER_SLOW_ABORT_RE = re.compile(r"took too long to process and has been aborted")
+# The worker-side corroboration: the inference grader flagging a job running N-times its expected
+# sampling time, with the residency snapshot (free VRAM) that fingerprints an over-committed device.
+_SLOWDOWN_GRADE_RE = re.compile(r"is ([\d.]+)x its expected sampling time")
+# Each successful submit reports how long the job spent between pop and submit, and how long generation
+# itself took. A large gap between the two means jobs aged in the pipeline (typically the single safety
+# stage backing up), not in generation -- a different cause, and fix, than a genuinely slow GPU.
+_SUBMIT_LATENCY_RE = re.compile(r"Job popped ([\d.]+) seconds ago and took ([\d.]+) to generate")
+# The wall-clock the safety stage took per check; a high average is the safety stage being the pipeline
+# bottleneck (e.g. CPU safety with safety_on_gpu off).
+_SAFETY_DURATION_RE = re.compile(r"took ([\d.]+) seconds to check safety")
+# Safety-stage stall signals. A verdict that never returned strands a job in SAFETY_CHECKING; the worker
+# now re-checks it (requeue), faults it with no image when the pipeline cannot check it (unrecoverable),
+# soft-pauses pops while safety is unreliable, and throttles intake when the safety backlog is too deep.
+# The dispatcher's "none was found" is the original lost-result signal that strands the job.
+_SAFETY_REQUEUE_RE = re.compile(r"requeued it for a fresh safety check")
+_SAFETY_UNRECOVERABLE_RE = re.compile(r"could not be safety-checked")
+_SAFETY_SOFT_PAUSE_RE = re.compile(r"Soft-pausing job pops.*safety could not check a result")
+_SAFETY_BACKPRESSURE_RE = re.compile(r"Withholding job pops: post-inference safety backlog (\d+) >= cap (\d+)")
+_LOST_SAFETY_RESULT_RE = re.compile(r"Expected to find a completed job .* none was found")
+# The scheduler explaining why a head-of-queue job is not dispatching despite pending work. The
+# "no matching gate" variant is the scheduler-bug-shaped stall (model resident and idle, nothing blocking
+# it, yet nothing dispatched).
+_DISPATCH_STALL_RE = re.compile(r"Inference dispatch stalled: head ")
+_DISPATCH_STALL_BUG_RE = re.compile(r"dispatch was withheld with no matching gate")
+
+# A median pop->submit latency this many times the median generation time means jobs are aging in the
+# pipeline queue, not in generation (the post-inference safety-backlog signature).
+_QUEUE_AGING_LATENCY_RATIO = 3.0
+
+# A run of server-side slow-aborts at or above this is a spiral (the horde will force maintenance),
+# not a stray slow job.
+_SLOW_ABORT_SPIRAL_THRESHOLD = 3
 
 # A pool that flapped through at least this many soft resets is "stuck recovering", not a one-off blip.
 _SOFT_RESET_FLAP_THRESHOLD = 2
@@ -70,6 +120,22 @@ Detector = Callable[[SessionContext], "list[Finding]"]
 def _matching(records: list[LogRecord], pattern: re.Pattern[str]) -> list[LogRecord]:
     """Orchestrator records whose message matches ``pattern``."""
     return [record for record in records if pattern.search(record.message)]
+
+
+def _median(values: list[float]) -> float | None:
+    """The median of ``values`` (robust to the warm-up/recalibration outliers in timing logs), or None."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _mean(values: list[float]) -> float:
+    """The arithmetic mean of ``values`` (0.0 for an empty list)."""
+    return sum(values) / len(values) if values else 0.0
 
 
 def _evidence(record: LogRecord) -> str:
@@ -256,6 +322,424 @@ def detect_orphan_wedge(context: SessionContext) -> list[Finding]:
     ]
 
 
+def _total_dropped_jobs(records: list[LogRecord]) -> int:
+    """Sum the jobs save-our-ship faulted across every give-up in the session (the 'dropped' count)."""
+    total = 0
+    for record in _matching(records, _GIVE_UP_RE):
+        match = _GIVE_UP_RE.search(record.message)
+        if match is not None:
+            total += int(match.group(1))
+    return total
+
+
+def _count_server_slow_aborts(records: list[LogRecord]) -> int:
+    """Count generations the horde aborted server-side for being too slow (also 'dropped' jobs)."""
+    return len(_matching(records, _SERVER_SLOW_ABORT_RE))
+
+
+def _describe_drops(records: list[LogRecord]) -> str:
+    """A clause naming what dropped jobs the worker produced in the lead-up to forced maintenance.
+
+    The horde forces maintenance for *dropped* jobs, and a worker can drop them two distinct ways: by
+    faulting unservable backlog jobs itself (save-our-ship give-up) or by submitting generations so late
+    that the horde aborts them as too slow. The clause names whichever actually happened so the operator
+    is pointed at the right upstream cause instead of a generic "investigate the faults".
+    """
+    giveups = _total_dropped_jobs(records)
+    aborts = _count_server_slow_aborts(records)
+    if giveups and aborts:
+        return (
+            f" The worker faulted {giveups} backlog job(s) via save-our-ship give-up and the horde aborted "
+            f"{aborts} generation(s) as too slow just before."
+        )
+    if aborts:
+        return (
+            f" The horde aborted {aborts} generation(s) as too slow ('took too long to process') just "
+            "before; the worker was generating slower than the horde's per-job deadline."
+        )
+    if giveups:
+        return f" The worker faulted {giveups} backlog job(s) via save-our-ship give-up just before."
+    return " investigate which jobs the worker faulted in the lead-up."
+
+
+def detect_forced_maintenance(context: SessionContext) -> list[Finding]:
+    """The horde forcing the worker into maintenance (the incident headline the operator actually sees).
+
+    Maintenance is a *symptom*: the server steps in after the worker drops too many jobs. So the finding
+    names the local drops as the cause rather than treating the maintenance flag as the thing to clear,
+    and stays informational for maintenance the worker did not cause (operator-set, key issues).
+    """
+    maintenance = _matching(context.session.records, _MAINTENANCE_POP_RE)
+    if not maintenance:
+        return []
+
+    giveups = _matching(context.session.records, _GIVE_UP_RE)
+    slow_aborts = _matching(context.session.records, _SERVER_SLOW_ABORT_RE)
+    forced_for_drops = any(_DROPPING_JOBS_RE.search(record.full_text) for record in maintenance)
+    if forced_for_drops:
+        drop_clause = _describe_drops(context.session.records)
+        # Point the operator at whichever upstream finding actually applies: a slow-generation spiral and a
+        # scheduler wedge produce the same maintenance symptom but call for opposite fixes.
+        see_also = "slow_generation_drop_spiral" if slow_aborts else "scheduler_starvation_wedge"
+        return [
+            Finding(
+                id="forced_maintenance",
+                severity=Severity.CRITICAL,
+                title="Horde forced the worker into maintenance",
+                verdict=(
+                    f"The horde rejected {len(maintenance)} pop(s) with forced maintenance because the worker "
+                    f"dropped too many jobs.{drop_clause} Maintenance is the server's response to those drops, "
+                    "not the underlying fault."
+                ),
+                remediation=(
+                    "Fix what is dropping jobs (see the slow-generation / starvation-wedge / recovery findings) "
+                    "rather than just clearing maintenance; it will re-trigger. If the worker is generating too "
+                    "slowly, reduce max_power, max_threads, queue_size, or max_batch (and put models on an SSD); "
+                    "if the cause is a self-inflicted scheduler wedge, reduce churn "
+                    "(unload_models_from_vram_often / high_performance_mode)."
+                ),
+                evidence=[_evidence(r) for r in (maintenance[:1] + giveups[:1] + slow_aborts[:1])],
+                see_also=see_also,
+            ),
+        ]
+    return [
+        Finding(
+            id="forced_maintenance",
+            severity=Severity.INFO,
+            title="Worker was in maintenance mode",
+            verdict=(
+                f"The horde rejected {len(maintenance)} pop(s) with maintenance mode, but not for dropped jobs "
+                "(likely operator-set or an API-key/credentials issue)."
+            ),
+            remediation=(
+                "If unexpected, unpause the worker in the horde UI and confirm the API key is set; otherwise no "
+                "action is needed."
+            ),
+            evidence=[_evidence(maintenance[0])],
+        ),
+    ]
+
+
+def detect_scheduler_starvation_wedge(context: SessionContext) -> list[Finding]:
+    """An over-conservative VRAM budget deferring head-of-queue jobs on an idle device (the root cause).
+
+    The budget refused to admit a head-of-queue model on a device with ample free VRAM, so the queue
+    deadlocked with idle processes and the recovery supervisor soft-reset the pools and faulted the
+    backlog. A lone force-admit that broke the wedge without escalating is a near-miss (warning); a
+    force-admit that still ended in a soft reset and faulted jobs is the self-inflicted wedge (critical).
+    """
+    starved = _matching(context.session.records, _FORCE_ADMIT_RE)
+    if not starved:
+        return []
+
+    durations = [int(m.group(1)) for r in starved if (m := _FORCE_ADMIT_RE.search(r.message))]
+    free_vrams = [int(m.group(1)) for r in starved if (m := _DEVICE_FREE_VRAM_RE.search(r.message))]
+    max_starved = max(durations) if durations else 0
+    free_hint = f" with as much as {max(free_vrams)} MB free VRAM on the device" if free_vrams else ""
+
+    soft_resets = _matching(context.session.records, _SOFT_RESET_RE)
+    dropped = _total_dropped_jobs(context.session.records)
+    escalated = bool(soft_resets) or dropped > 0
+
+    if escalated:
+        return [
+            Finding(
+                id="scheduler_starvation_wedge",
+                severity=Severity.CRITICAL,
+                title="Scheduler wedged on VRAM-budget over-deferral",
+                verdict=(
+                    f"The VRAM budget deferred head-of-queue job(s) on an idle device for up to {max_starved}s"
+                    f"{free_hint}, far more headroom than the head needed. The starved queue deadlocked, the "
+                    f"recovery supervisor soft-reset the pools {len(soft_resets)} time(s) and faulted {dropped} "
+                    "backlog job(s). Those faults are what the horde counts as dropped jobs."
+                ),
+                remediation=(
+                    "The budget was over-conservative for this device (free VRAM was ample), most often because "
+                    "rapid idle-process cycling left no settled baseline to size per-process overhead from. "
+                    "Reduce churn (unload_models_from_vram_often / high_performance_mode) or relax the VRAM "
+                    "budget so the head admits before the starvation timer trips the supervisor."
+                ),
+                evidence=[_evidence(r) for r in (starved[:2] + soft_resets[:1])],
+                see_also="forced_maintenance",
+            ),
+        ]
+    return [
+        Finding(
+            id="scheduler_starvation_wedge",
+            severity=Severity.WARNING,
+            title="Head-of-queue budget starvation (recovered)",
+            verdict=(
+                f"The VRAM budget deferred head-of-queue job(s) on an idle device for up to {max_starved}s"
+                f"{free_hint}, but force-admit broke the wedge before it escalated to a soft reset. A near-miss: "
+                "the budget is close to starving the scheduler on this device."
+            ),
+            remediation=(
+                "Watch for recurrence under load; if it escalates to soft resets and faulted jobs, treat it as a "
+                "wedge (reduce process churn or relax the VRAM budget)."
+            ),
+            evidence=[_evidence(r) for r in starved[:3]],
+        ),
+    ]
+
+
+def detect_slow_generation_drop_spiral(context: SessionContext) -> list[Finding]:
+    """The horde aborting generations as too slow, the drop mechanism behind a slow-worker maintenance.
+
+    This is the root cause the starvation-wedge detector does not cover: the worker is not wedged, it is
+    simply generating slower than the horde's per-job deadline, so the server aborts each late submission
+    ("took too long to process") and faults it. A sustained run of these aborts is what the horde counts
+    as dropped jobs and answers with forced maintenance. The worker-side grader corroborates with the
+    slowdown ratio and the free-VRAM snapshot that fingerprints an over-committed device; a handful of
+    isolated aborts is a warning, a sustained spiral (or one that already drew maintenance) is critical.
+    """
+    aborts = _matching(context.session.records, _SERVER_SLOW_ABORT_RE)
+    if not aborts:
+        return []
+
+    slowdowns = _matching(context.session.records, _SLOWDOWN_GRADE_RE)
+    ratios = [float(m.group(1)) for r in slowdowns if (m := _SLOWDOWN_GRADE_RE.search(r.message))]
+    free_vrams = [int(m.group(1)) for r in slowdowns if (m := _DEVICE_FREE_VRAM_RE.search(r.message))]
+    timestamps = [r.timestamp for r in aborts if r.timestamp is not None]
+    span_minutes = (timestamps[-1] - timestamps[0]).total_seconds() / 60 if len(timestamps) >= 2 else 0.0
+    span_clause = f" over {span_minutes:.0f} min" if span_minutes >= 1 else ""
+
+    maintenance = _matching(context.session.records, _MAINTENANCE_POP_RE)
+    forced_for_drops = any(_DROPPING_JOBS_RE.search(record.full_text) for record in maintenance)
+    spiral = forced_for_drops or len(aborts) >= _SLOW_ABORT_SPIRAL_THRESHOLD
+    severity = Severity.CRITICAL if spiral else Severity.WARNING
+
+    # Decide whether jobs aged in the pipeline queue (fast generation, long pop->submit latency) or in
+    # generation itself (slow GPU). The two share the "too slow" abort but call for opposite fixes, so the
+    # detector measures the submitted jobs' own latency-vs-generation breakdown rather than guessing.
+    latencies = [
+        (float(m.group(1)), float(m.group(2)))
+        for r in _matching(context.session.records, _SUBMIT_LATENCY_RE)
+        if (m := _SUBMIT_LATENCY_RE.search(r.message))
+    ]
+    safety_times = [
+        float(m.group(1))
+        for r in _matching(context.session.records, _SAFETY_DURATION_RE)
+        if (m := _SAFETY_DURATION_RE.search(r.message))
+    ]
+    median_latency = _median([lat for lat, _ in latencies])
+    median_gen = _median([gen for _, gen in latencies])
+    queue_aging = (
+        median_latency is not None
+        and median_gen is not None
+        and median_gen > 0
+        and median_latency >= median_gen * _QUEUE_AGING_LATENCY_RATIO
+    )
+
+    base_verdict = (
+        f"The horde aborted {len(aborts)} generation(s){span_clause} as too slow ('took too long to "
+        f"process and has been aborted'); each counts against the worker as a dropped job."
+    )
+    tail = "" if spiral else " Isolated so far, but a sustained run will draw horde-forced maintenance."
+
+    if queue_aging:
+        assert median_latency is not None and median_gen is not None
+        safety_clause = f" The safety stage averaged {_mean(safety_times):.1f}s per check." if safety_times else ""
+        safety_evidence = _matching(context.session.records, _SAFETY_DURATION_RE)[:1]
+        return [
+            Finding(
+                id="slow_generation_drop_spiral",
+                severity=severity,
+                title="Jobs aging in the pipeline queue (not slow generation)",
+                verdict=(
+                    f"{base_verdict} Generation itself was fast (median {median_gen:.0f}s) but jobs waited a "
+                    f"median {median_latency:.0f}s from pop to submit: they aged in the post-inference queue, "
+                    f"not in generation.{safety_clause} A downstream stage (typically the single, often "
+                    f"CPU-bound, safety process) is slower than inference, so its backlog grows until jobs "
+                    f"exceed their ttl.{tail}"
+                ),
+                remediation=(
+                    "This is a pipeline-balance problem, not a too-aggressive GPU config, so lowering "
+                    "max_power will not help. The worker now applies post-inference backpressure (it stops "
+                    "popping while the safety backlog cannot clear within the job ttl), which bounds this; if "
+                    "it persists, speed up the bottleneck stage (e.g. enable safety_on_gpu so safety is not "
+                    "CPU-bound, or add safety capacity) so throughput is not capped below inference."
+                ),
+                evidence=[_evidence(r) for r in (aborts[:2] + safety_evidence)],
+                see_also="forced_maintenance",
+            ),
+        ]
+
+    slow_clause = ""
+    if ratios:
+        slow_clause = f" The worker graded inference up to {max(ratios):.1f}x its expected sampling time"
+        if free_vrams:
+            slow_clause += f" with as little as {min(free_vrams)} MB free VRAM (an over-committed device)"
+        slow_clause += "."
+    return [
+        Finding(
+            id="slow_generation_drop_spiral",
+            severity=severity,
+            title="Slow generation is dropping jobs" if spiral else "Generations aborted as too slow",
+            verdict=base_verdict + slow_clause + tail,
+            remediation=(
+                "The worker cannot finish jobs within the horde's deadline. Reduce max_power (smaller "
+                "resolution / fewer steps), max_threads, queue_size, and/or max_batch so each job completes "
+                "in time; put models on an SSD and free VRAM/RAM so the device is not over-committed. This is "
+                "the upstream cause of any forced maintenance; clearing maintenance without slowing the "
+                "intake will just re-trigger it."
+            ),
+            evidence=[_evidence(r) for r in (aborts[:2] + slowdowns[:2])],
+            see_also="forced_maintenance",
+        ),
+    ]
+
+
+def detect_consecutive_failure_pause(context: SessionContext) -> list[Finding]:
+    """The worker self-pausing job pops after three consecutive faults (a downstream symptom)."""
+    pauses = _matching(context.session.records, _CONSECUTIVE_PAUSE_RE)
+    if not pauses:
+        return []
+    return [
+        Finding(
+            id="consecutive_failure_pause",
+            severity=Severity.WARNING,
+            title="Worker self-paused on consecutive faults",
+            verdict=(
+                f"The worker paused job pops {len(pauses)} time(s) after three consecutive faulted jobs. This is "
+                "the worker protecting itself, downstream of whatever kept faulting jobs."
+            ),
+            remediation=(
+                "Find the fault source (the starvation-wedge / recovery / OOM findings); the pause clears on its "
+                "own but will re-trigger until the faults stop."
+            ),
+            evidence=[_evidence(r) for r in pauses[:3]],
+        ),
+    ]
+
+
+def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
+    """The safety stage stranding jobs whose verdict never returned (the db0 forced-maintenance cause).
+
+    A job sent to safety whose result is lost is invisible to the orchestrator and sits in SAFETY_CHECKING
+    forever; the backlog pins pipeline slots and, with the queue unable to drain, latches the wedge that
+    ends in dropped jobs. The worker now recovers it (re-check), or -- when safety cannot be relied on --
+    faults it with no image and soft-pauses pops. This surfaces that recovery so a maintenance episode is
+    attributed to the *downstream safety stall* rather than to inference. Backpressure alone (the worker
+    correctly throttling intake to a slow safety stage) is the benign, lower-severity case.
+    """
+    records = context.session.records
+    requeues = _matching(records, _SAFETY_REQUEUE_RE)
+    unrecoverable = _matching(records, _SAFETY_UNRECOVERABLE_RE)
+    soft_pauses = _matching(records, _SAFETY_SOFT_PAUSE_RE)
+    lost_results = _matching(records, _LOST_SAFETY_RESULT_RE)
+    backpressure = _matching(records, _SAFETY_BACKPRESSURE_RE)
+
+    if not (requeues or unrecoverable or soft_pauses or lost_results or backpressure):
+        return []
+
+    # Escalation (a job faulted with no image, or pops soft-paused) means the safety pipeline could not be
+    # relied on and jobs were dropped: critical. Re-checks / lost results / pure backpressure recovered or
+    # throttled without dropping: a warning that the safety stage is the bottleneck.
+    escalated = bool(unrecoverable or soft_pauses)
+    severity = Severity.CRITICAL if escalated else Severity.WARNING
+
+    detail_bits: list[str] = []
+    if lost_results:
+        detail_bits.append(f"{len(lost_results)} safety result(s) never returned")
+    if requeues:
+        detail_bits.append(f"{len(requeues)} job(s) re-checked")
+    if unrecoverable:
+        detail_bits.append(f"{len(unrecoverable)} faulted with no image")
+    if soft_pauses:
+        detail_bits.append(f"{len(soft_pauses)} soft-pause(s)")
+    if backpressure:
+        detail_bits.append(f"{len(backpressure)} pop-throttle(s) on backlog")
+    detail = "; ".join(detail_bits)
+
+    if escalated:
+        verdict = (
+            f"The safety stage stranded jobs whose verdict never returned ({detail}). The worker faulted the "
+            "unservable ones with no image and soft-paused pops, but those faults count as dropped jobs and can "
+            "draw horde-forced maintenance. A lost safety verdict (a cycled/replaced safety process, or a dropped "
+            "result message) is the root cause."
+        )
+        remediation = (
+            "Stabilise the safety process: with safety_on_gpu set, frequent whole-card residency cycling or "
+            "unload_models_from_vram_often can churn it; check the bridge_safety_*.log for crashes. The worker "
+            "re-checks and (only as a last resort) faults with no image, so no unchecked image is ever submitted."
+        )
+    else:
+        verdict = (
+            f"The safety stage backed up or briefly lost a verdict ({detail}); the worker recovered (re-check) or "
+            "throttled intake without dropping jobs. The safety stage is the pipeline bottleneck."
+        )
+        remediation = (
+            "If it recurs under load, speed up safety (enable safety_on_gpu, or reduce post-processing) so the "
+            "backlog does not grow; no action is needed for an isolated occurrence."
+        )
+
+    evidence = unrecoverable[:1] + soft_pauses[:1] + lost_results[:1] + requeues[:1] + backpressure[:1]
+    return [
+        Finding(
+            id="safety_stage_stall",
+            severity=severity,
+            title="Safety stage stalled (lost verdicts / backlog)",
+            verdict=verdict,
+            remediation=remediation,
+            evidence=[_evidence(r) for r in evidence[:4]],
+            see_also="forced_maintenance" if escalated else None,
+        ),
+    ]
+
+
+def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
+    """A head-of-queue job that did not dispatch despite pending work and an idle, model-resident process.
+
+    The scheduler returns ``None`` silently from several gates, so a stuck queue with idle processes used to
+    leave no record of *why* the head was parked. The new dispatch-stall log names the blocking gate; the
+    "no matching gate" variant is the genuinely anomalous case (the head's model is resident and idle, no
+    gate is holding it, yet nothing dispatched) and is reported as critical, the rest as a warning.
+    """
+    stalls = _matching(context.session.records, _DISPATCH_STALL_RE)
+    if not stalls:
+        return []
+
+    bug_stalls = _matching(context.session.records, _DISPATCH_STALL_BUG_RE)
+    if bug_stalls:
+        return [
+            Finding(
+                id="head_dispatch_stall",
+                severity=Severity.CRITICAL,
+                title="Head-of-queue job not dispatching (no blocking gate)",
+                verdict=(
+                    f"The scheduler reported a parked head {len(bug_stalls)} time(s) whose model was resident on "
+                    "an idle process with no gate holding it, yet nothing dispatched. That is a scheduler stall "
+                    "(not a budget or concurrency decision) and can wedge the queue into dropped jobs."
+                ),
+                remediation=(
+                    "Capture the surrounding scheduling logs and process map: a model-resident, idle-process head "
+                    "that will not dispatch points to a dispatch-path bug (e.g. an eviction that clears the head's "
+                    "resident model just before dispatch under unload_models_from_vram_often). Reduce churn as a "
+                    "stopgap."
+                ),
+                evidence=[_evidence(r) for r in bug_stalls[:3]],
+                see_also="scheduler_starvation_wedge",
+            ),
+        ]
+    return [
+        Finding(
+            id="head_dispatch_stall",
+            severity=Severity.WARNING,
+            title="Head-of-queue job repeatedly parked",
+            verdict=(
+                f"The head of the queue was parked (not dispatching) {len(stalls)} time(s), each explained by a "
+                "known gate (concurrency cap, overlap headway, keep-single-inference, or a deferred preload). "
+                "Sustained, this starves throughput even though it is not a hard wedge."
+            ),
+            remediation=(
+                "If throughput is low, the named gate is the lever: review max_threads / batch settings, the "
+                "overlap-headway behaviour, or the VRAM budget that is deferring the preload."
+            ),
+            evidence=[_evidence(r) for r in stalls[:3]],
+        ),
+    ]
+
+
 def detect_session_summary(context: SessionContext) -> list[Finding]:
     """An always-present rollup: how the session ended and its recovery/fault headline numbers."""
     session = context.session
@@ -282,6 +766,12 @@ DETECTORS: list[Detector] = [
     detect_crash_on_start_loop,
     detect_doomed_pool_no_giveup,
     detect_gave_up_clean,
+    detect_forced_maintenance,
+    detect_scheduler_starvation_wedge,
+    detect_slow_generation_drop_spiral,
+    detect_safety_stage_stall,
+    detect_head_dispatch_stall,
+    detect_consecutive_failure_pause,
     detect_oom,
     detect_swallowed_oom,
     detect_orphan_wedge,

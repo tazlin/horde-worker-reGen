@@ -113,6 +113,7 @@ class StatusReporter:
         system_memory: SystemMemorySummary | None = None,
         download_status: DownloadStatusSnapshot | None = None,
         download_plan: DownloadPlanSummary | None = None,
+        stage_age_line: str | None = None,
     ) -> float:
         """Print the status of the worker.
 
@@ -145,6 +146,8 @@ class StatusReporter:
                 None when not yet sampled.
             download_status: Live background-download status, or None when no download process runs.
             download_plan: The config's disk-budget summary, or None when the reference is not loaded.
+            stage_age_line: A pre-formatted per-stage census (count + oldest age) to print under the job
+                info, or None to omit it (nothing is aging).
 
         Returns:
             The updated status message frequency.
@@ -182,6 +185,11 @@ class StatusReporter:
             num_process_recoveries,
             time_spent_no_jobs_available,
         )
+
+        # Per-stage aging (only when something is actually aging): makes a downstream stall -- jobs sitting
+        # in SAFETY_CHECKING or PENDING_SUBMIT while inference keeps finishing -- visible at a glance.
+        if stage_age_line:
+            logging_function(f"<fg #7dcea0>  {stage_age_line}</>")
 
         logging_function("<fg #7b7d7d>" + str("-" * 40) + "</>")
 

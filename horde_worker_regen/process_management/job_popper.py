@@ -33,7 +33,7 @@ from horde_worker_regen.process_management.gpu_pop_shaping import (
     under_fed_card,
 )
 from horde_worker_regen.process_management.job_models import APIWorkerMessage
-from horde_worker_regen.process_management.job_tracker import JobTracker
+from horde_worker_regen.process_management.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.model_availability import ModelAvailability
 from horde_worker_regen.process_management.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
@@ -57,6 +57,24 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.card_runtime import CardRuntime
     from horde_worker_regen.process_management.model_metadata import ModelMetadata
     from horde_worker_regen.process_management.shutdown_manager import ShutdownManager
+
+# Post-inference backpressure tuning. The safety stage sits downstream of inference and (unlike the
+# pre-inference queue, bounded by queue_size) had no bound: when inference outran a slow/CPU safety
+# stage the post-inference backlog grew until jobs aged past their horde ttl and were server-aborted as
+# "too slow", which the horde answers with forced maintenance. The popper therefore refuses to pop while
+# the backlog already represents more than a budget's worth of safety work.
+_DEFAULT_SAFETY_SECONDS = 8.0
+"""Per-check safety cost assumed before any real measurement exists (typical CPU safety check)."""
+_DEFAULT_JOB_TTL_SECONDS = 150.0
+"""Deadline assumed when the horde does not supply a job ttl; conservative so backpressure still bounds
+the backlog. Real ttls (when present) override this."""
+_POST_INFERENCE_WAIT_BUDGET_FRACTION = 0.5
+"""Fraction of the job ttl the post-inference (safety+submit) tail is allowed to consume. Holding the
+backlog under this keeps headroom for the inference and submit stages plus per-job variance, so a job
+admitted now still clears with margin before its deadline."""
+_MIN_POST_INFERENCE_BACKLOG = 2
+"""Always allow at least this much post-inference backlog per safety process, so a balanced pipeline
+still overlaps inference with safety instead of running them strictly one-at-a-time."""
 
 
 def _select_models_for_pop(
@@ -389,6 +407,44 @@ class JobPopper:
             max_jobs_in_queue += bridge_data.max_threads - 1
         return len(self._job_tracker.jobs_pending_inference) >= max_jobs_in_queue
 
+    _SAFETY_BACKLOG_LOG_INTERVAL_SECONDS = 30.0
+    """Minimum gap between repeats of the "withholding pops: safety backlog" line, so the sub-second pop
+    loop cannot spam it while the backpressure stays engaged."""
+
+    _safety_backlog_log_time: float = 0.0
+    """Monotonic-ish wall-clock of the last safety-backlog backpressure log (throttle state)."""
+
+    def _max_safe_safety_backlog(self) -> int:
+        """How many jobs may wait for safety before a newly popped job would risk aging out.
+
+        Sized from the measured safety cost and the horde-supplied job ttl: a job admitted now must pass
+        the whole backlog ahead of it through the (often single, CPU-bound) safety stage before it can be
+        submitted, so the backlog the worker tolerates is the deadline budget divided by the per-check
+        cost (scaled by the number of safety processes). Self-tunes: faster safety (or a longer ttl)
+        raises the cap, a slow safety stage lowers it, with no operator knob.
+        """
+        avg_safety = self._state.avg_safety_seconds if self._state.avg_safety_seconds > 0 else _DEFAULT_SAFETY_SECONDS
+        ttl = self._state.recent_job_ttl if self._state.recent_job_ttl is not None else _DEFAULT_JOB_TTL_SECONDS
+        num_safety = max(1, self._process_map.num_safety_processes())
+        budget_seconds = ttl * _POST_INFERENCE_WAIT_BUDGET_FRACTION
+        capacity = int(budget_seconds * num_safety / avg_safety)
+        return max(_MIN_POST_INFERENCE_BACKLOG * num_safety, capacity)
+
+    def _is_post_inference_backlogged(self) -> bool:
+        """Return True if the post-inference (safety) backlog is too deep to admit more work.
+
+        This is the backpressure the worker previously lacked: inference completions pile into the
+        ungated safety queue, so a safety stage even slightly slower than inference grows that queue until
+        jobs exceed their ttl and the horde aborts them as too slow. Counting the jobs already waiting for
+        (or in) safety against a deadline-derived cap lets the worker stop popping before the backlog ages
+        jobs out, throttling intake to the pipeline's slowest stage instead of spiralling into
+        forced maintenance.
+        """
+        backlog = len(self._job_tracker.jobs_pending_safety_check) + len(self._job_tracker.jobs_being_safety_checked)
+        if backlog == 0:
+            return False
+        return backlog >= self._max_safe_safety_backlog()
+
     @property
     def _lora_disk_permits(self) -> bool:
         """Whether the worker-wide LoRA disk guard currently permits advertising LoRA support.
@@ -442,6 +498,8 @@ class JobPopper:
         if self._pop_throttler.is_in_error_backoff:
             return False
         if self._is_queue_full(bridge_data):
+            return False
+        if self._is_post_inference_backlogged():
             return False
         return self._process_map.get_first_available_inference_process() is not None
 
@@ -528,6 +586,10 @@ class JobPopper:
     ) -> None:
         """Add a successfully popped job to the pending inference queue."""
         await self._job_tracker.record_popped_job(job_pop_response)
+        # Remember the horde-supplied deadline so post-inference backpressure can be sized to it; the
+        # field stays at its last known value (or None) when a pop omits the ttl.
+        if job_pop_response.ttl is not None:
+            self._state.recent_job_ttl = float(job_pop_response.ttl)
         jobs = []
         for job in self._job_tracker.jobs_pending_inference:
             if job.id_ is not None:
@@ -569,6 +631,37 @@ class JobPopper:
             return
 
         if self._is_queue_full(bridge_data):
+            return
+
+        # Post-inference backpressure: if the safety stage is backed up enough that a job admitted now
+        # would likely age past its ttl waiting for it, stop popping until the backlog drains. Without
+        # this the worker keeps accepting work a slow (often CPU) safety stage cannot clear, the backlog
+        # grows unbounded, and the horde aborts the aged jobs as too slow and forces maintenance.
+        if self._is_post_inference_backlogged():
+            self._state.last_pop_no_jobs_available = False
+            self._state.last_pop_skipped_reasons["safety_backlog"] = (
+                self._state.last_pop_skipped_reasons.get("safety_backlog", 0) + 1
+            )
+            # Surface the backpressure in prose, throttled so the sub-second pop loop never spams it: a
+            # bundle should show pops were stopped *because the safety stage is backed up*, not merely that
+            # pops stopped. Names the depth, the self-tuned cap, and the oldest waiting safety job so a
+            # slow downstream stage (typically CPU safety) is unmistakable.
+            now = time.time()
+            if (now - self._safety_backlog_log_time) >= self._SAFETY_BACKLOG_LOG_INTERVAL_SECONDS:
+                self._safety_backlog_log_time = now
+                backlog = len(self._job_tracker.jobs_pending_safety_check) + len(
+                    self._job_tracker.jobs_being_safety_checked,
+                )
+                safety_ages = self._job_tracker.stage_age_summary()
+                oldest = max(
+                    safety_ages.get(JobStage.PENDING_SAFETY_CHECK, (0, 0.0))[1],
+                    safety_ages.get(JobStage.SAFETY_CHECKING, (0, 0.0))[1],
+                )
+                logger.warning(
+                    f"Withholding job pops: post-inference safety backlog {backlog} >= cap "
+                    f"{self._max_safe_safety_backlog()} (oldest waiting safety job {oldest:.0f}s). The safety "
+                    "stage is slower than inference; if this persists, enable safety_on_gpu or speed safety up.",
+                )
             return
 
         # Warm-up rule: until the first job of the session has completed, don't queue

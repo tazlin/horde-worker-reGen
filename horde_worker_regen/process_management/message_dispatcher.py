@@ -252,12 +252,16 @@ class MessageDispatcher:
             known_launch_identifier = self._process_map[message.process_id].process_launch_identifier
 
             if message.process_launch_identifier != known_launch_identifier:
-                logger.error(
-                    f"Received a message from process {message.process_id} with launch identifier "
-                    f"{message.process_launch_identifier}, but expected {known_launch_identifier}",
+                # An in-flight message from a since-replaced process generation. This is expected and
+                # handled (we ignore it), so it is a WARNING, not an ERROR: a single process reload can
+                # leave many queued messages behind, and logging each as an error floods the errors-only
+                # trace with benign noise that makes a routine replacement (e.g. a maintenance-mode pool
+                # reload) look like an error storm in the recovery diagnostics.
+                logger.warning(
+                    f"Ignoring a stale message from process {message.process_id} (launch identifier "
+                    f"{message.process_launch_identifier}, expected {known_launch_identifier}); the process "
+                    f"was replaced. Message: {message}",
                 )
-                logger.error("This is probably due to a process being replaced. Ignoring.")
-                logger.error(f"Message: {message}")
                 continue
 
             if isinstance(message, HordeProcessHeartbeatMessage):
@@ -798,6 +802,11 @@ class MessageDispatcher:
         elif job_fault_entries:
             await self._job_tracker.clear_faults_for_job(completed_job_info.sdk_api_job_info.id_)
 
+        # Feed the post-inference backpressure model: the popper throttles new pops when the safety
+        # backlog can no longer clear within the job ttl, so a safety stage that is slower than inference
+        # cannot grow an unbounded backlog that ages jobs out into horde-forced maintenance.
+        self._state.record_safety_duration(message.time_elapsed)
+
         logger.debug(
             f"Job {message.job_id} had {num_images_censored} images censored and took "
             f"{message.time_elapsed:.2f} seconds to check safety",
@@ -831,6 +840,24 @@ class MessageDispatcher:
                     completed_job_info.censored = True
                     if completed_job_info.state != GENERATION_STATE.csam:
                         completed_job_info.state = GENERATION_STATE.censored
+
+        if any_safety_failed:
+            # The safety process could not produce a verdict for at least one image, so we cannot vouch
+            # that this job's images are safe. Per the no-unchecked-submit invariant we drop every image
+            # and report the whole job faulted (the horde reissues it) rather than upload an image the
+            # safety classifier never cleared. ``fault_job`` clears ``job_image_results`` so the submitter
+            # uploads nothing; ``safety_evaluated`` is deliberately left False to reflect that no clean
+            # verdict was obtained.
+            logger.error(
+                f"Job {message.job_id} had a safety evaluation failure; dropping its images and faulting it "
+                "so the horde reissues it (an image the safety check could not clear is never submitted).",
+            )
+            completed_job_info.fault_job()
+        else:
+            # The verdict has now been applied to every image, so mark the job safety-evaluated. This is the
+            # one and only writer of this flag; the submit boundary refuses to upload any job carrying images
+            # without it, so a job whose safety result was lost (and never re-checked) can never be submitted.
+            completed_job_info.safety_evaluated = True
 
         await self._job_tracker.queue_for_submit(completed_job_info)
 
