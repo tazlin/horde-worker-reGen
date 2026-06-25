@@ -164,7 +164,7 @@ def test_worker_details_maintenance_is_paused_and_names_the_horde() -> None:
         SupervisorStatus.RUNNING,
         0.5,
     )
-    assert report.phase is WorkerPhase.PAUSED
+    assert report.phase is WorkerPhase.MAINTENANCE
     assert "horde" in report.detail.lower()
 
 
@@ -186,9 +186,42 @@ def test_pop_maintenance_mode_detail_is_specific_not_local_pause() -> None:
         SupervisorStatus.RUNNING,
         0.5,
     )
-    assert report.phase is WorkerPhase.PAUSED
+    assert report.phase is WorkerPhase.MAINTENANCE
     assert "locally paused" not in report.detail
     assert "maintenance" in report.detail.lower()
+
+
+def test_maintenance_mode_beats_api_backoff_and_labels_connectivity() -> None:
+    """Maintenance is not a network disconnect, even when pop backoff is active."""
+    report = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            last_pop_maintenance_mode=True,
+            in_error_backoff=True,
+        ),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+
+    assert report.phase is WorkerPhase.MAINTENANCE
+    connectivity = next(check for check in report.checks if check.name == "API connectivity")
+    assert connectivity.status is HealthStatus.INFO
+    assert "maintenance" in connectivity.detail.lower()
+
+
+def test_optimistic_server_maintenance_is_shown_before_poll_confirmation() -> None:
+    """After the TUI sends maintenance ON, health shows maintenance before worker-details catches up."""
+    report = derive(
+        _snapshot(processes=[_process("WAITING_FOR_JOB")], worker_details_maintenance=False),
+        SupervisorStatus.RUNNING,
+        0.5,
+        optimistic_server_maintenance=True,
+    )
+
+    assert report.phase is WorkerPhase.MAINTENANCE
+    assert "requested" in report.detail.lower()
+    connectivity = next(check for check in report.checks if check.name == "API connectivity")
+    assert "maintenance" in connectivity.detail.lower()
 
 
 def _residency_check(report: object) -> object | None:

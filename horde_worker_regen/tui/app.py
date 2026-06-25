@@ -384,6 +384,7 @@ class HordeWorkerTUI(App[None]):
         # after a command is sent, so a rapid second press toggles correctly before the 15 s poll catches up.
         # Cleared once a snapshot confirms the advisory poll has reflected the new state.
         self._intended_server_maintenance: bool | None = None
+        self._server_maintenance_intent_pop_count: int | None = None
         # Tracks the previous-tick value of last_pop_maintenance_mode to detect False → True transitions
         # and fire a toast exactly once when the horde forces maintenance via the pop response.
         self._prev_pop_maintenance_mode: bool = False
@@ -603,13 +604,17 @@ class HordeWorkerTUI(App[None]):
                     self._pending_download_models = None
         self._frame += 1
         snapshot = self._supervisor.latest_snapshot
-        # Clear the "m" intent once the advisory poll confirms the horde reflects the requested state.
-        if (
-            self._intended_server_maintenance is not None
-            and snapshot is not None
-            and snapshot.worker_details_maintenance == self._intended_server_maintenance
-        ):
-            self._intended_server_maintenance = None
+        # Clear the "m" intent once the advisory poll confirms the horde reflects the requested state,
+        # or once a real job pop proves the worker is no longer in horde maintenance.
+        if self._intended_server_maintenance is not None and snapshot is not None:
+            confirmed_by_poll = snapshot.worker_details_maintenance == self._intended_server_maintenance
+            cleared_by_successful_pop = (
+                self._intended_server_maintenance
+                and self._server_maintenance_intent_pop_count is not None
+                and snapshot.num_jobs_popped > self._server_maintenance_intent_pop_count
+            )
+            if confirmed_by_poll or cleared_by_successful_pop:
+                self._clear_server_maintenance_intent()
         # Toast exactly once when the pop loop first sees a maintenance-mode error from the horde.
         pop_maint = snapshot.last_pop_maintenance_mode if snapshot is not None else False
         if pop_maint and not self._prev_pop_maintenance_mode:
@@ -623,7 +628,13 @@ class HordeWorkerTUI(App[None]):
         liveness_wall_time = self._supervisor.last_liveness_wall_time
         liveness_age = (now - liveness_wall_time) if liveness_wall_time is not None else snapshot_age
         offline_checks = build_offline_checks(self._config_path) if snapshot is None else None
-        report = derive(snapshot, self._supervisor.status, liveness_age, offline_checks=offline_checks)
+        report = derive(
+            snapshot,
+            self._supervisor.status,
+            liveness_age,
+            offline_checks=offline_checks,
+            optimistic_server_maintenance=self._intended_server_maintenance is True,
+        )
         try:
             self._update_status_bar(report, snapshot)
             self.query_one(OverviewView).update_view(
@@ -842,6 +853,11 @@ class HordeWorkerTUI(App[None]):
         else:
             self.notify("Could not request the download (worker not reachable).", severity="warning")
 
+    def _clear_server_maintenance_intent(self) -> None:
+        """Drop the optimistic server-maintenance command tracking once live state supersedes it."""
+        self._intended_server_maintenance = None
+        self._server_maintenance_intent_pop_count = None
+
     def _paused_source(self, snapshot: WorkerStateSnapshot | None) -> str:
         """Return a short source tag for the PAUSED badge (e.g. 'server', 'local', 'auto', 'pop')."""
         if snapshot is None:
@@ -859,7 +875,10 @@ class HordeWorkerTUI(App[None]):
     def _update_status_bar(self, report: HealthReport, snapshot: WorkerStateSnapshot | None) -> None:
         """Render the top status bar, led by the worker's current lifecycle phase."""
         phase_text = report.phase.value.upper()
-        if report.phase is WorkerPhase.PAUSED:
+        if report.phase is WorkerPhase.MAINTENANCE:
+            source = self._paused_source(snapshot) or "server"
+            phase_text = f"MAINT·{source}"
+        elif report.phase is WorkerPhase.PAUSED:
             source = self._paused_source(snapshot)
             if source:
                 phase_text = f"PAUSED·{source}"
@@ -944,6 +963,9 @@ class HordeWorkerTUI(App[None]):
         sent = self._supervisor.request_set_server_maintenance(enable)
         if sent:
             self._intended_server_maintenance = enable
+            self._server_maintenance_intent_pop_count = (
+                snapshot.num_jobs_popped if enable and snapshot is not None else None
+            )
         if not sent:
             self.notify("Worker not running; maintenance change not sent.")
         elif enable:

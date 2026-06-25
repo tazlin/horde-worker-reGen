@@ -16,6 +16,7 @@ from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.health import WorkerPhase, derive
 from horde_worker_regen.tui.wizard import WizardOutcome
 from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupervisor
+from tests.tui._fake_supervisor import FakeSupervisor
 
 # Headless run_test throttles timers, so the test drives the app's tick directly.
 _LIVE_PHASES = {
@@ -23,6 +24,7 @@ _LIVE_PHASES = {
     WorkerPhase.SERVING,
     WorkerPhase.READY,
     WorkerPhase.IDLE,
+    WorkerPhase.MAINTENANCE,
     WorkerPhase.PAUSED,
     WorkerPhase.DISCONNECTED,
 }
@@ -237,3 +239,33 @@ async def test_wizard_start_focuses_downloads_tab(tmp_path: Path, monkeypatch: p
         await pilot.pause()
         assert app.query_one("#main-tabs", TabbedContent).active == "tab-downloads"
         assert started is True
+
+
+async def test_tick_clears_optimistic_maintenance_after_successful_pop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful job pop is authoritative evidence that optimistic maintenance is no longer active."""
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    supervisor = FakeSupervisor(alive=True)
+    supervisor.latest_snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="T", worker_version="0.0.0"),
+        num_jobs_popped=7,
+    )
+    app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
+    app._intended_server_maintenance = True
+    app._server_maintenance_intent_pop_count = 6
+
+    captured: list[bool] = []
+
+    def _recording_derive(snapshot: object, status: object, age: float | None, **kwargs: object) -> object:
+        captured.append(bool(kwargs.get("optimistic_server_maintenance")))
+        return derive(snapshot, status, age, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("horde_worker_regen.tui.app.derive", _recording_derive)
+
+    async with app.run_test(size=(120, 40)):
+        app._tick()
+
+    assert app._intended_server_maintenance is None
+    assert app._server_maintenance_intent_pop_count is None
+    assert captured[-1] is False

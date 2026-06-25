@@ -83,6 +83,7 @@ class WorkerPhase(enum.StrEnum):
     SERVING = "serving"
     READY = "ready"
     IDLE = "idle"
+    MAINTENANCE = "maintenance"
     PAUSED = "paused"
     SHUTTING_DOWN = "shutting down"
     DEGRADED = "degraded"
@@ -118,6 +119,7 @@ def derive(
     snapshot_age: float | None,
     *,
     offline_checks: list[HealthCheck] | None = None,
+    optimistic_server_maintenance: bool = False,
 ) -> HealthReport:
     """Compute the worker's phase and health checklist (handles the no-snapshot startup case too).
 
@@ -158,7 +160,7 @@ def derive(
             True,
         )
 
-    checks = _build_checks(snapshot, snapshot_age)
+    checks = _build_checks(snapshot, snapshot_age, optimistic_server_maintenance=optimistic_server_maintenance)
 
     if snapshot_age is not None and snapshot_age > _stale_threshold(snapshot):
         return HealthReport(
@@ -178,6 +180,16 @@ def derive(
             checks,
             True,
         )
+    if _server_maintenance_active(snapshot, optimistic_server_maintenance=optimistic_server_maintenance):
+        return HealthReport(
+            WorkerPhase.MAINTENANCE,
+            HealthStatus.WARN,
+            "Maintenance mode",
+            _maintenance_detail(snapshot, optimistic_server_maintenance=optimistic_server_maintenance),
+            checks,
+            False,
+        )
+
     if snapshot.user_info_failed or snapshot.in_error_backoff:
         reason = snapshot.user_info_failed_reason or "Repeated job-pop failures; the server or network is unreachable."
         return HealthReport(
@@ -197,16 +209,15 @@ def derive(
             checks,
             False,
         )
-    if snapshot.maintenance_mode or snapshot.worker_details_maintenance or snapshot.worker_details_paused:
+    if snapshot.maintenance_mode or snapshot.worker_details_paused:
         return HealthReport(
             WorkerPhase.PAUSED,
             HealthStatus.WARN,
             "Paused",
-            _maintenance_detail(snapshot),
+            _maintenance_detail(snapshot, optimistic_server_maintenance=optimistic_server_maintenance),
             checks,
             False,
         )
-
     serving = any(process.last_process_state in _INFERENCE_STATES for process in snapshot.processes)
     if serving:
         kudos = "" if snapshot.kudos_per_hour is None else f" · {snapshot.kudos_per_hour:,.0f} kudos/hr"
@@ -275,18 +286,48 @@ def summarize_skips(skipped_reasons: dict[str, int], *, limit: int = 4) -> str:
     return " · ".join(f"{count} {reason}" for reason, count in ranked[:limit])
 
 
-def _maintenance_detail(snapshot: WorkerStateSnapshot) -> str:
+def _server_maintenance_active(
+    snapshot: WorkerStateSnapshot,
+    *,
+    optimistic_server_maintenance: bool = False,
+) -> bool:
+    """True when the horde, the last pop response, or the TUI's pending command says maintenance is active."""
+    return optimistic_server_maintenance or snapshot.worker_details_maintenance or snapshot.last_pop_maintenance_mode
+
+
+def _maintenance_detail(
+    snapshot: WorkerStateSnapshot,
+    *,
+    optimistic_server_maintenance: bool = False,
+) -> str:
     """Explain a paused/maintenance worker, naming the source (horde-forced, self-throttle, or local)."""
+    if (
+        optimistic_server_maintenance
+        and not snapshot.worker_details_maintenance
+        and not snapshot.last_pop_maintenance_mode
+    ):
+        return (
+            "The TUI has requested horde maintenance ON and is showing it immediately while the horde "
+            "registers the change."
+        )
+    note_on_maintenance = (
+        "NOTE: This happening expectedly means your worker dropped or timed out performing several jobs."
+        "Please check your diagnostics and logs to see what the issue is and fix it before clearing maintenance"
+        " mode, otherwise the horde will just set it again."
+    )
+
     if snapshot.worker_details_maintenance or snapshot.worker_details_paused:
         what = "maintenance" if snapshot.worker_details_maintenance else "paused"
         return (
             f"The horde has this worker set to {what} (server-side); it will not be given new jobs until "
             "cleared. In-flight jobs finish. Press the Maintenance (horde) key to toggle it."
+            f"{note_on_maintenance}"
         )
     if snapshot.last_pop_maintenance_mode:
         return (
             "The job-pop response returned a maintenance-mode error; the horde has stopped sending this "
-            "worker jobs. Press the Maintenance (horde) key to clear it, or wait for the horde to lift it."
+            "worker jobs. Press the Maintenance (horde) key to clear it."
+            f"{note_on_maintenance}"
         )
     if snapshot.self_throttle_paused:
         return (
@@ -316,11 +357,18 @@ def _warmup_detail(snapshot: WorkerStateSnapshot) -> tuple[str, str]:
     return "starting processes", "Spawning and initialising the inference processes."
 
 
-def _build_checks(snapshot: WorkerStateSnapshot, snapshot_age: float | None) -> list[HealthCheck]:
+def _build_checks(
+    snapshot: WorkerStateSnapshot,
+    snapshot_age: float | None,
+    *,
+    optimistic_server_maintenance: bool = False,
+) -> list[HealthCheck]:
     """Build the supporting health checklist from a snapshot."""
     checks: list[HealthCheck] = []
 
-    if snapshot.user_info_failed:
+    if _server_maintenance_active(snapshot, optimistic_server_maintenance=optimistic_server_maintenance):
+        checks.append(HealthCheck("API connectivity", HealthStatus.INFO, "Worker is in horde maintenance mode"))
+    elif snapshot.user_info_failed:
         reason = snapshot.user_info_failed_reason or "request failed"
         checks.append(HealthCheck("API connectivity", HealthStatus.ERROR, f"AI Horde API unreachable ({reason})"))
     elif snapshot.in_error_backoff:

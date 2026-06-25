@@ -77,6 +77,7 @@ _STATIC_GLYPHS: dict[WorkerPhase, str] = {
     WorkerPhase.CRASHED: "✗",
     WorkerPhase.DISCONNECTED: "✗",
     WorkerPhase.DEGRADED: "▲",
+    WorkerPhase.MAINTENANCE: "⏸",
     WorkerPhase.PAUSED: "⏸",
     WorkerPhase.IDLE: "○",
     WorkerPhase.READY: "●",

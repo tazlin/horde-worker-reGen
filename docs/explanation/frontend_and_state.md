@@ -41,12 +41,16 @@ defines the structured protocol over it:
   per-card fault/unservable-model health) that the GPUs tab and the Overview per-card
   strip render. Each `ProcessSnapshot` also carries the `device_index` of the card its
   slot is pinned to. A single-GPU host reports exactly one `CardSnapshot`. The snapshot
-  is versioned by `SUPERVISOR_PROTOCOL_VERSION` (currently 8) so a frontend can detect a
+  is versioned by `SUPERVISOR_PROTOCOL_VERSION` (currently 9) so a frontend can detect a
   mismatch with a worker built from different code.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate
-  limit, etc.).
+  limit, etc.). Server-side maintenance is reported separately from local pause: the
+  dashboard shows horde maintenance as a distinct **MAINTENANCE** phase, labels the
+  API connectivity row as maintenance instead of disconnected, and treats a pending
+  Maintenance (horde) command as active until the worker-details poll confirms it or
+  a later successful job pop proves the horde is sending work again.
 
 This mirrors the worker's own internal IPC (see
 [IPC and Messaging](ipc_and_messaging.md)) and is the structured upgrade of the
