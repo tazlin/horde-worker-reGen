@@ -262,12 +262,6 @@ extend-exclude = ["conda", "model-stats.py", "amd_go_fast.py"]
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
-
-[tool.mypy]
-plugins = [
-  "pydantic.mypy"
-]
-
 [tool.pytest.ini_options]
 addopts = "-p pytest_asyncio"
 asyncio_mode = "auto"
