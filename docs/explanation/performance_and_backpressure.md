@@ -442,20 +442,27 @@ not one that itself blocks on a download) and so cannot route around a LoRA job 
   withholds LoRA support once the local queue already holds `max(1, inference_processes - 1)` LoRA
   jobs. This guarantees at least one slot's worth of room for a non-LoRA job, which *can* line-skip past
   a LoRA job blocked at the head -- so the GPU keeps working even while one slot waits on a download.
-- **Fast-fault watchdog** (`ProcessLifecycleManager._effective_aux_download_timeout`): the first stall
-  is reaped at the configured `download_timeout`; once a backoff strike exists, further stalls are
-  reaped at a much shorter grace, so a requeued job that keeps timing out gives up its slot quickly
-  instead of burning the full window on every attempt.
-- **No futile retry during an outage**: a slot reaped mid aux-download normally requeues its job for
-  another attempt (slot crashes are usually transient). But when a download outage is already active,
-  an immediate retry just re-enters the same failing download and tears down a *second* slot, so the
-  job is instead faulted terminally and handed back to the horde to reassign. The job outcome is the
-  same as the eventual out-of-attempts fault, at half the process churn -- this is what stops one bad
-  job from costing two process recoveries. A lone transient stall (no active incident) keeps its retry.
+- **Child-side graceful abort (no teardown)**: the real cost of a stalled aux download was the response
+  to it -- the parent's watchdog tearing the whole inference process down (losing its resident model and
+  paying a full hordelib re-init) just because one download was slow. Instead, the parent hands each
+  dispatched job an `aux_download_deadline_seconds` (its backoff-aware watchdog timeout minus a margin;
+  `ProcessLifecycleManager.aux_download_deadline_for_dispatch`). When the child's `download_aux_models`
+  blows that deadline it **cancels** the stalled downloads (a manager-scoped
+  `cancel_active_downloads()` in the engine that abandons the retry ladder without killing the shared
+  download pool) and faults the job back to the parent through the ordinary faulted-result path, then
+  returns to `WAITING_FOR_JOB` with its model intact. A whole-process teardown+respawn becomes a
+  slot-local fault. The parent's stuck-aux **watchdog stays as the backstop**: it only fires (and tears
+  down) if the child fails to self-abort in time (e.g. a genuinely wedged process).
+- **Backoff-aware fault, registered once**: the child-reported aux fault arms the same LoRA-download
+  backoff strike and the same retry policy as a watchdog teardown would have -- not a resource/OOM
+  failure, and during an active outage dropped (handed back to the horde) rather than requeued straight
+  back into the same failing download. A lone transient stall (no active incident) keeps its one retry.
+  This is what stops one bad job from costing two process recoveries.
 
 Together these turn an all-LoRA queue facing a flaky source from a near-total stall (every slot idle
-behind one choking download) into a graceful degradation: LoRA intake pauses and escalates, non-LoRA
-work keeps flowing, and stuck slots are freed promptly without doubling up on process recoveries.
+behind one choking download, each stall costing a process teardown) into a graceful degradation: LoRA
+intake pauses and escalates, non-LoRA work keeps flowing, and a stalled download faults its single job
+and frees its slot with the model still resident -- no teardown, no respawn, no doubled-up recoveries.
 
 ## Multi-GPU pop shaping
 
