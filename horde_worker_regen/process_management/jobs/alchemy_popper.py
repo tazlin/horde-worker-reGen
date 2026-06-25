@@ -60,7 +60,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import Worker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind, capability_for_alchemy_form
-from horde_worker_regen.process_management.testing._canned_scenarios import CannedAlchemySource
+from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource
 from horde_worker_regen.runtime_version import runtime_version
 
 if TYPE_CHECKING:

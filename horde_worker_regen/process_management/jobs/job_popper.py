@@ -46,7 +46,7 @@ from horde_worker_regen.process_management.scheduling.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
     PopThrottler,
 )
-from horde_worker_regen.process_management.testing._canned_scenarios import (
+from horde_worker_regen.process_management.simulation._canned_scenarios import (
     CannedJobSource,
     make_default_dry_run_source,
 )

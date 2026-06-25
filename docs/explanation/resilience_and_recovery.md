@@ -194,7 +194,7 @@ unwind cleanly.
 
 Because this machinery only matters when things go wrong, the worker ships a
 typed fault-injection harness to exercise it without a GPU or a real failure.
-[`FaultProfile`][horde_worker_regen.process_management.testing.fault_injection.FaultProfile]
+[`FaultProfile`][horde_worker_regen.process_management.simulation.fault_injection.FaultProfile]
 tells one of the [fake worker processes](architecture.md#dry-run-mode) to
 misbehave in a specific, reproducible way: hang, crash, drop heartbeats, run
 slow, exhaust resources, or emit a malformed message. Profiles are plain pydantic

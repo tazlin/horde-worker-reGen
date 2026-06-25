@@ -190,7 +190,7 @@ worker. See [Frontend and Durable State](frontend_and_state.md).
 ## Dry-run mode
 
 When `dry_run_skip_api` is active,
-[`CannedJobSource`][horde_worker_regen.process_management.testing._canned_scenarios.CannedJobSource]
+[`CannedJobSource`][horde_worker_regen.process_management.simulation._canned_scenarios.CannedJobSource]
 substitutes synthetic jobs instead of calling the API, and
 `fake_worker_processes` substitutes canned image results instead of running real
 inference. Everything else (the job tracker, the scheduler, the message

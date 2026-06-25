@@ -39,7 +39,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.download_scheduler import DownloadKind, DownloadTask
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
-from horde_worker_regen.process_management.testing.fake_worker_processes import FakeDownloadProcess
+from horde_worker_regen.process_management.simulation.fake_worker_processes import FakeDownloadProcess
 from horde_worker_regen.process_management.workers.download_process import (
     DOWNLOAD_PROCESS_ID,
     FEATURE_IMAGE_MODEL,
@@ -614,7 +614,7 @@ class TestDownloadEntryPointSignatures:
         """The fake receives the same launch kwargs, so it must accept every real entry-point keyword."""
         import inspect
 
-        from horde_worker_regen.process_management.testing.fake_worker_processes import start_fake_download_process
+        from horde_worker_regen.process_management.simulation.fake_worker_processes import start_fake_download_process
         from horde_worker_regen.process_management.worker_entry_points import start_download_process
 
         real_kwargs = {

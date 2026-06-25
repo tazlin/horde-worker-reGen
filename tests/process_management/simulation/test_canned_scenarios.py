@@ -9,7 +9,7 @@ from horde_worker_regen.benchmark.scenarios import (
     CannedImageJobSpec,
     ScenarioSpec,
 )
-from horde_worker_regen.process_management.testing._canned_scenarios import (
+from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
     TimedJobSource,

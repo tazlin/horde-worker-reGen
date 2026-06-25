@@ -3,8 +3,6 @@ bridgeData.yaml*
 .gpu_backend
 .installed_gpu_backend
 .models_downloaded
-testing
-dummy
 .pt_*/*
 docs/plans/**/*.md
 kudos_training_data*

@@ -16,7 +16,7 @@ from horde_worker_regen.process_management.scheduling.performance_model import (
     load_seed_its_by_signature,
     signature_from_job,
 )
-from horde_worker_regen.process_management.testing._canned_scenarios import make_canned_job
+from horde_worker_regen.process_management.simulation._canned_scenarios import make_canned_job
 
 _SD15_BASELINE = "stable_diffusion_1"
 

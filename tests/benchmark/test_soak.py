@@ -6,7 +6,7 @@ from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.report import SuggestedBridgeData
 from horde_worker_regen.benchmark.scenarios import CannedAlchemyFormSpec, CannedImageJobSpec, ScenarioSpec
 from horde_worker_regen.benchmark.soak import build_soak_scenario, build_validation_level
-from horde_worker_regen.process_management.testing._canned_scenarios import (
+from horde_worker_regen.process_management.simulation._canned_scenarios import (
     GeneratingAlchemySource,
     GeneratingJobSource,
     SoakImageTemplate,

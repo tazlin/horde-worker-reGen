@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from horde_worker_regen.harness import WarmHarnessSession
-from horde_worker_regen.process_management.testing._canned_scenarios import make_alchemy_scenario, make_canned_job
+from horde_worker_regen.process_management.simulation._canned_scenarios import make_alchemy_scenario, make_canned_job
 
 pytestmark = pytest.mark.e2e
 

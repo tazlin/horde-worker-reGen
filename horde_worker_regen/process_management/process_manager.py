@@ -125,7 +125,7 @@ from horde_worker_regen.process_management.scheduling.performance_model import (
     PerformanceModel,
     load_seed_its_by_signature,
 )
-from horde_worker_regen.process_management.testing._canned_scenarios import CannedAlchemySource, CannedJobSource
+from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.workers.safety_orchestrator import SafetyOrchestrator
 from horde_worker_regen.reporting.kudos_logger import KudosLogger

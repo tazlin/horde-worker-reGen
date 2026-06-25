@@ -26,7 +26,6 @@ from horde_worker_regen.process_management.lifecycle.process_lifecycle import (
     ProcessLifecycleManager,
 )
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-
 from tests.process_management.conftest import make_mock_process_info, make_test_card_runtimes, make_test_runtime_config
 
 

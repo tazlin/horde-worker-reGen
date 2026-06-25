@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from horde_worker_regen.harness import HarnessConfig, run_harness_async
-from horde_worker_regen.process_management.testing._canned_scenarios import (
+from horde_worker_regen.process_management.simulation._canned_scenarios import (
     make_batch_scenario,
     make_mixed_model_scenario,
     make_simple_scenario,

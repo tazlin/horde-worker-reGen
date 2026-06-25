@@ -26,7 +26,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeSafetyResultMessage,
     ModelLoadState,
 )
-from horde_worker_regen.process_management.testing.fake_worker_processes import (
+from horde_worker_regen.process_management.simulation.fake_worker_processes import (
     FakeInferenceProcess,
     FakeSafetyProcess,
 )

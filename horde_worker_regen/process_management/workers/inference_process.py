@@ -928,7 +928,7 @@ class HordeInferenceProcess(HordeProcess):
         """
         import io
 
-        from horde_worker_regen.process_management.testing._dummy_images import make_dummy_png_bytes
+        from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
 
         png_bytes = make_dummy_png_bytes()
 

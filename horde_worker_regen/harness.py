@@ -47,7 +47,7 @@ from horde_worker_regen.process_management.process_manager import (
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot
-from horde_worker_regen.process_management.testing._canned_scenarios import (
+from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
     CannedAlchemySource,
     CannedJobSource,
@@ -58,11 +58,11 @@ from horde_worker_regen.process_management.testing._canned_scenarios import (
     make_canned_job,
     make_simple_scenario,
 )
-from horde_worker_regen.process_management.testing.fake_worker_processes import (
+from horde_worker_regen.process_management.simulation.fake_worker_processes import (
     start_fake_inference_process,
     start_fake_safety_process,
 )
-from horde_worker_regen.process_management.testing.fault_injection import FaultProfile
+from horde_worker_regen.process_management.simulation.fault_injection import FaultProfile
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
 
