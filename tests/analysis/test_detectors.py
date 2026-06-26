@@ -524,6 +524,13 @@ _DISPATCH_WHOLE_CARD_REASON = (
     "have stopped that idle sibling (only the head's holder is spared), so the shrink has not collapsed the "
     "pool and the head never dispatches"
 )
+# The non-head whole-card residency attribution (inference_scheduler._diagnose_dispatch_stall): the head's
+# model is not resident because a residency is held for a different, deeper-queue model that reserved the card.
+_DISPATCH_NONHEAD_REASON = (
+    "its model is not resident because a whole-card residency is held for non-head model "
+    "'Flux.1-Schnell fp8 (Compact)' -- the card is reserved for that model and its siblings were torn down, so "
+    "this head cannot load until that residency restores"
+)
 
 
 class TestSafetyStageStall:
@@ -610,6 +617,48 @@ class TestWholeCardConvergenceWedge:
         )
         findings = _diagnose(tmp_path, bridge)
         assert "whole_card_convergence_wedge" in findings
+        assert "head_dispatch_stall" not in findings
+
+
+class TestWholeCardNonHeadResidencyStarvation:
+    """A whole-card residency held for a non-head model that starves the actual head of the queue."""
+
+    def test_starvation_with_soft_reset_is_critical(self, tmp_path: Path) -> None:
+        """A head parked behind a non-head residency that escalates to a soft reset is the wedge (critical)."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _dispatch_stall("13:01:00.000", reason=_DISPATCH_NONHEAD_REASON, model="Juggernaut XL"),
+                _soft_reset("13:01:30.000"),
+            ],
+        )
+        findings = _diagnose(tmp_path, bridge)
+        assert "whole_card_nonhead_residency_starvation" in findings
+        assert findings["whole_card_nonhead_residency_starvation"].severity is Severity.CRITICAL
+        assert findings["whole_card_nonhead_residency_starvation"].see_also == "scheduler_starvation_wedge"
+
+    def test_starvation_without_escalation_is_warning(self, tmp_path: Path) -> None:
+        """A non-head residency stall that did not escalate to a soft reset or drops is the lower-severity case."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _dispatch_stall("13:01:00.000", reason=_DISPATCH_NONHEAD_REASON, model="Juggernaut XL"),
+            ],
+        )
+        findings = _diagnose(tmp_path, bridge)
+        assert "whole_card_nonhead_residency_starvation" in findings
+        assert findings["whole_card_nonhead_residency_starvation"].severity is Severity.WARNING
+
+    def test_line_does_not_also_fire_generic_dispatch_warning(self, tmp_path: Path) -> None:
+        """The non-head residency owns its line: head_dispatch_stall must not double-report it as a warning."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _dispatch_stall("13:01:00.000", reason=_DISPATCH_NONHEAD_REASON, model="Juggernaut XL"),
+            ],
+        )
+        findings = _diagnose(tmp_path, bridge)
+        assert "whole_card_nonhead_residency_starvation" in findings
         assert "head_dispatch_stall" not in findings
 
 

@@ -1398,6 +1398,24 @@ class InferenceScheduler:
         if process is None:
             if head.model is not None and self._horde_model_map.is_model_loading(head.model):
                 return "its model is loading (a preload is in progress)"
+            # A whole-card residency held for a *different* model reserves the card and tore its siblings down,
+            # so a head of another model cannot load until that residency restores. Name it: otherwise this
+            # reads as a generic VRAM-budget defer (the card looks idle with ample free VRAM) when the real
+            # cause is a residency granted to a non-head model.
+            nonhead_residency_model = next(
+                (
+                    state.model
+                    for _, state in self._held_residencies()
+                    if state.model is not None and state.model != head.model
+                ),
+                None,
+            )
+            if nonhead_residency_model is not None:
+                return (
+                    f"its model is not resident because a whole-card residency is held for non-head model "
+                    f"{nonhead_residency_model!r} -- the card is reserved for that model and its siblings were "
+                    f"torn down, so this head cannot load until that residency restores"
+                )
             return (
                 "its model is not resident and no preload has been admitted "
                 "(usually a VRAM/RAM budget defer -- see the budget lines above)"
@@ -2230,7 +2248,14 @@ class InferenceScheduler:
                 # held exclusive through the teardown so a second model cannot re-fill the card mid-reduction;
                 # the residency cooldown then restores concurrency.
                 needs_teardown_path = forecast.needs_exclusive_residency or forecast.needs_process_count_reduction
-                if self._whole_card_residency_enabled() and needs_teardown_path:
+                # Only the head (the next job to dispatch) may claim the whole card. The residency reserves the
+                # entire device and tears its siblings down; granting it to a deeper-queue heavy job would
+                # collapse the very processes serving the lighter heads ahead of it, starving them while the
+                # card is held for a job whose turn has not come (and held until that job drains). This honors
+                # the same head_job contract the budget-eviction branches below follow: a later job never
+                # displaces a resident head. A non-head heavy job falls through to the ordinary verdict and
+                # defers until it becomes the head.
+                if self._whole_card_residency_enabled() and needs_teardown_path and is_head_blocker:
                     first_time = not self._job_tracker.is_admitted_exclusive(job)
                     self._job_tracker.mark_admitted_exclusive(job)
                     if self._should_prestage_whole_card_head(

@@ -275,11 +275,10 @@ def _live_log_overlap_scheduler(
 
     The state at the moment the worker chose to tear all siblings down instead of pre-staging:
 
-    - process 1 is mid-inference on an SDXL-class checkpoint (``INFERENCE_STARTING``), device-free ~9329 MB
-      (its memory report read ``vram: 7046``);
+    - process 1 is mid-inference on an SDXL-class checkpoint (``INFERENCE_STARTING``), device-free ~9329 MB;
     - processes 2/3/4 are idle and **model-free** (bare ~1288 MB CUDA context each, ~1GB RSS);
-    - the queue is ``[SDXL(in-progress), SDXL(pending, head), Flux(pending)]`` -- Flux is **not** the head,
-      it sits behind another already-resident SDXL job;
+    - the queue is ``[SDXL(in-progress), Flux(pending, head)]`` -- Flux is the head, behind the in-flight SDXL
+      job, so it is the legitimate whole-card pre-stage target;
     - the box has 64GB RAM but one process already holds ~25GB RSS, so available RAM is well under Flux's
       conservative ``predict_job_ram_mb`` burden (~24GB) plus the 4GB reserve.
 
@@ -339,8 +338,6 @@ class TestLiveLogRamGateRegression:
         sdxl_in_progress = make_job_pop_response(_RESIDENT_SDXL)
         await track_popped_job_async(job_tracker, sdxl_in_progress)
         await mark_job_in_progress_async(job_tracker, sdxl_in_progress)
-        sdxl_head = make_job_pop_response(_RESIDENT_SDXL)
-        await track_popped_job_async(job_tracker, sdxl_head)
         flux = make_job_pop_response(_FLUX_MODEL, width=1024, height=1024)
         await track_popped_job_async(job_tracker, flux)
 
@@ -366,8 +363,6 @@ class TestLiveLogRamGateRegression:
         sdxl_in_progress = make_job_pop_response(_RESIDENT_SDXL)
         await track_popped_job_async(job_tracker, sdxl_in_progress)
         await mark_job_in_progress_async(job_tracker, sdxl_in_progress)
-        sdxl_head = make_job_pop_response(_RESIDENT_SDXL)
-        await track_popped_job_async(job_tracker, sdxl_head)
         flux = make_job_pop_response(_FLUX_MODEL, width=1024, height=1024)
         await track_popped_job_async(job_tracker, flux)
 

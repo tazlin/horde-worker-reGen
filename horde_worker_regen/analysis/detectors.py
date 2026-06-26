@@ -84,6 +84,11 @@ _DISPATCH_STALL_BUG_RE = re.compile(r"dispatch was withheld with no matching gat
 # supervisor soft-resets the pools. This is a distinct, nameable root cause (not a generic dispatch-path bug),
 # so it gets its own detector; the phrase is the worker's _diagnose_dispatch_stall attribution for it.
 _WHOLE_CARD_WEDGE_RE = re.compile(r"whole-card residency stuck: cannot reach sole residency")
+# A whole-card residency granted to a model that is not the head of the queue: it reserves the card and tears
+# its siblings down, so the actual head (a different model) cannot load and starves. Reads as a generic
+# VRAM-budget defer (the card looks idle) unless attributed to the held non-head residency, so it gets its own
+# detector keyed on the worker's _diagnose_dispatch_stall phrase for it.
+_WHOLE_CARD_NONHEAD_RE = re.compile(r"whole-card residency is held for non-head model")
 
 # A median pop->submit latency this many times the median generation time means jobs are aging in the
 # pipeline queue, not in generation (the post-inference safety-backlog signature).
@@ -737,6 +742,51 @@ def detect_whole_card_convergence_wedge(context: SessionContext) -> list[Finding
     ]
 
 
+def detect_whole_card_nonhead_residency_starvation(context: SessionContext) -> list[Finding]:
+    """A whole-card residency held for a non-head model, starving the actual head of the queue.
+
+    The whole-card residency reserves the entire device and tears its sibling processes down. Granting it to
+    a model that is not the head of the queue collapses the very processes serving the lighter heads ahead of
+    it, so the real head has no resident process and cannot load while the card is reserved for a job whose
+    turn has not come (held until that job drains). The head parks, the queue deadlocks, and the recovery
+    supervisor soft-resets and faults the backlog. The whole-card residency is meant to be granted only to the
+    head, so a firing here means a non-head model claimed the card -- distinct from a genuine VRAM-budget
+    over-deferral, which this would otherwise be mistaken for (the card looks idle with ample free VRAM).
+    """
+    starvations = _matching(context.session.records, _WHOLE_CARD_NONHEAD_RE)
+    if not starvations:
+        return []
+    soft_resets = _matching(context.session.records, _SOFT_RESET_RE)
+    dropped = _total_dropped_jobs(context.session.records)
+    escalated = bool(soft_resets) or dropped > 0
+    return [
+        Finding(
+            id="whole_card_nonhead_residency_starvation",
+            severity=Severity.CRITICAL if escalated else Severity.WARNING,
+            title="Whole-card residency held for a non-head model starved the queue head",
+            verdict=(
+                f"The head of the queue was parked {len(starvations)} time(s) because a whole-card residency was "
+                "held for a different (non-head) model, which reserved the card and tore down the processes "
+                "serving the head. "
+                + (
+                    f"The starved queue deadlocked, the recovery supervisor soft-reset the pools "
+                    f"{len(soft_resets)} time(s) and faulted {dropped} backlog job(s)."
+                    if escalated
+                    else "Force-admit or a drain broke it before it escalated to a soft reset."
+                )
+            ),
+            remediation=(
+                "The whole-card residency must only be granted to the head (next-to-dispatch) job; a deeper-queue "
+                "heavy model should defer until it becomes the head rather than reserving the card. If this "
+                "recurs, capture the residency establish/pre-stage lines and the queue order to confirm which "
+                "model claimed the card while a different head was pending."
+            ),
+            evidence=[_evidence(r) for r in (starvations[:2] + soft_resets[:1])],
+            see_also="scheduler_starvation_wedge",
+        ),
+    ]
+
+
 def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
     """A head-of-queue job that did not dispatch despite pending work and an idle, model-resident process.
 
@@ -744,11 +794,15 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
     leave no record of *why* the head was parked. The new dispatch-stall log names the blocking gate; the
     "no matching gate" variant is the genuinely anomalous case (the head's model is resident and idle, no
     gate is holding it, yet nothing dispatched) and is reported as critical, the rest as a warning. The
-    whole-card convergence wedge has its own detector (:func:`detect_whole_card_convergence_wedge`), so its
+    whole-card convergence wedge (:func:`detect_whole_card_convergence_wedge`) and the non-head residency
+    starvation (:func:`detect_whole_card_nonhead_residency_starvation`) have their own detectors, so their
     lines are excluded here to avoid double-reporting the same stall as a generic warning.
     """
-    wedge_stalls = _matching(context.session.records, _WHOLE_CARD_WEDGE_RE)
-    stalls = [r for r in _matching(context.session.records, _DISPATCH_STALL_RE) if r not in wedge_stalls]
+    excluded = _matching(context.session.records, _WHOLE_CARD_WEDGE_RE) + _matching(
+        context.session.records,
+        _WHOLE_CARD_NONHEAD_RE,
+    )
+    stalls = [r for r in _matching(context.session.records, _DISPATCH_STALL_RE) if r not in excluded]
     if not stalls:
         return []
 
@@ -824,6 +878,7 @@ DETECTORS: list[Detector] = [
     detect_slow_generation_drop_spiral,
     detect_safety_stage_stall,
     detect_whole_card_convergence_wedge,
+    detect_whole_card_nonhead_residency_starvation,
     detect_head_dispatch_stall,
     detect_consecutive_failure_pause,
     detect_oom,
