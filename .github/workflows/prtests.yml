@@ -29,12 +29,10 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
-      - name: Install pyrefly
-        run: |
-          version=$(grep -oP 'pyrefly==\K[^"]+' pyproject.toml | head -1)
-          uv tool install "pyrefly==$version"
+      - name: Install dependencies (including pyrefly)
+        run: uv sync --extra cpu --group dev
       - name: Run pre-commit hooks
-        uses: j178/prek-action@v2
+        run: uv run prek run --all-files
 
   dockerfile-lint:
     runs-on: ubuntu-latest
