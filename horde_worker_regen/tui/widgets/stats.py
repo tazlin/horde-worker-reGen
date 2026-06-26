@@ -125,9 +125,10 @@ class StatsView(Vertical):
     @staticmethod
     def _render_rollups(title: str, rows: list[StatsRollupRow]) -> Panel:
         table = Table(expand=True, border_style="grey37", header_style="bold")
-        first = "Model" if title == "By model" else "Baseline"
+        is_model_table = title == "By model totals"
+        first = "Model" if is_model_table else "Baseline"
         table.add_column(first, no_wrap=True)
-        if title == "By model":
+        if is_model_table:
             table.add_column("Baseline", no_wrap=True)
         table.add_column("Jobs", justify="right")
         table.add_column("Megapixelsteps", justify="right")
@@ -135,12 +136,12 @@ class StatsView(Vertical):
         table.add_column("E2E", justify="right")
         table.add_column("Batch>1", justify="right")
         if not rows:
-            empty = ["no finalized image jobs yet"] + ([""] if title == "By model" else []) + ["", "", "", "", ""]
+            empty = ["no finalized image jobs yet"] + ([""] if is_model_table else []) + ["", "", "", "", ""]
             table.add_row(*empty)
         else:
             for row in rows:
-                cells = [shorten(row.model, 32) if title == "By model" else short_baseline(row.baseline)]
-                if title == "By model":
+                cells = [shorten(row.model, 32) if is_model_table else short_baseline(row.baseline)]
+                if is_model_table:
                     cells.append(short_baseline(row.baseline))
                 cells.extend(
                     [
