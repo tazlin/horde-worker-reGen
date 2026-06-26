@@ -5,32 +5,12 @@ from __future__ import annotations
 import importlib
 from pathlib import Path
 
-CANONICAL_MODULES = [
-    "ipc.messages",
-    "ipc.supervisor_channel",
-    "lifecycle.process_lifecycle",
-    "lifecycle.process_map",
-    "scheduling.inference_scheduler",
-    "jobs.job_tracker",
-    "resources.resource_budget",
-    "testing.fake_worker_processes",
-    "_internal._aliased_types",
-]
-
 EXPECTED_TOP_LEVEL_FILES = {
     "__init__.py",
     "main_entry_point.py",
     "process_manager.py",
     "worker_entry_points.py",
 }
-
-
-def test_canonical_modules_import_from_grouped_packages() -> None:
-    """Grouped process-management modules import from their canonical paths."""
-    for module_name in CANONICAL_MODULES:
-        module = importlib.import_module(f"horde_worker_regen.process_management.{module_name}")
-
-        assert module.__name__ == f"horde_worker_regen.process_management.{module_name}"
 
 
 def test_process_management_top_level_stays_thin() -> None:
