@@ -181,7 +181,7 @@ class (an inference pool crashing on start, a recovery storm that never gives up
 "no images produced" OOM, an orphaned-job storm) and emits the child's exception as the root cause where
 it can. See [Troubleshoot](../how-to/troubleshoot.md#diagnose-a-crash-or-recovery-storm-from-the-logs).
 
-The dashboard exposes the same `diagnose` analysis without a shell: the **Diagnostics** tab (`F10`)
+The dashboard exposes the same `diagnose` analysis without a shell: the **Diagnostics** tab
 runs the detectors over `logs/` and renders the ranked findings, with a selector to pick which worker
 session to view. It reads the log files directly, so it **works whether or not the worker is running**.
 Each finding separates the *diagnosis* (what went wrong) from the *suggested fix*, and a timing line
@@ -250,3 +250,4 @@ The same generator is available in the dashboard: the **Logs** tab has a **Suppo
 Worker configuration itself can be supplied through `AIWORKER_*` variables instead of
 `bridgeData.yaml` when you pass `-e`; this is the container path described in
 [Run headless](../how-to/run-headless.md#configure-from-environment-variables-containers).
+

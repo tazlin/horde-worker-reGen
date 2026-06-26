@@ -31,6 +31,7 @@ from horde_worker_regen import __version__
 from horde_worker_regen.app_state import (
     AppStateStore,
     OnboardingChoice,
+    OverviewTrendWindow,
     OverviewViewMode,
     benchmark_status_summary,
     should_prompt_onboarding,
@@ -56,6 +57,7 @@ from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.update_check import check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView, BenchmarkWaitingState
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, ConfigLeaveChoice, ConfigLeaveModal
+from horde_worker_regen.tui.widgets.control import ControlView
 from horde_worker_regen.tui.widgets.diagnostics import DiagnosticsView
 from horde_worker_regen.tui.widgets.download_picker import (
     DownloadPickerModal,
@@ -305,7 +307,8 @@ class HordeWorkerTUI(App[None]):
     TabbedContent {
         height: 1fr;
     }
-    OverviewView, GpusView, LiveView, InsightsView, ConfigEditorView, LogsView, BenchmarkView, DownloadsView {
+    OverviewView, GpusView, LiveView, InsightsView, ConfigEditorView, LogsView, BenchmarkView, DownloadsView,
+    ControlView {
         height: 1fr;
         padding: 1 1;
     }
@@ -317,7 +320,8 @@ class HordeWorkerTUI(App[None]):
     Screen.-narrow ConfigEditorView,
     Screen.-narrow LogsView,
     Screen.-narrow BenchmarkView,
-    Screen.-narrow DownloadsView {
+    Screen.-narrow DownloadsView,
+    Screen.-narrow ControlView {
         padding: 1 0;
     }
     #overview-worker, #overview-processes {
@@ -326,14 +330,12 @@ class HordeWorkerTUI(App[None]):
     """
 
     BINDINGS = [
-        ("f2", "toggle_pause", "Pause/Resume"),
         ("f3", "start_stop_worker", "Start/Stop"),
-        ("f4", "toggle_autostart", "Auto-start"),
-        ("f5", "reload_config", "Reload config"),
         ("f6", "cycle_view_mode", "View mode"),
         ("f7", "toggle_download_pause", "Pause downloads"),
+        ("t", "cycle_trend_window", "Trend window"),
+        ("r", "reset_trends", "Reset trends"),
         ("f11", "restart_worker", "Restart worker"),
-        ("f10", "show_diagnostics", "Diagnostics"),
         ("m", "toggle_server_maintenance", "Maintenance (horde)"),
         ("ctrl+q", "quit", "Quit"),
         ("ctrl+c", "quit", "Quit"),
@@ -377,7 +379,10 @@ class HordeWorkerTUI(App[None]):
         # A picker selection chosen before a freshly-started worker's pipe is up; sent once it is (see
         # _tick), after the hold command, so the models are fetched without the GPU committing.
         self._pending_download_models: DownloadSelection | None = None
-        self._view_mode = self._app_state_store.load().overview_view_mode
+        persisted_state = self._app_state_store.load()
+        self._view_mode = persisted_state.overview_view_mode
+        self._trend_window = persisted_state.overview_trend_window
+        self._last_trend_config_fingerprint: tuple[object, ...] | None = None
         self._last_main_tab = "tab-overview"
         self._allow_tab_switch_to: str | None = None
         self._config_leave_warning_suppressed = False
@@ -397,6 +402,8 @@ class HordeWorkerTUI(App[None]):
         with TabbedContent(initial="tab-overview", id="main-tabs"):
             with TabPane("Overview", id="tab-overview"):
                 yield OverviewView()
+            with TabPane("Control", id="tab-control"):
+                yield ControlView()
             with TabPane("GPUs", id="tab-gpus"):
                 yield GpusView()
             with TabPane("Live", id="tab-live"):
@@ -640,14 +647,24 @@ class HordeWorkerTUI(App[None]):
         )
         try:
             self._update_status_bar(report, snapshot)
-            self.query_one(OverviewView).update_view(
+            overview = self.query_one(OverviewView)
+            self._maybe_mark_trend_config_change(overview, snapshot)
+            overview.update_view(
                 report,
                 snapshot,
                 frame=self._frame,
                 mode=self._view_mode,
+                trend_window=self._trend_window,
             )
             self.query_one(GpusView).update_view(snapshot, mode=self._view_mode)
             self.query_one(DownloadsView).update_view(snapshot, mode=self._view_mode)
+            self.query_one(ControlView).update_view(
+                snapshot,
+                supervisor_status=self._supervisor.status,
+                is_alive=self._supervisor.is_alive(),
+                restart_attempts=self._supervisor.restart_attempts,
+                auto_start=self._auto_start_enabled(),
+            )
             self._update_downloads_tab_label(snapshot)
             self.query_one(LogsView).set_view_mode(self._view_mode)
             config_editor = self.query_one(ConfigEditorView)
@@ -743,6 +760,30 @@ class HordeWorkerTUI(App[None]):
     def on_downloads_view_pause_toggle_requested(self, message: DownloadsView.PauseToggleRequested) -> None:
         """Forward a Downloads-panel pause/resume click to the worker."""
         self._set_downloads_paused(currently_paused=message.currently_paused)
+
+    def on_control_view_toggle_pause_requested(self, _message: ControlView.TogglePauseRequested) -> None:
+        """Forward the Control tab's local pause/resume request."""
+        self.action_toggle_pause()
+
+    def on_control_view_toggle_auto_start_requested(self, _message: ControlView.ToggleAutoStartRequested) -> None:
+        """Forward the Control tab's auto-start toggle request."""
+        self.action_toggle_autostart()
+        self._tick()
+
+    def on_control_view_start_stop_requested(self, _message: ControlView.StartStopRequested) -> None:
+        """Forward the Control tab's start/stop request."""
+        self.action_start_stop_worker()
+
+    def on_control_view_restart_requested(self, _message: ControlView.RestartRequested) -> None:
+        """Forward the Control tab's restart request."""
+        self.action_restart_worker()
+
+    def on_control_view_toggle_server_maintenance_requested(
+        self,
+        _message: ControlView.ToggleServerMaintenanceRequested,
+    ) -> None:
+        """Forward the Control tab's horde-maintenance request."""
+        self.action_toggle_server_maintenance()
 
     def on_downloads_view_rate_limit_requested(self, message: DownloadsView.RateLimitRequested) -> None:
         """Forward a Downloads-panel bandwidth-cap change to the worker."""
@@ -880,6 +921,47 @@ class HordeWorkerTUI(App[None]):
             return "local"
         return ""
 
+    @staticmethod
+    def _trend_config_fingerprint(snapshot: WorkerStateSnapshot | None) -> tuple[object, ...] | None:
+        """Return the capacity/workload config fields that affect trend interpretation."""
+        if snapshot is None:
+            return None
+        config = snapshot.config
+        return (
+            config.num_models,
+            config.max_power,
+            config.max_threads,
+            config.queue_size,
+            config.max_batch,
+            config.safety_on_gpu,
+            config.allow_img2img,
+            config.allow_lora,
+            config.effective_allow_lora,
+            config.allow_controlnet,
+            config.allow_sdxl_controlnet,
+            config.allow_post_processing,
+            config.high_performance_mode,
+            config.moderate_performance_mode,
+            config.extra_slow_worker,
+            config.alchemist,
+            config.alchemy_concurrent,
+            config.alchemy_max_concurrency,
+            config.alchemy_vram_headroom_mb,
+            tuple(config.alchemy_forms),
+        )
+
+    def _maybe_mark_trend_config_change(self, overview: OverviewView, snapshot: WorkerStateSnapshot | None) -> None:
+        """Show a trend stabilization disclaimer when relevant worker config changes."""
+        fingerprint = self._trend_config_fingerprint(snapshot)
+        if fingerprint is None:
+            return
+        if self._last_trend_config_fingerprint is None:
+            self._last_trend_config_fingerprint = fingerprint
+            return
+        if fingerprint != self._last_trend_config_fingerprint:
+            self._last_trend_config_fingerprint = fingerprint
+            overview.note_config_changed()
+
     def _update_status_bar(self, report: HealthReport, snapshot: WorkerStateSnapshot | None) -> None:
         """Render the top status bar, led by the worker's current lifecycle phase."""
         phase_text = report.phase.value.upper()
@@ -912,6 +994,22 @@ class HordeWorkerTUI(App[None]):
             HealthStatus.ERROR: "red",
         }[severity]
 
+    def _auto_start_enabled(self) -> bool:
+        """Return the persisted launch auto-start flag, defaulting safely on read failure."""
+        try:
+            return self._app_state_store.load().auto_start_worker
+        except Exception:
+            return False
+
+    _TREND_WINDOW_CYCLE = (
+        OverviewTrendWindow.FIVE_MINUTES,
+        OverviewTrendWindow.FIFTEEN_MINUTES,
+        OverviewTrendWindow.THIRTY_MINUTES,
+        OverviewTrendWindow.SIXTY_MINUTES,
+        OverviewTrendWindow.TWO_HOURS,
+        OverviewTrendWindow.ALL,
+    )
+    """The order the Overview trend-window shortcut cycles through."""
     _VIEW_MODE_CYCLE = (OverviewViewMode.NORMAL, OverviewViewMode.DETAILS, OverviewViewMode.THIN)
     """The order F6 steps through: the lean redesign, the verbose detail view, then the thin bar."""
 
@@ -934,6 +1032,27 @@ class HordeWorkerTUI(App[None]):
         self.notify(self._VIEW_MODE_NOTICE[self._view_mode])
         self._tick()
 
+    def action_cycle_trend_window(self) -> None:
+        """Cycle the Overview trend window and persist the selected span."""
+        index = (
+            self._TREND_WINDOW_CYCLE.index(self._trend_window) if self._trend_window in self._TREND_WINDOW_CYCLE else 0
+        )
+        self._trend_window = self._TREND_WINDOW_CYCLE[(index + 1) % len(self._TREND_WINDOW_CYCLE)]
+        with contextlib.suppress(Exception):
+            self._app_state_store.set_trend_window(self._trend_window)
+        label = "All" if self._trend_window is OverviewTrendWindow.ALL else self._trend_window.value
+        with contextlib.suppress(NoMatches):
+            self.query_one(OverviewView).soft_reset_trends(notice=f"Trend window changed to {label}; stabilizing.")
+        self.notify(f"Trend window: {label}")
+        self._tick()
+
+    def action_reset_trends(self) -> None:
+        """Soft-reset the Overview trend epoch without discarding older session samples."""
+        with contextlib.suppress(NoMatches):
+            self.query_one(OverviewView).soft_reset_trends()
+        self.notify("Overview trends soft-reset.")
+        self._tick()
+
     def action_toggle_pause(self) -> None:
         """Pause or resume the worker (a *local* pop-pause) depending on its current state.
 
@@ -943,7 +1062,7 @@ class HordeWorkerTUI(App[None]):
         explicit server-side toggle.
         """
         snapshot = self._supervisor.latest_snapshot
-        # Read supervisor_paused directly: it is the flag F2 controls. Using the aggregate
+        # Read supervisor_paused directly: it is the flag the local pause control changes. Using the aggregate
         # maintenance_mode here would latch permanently when the horde forces maintenance, because
         # that flag (last_pop_maintenance_mode) is not cleared by RESUME - only a successful pop clears it.
         if snapshot is not None and snapshot.supervisor_paused:
@@ -956,7 +1075,7 @@ class HordeWorkerTUI(App[None]):
     def action_toggle_server_maintenance(self) -> None:
         """Toggle the worker's server-side (horde) maintenance flag via the horde API.
 
-        Distinct from F2 (local pause): this asks the horde itself to stop (or resume) sending the worker
+        Distinct from local pause: this asks the horde itself to stop (or resume) sending the worker
         jobs, matching the maintenance the job-pop response reports. The current state is taken from the
         polled worker-details flag.
         """

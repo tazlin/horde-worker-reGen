@@ -68,12 +68,14 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PENDING_JOBS_IN_SNAPSHOT,
     RECENT_JOBS_IN_SNAPSHOT,
+    WORK_LEDGER_ENTRIES_IN_SNAPSHOT,
     CardSnapshot,
     DownloadPlanSummary,
     FeatureInfoRow,
     FeatureReadinessSummary,
     JobFeatureSummary,
     JobQueueEntry,
+    OrchestrationIntentSnapshot,
     ProcessSnapshot,
     RecentJobRecord,
     SupervisorChannel,
@@ -83,6 +85,8 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerStateSnapshot,
+    WorkLedgerEntry,
+    WorkLedgerStage,
 )
 from horde_worker_regen.process_management.jobs.alchemy_popper import DEFAULT_ALCHEMY_FORMS, AlchemyCoordinator
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
@@ -2974,6 +2978,173 @@ class HordeWorkerProcessManager:
             return None
         return str(baseline) if baseline is not None else None
 
+    @staticmethod
+    def _job_id_text(job_id: object | None) -> str:
+        """Return a stable string form for Horde generation IDs and SDK job IDs."""
+        if job_id is None:
+            return ""
+        root = getattr(job_id, "root", None)
+        return str(root if root is not None else job_id)
+
+    @staticmethod
+    def _ledger_stage(stage: JobStage) -> WorkLedgerStage:
+        """Map the internal job stage to the operator-facing work-ledger stage."""
+        return {
+            JobStage.PENDING_INFERENCE: WorkLedgerStage.QUEUED,
+            JobStage.INFERENCE_IN_PROGRESS: WorkLedgerStage.INFERENCE,
+            JobStage.DETACHED: WorkLedgerStage.PREPARING,
+            JobStage.PENDING_SAFETY_CHECK: WorkLedgerStage.SAFETY,
+            JobStage.SAFETY_CHECKING: WorkLedgerStage.SAFETY,
+            JobStage.PENDING_SUBMIT: WorkLedgerStage.SUBMIT,
+        }[stage]
+
+    def _process_for_job(self, job_id: str) -> ProcessSnapshot | None:
+        """Return the process snapshot currently referencing ``job_id``, if any."""
+        for process in (ProcessSnapshot.from_process_info(info) for info in self._process_map.values()):
+            if process.current_job_id == job_id:
+                return process
+        return None
+
+    def _tracked_job_to_ledger_entry(self, tracked: TrackedJob, *, now: float) -> WorkLedgerEntry:
+        """Project an active tracked job into the Overview work ledger."""
+        sdk_job = tracked.sdk_api_job_info
+        payload = sdk_job.payload
+        features = JobFeatureSummary.from_payload(payload)
+        job_id = self._job_id_text(tracked.job_id)
+        process = self._process_for_job(job_id)
+        stage = self._ledger_stage(tracked.stage)
+        intent = {
+            WorkLedgerStage.QUEUED: "waiting for model/process",
+            WorkLedgerStage.PREPARING: "between orchestration stages",
+            WorkLedgerStage.INFERENCE: "sampling" if process is not None and process.is_busy else "dispatched",
+            WorkLedgerStage.SAFETY: "safety check",
+            WorkLedgerStage.SUBMIT: "awaiting submit",
+        }.get(stage)
+        return WorkLedgerEntry(
+            job_id=job_id,
+            stage=stage,
+            model=str(sdk_job.model) if sdk_job.model is not None else None,
+            baseline=self._safe_model_baseline(str(sdk_job.model) if sdk_job.model is not None else None),
+            process_id=process.process_id if process is not None else None,
+            device_index=process.device_index if process is not None else tracked.last_dispatched_device_index,
+            progress_current=process.last_current_step if process is not None else None,
+            progress_total=process.last_total_steps if process is not None else None,
+            iterations_per_second=process.last_iterations_per_second if process is not None else None,
+            width=payload.width,
+            height=payload.height,
+            steps=payload.ddim_steps,
+            features=features if not features.is_empty() else None,
+            age_seconds=max(0.0, now - tracked.current_stage_since) if tracked.current_stage_since else None,
+            intent=intent,
+            raw_reason=getattr(self._inference_scheduler, "_dispatch_stall_last_reason", None),
+        )
+
+    def _recent_job_to_ledger_entry(self, job: RecentJobRecord) -> WorkLedgerEntry:
+        """Project a finished job record into the Overview work ledger."""
+        return WorkLedgerEntry(
+            job_id=job.job_id,
+            stage=WorkLedgerStage.FAULTED if job.faulted else WorkLedgerStage.COMPLETED,
+            model=job.model_name,
+            baseline=job.baseline,
+            width=job.width,
+            height=job.height,
+            steps=job.steps,
+            features=job.features,
+            queue_wait_seconds=job.queue_wait_seconds,
+            safety_seconds=job.safety_seconds,
+            e2e_seconds=job.e2e_seconds,
+            faulted=job.faulted,
+            intent="recent fault" if job.faulted else "recent completion",
+        )
+
+    def _build_work_ledger(self, recent_jobs: list[RecentJobRecord]) -> list[WorkLedgerEntry]:
+        """Build active rows first, then recent completed/faulted rows for the Overview work ledger."""
+        now = time.time()
+        rows = [self._tracked_job_to_ledger_entry(tracked, now=now) for tracked in self._job_tracker.tracked_jobs()]
+        active_ids = {row.job_id for row in rows}
+        for job in reversed(recent_jobs):
+            if len(rows) >= WORK_LEDGER_ENTRIES_IN_SNAPSHOT:
+                break
+            if job.job_id in active_ids:
+                continue
+            rows.append(self._recent_job_to_ledger_entry(job))
+        return rows[:WORK_LEDGER_ENTRIES_IN_SNAPSHOT]
+
+    def _build_orchestration_intent(self) -> OrchestrationIntentSnapshot:
+        """Summarize what the orchestrator is doing now and what it is waiting on next."""
+        raw_gate = getattr(self._inference_scheduler, "_dispatch_stall_last_reason", None)
+        head = next(
+            (job for job in self._job_tracker.jobs_pending_inference if job not in self._job_tracker.jobs_in_progress),
+            None,
+        )
+        target_job_id = self._job_id_text(head.id_) if head is not None else None
+        target_model = str(head.model) if head is not None and head.model is not None else None
+
+        if self._state.shutting_down:
+            return OrchestrationIntentSnapshot(
+                summary="Draining before shutdown.",
+                why="In-flight work finishes first.",
+            )
+        if self._state.supervisor_paused:
+            return OrchestrationIntentSnapshot(summary="Paused by operator.", why="No new jobs are being popped.")
+        if self._state.self_throttle_paused:
+            return OrchestrationIntentSnapshot(
+                summary="Self-throttled after resource faults.",
+                why="The worker is backing off before the horde forces maintenance.",
+            )
+        if self._model_availability.background_download_active:
+            return OrchestrationIntentSnapshot(
+                summary="Downloading model assets.",
+                next_action="Serve each model as soon as it is ready.",
+                why="Feature/model readiness gates job popping.",
+            )
+        if raw_gate:
+            return OrchestrationIntentSnapshot(
+                summary="Holding dispatch.",
+                next_action="Re-check the head job on the next scheduler tick.",
+                why=raw_gate,
+                raw_gate=raw_gate,
+                target_job_id=target_job_id,
+                target_model=target_model,
+            )
+        if self._job_tracker.jobs_in_progress:
+            count = len(self._job_tracker.jobs_in_progress)
+            return OrchestrationIntentSnapshot(
+                summary=f"Sampling {count} job{'s' if count != 1 else ''}.",
+                next_action=(f"Prepare {target_model}." if target_model else "Keep the pipeline fed."),
+                target_job_id=target_job_id,
+                target_model=target_model,
+            )
+        if head is not None:
+            if target_model and self._horde_model_map.is_model_loading(target_model):
+                summary = f"Preloading {target_model}."
+                why = "The queued job's model is loading into a process."
+            else:
+                summary = f"Preparing queued job {target_job_id[:8] if target_job_id else ''}.".strip()
+                why = "Waiting for a resident model and an accepting process."
+            return OrchestrationIntentSnapshot(
+                summary=summary,
+                next_action="Dispatch when the process can accept work.",
+                why=why,
+                target_job_id=target_job_id,
+                target_model=target_model,
+            )
+        safety = len(self._job_tracker.jobs_pending_safety_check) + len(self._job_tracker.jobs_being_safety_checked)
+        if safety:
+            return OrchestrationIntentSnapshot(summary=f"Safety checking {safety} job{'s' if safety != 1 else ''}.")
+        if self._job_tracker.jobs_pending_submit:
+            return OrchestrationIntentSnapshot(summary="Submitting completed jobs to the horde.")
+        if self._state.last_pop_skipped_reasons:
+            reasons = ", ".join(
+                f"{key}={value}" for key, value in sorted(self._state.last_pop_skipped_reasons.items())
+            )
+            return OrchestrationIntentSnapshot(
+                summary="Looking for matching horde work.",
+                next_action="Pop again after the throttle interval.",
+                why=f"Last pop skipped: {reasons}.",
+            )
+        return OrchestrationIntentSnapshot(summary="Ready for work.", next_action="Pop the next matching job.")
+
     def _build_pending_jobs_list(self) -> list[JobQueueEntry]:
         """Build a capped list of pending-inference jobs for the overview queue display."""
         entries: list[JobQueueEntry] = []
@@ -3184,6 +3355,11 @@ class HordeWorkerProcessManager:
             if api_message.message_text:
                 api_messages.append(api_message.message_text)
 
+        recent_jobs = [
+            RecentJobRecord.from_metrics_record(job, baseline=self._safe_model_baseline(job.model_name))
+            for job in run_metrics.jobs[-RECENT_JOBS_IN_SNAPSHOT:]
+        ]
+
         config = WorkerConfigSummary(
             dreamer_name=bridge_data.dreamer_worker_name,
             worker_version=horde_worker_regen.__version__,
@@ -3266,10 +3442,7 @@ class HordeWorkerProcessManager:
             vram_high_water_mb_per_process=run_metrics.vram_used_high_water_mb_per_process,
             ram_high_water_mb_per_process=run_metrics.ram_used_high_water_mb_per_process,
             disk_free_bytes=dict(self._disk_monitor.current_free_bytes),
-            recent_jobs=[
-                RecentJobRecord.from_metrics_record(job, baseline=self._safe_model_baseline(job.model_name))
-                for job in run_metrics.jobs[-RECENT_JOBS_IN_SNAPSHOT:]
-            ],
+            recent_jobs=recent_jobs,
             downloads=self._model_availability.status,
             download_plan=self._get_download_plan_summary(),
             feature_readiness=self._build_feature_readiness_summary(bridge_data),
@@ -3283,6 +3456,8 @@ class HordeWorkerProcessManager:
             alchemy_total_submitted=self._alchemy_coordinator.num_forms_submitted,
             alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
             pending_jobs=self._build_pending_jobs_list(),
+            orchestration_intent=self._build_orchestration_intent(),
+            work_ledger=self._build_work_ledger(recent_jobs),
             whole_card_residency=self._whole_card_residency_status(),
             per_card=self._build_card_snapshots(),
             system_memory=SystemMemorySnapshot.from_summary(self._sample_system_memory()),

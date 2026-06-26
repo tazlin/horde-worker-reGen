@@ -22,6 +22,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     DownloadStatusSnapshot,
     JobFeatureSummary,
     JobQueueEntry,
+    OrchestrationIntentSnapshot,
     ProcessSnapshot,
     RecentJobRecord,
     SupervisorChannel,
@@ -29,6 +30,8 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SystemMemorySnapshot,
     WorkerConfigSummary,
     WorkerStateSnapshot,
+    WorkLedgerEntry,
+    WorkLedgerStage,
 )
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 
@@ -435,13 +438,93 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
             for index, shape in enumerate(_MOCK_JOB_SHAPES[:queue_depth])
         ]
         sampling_count = sum(1 for p in processes if p.state == "INFERENCE_STARTING")
+        process_snapshots = [safety.to_snapshot(), *(process.to_snapshot() for process in processes)]
+        work_ledger = [
+            WorkLedgerEntry(
+                job_id=process.job_id,
+                stage=WorkLedgerStage.INFERENCE,
+                model=process.model,
+                baseline=_MOCK_BASELINES.get(process.model),
+                process_id=process.process_id,
+                device_index=0,
+                progress_current=process.step if process.state == "INFERENCE_STARTING" else None,
+                progress_total=process.total_steps if process.state == "INFERENCE_STARTING" else None,
+                iterations_per_second=process.its if process.state == "INFERENCE_STARTING" else None,
+                width=process.width,
+                height=process.height,
+                steps=process.total_steps,
+                intent="sampling" if process.state == "INFERENCE_STARTING" else "preparing",
+            )
+            for process in processes
+            if process.is_busy
+        ]
+        work_ledger.extend(
+            WorkLedgerEntry(
+                job_id=entry.job_id,
+                stage=WorkLedgerStage.QUEUED,
+                model=entry.model,
+                baseline=entry.baseline,
+                width=entry.width,
+                height=entry.height,
+                steps=entry.steps,
+                features=entry.features,
+                intent="waiting for model/process",
+            )
+            for entry in pending_jobs[:4]
+        )
+        active_ids = {entry.job_id for entry in work_ledger}
+        for job in reversed(recent_jobs):
+            if len(work_ledger) >= 12:
+                break
+            if job.job_id in active_ids:
+                continue
+            work_ledger.append(
+                WorkLedgerEntry(
+                    job_id=job.job_id,
+                    stage=WorkLedgerStage.FAULTED if job.faulted else WorkLedgerStage.COMPLETED,
+                    model=job.model_name,
+                    baseline=job.baseline,
+                    width=job.width,
+                    height=job.height,
+                    steps=job.steps,
+                    queue_wait_seconds=job.queue_wait_seconds,
+                    safety_seconds=job.safety_seconds,
+                    e2e_seconds=job.e2e_seconds,
+                    faulted=job.faulted,
+                    intent="recent fault" if job.faulted else "recent completion",
+                ),
+            )
+
+        if paused:
+            intent = OrchestrationIntentSnapshot(summary="Paused by operator.", why="No new jobs are being popped.")
+        elif sampling_count:
+            intent = OrchestrationIntentSnapshot(
+                summary=f"Sampling {sampling_count} job{'s' if sampling_count != 1 else ''}.",
+                next_action="Prepare the next queued model.",
+            )
+        elif pending_jobs:
+            intent = OrchestrationIntentSnapshot(
+                summary=f"Preparing queued job {pending_jobs[0].job_id[:8]}.",
+                next_action="Dispatch when the process can accept work.",
+                why="Synthetic worker is exercising the scheduler path.",
+                target_job_id=pending_jobs[0].job_id,
+                target_model=pending_jobs[0].model,
+            )
+        elif no_work:
+            intent = OrchestrationIntentSnapshot(
+                summary="Looking for matching horde work.",
+                next_action="Pop again after the throttle interval.",
+                why="Last pop skipped: models=3, max_pixels=1, nsfw=2.",
+            )
+        else:
+            intent = OrchestrationIntentSnapshot(summary="Ready for work.", next_action="Pop the next matching job.")
 
         snapshot = WorkerStateSnapshot(
             session_start_time=session_start,
             maintenance_mode=paused,
             worker_details_maintenance=horde_maintenance,
             config=config,
-            processes=[safety.to_snapshot(), *(process.to_snapshot() for process in processes)],
+            processes=process_snapshots,
             num_jobs_popped=jobs_popped,
             num_jobs_submitted=jobs_submitted,
             num_jobs_faulted=jobs_faulted,
@@ -459,6 +542,8 @@ def run_mock_worker(connection: object, options: WorkerLaunchOptions) -> None:
             jobs_pending_safety_check=sum(1 for p in processes if p.state == "INFERENCE_COMPLETE"),
             jobs_pending_submit=(int(elapsed) // 2) % 3,
             pending_jobs=pending_jobs,
+            orchestration_intent=intent,
+            work_ledger=work_ledger,
             recent_jobs=list(recent_jobs),
             kudos_per_hour=kudos_session / session_hours if kudos_session else None,
             kudos_this_session=kudos_session,

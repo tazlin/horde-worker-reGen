@@ -64,6 +64,17 @@ class OverviewViewMode(enum.StrEnum):
     """A single compact status bar only; the rest of the dashboard is hidden."""
 
 
+class OverviewTrendWindow(enum.StrEnum):
+    """The time span used by the Overview trend sparklines."""
+
+    FIVE_MINUTES = "5m"
+    FIFTEEN_MINUTES = "15m"
+    THIRTY_MINUTES = "30m"
+    SIXTY_MINUTES = "60m"
+    TWO_HOURS = "120m"
+    ALL = "all"
+
+
 class OnboardingChoice(enum.StrEnum):
     """The user's response to the first-run benchmark prompt."""
 
@@ -149,6 +160,8 @@ class WorkerAppState(BaseModel):
     overview_view_mode: OverviewViewMode = OverviewViewMode.NORMAL
     """How densely the Overview tab renders. The F6 toggle cycles normal -> details -> thin; the
     redesigned lean overview is the default, with the older verbose dashboard behind ``details``."""
+    overview_trend_window: OverviewTrendWindow = OverviewTrendWindow.FIFTEEN_MINUTES
+    """Time span used by the Overview trend sparklines; samples remain session-local."""
     worker_version_last_ran: str | None = None
     onboarding: OnboardingState = Field(default_factory=OnboardingState)
     last_worker_run: WorkerRunRecord | None = None
@@ -335,6 +348,12 @@ class AppStateStore:
         state.overview_view_mode = mode
         self.save(state)
 
+    def set_trend_window(self, window: OverviewTrendWindow) -> None:
+        """Persist the Overview tab's trend window."""
+        state = self.load()
+        state.overview_trend_window = window
+        self.save(state)
+
     # endregion
 
 
@@ -347,6 +366,7 @@ __all__ = [
     "KnownGoodSource",
     "OnboardingChoice",
     "OnboardingState",
+    "OverviewTrendWindow",
     "OverviewViewMode",
     "WorkerAppState",
     "WorkerRunRecord",

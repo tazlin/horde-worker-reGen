@@ -34,14 +34,16 @@ defines the structured protocol over it:
 - The worker pushes
   [`WorkerStateSnapshot`][horde_worker_regen.process_management.ipc.supervisor_channel.WorkerStateSnapshot]
   objects at a steady cadence (the same data the overview, per-process view, and
-  Downloads tab render), including a `SystemMemorySnapshot` (machine total/available
+  Downloads tab render), including an `orchestration_intent` summary (what the
+  scheduler/popper is doing next and why), a `work_ledger` of active/recent job
+  state, a `SystemMemorySnapshot` (machine total/available
   RAM plus per-role worker RSS) and a `per_card` list of
   [`CardSnapshot`][horde_worker_regen.process_management.ipc.supervisor_channel.CardSnapshot]
   (one per driven GPU: VRAM headroom, inference contexts, whole-card residency, and
   per-card fault/unservable-model health) that the GPUs tab and the Overview per-card
   strip render. Each `ProcessSnapshot` also carries the `device_index` of the card its
   slot is pinned to. A single-GPU host reports exactly one `CardSnapshot`. The snapshot
-  is versioned by `SUPERVISOR_PROTOCOL_VERSION` (currently 9) so a frontend can detect a
+  is versioned by `SUPERVISOR_PROTOCOL_VERSION` (currently 10) so a frontend can detect a
   mismatch with a worker built from different code.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]
@@ -202,3 +204,4 @@ module is dependency-light so it can be imported early in startup and by the TUI
 - [Resilience and Recovery](resilience_and_recovery.md): the owned-PID registry
   and action ledger that share the `.horde_worker_regen/` state directory
 - [Telemetry](telemetry.md): the separate observability layer
+

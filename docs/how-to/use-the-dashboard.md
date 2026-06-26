@@ -59,10 +59,11 @@ window open.
 
 | Tab | What it shows |
 |-----|---------------|
-| **Overview** | Headline metrics (jobs submitted/faulted, queue depth, GPU duty cycle, kudos/hr), a system-RAM line (machine in-use/total plus the worker's own footprint broken down by inference/safety/orchestrator/download), worker identity, and a per-process summary colour-coded by **temperature** (hot / next / warm / priming / cold) so a primed slot reads differently from a genuinely empty one. Horde maintenance appears as **MAINTENANCE** rather than **DISCONNECTED**; the API connectivity health row labels it as maintenance mode. On a multi-GPU worker it also carries a compact **per-card strip** (one row per GPU: VRAM bar, contexts, active jobs) and the per-process table gains a **GPU** column that groups each card's slots together. |
+| **Overview** | Headline metrics (jobs submitted/faulted, queue depth, GPU duty cycle, kudos/hr), health, and a **Now / Next / Why** strip that explains the scheduler's current intent. Job-owned facts live in a **Work ledger** (state, progress, model, process/GPU target, size, and reason), while the process table stays process-owned (slot state, resident model, GPU, memory, heartbeat, completed count). Trends show their configured time window and can be cycled across 5m / 15m / 30m / 60m / 120m / All; config changes and soft resets mark the trends as stabilizing. Multi-GPU workers also get a compact per-card strip (one row per GPU: VRAM bar, contexts, active jobs). In details density, the status block stays pinned above the scroll body; Health and Now / Next / Why form the left column, while GPUs + Job pipeline and Trends form the wider right column once the terminal is wide enough. 80-column terminals stay stacked. |
 | **GPUs** | A per-card breakdown for multi-GPU operators (a single-GPU host shows one collapsed card): each GPU's VRAM headroom with a near-OOM pressure flag, its inference contexts against their target, throughput (combined it/s and a jobs/hr trend), its concurrency ceiling and a busy-context duty proxy, and — in the details density (`F6`) — the whole-card residency it is holding and any models gone *locally unservable* on that card. |
 | **Live** | One panel per inference process: state (and its temperature phrase, e.g. *sampling*, *primed*, *loading*), current model and job, a sampling progress bar, iterations/second, VRAM/RAM (current and peak), and heartbeat freshness. |
 | **Downloads** | Model download progress, with pause/resume and an optional bandwidth cap. |
+| **Control** | Worker lifecycle and lower-frequency controls: start/stop, local pause/resume, auto-start on launch, restart, and horde-side maintenance. |
 | **Logs** | Tail `logs/bridge.log` or any subprocess `logs/bridge_n.log`, with level and substring filters. These are the same files the worker already writes (see [Logs](../reference/logs.md)). |
 | **Config** | A form over `bridgeData.yaml`, grouped by section with inline help, enforced bounds, and masked secrets. Comments and untouched keys are preserved. Includes a dedicated models editor and a searchable model picker: search across name/description/tags/triggers, filter by baseline/SFW/NSFW/inpainting and by on-disk status, sort by any column, see which list (load/skip) each model is already in, and inspect a model's full record before adding it. |
 | **Insights** | Live, actionable recommendations (low GPU duty cycle, VRAM pressure, fault rate, idle time, configuration mismatches) and a recent-activity rollup. |
@@ -82,13 +83,13 @@ that was already invalid on disk but that you did not touch will not block an un
 
 | Key | Action |
 |-----|--------|
-| `F2` | Pause / resume popping new jobs (in-flight jobs finish) |
 | `F3` | Start / stop the worker without quitting |
-| `F4` | Toggle whether the worker auto-starts when the dashboard launches |
-| `F5` | Reload `bridgeData.yaml` on the worker |
+| `F6` | Cycle dashboard density: normal, details, thin |
 | `F7` | Pause / resume model downloads |
-| `F8` | Jump to the Benchmark tab |
-| `F9` | Restart the worker process |
+| `F11` | Restart the worker process |
+| `M` | Toggle horde-side maintenance |
+| `T` | Cycle the Overview trend window: 5m, 15m, 30m, 60m, 120m, All |
+| `R` | Soft-reset the Overview trend epoch |
 | `Ctrl+Q` / `Ctrl+C` | Stop the worker and quit |
 
 ## Closing and reattaching
@@ -170,7 +171,7 @@ on the worker host; it serves that host's worker.
 
 When the dashboard owns the worker, it spawns the worker as a child process and talks to it over a
 duplex pipe, with no on-disk state file. The worker pushes compact state snapshots and accepts control
-commands (pause/resume, reload config, restart). State publishing never blocks the worker's control
+commands (pause/resume, maintenance, restart). State publishing never blocks the worker's control
 loop, so a slow or closed UI can never stall job processing. In browser mode a separate host process
 owns the worker and the served dashboard attaches to it over a socket, which is why closing the tab
 leaves the worker running.
@@ -178,3 +179,7 @@ leaves the worker running.
 See also: [Frontend and durable state](../explanation/frontend_and_state.md) for the supervisor
 channel, served/attached modes, and persisted state; [Architecture](../explanation/architecture.md);
 and [IPC and messaging](../explanation/ipc_and_messaging.md).
+
+
+
+

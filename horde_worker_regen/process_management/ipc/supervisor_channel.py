@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 9
+SUPERVISOR_PROTOCOL_VERSION = 10
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -51,6 +51,8 @@ and the snapshot's ``per_card`` list of :class:`CardSnapshot` (per-card VRAM, co
 fault/unservable-model health). Additive: a single-GPU host reports exactly one ``CardSnapshot``.
 v9 added the snapshot's ``feature_readiness`` (:class:`FeatureReadinessSummary`): the per-feature
 deps+on-disk readiness the worker uses to decide which gated features it offers to the Horde.
+v10 added ``orchestration_intent`` and ``work_ledger`` so the Overview can show the worker's current
+decision and promote per-job state out of the process table.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -58,6 +60,9 @@ RECENT_JOBS_IN_SNAPSHOT = 25
 
 PENDING_JOBS_IN_SNAPSHOT = 8
 """How many pending-inference jobs to carry in a snapshot (bounds payload size)."""
+
+WORK_LEDGER_ENTRIES_IN_SNAPSHOT = 18
+"""How many active/recent job rows to carry for the Overview work ledger (bounds payload size)."""
 
 
 class JobFeatureSummary(BaseModel):
@@ -117,6 +122,57 @@ class JobQueueEntry(BaseModel):
     width: int | None = None
     height: int | None = None
     features: JobFeatureSummary | None = None
+
+
+class WorkLedgerStage(enum.StrEnum):
+    """A job's operator-facing stage in the Overview work ledger."""
+
+    QUEUED = "queued"
+    PREPARING = "preparing"
+    INFERENCE = "inference"
+    SAFETY = "safety"
+    SUBMIT = "submit"
+    COMPLETED = "completed"
+    FAULTED = "faulted"
+
+
+class WorkLedgerEntry(BaseModel):
+    """One active or recently-finished job row for the Overview work ledger."""
+
+    job_id: str
+    stage: WorkLedgerStage
+    model: str | None = None
+    baseline: str | None = None
+    process_id: int | None = None
+    device_index: int | None = None
+    progress_current: int | None = None
+    progress_total: int | None = None
+    iterations_per_second: float | None = None
+    width: int | None = None
+    height: int | None = None
+    steps: int | None = None
+    features: JobFeatureSummary | None = None
+    age_seconds: float | None = None
+    queue_wait_seconds: float | None = None
+    safety_seconds: float | None = None
+    e2e_seconds: float | None = None
+    intent: str | None = None
+    raw_reason: str | None = None
+    faulted: bool = False
+
+
+class OrchestrationIntentSnapshot(BaseModel):
+    """The scheduler/popper's current plain-English intent for the Overview Now/Next/Why strip."""
+
+    summary: str = "Waiting for worker state."
+    next_action: str | None = None
+    why: str | None = None
+    raw_gate: str | None = None
+    target_job_id: str | None = None
+    target_model: str | None = None
+    target_process_id: int | None = None
+    target_device_index: int | None = None
+    updated_at: float = Field(default_factory=time.time)
 
 
 class WorkerConfigSummary(BaseModel):
@@ -715,6 +771,12 @@ class WorkerStateSnapshot(BaseModel):
 
     pending_jobs: list[JobQueueEntry] = Field(default_factory=list)
     """Pending-inference jobs (capped at :data:`PENDING_JOBS_IN_SNAPSHOT`), oldest first."""
+
+    orchestration_intent: OrchestrationIntentSnapshot = Field(default_factory=OrchestrationIntentSnapshot)
+    """Current plain-English scheduler intent for the Overview Now/Next/Why strip."""
+
+    work_ledger: list[WorkLedgerEntry] = Field(default_factory=list)
+    """Active and recent job rows for the Overview work ledger."""
 
     whole_card_residency: WholeCardResidencyStatus = Field(default_factory=WholeCardResidencyStatus)
     """Whole-card exclusive-residency posture: whether it can engage, and live detail when it has."""

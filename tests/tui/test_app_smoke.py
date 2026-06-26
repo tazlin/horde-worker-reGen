@@ -9,11 +9,12 @@ from pathlib import Path
 import pytest
 from textual.widgets import TabbedContent
 
-from horde_worker_regen.app_state import AppStateStore, OverviewViewMode
+from horde_worker_regen.app_state import AppStateStore, OnboardingChoice, OverviewViewMode
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.app import HordeWorkerTUI
 from horde_worker_regen.tui.health import WorkerPhase, derive
+from horde_worker_regen.tui.widgets.overview import OverviewView
 from horde_worker_regen.tui.wizard import WizardOutcome
 from horde_worker_regen.tui.worker_launcher import WorkerProcessMode, WorkerSupervisor
 from tests.tui._fake_supervisor import FakeSupervisor
@@ -48,7 +49,15 @@ async def test_app_boots_renders_and_cycles_tabs(tmp_path: Path) -> None:
             assert supervisor.latest_snapshot is not None, "no snapshot reached the app"
             assert supervisor.latest_snapshot.processes, "no processes in snapshot"
 
-            for tab in ("tab-live", "tab-downloads", "tab-logs", "tab-config", "tab-insights", "tab-overview"):
+            for tab in (
+                "tab-control",
+                "tab-live",
+                "tab-downloads",
+                "tab-logs",
+                "tab-config",
+                "tab-insights",
+                "tab-overview",
+            ):
                 app.query_one("#main-tabs", TabbedContent).active = tab
                 app._tick()
                 await pilot.pause()
@@ -64,6 +73,7 @@ async def test_app_boots_renders_and_cycles_tabs(tmp_path: Path) -> None:
             app.action_cycle_view_mode()
             await pilot.pause()
             assert app._view_mode is OverviewViewMode.DETAILS
+            assert app.query_one(OverviewView).has_class("-details-wide")
             assert store.load().overview_view_mode is OverviewViewMode.DETAILS
             app.action_cycle_view_mode()
             await pilot.pause()
@@ -74,6 +84,35 @@ async def test_app_boots_renders_and_cycles_tabs(tmp_path: Path) -> None:
     finally:
         supervisor.stop(timeout=10.0)
     assert not supervisor.is_alive()
+
+
+async def test_control_tab_forwards_relegated_controls(tmp_path: Path) -> None:
+    """The Control tab owns local pause, auto-start, and horde-maintenance controls."""
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    store.set_auto_start_worker(True)
+    store.record_onboarding_choice(OnboardingChoice.DECLINED)
+    fake = FakeSupervisor(alive=True)
+    fake.latest_snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Control", worker_version="0.0.0")
+    )
+    fake.last_liveness_wall_time = time.time()
+    app = HordeWorkerTUI(fake, config_path=Path("bridgeData.yaml"), app_state_store=store)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app.query_one("#main-tabs", TabbedContent).active = "tab-control"
+        app._tick()
+        await pilot.pause()
+
+        await pilot.click("#control-pause")
+        await pilot.pause()
+        await pilot.click("#control-autostart")
+        await pilot.pause()
+        await pilot.click("#control-maintenance")
+        await pilot.pause()
+
+    assert fake.pause_calls == 1
+    assert store.load().auto_start_worker is False
+    assert fake.server_maintenance == [True]
 
 
 @pytest.mark.e2e

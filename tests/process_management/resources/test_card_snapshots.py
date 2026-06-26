@@ -23,11 +23,11 @@ from tests.process_management.conftest import (
 )
 
 
-def test_protocol_version_is_9() -> None:
-    """The supervisor protocol is at v9 (per-card data landed at v8; feature readiness bumped it to v9)."""
-    assert SUPERVISOR_PROTOCOL_VERSION == 9
+def test_protocol_version_is_10() -> None:
+    """The supervisor protocol is at v10 (Overview intent/work-ledger data landed at v10)."""
+    assert SUPERVISOR_PROTOCOL_VERSION == 10
     snapshot = WorkerStateSnapshot(config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"))
-    assert snapshot.protocol_version == 9
+    assert snapshot.protocol_version == 10
     assert snapshot.per_card == []
 
 

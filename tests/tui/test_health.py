@@ -173,7 +173,7 @@ def test_pop_maintenance_mode_detail_is_specific_not_local_pause() -> None:
 
     There is a gap between when the pop loop first sees a maintenance-mode error and when the 15 s
     advisory poll confirms it. During that window maintenance_mode is True but worker_details_maintenance
-    is still False. The detail must not mislead the operator into thinking this is a local F2 pause.
+    is still False. The detail must not mislead the operator into thinking this is a local pause.
     """
     report = derive(
         _snapshot(

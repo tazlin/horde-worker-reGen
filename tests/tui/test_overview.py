@@ -16,6 +16,8 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WholeCardResidencyStatus,
     WorkerConfigSummary,
     WorkerStateSnapshot,
+    WorkLedgerEntry,
+    WorkLedgerStage,
 )
 from horde_worker_regen.process_management.models.feature_readiness import (
     FeatureReadiness,
@@ -200,21 +202,23 @@ def test_overview_shows_lora_pause_when_background_download_blocks_pops() -> Non
     assert OverviewView._allow_summary(snapshot) == "img2img, lora paused, controlnet, post"
 
 
-def test_process_table_shows_resolution_and_batch_by_default() -> None:
-    """The Size column surfaces the active job's resolution and batch without the detail toggle."""
+def test_process_table_keeps_process_owned_state() -> None:
+    """The process table focuses on slot/process attributes, not active job attributes."""
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
         processes=[_busy_process()],
     )
-    # Rendered wide enough to carry the WIDE Size column alongside the per-process GPU column.
     text = _render(OverviewView()._render_process_table(snapshot), width=200)
-    assert "832×1216 ×2" in text
-    # The lean view does not include the heartbeat-type column.
+    assert "Resident model" in text
+    assert "AlbedoBase XL" in text
+    assert "SDXL" in text
+    assert "832×1216" not in text
+    assert "7f3a1c9e" not in text
     assert "HB type" not in text
 
 
-def test_process_table_detailed_adds_technical_columns() -> None:
-    """The F6 detail view reveals per-job steps and heartbeat columns when the terminal is wide enough."""
+def test_process_table_detailed_adds_process_diagnostics() -> None:
+    """The F6 detail view reveals process heartbeat columns when the terminal is wide enough."""
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
         processes=[_busy_process()],
@@ -222,20 +226,20 @@ def test_process_table_detailed_adds_technical_columns() -> None:
     table = OverviewView()._render_process_table(snapshot, detailed=True, available_width=200)
     text = _render(table, width=200)
     assert "HB type" in text
-    assert "Steps" in text
+    assert "Heartbeat" in text
+    assert "Steps" not in text
 
 
 def test_process_table_sheds_to_essentials_on_narrow_terminal() -> None:
-    """At 80 columns the table keeps the essentials and sheds the richer columns to fit."""
+    """At 80 columns the table keeps process identity/state and sheds richer columns."""
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
         processes=[_busy_process()],
     )
     text = _render(OverviewView()._render_process_table(snapshot, available_width=80))
-    # Essentials survive...
-    assert "State" in text and "Progress" in text
-    # ...while the normal/wide columns and their data are shed to fit.
-    assert "Model" not in text
+    assert "State" in text
+    assert "Progress" not in text
+    assert "Resident model" not in text
     assert "GPU VRAM" not in text
     assert "832×1216" not in text
 
@@ -273,16 +277,32 @@ def test_process_table_residency_caption_wins_over_shed_hint() -> None:
     assert "more columns" not in text
 
 
-def test_process_table_shows_job_id_and_baseline() -> None:
-    """The process table names the active job (colour-coded id prefix) and the model's baseline."""
+def test_work_ledger_shows_job_id_progress_and_size() -> None:
+    """The work ledger owns active job details: id, progress, size, and intent."""
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
-        processes=[_busy_process()],
+        work_ledger=[
+            WorkLedgerEntry(
+                job_id="7f3a1c9e-4b2c-4d6e-8a1f-0c2b07d49abc",
+                stage=WorkLedgerStage.INFERENCE,
+                model="AlbedoBase XL",
+                baseline="stable_diffusion_xl",
+                process_id=1,
+                device_index=0,
+                progress_current=14,
+                progress_total=28,
+                width=832,
+                height=1216,
+                steps=28,
+                intent="sampling",
+            ),
+        ],
     )
-    text = _render(OverviewView()._render_process_table(snapshot))
-    # The colour-coded id shows its first UUID group, and the baseline its compact label.
+    text = _render(OverviewView()._render_work_ledger(snapshot, detailed=False, available_width=200), width=200)
     assert "7f3a1c9e" in text
-    assert "SDXL" in text
+    assert "14/28" in text
+    assert "832×1216" in text
+    assert "sampling" in text
 
 
 def test_queue_table_shows_job_id_and_baseline() -> None:

@@ -386,9 +386,9 @@ def _build_checks(
     alive = sum(1 for process in snapshot.processes if process.is_alive)
     total = len(snapshot.processes)
     if total and alive == total:
-        checks.append(HealthCheck("Processes", HealthStatus.OK, f"{alive}/{total} worker processes alive"))
+        checks.append(HealthCheck("Processes", HealthStatus.OK, f"{alive}/{total} processes alive"))
     elif total:
-        checks.append(HealthCheck("Processes", HealthStatus.WARN, f"{alive}/{total} worker processes alive"))
+        checks.append(HealthCheck("Processes", HealthStatus.WARN, f"{alive}/{total} processes alive"))
     else:
         checks.append(HealthCheck("Processes", HealthStatus.INFO, "No processes reported yet"))
 
@@ -425,7 +425,7 @@ def _build_checks(
             HealthCheck("Job health", HealthStatus.WARN, f"{snapshot.num_process_recoveries} process recover(ies)")
         )
     else:
-        checks.append(HealthCheck("Job health", HealthStatus.OK, "No recent failures or recoveries"))
+        checks.append(HealthCheck("Job health", HealthStatus.OK, "OK"))
 
     skips = summarize_skips(snapshot.last_pop_skipped_reasons)
     if skips:
@@ -455,7 +455,7 @@ def _residency_check(snapshot: WorkerStateSnapshot) -> HealthCheck | None:
         return HealthCheck(
             "Residency",
             HealthStatus.INFO,
-            "Heavy models (e.g. Flux) may briefly get sole use of the GPU; idle processes pause by design",
+            "Heavy models may briefly get sole use of the GPU",
         )
     return None
 

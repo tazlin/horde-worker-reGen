@@ -229,14 +229,14 @@ async def test_picker_selection_with_stopped_worker_holds_before_fetching(tmp_pa
         assert fake.download_requests[0].model_names == ["Missing A"]
 
 
-async def test_reload_config_key_reaches_the_worker(tmp_path: Path) -> None:
-    """Pressing F5 forwards a bridgeData reload request to the running worker."""
+async def test_reload_config_key_is_not_global_binding(tmp_path: Path) -> None:
+    """F5 no longer forwards a config reload; config changes flow through the Config tab."""
     fake, app = _make_app(tmp_path, auto_start=True)
     async with app.run_test(size=(140, 40)) as pilot:
         await pilot.pause()
         await pilot.press("f5")
         await pilot.pause()
-        assert fake.reload_config_calls == 1
+        assert fake.reload_config_calls == 0
 
 
 async def test_feature_readiness_panel_appears_when_the_worker_reports_it(tmp_path: Path) -> None:

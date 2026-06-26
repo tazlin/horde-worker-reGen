@@ -157,13 +157,13 @@ class DiagnosticsView(Vertical):
                 allow_blank=False,
                 id="diag-scope",
             )
+            yield Button("Run analysis", id="diag-run", variant="primary")
             yield Static(id="diag-controls-spacer")
             # The session selector and Run button form the right-hand cluster, set off from the scope
             # control by a divider so it reads as one group: pick a session to view, Run to (re)analyze.
             yield Rule(orientation="vertical", id="diag-divider")
             yield Label("Session", classes="diag-cap")
             yield Select((), prompt="run analysis to list sessions…", id="diag-session", allow_blank=True)
-            yield Button("Run analysis", id="diag-run", variant="primary")
         yield Static(id="diag-status")
         yield Static(id="diag-timing")
         yield LoadingIndicator(id="diag-loading")

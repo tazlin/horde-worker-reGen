@@ -76,7 +76,7 @@ class WorkerStartModal(ModalScreen[WorkerStartChoice]):
             (
                 "Starting the worker begins real work for the AI Horde: it spawns inference "
                 "processes and uses your GPU. It does not start automatically. You can start or "
-                "stop it any time with F3, and toggle auto-start with F4.",
+                "stop it any time with F3, and manage auto-start from the Control tab.",
                 "grey70",
             ),
         )

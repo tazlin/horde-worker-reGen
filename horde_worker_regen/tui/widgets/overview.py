@@ -11,10 +11,10 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import VerticalScroll
+from textual.containers import Container, Vertical, VerticalScroll
 from textual.widgets import Static
 
-from horde_worker_regen.app_state import OverviewViewMode
+from horde_worker_regen.app_state import OverviewTrendWindow, OverviewViewMode
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CardSnapshot,
     FeatureReadinessSummary,
@@ -23,6 +23,8 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RecentJobRecord,
     WholeCardResidencyStatus,
     WorkerStateSnapshot,
+    WorkLedgerEntry,
+    WorkLedgerStage,
 )
 from horde_worker_regen.process_management.lifecycle.process_temperature import (
     ProcessTemperature,
@@ -57,14 +59,25 @@ from horde_worker_regen.tui.responsive import (
 )
 from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
 
-_TREND_HISTORY = 180
-"""How many trend samples (GPU-duty / kudos-per-hour / job counts) the Trends region retains."""
+_TREND_HISTORY = 21600
+"""How many one-second trend samples the Trends region retains (up to roughly six hours)."""
 
 _TREND_SAMPLE_INTERVAL = 1.0
 """Minimum wall-clock seconds between recorded trend samples, so the window spans minutes not frames."""
 
-_TREND_SPARK_WIDTH = 40
-"""Maximum number of recent samples drawn in a Trends sparkline, keeping the line terminal-friendly."""
+_TREND_SPARK_WIDTH = 48
+"""Maximum number of samples drawn in a Trends sparkline, keeping the line terminal-friendly."""
+
+_TREND_WINDOW_SECONDS: dict[OverviewTrendWindow, float | None] = {
+    OverviewTrendWindow.FIVE_MINUTES: 5 * 60.0,
+    OverviewTrendWindow.FIFTEEN_MINUTES: 15 * 60.0,
+    OverviewTrendWindow.THIRTY_MINUTES: 30 * 60.0,
+    OverviewTrendWindow.SIXTY_MINUTES: 60 * 60.0,
+    OverviewTrendWindow.TWO_HOURS: 120 * 60.0,
+    OverviewTrendWindow.ALL: None,
+}
+_DETAIL_SIDE_BY_SIDE_MIN_WIDTH = 110
+"""Minimum Overview content width where detailed mode uses side-by-side row groups."""
 
 _SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "INFERENCE_POST_PROCESSING", "ALCHEMY_STARTING"})
 """States with a live sampling step/it-s; outside these the snapshot's step numbers are last-job residue."""
@@ -84,10 +97,65 @@ _STATIC_GLYPHS: dict[WorkerPhase, str] = {
 }
 
 
-class OverviewView(VerticalScroll):
+class OverviewView(Vertical):
     """A dashboard led by a living status hero and a health checklist."""
 
     DEFAULT_CSS = """
+    OverviewView #overview-body {
+        height: 1fr;
+    }
+    OverviewView .overview-row,
+    OverviewView .overview-grid {
+        height: auto;
+        width: 100%;
+        layout: vertical;
+    }
+    OverviewView .overview-row Static,
+    OverviewView .overview-grid Static {
+        height: auto;
+        width: 100%;
+    }
+    OverviewView #overview-workload-column {
+        height: auto;
+        width: 100%;
+        layout: vertical;
+    }
+    OverviewView.-details-wide #overview-core-grid {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 2fr 1fr;
+        grid-rows: auto;
+        grid-gutter: 0 1;
+    }
+    OverviewView.-details-wide #overview-core-grid Static,
+    OverviewView.-details-wide #overview-workload-column {
+        width: 100%;
+        height: auto;
+    }
+    OverviewView.-details-wide .overview-row {
+        layout: horizontal;
+        grid-gutter: 0 1;
+    }
+    OverviewView.-details-wide .overview-row Static {
+        width: 1fr;
+        height: auto;
+        margin: 0 1 0 0;
+    }
+    OverviewView.-details-wide #overview-ops-row {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr 1fr;
+        grid-rows: auto;
+        grid-gutter: 1 1;
+    }
+    OverviewView.-details-wide #overview-ops-row Static {
+        width: 100%;
+        height: auto;
+        margin: 0;
+    }
+    OverviewView.-details-wide #overview-worker {
+        row-span: 2;
+    }
     OverviewView #overview-residency {
         width: auto;
     }
@@ -95,16 +163,36 @@ class OverviewView(VerticalScroll):
         width: auto;
     }
     """
-    """The residency and alchemy boxes (non-expanding Panels) size to their content rather than the full
-    screen width, since their content is never wide enough to justify spanning the whole row."""
+    """Row containers stay vertical by default, then detailed mode opts into horizontal adjacency when the
+    current content width can support it."""
 
     def __init__(self) -> None:
         """Set up the view, including the client-side trend history for the Trends sparklines."""
         super().__init__()
-        self._gpu_duty_history: deque[float] = deque(maxlen=_TREND_HISTORY)
-        self._kudos_history: deque[float] = deque(maxlen=_TREND_HISTORY)
+        self._gpu_duty_history: deque[tuple[float, float]] = deque(maxlen=_TREND_HISTORY)
+        self._kudos_history: deque[tuple[float, float]] = deque(maxlen=_TREND_HISTORY)
         self._jobs_history: deque[tuple[float, int]] = deque(maxlen=_TREND_HISTORY)
         self._last_trend_sample = 0.0
+        self._trend_window = OverviewTrendWindow.FIFTEEN_MINUTES
+        self._trend_epoch = time.time()
+        self._trend_notice: str | None = None
+
+    def set_trend_window(self, window: OverviewTrendWindow) -> None:
+        """Set the rendered trend window without discarding the session sample buffers."""
+        self._trend_window = window
+
+    def trend_window(self) -> OverviewTrendWindow:
+        """Return the current trend window."""
+        return self._trend_window
+
+    def soft_reset_trends(self, *, notice: str = "Trends soft-reset; waiting for fresh samples.") -> None:
+        """Start a new trend epoch while retaining older session samples for All-mode context."""
+        self._trend_epoch = time.time()
+        self._trend_notice = notice
+
+    def note_config_changed(self) -> None:
+        """Mark trend output as stabilizing after a capacity/workload-affecting config change."""
+        self.soft_reset_trends(notice="Config changed; trends may take time to restabilize.")
 
     def compose(self) -> ComposeResult:
         """Lay out the compact bar plus the hero, health, trends, pipeline, and detail tables.
@@ -115,22 +203,31 @@ class OverviewView(VerticalScroll):
         """
         yield Static(id="overview-thin")
         yield Static(id="overview-hero")
-        yield Static(id="overview-health")
-        yield Static(id="overview-gpus")
-        yield Static(id="overview-trends")
-        yield Static(id="overview-pipeline")
-        yield Static(id="overview-processes")
-        yield Static(id="overview-residency")
-        yield Static(id="overview-worker")
-        yield Static(id="overview-alchemy")
-        yield Static(id="overview-queue")
-        yield Static(id="overview-recent")
+        with VerticalScroll(id="overview-body"):
+            with Container(id="overview-core-grid", classes="overview-grid"):
+                yield Static(id="overview-health")
+                with Container(id="overview-workload-column"):
+                    yield Static(id="overview-gpus")
+                    yield Static(id="overview-pipeline")
+                    yield Static(id="overview-intent")
+                yield Static(id="overview-trends")
+            yield Static(id="overview-queue")
+            yield Static(id="overview-work")
+            yield Static(id="overview-processes")
+            with Container(id="overview-ops-row", classes="overview-row"):
+                yield Static(id="overview-worker")
+                yield Static(id="overview-alchemy")
+                yield Static(id="overview-residency")
+            with Container(id="overview-history-row", classes="overview-row"):
+                yield Static(id="overview-recent")
 
     _NORMAL_NODE_IDS = (
         "#overview-hero",
         "#overview-health",
+        "#overview-intent",
         "#overview-trends",
         "#overview-pipeline",
+        "#overview-work",
         "#overview-processes",
     )
     """Statics shown in normal (and details) mode, hidden in thin mode."""
@@ -143,6 +240,12 @@ class OverviewView(VerticalScroll):
     )
     """Statics shown only in details mode (the demoted panels)."""
 
+    _NORMAL_ROW_IDS = ("#overview-core-grid", "#overview-body")
+    """Row containers shown in normal/details mode, hidden in thin mode."""
+
+    _DETAIL_ROW_IDS = ("#overview-ops-row", "#overview-history-row")
+    """Row containers shown only in details mode."""
+
     def update_view(
         self,
         report: HealthReport,
@@ -150,12 +253,23 @@ class OverviewView(VerticalScroll):
         *,
         frame: int,
         mode: OverviewViewMode = OverviewViewMode.NORMAL,
+        trend_window: OverviewTrendWindow | None = None,
     ) -> None:
         """Refresh the visible regions for the active view ``mode`` from the report and snapshot."""
+        if trend_window is not None:
+            self.set_trend_window(trend_window)
         thin = mode is OverviewViewMode.THIN
         detailed = mode is OverviewViewMode.DETAILS
+        # The laid-out content width drives both row adjacency and column shedding. It is 0 before the
+        # first layout pass, where None disables shedding so the first frame renders fully.
+        width = self.content_size.width or None
+        self.set_class(detailed and width is not None and width >= _DETAIL_SIDE_BY_SIDE_MIN_WIDTH, "-details-wide")
 
         self.query_one("#overview-thin", Static).display = thin
+        for row_id in self._NORMAL_ROW_IDS:
+            self.query_one(row_id).display = not thin
+        for row_id in self._DETAIL_ROW_IDS:
+            self.query_one(row_id).display = detailed
         for node_id in self._NORMAL_NODE_IDS:
             self.query_one(node_id, Static).display = not thin
         for node_id in self._DETAIL_NODE_IDS:
@@ -179,19 +293,19 @@ class OverviewView(VerticalScroll):
             self.query_one("#overview-thin", Static).update(self._render_compact_bar(report, snapshot, frame))
             return
 
-        # The laid-out content width drives column shedding; it is 0 before the first layout pass, where
-        # None disables shedding so the very first frame shows the full table rather than collapsing it.
-        width = self.content_size.width or None
-
         self.query_one("#overview-hero", Static).update(self._render_hero(report, snapshot, frame))
         self.query_one("#overview-health", Static).update(
             self._render_health(report, snapshot.feature_readiness if snapshot is not None else None),
         )
         if snapshot is not None:
+            self.query_one("#overview-intent", Static).update(self._render_intent(snapshot, detailed=detailed))
             if show_gpus:
                 self.query_one("#overview-gpus", Static).update(self._render_gpus_strip(snapshot, detailed=detailed))
             self.query_one("#overview-trends", Static).update(self._render_trends(snapshot))
             self.query_one("#overview-pipeline", Static).update(self._render_pipeline_strip(snapshot))
+            self.query_one("#overview-work", Static).update(
+                self._render_work_ledger(snapshot, detailed=detailed, available_width=width),
+            )
             self.query_one("#overview-processes", Static).update(
                 self._render_process_table(snapshot, detailed=detailed, available_width=width),
             )
@@ -218,12 +332,27 @@ class OverviewView(VerticalScroll):
         self._record_trends(snapshot)
 
     def _record_trends(self, snapshot: WorkerStateSnapshot) -> None:
-        """Append one sample of GPU-duty, kudos/hr, and the cumulative job counter to the buffers."""
+        """Append one timestamped sample of GPU-duty, kudos/hr, and the cumulative job counter."""
+        now = time.time()
         if snapshot.gpu_utilization_mean_percent is not None:
-            self._gpu_duty_history.append(snapshot.gpu_utilization_mean_percent)
+            self._gpu_duty_history.append((now, snapshot.gpu_utilization_mean_percent))
         if snapshot.kudos_per_hour is not None:
-            self._kudos_history.append(snapshot.kudos_per_hour)
-        self._jobs_history.append((time.time(), snapshot.num_jobs_submitted))
+            self._kudos_history.append((now, snapshot.kudos_per_hour))
+        self._jobs_history.append((now, snapshot.num_jobs_submitted))
+
+    def _windowed_float_series(self, samples: deque[tuple[float, float]]) -> list[float]:
+        """Return values in the active trend window and epoch."""
+        window_seconds = _TREND_WINDOW_SECONDS[self._trend_window]
+        now = time.time()
+        start = self._trend_epoch if window_seconds is None else max(self._trend_epoch, now - window_seconds)
+        return [value for timestamp, value in samples if timestamp >= start]
+
+    def _windowed_job_samples(self) -> list[tuple[float, int]]:
+        """Return job-counter samples in the active trend window and epoch."""
+        window_seconds = _TREND_WINDOW_SECONDS[self._trend_window]
+        now = time.time()
+        start = self._trend_epoch if window_seconds is None else max(self._trend_epoch, now - window_seconds)
+        return [(timestamp, count) for timestamp, count in self._jobs_history if timestamp >= start]
 
     def _hero_glyph(self, report: HealthReport, frame: int) -> Text:
         """A status glyph that pulses/spins for in-progress or attention states."""
@@ -648,6 +777,120 @@ class OverviewView(VerticalScroll):
         border = "green" if total_active > 0 else ("yellow" if not config.alchemy_concurrent else "grey37")
         return Panel(table, title="Alchemy", title_align="left", border_style=border, padding=(0, 1))
 
+    @staticmethod
+    def _render_intent(snapshot: WorkerStateSnapshot, *, detailed: bool) -> Panel:
+        """Render the Now / Next / Why orchestration strip."""
+        intent = snapshot.orchestration_intent
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(justify="right", style="bold cyan", no_wrap=True)
+        grid.add_column()
+        grid.add_row("Now", Text(intent.summary, style="bold"))
+        if intent.next_action:
+            grid.add_row("Next", Text(intent.next_action, style="grey70"))
+        if intent.why:
+            grid.add_row("Why", Text(intent.why, style="yellow" if "blocked" in intent.why.lower() else "grey70"))
+        if detailed and intent.raw_gate:
+            grid.add_row("Gate", Text(intent.raw_gate, style="grey62"))
+        target_parts = []
+        if intent.target_job_id:
+            target_parts.append(f"job {intent.target_job_id[:8]}")
+        if intent.target_model:
+            target_parts.append(shorten(intent.target_model, 32))
+        if intent.target_process_id is not None:
+            target_parts.append(f"proc {intent.target_process_id}")
+        if detailed and intent.target_device_index is not None:
+            target_parts.append(f"gpu {intent.target_device_index}")
+        if target_parts:
+            grid.add_row("Target", Text(" · ".join(target_parts), style="grey62"))
+        return Panel(grid, title="Now / Next / Why", title_align="left", border_style="cyan", padding=(0, 1))
+
+    @staticmethod
+    def _work_stage_cell(entry: WorkLedgerEntry) -> Text:
+        """Render a work-ledger stage with stable color semantics."""
+        style = {
+            WorkLedgerStage.QUEUED: "cyan",
+            WorkLedgerStage.PREPARING: "yellow",
+            WorkLedgerStage.INFERENCE: "green",
+            WorkLedgerStage.SAFETY: "magenta",
+            WorkLedgerStage.SUBMIT: "blue",
+            WorkLedgerStage.COMPLETED: "grey70",
+            WorkLedgerStage.FAULTED: "red",
+        }.get(entry.stage, "grey62")
+        return Text(entry.stage.value, style=style)
+
+    @staticmethod
+    def _work_model_cell(entry: WorkLedgerEntry) -> Text:
+        """Render model plus baseline in one compact job-owned cell."""
+        model = shorten(entry.model, 24) if entry.model else "-"
+        baseline = short_baseline(entry.baseline)
+        if baseline == "-":
+            return Text(model)
+        return Text.assemble((model, ""), (f" · {baseline}", "grey50"))
+
+    @staticmethod
+    def _work_progress_cell(entry: WorkLedgerEntry) -> Text:
+        """Render active job progress, or timing for completed work."""
+        if entry.progress_total:
+            current = entry.progress_current or 0
+            fraction = current / entry.progress_total
+            return Text.assemble((mini_bar(fraction, 8), "green"), (f" {current}/{entry.progress_total}", "grey62"))
+        if entry.e2e_seconds is not None:
+            return Text(human_duration(entry.e2e_seconds), style="grey62")
+        return Text("-", style="grey50")
+
+    @staticmethod
+    def _work_size_cell(entry: WorkLedgerEntry) -> str:
+        """Render a job's resolution and steps."""
+        size = f"{entry.width}×{entry.height}" if entry.width and entry.height else "-"
+        if entry.steps:
+            return f"{size} · {entry.steps}s"
+        return size
+
+    @staticmethod
+    def _work_age_cell(entry: WorkLedgerEntry) -> str:
+        """Render the active stage age or the recent job's end-to-end time."""
+        if entry.age_seconds is not None:
+            return human_duration(entry.age_seconds)
+        if entry.e2e_seconds is not None:
+            return human_duration(entry.e2e_seconds)
+        return "-"
+
+    @staticmethod
+    def _work_features_cell(entry: WorkLedgerEntry) -> str:
+        """Render compact feature tags for a work-ledger entry."""
+        return ", ".join(entry.features.as_tags()) if entry.features is not None else "-"
+
+    def _render_work_ledger(
+        self,
+        snapshot: WorkerStateSnapshot,
+        *,
+        detailed: bool,
+        available_width: int | None = None,
+    ) -> Panel:
+        """Render active and recent job-owned state separately from process-owned state."""
+        layout = select_columns(
+            _WORK_LEDGER_COLUMNS,
+            ceiling=intent_ceiling(detailed),
+            available_width=available_width,
+        )
+        table = Table(title="", expand=True, border_style="grey37", header_style="bold", show_header=True)
+        add_columns(table, layout.columns)
+        if not snapshot.work_ledger:
+            table.add_row(*placeholder_row(layout.columns, "Stage", "no active or recent work"))
+        else:
+            for entry in snapshot.work_ledger:
+                table.add_row(*[spec.render(entry) for spec in layout.columns])
+        subtitle = shed_hint(layout)
+        return Panel(
+            table,
+            title="Work ledger",
+            title_align="left",
+            subtitle=Text(subtitle, style="grey50") if subtitle else None,
+            subtitle_align="right",
+            border_style="green" if snapshot.work_ledger else "grey37",
+            padding=(0, 1),
+        )
+
     _PIPELINE_BAR_WIDTH = 8
     """Maximum block-bar width (chars) for one job-pipeline stage; bars scale to the busiest stage."""
 
@@ -791,8 +1034,8 @@ class OverviewView(VerticalScroll):
         window start, and the GPU row adds a duty bar so "how much of the time it is working" reads
         at a glance alongside the over-time shape.
         """
-        kudos_series = list(self._kudos_history)[-_TREND_SPARK_WIDTH:]
-        gpu_series = list(self._gpu_duty_history)[-_TREND_SPARK_WIDTH:]
+        kudos_series = self._windowed_float_series(self._kudos_history)[-_TREND_SPARK_WIDTH:]
+        gpu_series = self._windowed_float_series(self._gpu_duty_history)[-_TREND_SPARK_WIDTH:]
         rate, jobs_deltas = self._jobs_per_hour()
         jobs_deltas = jobs_deltas[-_TREND_SPARK_WIDTH:]
 
@@ -846,11 +1089,12 @@ class OverviewView(VerticalScroll):
         )
 
     def _trend_window_label(self) -> str:
-        """Describe the span the trend buffers currently cover (e.g. ``last 3m 20s``)."""
-        samples = list(self._jobs_history)
+        """Describe the configured and actual span the trend buffers currently cover."""
+        samples = self._windowed_job_samples()
+        label = "All" if self._trend_window is OverviewTrendWindow.ALL else self._trend_window.value
         if len(samples) < 2:
-            return "warming up"
-        return f"last {human_duration(samples[-1][0] - samples[0][0])}"
+            return f"{label} window · warming up"
+        return f"{label} window · {human_duration(samples[-1][0] - samples[0][0])} sampled"
 
     def _render_compact_bar(
         self,
@@ -884,7 +1128,7 @@ class OverviewView(VerticalScroll):
         line = Text.assemble(*parts)
         line.append_text(Text.assemble(sep, (f"{snapshot.num_jobs_submitted:,}", "bold"), (" done", "grey50")))
         line.append_text(Text.assemble(sep, (kudos, "bold cyan"), ("/h ", "grey50")))
-        line.append_text(self._trend_arrow(list(self._kudos_history)[-_TREND_SPARK_WIDTH:]))
+        line.append_text(self._trend_arrow(self._windowed_float_series(self._kudos_history)[-_TREND_SPARK_WIDTH:]))
         gpu_pct = format_percent(snapshot.gpu_utilization_mean_percent)
         line.append_text(Text.assemble((" gpu ", "grey50"), (gpu_pct, "")))
         if busy_fraction is not None:
@@ -1182,25 +1426,47 @@ def _heartbeat_age(row: _ProcessRow) -> float | None:
     return row.now - timestamp if timestamp else None
 
 
+_WORK_LEDGER_COLUMNS: list[ColumnSpec[WorkLedgerEntry]] = [
+    ColumnSpec("Stage", DensityTier.ESSENTIAL, OverviewView._work_stage_cell, width=9, no_wrap=True),
+    ColumnSpec("Job", DensityTier.ESSENTIAL, lambda e: job_id_text(e.job_id), width=8, no_wrap=True),
+    ColumnSpec("Model", DensityTier.ESSENTIAL, OverviewView._work_model_cell, min_width=18, no_wrap=True),
+    ColumnSpec("Progress", DensityTier.ESSENTIAL, OverviewView._work_progress_cell, width=12, no_wrap=True),
+    ColumnSpec("Intent", DensityTier.NORMAL, lambda e: shorten(e.intent, 28) if e.intent else "-", min_width=16),
+    ColumnSpec(
+        "Proc/GPU",
+        DensityTier.NORMAL,
+        lambda e: (
+            "-"
+            if e.process_id is None
+            else f"{e.process_id}" + (f"/g{e.device_index}" if e.device_index is not None else "")
+        ),
+        width=8,
+        no_wrap=True,
+    ),
+    ColumnSpec("Size", DensityTier.WIDE, OverviewView._work_size_cell, width=15, no_wrap=True),
+    ColumnSpec("it/s", DensityTier.WIDE, lambda e: format_its(e.iterations_per_second), justify="right", width=6),
+    ColumnSpec("Age", DensityTier.WIDE, OverviewView._work_age_cell, justify="right", width=8),
+    ColumnSpec("Features", DensityTier.DETAILS, OverviewView._work_features_cell, min_width=10, no_wrap=True),
+    ColumnSpec(
+        "Reason",
+        DensityTier.DETAILS,
+        lambda e: shorten(e.raw_reason, 32) if e.raw_reason else "-",
+        min_width=16,
+    ),
+]
+"""The work-ledger columns, tagged by the density tier at which each appears."""
+
 _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
     ColumnSpec("ID", DensityTier.ESSENTIAL, lambda r: str(r.process.process_id), justify="right", width=3),
     ColumnSpec("Type", DensityTier.ESSENTIAL, lambda r: r.process.process_type.title(), width=9),
-    ColumnSpec("GPU", DensityTier.NORMAL, lambda r: str(r.process.device_index), justify="right", width=4),
     ColumnSpec("State", DensityTier.ESSENTIAL, OverviewView._process_state_cell, width=18, no_wrap=True),
-    ColumnSpec("Job", DensityTier.ESSENTIAL, lambda r: job_id_text(r.process.current_job_id), width=8, no_wrap=True),
+    ColumnSpec("GPU", DensityTier.NORMAL, lambda r: str(r.process.device_index), justify="right", width=4),
     ColumnSpec(
-        "Progress",
-        DensityTier.ESSENTIAL,
-        lambda r: OverviewView._progress_cell(r.process),
-        width=12,
-        no_wrap=True,
-    ),
-    ColumnSpec(
-        "Model",
+        "Resident model",
         DensityTier.NORMAL,
-        lambda r: shorten(r.process.loaded_horde_model_name, 22),
-        min_width=14,
-        max_width=22,
+        lambda r: shorten(r.process.loaded_horde_model_name, 24),
+        min_width=16,
+        max_width=24,
         no_wrap=True,
     ),
     ColumnSpec(
@@ -1212,28 +1478,6 @@ _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
     ),
     ColumnSpec("Done", DensityTier.NORMAL, lambda r: f"{r.process.num_jobs_completed:,}", justify="right", width=5),
     ColumnSpec(
-        "Features",
-        DensityTier.WIDE,
-        lambda r: OverviewView._features_cell(r.process),
-        min_width=10,
-        no_wrap=True,
-    ),
-    ColumnSpec(
-        "Size",
-        DensityTier.WIDE,
-        lambda r: OverviewView._size_cell(r.process),
-        justify="right",
-        width=11,
-        no_wrap=True,
-    ),
-    ColumnSpec(
-        "it/s",
-        DensityTier.WIDE,
-        lambda r: format_its(r.process.last_iterations_per_second),
-        justify="right",
-        width=6,
-    ),
-    ColumnSpec(
         "GPU VRAM",
         DensityTier.WIDE,
         lambda r: OverviewView._vram_cell(r.process),
@@ -1242,11 +1486,12 @@ _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
         no_wrap=True,
     ),
     ColumnSpec(
-        "Steps",
-        DensityTier.DETAILS,
-        lambda r: str(r.process.current_job_steps) if r.process.current_job_steps else "-",
+        "RAM peak",
+        DensityTier.WIDE,
+        lambda r: human_mb(r.process.ram_used_high_water_mb) if r.process.ram_used_high_water_mb else "-",
         justify="right",
-        width=6,
+        width=9,
+        no_wrap=True,
     ),
     ColumnSpec(
         "Heartbeat",

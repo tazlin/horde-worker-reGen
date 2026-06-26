@@ -420,6 +420,10 @@ class JobTracker:
         tracked = self._tracked_by_id(job_id)
         return tracked.stage if tracked is not None else None
 
+    def tracked_jobs(self) -> tuple[TrackedJob, ...]:
+        """Return active tracked jobs in lifecycle order for read-only observers."""
+        return tuple(sorted(self._jobs.values(), key=lambda tracked: (tracked.stage_sequence, tracked.pop_order)))
+
     def stage_age_summary(self, *, now: float | None = None) -> dict[JobStage, tuple[int, float]]:
         """Return per-stage ``(count, oldest_age_seconds)`` for every non-empty stage.
 
