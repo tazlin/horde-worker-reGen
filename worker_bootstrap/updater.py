@@ -114,6 +114,23 @@ def _read_install_info(root: Path) -> dict[str, str]:
     return info
 
 
+def write_repo_to_install_info(root: Path, repo: str) -> None:
+    """Persist *repo* as the update origin in bin/install-info, preserving any other recorded keys.
+
+    Called by the ``update --repo`` path so that subsequent plain ``update`` runs keep pulling from
+    the same place without requiring the flag every time. Best-effort: a write failure is swallowed
+    so a failed persist never aborts an otherwise successful update.
+    """
+    info = _read_install_info(root)
+    info["repo"] = repo
+    path = paths.install_info_file(root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(f"{k}={v}\n" for k, v in info.items()), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def resolve_update_repo(root: Path | None = None) -> str:
     """Return the ``owner/repo`` to pull releases from (env override > install marker > default).
 

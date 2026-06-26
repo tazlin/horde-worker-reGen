@@ -465,8 +465,10 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
     intent to update now). It refuses to overlay an install whose updates are owned elsewhere (winget, a
     git checkout), but ``--check`` still reports availability for those.
     """
+    repo_override: str | None = getattr(args, "repo", None) or None
+
     if args.check:
-        info = updater.check_for_update(root)
+        info = updater.check_for_update(root, repo=repo_override)
         channel_note = " (beta channel)" if info.channel == "beta" else ""
         if info.latest is None:
             print("Could not determine the latest version (the update check failed).", file=sys.stderr)
@@ -484,13 +486,23 @@ def _cmd_update(args: argparse.Namespace, root: Path, uv: str) -> int:
         print(reason, file=sys.stderr)
         return 1
 
-    info = updater.check_for_update(root)
+    info = updater.check_for_update(root, repo=repo_override)
     channel_note = " (beta channel)" if info.channel == "beta" else ""
     if info.latest is None:
         print("Could not check for updates; leaving the current install unchanged.", file=sys.stderr)
         return 1
+
+    # Persist a --repo override as soon as the repo proves reachable (info.latest is not None), whether or
+    # not an update is actually available. This covers the "switch to official channel" case where both repos
+    # are at the same version: the user still wants future plain `update` runs to use the new origin.
+    if repo_override:
+        updater.write_repo_to_install_info(root, repo_override)
+
     if not info.available:
-        print(f"Already up to date ({info.current}){channel_note}.")
+        msg = f"Already up to date ({info.current}){channel_note}."
+        if repo_override:
+            msg += f" Update origin set to {repo_override}."
+        print(msg)
         return 0
 
     if not args.yes and consent.is_interactive():
@@ -664,6 +676,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_update = sub.add_parser("update", help="Update the worker to the latest release in place, then re-sync.")
     p_update.add_argument("--check", action="store_true", help="Only report whether an update is available.")
     p_update.add_argument("--yes", action="store_true", help="Apply without prompting (for non-interactive use).")
+    p_update.add_argument(
+        "--repo",
+        default=None,
+        metavar="OWNER/REPO",
+        help=(
+            "Pull releases from this repo instead of the recorded origin (env: HORDE_WORKER_UPDATE_REPO). "
+            "Persisted to bin/install-info on a successful check so future updates use the same origin "
+            "without the flag. Use this to switch from a beta fork to the official release channel or "
+            "vice versa (e.g. --repo Haidra-Org/horde-worker-reGen)."
+        ),
+    )
 
     return parser
 

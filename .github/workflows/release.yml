@@ -157,7 +157,7 @@ jobs:
           $iscc = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe","${env:ProgramFiles}\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue |
                   Sort-Object { $_.Directory.Name } -Descending | Select-Object -First 1 -ExpandProperty FullName
           if (-not $iscc) { throw 'ISCC.exe not found after installing Inno Setup' }
-          & $iscc 'packaging\inno\HordeWorker.iss' "/DStageDir=$stage" "/DMyAppVersion=$version" "/O$out"
+          & $iscc 'packaging\inno\HordeWorker.iss' "/DStageDir=$stage" "/DMyAppVersion=$version" "/DRepo=$env:GITHUB_REPOSITORY" "/O$out"
           if (-not (Test-Path (Join-Path $out 'HordeWorker-Setup.exe'))) {
             throw 'ISCC did not produce HordeWorker-Setup.exe'
           }
