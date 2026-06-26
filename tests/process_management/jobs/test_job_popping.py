@@ -1034,6 +1034,7 @@ class TestApiJobPopFullFlow:
         await popper.api_job_pop()
 
         assert popper._state.last_pop_maintenance_mode is False  # pyrefly: ignore - "always true" is wrong, api_job_pop() should mutate
+        assert popper._state.server_maintenance_cleared_by_job_pop is True
 
     @_full_flow_patches
     async def test_successful_pop_resets_throttler_to_default(self, _mock_req_cls: Mock) -> None:
@@ -1062,6 +1063,23 @@ class TestApiJobPopFullFlow:
 
         assert popper._state.last_pop_no_jobs_available is True
         assert len(popper._job_tracker.jobs_pending_inference) == 0
+
+    @_full_flow_patches
+    async def test_no_job_available_does_not_clear_maintenance_latch(self, _mock_req_cls: Mock) -> None:
+        """Only a real popped job proves horde maintenance is off; an empty response does not."""
+        empty_response = Mock()
+        empty_response.id_ = None
+        empty_response.skipped = Mock()
+        empty_response.skipped.model_dump.return_value = {}
+        empty_response.skipped.model_extra = None
+        empty_response.messages = None
+        state = WorkerState(last_job_pop_time=0.0, last_pop_maintenance_mode=True)
+        popper = self._make_ready_popper(api_response=empty_response, state=state)
+
+        await popper.api_job_pop()
+
+        assert popper._state.last_pop_maintenance_mode is True
+        assert popper._state.server_maintenance_cleared_by_job_pop is False
 
     @_full_flow_patches
     async def test_api_exception_slows_throttler(self, _mock_req_cls: Mock) -> None:

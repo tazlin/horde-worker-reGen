@@ -25,6 +25,8 @@ class WorkerState:
     last_job_pop_time: float = 0.0
     last_pop_no_jobs_available: bool = False
     last_pop_maintenance_mode: bool = False
+    server_maintenance_cleared_by_job_pop: bool = False
+    """A real popped job proved the horde is sending work again, even if worker-details polling is stale."""
     last_pop_skipped_reasons: dict[str, int] = dataclasses.field(default_factory=dict)
     """Why the last 'no job available' pop skipped work, per reason (models/nsfw/max_pixels/...).
 

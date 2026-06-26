@@ -198,3 +198,43 @@ class TestSnapshotMaintenanceFields:
         assert snapshot.supervisor_paused is False
         assert snapshot.last_pop_maintenance_mode is False
         assert snapshot.maintenance_mode is False
+
+
+class TestWorkerDetailsMaintenanceRefresh:
+    """Worker-details maintenance is advisory and can be stale behind successful pops."""
+
+    async def test_successful_job_pop_suppresses_stale_worker_details_maintenance(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A new popped job is stronger evidence than a stale worker-details maintenance=True poll."""
+        manager = make_testable_process_manager()
+        manager._state.server_maintenance_cleared_by_job_pop = True
+        monkeypatch.setattr(
+            manager,
+            "_fetch_worker_details",
+            lambda _worker_name: Mock(maintenance_mode=True, paused=False),
+        )
+
+        await manager.api_get_worker_details()
+
+        assert manager._worker_details_maintenance is False
+        assert manager._state.server_maintenance_cleared_by_job_pop is True
+
+    async def test_worker_details_maintenance_false_reconciles_successful_pop_signal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Once the advisory poll catches up to maintenance=False, the stale-poll suppression resets."""
+        manager = make_testable_process_manager()
+        manager._state.server_maintenance_cleared_by_job_pop = True
+        monkeypatch.setattr(
+            manager,
+            "_fetch_worker_details",
+            lambda _worker_name: Mock(maintenance_mode=False, paused=False),
+        )
+
+        await manager.api_get_worker_details()
+
+        assert manager._worker_details_maintenance is False
+        assert manager._state.server_maintenance_cleared_by_job_pop is False

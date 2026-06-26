@@ -536,6 +536,7 @@ class JobPopper:
                 logger.warning(f"Failed to pop job (Maintenance Mode): {response}")
                 MaintenanceModeMessenger.print_maintenance_mode_messages()
                 self._state.last_pop_maintenance_mode = True
+                self._state.server_maintenance_cleared_by_job_pop = False
         elif "we cannot accept workers serving" in message_lower:
             logger.warning(f"Failed to pop job (Unrecognized Model): {response}")
             logger.error(
@@ -825,8 +826,6 @@ class JobPopper:
             self._pop_throttler.on_pop_error()
             return
 
-        self._state.last_pop_maintenance_mode = False
-        self._replaced_due_to_maintenance = False
         self._pop_throttler.on_pop_success()
 
         info_string = "No job available. "
@@ -855,6 +854,11 @@ class JobPopper:
             )
             return
 
+        if self._state.last_pop_maintenance_mode:
+            logger.info("Clearing horde maintenance latch: a new job was popped successfully.")
+            self._state.server_maintenance_cleared_by_job_pop = True
+        self._state.last_pop_maintenance_mode = False
+        self._replaced_due_to_maintenance = False
         self._state.last_pop_no_jobs_available = False
         self._state.last_pop_skipped_reasons = {}
         self._pop_throttler.on_job_popped()

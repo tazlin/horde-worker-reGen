@@ -11,6 +11,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     DownloadStatusSnapshot,
     FeatureReadinessSummary,
     JobQueueEntry,
+    OrchestrationIntentSnapshot,
     ProcessSnapshot,
     SystemMemorySnapshot,
     WholeCardResidencyStatus,
@@ -277,6 +278,79 @@ def test_process_table_residency_caption_wins_over_shed_hint() -> None:
     assert "more columns" not in text
 
 
+def test_intent_hides_why_when_it_duplicates_detailed_gate() -> None:
+    """The detailed intent panel should not repeat identical Why and Gate text."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        orchestration_intent=OrchestrationIntentSnapshot(
+            summary="Waiting for dispatch.",
+            why="blocked by full queue",
+            raw_gate="blocked by full queue",
+        ),
+    )
+
+    text = _render(OverviewView._render_intent(snapshot, detailed=True))
+
+    assert "Gate" in text
+    assert "blocked by full queue" in text
+    assert " Why  " not in text
+
+
+def test_intent_keeps_duplicate_why_in_normal_mode_where_gate_is_hidden() -> None:
+    """Normal mode keeps Why when Gate would not be rendered anyway."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        orchestration_intent=OrchestrationIntentSnapshot(
+            summary="Waiting for dispatch.",
+            why="blocked by full queue",
+            raw_gate="blocked by full queue",
+        ),
+    )
+
+    text = _render(OverviewView._render_intent(snapshot, detailed=False))
+
+    assert "Why" in text
+    assert "blocked by full queue" in text
+    assert "Gate" not in text
+
+
+def test_intent_keeps_why_when_gate_differs() -> None:
+    """Different Why and Gate values both remain visible in detailed mode."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        orchestration_intent=OrchestrationIntentSnapshot(
+            summary="Waiting for dispatch.",
+            why="queue is full",
+            raw_gate="no free process",
+        ),
+    )
+
+    text = _render(OverviewView._render_intent(snapshot, detailed=True))
+
+    assert "Why" in text
+    assert "queue is full" in text
+    assert "Gate" in text
+    assert "no free process" in text
+
+
+def test_alchemy_panel_visibility_tracks_enabled_or_active_alchemy() -> None:
+    """Normal mode can show alchemy when it is configured or currently carrying forms."""
+    disabled = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0", alchemist=False),
+    )
+    enabled = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0", alchemist=True),
+    )
+    active = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0", alchemist=False),
+        alchemy_forms_in_flight=1,
+    )
+
+    assert OverviewView._show_alchemy_panel(disabled) is False
+    assert OverviewView._show_alchemy_panel(enabled) is True
+    assert OverviewView._show_alchemy_panel(active) is True
+
+
 def test_work_ledger_shows_job_id_progress_and_size() -> None:
     """The work ledger owns active job details: id, progress, size, and intent."""
     snapshot = WorkerStateSnapshot(
@@ -303,6 +377,51 @@ def test_work_ledger_shows_job_id_progress_and_size() -> None:
     assert "14/28" in text
     assert "832×1216" in text
     assert "sampling" in text
+
+
+def test_work_ledger_can_summarize_recent_jobs_without_hiding_active_work() -> None:
+    """The recent-job toggle hides terminal rows but keeps in-progress rows and a compact count."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        work_ledger=[
+            WorkLedgerEntry(
+                job_id="active-job-1234",
+                stage=WorkLedgerStage.INFERENCE,
+                model="AlbedoBase XL",
+                progress_current=7,
+                progress_total=28,
+                intent="sampling",
+            ),
+            WorkLedgerEntry(
+                job_id="done-job-1234",
+                stage=WorkLedgerStage.COMPLETED,
+                model="Deliberate",
+                e2e_seconds=12.0,
+            ),
+            WorkLedgerEntry(
+                job_id="fault-job-1234",
+                stage=WorkLedgerStage.FAULTED,
+                model="BrokenModel",
+                faulted=True,
+            ),
+        ],
+    )
+
+    text = _render(
+        OverviewView()._render_work_ledger(
+            snapshot,
+            detailed=False,
+            available_width=200,
+            show_recent_jobs=False,
+        ),
+        width=200,
+    )
+
+    assert "AlbedoBase XL" in text
+    assert "7/28" in text
+    assert "Deliberate" not in text
+    assert "BrokenModel" not in text
+    assert "1 job completed recently; 1 faulted" in text
 
 
 def test_queue_table_shows_job_id_and_baseline() -> None:

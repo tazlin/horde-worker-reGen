@@ -233,8 +233,6 @@ class OverviewView(Vertical):
     """Statics shown in normal (and details) mode, hidden in thin mode."""
 
     _DETAIL_NODE_IDS = (
-        "#overview-worker",
-        "#overview-alchemy",
         "#overview-queue",
         "#overview-recent",
     )
@@ -243,7 +241,7 @@ class OverviewView(Vertical):
     _NORMAL_ROW_IDS = ("#overview-core-grid", "#overview-body")
     """Row containers shown in normal/details mode, hidden in thin mode."""
 
-    _DETAIL_ROW_IDS = ("#overview-ops-row", "#overview-history-row")
+    _DETAIL_ROW_IDS = ("#overview-history-row",)
     """Row containers shown only in details mode."""
 
     def update_view(
@@ -254,6 +252,7 @@ class OverviewView(Vertical):
         frame: int,
         mode: OverviewViewMode = OverviewViewMode.NORMAL,
         trend_window: OverviewTrendWindow | None = None,
+        show_recent_work_ledger_jobs: bool = True,
     ) -> None:
         """Refresh the visible regions for the active view ``mode`` from the report and snapshot."""
         if trend_window is not None:
@@ -274,6 +273,12 @@ class OverviewView(Vertical):
             self.query_one(node_id, Static).display = not thin
         for node_id in self._DETAIL_NODE_IDS:
             self.query_one(node_id, Static).display = detailed
+
+        show_worker = not thin and snapshot is not None
+        show_alchemy = show_worker and self._show_alchemy_panel(snapshot)
+        self.query_one("#overview-ops-row").display = show_worker
+        self.query_one("#overview-worker", Static).display = show_worker
+        self.query_one("#overview-alchemy", Static).display = show_alchemy
 
         # The residency detail is details-only AND only when the feature applies, so the panel never
         # clutters the detailed view on hardware/configs that never engage whole-card residency.
@@ -304,14 +309,21 @@ class OverviewView(Vertical):
             self.query_one("#overview-trends", Static).update(self._render_trends(snapshot))
             self.query_one("#overview-pipeline", Static).update(self._render_pipeline_strip(snapshot))
             self.query_one("#overview-work", Static).update(
-                self._render_work_ledger(snapshot, detailed=detailed, available_width=width),
+                self._render_work_ledger(
+                    snapshot,
+                    detailed=detailed,
+                    available_width=width,
+                    show_recent_jobs=show_recent_work_ledger_jobs,
+                ),
             )
             self.query_one("#overview-processes", Static).update(
                 self._render_process_table(snapshot, detailed=detailed, available_width=width),
             )
-            if detailed:
+            if show_worker:
                 self.query_one("#overview-worker", Static).update(self._render_worker_table(snapshot))
+            if show_alchemy:
                 self.query_one("#overview-alchemy", Static).update(self._render_alchemy_panel(snapshot))
+            if detailed:
                 self.query_one("#overview-queue", Static).update(
                     self._render_queue_table(snapshot, available_width=width),
                 )
@@ -706,6 +718,14 @@ class OverviewView(Vertical):
         return table
 
     @staticmethod
+    def _show_alchemy_panel(snapshot: WorkerStateSnapshot) -> bool:
+        """Return whether the Overview should show the alchemy panel outside thin mode."""
+        return snapshot.config.alchemist or (
+            snapshot.alchemy_forms_pending + snapshot.alchemy_forms_in_flight + snapshot.alchemy_forms_awaiting_submit
+            > 0
+        )
+
+    @staticmethod
     def _allow_summary(snapshot: WorkerStateSnapshot) -> str:
         """Summarize which optional job features the worker accepts."""
         config = snapshot.config
@@ -787,7 +807,10 @@ class OverviewView(Vertical):
         grid.add_row("Now", Text(intent.summary, style="bold"))
         if intent.next_action:
             grid.add_row("Next", Text(intent.next_action, style="grey70"))
-        if intent.why:
+        hide_duplicate_why = bool(
+            detailed and intent.why and intent.raw_gate and intent.why.strip() == intent.raw_gate.strip()
+        )
+        if intent.why and not hide_duplicate_why:
             grid.add_row("Why", Text(intent.why, style="yellow" if "blocked" in intent.why.lower() else "grey70"))
         if detailed and intent.raw_gate:
             grid.add_row("Gate", Text(intent.raw_gate, style="grey62"))
@@ -866,8 +889,9 @@ class OverviewView(Vertical):
         *,
         detailed: bool,
         available_width: int | None = None,
+        show_recent_jobs: bool = True,
     ) -> Panel:
-        """Render active and recent job-owned state separately from process-owned state."""
+        """Render active and, optionally, recent job-owned state separately from process-owned state."""
         layout = select_columns(
             _WORK_LEDGER_COLUMNS,
             ceiling=intent_ceiling(detailed),
@@ -875,19 +899,35 @@ class OverviewView(Vertical):
         )
         table = Table(title="", expand=True, border_style="grey37", header_style="bold", show_header=True)
         add_columns(table, layout.columns)
-        if not snapshot.work_ledger:
-            table.add_row(*placeholder_row(layout.columns, "Stage", "no active or recent work"))
+        recent_stages = {WorkLedgerStage.COMPLETED, WorkLedgerStage.FAULTED}
+        recent_entries = [entry for entry in snapshot.work_ledger if entry.stage in recent_stages]
+        visible_entries = (
+            snapshot.work_ledger
+            if show_recent_jobs
+            else [entry for entry in snapshot.work_ledger if entry.stage not in recent_stages]
+        )
+        if not visible_entries:
+            placeholder = "no active or recent work" if show_recent_jobs else "no active work"
+            table.add_row(*placeholder_row(layout.columns, "Stage", placeholder))
         else:
-            for entry in snapshot.work_ledger:
+            for entry in visible_entries:
                 table.add_row(*[spec.render(entry) for spec in layout.columns])
         subtitle = shed_hint(layout)
+        body = table
+        if not show_recent_jobs and recent_entries:
+            completed = sum(1 for entry in recent_entries if not entry.faulted)
+            faulted = len(recent_entries) - completed
+            summary = f"{completed} job{'s' if completed != 1 else ''} completed recently"
+            if faulted:
+                summary += f"; {faulted} faulted"
+            body = Group(table, Text(f"({summary})", style="grey62"))
         return Panel(
-            table,
+            body,
             title="Work ledger",
             title_align="left",
             subtitle=Text(subtitle, style="grey50") if subtitle else None,
             subtitle_align="right",
-            border_style="green" if snapshot.work_ledger else "grey37",
+            border_style="green" if visible_entries else "grey37",
             padding=(0, 1),
         )
 

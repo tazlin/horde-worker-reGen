@@ -335,6 +335,7 @@ class HordeWorkerTUI(App[None]):
         ("f7", "toggle_download_pause", "Pause downloads"),
         ("t", "cycle_trend_window", "Trend window"),
         ("r", "reset_trends", "Reset trends"),
+        ("j", "toggle_work_ledger_recent_jobs", "Ledger recent"),
         ("f11", "restart_worker", "Restart worker"),
         ("m", "toggle_server_maintenance", "Maintenance (horde)"),
         ("ctrl+q", "quit", "Quit"),
@@ -382,6 +383,7 @@ class HordeWorkerTUI(App[None]):
         persisted_state = self._app_state_store.load()
         self._view_mode = persisted_state.overview_view_mode
         self._trend_window = persisted_state.overview_trend_window
+        self._show_recent_work_ledger_jobs = True
         self._last_trend_config_fingerprint: tuple[object, ...] | None = None
         self._last_main_tab = "tab-overview"
         self._allow_tab_switch_to: str | None = None
@@ -655,6 +657,7 @@ class HordeWorkerTUI(App[None]):
                 frame=self._frame,
                 mode=self._view_mode,
                 trend_window=self._trend_window,
+                show_recent_work_ledger_jobs=self._show_recent_work_ledger_jobs,
             )
             self.query_one(GpusView).update_view(snapshot, mode=self._view_mode)
             self.query_one(DownloadsView).update_view(snapshot, mode=self._view_mode)
@@ -1051,6 +1054,13 @@ class HordeWorkerTUI(App[None]):
         with contextlib.suppress(NoMatches):
             self.query_one(OverviewView).soft_reset_trends()
         self.notify("Overview trends soft-reset.")
+        self._tick()
+
+    def action_toggle_work_ledger_recent_jobs(self) -> None:
+        """Show or hide recently finished rows in the Overview work ledger."""
+        self._show_recent_work_ledger_jobs = not self._show_recent_work_ledger_jobs
+        state = "shown" if self._show_recent_work_ledger_jobs else "summarized"
+        self.notify(f"Work ledger recent jobs: {state}.")
         self._tick()
 
     def action_toggle_pause(self) -> None:

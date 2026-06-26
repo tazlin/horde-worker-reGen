@@ -1393,7 +1393,10 @@ class HordeWorkerProcessManager:
             return
         if worker_details is None:
             return
-        self._worker_details_maintenance = bool(worker_details.maintenance_mode)
+        polled_maintenance = bool(worker_details.maintenance_mode)
+        if not polled_maintenance:
+            self._state.server_maintenance_cleared_by_job_pop = False
+        self._worker_details_maintenance = polled_maintenance and not self._state.server_maintenance_cleared_by_job_pop
         self._worker_details_paused = bool(worker_details.paused)
 
     async def _api_get_user_info_loop(self) -> None:
@@ -1444,6 +1447,9 @@ class HordeWorkerProcessManager:
             self._maybe_start_safety_processes()
             self._maybe_start_inference_processes()
             self._apply_self_maintenance_throttle()
+            if self._state.server_maintenance_cleared_by_job_pop and self._worker_details_maintenance:
+                logger.info("Clearing cached worker-details maintenance: a new job was popped successfully.")
+                self._worker_details_maintenance = False
             self.detect_deadlock()
 
             if len(self._job_tracker.jobs_pending_safety_check) > 0:

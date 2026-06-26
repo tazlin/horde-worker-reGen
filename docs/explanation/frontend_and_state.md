@@ -52,7 +52,9 @@ defines the structured protocol over it:
   dashboard shows horde maintenance as a distinct **MAINTENANCE** phase, labels the
   API connectivity row as maintenance instead of disconnected, and treats a pending
   Maintenance (horde) command as active until the worker-details poll confirms it or
-  a later successful job pop proves the horde is sending work again.
+  a later successful job pop proves the horde is sending work again. The worker-side
+  maintenance latch follows the same rule: a real popped job clears the latch immediately
+  and suppresses any stale worker-details `maintenance=True` cache until the poll catches up.
 
 This mirrors the worker's own internal IPC (see
 [IPC and Messaging](ipc_and_messaging.md)) and is the structured upgrade of the
