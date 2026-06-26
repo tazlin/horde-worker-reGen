@@ -11,7 +11,8 @@
 # Options come from environment variables (so they work with the irm | iex form):
 #   $env:HORDE_WORKER_DIR         install location (default: .\HordeWorker in the current directory)
 #   $env:HORDE_WORKER_REPO        install from a fork (owner/repo; default Haidra-Org/horde-worker-reGen)
-#   $env:HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | cpu (default: detected from the GPU driver)
+#   $env:HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | rocm-windows | cpu
+#                                  (default: detected from the GPU driver)
 #   $env:HORDE_WORKER_FEATURES    optional feature extras: comma/space list of post-processing, controlnet,
 #                                 or 'none' (default: all on NVIDIA/CPU, none on other backends)
 #   $env:HORDE_WORKER_ASSUME_YES  accept the install notice without prompting (required when non-interactive)
@@ -179,7 +180,7 @@ Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
 # job now, so the exact same logic runs for the one-liner, the graphical installer and winget. runtime.cmd
 # installs uv via in-box curl/tar (no fragile nested PowerShell) and then runs bootstrap.py. We pass
 # --no-launch and start the dashboard ourselves below, after creating shortcuts. A pre-set
-# $env:HORDE_WORKER_BACKEND still overrides detection (e.g. 'cpu' to opt into a CPU-only AMD install).
+# $env:HORDE_WORKER_BACKEND still overrides detection (e.g. 'cpu' for CPU-only, or 'rocm-windows' for AMD).
 Write-Host "Setting up the environment. The first run downloads Python and PyTorch and can take several minutes..."
 & (Join-Path $InstallDir "runtime.cmd") install --no-launch
 if ($LASTEXITCODE -ne 0) {

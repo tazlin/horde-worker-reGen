@@ -345,6 +345,24 @@ def test_env_override_beats_detection(env: tuple[Path, list], monkeypatch: pytes
     assert backend.read_backend_file(root / "bin" / "backend") == "cpu"
 
 
+def test_sync_amd_windows_profile_uses_rocm_path(
+    env: tuple[Path, list],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AMD Windows ROCm profile tokens bypass locked-extra validation and use the ad-hoc ROCm path."""
+    _, calls = env
+
+    def fake_rocm_sync(uv: str, *, token: str, **kw: object) -> int:
+        calls.append(("rocm", token))
+        return 0
+
+    from worker_bootstrap import rocm
+
+    monkeypatch.setattr(rocm, "sync_rocm", fake_rocm_sync)
+    assert cli.main(["sync", "--backend", "rocm-windows"]) == 0
+    assert calls == [("rocm", "rocm-windows")]
+
+
 # --- preview / hold / prune path (existing .venv, so the dry-run preview runs) ---------------------
 
 _TORCH_BUMP_DRY_RUN = (

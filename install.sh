@@ -11,7 +11,8 @@
 # Options (environment variables, so they work with the curl | sh form):
 #   HORDE_WORKER_DIR         install location (default: ./horde-worker in the current directory)
 #   HORDE_WORKER_REPO        install from a fork (owner/repo; default Haidra-Org/horde-worker-reGen)
-#   HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | rocm | cpu (default: detected from the GPU/driver)
+#   HORDE_WORKER_BACKEND     cu126 | cu130 | cu132 | rocm | rocm-windows | cpu
+#                            (default: detected from the GPU/driver)
 #   HORDE_WORKER_FEATURES    optional feature extras to install: comma/space list of post-processing,
 #                            controlnet, or 'none' (default: all on NVIDIA/CPU, none on other backends)
 #   HORDE_WORKER_ASSUME_YES  accept the install notice without prompting (required when piped, no terminal)
@@ -147,7 +148,7 @@ rm -rf "$tmp_dir"
 # Everything else (install uv, detect the GPU, seed bridgeData.yaml, sync dependencies) is the bootstrap's
 # job now, so the one-liner, the regular launchers and every platform run identical logic. runtime.sh
 # installs uv and runs bootstrap.py. --no-launch: we start the dashboard ourselves below. A pre-set
-# HORDE_WORKER_BACKEND still overrides detection (e.g. 'cpu', or 'rocm' for AMD on Linux).
+# HORDE_WORKER_BACKEND still overrides detection (e.g. 'cpu', 'rocm' for AMD on Linux, or 'rocm-windows').
 echo "Setting up the environment. The first run downloads Python and PyTorch and can take several minutes..."
 if ! ./runtime.sh install --no-launch; then
     echo "" >&2

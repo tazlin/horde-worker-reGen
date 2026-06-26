@@ -2,10 +2,11 @@
 
 Ported from ``packaging/detect-backend.ps1`` and the ``install.sh`` detection block so a single
 standard-library implementation backs every install channel and platform. ``detect_backend`` returns a
-build token that the locked uv extras (``cu126``/``cu130``/``cu132``/``cpu``) or the ad-hoc ROCm path
+build token that the locked uv extras (``cu126``/``cu130``/``cu132``/``cpu``) or an ad-hoc ROCm path
 consume. For NVIDIA it selects the newest CUDA build the driver's reported max CUDA version can run
 (13.2+ -> ``cu132``, 13.0/13.1 -> ``cu130``, anything older or unreadable -> the safe ``cu126``); see
-:func:`_cuda_build`.
+:func:`_cuda_build`. AMD Windows follows the current ComfyUI/AMD ROCm support matrices and routes
+recognized Radeon/Ryzen AI devices to the official ROCm Windows PyTorch stack.
 """
 
 from __future__ import annotations
@@ -21,6 +22,10 @@ CU130 = "cu130"
 CU132 = "cu132"
 AMD_UNSUPPORTED = "amd-unsupported"
 ROCM = "rocm"
+ROCM_WINDOWS = "rocm-windows"
+ROCM_GFX110X = "rocm-gfx110x"
+ROCM_GFX1151 = "rocm-gfx1151"
+ROCM_GFX120X = "rocm-gfx120x"
 CPU = "cpu"
 
 _CUDA_VERSION_RE = re.compile(r"CUDA Version:\s*(\d+)\.(\d+)")
@@ -109,6 +114,30 @@ def _amd_present() -> bool:
     return _linux_lspci_match(("AMD", "Radeon", "Advanced Micro Devices"))
 
 
+def _windows_amd_rocm_backend() -> str | None:
+    """Return the AMD Windows ROCm token when the adapter is in the current support matrix.
+
+    Keep the matcher intentionally conservative: unknown AMD cards stay ``amd-unsupported`` instead of
+    getting a ROCm stack that may import but fail at runtime.
+    """
+    if not _is_windows():
+        return None
+    for raw_name in _windows_display_adapters():
+        name = raw_name.upper()
+        compact = re.sub(r"[\s\-_()]+", "", name)
+        if "AMD" not in name and "RADEON" not in name:
+            continue
+        if re.search(r"\bRX\s*(9060|9070|7700|7900)\b", name) or re.search(r"\b(PRO\s+)?W7900\b", name):
+            return ROCM_WINDOWS
+        if re.search(r"\bAI\s+PRO\s+R9700\b", name):
+            return ROCM_WINDOWS
+        if "RYZENAIMAX" in compact or "STRIXHALO" in compact or "RADEON8050S" in compact or "RADEON8060S" in compact:
+            return ROCM_WINDOWS
+        if re.search(r"RYZENAI9(HX)?(365|370|375|465|470|475)", compact):
+            return ROCM_WINDOWS
+    return None
+
+
 def _rocm_runtime_present() -> bool:
     """Return True when a usable ROCm runtime appears installed (Linux only)."""
     if _is_windows():
@@ -160,11 +189,14 @@ def detect_backend() -> str:
 
     Returns:
         ``cu132``/``cu130``/``cu126`` (NVIDIA: the newest build the driver's max CUDA version supports,
-        see :func:`_cuda_build`), ``rocm`` (AMD with a ROCm runtime on Linux), ``amd-unsupported`` (AMD
-        without a usable backend, e.g. Windows), or ``cpu``.
+        see :func:`_cuda_build`), ``rocm`` (AMD with a ROCm runtime on Linux), ``rocm-windows`` for
+        supported AMD Windows Radeon/Ryzen AI devices, ``amd-unsupported`` for an AMD card with no known
+        installable backend, or ``cpu``.
     """
     if _nvidia_present():
         return _cuda_build(_nvidia_cuda_version())
     if _amd_present():
+        if windows_backend := _windows_amd_rocm_backend():
+            return windows_backend
         return ROCM if _rocm_runtime_present() else AMD_UNSUPPORTED
     return CPU

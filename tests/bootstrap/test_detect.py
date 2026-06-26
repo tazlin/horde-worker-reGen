@@ -66,4 +66,45 @@ def test_detect_backend(
     monkeypatch.setattr(detect, "_nvidia_cuda_version", lambda: cuda_version)
     monkeypatch.setattr(detect, "_amd_present", lambda: amd)
     monkeypatch.setattr(detect, "_rocm_runtime_present", lambda: rocm)
+    monkeypatch.setattr(detect, "_windows_amd_rocm_backend", lambda: None)
     assert detect.detect_backend() == expected
+
+
+@pytest.mark.parametrize(
+    ("adapter_name", "expected"),
+    [
+        ("AMD Radeon RX 7900 XTX", detect.ROCM_WINDOWS),
+        ("AMD Radeon RX 7700 XT", detect.ROCM_WINDOWS),
+        ("AMD Radeon PRO W7900", detect.ROCM_WINDOWS),
+        ("AMD Radeon RX 9070 XT", detect.ROCM_WINDOWS),
+        ("AMD Radeon AI PRO R9700", detect.ROCM_WINDOWS),
+        ("AMD Radeon 8060S Graphics", detect.ROCM_WINDOWS),
+        ("AMD Ryzen AI 9 HX 370 w/ Radeon Graphics", detect.ROCM_WINDOWS),
+        ("AMD Ryzen AI Max+ 395 w/ Radeon Graphics", detect.ROCM_WINDOWS),
+    ],
+)
+def test_windows_amd_rocm_backend_supported_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter_name: str,
+    expected: str,
+) -> None:
+    """Supported AMD Windows adapter families map to the ROCm Windows profile."""
+    monkeypatch.setattr(detect, "_is_windows", lambda: True)
+    monkeypatch.setattr(detect, "_windows_display_adapters", lambda: [adapter_name])
+    assert detect._windows_amd_rocm_backend() == expected
+
+
+def test_windows_amd_rocm_backend_unknown_card_is_not_guessed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unknown AMD Windows cards remain unsupported instead of getting an unsafe ROCm wheel family."""
+    monkeypatch.setattr(detect, "_is_windows", lambda: True)
+    monkeypatch.setattr(detect, "_windows_display_adapters", lambda: ["AMD Radeon RX 6800 XT"])
+    assert detect._windows_amd_rocm_backend() is None
+
+
+def test_detect_backend_uses_windows_amd_rocm_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An AMD Windows profile returned by the matcher wins over the generic unsupported path."""
+    monkeypatch.setattr(detect, "_nvidia_present", lambda: False)
+    monkeypatch.setattr(detect, "_amd_present", lambda: True)
+    monkeypatch.setattr(detect, "_windows_amd_rocm_backend", lambda: detect.ROCM_WINDOWS)
+    monkeypatch.setattr(detect, "_rocm_runtime_present", lambda: False)
+    assert detect.detect_backend() == detect.ROCM_WINDOWS

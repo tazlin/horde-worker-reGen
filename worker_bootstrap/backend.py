@@ -8,7 +8,7 @@ from pathlib import Path
 
 # Builds whose torch wheels are pinned in uv.lock and installable with ``uv sync --locked --extra <build>``.
 # Used only as fallback guidance text; the authoritative list is read from pyproject.toml at runtime. ROCm
-# and amd-unsupported are intentionally absent (ROCm installs ad-hoc; amd-unsupported has no build).
+# and amd-unsupported are intentionally absent (ROCm profiles install ad-hoc; amd-unsupported has no build).
 _LOCKED_HINT = ("cu126", "cu130", "cu132", "cpu")
 
 # Optional feature extras (see pyproject ``[project.optional-dependencies]``). These re-export

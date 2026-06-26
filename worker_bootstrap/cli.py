@@ -30,9 +30,11 @@ _LAUNCH_COMMANDS: dict[str, list[str]] = {
 def _print_amd_unsupported() -> None:
     """Explain that no usable AMD backend was found and how to force a choice."""
     print(
-        "An AMD GPU was detected, but no usable GPU backend is available (no ROCm runtime found; ROCm is "
-        "Linux-only and DirectML is removed). Re-run with HORDE_WORKER_BACKEND=cpu for the CPU build "
-        "(~100x slower), or HORDE_WORKER_BACKEND=rocm after installing ROCm (Linux).",
+        "An AMD GPU was detected, but no installable GPU backend was matched. The installer supports "
+        "ComfyUI's experimental AMD Windows ROCm profile for supported Radeon/Ryzen AI GPUs, plus Linux "
+        "ROCm when the ROCm runtime is present. "
+        "Re-run with HORDE_WORKER_BACKEND=cpu for the CPU build (~100x slower), or force a known profile "
+        "with HORDE_WORKER_BACKEND=rocm-windows if your card is supported but was not recognized.",
         file=sys.stderr,
     )
 
@@ -260,10 +262,10 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -
         return 1
 
     config_seed.seed_config(template=paths.template_config(root), target=paths.bridge_config(root))
-    if token == detect.ROCM:
-        from worker_bootstrap import rocm
+    from worker_bootstrap import rocm
 
-        rc = rocm.sync_rocm(uv, root=root, hold=options.hold)
+    if rocm.is_rocm_token(token):
+        rc = rocm.sync_rocm(uv, root=root, hold=options.hold, token=token)
         if rc == 0:
             _maybe_prune(uv, root, options)
             _write_sync_stamp(root)
@@ -583,11 +585,14 @@ def _build_parser() -> argparse.ArgumentParser:
         target.add_argument(
             "--backend",
             default=None,
-            help="Force a torch build (cu126/cu130/cu132/cpu/rocm) instead of detecting/reading bin/backend.",
+            help=(
+                "Force a torch build (cu126/cu130/cu132/cpu/rocm/rocm-windows) instead of "
+                "detecting/reading bin/backend."
+            ),
         )
         # Convenience shortcuts kept for back-compat with the old update-runtime.cmd/sh flag interface
         # (e.g. `update-runtime.cmd --cu126`); each is just `--backend <build>`.
-        for build in ("cu126", "cu130", "cu132", "cpu", "rocm"):
+        for build in ("cu126", "cu130", "cu132", "cpu", "rocm", "rocm-windows"):
             target.add_argument(
                 f"--{build}",
                 dest="backend",

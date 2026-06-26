@@ -7,7 +7,8 @@
 #   cu132            an NVIDIA GPU on a CUDA 13.2+ driver -> CUDA 13.2 build
 #   cu130            an NVIDIA GPU on a CUDA 13.0/13.1 driver -> CUDA 13.0 build
 #   cu126            an NVIDIA GPU on a CUDA 12.x driver (or version unreadable) -> CUDA 12.6 build
-#   amd-unsupported  an AMD/Radeon GPU was found, but Windows has no working GPU backend today
+#   rocm-windows    AMD Windows, supported Radeon/Ryzen AI device for the ROCm Windows PyTorch stack
+#   amd-unsupported  an AMD/Radeon GPU was found, but not one of the known installable profiles
 #   cpu              no supported GPU found
 #
 # The CUDA build is the newest the driver's max supported CUDA version can run (nvidia-smi's "CUDA
@@ -38,13 +39,37 @@ function Test-NvidiaGpu {
     return $false
 }
 
-function Test-AmdGpu {
+function Get-AmdAdapterNames {
+    $names = @()
     try {
         foreach ($c in Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop) {
-            if ($c.Name -match "AMD|Radeon") { return $true }
+            if ($c.Name -match "AMD|Radeon") { $names += $c.Name }
         }
     } catch { }
-    return $false
+    return $names
+}
+
+function Test-AmdGpu {
+    return @((Get-AmdAdapterNames)).Count -gt 0
+}
+
+function Get-WindowsAmdRocmBackend {
+    foreach ($name in Get-AmdAdapterNames) {
+        $compact = ($name.ToUpperInvariant() -replace "[\s\-_()]+", "")
+        if ($name -match "\bRX\s*(9060|9070|7700|7900)\b" -or $name -match "\b(PRO\s+)?W7900\b") {
+            return "rocm-windows"
+        }
+        if ($name -match "\bAI\s+PRO\s+R9700\b") {
+            return "rocm-windows"
+        }
+        if ($compact -match "RYZENAIMAX|STRIXHALO|RADEON8050S|RADEON8060S") {
+            return "rocm-windows"
+        }
+        if ($compact -match "RYZENAI9(HX)?(365|370|375|465|470|475)") {
+            return "rocm-windows"
+        }
+    }
+    return $null
 }
 
 function Get-NvidiaCudaVersion {
@@ -81,7 +106,12 @@ if (Test-NvidiaGpu) {
         $token = "cu126"
     }
 } elseif (Test-AmdGpu) {
-    $token = "amd-unsupported"
+    $amdBackend = Get-WindowsAmdRocmBackend
+    if ($amdBackend) {
+        $token = $amdBackend
+    } else {
+        $token = "amd-unsupported"
+    }
 } else {
     $token = "cpu"
 }

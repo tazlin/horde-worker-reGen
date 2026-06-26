@@ -253,11 +253,14 @@ The same generator is available in the dashboard: the **Logs** tab has a **Suppo
 | Variable | Effect |
 |----------|--------|
 | `HORDE_WORKER_DIR` | Install location for the one-line installer. |
-| `HORDE_WORKER_BACKEND` | Force a PyTorch build: `cu126`, `cu130`, `cu132`, `rocm`, or `cpu` (default: detected). |
+| `HORDE_WORKER_BACKEND` | Force a PyTorch build: `cu126`, `cu130`, `cu132`, `rocm`, `rocm-windows`, or `cpu` (default: detected). |
 | `HORDE_WORKER_NO_SHORTCUTS` | Skip creating Desktop/Start Menu shortcuts. |
 | `HORDE_WORKER_NO_LAUNCH` | Skip auto-launching the dashboard after install. |
 | `HORDE_WORKER_ENABLE_LONG_PATHS` | Opt in to Windows system-wide long-path support (changes an HKLM setting; needs administrator). |
-| `HORDE_WORKER_ROCM_TORCH` | Override the ROCm torch version installed by `update-runtime-rocm`. |
+| `HORDE_WORKER_ROCM_TORCH` | Override the Linux ROCm torch version/spec installed by the ad-hoc ROCm path. |
+| `HORDE_WORKER_ROCM_INDEX` | Override the Linux ROCm wheel index used by the ad-hoc ROCm path. |
+| `HORDE_WORKER_ROCM_WINDOWS_VERSION` | Override the AMD ROCm Windows wheel version (default `7.2.1`). |
+| `HORDE_WORKER_ROCM_WINDOWS_BASE` | Override the AMD ROCm Windows wheel URL base. |
 | `CUDA_VISIBLE_DEVICES` | Pin a worker to a specific GPU (see [Run multiple GPUs](../how-to/run-multiple-gpus.md)). |
 
 ### Behaviour

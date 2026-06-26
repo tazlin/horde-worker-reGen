@@ -69,18 +69,27 @@ HORDE_WORKER_BACKEND=cu132 ./update-runtime.sh   # CUDA 13.2+ build (auto-select
 HORDE_WORKER_BACKEND=cu130 ./update-runtime.sh   # CUDA 13.0/13.1 build
 HORDE_WORKER_BACKEND=cu126 ./update-runtime.sh   # CUDA 12.6+ build
 HORDE_WORKER_BACKEND=cpu   ./update-runtime.sh   # no GPU
+HORDE_WORKER_BACKEND=rocm  ./update-runtime.sh   # Linux ROCm runtime detected/installed
 ```
 
 torch 2.12.0 has no `cu128` wheel, so a CUDA 12.x driver uses `cu126` (a legacy `cu128` request is
 remapped to `cu126` automatically). The full list of build extras is in `pyproject.toml`.
 
-Only these builds are locked. **ROCm** and **older torch versions** are installed ad hoc (not from the
-lockfile), which is easy to mix in but not pinned:
+Only the CUDA and CPU builds are locked. **ROCm** and **older torch versions** are installed ad hoc
+(not from the lockfile), which is easy to mix in but not pinned:
 
 ```bash
 ./update-runtime-rocm.sh                                            # torch 2.9.1 on ROCm 6.4 (override: HORDE_WORKER_ROCM_TORCH)
 UV_TORCH_BACKEND=auto uv pip install torch torchvision              # let uv auto-detect your GPU
 uv pip install torch==2.11.0 --extra-index-url https://download.pytorch.org/whl/cu128   # an older line
+```
+
+On Windows AMD, the installer detects supported Radeon/Ryzen AI devices and installs the `rocm-windows`
+profile with AMD's official ROCm Windows wheels:
+
+```powershell
+$env:HORDE_WORKER_BACKEND = "rocm-windows"
+.\update-runtime.cmd
 ```
 
 ## Run the worker

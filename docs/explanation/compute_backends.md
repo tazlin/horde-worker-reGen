@@ -50,9 +50,11 @@ backend-agnostic path. A missing `nvidia-smi`/NVML never breaks startup.
 The remaining constraints are **packaging, not worker code** (see the README's "Why fewer GPU types
 than ComfyUI?"): DirectML and *locked* ROCm/XPU builds are blocked upstream in PyTorch (the
 `pytorch-triton-rocm` / `pytorch-triton-xpu` sidecars are not published for the torch line the worker
-pins), so those torch builds are installed ad-hoc rather than from the lockfile. The runtime itself no
-longer hard-codes NVIDIA, and the heavy optional features are no longer in the base install (see
-below), so a base worker installs and runs on the accelerators ComfyUI supports.
+pins), so those torch builds are installed ad-hoc rather than from the lockfile. AMD Windows uses the
+same rule: the installer detects supported Radeon/Ryzen AI devices as `rocm-windows` and overlays AMD's
+official ROCm Windows torch stack after syncing the universal base.
+The runtime itself no longer hard-codes NVIDIA, and the heavy optional features are no longer in the base
+install (see below), so a base worker installs and runs on the accelerators ComfyUI supports.
 
 ## Optional features and their dependencies
 
@@ -81,7 +83,7 @@ build:
 
 - **NVIDIA (`cu126`/`cu130`/`cu132`) and CPU**: install `post-processing` and `controlnet` by default,
   so existing installs are unchanged.
-- **ROCm / XPU / MPS and other ad-hoc backends**: install **lean** (base only).
+- **ROCm / AMD Windows ROCm / XPU / MPS and other ad-hoc backends**: install **lean** (base only).
 
 Override per install with `HORDE_WORKER_FEATURES` (comma or space separated):
 

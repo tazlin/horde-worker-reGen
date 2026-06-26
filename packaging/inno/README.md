@@ -15,9 +15,10 @@ CI staging directory), so there is no second copy of the install logic to keep i
   silently reusing the previous folder is disabled (`UsePreviousAppDir=no`) so this choice is always offered.
   Models and the dependency cache live in the sibling `…-data` folder and are not moved when relocating, so a
   new location re-downloads them on first launch.
-- Detects the GPU once during the wizard via the shared `detect-backend.ps1`, warns on CPU-only, and offers
-  a CPU-only path (or cancels) for unsupported AMD-on-Windows. It writes the result to `bin\backend`, which
-  the deferred first-launch bootstrap reads so the correct PyTorch build is installed.
+- Detects the GPU once during the wizard via the shared `detect-backend.ps1`, warns on CPU-only, maps
+  supported AMD Windows cards to `rocm-windows`, and offers a CPU-only path (or cancels) for unsupported
+  AMD-on-Windows. It writes the result to `bin\backend`, which the deferred first-launch
+  bootstrap reads so the correct PyTorch build is installed.
 - Does **not** build the Python environment itself: first launch of `horde-worker.cmd` does that (and opens
   the browser wizard), exactly like every other install path.
 - Seeds `bridgeData.yaml` from the template (only if absent) and never deletes it on uninstall.

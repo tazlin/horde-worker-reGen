@@ -1,8 +1,12 @@
 # Run on AMD (ROCm)
 
-AMD support is **experimental** and centred on Linux. If you are not comfortable on the Linux command
-line, this path is not yet for you, and there is currently no easy AMD route on Windows (see DirectML
-below). For help, join the
+AMD support is **experimental**. The installer follows ComfyUI's backend support:
+
+- Linux uses the stable PyTorch ROCm wheel index.
+- Windows uses AMD's ROCm Windows PyTorch wheels for supported Radeon/Ryzen AI devices.
+- DirectML remains unavailable because its PyTorch line is too old for this worker.
+
+For help, join the
 [AMD discussion on Discord](https://discord.com/channels/781145214752129095/1076124012305993768).
 
 ## Linux
@@ -15,16 +19,39 @@ Use the ROCm variants of the scripts in place of the standard ones:
 Everything else (config, models, the dashboard) works as on any Linux install. See
 [Install](install.md) and [Configure for your GPU](configure-for-your-gpu.md).
 
-## DirectML (Windows): temporarily unavailable
+## Windows AMD ROCm
+
+The Windows installer detects supported AMD adapter names and installs the `rocm-windows` profile. That
+profile syncs the universal base environment, then overlays AMD's official ROCm Windows wheels for
+`amd_smi`, `hip_sdk`, `torch`, `torchvision`, and `torchaudio`.
+
+Current auto-detection is intentionally conservative and covers the device names in AMD's Radeon/Ryzen
+AI Windows compatibility tables, including:
+
+- Radeon RX 7900 / 7700 and Radeon PRO W7900
+- Radeon RX 9070 / 9060 and Radeon AI PRO R9700
+- Ryzen AI 9 HX 370-class devices and Ryzen AI Max / Radeon 8050S / 8060S
+
+If your supported card is not recognized, force the token before running the installer or update script:
+
+```powershell
+$env:HORDE_WORKER_BACKEND = "rocm-windows"
+.\update-runtime.cmd
+```
+
+These profiles install a lean base by default. Optional feature extras can be enabled with
+`HORDE_WORKER_FEATURES`, as described in [Compute backends](../explanation/compute_backends.md).
+
+## DirectML (Windows): unavailable
 
 DirectML let AMD and Intel GPUs run on Windows without CUDA. It is **temporarily unavailable**: the
 `torch-directml` build is pinned to an older PyTorch (the 2.4 era) that is incompatible with the
 version this worker now requires. The `update-runtime-directml` and `horde-bridge-directml` scripts
 were removed rather than left to fail with a confusing error.
 
-If you have an AMD or Intel GPU on Windows and no CUDA option, run the worker on Linux with ROCm for
-now, either on a native Linux install or through WSL (below). This section will be restored when a
-compatible DirectML build is available.
+If you have an unsupported AMD or Intel GPU on Windows and no CUDA option, run the worker on Linux with
+ROCm for now, either on a native Linux install or through WSL (below). This section will be restored
+when a compatible DirectML build is available.
 
 ## AMD ROCm inside Windows (WSL)
 

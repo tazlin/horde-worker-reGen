@@ -71,8 +71,9 @@ dependencies = [
 # (cu126/cu130/cpu only). Only these builds are locked. ROCm, Intel XPU, and other builds/versions are
 # installed AD-HOC (not from the lock): they pull their own triton sidecar (pytorch-triton-rocm /
 # pytorch-triton-xpu) which has no wheel under the locked torch range + py3.12, so locking them is
-# unsolvable. ROCm: `uv pip install torch==2.9.1 torchvision pytorch-triton-rocm --extra-index-url
-# https://download.pytorch.org/whl/rocm6.4`. Intel XPU: `uv pip install torch torchvision
+# unsolvable. Linux ROCm: `uv pip install torch==2.9.1 torchvision pytorch-triton-rocm --extra-index-url
+# https://download.pytorch.org/whl/rocm6.4`. AMD Windows follows ComfyUI's supported ROCm Windows
+# profile (`rocm-windows`) with official AMD direct wheels. Intel XPU: `uv pip install torch torchvision
 # --extra-index-url https://download.pytorch.org/whl/xpu`. Or let uv auto-detect:
 # `UV_TORCH_BACKEND=auto uv pip install torch torchvision`. (torch 2.12.0 has no cu128 wheel, so CUDA
 # 12.x uses cu126.) directml was removed in the hordelib v3 catch-up.

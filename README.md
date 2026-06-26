@@ -52,7 +52,8 @@ common first-run questions.
 | **Linux + AMD GPU** | Experimental | Uses ROCm (installed ad-hoc). Core features; opt into the rest. See [Run on AMD ROCm](docs/how-to/run-on-amd-rocm.md). |
 | **Linux + Intel Arc / XPU** | Experimental | Core features. Install the XPU torch wheel ad-hoc (see [Compute backends](docs/explanation/compute_backends.md)). |
 | **Apple Silicon (macOS / MPS)** | Experimental | Core features on the default macOS PyTorch wheel; much slower than a discrete GPU. |
-| **Windows + AMD / Intel GPU** | Not straightforward | DirectML is temporarily unavailable, so the realistic route is Linux or WSL. |
+| **Windows + AMD GPU** | Experimental | Supported for the Radeon/Ryzen AI devices in AMD's ROCm Windows compatibility matrix. See [Run on AMD ROCm](docs/how-to/run-on-amd-rocm.md). |
+| **Windows + Intel GPU** | Not straightforward | DirectML is temporarily unavailable, so the realistic route is Linux. |
 | **No supported GPU (CPU)** | CPU only | Installs and runs, only alchemy recommended. |
 
 Core image generation and the safety classifier are pure PyTorch and run on every backend above.

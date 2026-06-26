@@ -5,8 +5,9 @@ This directory holds everything used to turn a worker checkout into the artifact
 - `bundle-include.txt` - manifest of root files that go into the release zip (kept honest by
   `tests/test_bundle_manifest.py`).
 - `detect-backend.ps1` - the single GPU detector shared by `install.ps1` and the graphical
-  installer; prints the CUDA build chosen from the driver's CUDA version (`cu130` on a CUDA 13+
-  driver, else `cu128`), or `amd-unsupported` / `cpu`.
+  installer; prints the CUDA build chosen from the driver's CUDA version (`cu132` on CUDA 13.2+,
+  `cu130` on CUDA 13.0/13.1, else `cu126`), `rocm-windows` for supported AMD Windows devices, or
+  `amd-unsupported` / `cpu`.
 - `inno/HordeWorker.iss` - Inno Setup script for the double-click Windows installer
   (`HordeWorker-Setup.exe`). See [`inno/README.md`](inno/README.md).
 - `winget/` - the winget manifest.

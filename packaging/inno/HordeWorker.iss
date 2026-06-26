@@ -196,11 +196,11 @@ begin
 
   if DetectedBackend = 'amd-unsupported' then
   begin
-    // AMD on Windows has no working GPU backend today (ROCm is Linux-only, DirectML is removed). Offer a
-    // CPU-only install rather than silently doing the ~100x-slower thing without saying so.
-    if MsgBox('An AMD GPU was detected. Windows GPU acceleration is currently unavailable for AMD cards'
-              + ' (ROCm is Linux-only). The worker can still run on your CPU, but that is roughly 100x'
-              + ' slower and is mainly useful for testing.' + #13#10#13#10
+    // Unsupported AMD on Windows: the detector did not match the ROCm Windows compatibility matrix.
+    // Offer a CPU-only install rather than silently doing the ~100x-slower thing without saying so.
+    if MsgBox('An AMD GPU was detected, but it did not match a supported Windows ROCm profile.'
+              + ' The worker can still run on your CPU, but that is roughly 100x slower and is mainly'
+              + ' useful for testing.' + #13#10#13#10
               + 'Continue with a CPU-only install?', mbConfirmation, MB_YESNO) = IDYES then
       DetectedBackend := 'cpu'
     else

@@ -102,7 +102,7 @@ def test_full_builds_default_to_all_feature_extras(token: str) -> None:
     assert backend.desired_feature_extras(token) == backend.FEATURE_EXTRAS
 
 
-@pytest.mark.parametrize("token", ["rocm", "xpu", "mps"])
+@pytest.mark.parametrize("token", ["rocm", "rocm-windows", "xpu", "mps"])
 def test_lean_builds_default_to_no_feature_extras(token: str) -> None:
     """Non-NVIDIA backends default lean: no feature extras unless opted in."""
     assert backend.desired_feature_extras(token) == ()

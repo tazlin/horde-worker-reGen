@@ -132,7 +132,8 @@ function Invoke-SmokeTest {
     }
     $backend = (Get-Content (Join-Path $target 'bin\backend') -Raw).Trim()
     Write-Note "Install OK. Persisted backend = '$backend'"
-    if ($backend -notin @('cu126', 'cu128', 'cu130', 'cu132', 'cpu', 'rocm')) { Write-Warn "Unexpected backend token: '$backend'" }
+    $knownBackends = @('cu126', 'cu128', 'cu130', 'cu132', 'cpu', 'rocm', 'rocm-windows', 'rocm-gfx110x', 'rocm-gfx1151', 'rocm-gfx120x')
+    if ($backend -notin $knownBackends) { Write-Warn "Unexpected backend token: '$backend'" }
 
     Write-Note 'Uninstalling'
     $unins = Start-Process -FilePath (Join-Path $target 'unins000.exe') -Wait -PassThru `
