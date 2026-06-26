@@ -704,7 +704,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
         self.process_timeout = compute_performance_timeout(
             high_performance_mode=self.high_performance_mode,
             moderate_performance_mode=self.moderate_performance_mode,
-            default_timeout=self.model_fields["process_timeout"].default,
+            default_timeout=reGenBridgeData.model_fields["process_timeout"].default,
             current_timeout=self.process_timeout,
             log=True,
         )

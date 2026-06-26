@@ -135,7 +135,7 @@ def _download(url: str, dest: Path, *, retries: int = 3, timeout: int = 60) -> N
         try:
             request = urllib.request.Request(url, headers={"User-Agent": "horde-worker-bootstrap"})
             with urllib.request.urlopen(request, timeout=timeout) as response, dest.open("wb") as handle:
-                shutil.copyfileobj(response, handle)
+                shutil.copyfileobj(response, handle)  # type: ignore
             return
         except OSError as exc:
             last_error = exc

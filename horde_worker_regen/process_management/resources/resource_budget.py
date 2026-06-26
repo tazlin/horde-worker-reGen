@@ -523,15 +523,15 @@ def effective_inference_reserve_mb(
     (a safety margin on top). Falls back to the configured floor when total VRAM is unknown (cold start).
     """
     if total_vram_mb is None or total_vram_mb <= 0:
-        return float(configured_floor_mb)
+        return configured_floor_mb
     try:
         from hordelib.vram_planning import compute_inference_reserve_mb
 
         comfy_reserve = compute_inference_reserve_mb(int(total_vram_mb), reserve_vram_gb=reserve_vram_gb)
     except Exception as e:
         logger.debug(f"Inference-reserve lookup failed for {total_vram_mb} MB: {type(e).__name__} {e}")
-        return float(configured_floor_mb)
-    return float(max(comfy_reserve, configured_floor_mb))
+        return configured_floor_mb
+    return max(comfy_reserve, configured_floor_mb)
 
 
 def forecast_weight_streaming(

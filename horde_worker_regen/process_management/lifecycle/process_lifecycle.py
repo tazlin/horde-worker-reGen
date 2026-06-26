@@ -297,6 +297,8 @@ class ProcessLifecycleManager:
         if sys.platform == "win32":
             return
 
+        method = None
+
         try:
             method = self._ctx.get_start_method()
         except Exception:

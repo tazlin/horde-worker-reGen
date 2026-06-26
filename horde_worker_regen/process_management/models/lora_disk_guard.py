@@ -193,7 +193,7 @@ def constrain_lora_cache_to_disk(
     # Below the floor: cap the budget at what the volume can actually hold (current ad-hoc footprint
     # plus the negative headroom), so even a fixed hordelib won't immediately regrow into the wall.
     affordable = manager.calculate_adhoc_cache() + (free_before - floor_mb)
-    new_budget = int(max(0.0, min(configured_budget_mb, affordable)))
+    new_budget = int(max(0.0, min(float(configured_budget_mb), affordable)))
     manager.max_adhoc_disk = new_budget
 
     evicted = 0

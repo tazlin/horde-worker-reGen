@@ -32,7 +32,7 @@ from horde_worker_regen.benchmark.report import (
 from horde_worker_regen.benchmark.sizing import max_post_processing_resolution
 from horde_worker_regen.benchmark.soak import build_validation_level
 
-_ALL_TIERS = [BenchTier.SD15, BenchTier.SDXL, BenchTier.FLUX, BenchTier.QWEN, BenchTier.ZIMAGE]
+_ALL_TIERS = [BenchTier.SD15, BenchTier.SDXL, BenchTier.FLUX, BenchTier.QWEN]
 
 
 def _levels_on_axis(ladder: list[RampLevel], axis: BenchAxis) -> list[RampLevel]:
@@ -48,32 +48,14 @@ class TestTierMatrix:
         baseline_tiers = {level.tier for level in ladder if level.establishes_tier_baseline}
         assert baseline_tiers == set(_ALL_TIERS)
 
-    def test_huge_and_beta_tier_membership(self) -> None:
-        """flux/qwen/zimage are huge (warn + auto-skip); qwen and zimage are beta reference tiers."""
-        assert frozenset({BenchTier.FLUX, BenchTier.QWEN, BenchTier.ZIMAGE}) == HUGE_TIERS
-        assert frozenset({BenchTier.QWEN, BenchTier.ZIMAGE}) == BETA_TIERS
+    def test_flux_and_qwen_are_huge_and_qwen_is_beta(self) -> None:
+        """flux/qwen are flagged huge (warn + auto-skip) and qwen is sourced from the beta reference."""
+        assert frozenset({BenchTier.FLUX, BenchTier.QWEN}) == HUGE_TIERS
+        assert frozenset({BenchTier.QWEN}) == BETA_TIERS
 
     def test_flux_model_name_exists_in_reference_form(self) -> None:
         """The flux model name is the published compact checkpoint, not the old placeholder."""
         assert BENCH_TIER_MODELS[BenchTier.FLUX] == "Flux.1-Schnell fp8 (Compact)"
-
-    def test_zimage_model_name(self) -> None:
-        """The zimage model name matches the pending reference change_id 14."""
-        assert BENCH_TIER_MODELS[BenchTier.ZIMAGE] == "Z-Image-Turbo"
-
-    def test_zimage_has_no_hires_fix_level(self) -> None:
-        """Z-Image-Turbo declares hires_fix unsupported; no hires_fix level is built for it."""
-        ladder = build_default_ladder(LadderOptions(tiers=[BenchTier.ZIMAGE]))
-        hires_tiers = {level.tier for level in _levels_on_axis(ladder, BenchAxis.HIRES_FIX)}
-        assert BenchTier.ZIMAGE not in hires_tiers
-
-    def test_zimage_baseline_uses_fixed_steps_and_cfg(self) -> None:
-        """Z-Image-Turbo's canned jobs use the locked inference parameters (steps=9, cfg_scale=1.0)."""
-        ladder = build_default_ladder(LadderOptions(tiers=[BenchTier.ZIMAGE]))
-        baseline = next(level for level in ladder if level.establishes_tier_baseline)
-        job = baseline.scenario.expand_image_jobs()[0]
-        assert job.payload.ddim_steps == 9
-        assert job.payload.cfg_scale == 1.0
 
 
 class TestControlnetVsQrCode:
