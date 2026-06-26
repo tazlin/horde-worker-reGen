@@ -516,6 +516,14 @@ _DISPATCH_BUG_REASON = (
     "its model is resident and idle on process 1 but dispatch was withheld with no matching gate -- this is a "
     "scheduler stall worth reporting"
 )
+# The whole-card residency convergence attribution (inference_scheduler._diagnose_dispatch_stall): the head is
+# resident and idle, but an idle sibling holding a still-queued model was not torn down by the convergence.
+_DISPATCH_WHOLE_CARD_REASON = (
+    "its model is resident and idle on process 4, but the whole-card residency stuck: cannot reach sole "
+    "residency because process 3 holds queued model 'CyberRealistic Pony' -- the convergence teardown should "
+    "have stopped that idle sibling (only the head's holder is spared), so the shrink has not collapsed the "
+    "pool and the head never dispatches"
+)
 
 
 class TestSafetyStageStall:
@@ -570,6 +578,39 @@ class TestSafetyStageStall:
             ],
         )
         assert "safety_stage_stall" not in _diagnose(tmp_path, bridge)
+
+
+class TestWholeCardConvergenceWedge:
+    """The whole-card residency that cannot collapse to sole residency because a queued-model sibling is pinned."""
+
+    def test_queued_model_sibling_pins_teardown_is_critical(self, tmp_path: Path) -> None:
+        """A pre-staged head parked by a queued-model sibling is the convergence deadlock (critical)."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _dispatch_stall(
+                    "13:01:00.000", reason=_DISPATCH_WHOLE_CARD_REASON, model="Flux.1-Schnell fp8 (Compact)"
+                ),
+            ],
+        )
+        findings = _diagnose(tmp_path, bridge)
+        assert "whole_card_convergence_wedge" in findings
+        assert findings["whole_card_convergence_wedge"].severity is Severity.CRITICAL
+        assert findings["whole_card_convergence_wedge"].see_also == "head_dispatch_stall"
+
+    def test_wedge_line_does_not_also_fire_generic_dispatch_warning(self, tmp_path: Path) -> None:
+        """The wedge owns its line: head_dispatch_stall must not double-report it as a generic warning."""
+        bridge = "\n".join(
+            [
+                f"2026-06-25 13:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+                _dispatch_stall(
+                    "13:01:00.000", reason=_DISPATCH_WHOLE_CARD_REASON, model="Flux.1-Schnell fp8 (Compact)"
+                ),
+            ],
+        )
+        findings = _diagnose(tmp_path, bridge)
+        assert "whole_card_convergence_wedge" in findings
+        assert "head_dispatch_stall" not in findings
 
 
 class TestHeadDispatchStall:

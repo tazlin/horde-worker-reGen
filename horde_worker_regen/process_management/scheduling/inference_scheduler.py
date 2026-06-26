@@ -1084,12 +1084,15 @@ class InferenceScheduler:
         Driven each scheduling cycle while a residency is held. A pre-staged head is loaded into RAM before
         the device is claimed (see :meth:`_begin_whole_card_residency`); stopping idle siblings before the head
         is actually resident on a process could kill the very spare the pre-stage wants to use, so this waits
-        until the head is resident or loading on a process. From then on that process is the queued-model holder
-        ``scale_inference_processes`` spares, so reducing the live inference-process count to the forecast's
-        target stops the *other* idle siblings (and the former busy process once its job drains) to reclaim
-        their CUDA contexts, and safety is moved off-GPU, leaving the staged head the whole card when it samples.
-        A no-op until a residency is held and its model is staged; idempotent at the target. Converges every
-        held residency, so on a multi-GPU host each card's pre-staged head collapses its own card independently.
+        until the head is resident or loading on a process. From then on the scale-down is told this is a
+        whole-card collapse (``whole_card_model``), so it spares only that head's holder and stops the *other*
+        idle siblings -- including ones holding a model still queued behind the head, which the generic
+        scale-down guard would otherwise protect and thereby pin the count above the target forever. Those
+        queued jobs wait and reload once the head drains (see :meth:`_restore_siblings_after_whole_card`).
+        Reclaiming the siblings' CUDA contexts and moving safety off-GPU leaves the staged head the whole card
+        when it samples. A no-op until a residency is held and its model is staged; idempotent at the target.
+        Converges every held residency, so on a multi-GPU host each card's pre-staged head collapses its own
+        card independently.
         """
         for device_index, state in self._held_residencies():
             model = state.model
@@ -1098,7 +1101,11 @@ class InferenceScheduler:
             forecast = state.forecast
             target = (forecast.max_resident_processes() or 1) if forecast is not None else 1
             if self._process_map.num_loaded_inference_processes(device_index=device_index) > target:
-                self._process_lifecycle.scale_inference_processes(target, device_index=device_index)
+                self._process_lifecycle.scale_inference_processes(
+                    target,
+                    device_index=device_index,
+                    whole_card_model=model,
+                )
             if self._residency_should_pause_safety(device_index) and not self._process_lifecycle.is_safety_gpu_paused:
                 self._process_lifecycle.pause_safety_on_gpu()
 
@@ -1424,10 +1431,67 @@ class InferenceScheduler:
                 f"its model is resident and idle on process {process.process_id}, but the overlap-headway gate "
                 "is holding it (the in-flight job has not made enough progress to share the card)"
             )
+
+        # A held whole-card residency parks its own pre-staged head until the live inference-process count
+        # collapses to the forecast's target (sole residency). The convergence teardown is meant to stop the
+        # idle siblings -- including ones holding a model queued behind the head -- sparing only the head's
+        # holder. If the head is still parked with such a sibling un-torn-down, the convergence shrink has not
+        # collapsed the pool, and the head will be deferred until the recovery supervisor soft-resets. Name
+        # that specific state rather than reporting a gate-less "scheduler stall", so the post-mortem points at
+        # the residency teardown rather than the dispatch path.
+        found_residency, residency_device = self._residency_holder_for_model(head.model)
+        if found_residency and self._prestaged_whole_card_not_ready(head):
+            blockers = self._whole_card_convergence_blockers(process, residency_device)
+            if blockers:
+                pinned = ", ".join(f"process {pid} holds queued model {model!r}" for pid, model in blockers)
+                return (
+                    f"its model is resident and idle on process {process.process_id}, but the whole-card "
+                    f"residency stuck: cannot reach sole residency because {pinned} -- the convergence teardown "
+                    f"should have stopped that idle sibling (only the head's holder is spared), so the shrink "
+                    f"has not collapsed the pool and the head never dispatches"
+                )
+            return (
+                f"its model is resident and idle on process {process.process_id}, but its whole-card residency "
+                f"has not yet converged to sole residency (siblings still tearing down or the device draining)"
+            )
+
         return (
             f"its model is resident and idle on process {process.process_id} but dispatch was withheld with no "
             "matching gate -- this is a scheduler stall worth reporting"
         )
+
+    def _whole_card_convergence_blockers(
+        self,
+        head_process: HordeProcessInfo,
+        device_index: int | None,
+    ) -> list[tuple[int, str]]:
+        """Return idle sibling processes still holding a queued model while a whole-card head is parked.
+
+        Returns ``(process_id, model)`` for each inference process other than the head's own holder that is
+        idle (not busy), pinned to ``device_index`` when scoped, and holds a model that is still queued. The
+        whole-card convergence is meant to have torn these siblings down (sparing only the head's holder), so
+        finding any while the head is still parked is the fingerprint of a teardown that did not collapse the
+        pool. Read-only; used only to explain a stalled dispatch.
+        """
+        queued_models = {
+            job.model
+            for job in (*self._job_tracker.jobs_pending_inference, *self._job_tracker.jobs_in_progress)
+            if job.model is not None
+        }
+        blockers: list[tuple[int, str]] = []
+        for proc in self._process_map.values():
+            if proc.process_type is not HordeProcessType.INFERENCE:
+                continue
+            if proc.process_id == head_process.process_id:
+                continue
+            if device_index is not None and proc.device_index != device_index:
+                continue
+            if proc.is_process_busy():
+                continue
+            model = proc.loaded_horde_model_name
+            if model is not None and model in queued_models:
+                blockers.append((proc.process_id, model))
+        return blockers
 
     def _log_dispatch_stall_if_needed(
         self,

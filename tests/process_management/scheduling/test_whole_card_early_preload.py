@@ -214,7 +214,7 @@ class TestResidencyConvergesAfterDrain:
         Post-drain state: Flux is resident in RAM on a spare (``PRELOADED_MODEL``), the former busy process is
         idle but still holds its CUDA context, and no job is in progress. The residency must now scale down to
         the model's target (1) so Flux samples with the whole card; the process holding the pre-staged Flux is
-        protected from the teardown (it carries the queued model).
+        protected from the teardown as the whole-card residency holder.
         """
         _seed_flux_weight_estimates(monkeypatch)
 
@@ -258,7 +258,13 @@ class TestResidencyConvergesAfterDrain:
 
         scheduler.preload_models()
 
-        scheduler._process_lifecycle.scale_inference_processes.assert_called_with(1, device_index=None)
+        # The convergence shrink is whole-card aware: it spares only the staged Flux holder, not every
+        # idle sibling whose model is queued.
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_with(
+            1,
+            device_index=None,
+            whole_card_model=_FLUX_MODEL,
+        )
 
 
 def _live_log_overlap_scheduler(

@@ -320,7 +320,12 @@ and the total/live-context counts take a `device_index` and read just that card;
 the budget compares the job against *that card's* free VRAM plus its own committed
 reserve, eviction reclaims only that card's idle residents, and a whole-card
 exclusive residency claims (and later restores) one card's process pool
-independently of the others. A fresh preload also chooses *which* eligible card to
+independently of the others. Collapsing to that sole residency deliberately stops
+the idle siblings even when their model is still queued *behind* the heavy head: the
+head owns the card, so those queued jobs wait and their models reload once it drains.
+The generic scale-down spares any queued-model process, which would otherwise pin the
+count above the target and wedge the convergence forever; the residency instead tells
+the scale-down it is a whole-card collapse so it spares only the head's holder. A fresh preload also chooses *which* eligible card to
 load onto by the same sticky-then-least-loaded policy dispatch uses: a card already
 holding the model first (no duplicate load), then the eligible card running the
 fewest jobs. The single safety process is moved off-GPU only for a

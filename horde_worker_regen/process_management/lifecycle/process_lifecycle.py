@@ -773,7 +773,13 @@ class ProcessLifecycleManager:
             pid += 1
         return pid
 
-    def scale_inference_processes(self, target_count: int, *, device_index: int | None = None) -> int:
+    def scale_inference_processes(
+        self,
+        target_count: int,
+        *,
+        device_index: int | None = None,
+        whole_card_model: str | None = None,
+    ) -> int:
         """Grow or shrink the running inference processes toward ``target_count``.
 
         Growth spawns fresh processes (bounded by the launched-process ceiling). Shrink ends idle
@@ -789,6 +795,15 @@ class ProcessLifecycleManager:
                 lever a whole-card residency uses to reduce one card's live contexts on a multi-GPU host).
                 When None, the worker-wide pool, bounded by the launched-process ceiling (the single-GPU /
                 benchmark behaviour, unchanged).
+            whole_card_model: When set, this shrink is a whole-card residency collapsing to sole residency
+                for that model, so the usual "spare any process whose model is queued" protection is dropped:
+                whole-card residency means the heavy head owns the card and the queued siblings deliberately
+                wait (their models reload once the head drains, see
+                :meth:`InferenceScheduler._restore_siblings_after_whole_card`). Only the residency holder (the
+                process the head is staged/resident on) is spared -- otherwise a sibling holding a model queued
+                *behind* the head pins the count above the target and the residency can never converge, wedging
+                the queue. Busy processes are still never killed (the victim selection skips them), so live work
+                is unaffected. Leave None for the ordinary benchmark / pressure shrink.
 
         Returns:
             The number of inference processes after scaling (scoped to ``device_index`` when given).
@@ -809,15 +824,14 @@ class ProcessLifecycleManager:
                 self._start_inference_process(pid, device_index=new_process_device)
                 logger.info(f"Scaled up: started inference process {pid}")
         elif target < current:
-            disallowed = self.get_processes_with_model_for_queued_job()
-            if device_index is not None:
-                # Confine the shrink to this card: every inference process on another card is off-limits, so
-                # only an idle process on the target card can be the victim.
-                disallowed = disallowed + [
-                    p.process_id
-                    for p in self._process_map.values()
-                    if p.process_type is HordeProcessType.INFERENCE and p.device_index != device_index
-                ]
+            if whole_card_model is not None:
+                disallowed = self._whole_card_protected_processes(whole_card_model, device_index)
+            else:
+                disallowed = self.get_processes_with_model_for_queued_job()
+                if device_index is not None:
+                    # Confine the shrink to this card: every inference process on another card is off-limits, so
+                    # only an idle process on the target card can be the victim.
+                    disallowed = disallowed + self._other_card_inference_processes(device_index)
             for _ in range(current - target):
                 victim = self._process_map._get_first_inference_process_to_kill(disallowed_processes=disallowed)
                 if victim is None:
@@ -828,6 +842,33 @@ class ProcessLifecycleManager:
                 logger.info(f"Scaled down: stopped inference process {victim.process_id}")
 
         return self._process_map.num_loaded_inference_processes(device_index=device_index)
+
+    def _other_card_inference_processes(self, device_index: int) -> list[int]:
+        """Return inference processes pinned to a card other than ``device_index`` (off-limits for a scoped shrink)."""
+        return [
+            p.process_id
+            for p in self._process_map.values()
+            if p.process_type is HordeProcessType.INFERENCE and p.device_index != device_index
+        ]
+
+    def _whole_card_protected_processes(self, whole_card_model: str, device_index: int | None) -> list[int]:
+        """Return the processes a whole-card convergence shrink must spare: the residency holder, plus other cards.
+
+        The residency holder is whichever inference process the heavy head is staged or resident on (its
+        ``loaded_horde_model_name`` is ``whole_card_model``; a ``PRELOADED_MODEL`` head sets that name). Unlike
+        :meth:`get_processes_with_model_for_queued_job`, an idle sibling holding some *other* queued model is
+        deliberately left stoppable -- collapsing to sole residency is the whole point, and that sibling's
+        queued job waits and reloads after the head drains. When ``device_index`` is set the shrink is scoped
+        to one card, so every inference process on another card is also off-limits.
+        """
+        protected = [
+            p.process_id
+            for p in self._process_map.values()
+            if p.process_type is HordeProcessType.INFERENCE and p.loaded_horde_model_name == whole_card_model
+        ]
+        if device_index is not None:
+            protected += self._other_card_inference_processes(device_index)
+        return protected
 
     def end_inference_processes(
         self,

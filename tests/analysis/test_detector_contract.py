@@ -26,6 +26,7 @@ import pytest
 from horde_worker_regen.analysis.detectors import DETECTORS, Detector, Severity
 from tests.analysis.test_detectors import (
     _DISPATCH_BUG_REASON,
+    _DISPATCH_WHOLE_CARD_REASON,
     _STARTUP,
     _TRACEBACK,
     _consecutive_pause,
@@ -154,6 +155,16 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "detect_head_dispatch_stall": Contract(
         bridge=_bridge(_dispatch_stall("13:01:00.000", reason=_DISPATCH_BUG_REASON)),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_whole_card_convergence_wedge": Contract(
+        bridge=_bridge(
+            _dispatch_stall(
+                "13:01:00.000",
+                reason=_DISPATCH_WHOLE_CARD_REASON,
+                model="Flux.1-Schnell fp8 (Compact)",
+            ),
+        ),
         severity=Severity.CRITICAL,
     ),
     "detect_consecutive_failure_pause": Contract(

@@ -78,6 +78,12 @@ _LOST_SAFETY_RESULT_RE = re.compile(r"Expected to find a completed job .* none w
 # it, yet nothing dispatched).
 _DISPATCH_STALL_RE = re.compile(r"Inference dispatch stalled: head ")
 _DISPATCH_STALL_BUG_RE = re.compile(r"dispatch was withheld with no matching gate")
+# The whole-card residency convergence deadlock: a heavy head is pre-staged and waiting for sole residency,
+# but an idle sibling holds a model that is still queued behind it, so the scale-down guard protects that
+# sibling from the teardown and the residency never collapses. The head is parked until the recovery
+# supervisor soft-resets the pools. This is a distinct, nameable root cause (not a generic dispatch-path bug),
+# so it gets its own detector; the phrase is the worker's _diagnose_dispatch_stall attribution for it.
+_WHOLE_CARD_WEDGE_RE = re.compile(r"whole-card residency stuck: cannot reach sole residency")
 
 # A median pop->submit latency this many times the median generation time means jobs are aging in the
 # pipeline queue, not in generation (the post-inference safety-backlog signature).
@@ -690,15 +696,59 @@ def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
     ]
 
 
+def detect_whole_card_convergence_wedge(context: SessionContext) -> list[Finding]:
+    """A whole-card head parked because the residency cannot collapse to sole residency.
+
+    The wedge fingerprint: a heavy whole-card head (e.g. Flux fp8) is pre-staged into a spare process, but an
+    idle sibling still holds a model that is queued *behind* the head, and the live process count never reaches
+    the forecast target -- so the pre-staged head is deferred every tick until the recovery supervisor
+    soft-resets the pools (faulting the head and forcing process recoveries). The whole-card convergence
+    teardown is supposed to stop exactly that idle sibling (sparing only the head's holder), so reaching this
+    state means the convergence shrink did not engage for this process/queue shape. It is distinct from a
+    generic dispatch-path stall, so it is named explicitly in the worker's dispatch-stall log and detected on
+    its own here.
+    """
+    wedges = _matching(context.session.records, _WHOLE_CARD_WEDGE_RE)
+    if not wedges:
+        return []
+    return [
+        Finding(
+            id="whole_card_convergence_wedge",
+            severity=Severity.CRITICAL,
+            title="Whole-card residency cannot reach sole residency (queued-model sibling pins the teardown)",
+            verdict=(
+                f"A pre-staged whole-card head was parked {len(wedges)} time(s) because an idle sibling process "
+                "still holds a model queued behind it and was not torn down, so the residency never collapsed "
+                "to sole residency and the head was deferred until the recovery supervisor soft-reset the pools "
+                "(faulting the head and forcing process recoveries). The whole-card convergence is meant to "
+                "stop that sibling (sparing only the head's holder), so this indicates the convergence shrink "
+                "did not engage for this process/queue shape."
+            ),
+            remediation=(
+                "Capture the surrounding scheduling logs and the process map: confirm the pre-staged head's "
+                "holder is identified (its loaded model name) and that the idle sibling is genuinely idle (not "
+                "busy). A recurrence points at the whole-card teardown failing to stop an eligible sibling. As "
+                "an operational stopgap, reducing queue_size or avoiding a heavy whole-card model alongside a "
+                "deep same-cycle queue lowers the odds of hitting this shape."
+            ),
+            evidence=[_evidence(r) for r in wedges[:3]],
+            see_also="head_dispatch_stall",
+        ),
+    ]
+
+
 def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
     """A head-of-queue job that did not dispatch despite pending work and an idle, model-resident process.
 
     The scheduler returns ``None`` silently from several gates, so a stuck queue with idle processes used to
     leave no record of *why* the head was parked. The new dispatch-stall log names the blocking gate; the
     "no matching gate" variant is the genuinely anomalous case (the head's model is resident and idle, no
-    gate is holding it, yet nothing dispatched) and is reported as critical, the rest as a warning.
+    gate is holding it, yet nothing dispatched) and is reported as critical, the rest as a warning. The
+    whole-card convergence wedge has its own detector (:func:`detect_whole_card_convergence_wedge`), so its
+    lines are excluded here to avoid double-reporting the same stall as a generic warning.
     """
-    stalls = _matching(context.session.records, _DISPATCH_STALL_RE)
+    wedge_stalls = _matching(context.session.records, _WHOLE_CARD_WEDGE_RE)
+    stalls = [r for r in _matching(context.session.records, _DISPATCH_STALL_RE) if r not in wedge_stalls]
     if not stalls:
         return []
 
@@ -773,6 +823,7 @@ DETECTORS: list[Detector] = [
     detect_scheduler_starvation_wedge,
     detect_slow_generation_drop_spiral,
     detect_safety_stage_stall,
+    detect_whole_card_convergence_wedge,
     detect_head_dispatch_stall,
     detect_consecutive_failure_pause,
     detect_oom,
