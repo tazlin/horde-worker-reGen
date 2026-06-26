@@ -110,6 +110,7 @@ class TestReceiveAndHandleProcessMessages:
         msg.current_step = None
         msg.total_steps = None
         msg.iterations_per_second = None
+        msg.nonadvancing_step_repeats = 0
 
         _enqueue(message_dispatcher, msg)
         await message_dispatcher.receive_and_handle_process_messages()

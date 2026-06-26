@@ -1812,6 +1812,13 @@ class ProcessLifecycleManager:
         # below it is harmless.
         first_step_timeout = bridge_data.inference_first_step_timeout
 
+        # A slot stuck repeating one sampling step is not silent (it keeps heart-beating), so the
+        # silence-based timeout above cannot catch it; the child forwards a non-advancing-repeat count
+        # that this limit reaps on instead. Guard the type so a mocked config in tests cannot misfire.
+        stuck_step_limit = bridge_data.inference_stuck_step_repeat_limit
+        if not isinstance(stuck_step_limit, int) or isinstance(stuck_step_limit, bool):
+            stuck_step_limit = None
+
         for process_info in list(self._process_map.values()):
             if self._process_map.is_stuck_on_inference(
                 process_info.process_id,
@@ -1825,6 +1832,27 @@ class ProcessLifecycleManager:
                     os_pid=process_info.os_pid,
                     launch_identifier=process_info.process_launch_identifier,
                     reason="stuck mid inference (no step progress within inference_step_timeout)",
+                )
+                self._replace_inference_process(process_info)
+                any_replaced = True
+                self._recently_recovered = True
+                threading.Thread(target=timed_unset_recently_recovered).start()
+            elif stuck_step_limit is not None and self._process_map.is_stuck_on_nonadvancing_step(
+                process_info.process_id,
+                stuck_step_limit,
+            ):
+                logger.error(
+                    f"Inference slot {process_info.process_id} is stuck on a non-advancing sampling step "
+                    f"(reported step {process_info.last_current_step}/{process_info.last_total_steps} without "
+                    f"advancing {process_info.nonadvancing_step_repeats} times); the ComfyUI generation will "
+                    f"not return a result, replacing it (stuck-step watchdog).",
+                )
+                self._action_ledger.record(
+                    LedgerEventType.TIMEOUT_DETECTED,
+                    process_id=process_info.process_id,
+                    os_pid=process_info.os_pid,
+                    launch_identifier=process_info.process_launch_identifier,
+                    reason="stuck on a non-advancing sampling step (stuck-step watchdog)",
                 )
                 self._replace_inference_process(process_info)
                 any_replaced = True

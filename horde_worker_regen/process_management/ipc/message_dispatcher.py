@@ -372,6 +372,7 @@ class MessageDispatcher:
             current_step=message.current_step,
             total_steps=message.total_steps,
             iterations_per_second=message.iterations_per_second,
+            nonadvancing_step_repeats=message.nonadvancing_step_repeats,
         )
 
         in_progress_job_info = self._process_map[message.process_id].last_job_referenced

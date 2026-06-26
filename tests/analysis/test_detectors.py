@@ -120,6 +120,38 @@ def _force_admit(ts: str, *, starved_seconds: int, free_vram_mb: int, model: str
     )
 
 
+def _stuck_step_reap(ts: str, *, slot: int = 3, repeats: int = 3060) -> str:
+    """The stuck-step watchdog's reap line for a slot looping on one sampling step."""
+    return (
+        f"2026-06-26 {ts} | ERROR    | horde_worker_regen.process_management.lifecycle.process_lifecycle:replace_hung_processes:1830 - "
+        f"Inference slot {slot} is stuck on a non-advancing sampling step (reported step 24/25 without "
+        f"advancing {repeats} times); the ComfyUI generation will not return a result, replacing it "
+        f"(stuck-step watchdog)."
+    )
+
+
+class TestStuckInferenceStep:
+    """The detector for a slot wedged repeating one sampling step (the non-silent hang)."""
+
+    def _bridge(self, *lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-26 09:00:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_fires_and_points_at_the_lora_shape_cause(self, tmp_path: Path) -> None:
+        """The finding surfaces as a WARNING and steers the operator toward the upstream model/LoRA fault."""
+        findings = _diagnose(tmp_path, self._bridge(_stuck_step_reap("09:48:02.000")))
+        assert "stuck_inference_step" in findings
+        finding = findings["stuck_inference_step"]
+        assert finding.severity is Severity.WARNING
+        assert "lora" in finding.remediation.lower()
+
+    def test_silent_without_a_reap(self, tmp_path: Path) -> None:
+        """No reap line means no finding (the detector keys on the watchdog's own emit)."""
+        findings = _diagnose(tmp_path, self._bridge())
+        assert "stuck_inference_step" not in findings
+
+
 def _soft_reset(ts: str, *, level: int = 1) -> str:
     return (
         f"2026-06-25 {ts} | ERROR    | horde_worker_regen.process_management.process_manager:_perform_soft_reset:2070 - "

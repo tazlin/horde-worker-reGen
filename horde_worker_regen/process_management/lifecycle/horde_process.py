@@ -254,6 +254,7 @@ class HordeProcess(abc.ABC):
         current_step: int | None = None,
         total_steps: int | None = None,
         iterations_per_second: float | None = None,
+        nonadvancing_step_repeats: int = 0,
     ) -> None:
         """Send a heartbeat message to the main process, indicating that the process is still alive.
 
@@ -278,6 +279,7 @@ class HordeProcess(abc.ABC):
             current_step=current_step,
             total_steps=total_steps,
             iterations_per_second=iterations_per_second,
+            nonadvancing_step_repeats=nonadvancing_step_repeats,
         )
         self.process_message_queue.put(message)
 

@@ -190,6 +190,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         current_step: int | None = None,
         total_steps: int | None = None,
         iterations_per_second: float | None = None,
+        nonadvancing_step_repeats: int = 0,
     ) -> None:
         """Update the heartbeat for the given process ID.
 
@@ -202,6 +203,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             total_steps (int | None, optional): The total sampling steps, if applicable. Defaults to None.
             iterations_per_second (float | None, optional): The instantaneous sampling rate, \
                 if applicable. Defaults to None.
+            nonadvancing_step_repeats (int, optional): The child's running count of consecutive \
+                progress reports at the same sampling step without advancing. Defaults to 0.
         """
         self[process_id].last_heartbeat_delta = time.time() - self[process_id].last_heartbeat_timestamp
         self[process_id].last_received_timestamp = time.time()
@@ -213,6 +216,9 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             self[process_id].heartbeats_inference_steps = 0
 
         self[process_id].last_heartbeat_percent_complete = percent_complete
+        # The child sends its authoritative running count on every heartbeat (0 while advancing), so
+        # store it verbatim rather than re-deriving it here from the (step-less) post-completion beats.
+        self[process_id].nonadvancing_step_repeats = nonadvancing_step_repeats
 
         if heartbeat_type == HordeHeartbeatType.INFERENCE_STEP:
             if self[process_id].current_first_step_at is None:
@@ -412,6 +418,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].last_total_steps = None
         self[process_id].last_iterations_per_second = None
         self[process_id].current_first_step_at = None
+        self[process_id].nonadvancing_step_repeats = 0
 
     def delete_safety_processes(self) -> None:
         """Clear all safety processes."""
@@ -458,6 +465,26 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             timeout = max(inference_step_timeout, first_step_timeout)
 
         return (time.time() - process_info.last_heartbeat_timestamp) > timeout
+
+    def is_stuck_on_nonadvancing_step(self, process_id: int, repeat_limit: int) -> bool:
+        """Return true if a sampling slot keeps reporting the same step without ever advancing.
+
+        This is the wedge :meth:`is_stuck_on_inference` is blind to. There, a hung child goes *silent*
+        and the heartbeat-silence gap catches it. Here the child is not silent: the underlying ComfyUI
+        generation loops on a single step (in practice the final one, which a healthy job reports exactly
+        once), so the child keeps receiving identical progress callbacks and keeps emitting heartbeats.
+        Every heartbeat refreshes ``last_heartbeat_timestamp``, so the silence gap never grows and the
+        slot sits in ``INFERENCE_STARTING`` forever, holding VRAM and a queue slot while never returning
+        a result. The child counts those non-advancing reports and forwards the running count; once it
+        crosses ``repeat_limit`` the generation is wedged and the slot must be reaped despite its liveness.
+
+        The limit sits far above the healthy ceiling of one same-step report, so a job that briefly
+        re-reports its final step before returning is never mistaken for a wedge.
+        """
+        process_info = self[process_id]
+        if process_info.last_process_state != HordeProcessState.INFERENCE_STARTING:
+            return False
+        return process_info.nonadvancing_step_repeats >= repeat_limit
 
     def get_capable_processes(self, capability: WorkerCapability) -> list[HordeProcessInfo]:
         """Return all processes declaring the given capability.

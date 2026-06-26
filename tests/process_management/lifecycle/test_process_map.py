@@ -232,6 +232,75 @@ class TestFirstStepTimeout:
         assert process_map.is_stuck_on_inference(0, self._PER_STEP) is True
 
 
+class TestStuckOnNonAdvancingStep:
+    """Detecting a slot that keeps reporting the same sampling step without advancing.
+
+    The child forwards a running count of non-advancing progress reports; the map exposes it as a
+    reap signal that, unlike ``is_stuck_on_inference``, does not depend on the slot going silent.
+    """
+
+    _LIMIT = 6
+
+    def test_on_heartbeat_stores_the_forwarded_count(self) -> None:
+        """The map records the child's authoritative non-advancing count verbatim."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        process_map = ProcessMap({0: proc})
+
+        process_map.on_heartbeat(0, HordeHeartbeatType.PIPELINE_STATE_CHANGE, nonadvancing_step_repeats=9)
+
+        assert proc.nonadvancing_step_repeats == 9
+
+    def test_advancing_heartbeat_clears_the_count(self) -> None:
+        """An advancing step (the child sends 0) resets the stored count, so a wedge must be sustained."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        process_map = ProcessMap({0: proc})
+        process_map.on_heartbeat(0, HordeHeartbeatType.PIPELINE_STATE_CHANGE, nonadvancing_step_repeats=5)
+
+        process_map.on_heartbeat(
+            0,
+            HordeHeartbeatType.INFERENCE_STEP,
+            current_step=12,
+            total_steps=25,
+            nonadvancing_step_repeats=0,
+        )
+
+        assert proc.nonadvancing_step_repeats == 0
+
+    def test_stuck_when_count_reaches_limit_while_sampling(self) -> None:
+        """At or above the limit, a sampling slot is judged wedged."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        proc.nonadvancing_step_repeats = self._LIMIT
+        process_map = ProcessMap({0: proc})
+
+        assert process_map.is_stuck_on_nonadvancing_step(0, self._LIMIT) is True
+
+    def test_not_stuck_below_the_limit(self) -> None:
+        """Under the limit (a stray duplicate) is not a wedge."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        proc.nonadvancing_step_repeats = self._LIMIT - 1
+        process_map = ProcessMap({0: proc})
+
+        assert process_map.is_stuck_on_nonadvancing_step(0, self._LIMIT) is False
+
+    def test_not_stuck_when_not_sampling(self) -> None:
+        """A high count left over on an idle slot must not be read as a live wedge."""
+        proc = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)
+        proc.nonadvancing_step_repeats = self._LIMIT * 3
+        process_map = ProcessMap({0: proc})
+
+        assert process_map.is_stuck_on_nonadvancing_step(0, self._LIMIT) is False
+
+    def test_reset_heartbeat_state_clears_the_count(self) -> None:
+        """The count is job-scoped: a job boundary clears it so it cannot leak into the next job."""
+        proc = make_mock_process_info(0, state=HordeProcessState.INFERENCE_STARTING)
+        proc.nonadvancing_step_repeats = self._LIMIT
+        process_map = ProcessMap({0: proc})
+
+        process_map.reset_heartbeat_state(0)
+
+        assert proc.nonadvancing_step_repeats == 0
+
+
 class TestIsLaunchActive:
     """ProcessMap.is_launch_active distinguishes the live launch from a replaced or absent one."""
 

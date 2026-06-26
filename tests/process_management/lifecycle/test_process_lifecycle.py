@@ -38,6 +38,7 @@ def _make_plm(
     bridge_data.safety_on_gpu = False
     bridge_data.process_timeout = 120
     bridge_data.inference_step_timeout = 60
+    bridge_data.inference_stuck_step_repeat_limit = 6
     bridge_data.preload_timeout = 120
     bridge_data.download_timeout = 120
     bridge_data.post_process_timeout = 60
@@ -156,6 +157,61 @@ class TestModelLoadFailureQuarantine:
         assert 3 not in plm._quarantined_inference_slots
         # The slot's crash-loop counter must be untouched: load failures are the model's fault, not the slot's.
         assert plm._slot_recovery_history.get(3, []) == []
+
+
+class TestStuckOnNonAdvancingStep:
+    """The stuck-step watchdog reaps a slot looping on one sampling step, which silence cannot catch.
+
+    Reproduces the live wedge: an inference slot whose ComfyUI generation loops on the final step keeps
+    receiving identical progress callbacks and keeps emitting heartbeats, so ``last_heartbeat_timestamp``
+    stays fresh and the silence-based hang watchdog never fires. The slot sits in ``INFERENCE_STARTING``
+    indefinitely, holding VRAM and a queue slot while never returning a result. The fix reaps it once the
+    child-forwarded non-advancing-repeat count crosses the configured limit.
+    """
+
+    def _starting_slot(self, *, repeats: int) -> HordeProcessInfo:
+        """An INFERENCE_STARTING slot with a fresh heartbeat (not silent) and the given repeat count."""
+        proc = make_mock_process_info(1, model_name="m", state=HordeProcessState.INFERENCE_STARTING)
+        now = time.time()
+        # Fresh liveness on every clock the silence watchdog reads, so only the repeat count can reap it.
+        proc.last_heartbeat_timestamp = now
+        proc.last_received_timestamp = now
+        proc.last_process_state_started_at = now
+        proc.last_current_step = 24
+        proc.last_total_steps = 25
+        proc.nonadvancing_step_repeats = repeats
+        return proc
+
+    def test_wedged_slot_is_reaped_despite_fresh_heartbeats(self) -> None:
+        """A non-silent slot past the repeat limit is replaced (the bug: it never was)."""
+        proc = self._starting_slot(repeats=6)
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_called_once_with(proc)
+
+    def test_slot_below_the_limit_is_left_alone(self) -> None:
+        """A stray duplicate report (under the limit) is not a wedge and must not be reaped."""
+        proc = self._starting_slot(repeats=2)
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_not_called()
+
+    def test_idle_slot_with_a_stale_count_is_not_reaped(self) -> None:
+        """The count only reaps a slot that is actually sampling (INFERENCE_STARTING), not an idle one."""
+        proc = self._starting_slot(repeats=20)
+        proc.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_not_called()
 
 
 def test_empty_process_map_is_not_declared_all_unresponsive() -> None:

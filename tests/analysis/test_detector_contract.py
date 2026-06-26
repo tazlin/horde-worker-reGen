@@ -80,6 +80,16 @@ def _orphan_punt(ts: str, *, job_id: str, stuck_seconds: int = 42) -> str:
     )
 
 
+def _stuck_step(ts: str, *, slot: int = 3, repeats: int = 3060) -> str:
+    """process_lifecycle.replace_hung_processes: the stuck-step watchdog reaping a wedged sampling slot."""
+    return (
+        f"2026-06-26 {ts} | ERROR    | horde_worker_regen.process_management.lifecycle.process_lifecycle:replace_hung_processes:1830 - "
+        f"Inference slot {slot} is stuck on a non-advancing sampling step (reported step 24/25 without "
+        f"advancing {repeats} times); the ComfyUI generation will not return a result, replacing it "
+        f"(stuck-step watchdog)."
+    )
+
+
 def _oom(ts: str) -> str:
     """An explicit CUDA out-of-memory fault surfaced from an inference slot."""
     return f"2026-06-24 {ts} | ERROR | x:y:1 - CUDA out of memory. Tried to allocate 2.00 GiB"
@@ -177,6 +187,10 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "detect_consecutive_failure_pause": Contract(
         bridge=_bridge(_consecutive_pause("15:19:11.000")),
+        severity=Severity.WARNING,
+    ),
+    "detect_stuck_inference_step": Contract(
+        bridge=_bridge(_stuck_step("09:48:02.000")),
         severity=Severity.WARNING,
     ),
     "detect_oom": Contract(

@@ -90,6 +90,11 @@ _WHOLE_CARD_WEDGE_RE = re.compile(r"whole-card residency stuck: cannot reach sol
 # detector keyed on the worker's _diagnose_dispatch_stall phrase for it.
 _WHOLE_CARD_NONHEAD_RE = re.compile(r"whole-card residency is held for non-head model")
 
+# The stuck-step watchdog reaping a slot whose ComfyUI generation looped on one sampling step. The slot
+# kept heart-beating (so the silence watchdog stayed blind), which is exactly why this needs its own
+# detector rather than folding into a generic hang. The phrase is the worker's verbatim reap line.
+_STUCK_STEP_RE = re.compile(r"stuck on a non-advancing sampling step|stuck-step watchdog")
+
 # A median pop->submit latency this many times the median generation time means jobs are aging in the
 # pipeline queue, not in generation (the post-inference safety-backlog signature).
 _QUEUE_AGING_LATENCY_RATIO = 3.0
@@ -264,6 +269,36 @@ def detect_gave_up_clean(context: SessionContext) -> list[Finding]:
             ),
             remediation="No worker action needed beyond fixing the underlying crash cause; the bail-out worked.",
             evidence=[_evidence(abandon[0])],
+        ),
+    ]
+
+
+def detect_stuck_inference_step(context: SessionContext) -> list[Finding]:
+    """A slot wedged repeating one sampling step, which the silence-based hang watchdog cannot see."""
+    stuck = _matching(context.session.records, _STUCK_STEP_RE)
+    if not stuck:
+        return []
+    return [
+        Finding(
+            id="stuck_inference_step",
+            severity=Severity.WARNING,
+            title="Inference wedged on a non-advancing step",
+            verdict=(
+                f"{len(stuck)} time(s) an inference slot looped on a single sampling step (in practice the "
+                "final step) and never returned a result, while still emitting heartbeats. The slot was not "
+                "silent, so the per-step silence timeout could not catch it; the stuck-step watchdog reaped "
+                "it on the child's non-advancing-repeat count instead. Each occurrence stranded the in-flight "
+                "job and held the slot's VRAM until the reap."
+            ),
+            remediation=(
+                "Recovery worked, but the hang is upstream in ComfyUI/hordelib. The usual trigger is a "
+                "corrupt or incompatible model+LoRA combination: e.g. an SD1.5 LoRA applied to an SDXL "
+                "checkpoint produces a `ERROR lora ... shape ... is invalid` storm and then the pipeline "
+                "hangs at the final step. Check the affected slot's bridge_<N>.log just before the reap for "
+                "that shape-mismatch storm and exclude the offending LoRA/model pairing. If healthy jobs are "
+                "being reaped, raise `inference_stuck_step_repeat_limit`."
+            ),
+            evidence=[_evidence(r) for r in stuck[:4]],
         ),
     ]
 
@@ -881,6 +916,7 @@ DETECTORS: list[Detector] = [
     detect_whole_card_nonhead_residency_starvation,
     detect_head_dispatch_stall,
     detect_consecutive_failure_pause,
+    detect_stuck_inference_step,
     detect_oom,
     detect_swallowed_oom,
     detect_orphan_wedge,

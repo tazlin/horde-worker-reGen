@@ -369,6 +369,18 @@ class reGenBridgeData(CombinedHordeBridgeData):
     steady-state step, so the pre-first-step window uses this generous timeout and only falls back to the
     tighter ``inference_step_timeout`` once sampling progress has been observed. The watchdog floors the
     effective first-step grace at ``inference_step_timeout``, so a value below it has no effect."""
+    inference_stuck_step_repeat_limit: int = Field(default=6, ge=3, le=100)
+    """How many times a slot may report the *same* sampling step without advancing before it is reaped.
+
+    Guards a wedge the time-based ``inference_step_timeout`` cannot see: when the underlying ComfyUI
+    generation loops on a single step (in practice the final step, after a corrupt model+LoRA combination
+    or a pipeline fault), the child keeps receiving identical progress callbacks and keeps emitting
+    heartbeats, so the slot never goes silent and the hang watchdog never fires. It would otherwise sit in
+    ``INFERENCE_STARTING`` indefinitely, holding VRAM and a queue slot while never returning a result. A
+    healthy job reports each step (including the last) exactly once, so any sustained repeat is anomalous;
+    the default leaves headroom above a stray duplicate yet reaps a genuine wedge within seconds (progress
+    reports arrive roughly once a second). Lower it for faster recovery, raise it if a legitimate pipeline
+    on your hardware re-reports a step a handful of times before advancing."""
     contended_step_timeout: int = Field(default=120, ge=15, le=600)
     """Per-step hang timeout (seconds) for a slot doing legitimate but heartbeat-silent heavy work.
 

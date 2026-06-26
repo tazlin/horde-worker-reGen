@@ -131,6 +131,14 @@ class HordeProcessInfo:
     """The most recent sampling step reported by this process."""
     last_total_steps: int | None
     """The total steps of the most recent sampling run reported by this process."""
+    nonadvancing_step_repeats: int
+    """Consecutive non-advancing sampling-progress reports the child has forwarded for the current job.
+
+    0 during healthy sampling (each step is reported once). Climbs only when the child keeps receiving
+    progress callbacks at the same step without advancing -- the signature of a ComfyUI generation
+    wedged on a single step (typically the final one) that will never return a result. The heartbeats
+    that carry this keep arriving, so the silence-based hang watchdog cannot see the wedge; this count
+    is what the stuck-step watchdog reaps on instead."""
 
     last_job_metrics: JobPhaseMetrics | None
     """The per-job metrics snapshot from the most recently finished job on this process."""
@@ -226,6 +234,7 @@ class HordeProcessInfo:
         self.last_iterations_per_second = None
         self.last_current_step = None
         self.last_total_steps = None
+        self.nonadvancing_step_repeats = 0
 
         self.last_job_metrics = None
         self.vram_used_high_water_mb = 0

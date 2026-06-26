@@ -95,6 +95,21 @@ not from dispatch, so a long cold start or feature-heavy startup is never
 mislabelled as slow sampling; it only logs and feeds the widened timeout above,
 and never replaces a slot itself.
 
+Every timeout above measures *silence* — time since the last message or
+heartbeat. That misses one wedge: a generation that loops on a single sampling
+step without ever returning. ComfyUI keeps invoking the progress callback at
+that step (in practice the **final** step, after a corrupt or incompatible
+model+LoRA pairing), so the child keeps emitting heartbeats; the slot is never
+silent, and the per-step timeout never fires. The slot would sit in
+`INFERENCE_STARTING` indefinitely, holding VRAM and a queue slot. A healthy job
+reports each step (including the last) exactly once, so the child counts
+consecutive *non-advancing* progress reports and forwards the running count on
+its heartbeats. Once it crosses `inference_stuck_step_repeat_limit` the
+stuck-step watchdog reaps the slot despite its liveness. (The child cannot abort
+the wedged call itself: hordelib swallows exceptions raised inside the progress
+callback, so reaping is the parent's job.) The `detect_stuck_inference_step`
+[log detector](../reference/logs.md) recognizes the reap line after the fact.
+
 When a process exceeds its timeout, it is **replaced immediately** within the
 same call (see below); there is no separate notification sent to the message
 dispatcher. After any recovery, a short `recently_recovered` guard suppresses

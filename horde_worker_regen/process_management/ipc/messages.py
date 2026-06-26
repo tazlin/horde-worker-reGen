@@ -194,6 +194,15 @@ class HordeProcessHeartbeatMessage(HordeProcessMessage):
     iterations_per_second: float | None = None
     """The instantaneous sampling rate (-1.0 when not yet known), if applicable."""
 
+    nonadvancing_step_repeats: int = 0
+    """Consecutive progress reports the child has received at the *same* sampling step without advancing.
+
+    A healthy job reports each step (including the final one) exactly once, so this stays 0. When the
+    underlying ComfyUI generation loops on a single step (in practice the final step), the child keeps
+    receiving identical progress callbacks and keeps emitting heartbeats, so the parent's silence-based
+    hang watchdog never fires. The child counts those non-advancing reports and forwards the running
+    count here so the parent can reap the wedged slot even though it is not silent."""
+
 
 class HordeProcessStateChangeMessage(HordeProcessMessage):
     """State change messages that are sent from the child processes to the main process."""

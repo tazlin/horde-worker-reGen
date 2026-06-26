@@ -659,6 +659,16 @@ class HordeInferenceProcess(HordeProcess):
     _inference_slot_released: bool = False
     _post_processing_memory_report_sent: bool = False
 
+    _last_progress_step_seen: int | None = None
+    """The sampling step reported by the previous progress callback for the current job, or None."""
+    _nonadvancing_progress_repeats: int = 0
+    """Consecutive progress callbacks at the same step without advancing (0 while sampling advances).
+
+    A healthy generation reports each step (including the last) once, so this stays 0. It climbs only
+    when ComfyUI loops on a single step and never returns; it is forwarded on every heartbeat so the
+    parent's stuck-step watchdog can reap this slot, since the child cannot abort the wedged call itself
+    (hordelib swallows exceptions raised inside the progress callback)."""
+
     _last_job_inference_rate: str | None = None
     _last_inference_error: str | None = None
     """Summary of the exception that failed the current job's inference, or None if it succeeded.
@@ -702,6 +712,19 @@ class HordeInferenceProcess(HordeProcess):
         """
         from hordelib.api import ComfyUIProgressUnit, ProgressState, log_free_ram
 
+        # Track non-advancing sampling progress before any early return, so the post-completion repeats
+        # (the wedge signature: ComfyUI re-reporting the final step forever) are counted too. A healthy
+        # job reports each step once, so an advancing step resets the counter to 0.
+        reported_step = (
+            progress_report.comfyui_progress.current_step if progress_report.comfyui_progress is not None else None
+        )
+        if reported_step is not None:
+            if reported_step == self._last_progress_step_seen:
+                self._nonadvancing_progress_repeats += 1
+            else:
+                self._nonadvancing_progress_repeats = 0
+                self._last_progress_step_seen = reported_step
+
         if progress_report.hordelib_progress_state == ProgressState.post_processing or (
             self._in_post_processing and progress_report.hordelib_progress_state == ProgressState.progress
         ):
@@ -727,14 +750,20 @@ class HordeInferenceProcess(HordeProcess):
                 logger.debug("Acquired VAE decode semaphore")
                 self._send_inference_memory_report()
 
-            self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+            self.send_heartbeat_message(
+                heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,
+                nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
+            )
             self._maybe_send_periodic_memory_report()
             return
 
         if progress_report.comfyui_progress is not None and progress_report.comfyui_progress.current_step == (
             progress_report.comfyui_progress.total_steps
         ):
-            self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+            self.send_heartbeat_message(
+                heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,
+                nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
+            )
             self._current_job_inference_steps_complete = True
             self._send_inference_memory_report()
             logger.debug("Current job inference steps complete")
@@ -772,9 +801,13 @@ class HordeInferenceProcess(HordeProcess):
                 current_step=progress_report.comfyui_progress.current_step,
                 total_steps=progress_report.comfyui_progress.total_steps,
                 iterations_per_second=rate,
+                nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
             )
         else:
-            self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
+            self.send_heartbeat_message(
+                heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,
+                nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
+            )
 
         self._maybe_send_periodic_memory_report()
 
@@ -864,6 +897,8 @@ class HordeInferenceProcess(HordeProcess):
         self._post_processing_memory_report_sent = False
         self._last_job_inference_rate = None
         self._last_inference_error = None
+        self._last_progress_step_seen = None
+        self._nonadvancing_progress_repeats = 0
 
         try:
             self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)
@@ -902,6 +937,8 @@ class HordeInferenceProcess(HordeProcess):
             self._is_busy = False
             self._in_post_processing = False
             self._current_job_inference_steps_complete = False
+            self._last_progress_step_seen = None
+            self._nonadvancing_progress_repeats = 0
 
             self._send_job_metrics_message(str(job_info.id_))
             self._send_download_metrics_if_any()
