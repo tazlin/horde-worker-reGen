@@ -45,7 +45,7 @@ def test_stats_view_renders_populated_rollups() -> None:
         ),
     ]
 
-    text = _render(StatsView._render_rollups("By model", rows))
+    text = _render(StatsView._render_rollups("By model totals", rows))
 
     assert "Deliberate" in text
     assert "SD1.5" in text
