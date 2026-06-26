@@ -271,4 +271,3 @@ The same generator is available in the dashboard: the **Logs** tab has a **Suppo
 Worker configuration itself can be supplied through `AIWORKER_*` variables instead of
 `bridgeData.yaml` when you pass `-e`; this is the container path described in
 [Run headless](../how-to/run-headless.md#configure-from-environment-variables-containers).
-

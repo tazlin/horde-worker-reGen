@@ -48,4 +48,3 @@ less +F bridge_1.log
 
 Do **not** post `.log` files in public channels. Send them to a maintainer directly: we cannot
 guarantee your API key is not present in a log. See [Troubleshooting](../how-to/troubleshoot.md).
-

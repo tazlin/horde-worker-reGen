@@ -12,7 +12,7 @@
     - [See also](#see-also)
 
 The worker's parent process and its children communicate through a two-channel
-IPC (Inter-Process Communication) system. Understanding the message types and the 
+IPC (Inter-Process Communication) system. Understanding the message types and the
 optimistic-send pattern is essential for debugging state drift between parent and child.
 
 ## The two channels

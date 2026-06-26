@@ -19,7 +19,7 @@ import multiprocessing
 import os
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from typing import TextIO
@@ -122,7 +122,7 @@ def _stream_has_real_fd(stream: TextIO | None) -> bool:
 
 
 @contextlib.contextmanager
-def _real_std_streams_for_spawn() -> Iterator[None]:
+def _real_std_streams_for_spawn() -> Generator[None, None, None]:
     """Restore the interpreter's real ``stdout``/``stderr`` for the duration of a child-process spawn.
 
     On POSIX, multiprocessing's resource-tracker process is (re)launched lazily, and

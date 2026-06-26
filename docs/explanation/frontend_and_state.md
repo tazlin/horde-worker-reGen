@@ -233,4 +233,3 @@ module is dependency-light so it can be imported early in startup and by the TUI
 - [Resilience and Recovery](resilience_and_recovery.md): the owned-PID registry
   and action ledger that share the `.horde_worker_regen/` state directory
 - [Telemetry](telemetry.md): the separate observability layer
-

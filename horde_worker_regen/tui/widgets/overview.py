@@ -15,7 +15,6 @@ from textual.containers import Container, Vertical, VerticalScroll
 from textual.widgets import Static
 
 from horde_worker_regen.app_state import OverviewTrendWindow, OverviewViewMode
-from horde_worker_regen.update_check import UpdateInfo, current_version
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CardSnapshot,
     FeatureReadinessSummary,
@@ -60,6 +59,7 @@ from horde_worker_regen.tui.responsive import (
 )
 from horde_worker_regen.tui.trends import fixed_counter_deltas, fixed_float_buckets, trend_bounds
 from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
+from horde_worker_regen.update_check import UpdateInfo, current_version
 
 _TREND_HISTORY = 21600
 """How many one-second trend samples the Trends region retains (up to roughly six hours)."""

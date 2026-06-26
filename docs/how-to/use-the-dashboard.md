@@ -180,7 +180,3 @@ leaves the worker running.
 See also: [Frontend and durable state](../explanation/frontend_and_state.md) for the supervisor
 channel, served/attached modes, and persisted state; [Architecture](../explanation/architecture.md);
 and [IPC and messaging](../explanation/ipc_and_messaging.md).
-
-
-
-

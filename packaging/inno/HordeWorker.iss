@@ -59,9 +59,9 @@ LicenseFile={#StageDir}\THIRD-PARTY-NOTICES.md
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName=AI Horde Worker
-; The finished HordeWorker-Setup.exe is signed post-build by the release workflow 
+; The finished HordeWorker-Setup.exe is signed post-build by the release workflow
 ; (.github/workflows/release.yml) using Azure Trusted Signing over OIDC, which keeps
-; Local builds are therefore unsigned and will trip SmartScreen; that is expected for dev builds. 
+; Local builds are therefore unsigned and will trip SmartScreen; that is expected for dev builds.
 ; Do not re-enable an ISCC SignTool here.
 
 [Tasks]

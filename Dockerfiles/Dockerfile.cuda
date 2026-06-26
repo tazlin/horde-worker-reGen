@@ -21,7 +21,7 @@ ENV APP_HOME=/horde-worker-reGen
 # git is needed by hordelib's git-based dependency resolution, and it's generally useful to have in the image for debugging.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    git \ 
+    git \
     libgl1 \
     ca-certificates && \
     apt-get clean && \
