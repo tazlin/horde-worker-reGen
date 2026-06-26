@@ -898,6 +898,24 @@ class HordeWorkerProcessManager:
         self._recovery_supervisor = RecoverySupervisor()
         self._limp_by_active = False
 
+        # Save-our-ship doom tracking. A soft reset un-quarantines the inference pool to respawn it, so by
+        # the time the escalation reaches give-up a deterministically-doomed pool (every respawn re-crashes)
+        # can read as "recoverable" and the abort is declined. `_episode_saw_unrecoverable_pool` latches the
+        # doomed verdict for the life of the wedge episode so the give-up abort no longer hinges on the pool
+        # being quarantined at the exact give-up tick; it also holds the episode open while a doomed pool
+        # re-crashes without serving anything (so a slow restart cannot masquerade as recovery and reset the
+        # give-up clock). `_episode_progress_baseline` is the completed-job count when the episode opened: a
+        # later completion is genuine served progress that clears the latch.
+        self._episode_saw_unrecoverable_pool = False
+        self._episode_progress_baseline: int | None = None
+
+        # Runaway-recovery backstop, independent of the episode machinery: a pool that respawns and re-crashes
+        # in a tight loop racks up process recoveries without the give-up path ever catching it doomed at the
+        # right tick. Track recovery timestamps over a rolling window and abandon ship once they exceed the
+        # ceiling, so a continuously-flapping worker stops rather than recovering forever.
+        self._recovery_event_times: list[float] = []
+        self._last_seen_recovery_count = 0
+
         # Orphaned-in-progress-job watchdog: a job left INFERENCE_IN_PROGRESS that no live inference
         # slot owns will never produce a result, so it wedges the head of the queue forever unless
         # something punts it. `_orphan_in_progress_since` records when each such job was first seen
@@ -2211,11 +2229,91 @@ class HordeWorkerProcessManager:
             or self._orphan_wedge_active()
         )
 
+    _RUNAWAY_RECOVERY_WINDOW_SECONDS = 300.0
+    """Rolling window over which process recoveries are counted toward the runaway-recovery backstop."""
+
+    _RUNAWAY_RECOVERY_CEILING = 20
+    """Process recoveries within the window that mean the worker is flapping and must abandon ship.
+
+    Above the handful a transient incident legitimately incurs, below the unbounded count a deterministically
+    doomed pool produces while flapping between respawn and re-crash."""
+
+    def _made_progress_since_episode(self) -> bool:
+        """Whether a job has completed since the current wedge episode opened (genuine served progress).
+
+        Distinguishes a pool that actually recovered (it served work) from one that merely respawned its slots
+        without serving anything (a doomed pool flapping between crashes), which must not read as recovery.
+        """
+        if self._episode_progress_baseline is None:
+            return False
+        return self._job_tracker.total_num_completed_jobs > self._episode_progress_baseline
+
+    def _maybe_abort_on_runaway_recoveries(self) -> bool:
+        """Abandon ship if process recoveries are flapping faster than the rolling-window ceiling.
+
+        A clock/episode-independent backstop to the give-up escalation: a pool that respawns and re-crashes in
+        a tight loop racks up recoveries without the episode machinery ever catching it doomed at the give-up
+        tick. Returns True (after aborting) when the worker is flapping and must stop.
+        """
+        current = self._process_lifecycle._num_process_recoveries
+        if current < self._last_seen_recovery_count:
+            # The counter was reset (e.g. the warm benchmark resets it per level); restart tracking.
+            self._recovery_event_times.clear()
+            self._last_seen_recovery_count = current
+            return False
+        now = time.time()
+        new_recoveries = current - self._last_seen_recovery_count
+        self._last_seen_recovery_count = current
+        self._recovery_event_times.extend([now] * new_recoveries)
+        cutoff = now - self._RUNAWAY_RECOVERY_WINDOW_SECONDS
+        self._recovery_event_times = [t for t in self._recovery_event_times if t >= cutoff]
+        if len(self._recovery_event_times) < self._RUNAWAY_RECOVERY_CEILING or self._state.shutting_down:
+            return False
+        logger.critical(
+            f"Save-our-ship: {len(self._recovery_event_times)} process recoveries within "
+            f"{self._RUNAWAY_RECOVERY_WINDOW_SECONDS:.0f}s (ceiling {self._RUNAWAY_RECOVERY_CEILING}); the worker "
+            "is flapping and cannot stabilise. Abandoning ship (the last resort) rather than recovering forever.",
+        )
+        self._action_ledger.record(
+            LedgerEventType.RECOVERY_ABANDONED,
+            reason="save-our-ship: runaway process-recovery rate (flapping pool)",
+            detail={
+                "recoveries_in_window": len(self._recovery_event_times),
+                "window_seconds": self._RUNAWAY_RECOVERY_WINDOW_SECONDS,
+            },
+        )
+        self._abort()
+        return True
+
     def _run_recovery_supervisor(self) -> None:
         """Drive the save-our-ship escalation one tick and perform any action it returns."""
         if self._state.shutting_down:
             return
-        action = self._recovery_supervisor.evaluate(is_wedged=self._assess_wedge())
+        if self._maybe_abort_on_runaway_recoveries():
+            return
+        is_wedged = self._assess_wedge()
+        # Latch a doomed-pool verdict for the life of the wedge episode. A soft reset un-quarantines the pool
+        # to respawn it, so without this latch the give-up tick can read a deterministically-doomed pool as
+        # recoverable and decline to abort.
+        if self._is_inference_pool_unrecoverable() or self._is_safety_pool_unrecoverable():
+            self._episode_saw_unrecoverable_pool = True
+        if self._episode_saw_unrecoverable_pool:
+            if self._made_progress_since_episode():
+                # The doomed pool actually recovered and served work; it is no longer doomed.
+                self._episode_saw_unrecoverable_pool = False
+            else:
+                # Hold the episode open: a doomed pool that re-crashes without serving a job must not read as
+                # recovered just because its slots are transiently un-quarantined between crashes, or the clean
+                # streak would close the episode and reset the give-up clock (the slow-restart flap).
+                is_wedged = True
+        action = self._recovery_supervisor.evaluate(is_wedged=is_wedged)
+        # Maintain the episode-scoped progress baseline; clear the doom latch when the episode closes.
+        if self._recovery_supervisor.is_in_episode:
+            if self._episode_progress_baseline is None:
+                self._episode_progress_baseline = self._job_tracker.total_num_completed_jobs
+        else:
+            self._episode_progress_baseline = None
+            self._episode_saw_unrecoverable_pool = False
         if action is RecoveryAction.SOFT_RESET:
             self._perform_soft_reset()
             self._limp_by_active = True
@@ -2252,9 +2350,12 @@ class HordeWorkerProcessManager:
 
         Soft resets did not restore a working pool. Any jobs that cannot be served are reported faulted
         so the horde reissues them rather than holding them forever. If the worker structurally cannot
-        serve at all (inference pool unrecoverable, or safety pool failing), it shuts down cleanly: the
-        sanctioned last resort, so a permanently-broken worker stops rather than spinning, instead of
-        hanging. A worker whose pools later recover never reaches here (the episode closes first).
+        serve at all -- the inference pool is unrecoverable now, was seen doomed earlier this episode (a
+        soft reset's transient un-quarantine no longer masks that), no inference process is alive, or the
+        safety pool is failing -- it shuts down cleanly: the sanctioned last resort, so a permanently-broken
+        worker stops rather than spinning. A worker that genuinely recovers (it serves a job) clears the
+        doom latch and never aborts here; a healthy pool merely starved by a queue deadlock keeps capacity
+        available, reissues the stuck head, and keeps running.
         """
         faulted = 0
         # Reissue stuck pending work when the pool cannot serve it, OR when the pool is healthy but the
@@ -2295,7 +2396,16 @@ class HordeWorkerProcessManager:
                 "so the horde reissues them. Repeated drops like this can trigger horde-forced maintenance.",
             )
 
-        structurally_broken = self._is_inference_pool_unrecoverable() or self._is_safety_pool_unrecoverable()
+        # The pool cannot serve if it is quarantined out of the pool now, if it was seen doomed earlier this
+        # episode (a soft reset's transient un-quarantine must not mask that at the give-up tick), or if no
+        # inference process is alive at all. A healthy pool starved only by a queue deadlock keeps capacity
+        # available and is not broken: that case reissues the stuck head above and the worker keeps running.
+        structurally_broken = (
+            self._is_inference_pool_unrecoverable()
+            or self._is_safety_pool_unrecoverable()
+            or self._episode_saw_unrecoverable_pool
+            or not self._is_inference_capacity_available()
+        )
         self._action_ledger.record(
             LedgerEventType.RECOVERY_ABANDONED,
             reason="save-our-ship: soft resets could not restore a working pool",

@@ -31,13 +31,16 @@ no longer depends on the pool being quarantined at the exact give-up tick.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.lifecycle.recovery_supervisor import (
     _DEFAULT_CLEAN_STREAK_SECONDS,
     RecoverySupervisor,
 )
-from tests.process_management.conftest import make_testable_process_manager
+from tests.process_management.conftest import make_mock_process_info, make_testable_process_manager
 
 
 class _FakeClock:
@@ -140,3 +143,104 @@ class TestDoomedPoolEventuallyAborts:
             "Give-up fired on a doomed pool but did not abort because the pool was transiently "
             "un-quarantined by the preceding soft reset; the worker keeps running and loops."
         )
+
+
+class TestGiveUpDoesNotOverAbort:
+    """The doom-aware abort gate must not fire on a worker that is merely starved or has recovered."""
+
+    def test_healthy_pool_starved_by_queue_deadlock_does_not_abort(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A healthy pool (capacity available, never quarantined) must reissue work and keep running, not abort."""
+        pm = make_testable_process_manager()
+        aborted = {"called": False}
+        monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
+
+        # A live, idle inference process: capacity is available and no doom was ever latched.
+        pm._process_map[0] = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)
+        assert pm._is_inference_capacity_available() is True
+        assert pm._episode_saw_unrecoverable_pool is False
+
+        pm._give_up_on_wedged_jobs()
+
+        assert aborted["called"] is False
+
+    def test_served_progress_clears_doom_latch_so_recovered_worker_does_not_abort(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A doomed pool that recovers and serves a job clears the latch; a later give-up must not abort it."""
+        pm = make_testable_process_manager()
+        clock = _FakeClock()
+        pm._recovery_supervisor = RecoverySupervisor(clock=clock)
+        lifecycle = pm._process_lifecycle
+
+        aborted = {"called": False}
+        monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
+        monkeypatch.setattr(
+            lifecycle,
+            "rebuild_inference_pool",
+            lambda *, reason: lifecycle._quarantined_inference_slots.clear(),
+        )
+        monkeypatch.setattr(lifecycle, "rebuild_safety_pool", lambda *, reason: None)
+
+        # A live idle process so capacity stays available throughout: the latch, not the capacity gate, is
+        # what this exercises.
+        pm._process_map[0] = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)
+
+        # The episode opens doomed (every slot quarantined): the latch is set and the baseline captured.
+        lifecycle._quarantined_inference_slots = set(range(pm.max_inference_processes))
+        clock.advance(2.0)
+        pm._run_recovery_supervisor()
+        assert pm._episode_saw_unrecoverable_pool is True
+
+        # The pool genuinely recovers and serves a job: un-quarantine and record a completion past the baseline.
+        lifecycle._quarantined_inference_slots = set()
+        pm._job_tracker._total_num_completed_jobs += 1
+
+        # Tick well past the give-up age. The served progress clears the latch, so give-up declines to abort.
+        for _ in range(6):
+            clock.advance(2.0)
+            pm._run_recovery_supervisor()
+
+        assert pm._episode_saw_unrecoverable_pool is False
+        assert aborted["called"] is False
+
+
+class TestRunawayRecoveryBackstop:
+    """An independent, clock-agnostic catch-all: flapping recoveries abandon ship even if give-up never coincides."""
+
+    def test_flapping_recoveries_abandon_ship(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Recoveries past the ceiling within the window trip the backstop and abort the worker."""
+        pm = make_testable_process_manager()
+        aborted = {"called": False}
+        monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
+
+        pm._process_lifecycle._num_process_recoveries = pm._RUNAWAY_RECOVERY_CEILING
+
+        assert pm._maybe_abort_on_runaway_recoveries() is True
+        assert aborted["called"] is True
+
+    def test_sparse_recoveries_do_not_abandon_ship(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A recovery count just below the ceiling must not trip the backstop."""
+        pm = make_testable_process_manager()
+        aborted = {"called": False}
+        monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
+
+        pm._process_lifecycle._num_process_recoveries = pm._RUNAWAY_RECOVERY_CEILING - 1
+
+        assert pm._maybe_abort_on_runaway_recoveries() is False
+        assert aborted["called"] is False
+
+    def test_recoveries_outside_window_are_pruned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Recoveries older than the rolling window age out and cannot, alone, breach the ceiling."""
+        pm = make_testable_process_manager()
+        aborted = {"called": False}
+        monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
+
+        # A full ceiling's worth of recoveries, but all older than the window, with no new ones since.
+        stale = time.time() - pm._RUNAWAY_RECOVERY_WINDOW_SECONDS - 10.0
+        pm._recovery_event_times = [stale for _ in range(pm._RUNAWAY_RECOVERY_CEILING)]
+        pm._last_seen_recovery_count = pm._process_lifecycle._num_process_recoveries
+
+        assert pm._maybe_abort_on_runaway_recoveries() is False
+        assert aborted["called"] is False
+        assert pm._recovery_event_times == []
