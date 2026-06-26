@@ -141,7 +141,7 @@ def test_update_check_reports_available(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """`update --check` reports an available update without applying it."""
-    monkeypatch.setattr(cli.updater, "check_for_update", lambda root: _available_info())
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda root, **kw: _available_info())
     assert cli.main(["update", "--check"]) == 0
     assert "Update available" in capsys.readouterr().out
 
@@ -149,7 +149,7 @@ def test_update_check_reports_available(
 def test_update_applies_then_resyncs(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
     """`update --yes` applies the update and then re-syncs so the new deps are installed."""
     _, calls = env
-    monkeypatch.setattr(cli.updater, "check_for_update", lambda root: _available_info())
+    monkeypatch.setattr(cli.updater, "check_for_update", lambda root, **kw: _available_info())
     applied: list[bool] = []
     monkeypatch.setattr(
         cli.updater,
