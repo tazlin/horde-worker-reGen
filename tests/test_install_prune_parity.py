@@ -12,7 +12,7 @@ with an ``[InstallDelete]`` section.
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from worker_bootstrap import updater
 from worker_bootstrap.cli import _HANDLERS
@@ -57,6 +57,6 @@ def test_inno_installer_prunes_the_import_roots_before_copying() -> None:
     ``_MIRROR_DIRS`` so the two paths cannot drift.
     """
     iss_text = (REPO_ROOT / "packaging" / "inno" / "HordeWorker.iss").read_text(encoding="utf-8")
-    targets = {Path(name).name for name in _inno_install_delete_targets(iss_text)}
+    targets = {PureWindowsPath(name).name for name in _inno_install_delete_targets(iss_text)}
     missing = updater._MIRROR_DIRS - targets
     assert not missing, f"HordeWorker.iss [InstallDelete] must remove these import roots: {sorted(missing)}"
