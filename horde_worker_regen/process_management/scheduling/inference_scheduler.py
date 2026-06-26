@@ -144,6 +144,17 @@ by ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS``, yet its multi-gigabyte load equally 
 not be mistaken for a structural wedge that faults the never-run backlog. Bounded so a head that genuinely
 never loads still trips the supervisor."""
 
+_RAM_RECLAIM_CYCLE_GRACE_SECONDS = 60.0
+"""How long after the worker deliberately cycles an idle inference process to reclaim allocator-retained
+RAM (``_replace_stale_ram_unload_process``) the recovery supervisor keeps ignoring a queue wedge. The
+cycle restarts the slot (a ~20s spawn) and the next head must then preload onto it (another ~20s+), a
+window in which the queue is legitimately unservable through no fault of the pool. Without this grace
+that deliberate, bounded hold ages past ``_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS`` (20s) and is mistaken for
+a structural wedge -- soft-resetting the pools and faulting the perfectly-servable backlog (in a
+sole-process configuration this drops every queued job over a window the worker itself created).
+Covers the respawn + preload window; bounded so a cycle that genuinely never recovers still trips the
+supervisor."""
+
 _SCHEDULER_DIAGNOSTIC_REPEAT_SECONDS = 30.0
 """Minimum cadence for unchanged high-frequency scheduler diagnostics.
 
@@ -396,6 +407,11 @@ class InferenceScheduler:
         # branch, for a model that streams even alone). Its load equally holds the queue, so this bounds a
         # wedge grace that the whole-card establishment grace does not cover. 0.0 when none is loading.
         self._heavy_head_admitted_at: float = 0.0
+        # When an idle inference slot was last deliberately cycled to reclaim allocator-retained RAM
+        # (_replace_stale_ram_unload_process). The respawn + the next head's preload leave the queue
+        # briefly unservable through no fault of the pool, so this bounds a wedge grace covering that
+        # deliberate window. 0.0 when no reclaim cycle is in flight. See _RAM_RECLAIM_CYCLE_GRACE_SECONDS.
+        self._ram_reclaim_cycle_at: float = 0.0
         # Head-of-queue starvation backstop. Tracks the id of the job currently at the head of the queue
         # and when it first became budget-deferred onto an idle device, so a head that the budget gate
         # cannot fit (reclamation structurally exhausted) is force-admitted before the sustained-wedge
@@ -1198,6 +1214,21 @@ class InferenceScheduler:
             return False
         return (time.time() - self._heavy_head_admitted_at) < _HEAVY_HEAD_LOAD_GRACE_SECONDS
 
+    def ram_reclaim_cycle_grace_active(self) -> bool:
+        """Whether a deliberate RAM-reclaim process cycle is still inside its bounded respawn/preload window.
+
+        When the RAM budget cannot fit the next head and cycles an idle slot to return allocator-retained
+        RAM to the OS (:meth:`_replace_stale_ram_unload_process`), the slot respawns and the head must then
+        preload onto it. The queue is unservable across that window, but by the worker's own deliberate,
+        bounded action -- not a wedge. While true the recovery supervisor must not treat the held queue as a
+        structural wedge and fault the servable backlog. Bounded by ``_RAM_RECLAIM_CYCLE_GRACE_SECONDS`` so a
+        cycle that genuinely never recovers still trips the supervisor. Public: read by the process manager's
+        wedge assessment.
+        """
+        if self._ram_reclaim_cycle_at == 0.0:
+            return False
+        return (time.time() - self._ram_reclaim_cycle_at) < _RAM_RECLAIM_CYCLE_GRACE_SECONDS
+
     def card_residency(self, device_index: int | None) -> tuple[str | None, str]:
         """Return ``(model, phase)`` for the whole-card residency held on ``device_index`` (per-card view).
 
@@ -1998,6 +2029,11 @@ class InferenceScheduler:
             # bookkeeping (recovery count + crash-loop breaker) so sustained RAM pressure cannot
             # quarantine a perfectly healthy slot.
             self._process_lifecycle._replace_inference_process(process_info, intentional_reclaim=True)
+            # Open the bounded reclaim-cycle grace: the slot now respawns and the next head must preload
+            # onto it, a window in which the queue is unservable by the worker's own deliberate action, not
+            # a wedge. ram_reclaim_cycle_grace_active() reads this so the recovery supervisor does not
+            # soft-reset the pools and fault the servable backlog mid-reclaim.
+            self._ram_reclaim_cycle_at = time.time()
             self._record_churn("process_cycle")
             return True
 

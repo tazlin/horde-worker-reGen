@@ -2190,12 +2190,14 @@ class HordeWorkerProcessManager:
         if structural_queue_wedge and (
             self._inference_scheduler.whole_card_residency_grace_active()
             or self._inference_scheduler.heavy_head_load_grace_active()
+            or self._inference_scheduler.ram_reclaim_cycle_grace_active()
         ):
-            # The queue is deliberately held while a heavy head loads: either a whole-card residency
-            # establishing (idle siblings stopping, the safety process cycling off-GPU, ~11GB of weights
-            # loading) or a streams-even-alone head admitted best-effort off that path. Both are the worker
-            # doing the right thing, not a wedge, so do not let it soft-reset the pools mid-load. Both graces
-            # are bounded, so a load that genuinely never completes still trips the supervisor.
+            # The queue is deliberately held while the worker does the right thing, not a wedge, so do not
+            # let it soft-reset the pools mid-action: a whole-card residency establishing (idle siblings
+            # stopping, the safety process cycling off-GPU, ~11GB of weights loading), a streams-even-alone
+            # head admitted best-effort off that path, or an idle slot just cycled to reclaim
+            # allocator-retained RAM (which then respawns and reloads the head). All three graces are
+            # bounded, so an action that genuinely never completes still trips the supervisor.
             structural_queue_wedge = False
         if structural_queue_wedge and self._process_map.has_inference_in_progress():
             # Belt-and-braces: even if the queue-deadlock flag latched via some other path, a live slot
@@ -2261,6 +2263,12 @@ class HordeWorkerProcessManager:
         # capacity check alone would fault nothing and let the worker spin forever, so the structural
         # queue-deadlock signal must also reissue the head so the horde reassigns it and the queue unblocks.
         structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
+        if self._inference_scheduler.ram_reclaim_cycle_grace_active():
+            # Belt-and-braces with _assess_wedge: even if escalation reached give-up, a backlog whose only
+            # obstacle is the worker's own bounded RAM-reclaim cycle (the slot is respawning to reload the
+            # head) is servable, not unservable. Do not reissue it mid-reclaim; the grace is bounded, so a
+            # cycle that never recovers still falls through to the capacity check on a later tick.
+            structural_queue_wedge = False
         if not self._is_inference_capacity_available() or structural_queue_wedge:
             for job in list(self._job_tracker.jobs_pending_inference):
                 if job not in self._job_tracker.jobs_in_progress:
