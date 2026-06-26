@@ -18,9 +18,9 @@ import pytest
 from worker_bootstrap import updater as updater_mod
 from worker_bootstrap.cli import _cmd_update
 from worker_bootstrap.updater import (
+    _DEFAULT_REPO,
     UpdateInfo,
     UpdateResult,
-    _DEFAULT_REPO,
     _read_install_info,
     resolve_update_repo,
     write_repo_to_install_info,
@@ -122,9 +122,7 @@ def test_write_repo_creates_file_from_scratch(tmp_path: Path) -> None:
 def test_write_repo_updates_repo_and_preserves_other_keys(tmp_path: Path) -> None:
     """Updating 'repo' does not discard other recorded keys such as 'method'."""
     (tmp_path / "bin").mkdir()
-    (tmp_path / "bin" / "install-info").write_text(
-        f"method=exe\nrepo={_OFFICIAL_REPO}\n", encoding="utf-8"
-    )
+    (tmp_path / "bin" / "install-info").write_text(f"method=exe\nrepo={_OFFICIAL_REPO}\n", encoding="utf-8")
     write_repo_to_install_info(tmp_path, _FORK_REPO)
     info = _read_install_info(tmp_path)
     assert info.get("repo") == _FORK_REPO
@@ -155,9 +153,7 @@ def test_write_repo_strips_bom_from_existing_file(tmp_path: Path) -> None:
     """
     bom = "﻿"
     (tmp_path / "bin").mkdir()
-    (tmp_path / "bin" / "install-info").write_text(
-        f"{bom}method=exe\nrepo={_OFFICIAL_REPO}\n", encoding="utf-8"
-    )
+    (tmp_path / "bin" / "install-info").write_text(f"{bom}method=exe\nrepo={_OFFICIAL_REPO}\n", encoding="utf-8")
     write_repo_to_install_info(tmp_path, _FORK_REPO)
     raw = (tmp_path / "bin" / "install-info").read_bytes()
     assert not raw.startswith(b"\xef\xbb\xbf"), "rewrite must not carry the BOM forward"
@@ -291,6 +287,7 @@ def test_update_repo_flag_persists_on_available_update(
     monkeypatch.setattr(updater_mod, "sync_arp_version", lambda root, version: None)
     # _sync would try to run uv; short-circuit it here
     from worker_bootstrap import cli as cli_mod
+
     monkeypatch.setattr(cli_mod, "_sync", lambda uv, root, *, cli_flag, options: 0)
 
     rc = _cmd_update(_make_args(repo=_FORK_REPO), tmp_path, "uv")
