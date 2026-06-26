@@ -57,6 +57,7 @@ from horde_worker_regen.tui.responsive import (
     select_columns,
     shed_hint,
 )
+from horde_worker_regen.tui.trends import fixed_counter_deltas, fixed_float_buckets, trend_bounds
 from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
 
 _TREND_HISTORY = 21600
@@ -68,14 +69,6 @@ _TREND_SAMPLE_INTERVAL = 1.0
 _TREND_SPARK_WIDTH = 48
 """Maximum number of samples drawn in a Trends sparkline, keeping the line terminal-friendly."""
 
-_TREND_WINDOW_SECONDS: dict[OverviewTrendWindow, float | None] = {
-    OverviewTrendWindow.FIVE_MINUTES: 5 * 60.0,
-    OverviewTrendWindow.FIFTEEN_MINUTES: 15 * 60.0,
-    OverviewTrendWindow.THIRTY_MINUTES: 30 * 60.0,
-    OverviewTrendWindow.SIXTY_MINUTES: 60 * 60.0,
-    OverviewTrendWindow.TWO_HOURS: 120 * 60.0,
-    OverviewTrendWindow.ALL: None,
-}
 _DETAIL_SIDE_BY_SIDE_MIN_WIDTH = 110
 """Minimum Overview content width where detailed mode uses side-by-side row groups."""
 
@@ -176,6 +169,7 @@ class OverviewView(Vertical):
         self._trend_window = OverviewTrendWindow.FIFTEEN_MINUTES
         self._trend_epoch = time.time()
         self._trend_notice: str | None = None
+        self._trend_session_start: float | None = None
 
     def set_trend_window(self, window: OverviewTrendWindow) -> None:
         """Set the rendered trend window without discarding the session sample buffers."""
@@ -345,26 +339,36 @@ class OverviewView(Vertical):
 
     def _record_trends(self, snapshot: WorkerStateSnapshot) -> None:
         """Append one timestamped sample of GPU-duty, kudos/hr, and the cumulative job counter."""
-        now = time.time()
-        if snapshot.gpu_utilization_mean_percent is not None:
-            self._gpu_duty_history.append((now, snapshot.gpu_utilization_mean_percent))
-        if snapshot.kudos_per_hour is not None:
-            self._kudos_history.append((now, snapshot.kudos_per_hour))
-        self._jobs_history.append((now, snapshot.num_jobs_submitted))
+        sample = snapshot.latest_stats_sample
+        now = sample.timestamp if sample is not None else (snapshot.timestamp or time.time())
+        self._trend_session_start = snapshot.session_start_time or self._trend_session_start
+        gpu_duty = sample.gpu_duty_percent if sample is not None else snapshot.gpu_utilization_mean_percent
+        kudos_per_hour = sample.kudos_per_hour if sample is not None else snapshot.kudos_per_hour
+        jobs_submitted = sample.jobs_submitted if sample is not None else snapshot.num_jobs_submitted
+        if gpu_duty is not None:
+            self._gpu_duty_history.append((now, gpu_duty))
+        if kudos_per_hour is not None:
+            self._kudos_history.append((now, kudos_per_hour))
+        self._jobs_history.append((now, jobs_submitted))
 
     def _windowed_float_series(self, samples: deque[tuple[float, float]]) -> list[float]:
-        """Return values in the active trend window and epoch."""
-        window_seconds = _TREND_WINDOW_SECONDS[self._trend_window]
-        now = time.time()
-        start = self._trend_epoch if window_seconds is None else max(self._trend_epoch, now - window_seconds)
-        return [value for timestamp, value in samples if timestamp >= start]
+        """Return fixed buckets spanning the active trend window and epoch."""
+        return fixed_float_buckets(
+            list(samples),
+            self._trend_window,
+            session_start=self._trend_session_start,
+            epoch=self._trend_epoch,
+            buckets=_TREND_SPARK_WIDTH,
+        )
 
     def _windowed_job_samples(self) -> list[tuple[float, int]]:
         """Return job-counter samples in the active trend window and epoch."""
-        window_seconds = _TREND_WINDOW_SECONDS[self._trend_window]
-        now = time.time()
-        start = self._trend_epoch if window_seconds is None else max(self._trend_epoch, now - window_seconds)
-        return [(timestamp, count) for timestamp, count in self._jobs_history if timestamp >= start]
+        start, end, _configured = trend_bounds(
+            self._trend_window,
+            session_start=self._trend_session_start,
+            epoch=self._trend_epoch,
+        )
+        return [(timestamp, count) for timestamp, count in self._jobs_history if start <= timestamp <= end]
 
     def _hero_glyph(self, report: HealthReport, frame: int) -> Text:
         """A status glyph that pulses/spins for in-progress or attention states."""
@@ -1010,18 +1014,14 @@ class OverviewView(Vertical):
         return Text("→", style="grey50")
 
     def _jobs_per_hour(self) -> tuple[float | None, list[float]]:
-        """Derive a jobs/hr rate and a per-sample jobs-completed series from the job-count history.
-
-        Returns ``(rate, deltas)``: ``rate`` is None until two samples span a positive interval; the
-        ``deltas`` series is the jobs finished between consecutive samples (the sparkline's signal).
-        """
-        samples = list(self._jobs_history)
-        if len(samples) < 2:
-            return None, []
-        deltas = [float(max(0, b[1] - a[1])) for a, b in zip(samples, samples[1:], strict=False)]
-        elapsed = samples[-1][0] - samples[0][0]
-        completed = samples[-1][1] - samples[0][1]
-        rate = (completed / elapsed * 3600.0) if elapsed > 0 else None
+        """Derive jobs/hr and fixed-window completion buckets from the cumulative job counter."""
+        rate, deltas, _sampled_span = fixed_counter_deltas(
+            list(self._jobs_history),
+            self._trend_window,
+            session_start=self._trend_session_start,
+            epoch=self._trend_epoch,
+            buckets=_TREND_SPARK_WIDTH,
+        )
         return rate, deltas
 
     @staticmethod
@@ -1134,7 +1134,13 @@ class OverviewView(Vertical):
         label = "All" if self._trend_window is OverviewTrendWindow.ALL else self._trend_window.value
         if len(samples) < 2:
             return f"{label} window · warming up"
-        return f"{label} window · {human_duration(samples[-1][0] - samples[0][0])} sampled"
+        start, end, configured = trend_bounds(
+            self._trend_window,
+            session_start=self._trend_session_start,
+            epoch=self._trend_epoch,
+        )
+        span = configured if configured is not None else max(end - start, 0.0)
+        return f"{label} window · {human_duration(samples[-1][0] - samples[0][0])} sampled of {human_duration(span)}"
 
     def _render_compact_bar(
         self,

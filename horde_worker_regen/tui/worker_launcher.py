@@ -616,6 +616,15 @@ class WorkerSupervisor:
             ),
         )
 
+    def request_set_stats_export(self, enabled: bool) -> bool:
+        """Ask the worker to enable or disable stats JSONL export."""
+        return self.send_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_STATS_EXPORT,
+                stats_export_enabled=enabled,
+            ),
+        )
+
     # endregion
 
     def request_graceful_stop(self, *, timeout: float = GRACEFUL_STOP_TIMEOUT_SECONDS) -> None:

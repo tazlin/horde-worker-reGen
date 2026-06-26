@@ -10,14 +10,24 @@ crash events, and headline counters into one :class:`RunMetricsSnapshot`.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics
+from loguru import logger
 from pydantic import BaseModel, Field
 
+from horde_worker_regen.app_state import default_app_state_dir
 from horde_worker_regen.process_management.ipc.messages import (
     HordeDownloadMetricsMessage,
     HordeJobMetricsMessage,
+)
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    StatsExportState,
+    StatsHistoryBackfill,
+    StatsRollupRow,
+    StatsSample,
 )
 from horde_worker_regen.telemetry_spans import (
     job_e2e_histogram,
@@ -39,6 +49,11 @@ reclaim allocator-stranded RAM. None are faults; their *rate* is the churn signa
 """
 
 _CHURN_EVENT_RETENTION_SECONDS = 3600.0
+_STATS_SAMPLE_INTERVAL_SECONDS = 1.0
+_STATS_RECENT_HISTORY_SECONDS = 2 * 60 * 60
+_STATS_ALL_SESSION_POINTS = 720
+_STATS_ROTATE_BYTES = 5 * 1024 * 1024
+_STATS_WARNING_BYTES = 50 * 1024 * 1024
 """Drop churn timestamps older than this so the lists stay bounded on a long-running worker. Far wider
 than the duty-cycle report window, so every report's lookback is fully covered."""
 
@@ -70,6 +85,103 @@ class JobMetricsRecord(BaseModel):
     control_type: str | None = None
     post_processing: list[str] = Field(default_factory=list)
     hires_fix: bool = False
+    batch_count: int = 1
+    megapixelsteps: float = 0.0
+    sampling_seconds: float | None = None
+
+
+class StatsSampleEvent(BaseModel):
+    """One JSONL export event carrying a periodic stats sample."""
+
+    event: Literal["stats_sample"] = "stats_sample"
+    sample: StatsSample
+
+
+class StatsJobCompletedEvent(BaseModel):
+    """One JSONL export event carrying a finalized job metrics record."""
+
+    event: Literal["job_completed"] = "job_completed"
+    job: JobMetricsRecord
+    baseline: str | None = None
+
+
+class _StatsJsonlExporter:
+    """Session-scoped, rotating JSONL writer for stats samples and finalized jobs."""
+
+    def __init__(self, *, worker_version: str, state_dir: Path | None = None) -> None:
+        self._directory = (state_dir if state_dir is not None else default_app_state_dir()) / "stats"
+        self._version = worker_version.replace("/", "_").replace("\\", "_")
+        self._stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        self._index = 0
+        self._active_path: Path | None = None
+        self._last_write_error: str | None = None
+        self._disabled_by_error = False
+
+    @property
+    def active_file_path(self) -> str | None:
+        """Return the active JSONL path, if a file has been opened."""
+        return str(self._active_path) if self._active_path is not None else None
+
+    @property
+    def last_write_error(self) -> str | None:
+        """Return the last write error surfaced to the TUI."""
+        return self._last_write_error
+
+    @property
+    def disabled_by_error(self) -> bool:
+        """Whether export disabled itself after an IO failure."""
+        return self._disabled_by_error
+
+    def write(self, event: StatsSampleEvent | StatsJobCompletedEvent) -> bool:
+        """Append one typed event. Returns False when an IO error disabled export."""
+        if self._disabled_by_error:
+            return False
+        try:
+            payload = event.model_dump_json() + "\n"
+            path = self._path_for_payload(len(payload.encode("utf-8")))
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(payload)
+        except OSError as write_error:
+            self._last_write_error = str(write_error)
+            self._disabled_by_error = True
+            logger.warning(f"Stats JSONL export disabled after write failure: {write_error}")
+            return False
+        return True
+
+    def state(self, *, enabled: bool) -> StatsExportState:
+        """Build the supervisor-visible export state."""
+        total = self.total_bytes()
+        return StatsExportState(
+            enabled=enabled and not self._disabled_by_error,
+            active_file_path=self.active_file_path,
+            bytes_in_stats_files=total,
+            warning_over_50_mib=total > _STATS_WARNING_BYTES,
+            last_write_error=self._last_write_error,
+        )
+
+    def total_bytes(self) -> int:
+        """Return the total size of retained stats JSONL files."""
+        try:
+            return sum(path.stat().st_size for path in self._directory.glob("stats-v*.jsonl") if path.is_file())
+        except OSError:
+            return 0
+
+    def _path_for_payload(self, payload_bytes: int) -> Path:
+        self._directory.mkdir(parents=True, exist_ok=True)
+        if self._active_path is None:
+            self._active_path = self._candidate_path()
+            return self._active_path
+        try:
+            current_size = self._active_path.stat().st_size if self._active_path.exists() else 0
+        except OSError:
+            current_size = 0
+        if current_size and current_size + payload_bytes > _STATS_ROTATE_BYTES:
+            self._index += 1
+            self._active_path = self._candidate_path()
+        return self._active_path
+
+    def _candidate_path(self) -> Path:
+        return self._directory / f"stats-v{self._version}-{self._stamp}-{self._index:03d}.jsonl"
 
 
 class ProcessCrashRecord(BaseModel):
@@ -121,7 +233,7 @@ class WorkerRunMetrics:
     the process lifecycle manager records crash events.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, baseline_resolver: Callable[[str], str | None] | None = None) -> None:
         """Initialize empty aggregation state."""
         self._jobs: list[JobMetricsRecord] = []
         self._downloads: list[DownloadEvent] = []
@@ -129,6 +241,14 @@ class WorkerRunMetrics:
         self._vram_high_water_per_process: dict[int, int] = {}
         self._ram_high_water_per_process: dict[int, int] = {}
         self._crash_events: list[ProcessCrashRecord] = []
+        self._baseline_resolver = baseline_resolver
+        self._stats_samples: list[StatsSample] = []
+        self._all_stats_samples: list[StatsSample] = []
+        self._last_stats_sample_time = 0.0
+        self._model_rollups: dict[tuple[str | None, str | None], StatsRollupRow] = {}
+        self._baseline_rollups: dict[str | None, StatsRollupRow] = {}
+        self._stats_exporter: _StatsJsonlExporter | None = None
+        self._stats_export_enabled = False
         self._churn_event_times: dict[ChurnKind, list[float]] = {
             "model_swap": [],
             "vram_eviction": [],
@@ -143,6 +263,11 @@ class WorkerRunMetrics:
         self._vram_high_water_per_process.clear()
         self._ram_high_water_per_process.clear()
         self._crash_events.clear()
+        self._stats_samples.clear()
+        self._all_stats_samples.clear()
+        self._last_stats_sample_time = 0.0
+        self._model_rollups.clear()
+        self._baseline_rollups.clear()
         for times in self._churn_event_times.values():
             times.clear()
 
@@ -224,27 +349,44 @@ class WorkerRunMetrics:
         payload = api_job.payload
         control_type: str | None = str(payload.control_type) if payload.control_type else None
 
-        self._jobs.append(
-            JobMetricsRecord(
-                job_id=job_id,
-                faulted=completed_job_info.state == GENERATION_STATE.faulted,
-                time_popped=time_popped,
-                stage_timestamps=stage_timestamps,
-                queue_wait_seconds=queue_wait,
-                e2e_seconds=e2e,
-                safety_seconds=safety,
-                phase_metrics=self._phase_metrics_by_job.pop(job_id, None),
-                model_name=model_name,
-                steps=payload.ddim_steps,
-                width=payload.width,
-                height=payload.height,
-                loras_count=len(payload.loras) if payload.loras else 0,
-                tis_count=len(payload.tis) if payload.tis else 0,
-                control_type=control_type,
-                post_processing=[str(post_proc_step) for post_proc_step in payload.post_processing],
-                hires_fix=payload.hires_fix,
-            ),
+        phase_metrics = self._phase_metrics_by_job.pop(job_id, None)
+        sampling_seconds = (
+            phase_metrics.sampling.duration_seconds if phase_metrics is not None and phase_metrics.sampling else None
         )
+        batch_count = payload.n_iter if isinstance(payload.n_iter, int) and payload.n_iter > 0 else 1
+        megapixelsteps = (
+            (float(payload.width or 0) * float(payload.height or 0) / 1_000_000.0)
+            * float(
+                payload.ddim_steps or 0,
+            )
+            * float(batch_count)
+        )
+        record = JobMetricsRecord(
+            job_id=job_id,
+            faulted=completed_job_info.state == GENERATION_STATE.faulted,
+            time_popped=time_popped,
+            stage_timestamps=stage_timestamps,
+            queue_wait_seconds=queue_wait,
+            e2e_seconds=e2e,
+            safety_seconds=safety,
+            phase_metrics=phase_metrics,
+            model_name=model_name,
+            steps=payload.ddim_steps,
+            width=payload.width,
+            height=payload.height,
+            loras_count=len(payload.loras) if payload.loras else 0,
+            tis_count=len(payload.tis) if payload.tis else 0,
+            control_type=control_type,
+            post_processing=[str(post_proc_step) for post_proc_step in payload.post_processing],
+            hires_fix=payload.hires_fix,
+            batch_count=batch_count,
+            megapixelsteps=megapixelsteps,
+            sampling_seconds=sampling_seconds,
+        )
+        self._jobs.append(record)
+        baseline = self._resolve_baseline(model_name)
+        self._fold_rollup(record, baseline=baseline)
+        self._write_job_event(record, baseline=baseline)
 
     def record_process_crash(
         self,
@@ -264,6 +406,98 @@ class WorkerRunMetrics:
                 timestamp=time.time(),
             ),
         )
+
+    def set_stats_export(self, enabled: bool, *, worker_version: str) -> None:
+        """Enable or disable session-scoped stats JSONL export."""
+        self._stats_export_enabled = enabled
+        if enabled and self._stats_exporter is None:
+            self._stats_exporter = _StatsJsonlExporter(worker_version=worker_version)
+
+    def record_stats_sample(self, sample: StatsSample) -> StatsSample | None:
+        """Append a periodic stats sample at most once per second and export it when enabled."""
+        if sample.timestamp - self._last_stats_sample_time < _STATS_SAMPLE_INTERVAL_SECONDS:
+            return None
+        self._last_stats_sample_time = sample.timestamp
+        self._stats_samples.append(sample)
+        self._all_stats_samples.append(sample)
+        cutoff = sample.timestamp - _STATS_RECENT_HISTORY_SECONDS
+        if self._stats_samples and self._stats_samples[0].timestamp < cutoff:
+            self._stats_samples = [entry for entry in self._stats_samples if entry.timestamp >= cutoff]
+        self._write_sample_event(sample)
+        return sample
+
+    def latest_stats_sample(self) -> StatsSample | None:
+        """Return the newest worker-owned stats sample."""
+        return self._stats_samples[-1] if self._stats_samples else None
+
+    def stats_history_backfill(self) -> StatsHistoryBackfill:
+        """Return exact recent samples plus a decimated all-session sequence."""
+        return StatsHistoryBackfill(
+            recent_samples=list(self._stats_samples),
+            all_session_samples=self._decimated_stats_samples(),
+        )
+
+    def model_rollups(self) -> list[StatsRollupRow]:
+        """Return finalized image-job rollups by model."""
+        return sorted(self._model_rollups.values(), key=lambda row: row.jobs, reverse=True)
+
+    def baseline_rollups(self) -> list[StatsRollupRow]:
+        """Return finalized image-job rollups by baseline."""
+        return sorted(self._baseline_rollups.values(), key=lambda row: row.jobs, reverse=True)
+
+    def stats_export_state(self) -> StatsExportState:
+        """Return current JSONL export state for the supervisor snapshot."""
+        if self._stats_exporter is None:
+            return StatsExportState(enabled=False)
+        state = self._stats_exporter.state(enabled=self._stats_export_enabled)
+        if self._stats_exporter.disabled_by_error:
+            self._stats_export_enabled = False
+        return state
+
+    def _resolve_baseline(self, model_name: str | None) -> str | None:
+        if model_name is None or self._baseline_resolver is None:
+            return None
+        return self._baseline_resolver(model_name)
+
+    def _fold_rollup(self, record: JobMetricsRecord, *, baseline: str | None) -> None:
+        if record.is_alchemy:
+            return
+        model_key = (record.model_name, baseline)
+        model_row = self._model_rollups.setdefault(
+            model_key,
+            StatsRollupRow(model=record.model_name, baseline=baseline),
+        )
+        self._add_to_rollup(model_row, record)
+
+        baseline_row = self._baseline_rollups.setdefault(baseline, StatsRollupRow(baseline=baseline))
+        self._add_to_rollup(baseline_row, record)
+
+    @staticmethod
+    def _add_to_rollup(row: StatsRollupRow, record: JobMetricsRecord) -> None:
+        row.jobs += 1
+        row.megapixelsteps += record.megapixelsteps
+        row.sampling_seconds += record.sampling_seconds or 0.0
+        row.e2e_seconds += record.e2e_seconds or 0.0
+        if record.batch_count > 1:
+            row.batch_gt_one_jobs += 1
+
+    def _write_sample_event(self, sample: StatsSample) -> None:
+        if not self._stats_export_enabled or self._stats_exporter is None:
+            return
+        if not self._stats_exporter.write(StatsSampleEvent(sample=sample)):
+            self._stats_export_enabled = False
+
+    def _write_job_event(self, record: JobMetricsRecord, *, baseline: str | None) -> None:
+        if not self._stats_export_enabled or self._stats_exporter is None:
+            return
+        if not self._stats_exporter.write(StatsJobCompletedEvent(job=record, baseline=baseline)):
+            self._stats_export_enabled = False
+
+    def _decimated_stats_samples(self) -> list[StatsSample]:
+        if len(self._all_stats_samples) <= _STATS_ALL_SESSION_POINTS:
+            return list(self._all_stats_samples)
+        step = len(self._all_stats_samples) / _STATS_ALL_SESSION_POINTS
+        return [self._all_stats_samples[int(index * step)] for index in range(_STATS_ALL_SESSION_POINTS)]
 
     def snapshot(
         self,

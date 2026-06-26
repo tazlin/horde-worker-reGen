@@ -31,6 +31,7 @@ Installed as console scripts (defined in `pyproject.toml`):
 | `horde-benchmark` | `horde_worker_regen.benchmark.cli:main` | Progressive benchmark. |
 | `horde-duty-report` | `horde_worker_regen.analysis.duty_log_report:main` | Per-session GPU duty-cycle report over a `bridge.log`. |
 | `horde-log` | `horde_worker_regen.analysis.log_triage_cli:main` | Triage worker logs: sessions, timelines, and what-went-wrong findings. |
+| `horde-stats` | `horde_worker_regen.stats_operations:main` | Compress or downsample retained stats JSONL files. |
 
 ## `horde-worker` (dashboard)
 
@@ -65,6 +66,26 @@ carries two control commands that act on an already-running host and exit withou
 On Windows the worker host also shows a **system-tray icon** while it runs, with *Open dashboard* and
 *Stop worker & exit* actions, so a detached or orphaned worker stays visible and stoppable. See
 [Use the dashboard](../how-to/use-the-dashboard.md#closing-and-reattaching).
+
+## `horde-stats`
+
+Operate on retained stats JSONL files under `.horde_worker_regen/stats/`. The same implementation is
+importable from `horde_worker_regen.stats_operations` for the dashboard or other Python callers. By default,
+both operations skip the newest stats file so a running worker's active export file is not rewritten; pass
+`--include-latest` only when the worker is stopped or you intentionally want to touch it.
+
+| Subcommand | Meaning |
+|------------|---------|
+| `compress` | Gzip-compress existing uncompressed `stats-v*.jsonl` files, except the latest by default. |
+| `downsample SECONDS` | Rewrite stats files so `stats_sample` events are at least `SECONDS` apart. `job_completed` and unknown events are preserved. |
+
+Examples:
+
+```bash
+horde-stats compress
+horde-stats downsample 15
+horde-stats --stats-dir /path/to/.horde_worker_regen/stats downsample 60 --include-latest
+```
 
 ## `run_worker` (headless)
 

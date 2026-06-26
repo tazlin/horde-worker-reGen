@@ -111,6 +111,9 @@ class SupervisorLike(Protocol):
     def request_set_server_maintenance(self, enabled: bool) -> bool:
         """Ask the worker to set its server-side (horde) maintenance flag on or off."""
 
+    def request_set_stats_export(self, enabled: bool) -> bool:
+        """Ask the worker to enable or disable stats JSONL export."""
+
 
 class AttachedWorkerSupervisor:
     """Presents the supervisor interface while the real worker lives on a separate host process."""
@@ -271,6 +274,15 @@ class AttachedWorkerSupervisor:
             SupervisorControlMessage(
                 command=SupervisorCommand.SET_SERVER_MAINTENANCE,
                 server_maintenance_enabled=enabled,
+            ),
+        )
+
+    def request_set_stats_export(self, enabled: bool) -> bool:
+        """Ask the worker to enable or disable stats JSONL export."""
+        return self.send_command(
+            SupervisorControlMessage(
+                command=SupervisorCommand.SET_STATS_EXPORT,
+                stats_export_enabled=enabled,
             ),
         )
 

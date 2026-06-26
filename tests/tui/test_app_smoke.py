@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from textual.widgets import TabbedContent
 
-from horde_worker_regen.app_state import AppStateStore, OnboardingChoice, OverviewViewMode
+from horde_worker_regen.app_state import AppStateStore, OnboardingChoice, OverviewTrendWindow, OverviewViewMode
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
 from horde_worker_regen.run_worker import WorkerLaunchOptions
 from horde_worker_regen.tui.app import HordeWorkerTUI
@@ -84,6 +84,32 @@ async def test_app_boots_renders_and_cycles_tabs(tmp_path: Path) -> None:
     finally:
         supervisor.stop(timeout=10.0)
     assert not supervisor.is_alive()
+
+
+async def test_trend_window_cycle_does_not_soft_reset_existing_history(tmp_path: Path) -> None:
+    """Changing the trend span is a view change; only the explicit reset action moves the trend epoch."""
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    store.set_auto_start_worker(True)
+    store.record_onboarding_choice(OnboardingChoice.DECLINED)
+    fake = FakeSupervisor(alive=True)
+    fake.latest_snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Trend", worker_version="0.0.0")
+    )
+    app = HordeWorkerTUI(fake, config_path=Path("bridgeData.yaml"), app_state_store=store)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._tick()
+        await pilot.pause()
+        overview = app.query_one(OverviewView)
+        overview._trend_epoch = 123.0
+
+        app.action_cycle_trend_window()
+        await pilot.pause()
+
+        assert app._trend_window is OverviewTrendWindow.THIRTY_MINUTES
+        assert overview.trend_window() is OverviewTrendWindow.THIRTY_MINUTES
+        assert overview._trend_epoch == 123.0
+        assert store.load().overview_trend_window is OverviewTrendWindow.THIRTY_MINUTES
 
 
 async def test_control_tab_forwards_relegated_controls(tmp_path: Path) -> None:

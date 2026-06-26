@@ -70,6 +70,7 @@ class FakeSupervisor:
         self.rate_limits_kbps: list[int] = []
         self.download_requests: list[RecordedDownloadRequest] = []
         self.server_maintenance: list[bool] = []
+        self.stats_export: list[bool] = []
         self.set_concurrency_calls: list[tuple[int | None, int | None]] = []
         """Every ``request_set_concurrency`` call as ``(target_processes, target_threads)``."""
 
@@ -200,6 +201,12 @@ class FakeSupervisor:
         """Record a server-side maintenance toggle; True only when the worker is running."""
         self.requests.append("set_server_maintenance")
         self.server_maintenance.append(enabled)
+        return self._alive
+
+    def request_set_stats_export(self, enabled: bool) -> bool:
+        """Record a stats-export toggle; True only when the worker is running."""
+        self.requests.append("set_stats_export")
+        self.stats_export.append(enabled)
         return self._alive
 
     # endregion

@@ -4,6 +4,7 @@
     - [Two ways to run the worker](#two-ways-to-run-the-worker)
     - [The supervisor channel](#the-supervisor-channel)
     - [Terminal, served, and attached modes](#terminal-served-and-attached-modes)
+    - [Worker-owned stats history](#worker-owned-stats-history)
     - [The first-run wizard](#the-first-run-wizard)
     - [Worker identity preflight](#worker-identity-preflight)
     - [Durable app state](#durable-app-state)
@@ -42,13 +43,15 @@ defines the structured protocol over it:
   (one per driven GPU: VRAM headroom, inference contexts, whole-card residency, and
   per-card fault/unservable-model health) that the GPUs tab and the Overview per-card
   strip render. Each `ProcessSnapshot` also carries the `device_index` of the card its
-  slot is pinned to. A single-GPU host reports exactly one `CardSnapshot`. The snapshot
-  is versioned by `SUPERVISOR_PROTOCOL_VERSION` (currently 10) so a frontend can detect a
-  mismatch with a worker built from different code.
+  slot is pinned to. A single-GPU host reports exactly one `CardSnapshot`. Protocol v11 also carries
+  worker-owned stats data: the latest one-second `StatsSample`, bounded stats-history backfill for
+  reconnecting frontends, model/baseline `StatsRollupRow` tables, and `StatsExportState` for the JSONL
+  export toggle and disk-size warning. The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
+  (currently 11) so a frontend can detect a mismatch with a worker built from different code.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate
-  limit, etc.). Server-side maintenance is reported separately from local pause: the
+  limit, stats JSONL export enable/disable, etc.). Server-side maintenance is reported separately from local pause: the
   dashboard shows horde maintenance as a distinct **MAINTENANCE** phase, labels the
   API connectivity row as maintenance instead of disconnected, and treats a pending
   Maintenance (horde) command as active until the worker-details poll confirms it or
@@ -62,6 +65,30 @@ This mirrors the worker's own internal IPC (see
 hook. The models are deliberately pure-data and JSON-round-trippable: the default
 transport is a `multiprocessing` pipe (pickle), but the same models serialize
 cleanly for the localhost-socket fallback the launcher uses in served mode.
+
+## Worker-owned stats history
+
+The dashboard renders trend graphics, but the worker owns the underlying statistics samples. During snapshot
+construction the process manager appends at most one `StatsSample` per second from counters it already has in
+memory: submitted/faulted jobs, kudos/hr, GPU duty, queue and in-progress counts, no-work time, process
+recoveries, slowdowns, and alchemy totals. Finalized image jobs update incremental model and baseline rollups
+inside `WorkerRunMetrics`, so the Stats tab does not recompute those tables from the full job list on every
+frame. Alchemy forms remain in run metrics but are excluded from the image model/baseline tables.
+
+Reconnects receive a `StatsHistoryBackfill`: exact recent samples for the largest finite trend window plus a
+decimated all-session series. Consumers still bucket and render locally. Finite trend windows are interpreted
+as fixed spans from `now - window` to `now`; empty early buckets render as no activity, which keeps a 5m or
+60m graph visually spanning the selected duration even while the worker is warming up. Changing the selected
+window is only a view change over retained history; it does not move the trend epoch. `All` spans from the
+worker session start to now, while the explicit reset shortcut starts a new display epoch.
+
+The Stats tab can toggle worker-side JSONL export for the current session. Export writes typed `stats_sample`
+and `job_completed` events under `.horde_worker_regen/stats/`, uses version-and-session-stamped filenames,
+rotates at 5 MiB, and only warns when retained stats files exceed 50 MiB. IO failures disable export and appear
+in `StatsExportState`; they do not affect worker operation. Retained files can be operated on later via
+`horde_worker_regen.stats_operations`: compressing older JSONL files to `.jsonl.gz`, or downsampling
+`stats_sample` events to a caller-selected interval while preserving finalized-job events. The `horde-stats`
+CLI uses the same functions.
 
 ## Terminal, served, and attached modes
 

@@ -76,6 +76,7 @@ from horde_worker_regen.tui.widgets.onboarding import (
     WorkerStartModal,
 )
 from horde_worker_regen.tui.widgets.overview import OverviewView
+from horde_worker_regen.tui.widgets.stats import StatsView
 from horde_worker_regen.tui.wizard import SetupWizardModal, WizardOutcome, is_setup_incomplete
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode, WorkerSupervisor
 
@@ -307,13 +308,14 @@ class HordeWorkerTUI(App[None]):
     TabbedContent {
         height: 1fr;
     }
-    OverviewView, GpusView, LiveView, InsightsView, ConfigEditorView, LogsView, BenchmarkView, DownloadsView,
-    ControlView {
+    OverviewView, StatsView, GpusView, LiveView, InsightsView, ConfigEditorView, LogsView, BenchmarkView,
+    DownloadsView, ControlView {
         height: 1fr;
         padding: 1 1;
     }
     /* On a cramped terminal, drop the horizontal padding so the tables get those columns back. */
     Screen.-narrow OverviewView,
+    Screen.-narrow StatsView,
     Screen.-narrow GpusView,
     Screen.-narrow LiveView,
     Screen.-narrow InsightsView,
@@ -404,6 +406,8 @@ class HordeWorkerTUI(App[None]):
         with TabbedContent(initial="tab-overview", id="main-tabs"):
             with TabPane("Overview", id="tab-overview"):
                 yield OverviewView()
+            with TabPane("Stats", id="tab-stats"):
+                yield StatsView()
             with TabPane("Control", id="tab-control"):
                 yield ControlView()
             with TabPane("GPUs", id="tab-gpus"):
@@ -683,6 +687,7 @@ class HordeWorkerTUI(App[None]):
                     detailed=self._view_mode is OverviewViewMode.DETAILS,
                 )
                 self.query_one(InsightsView).update_snapshot(snapshot)
+                self.query_one(StatsView).update_snapshot(snapshot)
             self.query_one(BenchmarkView).update_view(
                 self._benchmark_supervisor.run_state,
                 self._benchmark_supervisor.status,
@@ -694,6 +699,14 @@ class HordeWorkerTUI(App[None]):
             # The refresh interval can fire during mount or teardown; skip until the DOM is ready.
             pass
         self._handle_benchmark_status_transition()
+
+    def on_stats_view_export_toggled(self, message: StatsView.ExportToggled) -> None:
+        """Forward the Stats tab JSONL export toggle to the worker."""
+        if not self._supervisor.request_set_stats_export(message.enabled):
+            self.notify("Stats export toggle could not be sent; worker is not connected.", severity="warning")
+            return
+        state = "enabled" if message.enabled else "disabled"
+        self.notify(f"Stats JSONL export {state}.")
 
     def _update_downloads_tab_label(self, snapshot: WorkerStateSnapshot | None) -> None:
         """Badge the Downloads tab with live progress so an active fetch is visible from any tab.
@@ -1045,7 +1058,7 @@ class HordeWorkerTUI(App[None]):
             self._app_state_store.set_trend_window(self._trend_window)
         label = "All" if self._trend_window is OverviewTrendWindow.ALL else self._trend_window.value
         with contextlib.suppress(NoMatches):
-            self.query_one(OverviewView).soft_reset_trends(notice=f"Trend window changed to {label}; stabilizing.")
+            self.query_one(OverviewView).set_trend_window(self._trend_window)
         self.notify(f"Trend window: {label}")
         self._tick()
 

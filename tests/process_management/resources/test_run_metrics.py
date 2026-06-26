@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics, ModelLoadEvent, SamplingStats
+from pytest import MonkeyPatch
 
 from horde_worker_regen.process_management.ipc.messages import (
     HordeDownloadMetricsMessage,
     HordeJobMetricsMessage,
 )
+from horde_worker_regen.process_management.ipc.supervisor_channel import StatsSample
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, TrackedJob
 from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
@@ -45,10 +48,12 @@ def _job_metrics_message(job_id: str, *, process_id: int = 0, is_alchemy: bool =
     )
 
 
-def _finalize_job(metrics: WorkerRunMetrics, *, faulted: bool = False) -> str:
+def _finalize_job(metrics: WorkerRunMetrics, *, faulted: bool = False, n_iter: int = 1) -> str:
     """Finalize a synthetic tracked job and return its job id string."""
     job = dummy_job_factory("Deliberate")
     assert job.id_ is not None
+    if n_iter != 1:
+        job = job.model_copy(update={"payload": job.payload.model_copy(update={"n_iter": n_iter})})
     tracked = TrackedJob(
         job_id=job.id_,
         sdk_api_job_info=job,
@@ -205,3 +210,100 @@ class TestAggregates:
         metrics.record_churn("process_cycle")
         metrics.reset()
         assert metrics.snapshot().churn_event_times["process_cycle"] == []
+
+
+class TestStatsRollupsAndExport:
+    """Worker-owned stats rollups and JSONL export."""
+
+    def test_finalized_jobs_update_rollups_incrementally(self) -> None:
+        """Model and baseline rollups include MPxsteps, sampling, E2E, and batch>1 job counts."""
+        metrics = WorkerRunMetrics(baseline_resolver=lambda _model: "stable_diffusion_1")
+        job_id = _finalize_job(metrics, n_iter=2)
+        metrics.on_job_metrics(_job_metrics_message(job_id))
+
+        model_rows = metrics.model_rollups()
+        baseline_rows = metrics.baseline_rollups()
+
+        assert model_rows[0].model == "Deliberate"
+        assert model_rows[0].baseline == "stable_diffusion_1"
+        assert model_rows[0].jobs == 1
+        assert model_rows[0].batch_gt_one_jobs == 1
+        assert model_rows[0].megapixelsteps == 512 * 512 / 1_000_000 * 30 * 2
+        assert model_rows[0].e2e_seconds == 12.0
+        assert baseline_rows[0].baseline == "stable_diffusion_1"
+
+    def test_sampling_and_e2e_seconds_are_separate(self) -> None:
+        """Sampling seconds come from child phase metrics while E2E comes from tracker timestamps."""
+        metrics = WorkerRunMetrics()
+        job = dummy_job_factory("Deliberate")
+        assert job.id_ is not None
+        metrics.on_job_metrics(_job_metrics_message(str(job.id_)))
+        tracked = TrackedJob(
+            job_id=job.id_,
+            sdk_api_job_info=job,
+            stage=JobStage.PENDING_SUBMIT,
+            time_popped=100.0,
+            stage_timestamps={"FINALIZED": 112.0},
+        )
+        metrics.on_job_finalized(
+            tracked,
+            HordeJobInfo(sdk_api_job_info=job, state=GENERATION_STATE.ok, time_popped=100.0),
+        )
+
+        row = metrics.model_rollups()[0]
+        assert row.sampling_seconds == 6.0
+        assert row.e2e_seconds == 12.0
+
+    def test_alchemy_jobs_do_not_pollute_image_rollups(self) -> None:
+        """Alchemy child metrics are retained as jobs but excluded from image model/baseline tables."""
+        metrics = WorkerRunMetrics()
+        metrics.on_job_metrics(_job_metrics_message("form-1", is_alchemy=True))
+
+        assert metrics.snapshot().jobs[0].is_alchemy
+        assert metrics.model_rollups() == []
+        assert metrics.baseline_rollups() == []
+
+    def test_jsonl_export_writes_sample_and_job_events(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """Export writes typed stats_sample and job_completed events under the session stats directory."""
+        monkeypatch.chdir(tmp_path)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.2.3")
+        metrics.record_stats_sample(StatsSample(timestamp=10.0, jobs_submitted=1))
+        _finalize_job(metrics)
+
+        files = list((tmp_path / ".horde_worker_regen" / "stats").glob("stats-v1.2.3-*.jsonl"))
+        assert len(files) == 1
+        lines = files[0].read_text(encoding="utf-8").splitlines()
+        assert '"event":"stats_sample"' in lines[0]
+        assert '"event":"job_completed"' in lines[1]
+
+    def test_jsonl_export_rotates_and_uses_versioned_filenames(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """Rotation starts numbered files, and different worker versions naturally use different names."""
+        import horde_worker_regen.process_management.resources.run_metrics as run_metrics
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(run_metrics, "_STATS_ROTATE_BYTES", 10)
+        first = WorkerRunMetrics()
+        first.set_stats_export(True, worker_version="1.0.0")
+        first.record_stats_sample(StatsSample(timestamp=10.0, jobs_submitted=1))
+        first.record_stats_sample(StatsSample(timestamp=11.0, jobs_submitted=2))
+
+        second = WorkerRunMetrics()
+        second.set_stats_export(True, worker_version="2.0.0")
+        second.record_stats_sample(StatsSample(timestamp=10.0, jobs_submitted=1))
+
+        names = sorted(path.name for path in (tmp_path / ".horde_worker_regen" / "stats").glob("*.jsonl"))
+        assert any("stats-v1.0.0" in name and "-001.jsonl" in name for name in names)
+        assert any("stats-v2.0.0" in name for name in names)
+
+    def test_total_size_warning_triggers_over_threshold(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+        """Stats export state warns once retained JSONL files exceed the configured threshold."""
+        import horde_worker_regen.process_management.resources.run_metrics as run_metrics
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(run_metrics, "_STATS_WARNING_BYTES", 1)
+        metrics = WorkerRunMetrics()
+        metrics.set_stats_export(True, worker_version="1.0.0")
+        metrics.record_stats_sample(StatsSample(timestamp=10.0, jobs_submitted=1))
+
+        assert metrics.stats_export_state().warning_over_50_mib

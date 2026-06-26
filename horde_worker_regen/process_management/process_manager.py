@@ -78,6 +78,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     OrchestrationIntentSnapshot,
     ProcessSnapshot,
     RecentJobRecord,
+    StatsSample,
     SupervisorChannel,
     SupervisorCommand,
     SupervisorControlMessage,
@@ -812,7 +813,7 @@ class HordeWorkerProcessManager:
             state=self._state,
         )
 
-        self._run_metrics = WorkerRunMetrics()
+        self._run_metrics = WorkerRunMetrics(baseline_resolver=self._safe_model_baseline)
 
         # Measure real GPU core uptime (the duty cycle) for the whole worker session, not just the
         # benchmark. A coarse 1s poll is plenty for the rolling-window trend and threshold logs and
@@ -2733,7 +2734,7 @@ class HordeWorkerProcessManager:
 
     _supervisor_publish_min_interval = 0.0
     """A hard floor between snapshots regardless of change (0 = publish every tick when state changed)."""
-    _supervisor_publish_floor_interval = 2.0
+    _supervisor_publish_floor_interval = 1.0
     """Maximum seconds between snapshots when nothing changes — a heartbeat so the TUI knows we're alive."""
 
     def _handle_supervisor_commands(self) -> None:
@@ -2819,6 +2820,12 @@ class HordeWorkerProcessManager:
                 # (drain-aware, idempotent) timed-shutdown is only the force-kill backstop.
                 self._shutdown()
                 self._start_timed_shutdown()
+            case SupervisorCommand.SET_STATS_EXPORT:
+                enabled = bool(command.stats_export_enabled)
+                import horde_worker_regen
+
+                self._run_metrics.set_stats_export(enabled, worker_version=horde_worker_regen.__version__)
+                logger.info(f"Supervisor {'enabled' if enabled else 'disabled'} stats JSONL export.")
 
     def _apply_set_concurrency(self, target_threads: int | None, target_processes: int | None) -> None:
         """Adjust the live concurrent-inference cap and/or running inference-process count.
@@ -3354,8 +3361,15 @@ class HordeWorkerProcessManager:
         kudos_session = self._state.kudos_generated_this_session
         kudos_per_hour = kudos_session / session_hours if kudos_session else None
 
+        now = time.time()
+        gpu_utilization_mean_percent = self._gpu_sampler.mean_percent(
+            window_seconds=self._DUTY_CYCLE_SNAPSHOT_WINDOW_SECONDS,
+        )
+        gpu_utilization_busy_fraction = self._gpu_sampler.busy_fraction(
+            window_seconds=self._DUTY_CYCLE_SNAPSHOT_WINDOW_SECONDS,
+        )
         last_pop_time = self._state.last_job_pop_time
-        seconds_since_last_pop = (time.time() - last_pop_time) if last_pop_time else None
+        seconds_since_last_pop = (now - last_pop_time) if last_pop_time else None
         api_messages: list[str] = []
         for api_message in self._job_popper.api_messages_received.values():
             if api_message.message_text:
@@ -3365,6 +3379,32 @@ class HordeWorkerProcessManager:
             RecentJobRecord.from_metrics_record(job, baseline=self._safe_model_baseline(job.model_name))
             for job in run_metrics.jobs[-RECENT_JOBS_IN_SNAPSHOT:]
         ]
+
+        stats_sample = self._run_metrics.record_stats_sample(
+            StatsSample(
+                timestamp=now,
+                jobs_submitted=self._job_tracker.total_num_completed_jobs,
+                jobs_faulted=self._job_tracker.num_jobs_faulted,
+                kudos_per_hour=kudos_per_hour,
+                gpu_duty_percent=gpu_utilization_mean_percent,
+                gpu_busy_fraction=gpu_utilization_busy_fraction,
+                pending_megapixelsteps=self._job_tracker.get_pending_megapixelsteps(),
+                jobs_pending_inference=len(self._job_tracker.jobs_pending_inference),
+                jobs_in_progress=len(self._job_tracker.jobs_in_progress),
+                jobs_pending_safety_check=len(self._job_tracker.jobs_pending_safety_check),
+                jobs_being_safety_checked=len(self._job_tracker.jobs_being_safety_checked),
+                jobs_pending_submit=len(self._job_tracker.jobs_pending_submit),
+                time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
+                num_process_recoveries=self._process_lifecycle._num_process_recoveries,
+                num_job_slowdowns=self._job_submitter.num_job_slowdowns,
+                alchemy_forms_pending=self._alchemy_coordinator.num_forms_pending,
+                alchemy_forms_in_flight=self._alchemy_coordinator.num_forms_in_flight,
+                alchemy_forms_awaiting_submit=self._alchemy_coordinator.num_forms_awaiting_submit,
+                alchemy_total_submitted=self._alchemy_coordinator.num_forms_submitted,
+                alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
+            ),
+        )
+        latest_stats_sample = stats_sample or self._run_metrics.latest_stats_sample()
 
         config = WorkerConfigSummary(
             dreamer_name=bridge_data.dreamer_worker_name,
@@ -3438,17 +3478,18 @@ class HordeWorkerProcessManager:
             kudos_per_hour=kudos_per_hour,
             kudos_this_session=kudos_session,
             active_models=active_models,
-            gpu_utilization_mean_percent=(
-                self._gpu_sampler.mean_percent(window_seconds=self._DUTY_CYCLE_SNAPSHOT_WINDOW_SECONDS)
-            ),
-            gpu_utilization_busy_fraction=(
-                self._gpu_sampler.busy_fraction(window_seconds=self._DUTY_CYCLE_SNAPSHOT_WINDOW_SECONDS)
-            ),
+            gpu_utilization_mean_percent=gpu_utilization_mean_percent,
+            gpu_utilization_busy_fraction=gpu_utilization_busy_fraction,
             gpu_utilization_samples=self._gpu_sampler.sample_count,
             vram_high_water_mb_per_process=run_metrics.vram_used_high_water_mb_per_process,
             ram_high_water_mb_per_process=run_metrics.ram_used_high_water_mb_per_process,
             disk_free_bytes=dict(self._disk_monitor.current_free_bytes),
             recent_jobs=recent_jobs,
+            latest_stats_sample=latest_stats_sample,
+            stats_model_rollups=self._run_metrics.model_rollups(),
+            stats_baseline_rollups=self._run_metrics.baseline_rollups(),
+            stats_export=self._run_metrics.stats_export_state(),
+            stats_history_backfill=self._run_metrics.stats_history_backfill(),
             downloads=self._model_availability.status,
             download_plan=self._get_download_plan_summary(),
             feature_readiness=self._build_feature_readiness_summary(bridge_data),

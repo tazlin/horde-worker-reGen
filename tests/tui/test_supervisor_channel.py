@@ -11,6 +11,8 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SUPERVISOR_PROTOCOL_VERSION,
     ProcessSnapshot,
     RecentJobRecord,
+    StatsRollupRow,
+    StatsSample,
     SupervisorChannel,
     SupervisorCommand,
     SupervisorControlMessage,
@@ -35,6 +37,42 @@ def _make_snapshot() -> WorkerStateSnapshot:
         total_vram_mb=24000,
     )
     return WorkerStateSnapshot(config=config, processes=[process], num_jobs_submitted=7)
+
+
+def test_protocol_version_is_v11() -> None:
+    """Stats snapshots and export controls ride supervisor protocol v11."""
+    assert SUPERVISOR_PROTOCOL_VERSION == 11
+
+
+def test_stats_fields_survive_json_roundtrip() -> None:
+    """Stats sample, rollups, and export state are part of the typed snapshot."""
+    snapshot = _make_snapshot()
+    snapshot.latest_stats_sample = StatsSample(timestamp=123.0, jobs_submitted=4)
+    snapshot.stats_model_rollups = [
+        StatsRollupRow(model="Deliberate", baseline="stable_diffusion_1", jobs=2, megapixelsteps=3.5),
+    ]
+    snapshot.stats_export.enabled = True
+    snapshot.stats_export.active_file_path = "stats.jsonl"
+
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+
+    assert restored.latest_stats_sample is not None
+    assert restored.latest_stats_sample.jobs_submitted == 4
+    assert restored.stats_model_rollups[0].megapixelsteps == 3.5
+    assert restored.stats_export.enabled is True
+
+
+def test_stats_export_command_shape() -> None:
+    """The stats export toggle is a typed supervisor command."""
+    message = SupervisorControlMessage(
+        command=SupervisorCommand.SET_STATS_EXPORT,
+        stats_export_enabled=True,
+    )
+
+    restored = SupervisorControlMessage.model_validate_json(message.model_dump_json())
+
+    assert restored.command is SupervisorCommand.SET_STATS_EXPORT
+    assert restored.stats_export_enabled is True
 
 
 def test_snapshot_pickle_roundtrip() -> None:

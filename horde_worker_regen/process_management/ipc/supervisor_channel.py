@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 10
+SUPERVISOR_PROTOCOL_VERSION = 11
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -53,6 +53,7 @@ v9 added the snapshot's ``feature_readiness`` (:class:`FeatureReadinessSummary`)
 deps+on-disk readiness the worker uses to decide which gated features it offers to the Horde.
 v10 added ``orchestration_intent`` and ``work_ledger`` so the Overview can show the worker's current
 decision and promote per-job state out of the process table.
+v11 added worker-owned stats samples/history, model/baseline rollups, and the stats JSONL export control.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -368,6 +369,60 @@ class RecentJobRecord(BaseModel):
             height=record.height,
             features=features,
         )
+
+
+class StatsSample(BaseModel):
+    """One lightweight, worker-owned statistics sample for trend history and JSONL export."""
+
+    timestamp: float = Field(default_factory=time.time)
+    jobs_submitted: int = 0
+    jobs_faulted: int = 0
+    kudos_per_hour: float | None = None
+    gpu_duty_percent: float | None = None
+    gpu_busy_fraction: float | None = None
+    pending_megapixelsteps: int = 0
+    jobs_pending_inference: int = 0
+    jobs_in_progress: int = 0
+    jobs_pending_safety_check: int = 0
+    jobs_being_safety_checked: int = 0
+    jobs_pending_submit: int = 0
+    time_spent_no_jobs_available: float = 0.0
+    num_process_recoveries: int = 0
+    num_job_slowdowns: int = 0
+    alchemy_forms_pending: int = 0
+    alchemy_forms_in_flight: int = 0
+    alchemy_forms_awaiting_submit: int = 0
+    alchemy_total_submitted: int = 0
+    alchemy_total_faulted: int = 0
+
+
+class StatsRollupRow(BaseModel):
+    """Incremental rollup of finalized image jobs by model or baseline."""
+
+    model: str | None = None
+    baseline: str | None = None
+    jobs: int = 0
+    megapixelsteps: float = 0.0
+    sampling_seconds: float = 0.0
+    e2e_seconds: float = 0.0
+    batch_gt_one_jobs: int = 0
+
+
+class StatsExportState(BaseModel):
+    """Current worker-side JSONL export state."""
+
+    enabled: bool = False
+    active_file_path: str | None = None
+    bytes_in_stats_files: int = 0
+    warning_over_50_mib: bool = False
+    last_write_error: str | None = None
+
+
+class StatsHistoryBackfill(BaseModel):
+    """Recent exact samples plus a decimated all-session series for reconnecting frontends."""
+
+    recent_samples: list[StatsSample] = Field(default_factory=list)
+    all_session_samples: list[StatsSample] = Field(default_factory=list)
 
 
 class DownloadPhase(enum.StrEnum):
@@ -758,6 +813,17 @@ class WorkerStateSnapshot(BaseModel):
     recent_jobs: list[RecentJobRecord] = Field(default_factory=list)
     """The most recent finished-job records, newest last (capped)."""
 
+    latest_stats_sample: StatsSample | None = None
+    """The latest one-second worker-owned stats sample."""
+    stats_model_rollups: list[StatsRollupRow] = Field(default_factory=list)
+    """Finalized image-job rollups by model."""
+    stats_baseline_rollups: list[StatsRollupRow] = Field(default_factory=list)
+    """Finalized image-job rollups by baseline."""
+    stats_export: StatsExportState = Field(default_factory=StatsExportState)
+    """Worker-side stats JSONL export state."""
+    stats_history_backfill: StatsHistoryBackfill | None = None
+    """Bounded stats history for reconnecting frontends."""
+
     alchemy_forms_pending: int = 0
     """Forms popped from the API but not yet dispatched to a child process."""
     alchemy_forms_in_flight: int = 0
@@ -824,6 +890,8 @@ class SupervisorCommand(enum.Enum):
     reports."""
     SHUTDOWN = enum.auto()
     """Begin a graceful, timed shutdown of the worker."""
+    SET_STATS_EXPORT = enum.auto()
+    """Enable or disable worker-side stats JSONL export for this session."""
 
 
 class SupervisorControlMessage(BaseModel):
@@ -845,6 +913,8 @@ class SupervisorControlMessage(BaseModel):
     """The image models to fetch on demand, for :attr:`SupervisorCommand.DOWNLOAD_MODELS`."""
     download_include_aux: bool = False
     """Whether a :attr:`SupervisorCommand.DOWNLOAD_MODELS` request should also run the aux/default pass."""
+    stats_export_enabled: bool | None = None
+    """Desired stats JSONL export state for :attr:`SupervisorCommand.SET_STATS_EXPORT`."""
 
 
 class SupervisorChannel:
