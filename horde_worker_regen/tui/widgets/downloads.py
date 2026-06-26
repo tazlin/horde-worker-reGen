@@ -30,7 +30,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerStateSnapshot,
 )
 from horde_worker_regen.process_management.models.feature_readiness import FeatureReadinessState
-from horde_worker_regen.tui.formatters import human_bytes, human_duration, shorten
+from horde_worker_regen.tui.formatters import human_bytes, human_duration, mini_bar, shorten
 
 
 def _host_label(item: CurrentDownloadStatus) -> str:
@@ -515,8 +515,7 @@ class DownloadsView(VerticalScroll):
         """Render a fixed-width text progress bar; an indeterminate marker when the total is unknown."""
         if percent is None:
             return "[" + "?" * _BAR_WIDTH + "]"
-        filled = int(round(percent / 100.0 * _BAR_WIDTH))
-        return "[" + "█" * filled + "░" * (_BAR_WIDTH - filled) + f"] {percent:5.1f}%"
+        return "[" + mini_bar(percent / 100.0, _BAR_WIDTH) + f"] {percent:5.1f}%"
 
     def _render_queue(self, downloads: DownloadStatusSnapshot | None) -> Panel:
         """Render the queue of pending downloads, labelled with feature and size."""

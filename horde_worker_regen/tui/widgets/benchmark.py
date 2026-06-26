@@ -39,6 +39,7 @@ from horde_worker_regen.tui.benchmark_launcher import (
     BenchmarkSupervisorStatus,
     LevelState,
 )
+from horde_worker_regen.tui.formatters import is_low_fidelity
 
 
 @dataclass(frozen=True)
@@ -1036,8 +1037,9 @@ class BenchmarkView(VerticalScroll):
         width = 20
         fraction = max(0.0, min(1.0, level.jobs_completed / level.jobs_expected))
         filled = int(round(fraction * width))
-        bar = Text("█" * filled, style="green")
-        bar.append("░" * (width - filled), style="grey37")
+        fill_char, empty_char = ("#", "-") if is_low_fidelity() else ("█", "░")
+        bar = Text(fill_char * filled, style="green")
+        bar.append(empty_char * (width - filled), style="grey37")
         bar.append(f"  {level.jobs_completed}/{level.jobs_expected}  {fraction * 100:.0f}%", style="grey70")
         bar.append_text(suffix)
         return bar

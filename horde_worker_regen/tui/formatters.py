@@ -27,6 +27,28 @@ def temperature_colour(temperature: ProcessTemperature) -> str:
 _SPARK_TICKS = "▁▂▃▄▅▆▇█"
 """Eight-level block glyphs, low to high, for compact trend sparklines."""
 
+_SPARK_TICKS_ASCII = " .:-=+*#"
+"""Eight-level ASCII fallback for terminals that lack Unicode block elements."""
+
+_low_fidelity: bool = False
+"""Process-wide flag: True when the terminal cannot reliably render Unicode block elements."""
+
+
+def configure_fidelity(low_fidelity: bool) -> None:
+    """Set the process-wide rendering fidelity (call once at app startup, before any render).
+
+    When low_fidelity is True, sparklines and progress bars use plain ASCII characters instead
+    of Unicode block glyphs, so the display stays readable on PuTTY and other legacy terminals.
+    """
+    global _low_fidelity
+    _low_fidelity = low_fidelity
+
+
+def is_low_fidelity() -> bool:
+    """Return whether ASCII-only rendering is active for this process."""
+    return _low_fidelity
+
+
 _JOB_ID_PALETTE: tuple[str, ...] = (
     "#5aa2ff",
     "#56d364",
@@ -209,26 +231,31 @@ def mini_bar(fraction: float, width: int) -> str:
     """Render a fixed-width filled/unfilled block bar (no percentage label).
 
     Shared by the live view's per-process progress and the overview's inline lanes so a single
-    fill convention is used everywhere.
+    fill convention is used everywhere. Uses ASCII characters (#/-) when low-fidelity mode is
+    active (see configure_fidelity).
     """
     fraction = max(0.0, min(fraction, 1.0))
     filled = int(round(fraction * width))
+    if _low_fidelity:
+        return "#" * filled + "-" * (width - filled)
     return "█" * filled + "░" * (width - filled)
 
 
 def sparkline(values: Sequence[float]) -> str:
-    """Render a sequence of values as a unicode block sparkline, scaled to its own min/max.
+    """Render a sequence of values as a sparkline, scaled to its own min/max.
 
     An empty sequence yields an empty string; a flat sequence renders as a low, even baseline so a
-    steady (but non-zero) signal still reads as present rather than blank.
+    steady (but non-zero) signal still reads as present rather than blank. Uses ASCII characters
+    when low-fidelity mode is active (see configure_fidelity).
     """
     if not values:
         return ""
+    ticks = _SPARK_TICKS_ASCII if _low_fidelity else _SPARK_TICKS
     lowest = min(values)
     highest = max(values)
     span = highest - lowest
     if span <= 0:
         # Flat line: show a mid-low baseline so a steady signal is visibly "there".
-        return _SPARK_TICKS[2] * len(values)
-    last_index = len(_SPARK_TICKS) - 1
-    return "".join(_SPARK_TICKS[int((value - lowest) / span * last_index)] for value in values)
+        return ticks[2] * len(values)
+    last_index = len(ticks) - 1
+    return "".join(ticks[int((value - lowest) / span * last_index)] for value in values)

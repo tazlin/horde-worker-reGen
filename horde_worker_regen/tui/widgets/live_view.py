@@ -22,6 +22,7 @@ from horde_worker_regen.tui.formatters import (
     STATE_LABELS,
     format_its,
     human_mb,
+    is_low_fidelity,
     job_id_text,
     label_state,
     shorten,
@@ -61,13 +62,14 @@ _STALE_AFTER_SECONDS = 4.0
 
 
 def _progress_bar(fraction: float) -> Text:
-    """Render a unicode progress bar coloured by fill fraction."""
+    """Render a progress bar coloured by fill fraction."""
     fraction = max(0.0, min(fraction, 1.0))
     filled = int(round(fraction * _BAR_WIDTH))
     colour = "green" if fraction >= 0.999 else "cyan"
+    fill_char, empty_char = ("#", "-") if is_low_fidelity() else ("█", "░")
     return Text.assemble(
-        ("█" * filled, colour),
-        ("░" * (_BAR_WIDTH - filled), "grey37"),
+        (fill_char * filled, colour),
+        (empty_char * (_BAR_WIDTH - filled), "grey37"),
         (f" {fraction * 100:5.1f}%", "bold"),
     )
 

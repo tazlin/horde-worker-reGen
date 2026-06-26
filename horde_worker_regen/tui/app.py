@@ -52,9 +52,10 @@ from horde_worker_regen.tui.benchmark_launcher import (
 from horde_worker_regen.tui.beta_models import apply_beta_model_env
 from horde_worker_regen.tui.cache_home import apply_cache_home_env
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
+from horde_worker_regen.tui.formatters import configure_fidelity
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
-from horde_worker_regen.tui.update_check import check_for_update
+from horde_worker_regen.tui.update_check import UpdateInfo, check_for_update
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView, BenchmarkWaitingState
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView, ConfigLeaveChoice, ConfigLeaveModal
 from horde_worker_regen.tui.widgets.control import ControlView
@@ -398,6 +399,7 @@ class HordeWorkerTUI(App[None]):
         # Tracks the previous-tick value of last_pop_maintenance_mode to detect False → True transitions
         # and fire a toast exactly once when the horde forces maintenance via the pop response.
         self._prev_pop_maintenance_mode: bool = False
+        self._update_info: UpdateInfo | None = None
 
     def compose(self) -> ComposeResult:
         """Lay out the header, status bar, tabbed views, and footer."""
@@ -428,8 +430,21 @@ class HordeWorkerTUI(App[None]):
                 yield BenchmarkView(worker_mode=self._supervisor.mode.value)
         yield Footer()
 
+    @staticmethod
+    def _detect_low_fidelity(encoding: str) -> bool:
+        """Return True when the terminal is unlikely to render Unicode block elements correctly.
+
+        The env var HORDE_WORKER_TUI_LOW_FIDELITY=1 forces ASCII mode regardless of encoding.
+        Absent that, any non-UTF-8 console encoding (e.g. PuTTY with CP1252) triggers the fallback.
+        """
+        env_override = os.environ.get("HORDE_WORKER_TUI_LOW_FIDELITY", "").strip().lower()
+        if env_override in ("1", "true", "yes"):
+            return True
+        return encoding.lower().replace("-", "") not in ("utf8", "utf8sig")
+
     def on_mount(self) -> None:
         """Begin the refresh loop, then run first-run setup or the usual start/onboarding prompts."""
+        configure_fidelity(self._detect_low_fidelity(self.console.encoding))
         self.set_interval(0.1, self._tick)
         # Resolve the models volume from config before any disk figures are computed, so free space and
         # on-disk checks match the worker's configured cache_home instead of defaulting to ./models.
@@ -481,6 +496,10 @@ class HordeWorkerTUI(App[None]):
         info = await asyncio.to_thread(check_for_update)
         if info is None:
             return
+        self._update_info = info
+        self.title = f"AI Horde Worker - v{__version__} (Update Available)"
+        with contextlib.suppress(Exception):
+            self.query_one(OverviewView).set_update_available(info)
         self.notify(
             f"Update available: v{runtime_version()} -> v{info.latest_version}. Update with "
             "'update.cmd'/'update.sh', or by re-running the installer.",

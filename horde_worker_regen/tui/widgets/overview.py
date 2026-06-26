@@ -15,6 +15,7 @@ from textual.containers import Container, Vertical, VerticalScroll
 from textual.widgets import Static
 
 from horde_worker_regen.app_state import OverviewTrendWindow, OverviewViewMode
+from horde_worker_regen.update_check import UpdateInfo, current_version
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CardSnapshot,
     FeatureReadinessSummary,
@@ -155,6 +156,10 @@ class OverviewView(Vertical):
     OverviewView #overview-alchemy {
         width: auto;
     }
+    OverviewView #overview-update-nag {
+        height: auto;
+        width: 100%;
+    }
     """
     """Row containers stay vertical by default, then detailed mode opts into horizontal adjacency when the
     current content width can support it."""
@@ -170,6 +175,7 @@ class OverviewView(Vertical):
         self._trend_epoch = time.time()
         self._trend_notice: str | None = None
         self._trend_session_start: float | None = None
+        self._update_info: UpdateInfo | None = None
 
     def set_trend_window(self, window: OverviewTrendWindow) -> None:
         """Set the rendered trend window without discarding the session sample buffers."""
@@ -188,6 +194,10 @@ class OverviewView(Vertical):
         """Mark trend output as stabilizing after a capacity/workload-affecting config change."""
         self.soft_reset_trends(notice="Config changed; trends may take time to restabilize.")
 
+    def set_update_available(self, info: UpdateInfo) -> None:
+        """Record that a newer release is available; the nag box shows on the next update_view call."""
+        self._update_info = info
+
     def compose(self) -> ComposeResult:
         """Lay out the compact bar plus the hero, health, trends, pipeline, and detail tables.
 
@@ -197,6 +207,7 @@ class OverviewView(Vertical):
         """
         yield Static(id="overview-thin")
         yield Static(id="overview-hero")
+        yield Static(id="overview-update-nag")
         with VerticalScroll(id="overview-body"):
             with Container(id="overview-core-grid", classes="overview-grid"):
                 yield Static(id="overview-health")
@@ -267,6 +278,13 @@ class OverviewView(Vertical):
             self.query_one(node_id, Static).display = not thin
         for node_id in self._DETAIL_NODE_IDS:
             self.query_one(node_id, Static).display = detailed
+
+        nag = self.query_one("#overview-update-nag", Static)
+        if self._update_info is not None:
+            nag.display = True
+            nag.update(self._render_update_nag(self._update_info))
+        else:
+            nag.display = False
 
         show_worker = not thin and snapshot is not None
         show_alchemy = show_worker and self._show_alchemy_panel(snapshot)
@@ -381,6 +399,22 @@ class OverviewView(Vertical):
             return Text(_SPINNER[frame % len(_SPINNER)], style=f"bold {report.severity.colour}")
         glyph = _STATIC_GLYPHS.get(report.phase, "●")
         return Text(glyph, style=report.severity.colour)
+
+    @staticmethod
+    def _render_update_nag(info: UpdateInfo) -> Panel:
+        """Render the update-available nag panel shown at the top of the overview."""
+        line = Text.assemble(
+            ("v", "grey70"),
+            (current_version(), "bold"),
+            (" -> ", "grey50"),
+            (f"v{info.latest_version}", "bold yellow"),
+            ("   Run ", "grey70"),
+            ("'update.cmd'", "bold cyan"),
+            (" / ", "grey50"),
+            ("'update.sh'", "bold cyan"),
+            (" to update, or re-run the installer.", "grey70"),
+        )
+        return Panel(line, title="Update available", title_align="left", border_style="yellow", padding=(0, 1))
 
     def _render_hero(self, report: HealthReport, snapshot: WorkerStateSnapshot | None, frame: int) -> Panel:
         """Render the headline status panel."""
