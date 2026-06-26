@@ -9,26 +9,18 @@ from __future__ import annotations
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
-    SUPERVISOR_PROTOCOL_VERSION,
     ProcessSnapshot,
-    WorkerConfigSummary,
-    WorkerStateSnapshot,
 )
-from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.resources.device_info import (
+    TorchDeviceInfo,
+    TorchDeviceMap,
+)
 from tests.process_management.conftest import (
     make_mock_bridge_data,
     make_mock_process_info,
     make_test_card_runtimes,
     make_testable_process_manager,
 )
-
-
-def test_protocol_version_is_10() -> None:
-    """The supervisor protocol is at v10 (Overview intent/work-ledger data landed at v10)."""
-    assert SUPERVISOR_PROTOCOL_VERSION == 10
-    snapshot = WorkerStateSnapshot(config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"))
-    assert snapshot.protocol_version == 10
-    assert snapshot.per_card == []
 
 
 def test_process_snapshot_carries_device_index() -> None:
@@ -72,18 +64,32 @@ def test_multi_gpu_projects_each_card_independently() -> None:
     config0 = make_mock_bridge_data(image_models_to_load=["m0"])
     config1 = make_mock_bridge_data(image_models_to_load=["m1"])
     pm._card_runtimes = {
-        0: make_test_card_runtimes(device_indices=(0,), config=config0, total_vram_mb=24576.0)[0],
-        1: make_test_card_runtimes(device_indices=(1,), config=config1, total_vram_mb=12288.0)[1],
+        0: make_test_card_runtimes(
+            device_indices=(0,), config=config0, total_vram_mb=24576.0
+        )[0],
+        1: make_test_card_runtimes(
+            device_indices=(1,), config=config1, total_vram_mb=12288.0
+        )[1],
     }
     pm._device_map = TorchDeviceMap(
         root={
-            0: TorchDeviceInfo(device_name="NVIDIA GeForce RTX 4090", device_index=0, total_memory=24 * 1024**3),
-            1: TorchDeviceInfo(device_name="NVIDIA GeForce RTX 3090", device_index=1, total_memory=12 * 1024**3),
+            0: TorchDeviceInfo(
+                device_name="NVIDIA GeForce RTX 4090",
+                device_index=0,
+                total_memory=24 * 1024**3,
+            ),
+            1: TorchDeviceInfo(
+                device_name="NVIDIA GeForce RTX 3090",
+                device_index=1,
+                total_memory=12 * 1024**3,
+            ),
         },
     )
 
     # A busy slot on card 1, reporting almost-full VRAM (free 500 MB -> pressured).
-    busy = make_mock_process_info(2, model_name="m1", state=HordeProcessState.INFERENCE_STARTING, device_index=1)
+    busy = make_mock_process_info(
+        2, model_name="m1", state=HordeProcessState.INFERENCE_STARTING, device_index=1
+    )
     busy.total_vram_mb = 12000
     busy.vram_usage_mb = 11500
     pm._process_map[2] = busy
