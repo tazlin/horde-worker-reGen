@@ -236,7 +236,17 @@ async def test_hang_at_zero_percent_is_recovered() -> None:
             skip_api=True,
             timeout_seconds=_HANG_DETECT_TIMEOUT_SECONDS,
             inference_fault_profile=FaultProfile(hang_after_n_jobs=1),
-            bridge_data_overrides={"max_inference_attempts": 1},
+            # A hang *at zero percent* emits no first step, so the watchdog reaps it on the first-step grace,
+            # not the per-step timeout. The production default for that grace (90s) is sized for a cold
+            # combined-checkpoint load and would, on its own, exceed this probe's budget. Pin both timeouts to
+            # the bridge-data floor so a wedged-before-first-step slot is detected in the ~15s of silence the
+            # budget above assumes (the effective first-step grace is floored at inference_step_timeout, so
+            # both must be lowered together).
+            bridge_data_overrides={
+                "max_inference_attempts": 1,
+                "inference_step_timeout": 15,
+                "inference_first_step_timeout": 15,
+            },
         ),
     )
 

@@ -59,10 +59,17 @@ class TestStreamForecastClassification:
 
     def test_effective_reserve_honors_comfy_floor_and_config(self) -> None:
         """The reserve is at least ComfyUI's inference floor, with the configured value as an extra floor."""
-        # On a 16GB Windows card ComfyUI's minimum_inference_memory is ~1519MB; a 2048 config floor wins.
+        from hordelib.vram_planning import compute_inference_reserve_mb
+
+        # ComfyUI's minimum_inference_memory is platform-dependent (the Windows reserve is higher and a
+        # 16GB card adds a bonus), so derive the floor for the running platform rather than hardcoding one
+        # value -- a constant tuned on Windows (~1519MB) fails on the Linux CI runner (~1219MB).
+        comfy_floor = float(compute_inference_reserve_mb(_DEVICE_TOTAL_VRAM_MB))
+        # A config floor above the ComfyUI floor wins.
         assert effective_inference_reserve_mb(_DEVICE_TOTAL_VRAM_MB, 2048.0) == 2048.0
         # A small config floor is raised to the ComfyUI floor so the forecast matches the real split point.
-        assert effective_inference_reserve_mb(_DEVICE_TOTAL_VRAM_MB, 256.0) >= 1519.0
+        assert comfy_floor > 256.0
+        assert effective_inference_reserve_mb(_DEVICE_TOTAL_VRAM_MB, 256.0) == comfy_floor
         # No total VRAM (cold start) falls back to the configured floor.
         assert effective_inference_reserve_mb(None, 2048.0) == 2048.0
 
