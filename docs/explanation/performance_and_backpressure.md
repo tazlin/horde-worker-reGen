@@ -368,7 +368,10 @@ is still queued *behind* the heavy head: the head owns the card's sampling, so t
 queued jobs wait and their models reload once it drains.
 The generic scale-down spares any queued-model process, which would otherwise pin the
 count above the target and wedge the convergence forever; the residency instead tells
-the scale-down it is a whole-card collapse so it spares only the head's holder. A fresh preload also chooses *which* eligible card to
+the scale-down it is a whole-card collapse so it spares only the head's holder. The
+holder test is based on the model being staged or resident on a live process, so a
+pre-staged head still converges after it finishes loading and returns to
+`WAITING_FOR_JOB`. A fresh preload also chooses *which* eligible card to
 load onto by the same sticky-then-least-loaded policy dispatch uses: a card already
 holding the model first (no duplicate load), then the eligible card running the
 fewest jobs. The single safety process is moved off-GPU only for a

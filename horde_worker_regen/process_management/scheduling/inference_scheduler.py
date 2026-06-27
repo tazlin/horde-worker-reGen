@@ -1136,7 +1136,7 @@ class InferenceScheduler:
         """
         for device_index, state in self._held_residencies():
             model = state.model
-            if model is None or not self._is_model_forecast_to_load(model):
+            if model is None or not self._whole_card_residency_has_holder(model, device_index):
                 continue
             forecast = state.forecast
             target = (forecast.max_resident_processes() or 1) if forecast is not None else 1
@@ -1147,6 +1147,20 @@ class InferenceScheduler:
                     whole_card_model=model,
                 )
             self._pause_safety_for_residency_if_idle(device_index)
+
+    def _whole_card_residency_has_holder(self, model: str, device_index: int | None) -> bool:
+        """Whether a held whole-card model is staged or resident on a live process.
+
+        Convergence must wait until the pre-staged head has a holder so the scale-down can spare that process.
+        Once the holder reports ready it may sit in ``WAITING_FOR_JOB`` rather than a preload state, so the
+        generic "forecast to load" predicate is too narrow here.
+        """
+        return any(
+            process.process_type is HordeProcessType.INFERENCE
+            and process.loaded_horde_model_name == model
+            and (device_index is None or process.device_index == device_index)
+            for process in self._process_map.values()
+        )
 
     def _prestaged_whole_card_not_ready(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether ``job`` must wait for its in-progress whole-card residency to claim the card before sampling.

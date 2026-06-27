@@ -421,8 +421,9 @@ class TestConvergenceLoopWedge:
         self,
         *,
         sibling_models: tuple[str | None, ...],
+        holder_state: HordeProcessState = HordeProcessState.PRELOADED_MODEL,
     ) -> tuple[InferenceScheduler, ProcessMap, JobTracker, StreamForecast]:
-        """Post-pre-stage state: Flux PRELOADED on one process, idle siblings holding ``sibling_models``.
+        """Post-pre-stage state: Flux held on one process, idle siblings holding ``sibling_models``.
 
         The budget-relative target on this 24GB box is two processes (Flux plus one idle context), so to leave
         a genuine teardown for the convergence loop the pool starts with *more* siblings than that: the loop
@@ -430,7 +431,7 @@ class TestConvergenceLoopWedge:
         name pins it to a queued job; None leaves it model-free). The wedge fires when every excess sibling
         holds a *queued* model -- the generic scale-down would protect them all and pin the count above target.
         """
-        flux_holder = make_mock_process_info(4, model_name=_FLUX_MODEL, state=HordeProcessState.PRELOADED_MODEL)
+        flux_holder = make_mock_process_info(4, model_name=_FLUX_MODEL, state=holder_state)
         siblings = [
             make_mock_process_info(3 - offset, model_name=model, state=HordeProcessState.WAITING_FOR_JOB)
             for offset, model in enumerate(sibling_models)
@@ -484,6 +485,27 @@ class TestConvergenceLoopWedge:
         assert scheduler._whole_card_teardown_exhausted(forecast) is True, (
             "with the pool at the target the head's teardown must read exhausted so it can dispatch"
         )
+
+    async def test_residency_converges_after_holder_becomes_waiting_for_job(self) -> None:
+        """Incident shape: a fully resident idle holder must still drive the convergence shrink.
+
+        Once the pre-stage has finished, the Flux holder may be ``WAITING_FOR_JOB`` rather than
+        ``PRELOADED_MODEL``. The residency is still valid and the queued sibling must still be stoppable;
+        otherwise the head parks until save-our-ship soft-resets the pool.
+        """
+        scheduler, process_map, job_tracker, forecast = self._staged_wedge(
+            sibling_models=(_RESIDENT_SDXL, _OTHER_SDXL),
+            holder_state=HordeProcessState.WAITING_FOR_JOB,
+        )
+        await track_popped_job_async(job_tracker, make_job_pop_response(_FLUX_MODEL, width=1216, height=1216))
+        await track_popped_job_async(job_tracker, make_job_pop_response(_RESIDENT_SDXL))
+        await track_popped_job_async(job_tracker, make_job_pop_response(_OTHER_SDXL))
+
+        for _ in range(30):
+            scheduler._converge_whole_card_residency()
+
+        assert process_map.num_loaded_inference_processes() == forecast.max_resident_processes()
+        assert scheduler._whole_card_teardown_exhausted(forecast) is True
 
     async def test_residency_converges_when_sibling_is_model_free(self) -> None:
         """GREEN control: model-free idle siblings let the convergence loop reach the target and ready the head.
