@@ -117,6 +117,14 @@ finite card. What matters is their *rate*. High churn inflates `queue_wait` and 
 the counts on the duty line points you straight at the reload behaviour behind a low reading and at the
 levers, [model stickiness](#tuning-levers-and-what-they-cannot-do) and residency, that suppress it.
 
+A distinct cost hides inside `vram_load` even when no swap or eviction is counted: the engine evicts a
+job's model from VRAM after every run, so the next job re-streams the same weights from RAM, a RAM→VRAM
+reload paid even for the *same* model back-to-back. The scheduler now suppresses that per-job eviction
+when the next queued job reuses the model and the VRAM budget confirms it fits (see
+[keeping a model resident between same-model jobs](performance_and_backpressure.md#keeping-a-model-resident-between-same-model-jobs)),
+so a homogeneous or sticky workload stops paying `vram_transfer` on its hot model and the residual reload
+loss narrows to genuine model *switches*.
+
 ## Where to read it
 
 The same [`DutyCycleSummary`][horde_worker_regen.process_management.resources.duty_cycle.DutyCycleSummary]
@@ -148,35 +156,53 @@ and for comparing runs.
 
 ### Across sessions: `horde-duty-report`
 
-`bridge.log` is appended across worker restarts, so one file holds many sessions, and a fair before/after
-comparison means reading each session separately against the config that produced it. The
+The preferred offline source is the worker-owned stats JSONL export under `.horde_worker_regen/stats/`.
+Those files carry one-second `stats_sample` records plus finalized `job_completed` records, so the
+report can account for every sampled interval, split **idle-time loss** from **partial-utilization
+loss**, and then enrich the buckets with per-job phase metrics, process-state summaries, scheduler
+intent, maintenance/backoff flags, and churn counters when the export contains them. Older stats files
+with fewer fields still parse; missing attribution is reported as `unknown` rather than dropped.
+
+`bridge.log` remains the fallback for older sessions or workers with stats export disabled. The
 `horde-duty-report` CLI ([`horde_worker_regen.analysis.duty_log_report`][horde_worker_regen.analysis.duty_log_report])
-splits the log into **session epochs** on the once-per-launch process-manager init banner and, per
-epoch, prints the duty distribution, the biggest per-job gaps, the churn totals, the effective config,
-and any disk-pressure dips:
+tries stats first when no explicit log path is supplied, then falls back to the epoch-aware log parser.
+Point it at either data source explicitly when comparing artifacts from a support bundle:
 
 ```bash
-horde-duty-report                 # every epoch in logs/bridge.log
-horde-duty-report --last          # only the most recent session
-horde-duty-report path/to/bridge.log --json
+horde-duty-report                              # stats JSONL if present, else logs/bridge.log
+horde-duty-report --stats .horde_worker_regen/stats --last
+horde-duty-report --logs logs --json
+horde-duty-report path/to/bridge.log           # legacy log-only path
 ```
 
-A single epoch renders roughly like this:
+A stats-backed session renders roughly like this:
 
 ```text
-== Epoch 2 | 2026-06-20 14:02-14:26 (24 min) | 8 windows ==
-   config: models=111, threads=1, queue=2, max_power=32, high_perf
-   verdict: below 90% target: mean 44%; ~18% idle (hand-off/no-work) + ~38% partial-utilization
-   duty: mean 44%  min 31%  max 58%
-   bands: <40% 3  40-60% 4  60-75% 1  75-90% 0  >=90% 0
-   top per-job gaps: queue wait 24.7s/job  model load (disk) 1.8s/job  safety 0.9s/job
-   reload churn: model swaps 29  VRAM evictions 22
+== Stats session 20260620-140201 v12.16.0 | 2026-06-20 14:02-14:26 | 1440 samples ==
+   duty: mean 44%  busy 82%  completed jobs 61
+   top loss buckets: model_load 420s (idle 180s, partial 240s)  scheduler_wait 210s (idle 210s, partial 0s)
+   phase medians: sampling 8.2s/job  model_load 1.8s/job  vram_transfer 1.2s/job  safety 0.9s/job
+   inference queue wait: total 210s (3.4s/job; median 2.1s, p90 8.8s, max 22.0s; 0.42x sampling time; overlaps active inference)
+   queue wait by model: model-a 90s/18j  model-b 54s/12j
+   inference dispatch gap: 32s queued with no active inference (15% of queued sample time)
+   dispatch gap states: inf#0=PRELOADING_MODEL 20s  inf#0=WAITING_FOR_JOB 12s
+   churn: model_swap 0.48/job  vram_eviction 0.36/job
+   operator view: Model load/transfer dominated loss; reduce model churn or use a smaller served model set for this VRAM size.
+   maintainer view: Unknown/unattributed time remains; inspect sample state/intent coverage around the evidence timestamps.
 ```
 
-Because each epoch's numbers are tied to the config that produced them, an A/B tuning comparison is
-meaningful in a way that a single blended average is not. The caveat is that the horde's demand (job
-sizes, model spread) varies between epochs, so short (roughly 24-minute) comparisons are noisy: prefer
-longer epochs and look for large deltas rather than reading significance into a few points of duty.
+The report intentionally keeps three related views separate. Idle seconds are wall-clock intervals where
+the GPU was mostly not doing work, attributed to demand limits, scheduler waits, local pause, API
+backoff, safety/submit queues, recovery, or `unknown`. Partial-utilization seconds are the remaining
+shortfall when the GPU was active but the mean utilization stayed below the target; those are attributed
+to the dominant phase or worker state (for example model load, VRAM transfer, safety, or
+post-processing). `inference_queue_wait` is popped-to-inference-start latency and can overlap active
+sampling when a standby job waits behind the one legal inference slot. `inference_dispatch_gap` is the
+narrower scheduler-delay signal: sampled time where inference work was queued and no inference job was
+active. Because each stats session is grouped by the export filename stamp, rotated `.jsonl` and
+`.jsonl.gz` files stay together for A/B comparisons. The same demand caveat still applies: short
+comparisons are noisy because the horde's model mix and job sizes vary, so prefer longer sessions and
+large deltas.
 
 ## The structural ceiling on VRAM-constrained cards
 
@@ -246,5 +272,9 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
   shared summary used by both the live worker and the benchmark
 - [`GpuUtilizationSampler`][horde_worker_regen.utils.gpu_monitor.GpuUtilizationSampler]: the background
   utilization sampler
+- [`horde_worker_regen.analysis.session_duty`][horde_worker_regen.analysis.session_duty]: the
+  stats-backed session analyzer behind the preferred `horde-duty-report` path
 - [`horde_worker_regen.analysis.duty_log_report`][horde_worker_regen.analysis.duty_log_report]: the
-  epoch-aware log analyzer behind `horde-duty-report`
+  CLI and legacy epoch-aware log analyzer behind `horde-duty-report`
+
+

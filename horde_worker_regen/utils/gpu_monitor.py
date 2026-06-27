@@ -120,28 +120,37 @@ class GpuUtilizationSampler:
         """The number of utilization samples currently retained."""
         return len(self._samples)
 
-    def _windowed_values(self, window_seconds: float | None) -> list[int]:
-        """Utilization values from the last ``window_seconds`` (whole buffer when None)."""
-        if window_seconds is None:
-            return list(self._samples)
-        cutoff = time.time() - window_seconds
-        return [value for timestamp, value in self._timeline if timestamp >= cutoff]
+    def _windowed_values(self, window_seconds: float | None, *, not_before: float | None = None) -> list[int]:
+        """Utilization values from the last ``window_seconds`` (whole buffer when None).
 
-    def mean_percent(self, window_seconds: float | None = None) -> float | None:
+        ``not_before`` drops any sample taken before that epoch second. The worker passes the first
+        inference's start time so the cold-boot model-load window (GPU idle while weights stream in,
+        before any job samples) never dilutes the duty figure: that startup time is not inter-job
+        inefficiency, just one-time warm-up, and counting it only adds noise to the headline.
+        """
+        if window_seconds is None and not_before is None:
+            return list(self._samples)
+        cutoff = time.time() - window_seconds if window_seconds is not None else None
+        floor = max(cutoff, not_before) if cutoff is not None and not_before is not None else (cutoff or not_before)
+        return [value for timestamp, value in self._timeline if floor is None or timestamp >= floor]
+
+    def mean_percent(self, window_seconds: float | None = None, *, not_before: float | None = None) -> float | None:
         """Average GPU core utilization (the duty cycle), over the whole run or the last window.
 
         Args:
             window_seconds: When given, average only samples from the last this-many seconds (for a
                 live rolling figure); when None, average the whole retained run (the benchmark's use).
+            not_before: When given, exclude samples taken before this epoch second (e.g. the first
+                inference start, so cold-boot warm-up is not counted against the duty cycle).
         """
-        values = self._windowed_values(window_seconds)
+        values = self._windowed_values(window_seconds, not_before=not_before)
         if not values:
             return None
         return sum(values) / len(values)
 
-    def busy_fraction(self, window_seconds: float | None = None) -> float | None:
+    def busy_fraction(self, window_seconds: float | None = None, *, not_before: float | None = None) -> float | None:
         """Fraction of samples at or above the busy threshold, over the whole run or the last window."""
-        values = self._windowed_values(window_seconds)
+        values = self._windowed_values(window_seconds, not_before=not_before)
         if not values:
             return None
         busy = sum(1 for value in values if value >= self._busy_threshold)

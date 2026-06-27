@@ -878,11 +878,20 @@ class HordeInferenceProcess(HordeProcess):
         thread.start()
         return stop_event, thread
 
-    def start_inference(self, job_info: ImageGenerateJobPopResponse) -> list[ResultingImageReturn] | None:
+    def start_inference(
+        self,
+        job_info: ImageGenerateJobPopResponse,
+        *,
+        keep_model_resident: bool = False,
+    ) -> list[ResultingImageReturn] | None:
         """Start an inference job in the HordeLib instance.
 
         Args:
             job_info (ImageGenerateJobPopResponse): The job to start inference on.
+            keep_model_resident (bool, optional): Keep the model resident in VRAM after this job
+                instead of evicting it, so a following same-model job skips the RAM->VRAM reload. The
+                scheduler sets this only when it has confirmed the next job reuses the model and the
+                VRAM budget allows it. Defaults to False.
 
         Returns:
             list[Image] | None: The generated images, or None if inference failed.
@@ -925,7 +934,11 @@ class HordeInferenceProcess(HordeProcess):
                         width=job_info.payload.width,
                         height=job_info.payload.height,
                     ):
-                        results = self._horde.basic_inference(job_info, progress_callback=self.progress_callback)
+                        results = self._horde.basic_inference(
+                            job_info,
+                            progress_callback=self.progress_callback,
+                            defer_vram_unload=keep_model_resident,
+                        )
         except Exception as e:
             # Keep a reason for the faulted result: the main process logs it and classifies a
             # resource/OOM failure (which earns a degraded retry) from this text. The full message is
@@ -1324,7 +1337,10 @@ class HordeInferenceProcess(HordeProcess):
 
                 time_start = time.time()
 
-                results = self.start_inference(message.sdk_api_job_info)
+                results = self.start_inference(
+                    message.sdk_api_job_info,
+                    keep_model_resident=message.keep_model_resident_after,
+                )
 
                 if results is None or len(results) == 0:
                     self.send_memory_report_message(include_vram=True)

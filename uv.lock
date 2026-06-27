@@ -1108,7 +1108,7 @@ wheels = [
 
 [[package]]
 name = "horde-engine"
-version = "3.9.2"
+version = "3.9.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1174,9 +1174,9 @@ dependencies = [
     { name = "yapf" },
     { name = "yarl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3b/a8/b5a00d5e50e8250b518097a776d601097aaad0082933bca180f452c88902/horde_engine-3.9.2.tar.gz", hash = "sha256:b9d58a1d14ef56614bd04e784bfb3e6fdf190e64230293a87ad83699777487cc", size = 395637, upload-time = "2026-06-25T02:40:23.721Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/85/b5/235289e853be19c2d2a961b989d0786ebb45b1dd91429e9427587fd432b5/horde_engine-3.9.3.tar.gz", hash = "sha256:6eeb3a4a1a1ee1d623cd1e6044e3f9274715f0efbba4168ca1de747835a77be8", size = 396001, upload-time = "2026-06-27T04:07:21.346Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/73/c6cc1baf9d2558644bf47ea22707359b1f25a646cb5f420805468033ac64/horde_engine-3.9.2-py3-none-any.whl", hash = "sha256:fdaf1d7a8ac53bd2d4462f1a7979ce714971bd403453d93a74a9d67486962354", size = 504732, upload-time = "2026-06-25T02:40:22.107Z" },
+    { url = "https://files.pythonhosted.org/packages/97/15/1bbc7201392fb82cdafb5e462e4c5e49b96eae89f9096ae4cce4c8448db7/horde_engine-3.9.3-py3-none-any.whl", hash = "sha256:e27a89841631b0e4457f2ab29857fa0d0016d7dc2512ca4dc8137886f267b12e", size = 505189, upload-time = "2026-06-27T04:07:19.305Z" },
 ]
 
 [package.optional-dependencies]

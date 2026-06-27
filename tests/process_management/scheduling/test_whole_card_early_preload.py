@@ -17,6 +17,7 @@ the process that holds the pre-staged model.
 
 from __future__ import annotations
 
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
@@ -86,7 +87,7 @@ def _build_overlap_scheduler(
     ]
     for proc in (busy, *idle):
         proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
-        proc.vram_usage_mb = _DEVICE_TOTAL_VRAM_MB - free_mb
+        proc.vram_usage_mb = int(_DEVICE_TOTAL_VRAM_MB - free_mb)
     process_map = ProcessMap({proc.process_id: proc for proc in (busy, *idle)})
 
     job_tracker = JobTracker()
@@ -99,7 +100,7 @@ def _build_overlap_scheduler(
     )
     scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=1 + num_idle)
     scheduler._process_lifecycle.pause_safety_on_gpu = Mock(return_value=True)
-    scheduler._process_lifecycle.is_safety_gpu_paused = False
+    cast(Any, scheduler._process_lifecycle).is_safety_gpu_paused = False
     return scheduler, process_map, job_tracker, busy, idle
 
 
@@ -205,6 +206,66 @@ class TestEarlyRamPreStage:
 class TestResidencyConvergesAfterDrain:
     """Once the head is pre-staged and the device frees, the residency must collapse to sole VRAM residency."""
 
+    async def test_convergence_defers_safety_pause_while_safety_backlog_exists(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Whole-card convergence must not interrupt an already-pending safety check."""
+        _seed_flux_weight_estimates(monkeypatch)
+
+        flux_holder = make_mock_process_info(2, model_name=_FLUX_MODEL, state=HordeProcessState.PRELOADED_MODEL)
+        former_busy = make_mock_process_info(1, model_name=_RESIDENT_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
+        spare_a = make_mock_process_info(3, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        spare_b = make_mock_process_info(4, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        procs = [former_busy, flux_holder, spare_a, spare_b]
+        for proc in procs:
+            proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+            proc.vram_usage_mb = int(_DEVICE_TOTAL_VRAM_MB - 15007.0)
+        process_map = ProcessMap({proc.process_id: proc for proc in procs})
+
+        job_tracker = JobTracker()
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            bridge_data=_overlap_bridge_data(),
+            max_concurrent=1,
+            max_inference=4,
+        )
+        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=4)
+        scheduler._process_lifecycle.pause_safety_on_gpu = Mock(return_value=True)
+        cast(Any, scheduler._process_lifecycle).is_safety_gpu_paused = False
+        scheduler._horde_model_map.update_entry(
+            horde_model_name=_FLUX_MODEL,
+            load_state=ModelLoadState.LOADED_IN_RAM,
+            process_id=flux_holder.process_id,
+        )
+        scheduler._sibling_teardown_for_model = _FLUX_MODEL
+        scheduler._whole_card_forecast = scheduler._forecast_streaming(
+            make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),
+            _FLUX_BASELINE,
+        )
+
+        safety_job = make_job_pop_response(_RESIDENT_SDXL)
+        safety_info = await job_tracker.record_popped_job(safety_job)
+        await job_tracker.mark_inference_started(safety_job)
+        await job_tracker.queue_for_safety(safety_info)
+        flux_head = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
+        await track_popped_job_async(job_tracker, flux_head)
+
+        scheduler.preload_models()
+
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_with(
+            1,
+            device_index=None,
+            whole_card_model=_FLUX_MODEL,
+        )
+        scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
+
+        await job_tracker.abandon_pending_safety(safety_info)
+        scheduler.preload_models()
+
+        scheduler._process_lifecycle.pause_safety_on_gpu.assert_called_once_with()
+
     async def test_collapses_to_target_protecting_the_prestaged_holder(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -226,7 +287,7 @@ class TestResidencyConvergesAfterDrain:
         procs = [former_busy, flux_holder, spare_a, spare_b]
         for proc in procs:
             proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
-            proc.vram_usage_mb = _DEVICE_TOTAL_VRAM_MB - 15007.0  # device drained: the live job has finished
+            proc.vram_usage_mb = int(_DEVICE_TOTAL_VRAM_MB - 15007.0)  # device drained: the live job has finished
         process_map = ProcessMap({proc.process_id: proc for proc in procs})
 
         job_tracker = JobTracker()
@@ -239,7 +300,7 @@ class TestResidencyConvergesAfterDrain:
         )
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=4)
         scheduler._process_lifecycle.pause_safety_on_gpu = Mock(return_value=True)
-        scheduler._process_lifecycle.is_safety_gpu_paused = False
+        cast(Any, scheduler._process_lifecycle).is_safety_gpu_paused = False
 
         # Flux is resident-in-RAM and a residency is being held for it (the state the pre-stage leaves).
         scheduler._horde_model_map.update_entry(
@@ -287,7 +348,7 @@ def _live_log_overlap_scheduler(
     """
     busy = make_mock_process_info(1, model_name=_RESIDENT_SDXL, state=HordeProcessState.INFERENCE_STARTING)
     busy.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
-    busy.vram_usage_mb = _DEVICE_TOTAL_VRAM_MB - 9329.0  # device-free 9329, matching the logged forecast
+    busy.vram_usage_mb = int(_DEVICE_TOTAL_VRAM_MB - 9329.0)  # device-free 9329, matching the logged forecast
     idle: list[HordeProcessInfo] = [
         make_mock_process_info(pid, model_name=None, state=HordeProcessState.WAITING_FOR_JOB) for pid in (2, 3, 4)
     ]
@@ -306,7 +367,7 @@ def _live_log_overlap_scheduler(
     )
     scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=4)
     scheduler._process_lifecycle.pause_safety_on_gpu = Mock(return_value=True)
-    scheduler._process_lifecycle.is_safety_gpu_paused = False
+    cast(Any, scheduler._process_lifecycle).is_safety_gpu_paused = False
     scheduler._measured_available_ram_mb = lambda: available_ram_mb  # type: ignore[method-assign]
     return scheduler, job_tracker, idle
 
@@ -345,7 +406,7 @@ class TestLiveLogRamGateRegression:
 
         assert admitted is True
         assert len(_idle_preloading_flux(idle)) == 1, "Flux must be staged into a spare's RAM (weights fit)"
-        assert scheduler._process_lifecycle.scale_inference_processes.called is False, (
+        assert cast(Mock, scheduler._process_lifecycle.scale_inference_processes).called is False, (
             "the worker must not tear the idle siblings down when the head can be pre-staged"
         )
 
@@ -391,7 +452,7 @@ def _staged_flux_scheduler(
     ]
     for proc in procs:
         proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
-        proc.vram_usage_mb = _DEVICE_TOTAL_VRAM_MB - free_mb
+        proc.vram_usage_mb = int(_DEVICE_TOTAL_VRAM_MB - free_mb)
     process_map = ProcessMap({proc.process_id: proc for proc in procs})
 
     job_tracker = JobTracker()
@@ -404,7 +465,7 @@ def _staged_flux_scheduler(
     )
     scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=num_processes)
     scheduler._process_lifecycle.pause_safety_on_gpu = Mock(return_value=True)
-    scheduler._process_lifecycle.is_safety_gpu_paused = safety_paused
+    cast(Any, scheduler._process_lifecycle).is_safety_gpu_paused = safety_paused
     scheduler._horde_model_map.update_entry(
         horde_model_name=_FLUX_MODEL,
         load_state=ModelLoadState.LOADED_IN_RAM,

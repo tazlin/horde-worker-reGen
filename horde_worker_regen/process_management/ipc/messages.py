@@ -493,6 +493,14 @@ class HordeInferenceControlMessage(HordeControlModelMessage):
     sdk_api_job_info: ImageGenerateJobPopResponse
     """The job as sent by the API."""
 
+    keep_model_resident_after: bool = False
+    """Keep this job's model resident in VRAM after the run instead of evicting it.
+
+    Set by the scheduler only when the next pending-inference job reuses the same model and the VRAM
+    budget confirms it can stay resident across the live process set, so the back-to-back force-reload
+    (the dominant non-sampling cost on small jobs) is skipped. Defaults to False, preserving the
+    aggressive per-job eviction that keeps sibling GPU instances from over-committing."""
+
     trace_context: str | None = None
     """W3C traceparent string for cross-process span correlation."""
 

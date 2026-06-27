@@ -14,6 +14,7 @@
         - [Concurrent-overlap gating](#concurrent-overlap-gating)
         - [Idle-thread diversity scheduling](#idle-thread-diversity-scheduling)
     - [Model eviction (LRU)](#model-eviction-lru)
+    - [Keeping a model resident between same-model jobs](#keeping-a-model-resident-between-same-model-jobs)
     - [The VRAM and RAM budget](#the-vram-and-ram-budget)
         - [Per-context overhead and the effective idle floor](#per-context-overhead-and-the-effective-idle-floor)
     - [Alchemy backpressure](#alchemy-backpressure)
@@ -71,6 +72,13 @@ until the backlog drains. The threshold is **not** a config field; it is
 derived from the active performance mode: `15` (normal), `60`
 (`moderate_performance_mode`), or `80` (`high_performance_mode`). How long
 popping pauses also scales with the backlog and performance mode.
+
+When local queueing is enabled, the megapixelstep gate preserves the first
+standby inference slot before it starts pausing pops. Pending megapixelsteps
+include the active inference job, so a single large SDXL job can exceed the
+normal-mode threshold by itself; without this exception, the worker can finish
+that job and then discover it has no already-popped successor to preload or run.
+After one non-running inference job is queued, the usual threshold applies again.
 
 This prevents the worker from accepting a large number of high-resolution jobs
 that would take hours to complete, starving smaller jobs behind them.
@@ -275,6 +283,33 @@ Eviction happens in two stages:
 (since reloading from disk is cheap) and less aggressive about VRAM eviction
 (since keeping models in VRAM is the real win).
 
+## Keeping a model resident between same-model jobs
+
+The eviction above is *scheduler*-driven and happens when a different model needs the space. There is a
+second, finer eviction underneath it: the engine force-loads a job's model fully into VRAM to sample it,
+then by default evicts it from VRAM the moment the job finishes. That blanket post-job eviction is what
+lets N inference processes share one GPU without their resident footprints colliding, but it also means
+the *next* job re-streams the same weights from RAM back into VRAM, a per-job RAM→VRAM cost that dominates
+non-sampling time on small jobs and shows up as the `vram_transfer` loss in the
+[duty-cycle report](duty-cycle.md). It is paid even when the very next job uses the *same* model on the
+*same* process.
+
+The scheduler suppresses that eviction for one dispatch when, and only when, both of these hold:
+
+- **the next queued inference job reuses this model**, so the retained weights are actually consumed
+  rather than idly pinning VRAM another model could use, and
+- **the [VRAM budget](#the-vram-and-ram-budget) confirms the footprint fits the measured free VRAM**, so
+  holding the model resident never starves a different model another process must load.
+
+When both hold, the dispatch carries a "keep resident after" hint to the engine, which skips the post-job
+VRAM cleanup so the following same-model job samples immediately with no reload. Retention is granted on
+evidence, never assumed: a disabled budget or unmeasured VRAM falls back to eviction, and even a granted
+retention is a soft hold — the engine's force-load overflow guard and the worker's under-pressure
+reclaim can still evict it, so a wrong call degrades to a reload rather than an out-of-memory. This is the
+mechanism that lets a sticky or homogeneous workload realise back-to-back sampling on its hot model
+without paying the [structural reload](duty-cycle.md#the-structural-ceiling-on-vram-constrained-cards)
+every job.
+
 ## The VRAM and RAM budget
 
 Each inference process loads models into the **same** GPU independently. Without a
@@ -329,8 +364,11 @@ the scale-down it is a whole-card collapse so it spares only the head's holder. 
 load onto by the same sticky-then-least-loaded policy dispatch uses: a card already
 holding the model first (no duplicate load), then the eligible card running the
 fewest jobs. The single safety process is moved off-GPU only for a
-residency on the card it is pinned to (the lowest-index card). System RAM stays a
-single shared pool sized from the *total* process count across all cards. A
+residency on the card it is pinned to (the lowest-index card), and only after
+already-pending or active safety checks have drained; this avoids interrupting a
+completed job's safety pass and paying a full safety-process restart in the
+middle of the pipeline. System RAM stays a single shared pool sized from the
+*total* process count across all cards. A
 single-GPU worker passes `device_index=None` throughout, so every reading is
 worker-wide exactly as before. (The per-context CUDA overhead the residency
 forecast assumes is a runtime/architecture constant and stays worker-wide; per-card

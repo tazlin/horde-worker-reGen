@@ -97,6 +97,10 @@ class PopThrottler:
         Manages the internal trigger state on ``self._job_tracker`` and logs
         the first time a wait is initiated.
         """
+        if self._should_preserve_standby_job(bridge_data):
+            self._job_tracker.reset_megapixelstep_trigger()
+            return False
+
         if not self._job_tracker.should_wait_for_pending_megapixelsteps():
             self._job_tracker.reset_megapixelstep_trigger()
             return False
@@ -136,6 +140,15 @@ class PopThrottler:
             f"{self._job_tracker._max_pending_megapixelsteps}, continuing with job pops",
         )
         return False
+
+    def _should_preserve_standby_job(self, bridge_data: reGenBridgeData) -> bool:
+        """Return whether popping should continue to fill the first standby slot."""
+        queue_size = bridge_data.queue_size
+        if queue_size <= 0:
+            return False
+
+        standby_jobs = len(self._job_tracker.jobs_pending_inference) - len(self._job_tracker.jobs_in_progress)
+        return standby_jobs < 1
 
     def _calculate_megapixelstep_wait(self, bridge_data: reGenBridgeData) -> float:
         """Calculate how many seconds to wait based on pending megapixelsteps and config."""

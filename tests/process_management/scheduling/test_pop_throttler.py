@@ -12,7 +12,12 @@ from horde_worker_regen.process_management.scheduling.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
     PopThrottler,
 )
-from tests.process_management.conftest import make_mock_bridge_data, make_mock_job, track_popped_job_async
+from tests.process_management.conftest import (
+    make_mock_bridge_data,
+    make_mock_job,
+    mark_job_in_progress_async,
+    track_popped_job_async,
+)
 
 
 def _make_throttler(
@@ -237,6 +242,25 @@ class TestShouldWaitForMegapixelsteps:
         assert result is True
         assert job_tracker._triggered_max_pending_megapixelsteps is True
         assert job_tracker._triggered_max_pending_megapixelsteps_time > 0
+
+    async def test_wait_preserves_first_standby_job(self) -> None:
+        """Megapixelstep backpressure should not starve the first standby queue slot."""
+        job_tracker = JobTracker()
+        job_tracker.set_performance_mode_thresholds(15)
+        throttler = _make_throttler(job_tracker=job_tracker)
+        bd = self._make_bridge_data(queue_size=1)
+
+        active_job = await track_popped_job_async(job_tracker, _make_mock_job())
+        await mark_job_in_progress_async(job_tracker, active_job)
+
+        assert job_tracker.should_wait_for_pending_megapixelsteps() is True
+        assert throttler.should_wait_for_megapixelsteps(bd) is False
+        assert job_tracker._triggered_max_pending_megapixelsteps is False
+
+        await track_popped_job_async(job_tracker, _make_mock_job())
+
+        assert throttler.should_wait_for_megapixelsteps(bd) is True
+        assert job_tracker._triggered_max_pending_megapixelsteps is True
 
     async def test_returns_true_while_within_wait_period(self) -> None:
         """While within the calculated wait window, should keep returning True."""

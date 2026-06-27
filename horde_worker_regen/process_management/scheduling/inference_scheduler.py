@@ -931,6 +931,20 @@ class InferenceScheduler:
             return True
         return device_index == min(self._card_runtimes)
 
+    def _has_safety_backlog(self) -> bool:
+        """Return whether safety has work that should not be interrupted by residency churn."""
+        return bool(self._job_tracker.jobs_pending_safety_check or self._job_tracker.jobs_being_safety_checked)
+
+    def _pause_safety_for_residency_if_idle(self, device_index: int | None) -> bool:
+        """Pause safety for whole-card residency only when no safety job is pending or active."""
+        if not self._residency_should_pause_safety(device_index):
+            return False
+        if self._process_lifecycle.is_safety_gpu_paused:
+            return False
+        if self._has_safety_backlog():
+            return False
+        return self._process_lifecycle.pause_safety_on_gpu()
+
     def _establish_whole_card_residency(
         self,
         job: ImageGenerateJobPopResponse,
@@ -971,9 +985,7 @@ class InferenceScheduler:
         if target < current:
             after = self._process_lifecycle.scale_inference_processes(target, device_index=device_index)
 
-        safety_paused = False
-        if self._residency_should_pause_safety(device_index):
-            safety_paused = self._process_lifecycle.pause_safety_on_gpu()
+        safety_paused = self._pause_safety_for_residency_if_idle(device_index)
 
         if announce or after < current or safety_paused:
             safety_note = " and moving safety off-GPU" if safety_paused else ""
@@ -1122,8 +1134,7 @@ class InferenceScheduler:
                     device_index=device_index,
                     whole_card_model=model,
                 )
-            if self._residency_should_pause_safety(device_index) and not self._process_lifecycle.is_safety_gpu_paused:
-                self._process_lifecycle.pause_safety_on_gpu()
+            self._pause_safety_for_residency_if_idle(device_index)
 
     def _prestaged_whole_card_not_ready(self, job: ImageGenerateJobPopResponse) -> bool:
         """Whether ``job`` must wait for its in-progress whole-card residency to claim the card before sampling.
@@ -3085,6 +3096,53 @@ class InferenceScheduler:
 
         return next_job_and_process
 
+    def _should_keep_model_resident(
+        self,
+        dispatched_job: ImageGenerateJobPopResponse,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Whether ``dispatched_job``'s model should stay resident in VRAM after it runs.
+
+        hordelib evicts the model from VRAM after every job so sibling GPU instances never collectively
+        over-commit; that eviction forces a RAM->VRAM reload on the next job, which is the dominant
+        non-sampling cost on small jobs. Retention skips that reload, but only earns its keep when the
+        reuse is imminent and the headroom is real, so both gates must hold:
+
+        - **same model queued next**: another pending-inference job (not this one, not already in flight)
+          reuses this model, so the retained weights are actually consumed rather than idly pinned.
+        - **budget fits**: the VRAM budget confirms the model's footprint fits the *measured* free VRAM,
+          so retention never starves a different model another process must load. A missing budget or
+          unmeasured VRAM yields False: retention is granted on evidence, never assumed.
+
+        Even when granted, hordelib's force-load overflow guard remains the hard backstop, and the
+        worker's under-pressure eviction can still reclaim the retained model, so a wrong call degrades
+        to a reload rather than an OOM.
+        """
+        model = dispatched_job.model
+        if model is None:
+            return False
+        same_model_pending = any(
+            job.model == model
+            for job in self._job_tracker.jobs_pending_inference
+            if job is not dispatched_job and job not in self._job_tracker.jobs_in_progress
+        )
+        if not same_model_pending:
+            return False
+        if not self._budget_active():
+            return False
+        free_vram_mb = self._measured_free_vram_mb(device_index=device_index)
+        if free_vram_mb is None:
+            return False
+        baseline = self._model_metadata.get_baseline(model)
+        verdict = self._vram_budget.check_job(
+            dispatched_job,
+            baseline,
+            free_vram_mb,
+            committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
+        )
+        return verdict.fits
+
     async def start_inference(self) -> bool:
         """Start inference for the next job in jobs_pending_inference, if possible.
 
@@ -3213,19 +3271,24 @@ class InferenceScheduler:
         logger.debug(f"All Batch IDs: {next_job.ids}")
 
         process_with_model.batch_amount = next_job.payload.n_iter
+        # Record the card this job runs on (None on a single-GPU host) so its over-budget fault streak is
+        # kept per card: a model unservable on a small card can still be advertised and run on a larger one.
+        dispatched_device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
+        keep_model_resident_after = self._should_keep_model_resident(
+            next_job,
+            device_index=dispatched_device_index,
+        )
         if process_with_model.safe_send_message(
             HordeInferenceControlMessage(
                 control_flag=HordeControlFlag.START_INFERENCE,
                 horde_model_name=next_job.model,
                 sdk_api_job_info=next_job,
+                keep_model_resident_after=keep_model_resident_after,
                 aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
                     self._runtime_config.bridge_data,
                 ),
             ),
         ):
-            # Record the card this job runs on (None on a single-GPU host) so its over-budget fault streak is
-            # kept per card: a model unservable on a small card can still be advertised and run on a larger one.
-            dispatched_device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
             await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)
             horde_model_baseline = self._model_metadata.get_baseline(next_job.model)
 
