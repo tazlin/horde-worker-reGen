@@ -716,12 +716,17 @@ class TestWholeCardIntent:
         assert forecast.fits_coresident is True
         assert forecast.needs_exclusive_residency is False
 
-    def test_intent_forces_sole_residency(self) -> None:
-        """Whole-card intent forces an exclusive residency forecast."""
+    def test_intent_forces_exclusive_residency(self) -> None:
+        """Whole-card intent forces an exclusive residency forecast even when the seed fits co-resident.
+
+        This is the Z-Image guard: intent wins over the fitting weight estimate, so the model takes the
+        exclusive path (evict sibling models, sample alone) rather than co-residing and thrashing. How many
+        idle sibling *contexts* survive that teardown is sized separately and budget-relative by
+        ``max_resident_processes`` (see :class:`TestWholeCardResidentProcessCount`); intent governs sole
+        *sampling*, not a blanket collapse to one process.
+        """
         forecast = self._coresident_forecast(wants_whole_card=True)
-        # Intent wins over the fitting weight estimate: claim the card and collapse to a single context.
         assert forecast.needs_exclusive_residency is True
-        assert forecast.max_resident_processes() == 1
 
     def test_intent_never_overrides_unservable(self) -> None:
         """Intent must not force exclusive residency on a model that cannot be served alone (fits_alone gate)."""
@@ -739,6 +744,59 @@ class TestWholeCardIntent:
         assert forecast.fits_alone is False
         assert forecast.needs_exclusive_residency is False
         assert forecast.streams_unavoidably is True
+
+
+class TestWholeCardResidentProcessCount:
+    """A whole-card model's teardown depth is budget-relative, not a blanket collapse to one process.
+
+    ``wants_whole_card`` governs that the model never *co-samples* (the scheduler's concurrency overlap gate),
+    not that every sibling *context* must be torn down. An idle, model-free sibling context costs only its
+    (cheap) per-context VRAM, so on a card whose VRAM genuinely holds the weights-plus-reserve alongside one or
+    more such contexts, keeping them avoids the teardown-and-respawn churn each time the heavy head cycles. The
+    same arithmetic returns sole residency on a card with no such room, so the behaviour stays hardware-relative.
+    """
+
+    @staticmethod
+    def _flux_fp8_forecast(*, total_vram_mb: float) -> resource_budget.StreamForecast:
+        # Flux.1-Schnell fp8 (Compact): the hordelib seed (weights ~11.5GB, load peak 14GB -> ~2.5GB activation
+        # working set folded into the reserve). A deliberately pessimistic ~3.4GB marginal (far above a real
+        # idle context) so the surviving-context result does not rest on an optimistic overhead.
+        return resource_budget.StreamForecast(
+            weights_mb=11500.0,
+            reserve_mb=2500.0,
+            base_reserve_mb=2500.0,
+            free_now_mb=total_vram_mb - 4266.0,
+            free_if_alone_mb=total_vram_mb - 4266.0,
+            free_after_model_evict_mb=total_vram_mb - 4266.0,
+            total_vram_mb=total_vram_mb,
+            per_process_overhead_mb=4266.0,
+            marginal_process_overhead_mb=3431.0,
+            wants_whole_card=True,
+        )
+
+    def test_high_vram_card_keeps_a_sibling_context(self) -> None:
+        """On a 24GB card the weights + reserve leave room for a sibling context, so the target is not one."""
+        forecast = self._flux_fp8_forecast(total_vram_mb=24074.0)
+        assert forecast.max_resident_processes() == 2
+
+    def test_low_vram_card_collapses_to_sole_residency(self) -> None:
+        """On a 16GB card the same fp8 weights leave no room, so sole residency is correct and unchanged."""
+        forecast = self._flux_fp8_forecast(total_vram_mb=16384.0)
+        assert forecast.max_resident_processes() == 1
+
+    def test_unsizable_whole_card_model_still_collapses_to_one(self) -> None:
+        """When the footprint cannot be sized (no total VRAM) a whole-card-intent model stays conservative."""
+        forecast = resource_budget.StreamForecast(
+            weights_mb=11500.0,
+            reserve_mb=2500.0,
+            free_now_mb=13000.0,
+            free_if_alone_mb=None,
+            free_after_model_evict_mb=None,
+            total_vram_mb=None,
+            per_process_overhead_mb=4266.0,
+            wants_whole_card=True,
+        )
+        assert forecast.max_resident_processes() == 1
 
 
 class TestRamPressureFloor:

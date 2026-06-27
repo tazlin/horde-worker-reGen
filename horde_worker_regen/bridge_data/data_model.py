@@ -636,6 +636,28 @@ class reGenBridgeData(CombinedHordeBridgeData):
     with no whole-card job pending or in progress does the worker restore full concurrency. 0 restores
     immediately (maximum responsiveness, maximum churn). Only used when `enable_vram_budget` is true."""
 
+    large_model_switch_min_seconds: int = Field(default=0, ge=0, le=600)
+    """Minimum seconds between accepting jobs for *different* very-large models (the switch throttle).
+
+    A queue that alternates distinct very-large models (Flux -> Z-Image -> Flux) forces a fresh whole-card
+    teardown and a multi-GB checkpoint reload on every switch. When set above 0, once a very-large model (the
+    EXTRA_LARGE tier: Flux/Cascade/Qwen/Z-Image and the named VRAM-heavy checkpoints) is loaded or queued, the
+    worker stops *offering* a different very-large model in its horde pop request until this many seconds have
+    elapsed since the last distinct large model was introduced. Jobs for the large model already in play are
+    unaffected; only churning to a new one is throttled, and no job is dropped (it is simply not requested). If
+    the worker goes fully idle with an empty local queue it offers large models again regardless, so this never
+    leaves the worker idle. 0 disables the throttle (the default)."""
+
+    large_model_reentry_cooldown_seconds: int = Field(default=-1, ge=-1, le=600)
+    """Seconds to avoid *any* very-large model after the last one drains (the re-entry cooldown).
+
+    Once the whole-card residency lease is up and no very-large model remains loaded or queued, the worker
+    stops offering *any* very-large model for this long, so it does ordinary work for a beat instead of
+    immediately re-entering large-model territory and re-thrashing. -1 (the default) inherits
+    `whole_card_residency_cooldown_seconds`, tying it to the residency lease it complements; 0 disables it; a
+    positive value overrides. As with the switch throttle, an idle worker with an empty local queue offers
+    large models again regardless, so it never sits idle. Independent of `whole_card_exclusive_residency`."""
+
     overbudget_step_timeout: int = Field(default=120, ge=15, le=600)
     """Per-step hang timeout (seconds) granted to a job admitted *against* the VRAM budget.
 

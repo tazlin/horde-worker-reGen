@@ -7,6 +7,7 @@ import collections
 import random
 import time
 from asyncio import CancelledError
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -28,8 +29,10 @@ from horde_worker_regen.process_management.gpu.gpu_pop_shaping import (
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.jobs.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
+from horde_worker_regen.process_management.jobs.large_model_pop_governor import LargeModelPopGovernor
 from horde_worker_regen.process_management.jobs.source_image_downloader import SourceImageDownloader
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.model_sizing import is_extra_large_model
 from horde_worker_regen.process_management.models.feature_readiness import (
     CONTROLNET_ANNOTATOR_FAILED_DETAIL,
     FeatureInputs,
@@ -251,6 +254,7 @@ class JobPopper:
         model_availability: ModelAvailability | None = None,
         card_runtimes: dict[int, CardRuntime] | None = None,
         model_metadata: ModelMetadata | None = None,
+        whole_card_residency_active: Callable[[], bool] | None = None,
     ) -> None:
         """Initialize with all required dependencies for job popping.
 
@@ -263,6 +267,10 @@ class JobPopper:
         When `card_runtimes` has more than one card, the pop advertises the union of the cards'
         capabilities (models, features, resolution, threads); a single card (or None) advertises the global
         config exactly as before.
+
+        `whole_card_residency_active` is queried by the large-model re-entry cooldown to know whether a
+        whole-card residency lease is still held; it defaults to "never held" so a worker wired without it
+        (and the tests) behaves as if no lease is ever active.
         """
         self._state = state
         self._process_map = process_map
@@ -272,6 +280,10 @@ class JobPopper:
         self._api_sessions = api_sessions
         self._card_runtimes = card_runtimes if card_runtimes is not None else {}
         self._model_metadata = model_metadata
+        self._whole_card_residency_active = (
+            whole_card_residency_active if whole_card_residency_active is not None else (lambda: False)
+        )
+        self._large_model_pop_governor = LargeModelPopGovernor()
 
         self._max_inference_processes = max_inference_processes
         # The constructor value is the provisioned ceiling; the threads advertised in pop requests
@@ -353,6 +365,88 @@ class JobPopper:
             self._card_runtimes.keys(),
             balance_threshold=self._gpu_pop_balance_threshold(bridge_data),
         )
+
+    def _baseline_value_for(self, model_name: str | None) -> str | None:
+        """The model's baseline value from the loaded reference, or None when metadata is unavailable.
+
+        With no metadata (or no name) the classifier still recognizes the named VRAM-heavy checkpoints by name,
+        so Flux/Cascade compact checkpoints are caught even before a reference is loaded.
+        """
+        if self._model_metadata is None or model_name is None:
+            return None
+        baseline = self._model_metadata.get_baseline(model_name)
+        return baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
+
+    def _is_large_model(self, model_name: str | None) -> bool:
+        """Whether a model is in the EXTRA_LARGE ('very large') tier the pop limiters govern."""
+        return model_name is not None and is_extra_large_model(model_name, self._baseline_value_for(model_name))
+
+    def _large_models_loaded_or_queued(self) -> frozenset[str]:
+        """The very-large models currently resident on a process or held in the local queue (incl. in flight)."""
+        in_play: set[str] = set()
+        for process in self._process_map.values():
+            model = process.loaded_horde_model_name
+            if model is not None and self._is_large_model(model):
+                in_play.add(model)
+        for job in self._job_tracker.jobs_pending_inference:
+            if job.model is not None and self._is_large_model(job.model):
+                in_play.add(job.model)
+        return frozenset(in_play)
+
+    @staticmethod
+    def _coerce_seconds(value: object, *, default: float) -> float:
+        """Coerce a config duration to float, falling back to ``default`` for a non-numeric (e.g. mocked) value."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return default
+        return float(value)
+
+    def _resolve_large_model_pop_durations(self, bridge_data: reGenBridgeData) -> tuple[float, float]:
+        """Return the effective (switch_min_seconds, reentry_cooldown_seconds), resolving the -1 inherit.
+
+        A negative re-entry value inherits ``whole_card_residency_cooldown_seconds`` (the lease it complements);
+        a non-numeric config (a partial mock) reads as disabled, so the limiter never crashes the pop cycle.
+        """
+        switch_min = self._coerce_seconds(getattr(bridge_data, "large_model_switch_min_seconds", 0), default=0.0)
+        reentry_raw = getattr(bridge_data, "large_model_reentry_cooldown_seconds", -1)
+        if isinstance(reentry_raw, bool) or not isinstance(reentry_raw, (int, float)):
+            reentry = 0.0
+        elif reentry_raw < 0:
+            reentry = self._coerce_seconds(
+                getattr(bridge_data, "whole_card_residency_cooldown_seconds", 0),
+                default=0.0,
+            )
+        else:
+            reentry = float(reentry_raw)
+        return switch_min, reentry
+
+    def _apply_large_model_pop_limits(self, models: set[str], bridge_data: reGenBridgeData) -> set[str]:
+        """Withhold very-large models from the offer per the switch throttle and re-entry cooldown.
+
+        Both limiters are off by default (zero durations) and yield to an idle escape (the worker holds no
+        work locally), so the worker never sits idle when the only work it could take is a large model. See
+        :class:`~horde_worker_regen.process_management.jobs.large_model_pop_governor.LargeModelPopGovernor`.
+        """
+        switch_min, reentry = self._resolve_large_model_pop_durations(bridge_data)
+        if switch_min <= 0 and reentry <= 0:
+            return models
+
+        candidate_large = frozenset(model for model in models if self._is_large_model(model))
+        decision = self._large_model_pop_governor.evaluate(
+            candidate_large_models=candidate_large,
+            incumbent_large_models=self._large_models_loaded_or_queued(),
+            residency_active=bool(self._whole_card_residency_active()),
+            now=time.time(),
+            switch_min_seconds=switch_min,
+            reentry_cooldown_seconds=reentry,
+            idle_escape=self._job_tracker.num_jobs_total == 0,
+        )
+        if decision.withheld:
+            logger.debug(
+                f"Large-model pop limiter ({decision.reason}): withholding {sorted(decision.withheld)} from "
+                "this pop offer.",
+            )
+            return models.difference(decision.withheld)
+        return models
 
     def set_canned_job_source(self, source: CannedJobSource | None) -> None:
         """Swap the canned job source at runtime (a warm benchmark worker's level boundary)."""
@@ -720,6 +814,13 @@ class JobPopper:
             card_runtimes=self._card_runtimes if self._multi_gpu_advertise else None,
         )
         if models is None:
+            return
+
+        # Tame pathological mixed very-large-model queues: withhold a switched-to or just-drained large model
+        # from this offer so the worker is not whipsawed into repeated whole-card teardowns and multi-GB
+        # reloads. A no-op unless the operator configures a switch interval or re-entry cooldown.
+        models = self._apply_large_model_pop_limits(models, bridge_data)
+        if len(models) == 0:
             return
 
         pop_nsfw = advertised.nsfw if advertised is not None else bridge_data.nsfw

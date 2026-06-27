@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import IntEnum
 
 import psutil
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -15,6 +14,7 @@ from loguru import logger
 
 from horde_worker_regen.consts import KNOWN_SLOW_WORKFLOWS, VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
+from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.gpu.gpu_eligibility import eligible_card_indices_for
@@ -167,47 +167,10 @@ _SCHEDULER_DIAGNOSTIC_MB_BUCKET = 256.0
 """Bucket size for deciding whether memory telemetry changed enough to re-log a scheduler diagnostic."""
 
 
-class _ModelSizeTier(IntEnum):
-    """How much of the device a model's inference is expected to want, for concurrency decisions.
-
-    Ordered so heavier tiers compare greater. ``LIGHT`` jobs (SD1.5/SD2) are cheap enough to sample
-    side by side; ``HEAVY`` (SDXL) jobs need the job they would overlap to be well underway first; and
-    ``EXTRA_LARGE`` (Cascade/Flux/Qwen/Z-Image and the named VRAM-heavy checkpoints) effectively want
-    the whole card and never share it.
-    """
-
-    LIGHT = 0
-    HEAVY = 1
-    EXTRA_LARGE = 2
-
-
-_LIGHT_BASELINE_VALUES = frozenset(
-    {
-        KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1.value,
-        KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_2_512.value,
-        KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_2_768.value,
-    },
-)
-"""Baselines treated as light enough to thread together without headway."""
-
-_HEAVY_BASELINE_VALUES = frozenset(
-    {
-        KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl.value,
-    },
-)
-"""Baselines that need the job they overlap to be well underway before joining the card."""
-
-_EXTRA_LARGE_BASELINE_VALUES = frozenset(
-    {
-        KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade.value,
-        KNOWN_IMAGE_GENERATION_BASELINE.flux_1.value,
-        KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell.value,
-        KNOWN_IMAGE_GENERATION_BASELINE.flux_dev.value,
-        KNOWN_IMAGE_GENERATION_BASELINE.qwen_image.value,
-        KNOWN_IMAGE_GENERATION_BASELINE.z_image_turbo.value,
-    },
-)
-"""Baselines that effectively want the whole card and never share it with a concurrent job."""
+# The model-size tier classification (and its baseline value sets) lives in the shared, torch-free
+# ``model_sizing`` module so the scheduler and the job popper's large-model pop limiters classify "very large"
+# identically. Aliased to the historical private name so the existing references read unchanged.
+_ModelSizeTier = ModelSizeTier
 
 _OVERLAP_HEADWAY_MIXED_HEAVY = 0.5
 """Fraction of the in-flight job's sampling that must be done before a concurrent job joins it when
@@ -1240,6 +1203,15 @@ class InferenceScheduler:
             return False
         return forecast.fits_weights_now
 
+    def is_whole_card_residency_active(self) -> bool:
+        """Whether any card currently holds a whole-card residency lease (its cooldown still running).
+
+        Mirrors the ``active`` field of :meth:`whole_card_residency_state` but without building the full
+        snapshot, so the job popper's large-model re-entry cooldown can cheaply ask "is the lease up?" every
+        pop cycle: the lease is up exactly when this returns False (no card holds a residency model).
+        """
+        return any(state.model is not None for state in self._whole_card_residencies.values())
+
     def whole_card_residency_grace_active(self) -> bool:
         """Whether a whole-card residency is establishing, so the held queue is intentional (not a wedge).
 
@@ -1891,21 +1863,13 @@ class InferenceScheduler:
     def _model_size_tier(self, model_name: str | None) -> _ModelSizeTier:
         """Classify a model by how much of the device its inference is expected to want.
 
-        A model named in the VRAM-heavy list, or carrying an extra-large baseline, wants the whole card.
-        SDXL is heavy; SD1.5/SD2 are light. An unknown baseline (no loaded reference for the model)
-        falls back to light so the overlap gate stays permissive rather than starving dispatch on
-        missing metadata; a genuinely large model is always classified by its known baseline.
+        Resolves the model's baseline from the loaded reference and delegates to the shared, torch-free
+        :func:`~horde_worker_regen.process_management.model_sizing.model_size_tier`, so this and the popper's
+        large-model pop limiters classify "very large" from the same single source of truth.
         """
-        if model_name is not None and model_name in VRAM_HEAVY_MODELS:
-            return _ModelSizeTier.EXTRA_LARGE
-
         baseline = self._model_metadata.get_baseline(model_name) if model_name is not None else None
         baseline_value = baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
-        if baseline_value in _EXTRA_LARGE_BASELINE_VALUES:
-            return _ModelSizeTier.EXTRA_LARGE
-        if baseline_value in _HEAVY_BASELINE_VALUES:
-            return _ModelSizeTier.HEAVY
-        return _ModelSizeTier.LIGHT
+        return model_size_tier(model_name, baseline_value)
 
     @staticmethod
     def _job_batch_amount(job: ImageGenerateJobPopResponse) -> int:

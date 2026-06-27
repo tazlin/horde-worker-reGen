@@ -325,10 +325,14 @@ class StreamForecast:
         estimate (SDXL at a big batch/resolution: it can co-reside, so it must reclaim a sibling *model*
         through the normal budget path, not claim the device and tear down sibling *processes*).
 
-        A baseline flagged ``wants_whole_card`` takes the same sole-residency path even when its (conservative)
+        A baseline flagged ``wants_whole_card`` takes the same residency path even when its (conservative)
         weight seed reads as co-resident: the tier classification asserts it never shares well in practice, so
-        intent wins over a weight estimate that merely happens to fit. ``fits_alone`` still gates it, so a
-        model that genuinely cannot be served alone is never forced down this path.
+        intent wins over a weight estimate that merely happens to fit. ``fits_alone`` still gates it, so a model
+        that genuinely cannot be served alone is never forced down this path. Entering this path reserves the
+        device and evicts sibling *models*; how many sibling *processes* (contexts) are torn down is sized
+        separately and budget-relative by :meth:`max_resident_processes`, so a whole-card model on a high-VRAM
+        card keeps the idle contexts its weights-plus-reserve genuinely leave room for rather than collapsing to
+        a single process.
         """
         if not (self.known and self.fits_alone):
             return False
@@ -416,14 +420,18 @@ class StreamForecast:
         ``marginal``. Returns None when it cannot be sized (unknown weights/total, or no per-process overhead to
         reason about), and at least 1 otherwise (the loading process must survive).
 
-        A ``wants_whole_card`` baseline collapses straight to 1: the tier declares it never shares the card, so
-        the teardown target is sole residency regardless of how many contexts the weight seed would otherwise
-        leave room for (a too-low seed must not let a sibling context creep back onto the card).
+        A ``wants_whole_card`` baseline is sized by this same budget arithmetic rather than collapsing straight
+        to 1. Its intent is that it never *co-samples* (enforced separately by the concurrency overlap gate),
+        not that every sibling *context* must be torn down: a context that holds no model and is not sampling
+        costs only its (cheap) per-context VRAM, so on a card whose VRAM genuinely holds the weights-plus-reserve
+        alongside one or more idle sibling contexts -- a Flux fp8 checkpoint (~11.5GB) on a 24GB card -- keeping
+        those contexts avoids a full teardown-and-respawn every time the heavy head cycles (the residency churn
+        that capped throughput). On a card with no such room (the same fp8 weights on a 16GB card) the budget
+        returns 1, so the behavior stays hardware-relative. Only when the footprint cannot be sized at all does a
+        whole-card-intent model still collapse to 1 (conservative); an ordinary model is then unsizable (None).
         """
-        if self.wants_whole_card and self.known:
-            return 1
         if self.weights_mb is None or self.total_vram_mb is None or self.per_process_overhead_mb <= 0:
-            return None
+            return 1 if (self.wants_whole_card and self.known) else None
         budget = self.total_vram_mb - self.weights_mb - self.reserve_mb
         if budget <= self.per_process_overhead_mb:
             return 1

@@ -942,6 +942,7 @@ class HordeWorkerProcessManager:
             model_availability=self._model_availability,
             card_runtimes=self._card_runtimes,
             model_metadata=self._model_metadata,
+            whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
         )
 
         self._alchemy_coordinator = AlchemyCoordinator(
