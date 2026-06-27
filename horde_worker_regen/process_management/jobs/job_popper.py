@@ -32,7 +32,6 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobStage, Job
 from horde_worker_regen.process_management.jobs.large_model_pop_governor import LargeModelPopGovernor
 from horde_worker_regen.process_management.jobs.source_image_downloader import SourceImageDownloader
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.models.model_sizing import is_extra_large_model
 from horde_worker_regen.process_management.models.feature_readiness import (
     CONTROLNET_ANNOTATOR_FAILED_DETAIL,
     FeatureInputs,
@@ -41,6 +40,7 @@ from horde_worker_regen.process_management.models.feature_readiness import (
     is_offered,
 )
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
+from horde_worker_regen.process_management.models.model_sizing import is_extra_large_model
 from horde_worker_regen.process_management.resources.resource_budget import (
     is_model_locally_unservable_for,
     predict_job_weight_mb,

@@ -276,5 +276,3 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
   stats-backed session analyzer behind the preferred `horde-duty-report` path
 - [`horde_worker_regen.analysis.duty_log_report`][horde_worker_regen.analysis.duty_log_report]: the
   CLI and legacy epoch-aware log analyzer behind `horde-duty-report`
-
-

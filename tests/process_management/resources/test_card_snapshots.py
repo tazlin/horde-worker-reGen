@@ -64,12 +64,8 @@ def test_multi_gpu_projects_each_card_independently() -> None:
     config0 = make_mock_bridge_data(image_models_to_load=["m0"])
     config1 = make_mock_bridge_data(image_models_to_load=["m1"])
     pm._card_runtimes = {
-        0: make_test_card_runtimes(
-            device_indices=(0,), config=config0, total_vram_mb=24576.0
-        )[0],
-        1: make_test_card_runtimes(
-            device_indices=(1,), config=config1, total_vram_mb=12288.0
-        )[1],
+        0: make_test_card_runtimes(device_indices=(0,), config=config0, total_vram_mb=24576.0)[0],
+        1: make_test_card_runtimes(device_indices=(1,), config=config1, total_vram_mb=12288.0)[1],
     }
     pm._device_map = TorchDeviceMap(
         root={
@@ -87,9 +83,7 @@ def test_multi_gpu_projects_each_card_independently() -> None:
     )
 
     # A busy slot on card 1, reporting almost-full VRAM (free 500 MB -> pressured).
-    busy = make_mock_process_info(
-        2, model_name="m1", state=HordeProcessState.INFERENCE_STARTING, device_index=1
-    )
+    busy = make_mock_process_info(2, model_name="m1", state=HordeProcessState.INFERENCE_STARTING, device_index=1)
     busy.total_vram_mb = 12000
     busy.vram_usage_mb = 11500
     pm._process_map[2] = busy

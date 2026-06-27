@@ -14,7 +14,6 @@ from loguru import logger
 
 from horde_worker_regen.consts import KNOWN_SLOW_WORKFLOWS, VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.gpu.gpu_eligibility import eligible_card_indices_for
@@ -37,6 +36,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     RamBudget,
@@ -1864,8 +1864,8 @@ class InferenceScheduler:
         """Classify a model by how much of the device its inference is expected to want.
 
         Resolves the model's baseline from the loaded reference and delegates to the shared, torch-free
-        :func:`~horde_worker_regen.process_management.model_sizing.model_size_tier`, so this and the popper's
-        large-model pop limiters classify "very large" from the same single source of truth.
+        :func:`~horde_worker_regen.process_management.models.model_sizing.model_size_tier`, so this and the
+        popper's large-model pop limiters classify "very large" from the same single source of truth.
         """
         baseline = self._model_metadata.get_baseline(model_name) if model_name is not None else None
         baseline_value = baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
