@@ -3569,16 +3569,19 @@ class InferenceScheduler:
                     unloaded_any = True
                     self._record_churn("vram_eviction")
             else:
-                logger.debug(f"Unloading all models from VRAM on process {process_info.process_id}")
-                if (
-                    not process_info.safe_send_message(
-                        HordeControlMessage(
-                            control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM,
-                        ),
-                    )
-                    and not self._state.shutting_down
-                ):
-                    self._process_lifecycle._replace_inference_process(process_info)
+                if process_info.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+                    logger.debug(f"Unloading all models from VRAM on process {process_info.process_id}")
+                    if (
+                        not process_info.safe_send_message(
+                            HordeControlMessage(
+                                control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM,
+                            ),
+                        )
+                        and not self._state.shutting_down
+                    ):
+                        self._process_lifecycle._replace_inference_process(process_info)
+                    process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+                    unloaded_any = True
 
         return unloaded_any
 

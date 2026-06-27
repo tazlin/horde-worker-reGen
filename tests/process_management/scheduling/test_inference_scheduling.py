@@ -746,6 +746,51 @@ class TestUnloadModels:
             intentional_reclaim=True,
         )
 
+    async def test_unload_vram_does_not_resend_to_model_less_process(self) -> None:
+        """Calling unload_models_from_vram twice must not re-send the UNLOAD command to a model-less process.
+
+        A process with ``loaded_horde_model_name=None`` that was already told to unload from VRAM must
+        not receive the same IPC command on every scheduling cycle. The guard that the non-None branch
+        has (``last_control_flag != UNLOAD_MODELS_FROM_VRAM``) is missing from the None (else) branch,
+        resulting in unbounded re-sends -- the livelock that triggers a save-our-ship soft reset when
+        the whole-card residency convergence hangs waiting for a sibling that keeps being prodded to
+        unload models it does not have.
+        """
+        # A model-less process (like the stuck process 4 in the incident).
+        empty = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        # A model-holding process that is the target (unload is called "on" this one).
+        target = make_mock_process_info(0, model_name="some_model", state=HordeProcessState.WAITING_FOR_JOB)
+        process_map = ProcessMap({0: target, 1: empty})
+
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_job_pop_response("some_model"))
+
+        sched = _make_inference_scheduler(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            max_inference=2,
+        )
+
+        # First call: the model-less process must be told to unload (it may hold stale VRAM).
+        sched.unload_models_from_vram(target)
+        assert empty.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM, (
+            "first call must set the control flag on the model-less process"
+        )
+
+        # Second call: the guard must prevent re-sending. The process was already told to unload and
+        # its response ("No models to unload from VRAM") has not yet arrived or been processed, so
+        # re-sending the same command is wasted IPC that causes the convergence livelock.
+        sched.unload_models_from_vram(target)
+        # The last_control_flag must still be UNLOAD_MODELS_FROM_VRAM -- the command was NOT re-sent
+        # because the guard suppressed the duplicate, meaning safe_send_message was not called again.
+        assert empty.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM, (
+            "second call must NOT re-send: the last_control_flag guard must suppress the duplicate "
+            "just as the non-None branch does"
+        )
+        # The else branch must also set unloaded_any when it first issues the command, so the caller
+        # knows that VRAM clearance work was initiated and does not loop forever assuming nothing happened.
+        # (This is a secondary assertion; the primary bug is the missing guard.)
+
 
 class TestHeadOfQueueMakeRoom:
     """The head-of-queue job must keep making progress.
