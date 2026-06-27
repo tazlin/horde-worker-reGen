@@ -50,8 +50,8 @@ class TestTierMatrix:
 
     def test_flux_and_qwen_are_huge_and_qwen_is_beta(self) -> None:
         """flux/qwen are flagged huge (warn + auto-skip) and qwen is sourced from the beta reference."""
-        assert frozenset({BenchTier.FLUX, BenchTier.QWEN}) == HUGE_TIERS
-        assert frozenset({BenchTier.QWEN}) == BETA_TIERS
+        assert frozenset({BenchTier.FLUX, BenchTier.QWEN, BenchTier.ZIMAGE}) == HUGE_TIERS
+        assert frozenset({BenchTier.QWEN, BenchTier.ZIMAGE}) == BETA_TIERS
 
     def test_flux_model_name_exists_in_reference_form(self) -> None:
         """The flux model name is the published compact checkpoint, not the old placeholder."""

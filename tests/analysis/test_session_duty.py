@@ -254,7 +254,7 @@ class TestDutyReportCli:
         stats_dir.mkdir()
         _write_jsonl(
             stats_dir / "stats-v1.0.0-20260620-010203-000.jsonl",
-            [_sample(100.0), _sample(101.0), _job()],
+            [_sample(100.0, jobs_pending_inference=1), _sample(101.0, jobs_pending_inference=1), _job()],
         )
         monkeypatch.setattr(sys, "argv", ["horde-duty-report", "--stats", str(stats_dir)])
 
