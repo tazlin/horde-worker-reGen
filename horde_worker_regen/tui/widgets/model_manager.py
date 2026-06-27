@@ -340,7 +340,7 @@ class ModelManagerView(Vertical):
         if not result.catalog_loaded:
             lines = Text()
             if result.default_applied:
-                lines.append("No load rules set — the worker would default to 'top 2'.\n", style="grey62")
+                lines.append("No load rules set; the worker would default to 'top 2'.\n", style="grey62")
             lines.append("The effective list appears here once the reference is loaded.", style="grey50")
             body.update(lines)
             return
@@ -385,7 +385,7 @@ class ModelManagerView(Vertical):
         warnings = self.query_one("#mm-warnings", Static)
         text = Text()
         for entry in result.needs_resolve:
-            text.append(f"⟳ '{entry}' not expanded yet — press Resolve.\n", style="dark_orange")
+            text.append(f"⟳ '{entry}' not expanded yet; press Resolve.\n", style="dark_orange")
         for warning in result.warnings:
             text.append(f"⚠ {warning}\n", style="yellow")
         warnings.update(text)

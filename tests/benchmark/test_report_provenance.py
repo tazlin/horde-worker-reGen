@@ -138,7 +138,7 @@ def test_inconclusive_soak_keeps_the_model_with_a_caveat() -> None:
     """A soak that failed without proving load instability (0 jobs, no hard finding) keeps the model.
 
     The isolated baseline passed and fits with headroom, so a soak that merely could-not-run (a
-    startup/supervisor wedge) must not zero out models_to_load — that was the 4090 regression.
+    startup/supervisor wedge) must not zero out models_to_load; that was the 4090 regression.
     """
     failed = synthesize_bridge_data(_soak_report(LevelOutcome.CRASHED_HANG), total_vram_mb=16000)
     assert _MODEL in failed.models_to_load

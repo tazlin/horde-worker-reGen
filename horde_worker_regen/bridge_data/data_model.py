@@ -167,7 +167,7 @@ def _warn_lease_without_residency(
     The lease brackets the diffusion model's RAM->VRAM load together with the denoise loop so a spare
     process can stage its next pipeline while another samples. With ``unload_models_from_vram_often`` the
     model is fully evicted between jobs, so there is no staged residency to overlap and the lease serializes
-    the reload behind sampling instead — usually a throughput loss rather than a gain.
+    the reload behind sampling instead, which is usually a throughput loss rather than a gain.
 
     Returns:
         True if the lease is enabled in a non-resident (counterproductive) configuration.
@@ -428,7 +428,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     When true, at most `gpu_sampling_lease_slots` inference processes run the denoising loop at
     once; any extra processes stage their next pipeline (model load, prompt encode) concurrently,
-    so when a sampling process finishes the next starts immediately — keeping the GPU busy
+    so when a sampling process finishes the next starts immediately, keeping the GPU busy
     between jobs instead of idling during per-job warm-up. Trades extra resident memory (each
     process keeps its model staged) for higher GPU utilization, and is counterproductive with
     `unload_models_from_vram_often: true`: the lease brackets the diffusion model's RAM->VRAM load
@@ -439,8 +439,8 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """How many inference processes may run the GPU denoising loop at once when
     `gpu_sampling_lease_enabled` is true (clamped to the inference-process count at runtime).
 
-    1 (the default) serializes denoising — one process samples while the rest stage their next
-    pipeline — the cleanest way to keep a single GPU busy back-to-back. Values > 1 permit that
+    1 (the default) serializes denoising, so one process samples while the rest stage their next
+    pipeline; this is the cleanest way to keep a single GPU busy back-to-back. Values > 1 permit that
     many concurrent denoise loops; on hardware without CUDA MPS (e.g. Windows WDDM) concurrent
     loops time-slice the GPU rather than truly parallelizing, so this can raise the
     coverage-based duty-cycle metric without improving throughput. No effect unless
@@ -483,7 +483,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     Graph forms (upscalers, facefixers, strip_background) run on the inference processes,
     which they share with image generation; CLIP forms (interrogation, nsfw) run on the
-    safety process. Image jobs always win contention for those processes — alchemy only
+    safety process. Image jobs always win contention for those processes; alchemy only
     uses a lane image work does not currently need (see `alchemy_allow_concurrent`). The
     forms offered are controlled by the `forms` field (see `CombinedHordeBridgeData`).
     """

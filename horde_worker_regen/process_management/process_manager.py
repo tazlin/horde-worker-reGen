@@ -2449,7 +2449,7 @@ class HordeWorkerProcessManager:
                 # Watch for an externally-created .abort file as a signal-less
                 # abort trigger (e.g. for process managers that cannot send signals).
                 if os.path.exists(".abort"):
-                    logger.warning("Found .abort file — aborting immediately")
+                    logger.warning("Found .abort file; aborting immediately")
                     self._abort()
                     break
                 if not await self._control_loop_tick():
@@ -2875,7 +2875,7 @@ class HordeWorkerProcessManager:
     _supervisor_publish_min_interval = 0.0
     """A hard floor between snapshots regardless of change (0 = publish every tick when state changed)."""
     _supervisor_publish_floor_interval = 1.0
-    """Maximum seconds between snapshots when nothing changes — a heartbeat so the TUI knows we're alive."""
+    """Maximum seconds between snapshots when nothing changes; a heartbeat so the TUI knows we're alive."""
 
     def _handle_supervisor_commands(self) -> None:
         """Drain and apply any control commands from a supervising frontend (no-op if unsupervised)."""
@@ -3009,7 +3009,7 @@ class HordeWorkerProcessManager:
         """A cheap fingerprint of the display-relevant worker state.
 
         Publishing is gated on this changing (plus a periodic floor): it captures the per-process states,
-        sampling progress, and headline counters that the dashboards render — but deliberately omits
+        sampling progress, and headline counters that the dashboards render; but deliberately omits
         constantly-jittering memory/kudos figures, which ride the floor refresh instead. Computing it each
         tick avoids the cost of a full snapshot build (notably ``run_metrics.snapshot``) when idle.
         """
@@ -3915,7 +3915,7 @@ class HordeWorkerProcessManager:
         """Supervise a finished main-loop task; shut down gracefully if one ends unexpectedly.
 
         Each main-loop coroutine is meant to run for the worker's whole life. If one finishes while
-        the worker is not already shutting down — whether by raising or by returning early — the
+        the worker is not already shutting down, whether by raising or by returning early, the
         worker would otherwise limp on with a dead loop (e.g. jobs popped but never submitted, which
         orphans them). Instead, initiate a graceful shutdown so in-flight work drains and any
         supervising frontend relaunches us.

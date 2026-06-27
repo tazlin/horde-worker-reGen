@@ -1,6 +1,6 @@
 """A simple LRU cache for tracking recently used models.
 
-This is implemented as an ordered set — the dictionary values are always
+This is implemented as an ordered set; the dictionary values are always
 ``None`` and only the insertion order of keys matters.
 """
 

@@ -5,11 +5,11 @@ that a level that OOMs, hangs, or hard-crashes the worker takes down only this p
 the controller records the death as a finding and the ramp continues.
 
 Writes (into ``--out``):
-- ``level_<id>.json`` — the :class:`LevelRunResult` (written even on failure, via finally)
-- ``level_<id>.log`` — the full loguru output of the run
-- ``level_<id>.heartbeat`` — touched every few seconds so the controller can tell a hang
+- ``level_<id>.json``: the :class:`LevelRunResult` (written even on failure, via finally)
+- ``level_<id>.log``: the full loguru output of the run
+- ``level_<id>.heartbeat``: touched every few seconds so the controller can tell a hang
   from a slow level
-- ``level_<id>.faulthandler`` — Python tracebacks on hard faults
+- ``level_<id>.faulthandler``: Python tracebacks on hard faults
 """
 
 from __future__ import annotations

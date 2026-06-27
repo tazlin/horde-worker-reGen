@@ -329,8 +329,8 @@ def _prepare_runtime(options: WorkerLaunchOptions, *, supervised: bool = False) 
         rewriter_stderr = LogConsoleRewriter(sys.stderr)  # type: ignore
         sys.stderr = rewriter_stderr
 
-    # OpenTelemetry tracing is opt-in only (AIWORKER_REGEN_ENABLE_TELEMETRY). Force it off here —
-    # before any hordelib import and before worker processes are spawned — so the kill switch is
+    # OpenTelemetry tracing is opt-in only (AIWORKER_REGEN_ENABLE_TELEMETRY). Force it off here,
+    # before any hordelib import and before worker processes are spawned, so the kill switch is
     # inherited by every child. Left on, hordelib's per-ComfyUI-op spans starve the inference loop
     # and depress GPU duty cycle even with no collector running. See telemetry.py.
     from horde_worker_regen.telemetry import claim_logfire_ownership, enforce_telemetry_default_off

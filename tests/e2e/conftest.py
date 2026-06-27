@@ -20,7 +20,7 @@ from tests.process_management.conftest import (
 # On Windows the default ProactorEventLoop (IOCP-based) teardown can race with
 # VS Code's named-pipe server that vscode-pytest relies on, causing the pipe to
 # disappear before the final test report is sent.  Switching to the selector-based
-# event loop avoids IOCP altogether — the e2e tests here do not need IOCP features
+# event loop avoids IOCP altogether; the e2e tests here do not need IOCP features
 # (they use ``multiprocessing``, not ``asyncio.subprocess``).
 if sys.platform == "win32":
     _E2E_EVENT_LOOP_POLICY = asyncio.WindowsSelectorEventLoopPolicy()

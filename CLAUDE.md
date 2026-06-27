@@ -1,4 +1,4 @@
-# CLAUDE.md — horde-worker-reGen
+# CLAUDE.md: horde-worker-reGen
 
 > [!IMPORTANT]
 > **Read `AGENTS.md` before starting any work in this repository.**

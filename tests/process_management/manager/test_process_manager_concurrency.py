@@ -1,7 +1,7 @@
 """Semantic tests for GPU concurrency resolution (sampling-lease wiring).
 
-These pin the *policy* — how enabling the lease decouples the denoise gate from the whole-job
-inference semaphore, and how the slot count is clamped — rather than the literal arithmetic.
+These pin the *policy*: how enabling the lease decouples the denoise gate from the whole-job
+inference semaphore, and how the slot count is clamped, rather than the literal arithmetic.
 """
 
 from __future__ import annotations

@@ -52,7 +52,7 @@ class FeatureReadinessState(enum.StrEnum):
     so the feature is disabled until the operator intervenes. Distinct from WAITING, which recovers itself."""
 
 
-CONTROLNET_ANNOTATOR_FAILED_DETAIL = "annotators failed to load; ControlNet disabled — restart the worker to retry"
+CONTROLNET_ANNOTATOR_FAILED_DETAIL = "annotators failed to load; ControlNet disabled; restart the worker to retry"
 """Operator-facing reason for a ControlNet feature withheld by a permanent annotator verify failure."""
 
 

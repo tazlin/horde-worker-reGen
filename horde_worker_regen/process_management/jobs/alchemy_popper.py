@@ -83,7 +83,7 @@ class _AlchemyPopResponse(AlchemyJobPopResponse):
 
     The base class advertises `AlchemyJobSubmitRequest` as its failure-cleanup request but
     supplies only ``{"id": ...}`` as construction params, so the SDK client session raises a
-    pydantic ValidationError (missing `result`/`state`) building the cleanup request — after
+    pydantic ValidationError (missing `result`/`state`) building the cleanup request, after
     the pop already succeeded server-side, silently dropping the popped forms. The
     coordinator submits faulted states itself, so the SDK's cleanup tracking is unwanted
     here regardless.
@@ -229,7 +229,7 @@ class AlchemyCoordinator:
 
     _estimator: AlchemyHeadroomEstimator
     _free_vram_baseline_mb: float | None
-    """Free VRAM (MB) sampled while no alchemy was in flight — the cost baseline."""
+    """Free VRAM (MB) sampled while no alchemy was in flight; the cost baseline."""
     _min_free_vram_mb: float | None
     """Low-water mark of free VRAM (MB) seen while the current alchemy batch was in flight."""
 

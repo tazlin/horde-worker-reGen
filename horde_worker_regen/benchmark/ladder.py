@@ -67,7 +67,7 @@ BENCH_TIER_MODELS: dict[BenchTier, str] = {
 BENCH_TIER_MODEL_POOLS: dict[BenchTier, list[str]] = {
     # Distinct same-tier checkpoints for the multi-model soak. A single-model soak cannot
     # saturate >2 inference jobs (the popper caps in-flight jobs at 2 per model), so the soak
-    # needs a pool of distinct models — one per inference process — to actually exercise every
+    # needs a pool of distinct models, one per inference process, to actually exercise every
     # process and the cross-process coordination. pool[0] MUST equal BENCH_TIER_MODELS[tier]
     # (the baseline/single-model paths use that name). All names must exist in the AI-Horde
     # image model reference; the controller trims the pool to what fits in VRAM.

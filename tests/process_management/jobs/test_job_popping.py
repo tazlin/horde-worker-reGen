@@ -973,7 +973,7 @@ class TestApiJobPopFullFlow:
     """End-to-end tests for api_job_pop with mocked API responses.
 
     We patch ImageGenerateJobPopRequest and span_job_pop so we don't depend on
-    SDK validation or telemetry — the tests focus on how JobPopper orchestrates
+    SDK validation or telemetry; the tests focus on how JobPopper orchestrates
     the response.
     """
 

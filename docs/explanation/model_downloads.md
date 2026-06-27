@@ -4,12 +4,15 @@
     - [Two kinds of "download"](#two-kinds-of-download)
     - [The dedicated download process](#the-dedicated-download-process)
     - [Model availability and the pop gate](#model-availability-and-the-pop-gate)
+    - [Feature readiness: deps plus models on disk](#feature-readiness-deps-plus-models-on-disk)
     - [Planning: what a config implies for disk](#planning-what-a-config-implies-for-disk)
     - [Pause and bandwidth controls](#pause-and-bandwidth-controls)
     - [Parallel downloads by host](#parallel-downloads-by-host)
     - [Segmented downloads (connections per file)](#segmented-downloads-connections-per-file)
     - [Download-only mode and the model picker](#download-only-mode-and-the-model-picker)
     - [Standalone download CLI](#standalone-download-cli)
+    - [The gated R2 mirror for auxiliary models](#the-gated-r2-mirror-for-auxiliary-models)
+    - [Benchmark downloads: one coherent picture](#benchmark-downloads-one-coherent-picture)
     - [See also](#see-also)
 
 Model weights are large and slow to fetch, and a worker should be able to start
@@ -319,7 +322,7 @@ paths the package expects, so the detectors find them present and skip their own
 download. They are a first-class `controlnet_annotator` model-reference category
 (verified in `horde_model_reference.annotator_catalog`, bridged to records by
 `annotator_records`), and hordelib registers an `AnnotatorModelProvider` so the set
-is also queryable as `source="comfyui_controlnet_aux"` — no longer an opaque
+is also queryable as `source="comfyui_controlnet_aux"` which is no longer an opaque
 side-channel.
 
 ## Benchmark downloads: one coherent picture

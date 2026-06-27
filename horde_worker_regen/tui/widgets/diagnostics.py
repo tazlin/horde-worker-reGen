@@ -174,7 +174,7 @@ class DiagnosticsView(Vertical):
         """Show the idle hint, and tick a clock so the analysis age (and staleness) stays current."""
         self._set_status("Choose a scope, then press Run analysis (works whether or not the worker is running).")
         self.query_one("#diag-results", Static).update(
-            Text("No analysis yet — press Run analysis to triage the worker logs.", style="grey50"),
+            Text("No analysis yet; press Run analysis to triage the worker logs.", style="grey50"),
         )
         # A 1s tick keeps the "now" clock and the age/staleness readout live without re-parsing; it only
         # rewrites a one-line Static, so it is cheap even while the tab is in the background.
@@ -204,7 +204,7 @@ class DiagnosticsView(Vertical):
         """Show that the chosen scope is not applied until Run analysis is pressed."""
         label = _SCOPE_LABELS.get(scope, scope)
         if self._analyzed_scope is not None and scope != self._analyzed_scope:
-            self._set_status(f"Scope changed to ‘{label}’ — press Run analysis to apply it.", style="bold yellow")
+            self._set_status(f"Scope changed to '{label}'; press Run analysis to apply it.", style="bold yellow")
         else:
             self._set_status(f"Scope: {label}. Press Run analysis to run.")
 
@@ -343,7 +343,7 @@ class DiagnosticsView(Vertical):
         position = "latest" if is_latest else f"#{session.index}"
         version = f"v{session.version}" if session.version else "v?"
         worst = self._worst_severity(diagnosis)
-        flag = f" — {worst.value}" if worst is not None else ""
+        flag = f"; {worst.value}" if worst is not None else ""
         return f"{position}  {version}  ({session.end_reason}){flag}"
 
     @staticmethod
@@ -361,11 +361,11 @@ class DiagnosticsView(Vertical):
         session = diagnosis.session
         scope_label = _SCOPE_LABELS.get(self._analyzed_scope or "", "")
         self._set_status(
-            f"Session #{session.index} ({session.end_reason}) — {len(diagnosis.findings)} finding(s). "
+            f"Session #{session.index} ({session.end_reason}); {len(diagnosis.findings)} finding(s). "
             f"Scope: {scope_label}. Change scope or Run analysis to refresh.",
         )
         if not diagnosis.findings:
-            results.update(Text("No findings — this session looks clean.", style="green"))
+            results.update(Text("No findings; this session looks clean.", style="green"))
             return
         results.update(Group(*(self._render_finding(finding) for finding in diagnosis.findings)))
 
@@ -427,7 +427,7 @@ class DiagnosticsView(Vertical):
             line = Text()
             line.append(" STALE ", style="bold white on red")
             line.append(
-                f"  analysis is {human_duration(age)} old (>5 min) — press Run analysis to refresh.  ",
+                f"  analysis is {human_duration(age)} old (>5 min); press Run analysis to refresh.  ",
                 style="bold yellow",
             )
             line.append(f"Analyzed {analyzed_text} · now {now_text}", style="yellow")

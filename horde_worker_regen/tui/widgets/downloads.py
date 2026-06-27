@@ -457,7 +457,7 @@ class DownloadsView(VerticalScroll):
                 header,
                 where,
                 Text(
-                    "Preparing controlnet annotators — one-time setup (initialising the inference engine and "
+                    "Preparing controlnet annotators (one-time setup, initialising the inference engine and "
                     "verifying each preprocessor). This can take several minutes and runs only once.",
                     style="yellow",
                 ),
@@ -468,7 +468,7 @@ class DownloadsView(VerticalScroll):
                 header,
                 where,
                 Text.assemble(
-                    ("Downloaded — verifying checksum (sha256)… ", "yellow"),
+                    ("Downloaded, verifying checksum (sha256)… ", "yellow"),
                     (sizes, "grey70"),
                     ("   (large files take a while to verify)", "grey50 italic"),
                 ),

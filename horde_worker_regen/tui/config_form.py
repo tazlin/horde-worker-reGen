@@ -489,7 +489,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Model downloads",
         "Connections used to fetch a single large file (1 = single stream). A big checkpoint is split "
         "across this many ranged connections to raise its download rate; small files use one stream. "
-        "WARNING: a multi-connection download CANNOT resume — if interrupted, the whole file restarts "
+        "WARNING: a multi-connection download CANNOT resume; if interrupted, the whole file restarts "
         "from scratch. Set this to 1 on a slow/unreliable connection to keep resumable downloads.",
         minimum=1,
         maximum=8,

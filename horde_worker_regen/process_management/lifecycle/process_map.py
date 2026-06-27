@@ -742,7 +742,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             if p.is_process_busy():
                 continue
 
-            # Already ending or ended — the pipe is already closing; do not re-target.
+            # Already ending or ended; the pipe is already closing; do not re-target.
             if p.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
                 continue
 

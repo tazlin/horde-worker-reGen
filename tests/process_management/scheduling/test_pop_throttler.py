@@ -202,7 +202,7 @@ class TestOnJobPopped:
 
 
 class TestShouldWaitForMegapixelsteps:
-    """Megapixelstep wait logic — the most complex throttle path."""
+    """Megapixelstep wait logic; the most complex throttle path."""
 
     def _make_bridge_data(self, **overrides: object) -> Mock:
         return make_mock_bridge_data(**overrides)

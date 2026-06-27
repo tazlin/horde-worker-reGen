@@ -90,8 +90,8 @@ class LevelStats(BaseModel):
     phase breakdown."""
     post_warmup_vram_reloads: int | None = None
     """RAM->VRAM model reloads observed after the first completed job (warm-up excluded). Under
-    expected residency this should be 0; a positive count means a model was evicted and reloaded
-    — memory pressure defeated residency, or stickiness broke and a process thrashed its
+    expected residency this should be 0; a positive count means a model was evicted and reloaded.
+    Either memory pressure defeated residency, or stickiness broke and a process thrashed its
     single-slot RAM cache. None when no phase metrics were captured."""
     vram_used_high_water_mb: int | None = None
     total_vram_mb: int | None = None
@@ -103,7 +103,7 @@ class LevelStats(BaseModel):
     e2e_seconds_p95: float | None = None
     phase_breakdown_seconds: dict[str, float] = {}
     """Median per-job seconds in each pipeline phase (queue_wait, disk_load, vram_load,
-    sampling, vae, other_inference, safety, submit) — a "where the time goes" view."""
+    sampling, vae, other_inference, safety, submit): a "where the time goes" view."""
     time_spent_no_jobs_available: float | None = None
     """Seconds in the run the worker idled because the horde offered no jobs. Lets a low duty cycle be
     split into demand-limited idle (this) versus worker-side hand-off gaps. None when not measured."""
@@ -188,7 +188,7 @@ def evaluate_level(
                 # the cost so an operator sees the throughput trade-off without it failing.
                 advisories.append(
                     f"sampling rate is {fraction:.0%} of the tier baseline "
-                    f"({stats.its_p50:.2f} vs {baseline.its_p50:.2f} it/s) — expected for this "
+                    f"({stats.its_p50:.2f} vs {baseline.its_p50:.2f} it/s); expected for this "
                     "batch/feature profile, not a regression",
                 )
 
@@ -209,7 +209,7 @@ def evaluate_level(
         if stats.gpu_utilization_mean_percent < criteria.target_gpu_utilization_percent:
             advisories.append(
                 f"GPU duty cycle {stats.gpu_utilization_mean_percent:.0f}% is below the "
-                f"{criteria.target_gpu_utilization_percent:.0f}% target — the GPU idled between jobs"
+                f"{criteria.target_gpu_utilization_percent:.0f}% target; the GPU idled between jobs"
                 f"{_duty_cycle_attribution(stats)}; "
                 "see the uptime levers (post-processing overlap, queue depth, thread count)",
             )
@@ -223,7 +223,7 @@ def evaluate_level(
         if stats.gpu_utilization_mean_percent < criteria.min_gpu_duty_cycle_percent:
             reasons.append(
                 f"GPU duty cycle {stats.gpu_utilization_mean_percent:.0f}% is below the "
-                f"{criteria.min_gpu_duty_cycle_percent:.0f}% floor — the GPU idled between jobs "
+                f"{criteria.min_gpu_duty_cycle_percent:.0f}% floor; the GPU idled between jobs "
                 f"under sustained load{_duty_cycle_attribution(stats)}",
             )
         else:
@@ -235,7 +235,7 @@ def evaluate_level(
     if criteria.expect_vram_residency and stats.post_warmup_vram_reloads:
         advisories.append(
             f"memory pressure defeated residency: {stats.post_warmup_vram_reloads} RAM->VRAM "
-            "reload(s) after warm-up — the soak is not exercising resident models as intended",
+            "reload(s) after warm-up; the soak is not exercising resident models as intended",
         )
 
     if (
@@ -262,7 +262,7 @@ def evaluate_level(
     ):
         advisories.append(
             f"download bandwidth dipped to {stats.download_mbps_min:.1f} MB/s "
-            f"(advisory floor {criteria.min_download_mbps:.1f} MB/s) — "
+            f"(advisory floor {criteria.min_download_mbps:.1f} MB/s); "
             "ad-hoc lora/ti features may cause job timeouts on this connection",
         )
 

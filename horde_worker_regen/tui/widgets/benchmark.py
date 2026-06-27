@@ -872,7 +872,7 @@ class BenchmarkView(VerticalScroll):
         A features-only download (controlnet checkpoints / annotators, fetched via the aux pass) has no named
         image models to count, so it reads as a plain in-progress message rather than an ``N of M`` tally.
         """
-        progress = f"— {state.ready} of {state.total} downloaded. " if state.total else "in the background. "
+        progress = f"; {state.ready} of {state.total} downloaded. " if state.total else "in the background. "
         return Text.assemble(
             ("⏳ Waiting for benchmark models ", "bold yellow"),
             (progress, "yellow"),

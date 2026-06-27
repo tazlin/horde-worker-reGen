@@ -1,7 +1,7 @@
 """Semantic tests for the telemetry opt-in / default-off policy.
 
-These pin the *policy* — tracing is off unless explicitly opted in, and the worker hard-overrides
-an ambient enable — rather than how the kill switch is wired.
+These pin the *policy*: tracing is off unless explicitly opted in, and the worker hard-overrides
+an ambient enable, rather than how the kill switch is wired.
 """
 
 from __future__ import annotations

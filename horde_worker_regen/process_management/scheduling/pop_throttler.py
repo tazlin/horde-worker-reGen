@@ -60,7 +60,7 @@ class PopThrottler:
     def is_in_error_backoff(self) -> bool:
         """Whether pops are currently slowed due to a recent error.
 
-        While True, fast/urgent pop-ahead must not bypass the frequency gate — the worker is
+        While True, fast/urgent pop-ahead must not bypass the frequency gate; the worker is
         deliberately backing off the API after a failure.
         """
         return self._current_pop_frequency > self._default_pop_frequency

@@ -1,7 +1,7 @@
 """Read-only view over the loaded stable diffusion model reference.
 
 Public members:
-    ``ModelMetadata`` — query surface for model baseline/category lookups.
+    ``ModelMetadata``: query surface for model baseline/category lookups.
 """
 
 from __future__ import annotations

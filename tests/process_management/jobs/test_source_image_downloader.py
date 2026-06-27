@@ -45,7 +45,7 @@ def _make_job_response(
     job.async_download_source_mask = AsyncMock()
     job.async_download_extra_source_images = AsyncMock()
 
-    # Downloaded results — None means not yet downloaded
+    # Downloaded results; None means not yet downloaded
     job.get_downloaded_source_image = Mock(return_value=None)
     job.get_downloaded_source_mask = Mock(return_value=None)
     job.get_downloaded_extra_source_images = Mock(return_value=None)

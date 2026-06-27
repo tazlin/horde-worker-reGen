@@ -2,15 +2,15 @@
 
 A multi-model soak wants one resident model per inference process so every process stays busy.
 But N co-resident models can exceed VRAM (or RAM), and the worker's memory-pressure valves would
-then silently evict and reload — defeating the very residency the soak is meant to exercise (and,
+then silently evict and reload, defeating the very residency the soak is meant to exercise (and,
 without a worker-owned budget, risking a cross-process OOM). So before committing to an N-model
-topology the controller asks this module: *do N models fit?* — and if not, *what is the largest
+topology the controller asks this module: *do N models fit?*, and if not, *what is the largest
 pool that does?* That keeps the soak honest on machines that cannot hold the full pool, rather
 than producing a thrash-dominated, misleading result.
 
 The math is deliberately conservative: each resident model is charged its full single-job burden
 (weights + a working set), which over-counts the working memory of an idle-resident model. Erring
-high is the right direction for a fail-fast gate. Pure and table-testable — no torch/NVML here.
+high is the right direction for a fail-fast gate. Pure and table-testable; no torch/NVML here.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ class SoakFitPlan:
             return (
                 f"only {self.fitting_models} of {self.desired_models} soak models fit "
                 f"(~{self.per_model_vram_mb:.0f} MB each, {self.reserve_vram_mb:.0f} MB reserve, "
-                f"{self.total_vram_mb:.0f} MB total VRAM) — trimming the pool"
+                f"{self.total_vram_mb:.0f} MB total VRAM); trimming the pool"
             )
         return (
             f"no soak model fits: ~{self.per_model_vram_mb:.0f} MB each leaves nothing under the "
@@ -63,7 +63,7 @@ class SoakFitPlan:
 def _fitting_count(*, per_unit_mb: float, total_mb: float, reserve_mb: float, desired: int) -> int:
     """How many ``per_unit_mb`` footprints fit under ``total_mb - reserve_mb`` (capped at desired).
 
-    A non-positive per-unit estimate means "cannot estimate" — return ``desired`` so a missing
+    A non-positive per-unit estimate means "cannot estimate", so return ``desired`` so a missing
     burden number never blocks the soak (the run's own OOM guards remain the backstop).
     """
     if per_unit_mb <= 0:

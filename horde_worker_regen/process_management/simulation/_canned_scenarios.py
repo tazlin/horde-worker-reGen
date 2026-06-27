@@ -241,7 +241,7 @@ def make_lora_scenario(
 ) -> list[ImageGenerateJobPopResponse]:
     """Create jobs that each request the given loras (round-robin over the names).
 
-    Names not already in the local cache trigger ad-hoc CivitAI downloads in real mode —
+    Names not already in the local cache trigger ad-hoc CivitAI downloads in real mode;
     that is the download-bandwidth dimension of the benchmark.
     """
     if not lora_names:
@@ -518,7 +518,7 @@ class TimedJobSource(CannedJobSource):
     """A canned job source that releases jobs on a schedule instead of all at once.
 
     Returns the no-job-available response until the schedule says the next job has
-    "arrived" — the popper needs no changes since it already handles empty pops.
+    "arrived"; the popper needs no changes since it already handles empty pops.
     """
 
     def __init__(

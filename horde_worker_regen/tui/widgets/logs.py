@@ -339,7 +339,7 @@ class LogsView(Vertical):
         """Show or hide the 'new lines below' hint based on whether the user has scrolled up."""
         hint = self.query_one("#log-scroll-hint", Static)
         if self._unseen_below > 0:
-            hint.update(Text(f"↓ {self._unseen_below:,} new line(s) below — press End to jump to latest"))
+            hint.update(Text(f"↓ {self._unseen_below:,} new line(s) below; press End to jump to latest"))
             hint.display = True
         else:
             hint.display = False

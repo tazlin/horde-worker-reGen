@@ -52,18 +52,18 @@ disabled, so re-enabling is just reversing each item below.
    hash) so those tests stay green.
 
 5. **Restore the user-facing pointers** (each was removed; add it back):
-   - `README.md` — the `winget install Haidra.HordeWorker` line in the Windows command-line install.
-   - `docs/how-to/install.md` — the `winget` scripted-install block, and the two "to another drive with
+   - `README.md`: the `winget install Haidra.HordeWorker` line in the Windows command-line install.
+   - `docs/how-to/install.md`: the `winget` scripted-install block, and the two "to another drive with
      winget" notes (install path + disk space sections).
-   - `docs/tutorials/getting-started.md` — "Other ways to install (winget, ...)".
-   - `docs/how-to/update-the-worker.md` — the `winget` row in the update table, the "winget and git-clone
+   - `docs/tutorials/getting-started.md`: "Other ways to install (winget, ...)".
+   - `docs/how-to/update-the-worker.md`: the `winget` row in the update table, the "winget and git-clone
      installs never self-update" sentence, and "(one-line installer, `.exe`, or winget)" in the download
      preview section.
-   - `docs/how-to/troubleshoot.md` — the SmartScreen note's "`winget install` avoids the prompt."
-   - `install.ps1` — the closing "To update later" message's `winget upgrade Haidra.HordeWorker` option.
+   - `docs/how-to/troubleshoot.md`: the SmartScreen note's "`winget install` avoids the prompt."
+   - `install.ps1`: the closing "To update later" message's `winget upgrade Haidra.HordeWorker` option.
    - In-app update notices: `horde_worker_regen/run_worker.py`, `horde_worker_regen/tui/app.py`,
      `horde_worker_regen/reporting/status_reporter.py`, and the docstring in
-     `horde_worker_regen/update_check.py` — add `winget upgrade Haidra.HordeWorker` back to the remedy text,
+     `horde_worker_regen/update_check.py`: add `winget upgrade Haidra.HordeWorker` back to the remedy text,
      and restore the assertion in `tests/test_status_reporter_version_nag.py`.
    - Remove the "Paused" banner at the top of `packaging/winget/README.md`.
 

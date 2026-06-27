@@ -660,7 +660,7 @@ def synthesize_bridge_data(levels: list[LevelReport], *, total_vram_mb: int | No
             # controlnet. allow_controlnet (canny/depth/openpose) is therefore left to the CONTROLNET
             # axis alone: enabling it off a QR-code pass made the worker advertise and accept classic
             # controlnet jobs that the CONTROLNET level had just shown to crash (the 4090 run did
-            # exactly this — allow_controlnet:on while the report's own capability table said ✗).
+            # exactly this: allow_controlnet:on while the report's own capability table said ✗).
             if level.tier == BenchTier.SDXL:
                 suggestion.allow_sdxl_controlnet = True
         elif level.axis == BenchAxis.POST_PROCESSING:
@@ -1036,7 +1036,7 @@ def render_markdown(report: BenchmarkReport) -> str:
         lines.append(
             "Median time a typical image job spends in each phase. `other_inference` is the "
             "inference time outside model load, sampling and VAE (graph build, prompt encode, "
-            "image encode, IPC) — the prime target for raising GPU duty.",
+            "image encode, IPC); the prime target for raising GPU duty.",
         )
         lines.append("")
         for level_report in timed_levels:
@@ -1066,7 +1066,7 @@ def render_markdown(report: BenchmarkReport) -> str:
     lines.append("## Remediation queue")
     lines.append("")
     if not report.findings:
-        lines.append("No robustness findings — no crashes, hangs, lost jobs, or stalls observed.")
+        lines.append("No robustness findings; no crashes, hangs, lost jobs, or stalls observed.")
     else:
         for finding in report.findings:
             lines.append(f"- **{finding.kind}** ({finding.level_id}): {finding.evidence}")

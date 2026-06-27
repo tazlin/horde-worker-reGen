@@ -138,7 +138,7 @@ def _select_models_for_pop(
             }
             if len(loaded_models) >= 1:
                 # free_models may be empty when all inference processes are
-                # busy; in that case no pop occurs (intentional — there is
+                # busy; in that case no pop occurs (intentional: there is
                 # no process available to accept a new job).
                 models = free_models
             logger.debug(f"Sticky models -- popping only {models}")
@@ -494,7 +494,7 @@ class JobPopper:
         freed GPU slot starved while a job is readily available; popping back-to-back fills the
         buffer so the slot refills without delay. When the queue is full, no process is free, the
         source has no work, or we are backing off, this is False and the loop reverts to polite
-        interval polling — so this never increases pressure on the API beyond filling the buffer.
+        interval polling; so this never increases pressure on the API beyond filling the buffer.
         """
         if self._state.last_pop_no_jobs_available:
             return False
@@ -893,7 +893,7 @@ class JobPopper:
         """Run the API call loop for popping jobs.
 
         The loop normally polls at ``_api_call_loop_interval`` (~1s). When the worker is hungry
-        (a GPU slot is free, the queue has room, and work is flowing — see :meth:`_is_hungry`),
+        (a GPU slot is free, the queue has room, and work is flowing; see :meth:`_is_hungry`),
         it instead pops back-to-back at ``_fast_pop_interval`` to refill the local queue, so a
         process that just finished a job does not sit idle waiting for the next poll tick. It
         reverts to the slow cadence the moment the queue is full or no work is available.

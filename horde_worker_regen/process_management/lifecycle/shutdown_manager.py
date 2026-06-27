@@ -226,7 +226,7 @@ class ShutdownManager:
                 return False
 
         # If no inference processes exist at all (e.g. before any have started),
-        # Python's all([]) returns True — this is intentional: with no processes
+        # Python's all([]) returns True; this is intentional: with no processes
         # and no pending/in-progress jobs, we are ready to shut down.
         inference_processes = self._process_map.get_inference_processes()
         if all(

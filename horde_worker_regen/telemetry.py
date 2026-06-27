@@ -32,7 +32,7 @@ def telemetry_enabled() -> bool:
     """Whether OpenTelemetry tracing is explicitly opted in for this worker.
 
     Tracing is OFF by default. It is enabled ONLY by this worker's own flag
-    (:data:`TELEMETRY_OPT_IN_ENV_VAR`) — never implicitly by ambient ``OTEL_*`` / ``LOGFIRE_*``
+    (:data:`TELEMETRY_OPT_IN_ENV_VAR`); never implicitly by ambient ``OTEL_*`` / ``LOGFIRE_*``
     settings a developer may carry in their shell or system environment. Opt in only when a
     collector (Jaeger/Prometheus) or the Logfire cloud is actually running to consume the spans.
     """
@@ -46,9 +46,9 @@ def enforce_telemetry_default_off() -> None:
     collector the SDK still builds and processes those spans on threads that contend for the GIL,
     which measurably starves the inference loop and depresses GPU duty cycle (≈1s/job of stall was
     measured on an sd15 soak; disabling it raised throughput ~20% and duty-cycle coverage from
-    ~0.86 to ~0.93). The shipped worker therefore disables tracing *explicitly* — hard-overriding
+    ~0.86 to ~0.93). The shipped worker therefore disables tracing *explicitly*, hard-overriding
     any ambient ``OTEL_SDK_DISABLED=false`` or ``OTEL_EXPORTER_OTLP_*`` a developer has set
-    system-wide — rather than hoping the environment is clean.
+    system-wide, rather than hoping the environment is clean.
 
     Call as early as possible (before logfire/hordelib import) so the kill switch is read when the
     OTel SDK initialises; the env var is inherited by spawned child processes.

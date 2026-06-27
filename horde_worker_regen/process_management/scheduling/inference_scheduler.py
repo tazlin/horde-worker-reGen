@@ -1821,10 +1821,10 @@ class InferenceScheduler:
         """The cap on concurrently in-progress jobs for this scheduling decision.
 
         Without the GPU sampling lease, the inference semaphore is the sole denoise gate, so this
-        is the concurrent-sampling count — dispatching more would over-subscribe the GPU. With the
+        is the concurrent-sampling count; dispatching more would over-subscribe the GPU. With the
         lease enabled, the lease (not this cap) limits actual concurrent sampling, so spare
         inference processes are allowed to receive jobs and stage their pipeline (model load,
-        prompt encode) *ahead* while others sample — filling the inter-job gaps where the GPU
+        prompt encode) *ahead* while others sample, filling the inter-job gaps where the GPU
         would otherwise go dark. That pre-staging is permitted up to the full inference-process
         count, but only while there is enough free VRAM to hold another staged model; otherwise it
         falls back to the sampling-slot cap so speculation never over-commits the device.
@@ -2204,7 +2204,7 @@ class InferenceScheduler:
             # Model->process affinity: in the models<=processes regime, never displace the last
             # resident copy of a still-wanted model. Without this, hot models' second instances
             # (the 2-per-model cap) consume the spare processes and the fallback evicts a cold
-            # model's only copy, forcing it to disk-reload on its next job — the dominant
+            # model's only copy, forcing it to disk-reload on its next job; the dominant
             # GPU-duty-cycle tax measured on the multi-model soak. The working model set is taken
             # from live state (loaded + in-flight + pending), not bridge_data.image_models_to_load,
             # because the harness/canned path never resolves that config field.
@@ -3407,7 +3407,7 @@ class InferenceScheduler:
     def _compute_wanted_models(self) -> set[str]:
         """The set of models the worker is actively serving right now.
 
-        Derived from live scheduler state — every model currently resident on an inference
+        Derived from live scheduler state; every model currently resident on an inference
         process, plus every model referenced by a pending or in-progress job. This mirrors the
         affinity computation in :meth:`preload_models`; ``bridge_data.image_models_to_load`` is
         deliberately not used because the harness/canned path never resolves that config field,
@@ -3445,8 +3445,8 @@ class InferenceScheduler:
     def _refresh_model_demand(self) -> None:
         """Stamp the current time against every model with live demand (pending/in-progress job).
 
-        Feeds the residency grace period (:meth:`_is_recently_demanded`). Only genuine demand —
-        not mere residency — refreshes the stamp, so a loaded-but-idle model's grace still
+        Feeds the residency grace period (:meth:`_is_recently_demanded`). Only genuine demand,
+        not mere residency, refreshes the stamp, so a loaded-but-idle model's grace still
         expires. Entries well past the grace window are pruned to bound the dict.
         """
         now = time.time()
@@ -3477,11 +3477,11 @@ class InferenceScheduler:
 
         - **Working set fits the process count** (``affinity_active``): every actively-served
           model can have its own home process, so keep them all resident in both RAM and VRAM.
-          This is the regime the soak measures and the dominant duty-cycle win — it stops a
+          This is the regime the soak measures and the dominant duty-cycle win; it stops a
           process evicting the very model it just used (and is about to reuse) the instant its
           next job has not yet been popped.
         - **More models than processes**: residency cannot be guaranteed, so apply only a RAM
-          grace period — cheap to hold, and it avoids the expensive disk reload between a model's
+          grace period; cheap to hold, and it avoids the expensive disk reload between a model's
           consecutive jobs. VRAM, the scarce resource, is still reclaimed promptly.
 
         ``under_pressure`` is the measured-budget override (the WS-1 "aggregate budget"): the
@@ -3815,8 +3815,8 @@ class InferenceScheduler:
                 # Fill every free inference slot this cycle rather than one per ~0.5s control-loop
                 # tick: when several jobs complete close together, dispatching them one tick apart
                 # leaves the GPU underfed. start_inference() returns False once no more can start
-                # (its own concurrency gate — jobs_in_progress >= max_concurrent, no free process,
-                # or no eligible job — stops the loop), so this cannot over-subscribe.
+                # (its own concurrency gate: jobs_in_progress >= max_concurrent, no free process,
+                # or no eligible job, stops the loop), so this cannot over-subscribe.
                 started_any = False
                 while await self.start_inference():
                     started_any = True

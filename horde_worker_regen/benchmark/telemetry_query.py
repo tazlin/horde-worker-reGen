@@ -10,7 +10,7 @@ time went by querying the telemetry the worker and hordelib already emit:
   ``gpu_busy_percent``) for aggregate queries over a time range.
 
 Everything degrades gracefully: if an endpoint is unreachable the calls return ``None``/empty and
-log at debug, so a run without the telemetry stack (CI, a volunteer machine) is unaffected — the
+log at debug, so a run without the telemetry stack (CI, a volunteer machine) is unaffected; the
 same posture as ``utils/gpu_monitor.py``.
 """
 
@@ -24,7 +24,7 @@ import requests
 from loguru import logger
 
 # hordelib's per-span operation names that represent actual GPU work. The union of their wall-clock
-# intervals (NOT the naive sum — sample nests calc_cond_batch) is the GPU-busy time within a trace.
+# intervals (NOT the naive sum, since sample nests calc_cond_batch) is the GPU-busy time within a trace.
 GPU_BUSY_OPERATIONS: frozenset[str] = frozenset(
     {
         "comfy.internal.sample",

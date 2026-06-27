@@ -1,7 +1,7 @@
 """Live, hot-reloadable bridge configuration.
 
 Public members:
-    ``RuntimeConfig`` — single-writer/many-reader holder for ``reGenBridgeData``.
+    ``RuntimeConfig``: single-writer/many-reader holder for ``reGenBridgeData``.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ class RuntimeConfig:
     """Holds the current bridge configuration snapshot and the live effective concurrency.
 
     The reload loop is the only writer of ``bridge_data``; components read via ``bridge_data``.
-    Reads return whatever snapshot is current at the moment of the read — no atomicity is promised
+    Reads return whatever snapshot is current at the moment of the read; no atomicity is promised
     across multiple reads.
 
     ``effective_max_threads`` is the *live* concurrent-inference cap the scheduler and popper read

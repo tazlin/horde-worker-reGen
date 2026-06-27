@@ -3,7 +3,7 @@
 When the worker serves at least as many inference processes as distinct models, every model
 can have a permanent home process and never needs reloading. The scheduler's default preload
 target picker (``get_first_available``) prefers empty processes but, when none are free, falls
-back to *any* idle process — which can displace a model that is still wanted, forcing a disk
+back to *any* idle process, which can displace a model that is still wanted, forcing a disk
 reload of that model when its next job arrives. Under the popper's 2-per-model in-flight cap,
 hot models spawn second instances that consume the spare processes, and the fallback then evicts
 a cold model's only copy. Measured: a 4-model / 6-process soak did a full disk reload on more than

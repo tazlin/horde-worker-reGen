@@ -8,10 +8,10 @@ while letting the caller choose which heavy subsystems are real:
   makes zero network calls. ``skip_api=False`` talks to the live AI Horde API.
 - **Worker processes** (``process_mode``):
     - ``"fake"``: child processes run the protocol-faithful fakes from
-      ``fake_worker_processes`` — no hordelib/torch anywhere, no GPU needed.
+      ``fake_worker_processes``; no hordelib/torch anywhere, no GPU needed.
     - ``"dry_run"``: the real ``HordeInferenceProcess``/``HordeSafetyProcess`` run,
       but skip model loading and inference (requires the ML deps installed).
-    - ``"real"``: full production behavior (GPU, model downloads) — benchmark mode.
+    - ``"real"``: full production behavior (GPU, model downloads); benchmark mode.
 
 This is the foundation used by the e2e tests and intended for the future
 ramping-difficulty benchmark CLI.
@@ -132,7 +132,7 @@ class HarnessConfig:
     """When set, run a time-bounded sustained-load soak instead of a fixed scenario.
 
     Jobs (and alchemy forms) are *generated* continuously from `soak_image_templates`
-    (and `soak_alchemy_templates`) — minting fresh IDs each pop — keeping the worker
+    (and `soak_alchemy_templates`), minting fresh IDs each pop, keeping the worker
     saturated for this many seconds, after which generation stops and in-flight work is
     drained. Used by the post-ramp validation phase."""
 
@@ -525,13 +525,13 @@ async def _watch_for_soak_period(
     sustained load rather than cold start.
 
     Returns True only if the hard `timeout_seconds` was hit during the load phase (a genuine
-    failure — the worker stopped making progress); completing the period and draining cleanly
+    failure: the worker stopped making progress); completing the period and draining cleanly
     (or hitting the bounded drain timeout) returns False.
     """
     time_started = time.time()
     gpu_sampling_started = False
 
-    # Phase 1 — sustained load: the generating sources keep the worker saturated.
+    # Phase 1: sustained load: the generating sources keep the worker saturated.
     while time.time() - time_started < soak_seconds:
         await asyncio.sleep(0.2)
         if not gpu_sampling_started and gpu_sampler is not None and manager._job_tracker.total_num_completed_jobs >= 1:
@@ -547,7 +547,7 @@ async def _watch_for_soak_period(
     if gpu_sampler is not None:
         gpu_sampler.stop()
 
-    # Phase 2 — drain: stop minting work and let everything already accepted finish.
+    # Phase 2: drain: stop minting work and let everything already accepted finish.
     _stop_soak_sources(manager)
     logger.info(f"Soak period of {soak_seconds:.0f}s elapsed; draining in-flight work")
     drain_started = time.time()

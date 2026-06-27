@@ -1,9 +1,9 @@
 """The post-ramp sustained-load validation (soak) phase.
 
 The ramp proves each capability in isolation over a handful of jobs. This phase then takes
-the *synthesized* recommendation and runs the worker under continuous, mixed traffic —
+the *synthesized* recommendation and runs the worker under continuous, mixed traffic,
 weighted toward the jobs that most stress the chosen configuration (max batch, the heaviest
-enabled features, concurrent alchemy) — for a fixed period. It catches problems a short
+enabled features, concurrent alchemy), for a fixed period. It catches problems a short
 ramp level cannot: VRAM/RAM creep, thermal throttling, queue backpressure, or recoveries
 that only accumulate over time.
 

@@ -7,7 +7,7 @@ home-directory path and OS username baked into every absolute path, and the work
 removes both.
 
 The redaction is *value-based first*: when the config is readable we know the exact secret strings, so we
-replace those literal values everywhere they appear — config field, an env-var echo in a subprocess
+replace those literal values everywhere they appear: config field, an env-var echo in a subprocess
 traceback, anywhere. A *pattern backstop* (``api_key: <something>``) catches a foreign bundle whose
 config we do not have, so we can still scrub a key whose value we never learned. It deliberately does
 **not** scrub by entropy ("any long hex string"): job ids, sha256 checksums, and model names are long

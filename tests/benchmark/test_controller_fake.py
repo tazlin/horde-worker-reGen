@@ -251,7 +251,7 @@ def test_failed_axis_skips_higher_rungs(tmp_path: Path) -> None:
         name="never-arrives",
         image_jobs=[CannedImageJobSpec(count=2)],
         # Steady arrival at 0.1 jobs/min: the first job is available immediately, but the
-        # second only "arrives" after 10 minutes — far beyond the 8s level timeout — so the
+        # second only "arrives" after 10 minutes, far beyond the 8s level timeout, so the
         # level can never complete all of its expected jobs and is guaranteed to time out.
         arrival_kind="steady",
         arrival_rate_per_minute=0.1,

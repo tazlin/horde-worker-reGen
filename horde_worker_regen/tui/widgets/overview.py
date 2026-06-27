@@ -558,7 +558,7 @@ class OverviewView(Vertical):
             (" has sole use of the GPU", "#f0beff"),
         )
         line.append(
-            f" — running {residency.processes_now}/{residency.processes_max} inference processes",
+            f"; running {residency.processes_now}/{residency.processes_max} inference processes",
             style="grey70",
         )
         if residency.safety_paused:

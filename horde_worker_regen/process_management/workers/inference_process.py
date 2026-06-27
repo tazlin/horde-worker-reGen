@@ -468,7 +468,7 @@ class HordeInferenceProcess(HordeProcess):
                 time_to_wait_for_downloads = 0
                 for lora_entry in loras:
                     _abort_if_past_deadline()
-                    # Already on disk — nothing to fetch, but still drain any in-flight downloads. Bound
+                    # Already on disk; nothing to fetch, but still drain any in-flight downloads. Bound
                     # the drain by at least the base LoRA budget: a bare 0 (the accumulator's value before
                     # any fetch this job) reaches the manager as "wait forever", which a wedged background
                     # download (e.g. one retrying a full disk) would turn into an unbounded stall.

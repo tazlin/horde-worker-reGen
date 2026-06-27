@@ -291,7 +291,7 @@ def _format_download_plan(
         f"  ·  Volume: {free}",
     )
     if not plan.fits:
-        lines.append(f"  WARNING: not enough free space — about {plan.shortfall_bytes / 1024**3:.1f} GB short.")
+        lines.append(f"  WARNING: not enough free space: about {plan.shortfall_bytes / 1024**3:.1f} GB short.")
     if annotator_row is not None:
         size = f"~{annotator_row.size_bytes / 1024**3:.1f} GB" if annotator_row.size_bytes else "size unknown"
         lines.append(f"Controlnet annotators (lazy, fetched on first use): {size}")

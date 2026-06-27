@@ -2,7 +2,7 @@
 
 These verify that the harness helpers (``_cleanup_stale_abort_file``,
 ``_determine_exit_reason``, ``_collect_run_diagnostics``, ``HarnessResult.failure_summary``)
-produce correct and actionable information when the harness misbehaves — without
+produce correct and actionable information when the harness misbehaves, without
 spawning any child processes.
 """
 

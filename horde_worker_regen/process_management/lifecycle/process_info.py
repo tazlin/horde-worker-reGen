@@ -290,7 +290,7 @@ class HordeProcessInfo:
             from horde_worker_regen.process_management.process_manager import _caught_signal
 
             # Pipe closure is expected when the child is ending/ended, or when the
-            # worker is shutting down — log at debug level to avoid noise.
+            # worker is shutting down; log at debug level to avoid noise.
             _pipe_expected_to_close = (
                 _caught_signal
                 or self.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED)

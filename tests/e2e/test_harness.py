@@ -1,7 +1,7 @@
 """End-to-end tests that run the full worker lifecycle through the harness.
 
 These spawn real OS child processes (running the protocol-faithful fakes) and run the
-real asyncio orchestration loop with the API faked out — no GPU, no network, no
+real asyncio orchestration loop with the API faked out; no GPU, no network, no
 hordelib/torch in any process.
 
 All tests in this module are async so they use pytest-asyncio's managed event loop

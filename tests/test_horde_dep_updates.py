@@ -67,7 +67,7 @@ def _requested_extras(spec: str) -> set[str]:
 
 def test_uv_lock_exists() -> None:
     """Check that uv.lock exists and is not empty."""
-    assert UV_LOCK_FILE_PATH.exists(), "uv.lock not found — run 'uv lock' to generate it"
+    assert UV_LOCK_FILE_PATH.exists(), "uv.lock not found; run 'uv lock' to generate it"
     assert UV_LOCK_FILE_PATH.stat().st_size > 0, "uv.lock is empty"
 
 
@@ -188,7 +188,7 @@ def test_lock_resolves_spandrel_extra_arches() -> None:
     """
     locked_names = {_normalize(p["name"]) for p in _load_lock()["package"]}
     assert "spandrel-extra-arches" in locked_names, (
-        "spandrel-extra-arches missing from uv.lock — run 'uv lock' after adding the horde_engine[upscale-extra] extra"
+        "spandrel-extra-arches missing from uv.lock; run 'uv lock' after adding the horde_engine[upscale-extra] extra"
     )
 
 
@@ -200,5 +200,5 @@ def test_lock_resolves_diffusers() -> None:
     """
     locked_names = {p["name"] for p in _load_lock()["package"]}
     assert "diffusers" in locked_names, (
-        "diffusers missing from uv.lock — run 'uv lock' after adding the horde_engine[layerdiffuse] extra"
+        "diffusers missing from uv.lock; run 'uv lock' after adding the horde_engine[layerdiffuse] extra"
     )

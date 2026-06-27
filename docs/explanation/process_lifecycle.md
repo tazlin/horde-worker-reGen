@@ -7,6 +7,7 @@
     - [Hung-process detection](#hung-process-detection)
     - [Process replacement](#process-replacement)
     - [Model preloading lifecycle](#model-preloading-lifecycle)
+    - [See also](#see-also)
 
 `ProcessLifecycleManager` owns everything related to starting, stopping,
 monitoring, and replacing child processes. It is the only component that creates
@@ -95,7 +96,7 @@ not from dispatch, so a long cold start or feature-heavy startup is never
 mislabelled as slow sampling; it only logs and feeds the widened timeout above,
 and never replaces a slot itself.
 
-Every timeout above measures *silence* — time since the last message or
+Every timeout above measures *silence*, the time since the last message or
 heartbeat. That misses one wedge: a generation that loops on a single sampling
 step without ever returning. ComfyUI keeps invoking the progress callback at
 that step (in practice the **final** step, after a corrupt or incompatible

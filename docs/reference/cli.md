@@ -142,9 +142,9 @@ a sustained-load **validation soak** (V). Stage C is grounded in what hordelib a
 classic **controlnet** (canny/depth/openpose preprocessors) is exercised on SD1.5 only, while the
 **qr_code** workflow (the real SDXL controlnet capability, gated by `allow_sdxl_controlnet`) is
 exercised on SD1.5 and SDXL. Post-processing sweeps every known upscaler and face-fixer at 512²,
-1024², and a VRAM-derived maximum. Alchemy is tested on both lanes independently — the CLIP lane
+1024², and a VRAM-derived maximum. Alchemy is tested on both lanes independently, the CLIP lane
 (caption/interrogation/NSFW, on the safety process) and the graph lane (upscalers/face-fixers/
-strip-background, on the inference processes) — plus a concurrent-with-image rung.
+strip-background, on the inference processes), plus a concurrent-with-image rung.
 
 The report separates **Capabilities** (everything the worker proved it can do) from a **conservative
 recommended bridgeData** (only models that fit with VRAM headroom are loaded, the batch size is the
@@ -237,7 +237,7 @@ analysis is more than five minutes old.
 
 A **scope** selector (left of the session/Run cluster) chooses how much history a pass reads:
 *Current session* and *Last 3 sessions* read only the live `bridge.log` (fast); *All logs* also
-decompresses every rotation. Analysis is **only started by pressing Run analysis** — opening the tab or
+decompresses every rotation. Analysis is **only started by pressing Run analysis**, opening the tab or
 changing the scope does not run anything (changing the scope shows a "press Run analysis to apply"
 hint), so a slow pass is never triggered just by browsing. The parse and detectors are CPU-bound, so
 the work runs in a **separate worker process** (only a lightweight, record-free summary is returned)
@@ -250,7 +250,7 @@ for the contract that keeps the detectors, the logs they read, and this tab from
 `horde-log bundle` collects everything a maintainer needs into one shareable `.zip`: the diagnosis
 (`diagnose.txt`), the worker's logs, the action ledger, the redacted config, and a system/cache report
 (OS, worker version, RAM/disk, on-disk model listing). **Every text artifact is scrubbed before it is
-written** — the horde `api_key` and CivitAI token always, and (by default) personal identifiers (home
+written**. The horde `api_key` and CivitAI token always, and (by default) personal identifiers (home
 path, username, worker name) too. The command prints how many occurrences it redacted and reminds you to
 skim the result before sending; redaction is best-effort, not a guarantee.
 
