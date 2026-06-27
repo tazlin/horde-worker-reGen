@@ -248,11 +248,11 @@ for the contract that keeps the detectors, the logs they read, and this tab from
 ### `bundle`: a redacted archive for a maintainer
 
 `horde-log bundle` collects everything a maintainer needs into one shareable `.zip`: the diagnosis
-(`diagnose.txt`), the worker's logs, the action ledger, the redacted config, and a system/cache report
-(OS, worker version, RAM/disk, on-disk model listing). **Every text artifact is scrubbed before it is
-written**. The horde `api_key` and CivitAI token always, and (by default) personal identifiers (home
-path, username, worker name) too. The command prints how many occurrences it redacted and reminds you to
-skim the result before sending; redaction is best-effort, not a guarantee.
+(`diagnose.txt`), the worker's logs, retained stats JSONL files, the action ledger, the redacted config,
+and a system/cache report (OS, worker version, RAM/disk, on-disk model listing). **Every text artifact is
+scrubbed before it is written**. The horde `api_key` and CivitAI token always, and (by default)
+personal identifiers (home path, username, worker name) too. The command prints how many occurrences it
+redacted and reminds you to skim the result before sending; redaction is best-effort, not a guarantee.
 
 ```bash
 # The usual: bundle the current logs into horde_support_<timestamp>.zip

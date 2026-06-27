@@ -12,6 +12,7 @@ Pure-stdlib + the rest of the analysis package; torch-free (the optional GPU pro
 from __future__ import annotations
 
 import getpass
+import gzip
 import json
 import os
 import re
@@ -45,6 +46,8 @@ _MAX_FILE_BYTES = 15 * 1024 * 1024
 # form. These are older sessions; the active bridge.log (appended across restarts) already covers history,
 # so rotations are excluded by default and included only with --full-logs.
 _ROTATION_TS_RE = re.compile(r"\.\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?\.log$")
+_APP_STATE_DIRNAME = ".horde_worker_regen"
+_STATS_DIRNAME = "stats"
 
 
 @dataclass
@@ -107,6 +110,43 @@ def _read_log_text(file_path: Path, *, cap: bool) -> str:
         megabytes = _MAX_FILE_BYTES // (1024 * 1024)
         text = f"[... truncated to the most recent {megabytes} MB ...]\n" + text[-_MAX_FILE_BYTES:]
     return text
+
+
+def _find_stats_files(root: Path) -> list[Path]:
+    """Find retained stats JSONL files related to ``root``."""
+    candidate_dirs = [
+        root / _APP_STATE_DIRNAME / _STATS_DIRNAME,
+        root.parent / _APP_STATE_DIRNAME / _STATS_DIRNAME,
+        root / _STATS_DIRNAME,
+    ]
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for directory in candidate_dirs:
+        for pattern in ("stats-v*.jsonl", "stats-v*.jsonl.gz"):
+            for path in sorted(directory.glob(pattern)):
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                if path.is_file():
+                    found.append(path)
+    return sorted(found, key=lambda p: p.name)
+
+
+def _stats_member_name(file_path: Path) -> str:
+    """Return the in-zip stats path, normalizing gzip files back to JSONL text."""
+    name = file_path.name
+    if name.endswith(".gz"):
+        name = name[: -len(".gz")]
+    return f"stats/{name}"
+
+
+def _read_stats_text(file_path: Path) -> str:
+    """Read a retained stats JSONL file, decompressing gzip sources for redaction."""
+    if file_path.name.endswith(".gz"):
+        with gzip.open(file_path, "rt", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    return file_path.read_text(encoding="utf-8", errors="replace")
 
 
 def _make_redactor(config_path: Path, *, redact_identifiers: bool) -> Redactor:
@@ -196,6 +236,17 @@ def build_support_bundle(
         if ledger_paths:
             ledger_text = "\n".join(p.read_text(encoding="utf-8", errors="replace").rstrip("\n") for p in ledger_paths)
             _write(zf, "action_ledger.jsonl", ledger_text)
+        used_stats_names: set[str] = set()
+        for stats_path in _find_stats_files(log_bundle.root):
+            name = _stats_member_name(stats_path)
+            if name in used_stats_names:
+                stem, _, ext = name.rpartition(".")
+                index = 1
+                while f"{stem}.{index}.{ext}" in used_stats_names:
+                    index += 1
+                name = f"{stem}.{index}.{ext}"
+            used_stats_names.add(name)
+            _write(zf, name, _read_stats_text(stats_path))
 
         # Every log file, redacted. Dedup member names so a rotation that exists both raw and zipped (both
         # reduce to the same `.log` name) does not collide in the archive.

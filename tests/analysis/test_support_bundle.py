@@ -7,6 +7,8 @@ then read every member of the produced zip and assert the secret appears nowhere
 
 from __future__ import annotations
 
+import gzip
+import json
 import zipfile
 from pathlib import Path
 
@@ -123,3 +125,31 @@ class TestContents:
             diagnose = zf.read("diagnose.txt").decode("utf-8")
         assert "Torch not compiled with CUDA enabled" in diagnose
         assert _API_KEY not in diagnose
+
+    def test_stats_jsonl_files_are_included_and_redacted(self, tmp_path: Path) -> None:
+        """Retained worker stats JSONL files ship with the support bundle."""
+        logs = _worker_dir(tmp_path)
+        stats_dir = tmp_path / ".horde_worker_regen" / "stats"
+        stats_dir.mkdir(parents=True)
+        (stats_dir / "stats-v1.0.0-20260620-010203-000.jsonl").write_text(
+            json.dumps({"event": "stats_sample", "worker": _WORKER}) + "\n",
+            encoding="utf-8",
+        )
+        with gzip.open(
+            stats_dir / "stats-v1.0.0-20260620-010203-001.jsonl.gz",
+            "wt",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(json.dumps({"event": "job_completed", "token": _CIVITAI}) + "\n")
+
+        out = tmp_path / "bundle.zip"
+        build_support_bundle(logs, out, config_path=tmp_path / "bridgeData.yaml")
+
+        with zipfile.ZipFile(out) as zf:
+            names = set(zf.namelist())
+            stats_text = zf.read("stats/stats-v1.0.0-20260620-010203-000.jsonl").decode("utf-8")
+            compressed_stats_text = zf.read("stats/stats-v1.0.0-20260620-010203-001.jsonl").decode("utf-8")
+        assert "stats/stats-v1.0.0-20260620-010203-000.jsonl" in names
+        assert "stats/stats-v1.0.0-20260620-010203-001.jsonl" in names
+        assert _WORKER not in stats_text
+        assert _CIVITAI not in compressed_stats_text
