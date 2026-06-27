@@ -13,3 +13,21 @@ ignore-missing-imports = [
     "ruamel.*",
     "pystray.*",
 ]
+
+# Windows-only code guarded at runtime with sys.platform / _is_windows() checks;
+# pyrefly doesn't recognise those as dead-code elimination and reports missing
+# attributes on ctypes.WinDLL / winreg.* that only exist on Windows.
+[[sub-config]]
+matches = "horde_worker_regen/tui/job_object.py"
+[sub-config.errors]
+missing-attribute = false
+
+[[sub-config]]
+matches = "worker_bootstrap/detect.py"
+[sub-config.errors]
+missing-attribute = false
+
+[[sub-config]]
+matches = "worker_bootstrap/updater.py"
+[sub-config.errors]
+missing-attribute = false
