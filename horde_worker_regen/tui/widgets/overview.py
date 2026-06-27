@@ -1100,16 +1100,28 @@ class OverviewView(Vertical):
 
     @staticmethod
     def _trend_arrow(series: list[float]) -> Text:
-        """A direction marker comparing the latest sample to the window start, with a percent delta.
+        """A direction marker from comparing averaged early and late non-empty segments.
 
-        A short or flat series reads as steady rather than asserting a trend the data cannot support.
+        Bucketed series often contain zeroes where no sample fell in a time slice; those are *absent
+        data*, not genuine zeroes, so the arrow skips them.  The series is split into halves and each
+        half must contain at least two positive values, otherwise the arrow declines to assert a trend
+        the data cannot support.
         """
-        if len(series) < 2 or series[0] == 0:
+        if len(series) < 4:
             return Text("→", style="grey50")
-        change = (series[-1] - series[0]) / abs(series[0])
-        if change > 0.02:
+        mid = len(series) // 2
+        head = [v for v in series[:mid] if v > 0]
+        tail = [v for v in series[mid:] if v > 0]
+        if len(head) < 2 or len(tail) < 2:
+            return Text("→", style="grey50")
+        head_avg = sum(head) / len(head)
+        tail_avg = sum(tail) / len(tail)
+        if head_avg < 0.01:
+            return Text("→", style="grey50")
+        change = (tail_avg - head_avg) / head_avg
+        if change > 0.05:
             return Text(f"▲ {abs(change) * 100:.0f}%", style="green")
-        if change < -0.02:
+        if change < -0.05:
             return Text(f"▼ {abs(change) * 100:.0f}%", style="red")
         return Text("→", style="grey50")
 
