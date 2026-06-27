@@ -181,6 +181,9 @@ class TestPreloadBudgetGate:
             max_concurrent=2,
             max_inference=2,
         )
+        # Prevent the real psutil RAM reading from spuriously tripping the RAM danger floor gate
+        # when system available memory is low (common in large combined test runs).
+        monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
 
         assert scheduler.preload_models() is False
         # The spare process was NOT told to preload...
@@ -299,6 +302,9 @@ class TestPreloadBudgetGate:
             max_concurrent=2,
             max_inference=2,
         )
+        # Prevent the real psutil RAM reading from spuriously tripping the RAM danger floor gate
+        # when system available memory is low (common in large combined test runs).
+        monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
 
         assert scheduler.preload_models() is True
         assert spare.last_control_flag == HordeControlFlag.PRELOAD_MODEL

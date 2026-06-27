@@ -142,6 +142,9 @@ class TestSchedulerActuatesProcessReduction:
 
         scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=4)
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=3)
+        # Prevent the real psutil RAM reading from spuriously tripping the RAM danger floor gate
+        # when system available memory is low (common in large combined test runs).
+        monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
 
         head_job = make_job_pop_response("CyberRealistic Pony")
         await track_popped_job_async(job_tracker, head_job)
