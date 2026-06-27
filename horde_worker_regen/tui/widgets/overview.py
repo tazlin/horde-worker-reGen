@@ -216,8 +216,8 @@ class OverviewView(Vertical):
                     yield Static(id="overview-gpus")
                     yield Static(id="overview-pipeline")
                     yield Static(id="overview-intent")
-                    yield Static(id="overview-governors")
                 yield Static(id="overview-trends")
+                yield Static(id="overview-governors")
             yield Static(id="overview-queue")
             yield Static(id="overview-work")
             yield Static(id="overview-processes")
@@ -1218,8 +1218,25 @@ class OverviewView(Vertical):
         )
 
         window = self._trend_window_label()
+
+        # Surface a transient notice (soft-reset, config change) and clear it once
+        # enough data has accumulated that the trend arrows are informative again.
+        notice: Text | None = None
+        if self._trend_notice is not None:
+            job_samples = self._windowed_job_samples()
+            if len(job_samples) >= 4:
+                self._trend_notice = None
+            else:
+                notice = Text(self._trend_notice, style="italic yellow")
+
+        body: Group
+        if notice is not None:
+            body = Group(notice, grid)
+        else:
+            body = Group(grid)
+
         return Panel(
-            grid,
+            body,
             title="Trends",
             title_align="left",
             subtitle=Text(window, style="grey50"),
