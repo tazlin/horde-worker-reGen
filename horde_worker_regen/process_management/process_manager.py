@@ -2370,8 +2370,49 @@ class HordeWorkerProcessManager:
             rows.append(self._recent_job_to_ledger_entry(job))
         return rows[:WORK_LEDGER_ENTRIES_IN_SNAPSHOT]
 
+    @staticmethod
+    def _format_remaining_seconds(seconds: float) -> str:
+        """Format a remaining-time value compactly for the orchestrator intent (e.g. ``2m 30s``).
+
+        Kept here rather than importing ``human_duration`` from the TUI layer to avoid a dependency
+        inversion: the orchestrator owns the intent, the TUI only renders it.
+        """
+        total = int(max(seconds, 0))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h {minutes:02d}m {secs:02d}s"
+        if minutes:
+            return f"{minutes}m {secs:02d}s"
+        return f"{secs}s"
+
+    # Mapping of AI Horde API skip-reason keys to operator-facing phrases, so the "Why" line
+    # in the Now/Next/Why strip is intelligible rather than raw key=value pairs. Unknown keys
+    # fall through unchanged.
+    _SKIP_REASON_PHRASES: dict[str, str] = {
+        "models": "no matching models offered",
+        "nsfw": "NSFW mismatch",
+        "max_pixels": "max pixels exceeded",
+        "trusted": "trusted-worker-only jobs",
+        "allow_img2img": "img2img not allowed",
+        "allow_controlnet": "controlnet not allowed",
+        "allow_sdxl_controlnet": "SDXL controlnet not allowed",
+        "allow_lora": "LoRA not offered",
+        "allow_post_processing": "post-processing not allowed",
+        "allow_painting": "inpainting not allowed",
+        "safety_backlog": "safety backlogged",
+        "kudos": "insufficient kudos",
+        "worker_id": "worker-id mismatch",
+    }
+
     def _build_orchestration_intent(self) -> OrchestrationIntentSnapshot:
-        """Summarize what the orchestrator is doing now and what it is waiting on next."""
+        """Summarize what the orchestrator is doing now and what it is waiting on next.
+
+        The cascade is priority-ordered: the first matching condition wins, so higher-priority
+        states (shutdown, pauses, holds) dominate lower-priority operational states (sampling,
+        safety, idle). Each early-return path that stops job popping should have a distinct
+        intent so the operator can see *why* the worker is not taking new work.
+        """
         raw_gate = getattr(self._inference_scheduler, "_dispatch_stall_last_reason", None)
         head = next(
             (job for job in self._job_tracker.jobs_pending_inference if job not in self._job_tracker.jobs_in_progress),
@@ -2380,24 +2421,56 @@ class HordeWorkerProcessManager:
         target_job_id = self._job_id_text(head.id_) if head is not None else None
         target_model = str(head.model) if head is not None and head.model is not None else None
 
+        # Terminal / operator-commanded states
         if self._state.shutting_down:
             return OrchestrationIntentSnapshot(
                 summary="Draining before shutdown.",
                 why="In-flight work finishes first.",
             )
+
         if self._state.supervisor_paused:
             return OrchestrationIntentSnapshot(summary="Paused by operator.", why="No new jobs are being popped.")
+
+        # Download-only hold (operator-initiated pre-fetch posture)
+        if self._state.downloads_only_hold:
+            return OrchestrationIntentSnapshot(
+                summary="Download-only mode: pre-fetching models without serving.",
+                next_action="Use the Downloads tab to go live when ready.",
+                why="Inference and safety are held; the GPU is not committed.",
+            )
+
+        # Self-throttle (worker-initiated, auto-resuming)
         if self._state.self_throttle_paused:
+            remaining = max(0.0, self._state.self_throttle_paused_until - time.time())
+            why = "The worker is backing off before the horde forces maintenance."
+            if remaining > 0:
+                why += f" Resumes in ~{self._format_remaining_seconds(remaining)}."
             return OrchestrationIntentSnapshot(
                 summary="Self-throttled after resource faults.",
-                why="The worker is backing off before the horde forces maintenance.",
+                why=why,
             )
+
+        # Background model download
         if self._model_availability.background_download_active:
+            model_hint = ""
+            status = self._model_availability.status
+            if status is not None and status.active:
+                model_hint = f" ({status.active[0].model_name})"
             return OrchestrationIntentSnapshot(
-                summary="Downloading model assets.",
+                summary=f"Downloading model assets{model_hint}.",
                 next_action="Serve each model as soon as it is ready.",
                 why="Feature/model readiness gates job popping.",
             )
+
+        # Horde-forced maintenance (server-side pause)
+        if self._state.last_pop_maintenance_mode:
+            return OrchestrationIntentSnapshot(
+                summary="In horde maintenance mode.",
+                next_action="Press the Maintenance (horde) key to clear it when ready.",
+                why="The horde has paused this worker; it will not be given new jobs until cleared.",
+            )
+
+        # Dispatch stall (head parked, no job dispatched this cycle)
         if raw_gate:
             return OrchestrationIntentSnapshot(
                 summary="Holding dispatch.",
@@ -2407,21 +2480,50 @@ class HordeWorkerProcessManager:
                 target_job_id=target_job_id,
                 target_model=target_model,
             )
+
+        # Jobs in progress (sampling or post-processing)
         if self._job_tracker.jobs_in_progress:
             count = len(self._job_tracker.jobs_in_progress)
+            sampling = self._process_map.num_busy_with_inference()
+            post = self._process_map.num_busy_with_post_processing()
+            if sampling > 0:
+                summary = f"Sampling {sampling} job{'s' if sampling != 1 else ''}"
+                if post > 0:
+                    summary += f" (+ {post} in post-processing)"
+                summary += "."
+            elif post > 0:
+                summary = f"Post-processing {post} job{'s' if post != 1 else ''}."
+            else:
+                summary = f"{count} job{'s' if count != 1 else ''} in progress."
+
             return OrchestrationIntentSnapshot(
-                summary=f"Sampling {count} job{'s' if count != 1 else ''}.",
+                summary=summary,
                 next_action=(f"Prepare {target_model}." if target_model else "Keep the pipeline fed."),
                 target_job_id=target_job_id,
                 target_model=target_model,
             )
+
+        # A queued job is waiting but nothing is in progress
         if head is not None:
             if target_model and self._horde_model_map.is_model_loading(target_model):
                 summary = f"Preloading {target_model}."
                 why = "The queued job's model is loading into a process."
             else:
                 summary = f"Preparing queued job {target_job_id[:8] if target_job_id else ''}.".strip()
-                why = "Waiting for a resident model and an accepting process."
+                _find_resident = getattr(self._inference_scheduler, "_resident_process_for_job", None)
+                resident = _find_resident(head) if _find_resident is not None else None
+                if resident is not None:
+                    if resident.last_process_state.name == "INFERENCE_STARTING":
+                        why = f"Process {resident.process_id} is busy sampling."
+                    elif resident.last_process_state.name == "INFERENCE_POST_PROCESSING":
+                        why = f"Process {resident.process_id} is finishing post-processing."
+                    elif resident.last_process_state.name == "DOWNLOADING_AUX_MODEL":
+                        why = f"Process {resident.process_id} is downloading auxiliary models."
+                    else:
+                        state_phrase = resident.last_process_state.name.lower().replace("_", " ")
+                        why = f"Process {resident.process_id} is {state_phrase}."
+                else:
+                    why = "Waiting for a resident model and an accepting process."
             return OrchestrationIntentSnapshot(
                 summary=summary,
                 next_action="Dispatch when the process can accept work.",
@@ -2429,20 +2531,87 @@ class HordeWorkerProcessManager:
                 target_job_id=target_job_id,
                 target_model=target_model,
             )
+
+        # Consecutive failure backoff
+        if self._state.too_many_consecutive_failed_jobs:
+            remaining = max(
+                0.0,
+                self._state.too_many_consecutive_failed_jobs_time + CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS - time.time(),
+            )
+            why = f"{self._state.consecutive_failed_jobs} consecutive job failures."
+            if remaining > 0:
+                why += f" Resumes in ~{self._format_remaining_seconds(remaining)}."
+            return OrchestrationIntentSnapshot(
+                summary="Paused after consecutive job failures.",
+                next_action="Check logs and diagnostics to identify the fault.",
+                why=why,
+            )
+
+        # Safety backlog backpressure (pops withheld to let the safety stage catch up)
+        safety_backlog = len(self._job_tracker.jobs_pending_safety_check) + len(
+            self._job_tracker.jobs_being_safety_checked
+        )
+        if safety_backlog > 0 and getattr(self._job_popper, "_is_post_inference_backlogged", lambda: False)():
+            return OrchestrationIntentSnapshot(
+                summary=f"Safety backlogged: withholding pops ({safety_backlog} waiting).",
+                next_action="Pops resume when the safety stage catches up.",
+                why="The safety stage is slower than inference; enable safety_on_gpu or speed safety up.",
+            )
+
+        # API error backoff
+        if self._job_popper._pop_throttler.is_in_error_backoff:
+            return OrchestrationIntentSnapshot(
+                summary="Backing off after API errors.",
+                next_action="Pops resume automatically after the backoff interval.",
+                why="The horde API returned errors on recent pop attempts.",
+            )
+
+        # Warm-up rule: don't queue ahead until the first job completes
+        if self._job_tracker.total_num_completed_jobs == 0 and self._job_tracker.jobs_pending_inference:
+            return OrchestrationIntentSnapshot(
+                summary="Warming up: withholding queue-ahead until the first job completes.",
+                next_action="The queue will fill once the inaugural job succeeds.",
+                why="If the worker is doomed to fail with one job, it is doomed to fail with two.",
+            )
+
+        # Safety stage activity (normal, not backlogged)
         safety = len(self._job_tracker.jobs_pending_safety_check) + len(self._job_tracker.jobs_being_safety_checked)
         if safety:
-            return OrchestrationIntentSnapshot(summary=f"Safety checking {safety} job{'s' if safety != 1 else ''}.")
-        if self._job_tracker.jobs_pending_submit:
-            return OrchestrationIntentSnapshot(summary="Submitting completed jobs to the horde.")
-        if self._state.last_pop_skipped_reasons:
-            reasons = ", ".join(
-                f"{key}={value}" for key, value in sorted(self._state.last_pop_skipped_reasons.items())
+            return OrchestrationIntentSnapshot(
+                summary=f"Safety checking {safety} job{'s' if safety != 1 else ''}.",
+                next_action="Jobs will be submitted once safety completes.",
             )
+
+        # Submission stage
+        if self._job_tracker.jobs_pending_submit:
+            return OrchestrationIntentSnapshot(
+                summary="Submitting completed jobs to the horde.",
+                next_action="Results are being uploaded and reported.",
+            )
+
+        # Alchemy active with no inference work
+        alchemy_active = self._alchemy_coordinator.num_forms_in_flight + self._alchemy_coordinator.num_forms_pending
+        if alchemy_active > 0:
+            return OrchestrationIntentSnapshot(
+                summary=f"Processing alchemy: {alchemy_active} form{'s' if alchemy_active != 1 else ''}.",
+                next_action="Pop inference jobs when alchemy work completes.",
+                why="Alchemy (upscale/face-fix/interrogate/caption) is using the GPU.",
+            )
+
+        # Last pop returned no job; surface the API's skip reasons in friendly prose
+        if self._state.last_pop_skipped_reasons:
+            phrases: list[str] = []
+            for key, value in sorted(self._state.last_pop_skipped_reasons.items()):
+                phrase = self._SKIP_REASON_PHRASES.get(key, key)
+                phrases.append(f"{value} {phrase}")
+            reasons = " · ".join(phrases)
             return OrchestrationIntentSnapshot(
                 summary="Looking for matching horde work.",
                 next_action="Pop again after the throttle interval.",
                 why=f"Last pop skipped: {reasons}.",
             )
+
+        # Default: ready and waiting
         return OrchestrationIntentSnapshot(summary="Ready for work.", next_action="Pop the next matching job.")
 
     def _build_pending_jobs_list(self) -> list[JobQueueEntry]:

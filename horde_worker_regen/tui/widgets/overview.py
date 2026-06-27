@@ -161,6 +161,20 @@ class OverviewView(Vertical):
         height: auto;
         width: 100%;
     }
+    OverviewView #overview-intent-row {
+        layout: grid;
+        grid-size: 3;
+        grid-columns: 1fr 1fr 1fr;
+        grid-rows: auto;
+        grid-gutter: 0 1;
+        height: auto;
+        width: 100%;
+    }
+    OverviewView #overview-intent-row Static {
+        width: 100%;
+        height: auto;
+        margin: 0;
+    }
     """
     """Row containers stay vertical by default, then detailed mode opts into horizontal adjacency when the
     current content width can support it."""
@@ -215,10 +229,11 @@ class OverviewView(Vertical):
                 with Container(id="overview-workload-column"):
                     yield Static(id="overview-gpus")
                     yield Static(id="overview-pipeline")
-                    yield Static(id="overview-intent")
                 yield Static(id="overview-trends")
+            with Container(id="overview-intent-row"):
+                yield Static(id="overview-queue")
+                yield Static(id="overview-intent")
                 yield Static(id="overview-governors")
-            yield Static(id="overview-queue")
             yield Static(id="overview-work")
             yield Static(id="overview-processes")
             with Container(id="overview-ops-row", classes="overview-row"):
@@ -231,7 +246,6 @@ class OverviewView(Vertical):
     _NORMAL_NODE_IDS = (
         "#overview-hero",
         "#overview-health",
-        "#overview-intent",
         "#overview-trends",
         "#overview-pipeline",
         "#overview-work",
@@ -240,12 +254,11 @@ class OverviewView(Vertical):
     """Statics shown in normal (and details) mode, hidden in thin mode."""
 
     _DETAIL_NODE_IDS = (
-        "#overview-queue",
         "#overview-recent",
     )
     """Statics shown only in details mode (the demoted panels)."""
 
-    _NORMAL_ROW_IDS = ("#overview-core-grid", "#overview-body")
+    _NORMAL_ROW_IDS = ("#overview-core-grid", "#overview-body", "#overview-intent-row")
     """Row containers shown in normal/details mode, hidden in thin mode."""
 
     _DETAIL_ROW_IDS = ("#overview-history-row",)
@@ -280,6 +293,9 @@ class OverviewView(Vertical):
             self.query_one(node_id, Static).display = not thin
         for node_id in self._DETAIL_NODE_IDS:
             self.query_one(node_id, Static).display = detailed
+        # The intent-row children are managed individually (queue is details-only, governors conditional).
+        self.query_one("#overview-intent", Static).display = not thin
+        self.query_one("#overview-queue", Static).display = detailed
 
         nag = self.query_one("#overview-update-nag", Static)
         if self._update_info is not None:
@@ -331,6 +347,10 @@ class OverviewView(Vertical):
                 self.query_one("#overview-governors", Static).update(
                     self._render_governors_panel(governors, detailed=detailed),
                 )
+            if detailed:
+                self.query_one("#overview-queue", Static).update(
+                    self._render_queue_table(snapshot, available_width=width),
+                )
             if show_gpus:
                 self.query_one("#overview-gpus", Static).update(self._render_gpus_strip(snapshot, detailed=detailed))
             self.query_one("#overview-trends", Static).update(self._render_trends(snapshot))
@@ -351,9 +371,6 @@ class OverviewView(Vertical):
             if show_alchemy:
                 self.query_one("#overview-alchemy", Static).update(self._render_alchemy_panel(snapshot))
             if detailed:
-                self.query_one("#overview-queue", Static).update(
-                    self._render_queue_table(snapshot, available_width=width),
-                )
                 self.query_one("#overview-recent", Static).update(
                     self._render_recent_jobs(snapshot, available_width=width),
                 )
