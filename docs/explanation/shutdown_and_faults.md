@@ -41,18 +41,22 @@ There are two termination paths:
    submitting pending results.
 7. When all jobs are finalized (all stage collections empty), the main loop
    exits.
-8. If jobs don't drain within a grace period (scaled by the amount of
-   outstanding work, then hard-capped), any still-outstanding jobs are faulted so
-   the still-running submitter reports them and the horde reissues them
-   immediately, and only then are all processes force-killed. This keeps the
-   no-loss invariant even when a drain cannot finish in time.
+8. A timed backstop bounds the drain. If no accepted work remains anywhere in
+   the pipeline (no inference, safety, submit, or alchemy work), the backstop
+   uses a short grace and then force-kills/reaps children because there is no
+   horde-owned job to lose. If work is still outstanding, the grace is scaled by
+   that work and hard-capped; after it expires, any still-outstanding jobs are
+   faulted so the still-running submitter reports them and the horde reissues
+   them immediately, and only then are all processes force-killed. This keeps
+   the no-loss invariant even when a drain cannot finish in time.
 
 ### Abort sequence
 
 1. [`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker]'s `_purge_jobs()`
    clears all job collections (jobs are lost).
 2. [`ProcessLifecycleManager`][horde_worker_regen.process_management.lifecycle.process_lifecycle.ProcessLifecycleManager]'s
-   `_hard_kill_processes()` kills all children immediately.
+   `_hard_kill_processes()` kills all children immediately, joins them briefly,
+   and clears the in-memory process/model maps and owned-PID registry.
 3. `start_timed_shutdown()` launches a background thread that `sys.exit(1)`
    after a grace period; a last-resort measure if the main loop is stuck.
 

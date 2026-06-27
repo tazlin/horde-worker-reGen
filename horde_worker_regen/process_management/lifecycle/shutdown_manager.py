@@ -18,6 +18,9 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 _SHUTDOWN_GRACE_BASE_SECONDS = 20.0
 """Minimum grace before the force-kill backstop fires, regardless of outstanding work."""
 
+_EMPTY_SHUTDOWN_GRACE_SECONDS = 3.0
+"""Grace before force-killing children when no accepted work remains anywhere in the pipeline."""
+
 _SHUTDOWN_GRACE_PER_JOB_SECONDS = 40.0
 """Extra grace granted per outstanding job (any stage), so in-flight work can drain before a kill."""
 
@@ -109,8 +112,15 @@ class ShutdownManager:
             + len(tracker.jobs_pending_submit)
         )
 
+    def _has_outstanding_work(self) -> bool:
+        """Return whether shutdown still has accepted work to drain before children may be killed quickly."""
+        return self._outstanding_job_count() > 0 or self._state.alchemy_forms_in_flight > 0
+
     def _compute_shutdown_grace(self) -> float:
         """Grace before the force-kill backstop, scaled by outstanding work and hard-capped."""
+        if not self._has_outstanding_work():
+            return _EMPTY_SHUTDOWN_GRACE_SECONDS
+
         grace = _SHUTDOWN_GRACE_BASE_SECONDS + (_SHUTDOWN_GRACE_PER_JOB_SECONDS * self._outstanding_job_count())
         return min(grace, MAX_SHUTDOWN_GRACE_SECONDS)
 
@@ -175,13 +185,7 @@ class ShutdownManager:
 
             # Grace expired with the worker still up: report any stuck jobs, then force the kill.
             self._fault_report_outstanding_jobs()
-
-            for process in self._process_map.values():
-                try:
-                    process.mp_process.kill()
-                    process.mp_process.join(1)
-                except Exception as e:
-                    logger.error(f"Failed to kill process {process}: {e}")
+            self._process_lifecycle._hard_kill_processes()
 
             # Only force-exit if the graceful shutdown hasn't completed; a clean exit
             # should be left to the main thread (and embedders like the test harness).

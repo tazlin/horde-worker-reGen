@@ -16,6 +16,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.shutdown_manager import (
+    _EMPTY_SHUTDOWN_GRACE_SECONDS,
     _SHUTDOWN_GRACE_BASE_SECONDS,
     _SHUTDOWN_GRACE_PER_JOB_SECONDS,
     MAX_SHUTDOWN_GRACE_SECONDS,
@@ -224,9 +225,15 @@ class TestSignalHandler:
 class TestComputeShutdownGrace:
     """The force-kill grace scales with outstanding work (all stages) and is hard-capped."""
 
-    def test_empty_tracker_uses_base_grace(self) -> None:
-        """With no jobs in flight, the grace is just the base."""
+    def test_empty_pipeline_uses_short_grace(self) -> None:
+        """With no accepted work in flight, the force-kill backstop uses the short empty-pipeline grace."""
         shutdown_manager = _make_shutdown_manager()
+        assert shutdown_manager._compute_shutdown_grace() == _EMPTY_SHUTDOWN_GRACE_SECONDS
+
+    def test_alchemy_work_uses_drain_grace(self) -> None:
+        """Alchemy in flight is accepted work, so it must not take the empty-pipeline fast path."""
+        state = WorkerState(alchemy_forms_in_flight=1)
+        shutdown_manager = _make_shutdown_manager(state=state)
         assert shutdown_manager._compute_shutdown_grace() == _SHUTDOWN_GRACE_BASE_SECONDS
 
     async def test_grace_scales_with_outstanding_jobs(self) -> None:
