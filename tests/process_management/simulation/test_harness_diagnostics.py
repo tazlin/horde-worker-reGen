@@ -14,17 +14,72 @@ from unittest.mock import Mock, patch
 import pytest
 
 from horde_worker_regen.harness import (
+    HarnessConfig,
     HarnessResult,
     _cleanup_stale_abort_file,
     _collect_run_diagnostics,
     _determine_exit_reason,
+    build_harness_process_manager,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.simulation.fake_worker_processes import (
+    start_fake_download_process,
+    start_fake_inference_process,
+    start_fake_safety_process,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
     make_testable_process_manager,
 )
+
+
+class TestFakeModeWiring:
+    """Tests for fake-mode child process entry-point wiring."""
+
+    def test_fake_mode_uses_fake_download_inference_and_safety_entry_points(self) -> None:
+        """Fake harness runs must not accidentally launch a real child process type."""
+        manager, _ = build_harness_process_manager(HarnessConfig(process_mode="fake", skip_api=True, num_jobs=1))
+        entry_points = manager._process_lifecycle._entry_points
+
+        assert entry_points.inference_entry_point is start_fake_inference_process
+        assert entry_points.safety_entry_point is start_fake_safety_process
+        assert getattr(entry_points.download_entry_point, "func", None) is start_fake_download_process
+
+    def test_fake_download_defaults_to_all_scenario_models_available(self) -> None:
+        """Default fake mode keeps historical behavior: no image-model download gate."""
+        scenario = [make_job_pop_response("model-a"), make_job_pop_response("model-b")]
+        manager, _ = build_harness_process_manager(
+            HarnessConfig(process_mode="fake", skip_api=True, scenario=scenario),
+        )
+        entry_points = manager._process_lifecycle._entry_points
+
+        assert manager._enable_background_downloads is False
+        assert getattr(entry_points.download_entry_point, "keywords", {})["scripted_present"] == [
+            "model-a",
+            "model-b",
+        ]
+
+    def test_fake_download_can_start_from_partial_model_set(self) -> None:
+        """Canary simulations can exercise cold-start model availability with fake downloads."""
+        scenario = [make_job_pop_response("model-a"), make_job_pop_response("model-b")]
+        manager, _ = build_harness_process_manager(
+            HarnessConfig(
+                process_mode="fake",
+                skip_api=True,
+                scenario=scenario,
+                fake_initially_available_models=["model-a"],
+                fake_download_delay_seconds=0.25,
+                fake_download_fail_models=["missing-model"],
+            ),
+        )
+        entry_points = manager._process_lifecycle._entry_points
+        keywords = getattr(entry_points.download_entry_point, "keywords", {})
+
+        assert manager._enable_background_downloads is True
+        assert keywords["scripted_present"] == ["model-a"]
+        assert keywords["download_delay_seconds"] == 0.25
+        assert keywords["fail_models"] == ["missing-model"]
 
 
 class TestCleanupStaleAbortFile:

@@ -265,6 +265,8 @@ class ProcessLifecycleManager:
         # Set while a whole-card (single-residency) job claims the device, so the safety process's CUDA
         # context (only reclaimable by the process exiting) is freed for the heavy model. Restored after.
         self._safety_gpu_paused = False
+        self._safety_gpu_pause_count = 0
+        self._safety_gpu_restore_count = 0
         # Marks the *next* safety-pool rebuild as an intentional whole-card pause/restore cycle, so its
         # completion is not counted as a crash recovery and does not feed the safety crash-loop breaker.
         # Without this, repeated whole-card jobs cycling safety off/on read as a safety crash loop and trip
@@ -955,6 +957,16 @@ class ProcessLifecycleManager:
         """Whether the safety process is being forced off-GPU for a whole-card job."""
         return self._safety_gpu_paused
 
+    @property
+    def safety_gpu_pause_count(self) -> int:
+        """How many whole-card residency safety-off-GPU pauses this lifecycle manager initiated."""
+        return self._safety_gpu_pause_count
+
+    @property
+    def safety_gpu_restore_count(self) -> int:
+        """How many whole-card residency safety-on-GPU restores this lifecycle manager initiated."""
+        return self._safety_gpu_restore_count
+
     def pause_safety_on_gpu(self) -> bool:
         """Move the safety process off-GPU (cpu_only) so its CUDA context frees for a whole-card model.
 
@@ -969,6 +981,7 @@ class ProcessLifecycleManager:
         if not self._runtime_config.bridge_data.safety_on_gpu or self._safety_gpu_paused:
             return False
         self._safety_gpu_paused = True
+        self._safety_gpu_pause_count += 1
         self._safety_replacement_intentional = True
         self._initiate_safety_replacement()
         logger.info("Whole-card residency: moving the safety process off-GPU to free its VRAM context.")
@@ -986,6 +999,7 @@ class ProcessLifecycleManager:
         if not self._safety_gpu_paused:
             return False
         self._safety_gpu_paused = False
+        self._safety_gpu_restore_count += 1
         self._safety_replacement_intentional = True
         self._initiate_safety_replacement()
         logger.info("Whole-card residency complete: restoring the safety process to the GPU.")

@@ -39,6 +39,7 @@ from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+from horde_worker_regen.consts import VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management.ipc.messages import AlchemyFormSpec
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.process_manager import (
@@ -59,6 +60,7 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
     make_simple_scenario,
 )
 from horde_worker_regen.process_management.simulation.fake_worker_processes import (
+    start_fake_download_process,
     start_fake_inference_process,
     start_fake_safety_process,
 )
@@ -115,6 +117,14 @@ class HarnessConfig:
     horde_model_reference_manager: ModelReferenceManager | None = None
     """Required for non-skip_api runs that need live model reference data; optional otherwise."""
 
+    system_resources: SystemResources | None = None
+    """Optional fake/dry-run hardware topology override for e2e simulations.
+
+    Real-mode runs still detect the actual host. Fake/dry-run runs default to a single synthetic 8 GB
+    card, but canary tests can inject varied RAM, card count, VRAM capacity, backend kind, and process
+    overheads so the real manager plans the same topology an operator's machine would present.
+    """
+
     fail_every_n: int = 0
     """If > 0, every nth fake inference job reports a faulted result (fake process mode only)."""
 
@@ -124,6 +134,22 @@ class HarnessConfig:
 
     safety_fault_profile: FaultProfile | None = None
     """If set (fake process mode only), scripts the safety fakes' misbehaviour on the eval path."""
+
+    fake_initially_available_models: list[str] | None = None
+    """Optional fake-mode model set present before the fake download process starts.
+
+    None preserves the historical harness behavior: every scenario model is already present. Supplying a
+    subset lets e2e simulations exercise cold-start/background-download availability without real downloads.
+    """
+
+    fake_download_delay_seconds: float = 0.0
+    """Per-model delay for fake-mode image-model downloads."""
+
+    fake_download_fail_models: list[str] = field(default_factory=list)
+    """Image models the fake download process should report as failed in fake mode."""
+
+    download_fault_profile: FaultProfile | None = None
+    """If set (fake process mode only), scripts fake download process startup/slow behaviour."""
 
     audit: bool = True
     """If True, attach a JobLifecycleAuditor and report invariant violations in the result."""
@@ -179,6 +205,16 @@ class HarnessResult:
     num_alchemy_forms_expected: int = 0
     num_alchemy_forms_completed: int = 0
     num_alchemy_forms_faulted: int = 0
+    model_availability_known: bool = False
+    """Whether the background download process reported image-model availability during the run."""
+    available_model_names: list[str] = field(default_factory=list)
+    """Final image-model present set reported by the download process, sorted."""
+    failed_download_model_names: list[str] = field(default_factory=list)
+    """Final image-model failures reported by the download process, sorted."""
+    safety_gpu_pause_count: int = 0
+    """Number of whole-card residency safety-off-GPU pauses initiated during the run."""
+    safety_gpu_restore_count: int = 0
+    """Number of whole-card residency safety-on-GPU restores initiated during the run."""
 
     @property
     def all_jobs_accounted_for(self) -> bool:
@@ -209,6 +245,8 @@ class HarnessResult:
             parts.append(f"jobs_completed={self.num_jobs_completed}/{self.num_jobs_expected}")
         if self.audit_failures:
             parts.append(f"audit_failures={len(self.audit_failures)}")
+        if self.num_jobs_submitted_faulted > 0:
+            parts.append(f"jobs_submitted_faulted={self.num_jobs_submitted_faulted}")
         if self.num_alchemy_forms_faulted > 0:
             parts.append(f"alchemy_faulted={self.num_alchemy_forms_faulted}")
         if self.num_alchemy_forms_completed < self.num_alchemy_forms_expected:
@@ -323,6 +361,19 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
     return bridge_data
 
 
+def _fallback_baseline_for_harness_model(model_name: str) -> KNOWN_IMAGE_GENERATION_BASELINE:
+    """Return a representative baseline for a synthetic harness model record."""
+    if model_name == "Flux.1-Schnell fp8 (Compact)":
+        return KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell
+    if model_name == "Flux.1-Schnell fp16 (Compact)":
+        return KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell
+    if model_name == "Stable Cascade 1.0":
+        return KNOWN_IMAGE_GENERATION_BASELINE.stable_cascade
+    if model_name in VRAM_HEAVY_MODELS:
+        return KNOWN_IMAGE_GENERATION_BASELINE.flux_schnell
+    return KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1
+
+
 def build_harness_model_reference(
     scenario: list[ImageGenerateJobPopResponse],
     reference_manager: ModelReferenceManager | None = None,
@@ -353,7 +404,7 @@ def build_harness_model_reference(
             continue
         reference[job.model] = ImageGenerationModelRecord(
             name=job.model,
-            baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+            baseline=_fallback_baseline_for_harness_model(job.model),
             nsfw=False,
             description="e2e harness model record",
         )
@@ -425,9 +476,23 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
             else start_fake_safety_process
         )
 
+        available_models = (
+            config.fake_initially_available_models
+            if config.fake_initially_available_models is not None
+            else [job.model for job in scenario if job.model is not None]
+        )
+        download_entry_point = functools.partial(
+            start_fake_download_process,
+            scripted_present=available_models,
+            download_delay_seconds=config.fake_download_delay_seconds,
+            fail_models=config.fake_download_fail_models,
+            fault_profile=config.download_fault_profile,
+        )
+
         entry_points = ProcessEntryPoints(
             inference_entry_point=inference_entry_point,
             safety_entry_point=safety_entry_point,
+            download_entry_point=download_entry_point,
         )
 
     canned_job_source: CannedJobSource | None = None
@@ -445,7 +510,9 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
     elif config.skip_api and config.alchemy_forms:
         canned_alchemy_source = CannedAlchemySource(config.alchemy_forms)
 
-    system_resources = _build_harness_system_resources() if config.process_mode != "real" else None
+    system_resources = None
+    if config.process_mode != "real":
+        system_resources = config.system_resources or _build_harness_system_resources()
 
     manager = HordeWorkerProcessManager(
         ctx=multiprocessing.get_context("spawn"),
@@ -457,6 +524,8 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
         process_entry_points=entry_points,
         canned_job_source=canned_job_source,
         canned_alchemy_source=canned_alchemy_source,
+        enable_background_downloads=config.process_mode == "fake"
+        and config.fake_initially_available_models is not None,
     )
 
     return manager, len(scenario)
@@ -734,6 +803,7 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         num_jobs_expected = num_jobs_completed
         num_forms_expected = num_forms_completed
 
+    availability = manager._model_availability
     return HarnessResult(
         num_jobs_expected=num_jobs_expected,
         num_jobs_completed=num_jobs_completed,
@@ -748,6 +818,11 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         num_alchemy_forms_expected=num_forms_expected,
         num_alchemy_forms_completed=num_forms_completed,
         num_alchemy_forms_faulted=manager._alchemy_coordinator.num_canned_forms_faulted,
+        model_availability_known=availability.is_known,
+        available_model_names=sorted(availability.present or []),
+        failed_download_model_names=sorted(availability.failed),
+        safety_gpu_pause_count=manager._process_lifecycle.safety_gpu_pause_count,
+        safety_gpu_restore_count=manager._process_lifecycle.safety_gpu_restore_count,
     )
 
 
@@ -796,7 +871,7 @@ def _collect_run_diagnostics(
         )
 
     popped = len(manager._job_tracker.jobs_lookup)
-    if popped == 0 and elapsed > 2.0:
+    if popped == 0 and completed == 0 and faulted == 0 and elapsed > 2.0:
         diags.append("No jobs were ever popped; check canned_job_source or process availability")
 
     return diags

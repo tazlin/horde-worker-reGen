@@ -192,10 +192,15 @@ worker. See [Frontend and Durable State](frontend_and_state.md).
 When `dry_run_skip_api` is active,
 [`CannedJobSource`][horde_worker_regen.process_management.simulation._canned_scenarios.CannedJobSource]
 substitutes synthetic jobs instead of calling the API, and
-`fake_worker_processes` substitutes canned image results instead of running real
-inference. Everything else (the job tracker, the scheduler, the message
-dispatcher) runs identically. This is how the extensive test suite validates
-the pipeline without touching the network or a GPU.
+`fake_worker_processes` substitutes fake download, inference, and safety child
+processes instead of running real model downloads, inference, or safety
+evaluation. Everything else (the job tracker, the scheduler, the message
+dispatcher) runs identically. The e2e harness can also inject synthetic system
+resources (RAM, card count, per-card VRAM, backend kind, and process-overhead
+estimates) and script the fake download process's initial model availability,
+which lets canary simulations exercise representative volunteer-host topologies,
+cold-start model availability, and background-download queue pressure without
+touching the network or a GPU.
 
 ## Where the code lives
 
