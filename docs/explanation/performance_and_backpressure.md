@@ -355,9 +355,17 @@ and the total/live-context counts take a `device_index` and read just that card;
 the budget compares the job against *that card's* free VRAM plus its own committed
 reserve, eviction reclaims only that card's idle residents, and a whole-card
 exclusive residency claims (and later restores) one card's process pool
-independently of the others. Collapsing to that sole residency deliberately stops
-the idle siblings even when their model is still queued *behind* the heavy head: the
-head owns the card, so those queued jobs wait and their models reload once it drains.
+independently of the others. The residency reduces the live process count to the
+largest the card's VRAM proves can co-reside with the heavy model (its weights plus
+the activation-inclusive reserve, against the measured per-context cost), not a blanket
+collapse to one: on a high-VRAM card a small-fraction heavy model (an fp8 Flux
+checkpoint on a 24 GB card) keeps an idle sibling context so the next job pipelines
+without a respawn, while on a card with no such room (the same checkpoint on a 16 GB
+card) it collapses to sole residency. The whole-card *intent* still governs that the
+model never co-*samples* (the concurrency overlap gate), so only the teardown depth is
+hardware-relative. The teardown deliberately stops idle siblings even when their model
+is still queued *behind* the heavy head: the head owns the card's sampling, so those
+queued jobs wait and their models reload once it drains.
 The generic scale-down spares any queued-model process, which would otherwise pin the
 count above the target and wedge the convergence forever; the residency instead tells
 the scale-down it is a whole-card collapse so it spares only the head's holder. A fresh preload also chooses *which* eligible card to
@@ -433,6 +441,35 @@ why. This keeps a small-weight model on a large card (an SDXL checkpoint on a 24
 rather than reserving the card for it; on a smaller card the same checkpoint *is* card-demanding, so a teardown
 there remains available. It is the difference between a teardown justified by measured contention and one
 conjured by an unmeasured over-count.
+
+### Large-model pop limiters
+
+Whole-card residency is disruptive even when correctly sized: a queue that *alternates* distinct very-large
+models (Flux → Z-Image → Flux → Flux → Z-Image) makes every switch tear the pool down and stream a fresh
+multi-GB checkpoint from disk, so the worker spends most of its time loading rather than generating. Two
+optional limiters act at the only point the worker controls what work it takes: the set of models it
+*offers* in the horde pop request. Because they shape the offer, no job is ever popped and then dropped
+(dropping is what trips the horde's "too many drops" maintenance). Both classify "very large" from the same
+`EXTRA_LARGE` tier the residency machinery uses
+([`is_extra_large_model`][horde_worker_regen.process_management.models.model_sizing.is_extra_large_model]:
+the Flux/Cascade/Qwen/Z-Image baselines and the named VRAM-heavy checkpoints), so the set they throttle is
+exactly the set that would claim the card.
+
+- **The switch throttle** (`large_model_switch_min_seconds`): once a very-large model is loaded or queued,
+  a *different* very-large model is withheld from the offer until that many seconds have elapsed since the
+  last distinct large model was introduced. Jobs for the large model already in play stay offerable; only
+  churning to a new one is throttled.
+- **The re-entry cooldown** (`large_model_reentry_cooldown_seconds`): once the whole-card residency lease is
+  up *and* no very-large model remains loaded or queued, *any* very-large model is withheld for the
+  cooldown, so the worker does ordinary work for a beat instead of immediately re-thrashing. `-1` inherits
+  `whole_card_residency_cooldown_seconds` (the lease it complements); `0` disables it.
+
+Both yield to an idle escape: when the worker holds no local work at all (an empty queue, nothing in
+flight), nothing is withheld, so a limiter never leaves the worker idle when the only work it could take is
+a large model. The timing state lives in a pure, worker-wide
+[`LargeModelPopGovernor`][horde_worker_regen.process_management.jobs.large_model_pop_governor.LargeModelPopGovernor];
+both limiters are off by default (zero / inherited-zero durations) and independent of
+`whole_card_exclusive_residency`.
 
 ## Alchemy backpressure
 

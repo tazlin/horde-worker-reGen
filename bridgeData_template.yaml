@@ -545,6 +545,22 @@ whole_card_residency_safety_off_gpu: true
 # churn. 0 restores immediately (most responsive, most churn). Only used with enable_vram_budget.
 whole_card_residency_cooldown_seconds: 45
 
+# Minimum seconds between accepting jobs for *different* very-large models (Flux/Cascade/Qwen/Z-Image and
+# the named VRAM-heavy checkpoints). A queue that alternates distinct very-large models forces a fresh
+# whole-card teardown and a multi-GB checkpoint reload on every switch. Above 0, once a very-large model is
+# loaded or queued the worker stops *offering* a different very-large model until this many seconds have
+# elapsed since the last distinct large model was introduced (the model already in play is unaffected; no
+# job is dropped). An idle worker with an empty queue offers large models again regardless, so it never
+# sits idle. 0 disables (the default).
+large_model_switch_min_seconds: 0
+
+# Seconds to avoid *any* very-large model after the last one drains. Once the whole-card residency lease is
+# up and no very-large model remains loaded or queued, the worker does ordinary work for this long before
+# it is allowed back into large-model territory, instead of immediately re-thrashing. -1 (the default)
+# inherits whole_card_residency_cooldown_seconds; 0 disables; a positive value overrides. Independent of
+# whole_card_exclusive_residency.
+large_model_reentry_cooldown_seconds: -1
+
 # Per-step hang timeout (seconds) for a job admitted against the VRAM budget. Such a heavy job can
 # stream weights through VRAM each step, so its steps are legitimately far slower than a normal step;
 # this generous grace lets it complete instead of being killed. Floored at inference_step_timeout.
