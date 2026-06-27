@@ -39,9 +39,9 @@ def _make_snapshot() -> WorkerStateSnapshot:
     return WorkerStateSnapshot(config=config, processes=[process], num_jobs_submitted=7)
 
 
-def test_protocol_version_is_v11() -> None:
-    """Stats snapshots and export controls ride supervisor protocol v11."""
-    assert SUPERVISOR_PROTOCOL_VERSION == 11
+def test_protocol_version_is_v12() -> None:
+    """Stats snapshots and export controls ride supervisor protocol v12."""
+    assert SUPERVISOR_PROTOCOL_VERSION == 12
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:
