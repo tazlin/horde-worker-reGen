@@ -49,6 +49,7 @@ WORKDIR "${APP_HOME}"
 # Copy only the metadata first so the (slow, heavy) dependency layer is cached and not rebuilt on
 # every source change. README.md/LICENSE are referenced by the project metadata.
 COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY horde_worker_regen/__init__.py horde_worker_regen/__init__.py
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project \
     --extra "${TORCH_BACKEND}" --extra post-processing --extra controlnet

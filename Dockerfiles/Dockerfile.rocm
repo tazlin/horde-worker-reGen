@@ -47,6 +47,7 @@ WORKDIR "${APP_HOME}"
 
 # Cache the heavy base (cpu-extra) dependency layer independently of source changes.
 COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY horde_worker_regen/__init__.py horde_worker_regen/__init__.py
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --extra cpu
 
