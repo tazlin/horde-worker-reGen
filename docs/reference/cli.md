@@ -29,7 +29,7 @@ Installed as console scripts (defined in `pyproject.toml`):
 | `horde-worker-web` | `horde_worker_regen.tui.web:main` | Serve the dashboard over the web. |
 | `horde-worker-host` | `horde_worker_regen.tui.worker_host:main` | Background worker host the web dashboard attaches to. |
 | `horde-benchmark` | `horde_worker_regen.benchmark.cli:main` | Progressive benchmark. |
-| `horde-duty-report` | `horde_worker_regen.analysis.duty_log_report:main` | Per-session GPU duty-cycle report over a `bridge.log`. |
+| `horde-duty-report` | `horde_worker_regen.analysis.duty_log_report:main` | Per-session GPU duty-cycle report over stats JSONL, with `bridge.log` fallback. |
 | `horde-log` | `horde_worker_regen.analysis.log_triage_cli:main` | Triage worker logs: sessions, timelines, and what-went-wrong findings. |
 | `horde-stats` | `horde_worker_regen.stats_operations:main` | Compress or downsample retained stats JSONL files. |
 
@@ -66,6 +66,32 @@ carries two control commands that act on an already-running host and exit withou
 On Windows the worker host also shows a **system-tray icon** while it runs, with *Open dashboard* and
 *Stop worker & exit* actions, so a detached or orphaned worker stays visible and stoppable. See
 [Use the dashboard](../how-to/use-the-dashboard.md#closing-and-reattaching).
+
+## `horde-duty-report`
+
+Analyze GPU duty-cycle loss across worker sessions. By default, the command reads retained stats JSONL
+from `.horde_worker_regen/stats/` when files are present, because those samples carry structured worker
+state and finalized-job phase metrics. If no stats session is available, or when you pass a log path, it
+falls back to the legacy epoch-aware `bridge.log` parser.
+
+| Flag / argument | Meaning |
+|-----------------|---------|
+| `LOG` | Optional `bridge.log` path for the legacy log parser. Supplying this makes the command log-focused unless `--stats` is also supplied. |
+| `--stats DIR` | Analyze `stats-v*.jsonl` and `stats-v*.jsonl.gz` files from a stats directory. Rotated files with the same filename stamp are grouped into one session. |
+| `--logs PATH` | Log file or directory containing `bridge.log`, used as fallback or for log-only analysis. |
+| `--last` | Only report the newest stats session or log epoch. |
+| `--json` | Emit the machine-readable report schema. Stats-backed JSON uses `SessionDutyReport.to_dict()`. |
+
+Examples:
+
+```bash
+horde-duty-report
+horde-duty-report --stats .horde_worker_regen/stats --last
+horde-duty-report --logs logs --json
+horde-duty-report logs/bridge.log
+```
+
+The stats-backed report separates idle loss from partial-utilization loss, reports popped-job `inference_queue_wait` before inference starts, reports sampled `inference_dispatch_gap` when queued inference work has no active inference process, and keeps `unknown` as a first-class bucket when older files lack enough state to attribute a sampled interval.
 
 ## `horde-stats`
 
@@ -274,3 +300,4 @@ The same generator is available in the dashboard: the **Logs** tab has a **Suppo
 Worker configuration itself can be supplied through `AIWORKER_*` variables instead of
 `bridgeData.yaml` when you pass `-e`; this is the container path described in
 [Run headless](../how-to/run-headless.md#configure-from-environment-variables-containers).
+

@@ -41,6 +41,27 @@ class TestGpuUtilizationSampler:
         # The whole-run figure (no window) reads the separate sample buffer, untouched here.
         assert sampler.mean_percent() is None
 
+    def test_not_before_excludes_pre_first_inference_samples(self) -> None:
+        """``not_before`` drops cold-boot warm-up samples so they never dilute the duty figure."""
+        sampler = GpuUtilizationSampler(busy_threshold_percent=50)
+        now = time.time()
+        first_inference = now - 2.5
+        # Two idle boot samples before the first inference, then two busy samples after it.
+        sampler._timeline.extend(  # noqa: SLF001 - injecting the timestamped series directly
+            [(now - 4.0, 0), (now - 3.0, 0), (now - 2.0, 100), (now - 1.0, 100)],
+        )
+        # Without the cutoff the boot idle halves the mean; with it, only the two busy samples count.
+        assert sampler.mean_percent(window_seconds=10.0) == (0 + 0 + 100 + 100) / 4
+        assert sampler.mean_percent(window_seconds=10.0, not_before=first_inference) == 100.0
+        assert sampler.busy_fraction(window_seconds=10.0, not_before=first_inference) == 1.0
+
+    def test_not_before_after_all_samples_reports_none(self) -> None:
+        """A cutoff later than every sample (no inference yet) yields no duty reading rather than zero."""
+        sampler = GpuUtilizationSampler(busy_threshold_percent=50)
+        now = time.time()
+        sampler._timeline.extend([(now - 4.0, 0), (now - 3.0, 0)])  # noqa: SLF001
+        assert sampler.mean_percent(window_seconds=10.0, not_before=now) is None
+
     def test_buffers_are_bounded(self) -> None:
         """A long-lived worker cannot grow the sample buffers without bound."""
         sampler = GpuUtilizationSampler(max_samples=5, read_utilization=lambda: 50)

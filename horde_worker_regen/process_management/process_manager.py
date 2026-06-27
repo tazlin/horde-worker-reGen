@@ -822,6 +822,10 @@ class HordeWorkerProcessManager:
         self._gpu_sampler = GpuUtilizationSampler(interval_seconds=1.0)
         self._last_duty_cycle_log_time = 0.0
         self._last_no_jobs_seconds_at_duty_log = 0.0
+        self._first_inference_started_at: float | None = None
+        """Epoch second the worker's first-ever inference began sampling, cached once. The duty cycle
+        excludes everything before it: cold-boot model loading is one-time warm-up, not inter-job
+        inefficiency, so counting it only depresses the headline with noise."""
 
         # Expected-time-to-complete model: seeds from the last benchmark's per-tier reference it/s and
         # self-calibrates from this worker's own jobs, so a "slow" job becomes measurable rather than
@@ -2699,10 +2703,28 @@ class HordeWorkerProcessManager:
         if window_seconds < self._DUTY_CYCLE_REPORT_INTERVAL_SECONDS:
             return
 
-        nvml_mean = self._gpu_sampler.mean_percent(window_seconds=window_seconds)
-        nvml_busy = self._gpu_sampler.busy_fraction(window_seconds=window_seconds)
-
         metrics = self.get_run_metrics_snapshot()
+
+        # Cache the first-ever inference start (monotonically the minimum across all retained jobs) so the
+        # duty cycle measures only from when the GPU started doing job work, never the cold-boot warm-up.
+        if self._first_inference_started_at is None:
+            inference_starts = [
+                started
+                for job in metrics.jobs
+                if (started := job.stage_timestamps.get("INFERENCE_IN_PROGRESS")) is not None
+            ]
+            if inference_starts:
+                self._first_inference_started_at = min(inference_starts)
+
+        nvml_mean = self._gpu_sampler.mean_percent(
+            window_seconds=window_seconds,
+            not_before=self._first_inference_started_at,
+        )
+        nvml_busy = self._gpu_sampler.busy_fraction(
+            window_seconds=window_seconds,
+            not_before=self._first_inference_started_at,
+        )
+
         window_start = self._last_duty_cycle_log_time
         jobs_in_window = [
             job for job in metrics.jobs if (job.stage_timestamps.get("FINALIZED") or 0.0) >= window_start
@@ -3497,6 +3519,14 @@ class HordeWorkerProcessManager:
             RecentJobRecord.from_metrics_record(job, baseline=self._safe_model_baseline(job.model_name))
             for job in run_metrics.jobs[-RECENT_JOBS_IN_SNAPSHOT:]
         ]
+        orchestration_intent = self._build_orchestration_intent()
+        process_state_summary = " ".join(
+            f"{process.process_type.lower()}#{process.process_id}={process.last_process_state}"
+            for process in processes
+        )
+        maintenance_mode = (
+            self._state.last_pop_maintenance_mode or self._state.supervisor_paused or self._state.self_throttle_paused
+        )
 
         stats_sample = self._run_metrics.record_stats_sample(
             StatsSample(
@@ -3520,6 +3550,20 @@ class HordeWorkerProcessManager:
                 alchemy_forms_awaiting_submit=self._alchemy_coordinator.num_forms_awaiting_submit,
                 alchemy_total_submitted=self._alchemy_coordinator.num_forms_submitted,
                 alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
+                process_state_summary=process_state_summary,
+                orchestration_intent_summary=orchestration_intent.summary,
+                orchestration_next_action=orchestration_intent.next_action,
+                orchestration_why=orchestration_intent.why,
+                orchestration_raw_gate=orchestration_intent.raw_gate,
+                maintenance_mode=maintenance_mode,
+                self_throttle_paused=self._state.self_throttle_paused,
+                supervisor_paused=self._state.supervisor_paused,
+                last_pop_maintenance_mode=self._state.last_pop_maintenance_mode,
+                worker_details_maintenance=self._worker_details_maintenance,
+                in_error_backoff=self._job_popper._pop_throttler.is_in_error_backoff,
+                last_pop_no_jobs_available=self._state.last_pop_no_jobs_available,
+                last_pop_skipped_reasons=dict(self._state.last_pop_skipped_reasons),
+                churn_counts={kind: len(times) for kind, times in run_metrics.churn_event_times.items()},
             ),
         )
         latest_stats_sample = stats_sample or self._run_metrics.latest_stats_sample()
@@ -3559,11 +3603,7 @@ class HordeWorkerProcessManager:
         return WorkerStateSnapshot(
             session_start_time=self.session_start_time,
             shutting_down=self._state.shutting_down,
-            maintenance_mode=(
-                self._state.last_pop_maintenance_mode
-                or self._state.supervisor_paused
-                or self._state.self_throttle_paused
-            ),
+            maintenance_mode=maintenance_mode,
             self_throttle_paused=self._state.self_throttle_paused,
             supervisor_paused=self._state.supervisor_paused,
             last_pop_maintenance_mode=self._state.last_pop_maintenance_mode,
@@ -3621,7 +3661,7 @@ class HordeWorkerProcessManager:
             alchemy_total_submitted=self._alchemy_coordinator.num_forms_submitted,
             alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
             pending_jobs=self._build_pending_jobs_list(),
-            orchestration_intent=self._build_orchestration_intent(),
+            orchestration_intent=orchestration_intent,
             work_ledger=self._build_work_ledger(recent_jobs),
             whole_card_residency=self._whole_card_residency_status(),
             per_card=self._build_card_snapshots(),

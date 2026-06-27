@@ -23,6 +23,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from horde_worker_regen.analysis.session_duty import analyze_stats_sessions, render_session_duty_report
+from horde_worker_regen.stats_operations import default_stats_dir
+
 _TS_RE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)")
 _TS_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 
@@ -390,23 +393,49 @@ def _report_to_dict(report: EpochReport) -> dict[str, object]:
 
 
 def main() -> None:
-    """CLI entry point: parse a bridge.log and print per-epoch duty-cycle reports."""
-    parser = argparse.ArgumentParser(description="Epoch-aware GPU duty-cycle report over a bridge.log.")
+    """CLI entry point: prefer stats JSONL, then fall back to bridge.log parsing."""
+    parser = argparse.ArgumentParser(description="Offline GPU duty-cycle report over stats JSONL or bridge.log.")
     parser.add_argument(
         "log",
         nargs="?",
-        default="logs/bridge.log",
+        default=None,
         type=Path,
-        help="Path to the bridge.log to analyze (default: logs/bridge.log).",
+        help="Path to the bridge.log to analyze when stats are unavailable or --logs is used.",
     )
-    parser.add_argument("--last", action="store_true", help="Only report the most recent epoch.")
+    parser.add_argument(
+        "--stats",
+        type=Path,
+        default=None,
+        help="Stats directory containing stats-v*.jsonl[.gz] files (default: .horde_worker_regen/stats).",
+    )
+    parser.add_argument(
+        "--logs",
+        type=Path,
+        default=None,
+        help="Log file or directory containing bridge.log, used as enrichment/fallback.",
+    )
+    parser.add_argument("--last", action="store_true", help="Only report the most recent session/epoch.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of text.")
     args = parser.parse_args()
 
-    if not args.log.exists():
-        parser.error(f"log file not found: {args.log}")
+    explicit_log = args.log is not None or args.logs is not None
+    stats_dir = args.stats or default_stats_dir()
+    stats_reports = []
+    if args.stats is not None or not explicit_log:
+        stats_reports = analyze_stats_sessions(stats_dir, last=args.last)
 
-    lines = args.log.read_text(encoding="utf-8", errors="replace").splitlines()
+    if stats_reports:
+        if args.json:
+            print(json.dumps([report.to_dict() for report in stats_reports], indent=2))
+        else:
+            print(render_session_duty_report(stats_reports))
+        return
+
+    log_path = _resolve_log_path(args.logs or args.log or Path("logs/bridge.log"))
+    if not log_path.exists():
+        parser.error(f"stats not found in {stats_dir} and log file not found: {log_path}")
+
+    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     reports = analyze_log(lines)
     if args.last and reports:
         reports = reports[-1:]
@@ -415,6 +444,11 @@ def main() -> None:
         print(json.dumps([_report_to_dict(r) for r in reports], indent=2))
     else:
         print(render_report(reports))
+
+
+def _resolve_log_path(path: Path) -> Path:
+    """Resolve ``--logs`` whether it points at a directory or bridge.log itself."""
+    return path / "bridge.log" if path.is_dir() else path
 
 
 if __name__ == "__main__":

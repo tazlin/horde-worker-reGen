@@ -394,6 +394,26 @@ class StatsSample(BaseModel):
     alchemy_forms_awaiting_submit: int = 0
     alchemy_total_submitted: int = 0
     alchemy_total_faulted: int = 0
+    process_state_summary: str = ""
+    """Compact per-process state line for offline duty-cycle attribution."""
+    orchestration_intent_summary: str = ""
+    """The scheduler/popper's current high-level intent at sample time."""
+    orchestration_next_action: str | None = None
+    """The next planned orchestration action, when known."""
+    orchestration_why: str | None = None
+    """Human-readable reason for the current orchestration decision."""
+    orchestration_raw_gate: str | None = None
+    """Raw gate/blocking reason behind the orchestration decision, when available."""
+    maintenance_mode: bool = False
+    self_throttle_paused: bool = False
+    supervisor_paused: bool = False
+    last_pop_maintenance_mode: bool = False
+    worker_details_maintenance: bool = False
+    in_error_backoff: bool = False
+    last_pop_no_jobs_available: bool = False
+    last_pop_skipped_reasons: dict[str, int] = Field(default_factory=dict)
+    churn_counts: dict[str, int] = Field(default_factory=dict)
+    """Cumulative reload/respawn churn counts by kind at sample time."""
 
 
 class StatsRollupRow(BaseModel):
