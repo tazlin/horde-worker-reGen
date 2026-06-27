@@ -37,32 +37,28 @@ from horde_sdk.ai_horde_api.apimodels import (
     UserDetailsResponse,
     WorkerDetailItem,
 )
-from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
-from pydantic import ValidationError
 
 from horde_worker_regen.app_state import AppStateStore, WorkerRunRecord, default_app_state_dir
 from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.bridge_data.gpu_config import resolve_all_effective_gpu_configs
-from horde_worker_regen.bridge_data.load_config import BridgeDataLoader
 from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities
 from horde_worker_regen.consts import (
     BRIDGE_CONFIG_FILENAME,
     VRAM_HEAVY_MODELS,
 )
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.config.bridge_data_reloader import BridgeDataReloader
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_identity import lookup_worker_by_name
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
-from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
-    HordeControlFlag,
-    HordeDownloadAvailabilityMessage,
     HordeProcessState,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
@@ -70,7 +66,6 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     RECENT_JOBS_IN_SNAPSHOT,
     WORK_LEDGER_ENTRIES_IN_SNAPSHOT,
     CardSnapshot,
-    DownloadPlanSummary,
     FeatureInfoRow,
     FeatureReadinessSummary,
     JobFeatureSummary,
@@ -99,9 +94,10 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.process_temperature import classify_process_temperature
-from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoveryAction, RecoverySupervisor
 from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
 from horde_worker_regen.process_management.models.desired_state import DesiredState
+from horde_worker_regen.process_management.models.download_coordinator import ModelDownloadCoordinator
 from horde_worker_regen.process_management.models.feature_readiness import (
     CONTROLNET_ANNOTATOR_FAILED_DETAIL,
     FeatureInputs,
@@ -638,14 +634,6 @@ class HordeWorkerProcessManager:
         self._model_availability = ModelAvailability()
         self._desired_state = DesiredState()
         self._enable_background_downloads = enable_background_downloads
-        self._inference_processes_started = False
-        self._safety_processes_started = False
-        self._initial_download_requested = False
-        self._download_wait_started = 0.0
-        self._download_plan_summary: DownloadPlanSummary | None = None
-        self._download_plan_refreshed_at = 0.0
-        """Monotonic time the disk plan was last (re)computed; it refreshes on a throttle so the presence
-        counts track downloads completing, all from the single horde_model_reference presence authority."""
         # Periodic, parent-owned reference refresh: subprocesses never download references, so the
         # parent re-downloads on this cadence and tells every subprocess to reload from disk. The same
         # reload also re-reads lora.json/ti.json, which is how cross-process LoRa/TI downloads become
@@ -657,6 +645,15 @@ class HordeWorkerProcessManager:
         logger.debug(f"Custom Models to load: {bridge_data.custom_models}")
 
         self.horde_model_reference_manager = horde_model_reference_manager
+
+        self._bridge_data_reloader = BridgeDataReloader(
+            state=self._state,
+            bridge_data_provider=lambda: self.bridge_data,
+            model_reference_manager_provider=lambda: self.horde_model_reference_manager,
+            apply_bridge_data=self._apply_reloaded_bridge_data,
+            enable_performance_mode=self.enable_performance_mode,
+            shutdown_callback=self._shutdown,
+        )
 
         self._process_map = ProcessMap({})
         self._horde_model_map = HordeModelMap(root={})
@@ -794,11 +791,22 @@ class HordeWorkerProcessManager:
             max_safety_processes=self.max_safety_processes,
             amd_gpu=self._amd_gpu,
             directml=self._directml,
-            abort_callback=self._abort,
+            abort_callback=lambda: self._abort(),
             state=self._state,
             entry_points=process_entry_points,
             owned_registry=self._owned_registry,
             action_ledger=self._action_ledger,
+        )
+
+        self._download_coordinator = ModelDownloadCoordinator(
+            state=self._state,
+            process_map=self._process_map,
+            process_lifecycle=self._process_lifecycle,
+            model_availability=self._model_availability,
+            desired_state=self._desired_state,
+            bridge_data_provider=lambda: self.bridge_data,
+            stable_diffusion_reference_provider=lambda: self.stable_diffusion_reference,
+            enable_background_downloads=self._enable_background_downloads,
         )
 
         self._message_dispatcher = MessageDispatcher(
@@ -837,7 +845,7 @@ class HordeWorkerProcessManager:
             on_job_metrics=self._on_job_metrics,
             on_download_metrics=self._run_metrics.on_download_metrics,
         )
-        self._message_dispatcher.set_download_availability_handler(self._on_download_availability)
+        self._message_dispatcher.set_download_availability_handler(self._download_coordinator.on_download_availability)
         self._message_dispatcher.set_model_load_failure_handler(self._on_model_load_failure)
         self._job_tracker.set_finalize_observer(self._on_job_finalized)
         self._process_lifecycle.set_process_recovery_observer(self._record_process_crash)
@@ -896,50 +904,19 @@ class HordeWorkerProcessManager:
         # the run metrics so the periodic duty-cycle line can name it alongside the per-job phase gaps.
         self._inference_scheduler.set_churn_observer(self._run_metrics.record_churn)
 
-        # Save-our-ship: escalates a worker that has stopped making progress on accepted work from an
-        # in-place soft reset (rebuild pools, limp-by) to giving up cleanly on jobs it cannot serve, so
-        # the worker keeps running rather than wedging. See RecoverySupervisor for the escalation policy.
-        self._recovery_supervisor = RecoverySupervisor()
-        self._limp_by_active = False
-
-        # Save-our-ship doom tracking. A soft reset un-quarantines the inference pool to respawn it, so by
-        # the time the escalation reaches give-up a deterministically-doomed pool (every respawn re-crashes)
-        # can read as "recoverable" and the abort is declined. `_episode_saw_unrecoverable_pool` latches the
-        # doomed verdict for the life of the wedge episode so the give-up abort no longer hinges on the pool
-        # being quarantined at the exact give-up tick; it also holds the episode open while a doomed pool
-        # re-crashes without serving anything (so a slow restart cannot masquerade as recovery and reset the
-        # give-up clock). `_episode_progress_baseline` is the completed-job count when the episode opened: a
-        # later completion is genuine served progress that clears the latch.
-        self._episode_saw_unrecoverable_pool = False
-        self._episode_progress_baseline: int | None = None
-
-        # Runaway-recovery backstop, independent of the episode machinery: a pool that respawns and re-crashes
-        # in a tight loop racks up process recoveries without the give-up path ever catching it doomed at the
-        # right tick. Track recovery timestamps over a rolling window and abandon ship once they exceed the
-        # ceiling, so a continuously-flapping worker stops rather than recovering forever.
-        self._recovery_event_times: list[float] = []
-        self._last_seen_recovery_count = 0
-
-        # Orphaned-in-progress-job watchdog: a job left INFERENCE_IN_PROGRESS that no live inference
-        # slot owns will never produce a result, so it wedges the head of the queue forever unless
-        # something punts it. `_orphan_in_progress_since` records when each such job was first seen
-        # un-owned (so a brief dispatch race is ridden out before punting); `_orphan_punt_history`
-        # records recent punts so a recurring orphan storm escalates into the save-our-ship wedge path
-        # (soft reset + limp-by) rather than silently punting jobs forever at full settings.
-        self._orphan_in_progress_since: dict[GenerationID, float] = {}
-        self._orphan_punt_history: list[float] = []
-
-        # Orphaned-safety-check watchdog (the analogue of the in-progress watchdog, for the safety stage):
-        # a job sent to the safety process whose verdict never returns (the process was replaced, or its
-        # result message was dropped) is stranded in SAFETY_CHECKING forever -- nothing retries it, because
-        # the orchestrator only acts on PENDING_SAFETY_CHECK. Such jobs pin pipeline slots and, with the
-        # queue unable to drain, can wedge the pipeline into soft resets and dropped jobs up to
-        # horde-forced maintenance. `_orphan_safety_since` records when each SAFETY_CHECKING job was first
-        # seen (the grace clock); `_safety_requeue_count` counts how many times a job has been requeued for
-        # a fresh check, so a job the safety pipeline cannot ever check (a pathological loop) is escalated
-        # to a no-image fault instead of being requeued forever.
-        self._orphan_safety_since: dict[GenerationID, float] = {}
-        self._safety_requeue_count: dict[GenerationID, int] = {}
+        self._recovery_coordinator = WorkerRecoveryCoordinator(
+            state=self._state,
+            runtime_config=self._runtime_config,
+            job_tracker=self._job_tracker,
+            process_map=self._process_map,
+            process_lifecycle=self._process_lifecycle,
+            message_dispatcher=self._message_dispatcher,
+            inference_scheduler=self._inference_scheduler,
+            action_ledger=self._action_ledger,
+            bridge_data_provider=lambda: self.bridge_data,
+            max_inference_processes_provider=lambda: self.max_inference_processes,
+            abort_callback=lambda: self._abort(),
+        )
 
         self._job_submitter = JobSubmitter(
             state=self._state,
@@ -1467,8 +1444,8 @@ class HordeWorkerProcessManager:
             await self._sleep(self._loop_interval)
 
             await self.receive_and_handle_process_messages()
-            self._maybe_start_safety_processes()
-            self._maybe_start_inference_processes()
+            self._download_coordinator.maybe_start_safety_processes()
+            self._download_coordinator.maybe_start_inference_processes()
             self._apply_self_maintenance_throttle()
             if self._state.server_maintenance_cleared_by_job_pop and self._worker_details_maintenance:
                 logger.info("Clearing cached worker-details maintenance: a new job was popped successfully.")
@@ -1512,16 +1489,16 @@ class HordeWorkerProcessManager:
 
             # Backstop the per-slot recovery: punt any job left in-progress with no owning live slot
             # before it can wedge the head of the queue.
-            self._reconcile_orphaned_in_progress_jobs()
+            self._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
 
             # The safety-stage analogue: recover any job stranded in SAFETY_CHECKING whose verdict was lost
             # (re-check it, or fault it with no image if safety is pathological) before the backlog wedges
             # the pipeline.
-            await self._reconcile_orphaned_safety_jobs()
+            await self._recovery_coordinator.reconcile_orphaned_safety_jobs()
 
             # Save-our-ship: above the per-slot recovery, escalate a worker that is wedged as a whole
             # (no live process for pending work) to a soft reset and finally to giving up cleanly.
-            self._run_recovery_supervisor()
+            self._recovery_coordinator.run_recovery_supervisor()
 
             # During graceful shutdown, keep the inference processes up until the queue the worker
             # already accepted has drained, so those jobs get a chance to finish (the popper has
@@ -1556,14 +1533,6 @@ class HordeWorkerProcessManager:
 
         await self._sleep(self._loop_interval / 2)
         return True
-
-    _DOWNLOAD_STARTUP_GRACE_SECONDS = 90.0
-    """How long to wait for the download process's first availability report before starting
-    inference anyway, so a missing/failed download process can never wedge startup forever."""
-
-    _DOWNLOAD_PLAN_REFRESH_SECONDS = 2.0
-    """How often the disk plan is recomputed so its presence counts track downloads completing live,
-    while keeping the existence checks off the hot path."""
 
     _REFERENCE_REFRESH_INTERVAL_SECONDS = 1800.0
     """How often the parent re-downloads the model reference and tells subprocesses to reload from
@@ -1628,819 +1597,22 @@ class HordeWorkerProcessManager:
                 f"Quarantined model {model_name}: faulted {faulted} queued job(s) for reissue to the horde.",
             )
 
-    def _on_download_availability(self, message: HordeDownloadAvailabilityMessage) -> None:
-        """Record an on-disk availability snapshot from the download process.
-
-        On the first authoritative (post-scan) report, request background downloads of any
-        configured-but-missing models, then (re)check whether inference processes can be started now
-        that disk presence is known. Early initializing/scanning reports update the live status only;
-        acting on them would request downloads against an as-yet-incomplete present set.
-        """
-        self._model_availability.update(
-            present=set(message.available_model_names),
-            currently_downloading=message.currently_downloading,
-            pending=tuple(message.pending_downloads),
-            failed=tuple(message.failed_downloads),
-            status=message.status,
-            scan_complete=message.scan_complete,
-            safety_present=message.safety_models_present,
-            safety_attempted=message.safety_models_attempted,
-            controlnet_present=message.controlnet_present,
-            sdxl_controlnet_present=message.sdxl_controlnet_present,
-            post_processing_present=message.post_processing_present,
-            controlnet_failed=message.controlnet_failed,
-        )
-
-        # A completed download changed the on-disk reference (a new image model, or the LoRa/TI/aux
-        # pass). Tell the inference subprocesses to reload from disk so newly downloaded auxiliary
-        # models become visible cross-process without a restart. Subprocesses never download.
-        if message.reference_changed:
-            self._process_lifecycle.broadcast_reload_model_database()
-
-        if message.scan_complete and not self._initial_download_requested:
-            self._initial_download_requested = True
-            plan = self._get_download_plan_summary()
-            if plan is not None:
-                StatusReporter.log_startup_download_plan(plan)
-            # Only run the (heavier) auxiliary pass on a genuinely incomplete install; a worker that
-            # already has all its image models almost certainly has its aux models too.
-            self._reconcile_downloads(run_aux_if_incomplete=True)
-
-        self._maybe_start_safety_processes()
-        self._maybe_start_inference_processes()
-
-    def _reconcile_downloads(
-        self,
-        *,
-        run_aux_if_incomplete: bool = False,
-        force_aux: bool = False,
-        previously_configured: set[str] | None = None,
-    ) -> None:
-        """Drive the download process toward the one desired on-disk set, fetching and pruning as needed.
-
-        The desired set is the resolved configured models unioned with the operator's picker additions (held
-        in ``self._desired_state``), so the picker and config share one authoritative set and cannot diverge:
-        a config reload no longer prunes a picker-added download. Shared by the initial scan-complete trigger,
-        the config-reload path, and the picker. The download process dedups against what it already has or is
-        in-flight on, so re-sending the full missing set is safe.
-
-        The auxiliary pass (LoRa/ControlNet/post-processing/safety) is one-shot in the download process.
-        ``run_aux_if_incomplete`` runs it only when image models are still missing (the first-install case);
-        ``force_aux`` runs it unconditionally (the picker's "include auxiliary models").
-
-        ``previously_configured`` is the image-model set before a reload; a removal still sends the
-        now-authoritative desired set so the download process stops any queued/in-flight download of the
-        dropped model. Files are never deleted, since pruning is queue-only.
-        """
-        if not self._enable_background_downloads:
-            return
-        present = self._model_availability.present or set()
-        in_flight = set(self._model_availability.pending)
-        if self._model_availability.currently_downloading is not None:
-            in_flight.add(self._model_availability.currently_downloading)
-        plan = self._desired_state.reconcile(
-            configured=self.bridge_data.image_models_to_load,
-            present=present,
-            in_flight=in_flight,
-        )
-        removed = (previously_configured or set()) - plan.desired
-        download_aux = force_aux or (run_aux_if_incomplete and len(plan.to_fetch) > 0)
-        if not plan.has_work and not removed and not download_aux:
-            return
-        if removed:
-            logger.info(f"Config removed {len(removed)} image model(s); stopping their downloads: {sorted(removed)}")
-        if plan.to_fetch:
-            desired_present = len(plan.desired) - len(plan.to_fetch)
-            logger.info(
-                f"Worker has {desired_present} of {len(plan.desired)} desired models on disk; "
-                f"background-downloading {len(plan.to_fetch)} missing: {list(plan.to_fetch)}",
-            )
-        self._process_lifecycle.request_downloads(
-            list(plan.to_fetch),
-            download_aux=download_aux,
-            desired_image_models=sorted(plan.desired),
-        )
-
-    def _download_process_flags(self) -> tuple[object, ...]:
-        """The download-gating bridge-data fields, snapshotted for change detection across a reload.
-
-        These gate *which* auxiliary categories the download process fetches (plus nsfw filtering and LoRa
-        purging). They seed the process at construction but are forwarded live when they change, so the
-        process never has to restart to pick them up. Order is irrelevant; only equality is compared.
-        """
-        return (
-            self.bridge_data.nsfw,
-            self.bridge_data.allow_lora,
-            self.bridge_data.allow_controlnet,
-            self.bridge_data.allow_sdxl_controlnet,
-            self.bridge_data.allow_post_processing,
-            self.bridge_data.purge_loras_on_download,
-        )
-
-    def _forward_download_gating_if_changed(self, previous_flags: tuple[object, ...]) -> None:
-        """Apply changed download-gating flags to the download process live, without a restart.
-
-        The aux/nsfw/purge flags gate which auxiliary categories the download process fetches. They were once
-        construction-time only, so a change to them restarted the (jobless) download process; they are now
-        forwarded live, and the download process re-arms its one-shot aux pass when a category is newly
-        enabled, so a newly-permitted category downloads without the disruptive cycle. ``previous_flags`` is
-        the gating tuple before the reload; an unchanged reload is a no-op.
-        """
-        if not self._enable_background_downloads:
-            return
-        if self._download_process_flags() == previous_flags:
-            return
-        logger.info("Download-affecting config changed on reload; applying the new gating live.")
-        self._process_lifecycle.set_download_gating(
-            nsfw=self.bridge_data.nsfw,
-            allow_lora=self.bridge_data.allow_lora,
-            allow_controlnet=self.bridge_data.allow_controlnet,
-            allow_sdxl_controlnet=self.bridge_data.allow_sdxl_controlnet,
-            allow_post_processing=self.bridge_data.allow_post_processing,
-            purge_loras=self.bridge_data.purge_loras_on_download,
-        )
-
-    def _enter_downloads_only_hold(self) -> None:
-        """Enter the download-only posture: keep fetching models but hold inference/safety/popping.
-
-        Lets the operator pre-fetch models without committing the GPU. The download process is ensured
-        running (it is the thing that does the work and the availability oracle); inference and safety
-        stay deferred via the hold gate, and the job popper stops popping. Idempotent.
-        """
-        if not self._enable_background_downloads:
-            logger.warning("Download-only hold requested but background downloads are disabled; ignoring.")
-            return
-        if self._state.downloads_only_hold:
-            return
-        self._state.downloads_only_hold = True
-        self._process_lifecycle.start_download_process()
-        logger.info("Entered download-only mode: pre-fetching models; inference and job popping are held.")
-
-    def _leave_downloads_only_hold(self) -> None:
-        """Leave the download-only posture and bring the worker fully up (GO_LIVE).
-
-        Clears the hold and re-checks the deferred starts immediately; inference/safety come up once a
-        model is present (the normal availability gate), and popping resumes. In-flight downloads are
-        untouched, and the present-set pop gate keeps the worker from advertising a still-downloading model.
-        """
-        if not self._state.downloads_only_hold:
-            return
-        self._state.downloads_only_hold = False
-        logger.info("Leaving download-only mode (GO_LIVE): starting inference/safety and resuming job popping.")
-        # A benchmark drain scales the inference pool to zero while the hold is active and latches
-        # ``_inference_processes_started`` (a side effect of SET_CONCURRENCY). The lazy starter short-circuits
-        # on that latch, so without clearing it here go-live would resume popping with an empty pool -- the
-        # worker would accept jobs it has no process to run. Clear the latch only when the pool is genuinely
-        # empty, so a hold that never shed inference (e.g. a manual download-only hold on a serving worker)
-        # does not spawn a duplicate set.
-        if self._inference_processes_started and self._process_map.num_inference_processes() == 0:
-            self._inference_processes_started = False
-        self._maybe_start_safety_processes()
-        self._maybe_start_inference_processes()
-
-    def _download_models_on_demand(self, model_names: list[str], *, include_aux: bool) -> None:
-        """Add operator-chosen models to the desired set and fetch them now (drives the TUI picker).
-
-        The names join the one authoritative desired set held in ``self._desired_state``, so a later config
-        reconcile keeps fetching them instead of pruning them. (The former additive path sent no desired set,
-        so the next config reconcile cancelled the picker's downloads.) ``include_aux`` also forces the
-        one-time aux/default pass. Picker additions are transient: a downloaded model stays on disk, but a
-        restart reverts the desired set to whatever config resolves to.
-        """
-        if not self._enable_background_downloads:
-            logger.warning("On-demand download requested but background downloads are disabled; ignoring.")
-            return
-        if not model_names and not include_aux:
-            return
-        self._process_lifecycle.start_download_process()
-        if model_names:
-            self._desired_state.add_picker_models(model_names)
-            logger.info(f"Picker added {len(model_names)} model(s) to the desired set: {sorted(model_names)}")
-        self._reconcile_downloads(force_aux=include_aux)
-
-    def _maybe_start_safety_processes(self) -> None:
-        """Start safety processes once the required safety models are on disk (background-download mode).
-
-        The safety models (DeepDanbooru + CLIP, ~2.3GB) are fetched by the dedicated download process.
-        Starting the safety process before they are present would make it download them synchronously in
-        its constructor: minutes of work with no parent-visible state change, which reads as a hung
-        worker (especially under the TUI, whose console is redirected). So we defer the launch until the
-        download process reports them present.
-
-        The fallback is deliberately narrow to avoid a duplicate, concurrent download: we only start the
-        safety process early (to let it self-fetch) once the download process has *finished* its one-shot
-        ensure without producing them (``safety_attempted`` but not ``safety_present`` -- e.g. the download
-        failed), or when it never reported at all (a crashed import, bounded by the startup grace). While
-        the ensure is still pending or in flight we simply wait, which is the whole point: the operator
-        sees a real "downloading safety models" phase instead of a freeze. A transient post-scan idle
-        report (ensure not yet attempted) must not trip the fallback, which is why this keys on
-        ``safety_attempted`` rather than the download phase.
-        """
-        if self._safety_processes_started or not self._enable_background_downloads:
-            return
-        if self._state.downloads_only_hold:
-            return
-
-        availability = self._model_availability
-        if availability.safety_present:
-            logger.info("Required safety models are present on disk; starting safety processes")
-            self._process_lifecycle.start_safety_processes()
-            self._safety_processes_started = True
-            return
-
-        if availability.safety_attempted:
-            logger.warning(
-                "Download process finished without providing the safety models; starting the safety "
-                "process to fetch them directly (it will surface any download error)",
-            )
-            self._process_lifecycle.start_safety_processes()
-            self._safety_processes_started = True
-            return
-
-        # A download process that never reported at all (crashed/hung import) must not wedge startup.
-        if not availability.is_known and (time.time() - self._download_wait_started) > (
-            self._DOWNLOAD_STARTUP_GRACE_SECONDS
-        ):
-            logger.warning(
-                "No model availability report after "
-                f"{self._DOWNLOAD_STARTUP_GRACE_SECONDS:.0f}s; starting safety processes anyway",
-            )
-            self._process_lifecycle.start_safety_processes()
-            self._safety_processes_started = True
-
-    def _maybe_start_inference_processes(self) -> None:
-        """Start inference processes once at least one model is present (background-download mode).
-
-        In the default (non-background-download) mode inference processes are started up front, so
-        this is a no-op. With background downloads enabled, starting before any model is on disk
-        would crash the inference children ("no models available"); this defers them until disk
-        presence is known, with a grace-period fallback so a silent download process cannot hang us.
-        """
-        if self._inference_processes_started or not self._enable_background_downloads:
-            return
-        if self._state.downloads_only_hold:
-            return
-
-        availability = self._model_availability
-        if availability.scan_complete and len(availability.present or set()) > 0:
-            logger.info("At least one model is present on disk; starting inference processes")
-            self._process_lifecycle.start_inference_processes()
-            self._inference_processes_started = True
-            return
-
-        # While the download process is still initializing/scanning, or reporting an empty disk, we
-        # keep waiting: starting inference with no models would only crash and churn the children. The
-        # grace fallback exists solely for a download process that never reports at all (crashed/hung
-        # import); an actively-initializing or -scanning process counts as alive and resets the clock.
-        if availability.is_known and not availability.scan_complete:
-            self._download_wait_started = time.time()
-            return
-
-        if not availability.is_known and (time.time() - self._download_wait_started) > (
-            self._DOWNLOAD_STARTUP_GRACE_SECONDS
-        ):
-            logger.warning(
-                "No model availability report after "
-                f"{self._DOWNLOAD_STARTUP_GRACE_SECONDS:.0f}s; starting inference processes anyway",
-            )
-            self._process_lifecycle.start_inference_processes()
-            self._inference_processes_started = True
-
-    def _is_inference_capacity_available(self) -> bool:
-        """Whether any inference process is alive to serve pending inference work."""
-        return any(
-            process_info.process_type == HordeProcessType.INFERENCE and process_info.is_process_alive()
-            for process_info in self._process_map.values()
-        )
-
-    def _is_safety_capacity_available(self) -> bool:
-        """Whether any safety process is alive to serve pending safety checks."""
-        return any(
-            process_info.process_type == HordeProcessType.SAFETY and process_info.is_process_alive()
-            for process_info in self._process_map.values()
-        )
-
-    def _is_safety_pool_ready(self) -> bool:
-        """Whether at least one safety process is alive and able to accept a check (genuine recovery)."""
-        return any(
-            process_info.process_type == HordeProcessType.SAFETY and process_info.can_accept_job()
-            for process_info in self._process_map.values()
-        )
-
-    def _is_inference_pool_unrecoverable(self) -> bool:
-        """Whether the crash-loop breaker has quarantined every inference slot (definitive: cannot serve).
-
-        Quarantine requires repeated rapid failures per slot, so this never fires during a normal slot
-        replacement or a slow model load (neither of which quarantines), only when every slot has
-        crash-looped out of the pool.
-        """
-        return len(self._process_lifecycle.quarantined_inference_slots) >= self.max_inference_processes
-
-    def _is_safety_pool_unrecoverable(self) -> bool:
-        """Whether the safety pool is crash-looping (rebuilt too often) and not currently ready to serve.
-
-        The readiness gate keeps a pool that has recovered (a healthy safety process is up) from being
-        treated as wedged while its recent rebuild count ages out of the window.
-        """
-        return self._process_lifecycle.safety_pool_failing and not self._is_safety_pool_ready()
-
-    _ORPHAN_IN_PROGRESS_GRACE_SECONDS = 30.0
-    """How long a job may sit INFERENCE_IN_PROGRESS with no owning live slot before it is punted.
-
-    Long enough to ride out the brief window between a job being marked in-progress and its owning
-    slot's reference being recorded (and any in-flight result still on the wire), short enough that a
-    truly orphaned job drains in well under a minute instead of wedging the queue head indefinitely."""
-
-    _ORPHAN_PUNT_WINDOW_SECONDS = 300.0
-    """Sliding window over which repeated orphan punts are counted toward the wedge escalation."""
-
-    _ORPHAN_PUNT_WEDGE_THRESHOLD = 3
-    """Orphan punts within the window that escalate to the save-our-ship wedge path (soft reset/limp-by)."""
-
-    def _inference_slot_owns_job(self, job_id: GenerationID) -> bool:
-        """Whether some live inference slot owns (references) the given job, busy or dispatch-in-flight.
-
-        ``last_job_referenced`` is not cleared when a job completes or its slot returns to idle, so a
-        reference match alone is not ownership: an idle slot (one that ``can_accept_job``) carrying only a
-        stale reference will never produce a result for the job. Counting such a slot as the owner lets a
-        job whose result was lost (e.g. dropped by the launch-identifier guard during a recovery storm) sit
-        in progress forever, shielded from the orphaned-job watchdog, until it wedges the whole worker.
-
-        A referencing live slot owns the job in two cases. Either it is genuinely busy (not
-        ``can_accept_job``), actively processing the job; or a fresh dispatch is in flight for exactly this
-        job. ``start_inference`` stamps the slot with ``last_control_flag == START_INFERENCE`` and
-        ``current_inference_started_at`` (the dispatch time) the moment it sends START_INFERENCE, and the
-        first inbound result for the slot retires that timestamp. So those two stamps together are an
-        authoritative "dispatched, not yet acked" signal: under host contention a child can stay briefly in
-        a ``can_accept_job`` state (WAITING_FOR_JOB) after the dispatch was sent, and the slot must still own
-        the job through that pre-ack window rather than be mistaken for an idle slot carrying a stale
-        reference (the lost-result case the watchdog legitimately punts).
-        """
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if not process_info.is_process_alive():
-                continue
-            referenced = process_info.last_job_referenced
-            if referenced is None or referenced.id_ != job_id:
-                continue
-            if not process_info.can_accept_job():
-                return True
-            if (
-                process_info.last_control_flag == HordeControlFlag.START_INFERENCE
-                and process_info.current_inference_started_at is not None
-            ):
-                return True
-        return False
-
-    def _reconcile_orphaned_in_progress_jobs(self) -> None:
-        """Punt jobs stuck INFERENCE_IN_PROGRESS that no live inference slot owns.
-
-        Per-slot recovery faults the job of the slot it replaces, but a mis-association, a lost result,
-        or a requeue race can still leave a *different* job marked in-progress with no owning slot. No
-        result will ever arrive for it, so it pins the head of the queue forever . This watchdog is the
-        backstop: an in-progress job that no live slot has referenced for ``_ORPHAN_IN_PROGRESS_GRACE``
-        seconds is faulted (retryable, so it requeues or, once attempts are exhausted, is reported
-        faulted and drains). Recurring orphans feed the wedge escalation so the worker limps by.
-        """
-        now = time.time()
-        in_progress = self._job_tracker.jobs_in_progress
-        live_ids = {job.id_ for job in in_progress if job.id_ is not None and self._inference_slot_owns_job(job.id_)}
-
-        # Forget jobs that are owned again or no longer in progress, so the grace clock only runs while
-        # a job is continuously orphaned.
-        current_ids = {job.id_ for job in in_progress if job.id_ is not None}
-        for job_id in list(self._orphan_in_progress_since):
-            if job_id not in current_ids or job_id in live_ids:
-                del self._orphan_in_progress_since[job_id]
-
-        for job in in_progress:
-            job_id = job.id_
-            if job_id is None or job_id in live_ids:
-                continue
-            first_seen = self._orphan_in_progress_since.setdefault(job_id, now)
-            if (now - first_seen) < self._ORPHAN_IN_PROGRESS_GRACE_SECONDS:
-                continue
-
-            logger.error(
-                f"Job {job_id} has been in progress with no live inference slot for "
-                f"{now - first_seen:.0f}s; punting it so the queue can drain (orphaned-job watchdog).",
-            )
-            self._action_ledger.record(
-                LedgerEventType.INFERENCE_FAULTED,
-                job_id=str(job_id),
-                reason="orphaned in-progress job (no owning live inference slot)",
-                detail={"stuck_seconds": round(now - first_seen, 1)},
-            )
-            # An orphan is an ownership/host-contention failure, not a verdict that the model cannot fit the
-            # card it was dispatched to. Flag it so a terminal punt of an over-budget job does not key that
-            # card's "locally unservable" streak and wrongly de-list a model a capable card can still run.
-            self._job_tracker.handle_job_fault_now(
-                faulted_job=job,
-                process_timeout=self.bridge_data.process_timeout,
-                retryable=True,
-                scheduling_fault=True,
-            )
-            del self._orphan_in_progress_since[job_id]
-            self._orphan_punt_history.append(now)
-
-    def _orphan_wedge_active(self) -> bool:
-        """Whether orphaned-job punts have recurred often enough to count as a worker-level wedge.
-
-        A single orphan is handled by punting it; a *storm* of them means something upstream keeps
-        stranding jobs (a flaky GPU that hangs each inference, say), which the punt alone does not fix.
-        Surfacing it as a wedge lets the recovery supervisor soft-reset the pools and limp by at
-        reduced concurrency, then restore settings once the storm subsides.
-        """
-        now = time.time()
-        self._orphan_punt_history = [
-            t for t in self._orphan_punt_history if (now - t) <= self._ORPHAN_PUNT_WINDOW_SECONDS
-        ]
-        return len(self._orphan_punt_history) >= self._ORPHAN_PUNT_WEDGE_THRESHOLD
-
-    _ORPHAN_SAFETY_GRACE_SECONDS = 45.0
-    """How long a job may sit SAFETY_CHECKING with no verdict returned before it is treated as orphaned.
-
-    A safety check completes in seconds even for a batch, so well past this the verdict is lost (the
-    safety process was replaced, or its result message was dropped). Generous enough to ride out a slow
-    CPU-bound check, short enough that a stranded job is recovered in under a minute instead of pinning a
-    pipeline slot indefinitely."""
-
-    _SAFETY_REQUEUE_MAX = 3
-    """How many times one job may be requeued for a fresh safety check before it is faulted with no image.
-
-    A job whose verdict is lost on every re-send is one the safety pipeline cannot check; rather than loop
-    forever it is faulted (no image submitted, the horde reissues it) and the worker soft-pauses."""
-
-    _SAFETY_SOFT_PAUSE_SECONDS = 60.0
-    """How long the worker soft-pauses popping after an unrecoverable safety failure, before retrying.
-
-    Reuses the self-throttle pause (pops stop; in-flight safety-checked jobs still submit) and auto-resumes,
-    so a transient safety outage self-heals while a persistent one keeps the worker from popping work it
-    cannot safety-check (and therefore from dropping it into horde-forced maintenance)."""
-
-    def _engage_safety_soft_pause(self, reason: str) -> None:
-        """Soft-pause job popping because safety could not be relied on to check results.
-
-        Uses the same worker-initiated pause as the self-maintenance throttle: new pops stop while
-        already-safety-checked jobs keep submitting, and it auto-resumes after a cooldown so a transient
-        safety outage recovers on its own. Never extends an existing, longer pause.
-        """
-        until = time.time() + self._SAFETY_SOFT_PAUSE_SECONDS
-        if self._state.self_throttle_paused and self._state.self_throttle_paused_until >= until:
-            return
-        self._state.self_throttle_paused = True
-        self._state.self_throttle_paused_until = until
-        logger.warning(
-            f"Soft-pausing job pops for {self._SAFETY_SOFT_PAUSE_SECONDS:.0f}s: safety could not check a "
-            f"result ({reason}). In-flight checked jobs still submit; pops resume automatically once safety "
-            "recovers, so the worker does not keep taking on work it cannot safety-check.",
-        )
-
-    async def _reconcile_orphaned_safety_jobs(self) -> None:
-        """Recover jobs stranded in SAFETY_CHECKING whose verdict will never return.
-
-        The safety orchestrator only ever acts on PENDING_SAFETY_CHECK, so a job whose safety result was
-        lost (its process replaced, or a dropped result message) sits in SAFETY_CHECKING forever: nothing
-        re-checks it, it pins a pipeline slot, and -- with the queue then unable to drain -- it drives the
-        structural wedge that ends in dropped jobs and horde-forced maintenance.
-
-        This watchdog is the safety-stage analogue of :meth:`_reconcile_orphaned_in_progress_jobs`. A job
-        continuously in SAFETY_CHECKING past :data:`_ORPHAN_SAFETY_GRACE_SECONDS` is requeued for a fresh
-        check (its images preserved, so they are actually re-evaluated, never submitted unchecked) and a
-        fresh safety process is brought up in case the current one is wedged. A job that keeps being
-        orphaned (:data:`_SAFETY_REQUEUE_MAX` requeues), or any safety orphan while the safety pool is
-        unrecoverable (crash-looping), is escalated: faulted with no image so the horde reissues it, and the
-        worker soft-pauses popping so it stops taking on work it cannot safety-check.
-        """
-        now = time.time()
-        checking = self._job_tracker.jobs_being_safety_checked
-        current_ids = {info.sdk_api_job_info.id_ for info in checking if info.sdk_api_job_info.id_ is not None}
-
-        # Drop the grace clock for jobs no longer in SAFETY_CHECKING so it only runs while a job is
-        # continuously stranded. Keep a job's requeue tally while it is cycling back through
-        # PENDING_SAFETY_CHECK (a re-check in flight), but clear it once the job has left the safety stages
-        # for good (reached submit) so a later, unrelated stall starts from a clean count.
-        for job_id in list(self._orphan_safety_since):
-            if job_id not in current_ids:
-                del self._orphan_safety_since[job_id]
-        for job_id in list(self._safety_requeue_count):
-            if job_id not in current_ids and self._job_tracker.get_stage(job_id) != JobStage.PENDING_SAFETY_CHECK:
-                del self._safety_requeue_count[job_id]
-
-        pool_unrecoverable = self._is_safety_pool_unrecoverable()
-
-        for info in checking:
-            job = info.sdk_api_job_info
-            job_id = job.id_
-            if job_id is None:
-                continue
-            first_seen = self._orphan_safety_since.setdefault(job_id, now)
-            if (now - first_seen) < self._ORPHAN_SAFETY_GRACE_SECONDS:
-                continue
-
-            requeues = self._safety_requeue_count.get(job_id, 0)
-            if pool_unrecoverable or requeues >= self._SAFETY_REQUEUE_MAX:
-                reason = (
-                    "safety pool unrecoverable (crash-looping)"
-                    if pool_unrecoverable
-                    else f"requeued {requeues} times without a verdict"
-                )
-                logger.critical(
-                    f"Job {job_id} could not be safety-checked ({reason}); dropping its images and faulting "
-                    "it so the horde reissues it (an image the safety check never cleared is never "
-                    "submitted). Soft-pausing pops until safety recovers.",
-                )
-                # Drop the images explicitly so nothing unchecked can survive to the submit path, then fault
-                # terminally (no image, reissued by the horde). scheduling_fault keeps this off the per-model
-                # "locally unservable" streak: it is a safety-pipeline failure, not a card-fit verdict.
-                info.fault_job()
-                self._action_ledger.record(
-                    LedgerEventType.INFERENCE_FAULTED,
-                    job_id=str(job_id),
-                    reason=f"safety check unrecoverable ({reason})",
-                    detail={"stuck_seconds": round(now - first_seen, 1), "safety_requeues": requeues},
-                )
-                self._job_tracker.handle_job_fault_now(
-                    faulted_job=job,
-                    process_timeout=self.bridge_data.process_timeout,
-                    retryable=False,
-                    scheduling_fault=True,
-                )
-                self._orphan_safety_since.pop(job_id, None)
-                self._safety_requeue_count.pop(job_id, None)
-                self._engage_safety_soft_pause(reason)
-                continue
-
-            if await self._job_tracker.requeue_one_being_safety_checked(job_id):
-                self._safety_requeue_count[job_id] = requeues + 1
-                self._orphan_safety_since.pop(job_id, None)
-                # Only force a fresh safety process when the current pool cannot serve a check (dead or
-                # wedged). When a ready safety process is already up -- idle, but a
-                # result was lost -- the requeued job is simply re-checked by it; tearing that healthy
-                # process down on every orphan would only churn the pool (and double-rebuild right after a
-                # soft reset). A genuinely broken process is caught by the re-check also being lost, which
-                # escalates to the no-image fault above.
-                if not self._is_safety_pool_ready():
-                    self._process_lifecycle.safety_processes_should_be_replaced = True
-                logger.warning(
-                    f"Job {job_id} awaited a safety verdict for {now - first_seen:.0f}s with none returned; "
-                    f"requeued it for a fresh safety check (attempt {requeues + 1}/{self._SAFETY_REQUEUE_MAX}). "
-                    "Its images are re-checked, never submitted unchecked.",
-                )
-
-    def _assess_wedge(self) -> bool:
-        """Whether the worker structurally cannot make progress (the SOS/save-our-ship trigger).
-
-        Keyed on the crash-loop signals (every inference slot quarantined, or the safety pool
-        crash-looping with no healthy process), a sustained *queue* deadlock (pending inference work with
-        every process idle), plus a recurring orphaned-job storm, not on transient capacity gaps. A merely
-        slow, busy, replacing, or model-loading worker trips none of these, so a healthy worker is never
-        wedged. Note the *general* deadlock flag is intentionally not a wedge signal: it also fires for a
-        job draining through the safety/submit tail during a queue lull (see
-        ``DeadlockSnapshot.indicates_structural_wedge``).
-        """
-        if self._state.shutting_down:
-            return False
-        if self._state.downloads_only_hold:
-            # A worker deliberately held for downloads runs no inference and pops no jobs by design, so it can
-            # never be "wedged" for lack of progress on work it is not accepting. Suppressing the verdict here
-            # keeps the save-our-ship recovery (soft resets, abandon-ship abort) from reaping the worker and
-            # its download process during a long pre-fetch. The hold is cleared on go-live / start.
-            return False
-        structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
-        if structural_queue_wedge and (
-            self._inference_scheduler.whole_card_residency_grace_active()
-            or self._inference_scheduler.heavy_head_load_grace_active()
-            or self._inference_scheduler.ram_reclaim_cycle_grace_active()
-        ):
-            # The queue is deliberately held while the worker does the right thing, not a wedge, so do not
-            # let it soft-reset the pools mid-action: a whole-card residency establishing (idle siblings
-            # stopping, the safety process cycling off-GPU, ~11GB of weights loading), a streams-even-alone
-            # head admitted best-effort off that path, or an idle slot just cycled to reclaim
-            # allocator-retained RAM (which then respawns and reloads the head). All three graces are
-            # bounded, so an action that genuinely never completes still trips the supervisor.
-            structural_queue_wedge = False
-        if structural_queue_wedge and self._process_map.has_inference_in_progress():
-            # Belt-and-braces: even if the queue-deadlock flag latched via some other path, a live slot
-            # actively running a job is progress, not a wedge. This zeroes only the queue-wedge term; a
-            # genuinely hung INFERENCE_STARTING slot is still caught by the step-timeout / orphan watchdogs.
-            structural_queue_wedge = False
-        return (
-            self._is_inference_pool_unrecoverable()
-            or self._is_safety_pool_unrecoverable()
-            or structural_queue_wedge
-            or self._orphan_wedge_active()
-        )
-
-    _RUNAWAY_RECOVERY_WINDOW_SECONDS = 300.0
-    """Rolling window over which process recoveries are counted toward the runaway-recovery backstop."""
-
-    _RUNAWAY_RECOVERY_CEILING = 20
-    """Process recoveries within the window that mean the worker is flapping and must abandon ship.
-
-    Above the handful a transient incident legitimately incurs, below the unbounded count a deterministically
-    doomed pool produces while flapping between respawn and re-crash."""
-
-    def _made_progress_since_episode(self) -> bool:
-        """Whether a job has completed since the current wedge episode opened (genuine served progress).
-
-        Distinguishes a pool that actually recovered (it served work) from one that merely respawned its slots
-        without serving anything (a doomed pool flapping between crashes), which must not read as recovery.
-        """
-        if self._episode_progress_baseline is None:
-            return False
-        return self._job_tracker.total_num_completed_jobs > self._episode_progress_baseline
-
-    def _maybe_abort_on_runaway_recoveries(self) -> bool:
-        """Abandon ship if process recoveries are flapping faster than the rolling-window ceiling.
-
-        A clock/episode-independent backstop to the give-up escalation: a pool that respawns and re-crashes in
-        a tight loop racks up recoveries without the episode machinery ever catching it doomed at the give-up
-        tick. Returns True (after aborting) when the worker is flapping and must stop.
-        """
-        current = self._process_lifecycle._num_process_recoveries
-        if current < self._last_seen_recovery_count:
-            # The counter was reset (e.g. the warm benchmark resets it per level); restart tracking.
-            self._recovery_event_times.clear()
-            self._last_seen_recovery_count = current
-            return False
-        now = time.time()
-        new_recoveries = current - self._last_seen_recovery_count
-        self._last_seen_recovery_count = current
-        self._recovery_event_times.extend([now] * new_recoveries)
-        cutoff = now - self._RUNAWAY_RECOVERY_WINDOW_SECONDS
-        self._recovery_event_times = [t for t in self._recovery_event_times if t >= cutoff]
-        if len(self._recovery_event_times) < self._RUNAWAY_RECOVERY_CEILING or self._state.shutting_down:
-            return False
-        logger.critical(
-            f"Save-our-ship: {len(self._recovery_event_times)} process recoveries within "
-            f"{self._RUNAWAY_RECOVERY_WINDOW_SECONDS:.0f}s (ceiling {self._RUNAWAY_RECOVERY_CEILING}); the worker "
-            "is flapping and cannot stabilise. Abandoning ship (the last resort) rather than recovering forever.",
-        )
-        self._action_ledger.record(
-            LedgerEventType.RECOVERY_ABANDONED,
-            reason="save-our-ship: runaway process-recovery rate (flapping pool)",
-            detail={
-                "recoveries_in_window": len(self._recovery_event_times),
-                "window_seconds": self._RUNAWAY_RECOVERY_WINDOW_SECONDS,
-            },
-        )
-        self._abort()
-        return True
-
-    def _run_recovery_supervisor(self) -> None:
-        """Drive the save-our-ship escalation one tick and perform any action it returns."""
-        if self._state.shutting_down:
-            return
-        if self._maybe_abort_on_runaway_recoveries():
-            return
-        is_wedged = self._assess_wedge()
-        # Latch a doomed-pool verdict for the life of the wedge episode. A soft reset un-quarantines the pool
-        # to respawn it, so without this latch the give-up tick can read a deterministically-doomed pool as
-        # recoverable and decline to abort.
-        if self._is_inference_pool_unrecoverable() or self._is_safety_pool_unrecoverable():
-            self._episode_saw_unrecoverable_pool = True
-        if self._episode_saw_unrecoverable_pool:
-            if self._made_progress_since_episode():
-                # The doomed pool actually recovered and served work; it is no longer doomed.
-                self._episode_saw_unrecoverable_pool = False
-            else:
-                # Hold the episode open: a doomed pool that re-crashes without serving a job must not read as
-                # recovered just because its slots are transiently un-quarantined between crashes, or the clean
-                # streak would close the episode and reset the give-up clock (the slow-restart flap).
-                is_wedged = True
-        action = self._recovery_supervisor.evaluate(is_wedged=is_wedged)
-        # Maintain the episode-scoped progress baseline; clear the doom latch when the episode closes.
-        if self._recovery_supervisor.is_in_episode:
-            if self._episode_progress_baseline is None:
-                self._episode_progress_baseline = self._job_tracker.total_num_completed_jobs
-        else:
-            self._episode_progress_baseline = None
-            self._episode_saw_unrecoverable_pool = False
-        if action is RecoveryAction.SOFT_RESET:
-            self._perform_soft_reset()
-            self._limp_by_active = True
-        elif action is RecoveryAction.GIVE_UP:
-            self._give_up_on_wedged_jobs()
-        elif self._limp_by_active and not self._recovery_supervisor.is_in_episode:
-            # The episode recovered after a sustained clean streak: undo limp-by exactly once, restoring
-            # the *configured* concurrency (not the ceiling, which would override a user max_threads or a
-            # live TUI override). RuntimeConfig clamps to the ceiling.
-            self._limp_by_active = False
-            self._runtime_config.set_effective_max_threads(self.bridge_data.max_threads)
-            logger.info("Save-our-ship: pools recovered; restored configured concurrency (limp-by cleared).")
-
-    def _perform_soft_reset(self) -> None:
-        """Rebuild the worker's process pools in place and drop one limp-by notch (reduced concurrency)."""
-        level = self._recovery_supervisor.limp_by_level
-        # Limp by one notch *down from the current* effective concurrency (clamped to >= 1 by
-        # RuntimeConfig), never up from a lower configured value.
-        applied = self._runtime_config.set_effective_max_threads(self._runtime_config.effective_max_threads - 1)
-        logger.error(
-            f"Save-our-ship soft reset #{level}: rebuilding process pools and limping by "
-            f"(effective max_threads -> {applied}).",
-        )
-        self._action_ledger.record(
-            LedgerEventType.SOFT_RESET,
-            reason=f"save-our-ship soft reset #{level}",
-            detail={"limp_by_level": level, "effective_max_threads": applied},
-        )
-        self._process_lifecycle.rebuild_inference_pool(reason=f"soft reset #{level}")
-        self._process_lifecycle.rebuild_safety_pool(reason=f"soft reset #{level}")
-
-    def _give_up_on_wedged_jobs(self) -> None:
-        """Last resort: fault unservable jobs, and if no pool can recover, shut down cleanly.
-
-        Soft resets did not restore a working pool. Any jobs that cannot be served are reported faulted
-        so the horde reissues them rather than holding them forever. If the worker structurally cannot
-        serve at all -- the inference pool is unrecoverable now, was seen doomed earlier this episode (a
-        soft reset's transient un-quarantine no longer masks that), no inference process is alive, or the
-        safety pool is failing -- it shuts down cleanly: the sanctioned last resort, so a permanently-broken
-        worker stops rather than spinning. A worker that genuinely recovers (it serves a job) clears the
-        doom latch and never aborts here; a healthy pool merely starved by a queue deadlock keeps capacity
-        available, reissues the stuck head, and keeps running.
-        """
-        faulted = 0
-        # Reissue stuck pending work when the pool cannot serve it, OR when the pool is healthy but the
-        # scheduler is structurally wedged (a sustained queue deadlock: pending inference work with every
-        # process idle and no progress). The latter is the "healthy pool, starved scheduler" wedge: the
-        # capacity check alone would fault nothing and let the worker spin forever, so the structural
-        # queue-deadlock signal must also reissue the head so the horde reassigns it and the queue unblocks.
-        structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
-        if self._inference_scheduler.ram_reclaim_cycle_grace_active():
-            # Belt-and-braces with _assess_wedge: even if escalation reached give-up, a backlog whose only
-            # obstacle is the worker's own bounded RAM-reclaim cycle (the slot is respawning to reload the
-            # head) is servable, not unservable. Do not reissue it mid-reclaim; the grace is bounded, so a
-            # cycle that never recovers still falls through to the capacity check on a later tick.
-            structural_queue_wedge = False
-        if not self._is_inference_capacity_available() or structural_queue_wedge:
-            for job in list(self._job_tracker.jobs_pending_inference):
-                if job not in self._job_tracker.jobs_in_progress:
-                    self._job_tracker.handle_job_fault_now(job, retryable=False)
-                    faulted += 1
-        if not self._is_safety_capacity_available():
-            stuck_safety = list(self._job_tracker.jobs_pending_safety_check) + list(
-                self._job_tracker.jobs_being_safety_checked,
-            )
-            for info in stuck_safety:
-                self._job_tracker.handle_job_fault_now(info.sdk_api_job_info, retryable=False)
-                faulted += 1
-        if faulted > 0:
-            # Name *why* the jobs were unservable so the give-up is self-explanatory in a bundle: a healthy
-            # pool starved by a queue deadlock (the scheduler-wedge case) reads very differently from a pool
-            # that could not be restored, and both faults count against the worker as dropped jobs that can
-            # provoke horde-forced maintenance.
-            if structural_queue_wedge and self._is_inference_capacity_available():
-                cause = "scheduler wedged with idle processes (queue deadlock) despite a healthy pool"
-            else:
-                cause = "no inference capacity could be restored"
-            logger.critical(
-                f"Save-our-ship: gave up on {faulted} unservable job(s) ({cause}) and reported them faulted "
-                "so the horde reissues them. Repeated drops like this can trigger horde-forced maintenance.",
-            )
-
-        # The pool cannot serve if it is quarantined out of the pool now, if it was seen doomed earlier this
-        # episode (a soft reset's transient un-quarantine must not mask that at the give-up tick), or if no
-        # inference process is alive at all. A healthy pool starved only by a queue deadlock keeps capacity
-        # available and is not broken: that case reissues the stuck head above and the worker keeps running.
-        structurally_broken = (
-            self._is_inference_pool_unrecoverable()
-            or self._is_safety_pool_unrecoverable()
-            or self._episode_saw_unrecoverable_pool
-            or not self._is_inference_capacity_available()
-        )
-        self._action_ledger.record(
-            LedgerEventType.RECOVERY_ABANDONED,
-            reason="save-our-ship: soft resets could not restore a working pool",
-            detail={"jobs_faulted": faulted, "structurally_broken": structurally_broken},
-        )
-        if structurally_broken and not self._state.shutting_down:
-            logger.critical(
-                "Save-our-ship: the worker cannot restore a working process pool after repeated soft "
-                "resets; abandoning ship (the last resort) rather than spinning indefinitely.",
-            )
-            # Abort rather than graceful shutdown: a graceful drain is gated by `recently_recovered`
-            # (which the soft resets just set) and would stall for the watchdog window, and there is
-            # nothing to drain gracefully when the pools are dead. The .abort sentinel stops promptly.
-            self._abort()
-
     async def _process_control_loop(self) -> None:
-        self._download_wait_started = time.time()
+        self._download_coordinator.download_wait_started = time.time()
         self._gpu_sampler.start()
         if self._enable_background_downloads:
             self._process_lifecycle.start_download_process()
             # Both the safety and inference processes are started lazily once their required models are on
-            # disk; see _maybe_start_safety_processes / _maybe_start_inference_processes (called from the
-            # availability handler and each tick). Starting the safety process up front would make it
+            # disk; the download coordinator checks model availability from the handler and each tick.
+            # Starting the safety process up front would make it
             # download the ~2.3GB safety models synchronously (and invisibly) in its constructor.
         else:
             # Without a download process there is nothing to defer to: start everything up front and let
             # the safety process fetch its own models (the legacy behaviour for tests/harness/dry-run).
             self._process_lifecycle.start_safety_processes()
-            self._safety_processes_started = True
+            self._download_coordinator.safety_processes_started = True
             self._process_lifecycle.start_inference_processes()
-            self._inference_processes_started = True
+            self._download_coordinator.inference_processes_started = True
 
         while True:
             try:
@@ -2665,7 +1837,7 @@ class HordeWorkerProcessManager:
             return "ready; waiting for first job", process_summary
         if any(p.last_process_state == HordeProcessState.PROCESS_STARTING for p in inference):
             return "initializing inference process (loading GPU/model stack; first start is slow)", process_summary
-        if self._enable_background_downloads and not self._inference_processes_started:
+        if self._enable_background_downloads and not self._download_coordinator.inference_processes_started:
             return "waiting for model download / disk scan", process_summary
         return "starting worker processes", process_summary
 
@@ -2865,7 +2037,7 @@ class HordeWorkerProcessManager:
             total_ram_gigabytes=self.total_ram_gigabytes,
             system_memory=self._sample_system_memory(),
             download_status=self._model_availability.status,
-            download_plan=self._get_download_plan_summary(),
+            download_plan=self._download_coordinator.get_download_plan_summary(),
             stage_age_line=self._build_stage_age_line(),
         )
 
@@ -2921,7 +2093,7 @@ class HordeWorkerProcessManager:
             case SupervisorCommand.RELOAD_CONFIG:
                 logger.info("Supervisor requested config reload from disk.")
                 # Off the control loop: the resolve is network-bound and must not stall the worker.
-                self._schedule_config_reload()
+                self._bridge_data_reloader.schedule_config_reload()
             case SupervisorCommand.SET_CONCURRENCY:
                 self._apply_set_concurrency(command.target_threads, command.target_processes)
             case SupervisorCommand.PAUSE_DOWNLOADS:
@@ -2936,11 +2108,13 @@ class HordeWorkerProcessManager:
                 logger.info(f"Supervisor set download rate limit to {limit_label}.")
                 self._process_lifecycle.set_download_controls(rate_limit_kbps=rate)
             case SupervisorCommand.DOWNLOADS_ONLY_HOLD:
-                self._enter_downloads_only_hold()
+                self._download_coordinator.enter_downloads_only_hold()
             case SupervisorCommand.GO_LIVE:
-                self._leave_downloads_only_hold()
+                self._download_coordinator.leave_downloads_only_hold()
             case SupervisorCommand.DOWNLOAD_MODELS:
-                self._download_models_on_demand(command.download_model_names, include_aux=command.download_include_aux)
+                self._download_coordinator.download_models_on_demand(
+                    command.download_model_names, include_aux=command.download_include_aux
+                )
             case SupervisorCommand.SET_SERVER_MAINTENANCE:
                 enabled = bool(command.server_maintenance_enabled)
                 logger.warning(
@@ -2980,7 +2154,7 @@ class HordeWorkerProcessManager:
             logger.info(f"Supervisor set concurrent-inference cap to {applied} (requested {target_threads}).")
         if target_processes is not None:
             result = self._process_lifecycle.scale_inference_processes(target_processes)
-            self._inference_processes_started = True
+            self._download_coordinator.inference_processes_started = True
             logger.info(f"Supervisor scaled inference processes to {result} (requested {target_processes}).")
 
     def install_benchmark_scenario(
@@ -3076,46 +2250,6 @@ class HordeWorkerProcessManager:
             return
         if not self._supervisor.send_snapshot(snapshot):
             self._supervisor = None
-
-    def _get_download_plan_summary(self) -> DownloadPlanSummary | None:
-        """Compute the config's disk-implications summary, refreshed on a short throttle.
-
-        Existence-only and torch-free (see :mod:`model_download_plan`); the live download process stays
-        authoritative about integrity. Presence comes from the single ``horde_model_reference`` on-disk
-        authority, so re-running it as downloads complete is what lets ``num_present`` (and thus the TUI's
-        live readiness) climb without ever disagreeing with the disk budget. The throttle keeps the
-        existence checks off the hot path; the last result is held between refreshes (and when the
-        reference is not yet loaded the snapshot simply omits the plan).
-        """
-        now = time.monotonic()
-        fresh = (now - self._download_plan_refreshed_at) < self._DOWNLOAD_PLAN_REFRESH_SECONDS
-        if self._download_plan_summary is not None and fresh:
-            return self._download_plan_summary
-
-        reference = self.stable_diffusion_reference
-        if reference is None:
-            return self._download_plan_summary
-
-        from horde_worker_regen import model_download_plan
-
-        plan = model_download_plan.compute_download_plan(
-            list(self.bridge_data.image_models_to_load),
-            reference,
-            extra_model_directories=self.bridge_data.extra_model_directories,
-        )
-        self._download_plan_summary = DownloadPlanSummary(
-            present_bytes=plan.present_bytes,
-            to_download_bytes=plan.to_download_bytes,
-            total_bytes=plan.total_bytes,
-            free_disk_bytes=plan.free_disk_bytes,
-            fits=plan.fits,
-            shortfall_bytes=plan.shortfall_bytes,
-            num_present=plan.num_present,
-            num_to_download=plan.num_to_download,
-            sizes_complete=plan.sizes_complete,
-        )
-        self._download_plan_refreshed_at = now
-        return self._download_plan_summary
 
     def _safe_model_baseline(self, model_name: str | None) -> str | None:
         """Resolve a model's baseline as a plain string for the wire, swallowing lookup misses.
@@ -3649,7 +2783,7 @@ class HordeWorkerProcessManager:
             stats_export=self._run_metrics.stats_export_state(),
             stats_history_backfill=self._run_metrics.stats_history_backfill(),
             downloads=self._model_availability.status,
-            download_plan=self._get_download_plan_summary(),
+            download_plan=self._download_coordinator.get_download_plan_summary(),
             feature_readiness=self._build_feature_readiness_summary(bridge_data),
             lora_pops_blocked_by_downloads=(
                 bridge_data.allow_lora and self._model_availability.background_download_active
@@ -3761,68 +2895,13 @@ class HordeWorkerProcessManager:
             clean_exit=not self._state.too_many_consecutive_failed_jobs,
         )
 
-    _bridge_data_loop_interval = 1.0
-    """The interval between bridge data loop iterations."""
-    _last_bridge_data_reload_time = 0.0
-    """The epoch time of the last bridge data reload."""
-
-    _bridge_data_last_modified_time = 0.0
-    """The time the bridge data file on disk was last modified."""
-
-    _bridge_data_reload_lock: asyncio.Lock | None = None
-    """Serialises off-loop reloads so the mtime watcher and an explicit reload command never overlap."""
-
-    _config_reload_tasks: set[asyncio.Task[None]] | None = None
-    """Strong references to in-flight off-loop reload tasks (asyncio only weakly references tasks)."""
-
-    def _load_bridge_data_blocking(self) -> reGenBridgeData | None:
-        """Read and resolve bridge data from disk, returning the new model (or None when nothing to apply).
-
-        This is the network-bound half of a reload: ``BridgeDataLoader.load`` resolves meta instructions
-        (``top N`` etc.) against the horde stats API, which can take many seconds. It is split out so the
-        event loop can run it in a thread (see :meth:`_reload_bridge_data_off_loop`) instead of stalling
-        every other coroutine (job popping, heartbeats, submission) for the duration. Safe to call off the
-        event loop; all the dependent state changes happen in :meth:`_apply_reloaded_bridge_data`.
-        """
-        if self.bridge_data._loaded_from_env_vars:
-            return None
-
-        if self.horde_model_reference_manager is None:
-            logger.debug("No model reference manager available; skipping bridge data reload")
-            return None
-
-        try:
-            return BridgeDataLoader.load(
-                file_path=BRIDGE_CONFIG_FILENAME,
-                horde_model_reference_manager=self.horde_model_reference_manager,
-            )
-        except Exception as e:
-            logger.debug(e)
-
-            if "No such file or directory" in str(e):
-                logger.error(f"Could not find {BRIDGE_CONFIG_FILENAME}. Please create it and try again.")
-
-            if isinstance(e, ValidationError):
-                logger.error(f"The following fields in {BRIDGE_CONFIG_FILENAME} failed validation:")
-                for error in e.errors():
-                    logger.error(f"{error['loc'][0]}: {error['msg']}")
-
-            return None
-
     def _apply_reloaded_bridge_data(self, bridge_data: reGenBridgeData) -> None:
-        """Swap in freshly-loaded bridge data and re-derive dependent state (must run on the event loop)."""
+        """Swap in freshly-loaded bridge data and re-derive dependent state."""
         previous_effective = self._runtime_config.effective_max_threads
-        # Captured before the swap so the download request below can detect models the reload dropped and
-        # tell the download process to stop fetching them.
         previously_configured = set(self.bridge_data.image_models_to_load)
-        # The aux/download gating is baked into the download process at construction, so a change to it
-        # requires a restart; captured before the swap to compare against the reloaded config.
-        previous_download_flags = self._download_process_flags()
-        # The setter calls RuntimeConfig.update, which re-derives the effective concurrency cap
-        # (clamped to the session ceiling) from the reloaded max_threads.
+        previous_download_flags = self._download_coordinator.download_process_flags()
+
         self.bridge_data = bridge_data
-        # Re-coerce on every reload so a config edit re-enabling a feature whose packages are still
-        # missing is caught again; the warning only fires when a flag actually flips, not each tick.
         coerce_bridge_data_to_capabilities(self.bridge_data)
         new_effective = self._runtime_config.effective_max_threads
         if new_effective != previous_effective:
@@ -3838,8 +2917,7 @@ class HordeWorkerProcessManager:
             )
         logger.debug(f"Models to load: {self.bridge_data.image_models_to_load}")
         logger.debug(f"Custom models: {self.bridge_data.custom_models}")
-        # Re-assert the config's download controls (config is authoritative on reload, overriding any
-        # prior live TUI override); a None rate-limit means unlimited, sent as 0 to clear any cap.
+
         self._process_lifecycle.set_download_controls(
             paused=self.bridge_data.downloads_paused,
             rate_limit_kbps=self.bridge_data.download_rate_limit_kbps or 0,
@@ -3847,69 +2925,11 @@ class HordeWorkerProcessManager:
             per_host_concurrency=self.bridge_data.download_per_host_concurrency,
             connections_per_file=self.bridge_data.download_connections_per_file,
         )
-        # A config change can add image models that are not yet on disk (fetch them in the background so a
-        # newly-configured model becomes servable without a restart) or remove models (stop their queued/
-        # in-flight downloads); the startup trigger is one-shot, so the reload owns both directions.
-        self._reconcile_downloads(
+        self._download_coordinator.reconcile_downloads(
             run_aux_if_incomplete=False,
             previously_configured=previously_configured,
         )
-        # A change to the download process's gating (aux flags, nsfw, purge) is forwarded live; live controls
-        # were already forwarded above. Neither needs a download-process restart.
-        self._forward_download_gating_if_changed(previous_download_flags)
-
-    def get_bridge_data_from_disk(self) -> None:
-        """Load the bridge data from disk (blocking).
-
-        Prefer :meth:`_reload_bridge_data_off_loop` when called from the event loop; this synchronous
-        form is for startup (before the loop runs) and is kept for callers that are not on the loop.
-        """
-        bridge_data = self._load_bridge_data_blocking()
-        if bridge_data is not None:
-            self._apply_reloaded_bridge_data(bridge_data)
-
-    async def _reload_bridge_data_off_loop(self) -> None:
-        """Reload bridge data without stalling the event loop (the resolve is run in a worker thread)."""
-        if self._bridge_data_reload_lock is None:
-            self._bridge_data_reload_lock = asyncio.Lock()
-        async with self._bridge_data_reload_lock:
-            bridge_data = await asyncio.to_thread(self._load_bridge_data_blocking)
-            if bridge_data is not None:
-                self._apply_reloaded_bridge_data(bridge_data)
-
-    def _schedule_config_reload(self) -> None:
-        """Kick off an off-loop reload from synchronous, on-loop code (e.g. a supervisor command)."""
-        if self._config_reload_tasks is None:
-            self._config_reload_tasks = set()
-        task = asyncio.create_task(self._reload_bridge_data_off_loop())
-        self._config_reload_tasks.add(task)
-        task.add_done_callback(self._config_reload_tasks.discard)
-
-    async def _bridge_data_loop(self) -> None:
-        while True:
-            try:
-                if self._state.shutting_down:
-                    break
-
-                self._bridge_data_last_modified_time = os.path.getmtime(BRIDGE_CONFIG_FILENAME)
-
-                if self._last_bridge_data_reload_time < self._bridge_data_last_modified_time:
-                    logger.info(f"Reloading {BRIDGE_CONFIG_FILENAME}")
-                    await self._reload_bridge_data_off_loop()
-                    # Capture mtime immediately after a successful load so that
-                    # a modification during the load does not go undetected.
-                    self._last_bridge_data_reload_time = os.path.getmtime(BRIDGE_CONFIG_FILENAME)
-                    logger.success(f"Reloaded {BRIDGE_CONFIG_FILENAME}")
-                    self.enable_performance_mode()
-                await asyncio.sleep(self._bridge_data_loop_interval)
-            except CancelledError as e:
-                self._shutdown()
-                logger.debug(f"CancelledError: {e}")
-            except Exception as e:
-                # Best-effort config watcher: a transient read/parse error (e.g. the file briefly
-                # missing mid-rewrite) must never take the worker down. Log and retry next interval.
-                logger.warning(f"Error while watching {BRIDGE_CONFIG_FILENAME} for changes: {e}")
-                await asyncio.sleep(self._bridge_data_loop_interval)
+        self._download_coordinator.forward_download_gating_if_changed(previous_download_flags)
 
     def _handle_exception(self, task: asyncio.Task[None]) -> None:
         """Supervise a finished main-loop task; shut down gracefully if one ends unexpectedly.
@@ -3973,7 +2993,7 @@ class HordeWorkerProcessManager:
                 self._alchemy_coordinator.run(),
             ]
             if not self.bridge_data._loaded_from_env_vars:
-                coroutines.append(self._bridge_data_loop())
+                coroutines.append(self._bridge_data_reloader.bridge_data_loop())
 
             tasks = [asyncio.create_task(coro) for coro in coroutines]
             for task in tasks:

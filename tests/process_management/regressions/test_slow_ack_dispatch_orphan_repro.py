@@ -69,7 +69,7 @@ async def test_freshly_dispatched_slot_owns_its_job_despite_waiting_state() -> N
     assert job.id_ is not None
 
     # RED: the slot holding the freshly dispatched job is its owner.
-    assert pm._inference_slot_owns_job(job.id_) is True
+    assert pm._recovery_coordinator.inference_slot_owns_job(job.id_) is True
 
 
 async def test_watchdog_does_not_start_orphan_clock_for_freshly_dispatched_slot() -> None:
@@ -92,12 +92,12 @@ async def test_watchdog_does_not_start_orphan_clock_for_freshly_dispatched_slot(
     slot.last_job_referenced = job
     assert job.id_ is not None
 
-    pm._reconcile_orphaned_in_progress_jobs()
+    pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
 
     # RED: an owned job is never marked orphaned, so it is not on the grace clock and not punted.
-    assert job.id_ not in pm._orphan_in_progress_since
+    assert job.id_ not in pm._recovery_coordinator.orphan_in_progress_since
     assert pm._job_tracker.get_stage(job.id_) == JobStage.INFERENCE_IN_PROGRESS
-    assert pm._orphan_punt_history == []
+    assert pm._recovery_coordinator.orphan_punt_history == []
 
 
 async def test_idle_slot_with_stale_reference_is_still_punted() -> None:
@@ -122,14 +122,16 @@ async def test_idle_slot_with_stale_reference_is_still_punted() -> None:
     slot.last_job_referenced = job  # stale reference only
     assert job.id_ is not None
 
-    assert pm._inference_slot_owns_job(job.id_) is False
+    assert pm._recovery_coordinator.inference_slot_owns_job(job.id_) is False
 
-    pm._orphan_in_progress_since[job.id_] = time.time() - (pm._ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1)
-    pm._reconcile_orphaned_in_progress_jobs()
+    pm._recovery_coordinator.orphan_in_progress_since[job.id_] = time.time() - (
+        pm._recovery_coordinator.ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1
+    )
+    pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
 
     # The stranded job is punted off the head (requeued by the bounded-retry policy) so the queue drains.
     assert pm._job_tracker.get_stage(job.id_) != JobStage.INFERENCE_IN_PROGRESS
-    assert len(pm._orphan_punt_history) == 1
+    assert len(pm._recovery_coordinator.orphan_punt_history) == 1
 
 
 async def test_re_dispatch_re_stamps_ownership_to_the_new_job() -> None:
@@ -155,13 +157,13 @@ async def test_re_dispatch_re_stamps_ownership_to_the_new_job() -> None:
     slot.last_control_flag = HordeControlFlag.START_INFERENCE
     slot.current_inference_started_at = time.time()
     slot.last_job_referenced = job_a
-    assert pm._inference_slot_owns_job(job_a.id_) is True
+    assert pm._recovery_coordinator.inference_slot_owns_job(job_a.id_) is True
 
     slot.current_inference_started_at = time.time()
     slot.last_job_referenced = job_b
 
-    assert pm._inference_slot_owns_job(job_b.id_) is True
-    assert pm._inference_slot_owns_job(job_a.id_) is False
+    assert pm._recovery_coordinator.inference_slot_owns_job(job_b.id_) is True
+    assert pm._recovery_coordinator.inference_slot_owns_job(job_a.id_) is False
 
 
 async def test_dropped_result_retires_the_slots_dispatch_stamp() -> None:
@@ -184,7 +186,7 @@ async def test_dropped_result_retires_the_slots_dispatch_stamp() -> None:
     assert dropped_job.id_ is not None
 
     # While the stamp stands the slot looks like the job's dispatch-in-flight owner.
-    assert pm._inference_slot_owns_job(dropped_job.id_) is True
+    assert pm._recovery_coordinator.inference_slot_owns_job(dropped_job.id_) is True
 
     msg = Mock(spec=HordeInferenceResultMessage)
     msg.process_id = 3
@@ -193,4 +195,4 @@ async def test_dropped_result_retires_the_slots_dispatch_stamp() -> None:
 
     # The dropped result retired the stamp, so the slot can no longer phantom-own its stale reference.
     assert slot.current_inference_started_at is None
-    assert pm._inference_slot_owns_job(dropped_job.id_) is False
+    assert pm._recovery_coordinator.inference_slot_owns_job(dropped_job.id_) is False

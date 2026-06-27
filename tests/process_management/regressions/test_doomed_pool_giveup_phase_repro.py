@@ -73,7 +73,7 @@ class TestDoomedPoolEventuallyAborts:
 
         # Deterministic clock so the episode/give-up/clean-streak timing is exact.
         clock = _FakeClock()
-        pm._recovery_supervisor = RecoverySupervisor(clock=clock)
+        pm._recovery_coordinator.recovery_supervisor = RecoverySupervisor(clock=clock)
 
         # A soft reset rebuilds the pool in place, which clears the quarantine set and respawns the
         # slots. Emulate just that effect (un-quarantine every slot) without launching real children.
@@ -99,7 +99,7 @@ class TestDoomedPoolEventuallyAborts:
             # the pool. Tick through the soft reset and past the give-up age while un-quarantined.
             for _ in range(5):
                 clock.advance(2.0)
-                pm._run_recovery_supervisor()
+                pm._recovery_coordinator.run_recovery_supervisor()
                 if aborted["called"]:
                     break
 
@@ -107,7 +107,7 @@ class TestDoomedPoolEventuallyAborts:
             # streak, closing the episode and resetting the give-up clock.
             for _ in range(int(_SLOW_RESTART_SECONDS // 2) + 1):
                 clock.advance(2.0)
-                pm._run_recovery_supervisor()
+                pm._recovery_coordinator.run_recovery_supervisor()
 
             if aborted["called"]:
                 break
@@ -135,9 +135,9 @@ class TestDoomedPoolEventuallyAborts:
         # The pool is doomed (it will re-crash), but a soft reset has *just* un-quarantined every slot, so
         # at this instant nothing is quarantined: exactly the state the episode reaches when give-up is due.
         lifecycle._quarantined_inference_slots = set()
-        assert pm._is_inference_pool_unrecoverable() is False
+        assert pm._recovery_coordinator.is_inference_pool_unrecoverable() is False
 
-        pm._give_up_on_wedged_jobs()
+        pm._recovery_coordinator.give_up_on_wedged_jobs()
 
         assert aborted["called"], (
             "Give-up fired on a doomed pool but did not abort because the pool was transiently "
@@ -156,10 +156,10 @@ class TestGiveUpDoesNotOverAbort:
 
         # A live, idle inference process: capacity is available and no doom was ever latched.
         pm._process_map[0] = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)
-        assert pm._is_inference_capacity_available() is True
-        assert pm._episode_saw_unrecoverable_pool is False
+        assert pm._recovery_coordinator.is_inference_capacity_available() is True
+        assert pm._recovery_coordinator.episode_saw_unrecoverable_pool is False
 
-        pm._give_up_on_wedged_jobs()
+        pm._recovery_coordinator.give_up_on_wedged_jobs()
 
         assert aborted["called"] is False
 
@@ -170,7 +170,7 @@ class TestGiveUpDoesNotOverAbort:
         """A doomed pool that recovers and serves a job clears the latch; a later give-up must not abort it."""
         pm = make_testable_process_manager()
         clock = _FakeClock()
-        pm._recovery_supervisor = RecoverySupervisor(clock=clock)
+        pm._recovery_coordinator.recovery_supervisor = RecoverySupervisor(clock=clock)
         lifecycle = pm._process_lifecycle
 
         aborted = {"called": False}
@@ -189,8 +189,8 @@ class TestGiveUpDoesNotOverAbort:
         # The episode opens doomed (every slot quarantined): the latch is set and the baseline captured.
         lifecycle._quarantined_inference_slots = set(range(pm.max_inference_processes))
         clock.advance(2.0)
-        pm._run_recovery_supervisor()
-        assert pm._episode_saw_unrecoverable_pool is True
+        pm._recovery_coordinator.run_recovery_supervisor()
+        assert pm._recovery_coordinator.episode_saw_unrecoverable_pool is True
 
         # The pool genuinely recovers and serves a job: un-quarantine and record a completion past the baseline.
         lifecycle._quarantined_inference_slots = set()
@@ -199,9 +199,9 @@ class TestGiveUpDoesNotOverAbort:
         # Tick well past the give-up age. The served progress clears the latch, so give-up declines to abort.
         for _ in range(6):
             clock.advance(2.0)
-            pm._run_recovery_supervisor()
+            pm._recovery_coordinator.run_recovery_supervisor()
 
-        assert pm._episode_saw_unrecoverable_pool is False
+        assert pm._recovery_coordinator.episode_saw_unrecoverable_pool is False
         assert aborted["called"] is False
 
 
@@ -214,9 +214,9 @@ class TestRunawayRecoveryBackstop:
         aborted = {"called": False}
         monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
 
-        pm._process_lifecycle._num_process_recoveries = pm._RUNAWAY_RECOVERY_CEILING
+        pm._process_lifecycle._num_process_recoveries = pm._recovery_coordinator.RUNAWAY_RECOVERY_CEILING
 
-        assert pm._maybe_abort_on_runaway_recoveries() is True
+        assert pm._recovery_coordinator.maybe_abort_on_runaway_recoveries() is True
         assert aborted["called"] is True
 
     def test_sparse_recoveries_do_not_abandon_ship(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -225,9 +225,9 @@ class TestRunawayRecoveryBackstop:
         aborted = {"called": False}
         monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
 
-        pm._process_lifecycle._num_process_recoveries = pm._RUNAWAY_RECOVERY_CEILING - 1
+        pm._process_lifecycle._num_process_recoveries = pm._recovery_coordinator.RUNAWAY_RECOVERY_CEILING - 1
 
-        assert pm._maybe_abort_on_runaway_recoveries() is False
+        assert pm._recovery_coordinator.maybe_abort_on_runaway_recoveries() is False
         assert aborted["called"] is False
 
     def test_recoveries_outside_window_are_pruned(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -237,10 +237,12 @@ class TestRunawayRecoveryBackstop:
         monkeypatch.setattr(pm, "_abort", lambda: aborted.__setitem__("called", True))
 
         # A full ceiling's worth of recoveries, but all older than the window, with no new ones since.
-        stale = time.time() - pm._RUNAWAY_RECOVERY_WINDOW_SECONDS - 10.0
-        pm._recovery_event_times = [stale for _ in range(pm._RUNAWAY_RECOVERY_CEILING)]
-        pm._last_seen_recovery_count = pm._process_lifecycle._num_process_recoveries
+        stale = time.time() - pm._recovery_coordinator.RUNAWAY_RECOVERY_WINDOW_SECONDS - 10.0
+        pm._recovery_coordinator.recovery_event_times = [
+            stale for _ in range(pm._recovery_coordinator.RUNAWAY_RECOVERY_CEILING)
+        ]
+        pm._recovery_coordinator.last_seen_recovery_count = pm._process_lifecycle._num_process_recoveries
 
-        assert pm._maybe_abort_on_runaway_recoveries() is False
+        assert pm._recovery_coordinator.maybe_abort_on_runaway_recoveries() is False
         assert aborted["called"] is False
-        assert pm._recovery_event_times == []
+        assert pm._recovery_coordinator.recovery_event_times == []

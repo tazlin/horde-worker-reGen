@@ -1,0 +1,2 @@
+# worker_recovery_coordinator
+::: horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator

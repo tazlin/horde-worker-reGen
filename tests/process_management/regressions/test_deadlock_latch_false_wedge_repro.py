@@ -99,7 +99,7 @@ async def test_worker_with_job_in_progress_is_not_assessed_as_wedged() -> None:
     pm.detect_deadlock()
 
     # RED: a job is in progress on a live, healthy slot, so the worker is not wedged.
-    assert pm._assess_wedge() is False
+    assert pm._recovery_coordinator.assess_wedge() is False
 
 
 async def test_sustained_all_idle_queue_deadlock_is_still_a_wedge() -> None:
@@ -122,7 +122,7 @@ async def test_sustained_all_idle_queue_deadlock_is_still_a_wedge() -> None:
     pm._message_dispatcher._last_queue_deadlock_detected_time = time.time() - _STRUCTURAL_WEDGE_AGE
 
     assert pm._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge() is True
-    assert pm._assess_wedge() is True
+    assert pm._recovery_coordinator.assess_wedge() is True
 
 
 async def test_latched_flag_stays_latched_while_a_slot_merely_preloads() -> None:
@@ -172,9 +172,9 @@ async def test_inference_suppression_zeroes_only_the_queue_wedge_term() -> None:
     pm._message_dispatcher._last_queue_deadlock_detected_time = time.time() - _STRUCTURAL_WEDGE_AGE
 
     # With no other signal, the suppressed queue wedge leaves the worker un-wedged.
-    assert pm._assess_wedge() is False
+    assert pm._recovery_coordinator.assess_wedge() is False
 
     # An independent orphan storm must still escalate: suppression touches only the queue-wedge term.
     now = time.time()
-    pm._orphan_punt_history = [now] * pm._ORPHAN_PUNT_WEDGE_THRESHOLD
-    assert pm._assess_wedge() is True
+    pm._recovery_coordinator.orphan_punt_history = [now] * pm._recovery_coordinator.ORPHAN_PUNT_WEDGE_THRESHOLD
+    assert pm._recovery_coordinator.assess_wedge() is True

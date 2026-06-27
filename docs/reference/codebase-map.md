@@ -26,10 +26,10 @@ these files, read [Architecture](../explanation/architecture.md) first.
 | Starting / replacing child processes   | `process_management/lifecycle/process_lifecycle.py` (`ProcessLifecycleManager`) |
 | Live process state                     | `process_management/lifecycle/process_map.py`, `process_info.py`   |
 | Result upload & submission             | `process_management/jobs/job_submitter.py` (`JobSubmitter`)        |
-| Config fields & hot-reload             | `bridge_data/`, `process_management/config/runtime_config.py`      |
+| Config fields & hot-reload             | `bridge_data/`, `process_management/config/runtime_config.py`, `process_management/config/bridge_data_reloader.py` |
 | Dashboard state channel                | `process_management/ipc/supervisor_channel.py`                     |
 | What runs inside a child process       | `process_management/workers/inference_process.py`, `safety_process.py`, `download_process.py` |
-| Model availability and downloads       | `process_management/models/`, `process_management/workers/download_process.py` |
+| Model availability and downloads       | `process_management/models/` (`ModelDownloadCoordinator`), `process_management/workers/download_process.py` |
 | VRAM/RAM budgeting and metrics         | `process_management/resources/`                                    |
 | Multi-GPU routing                      | `process_management/gpu/`                                          |
 | Dry-run / test doubles                 | `process_management/testing/`                                      |
@@ -59,15 +59,15 @@ module paths directly.
 
 | Subpackage | Responsibility |
 | ---------- | -------------- |
-| `lifecycle/` | Parent-side process machinery: spawn, supervise, reap, replace, shutdown, recovery, crash capture, process maps, and process metadata. |
+| `lifecycle/` | Parent-side process machinery: spawn, supervise, reap, replace, shutdown, worker-level recovery, crash capture, process maps, and process metadata. |
 | `workers/` | Child-process bodies and worker-side orchestration: inference, safety, safety dispatch, and background downloads. |
 | `scheduling/` | What to run, when, where, and why: inference scheduling, pop throttling, model affinity, performance model, and workload flow routing. |
 | `jobs/` | The unit of work: pop, submit, track, classify failures, alchemy coordination, job data models, and source-image downloads. |
-| `models/` | On-disk model state and feature readiness: desired state, availability, metadata, load map, cache, LoRA guards/backoff, and download scheduling. |
+| `models/` | On-disk model state and feature readiness: desired state, availability, metadata, load map, cache, LoRA guards/backoff, download coordination, and download scheduling. |
 | `resources/` | Runtime resource accounting: VRAM/RAM budgets, device info, system memory, duty-cycle summaries, and run metrics. |
 | `gpu/` | Multi-GPU routing primitives: card runtime state, eligibility checks, and advertised pop-shaping capabilities. |
 | `ipc/` | Message types, channels, dispatch, supervisor protocol, action ledger, and API sessions. |
-| `config/` | Live runtime config, mutable worker state, and worker identity preflight. |
+| `config/` | Live runtime config, bridge-data reload orchestration, mutable worker state, and worker identity preflight. |
 | `testing/` | Dry-run and test-double modules that are imported by both tests and the harness. |
 | `_internal/` | Cross-cutting internal helpers that do not belong to a domain package. |
 

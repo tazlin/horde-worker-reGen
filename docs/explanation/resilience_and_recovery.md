@@ -26,7 +26,7 @@ the one below and only escalating when the lower layer cannot cope:
 | ----- | ----- | --------- | ----- |
 | 1 | A single job faulted | Bounded retry; one degraded (isolated) retry for resource faults | `JobTracker` + `failure_classification.py` |
 | 2 | A single slot crashed | Replace the process; quarantine it if it crash-loops | `ProcessLifecycleManager` |
-| 3 | The whole worker is wedged | Soft-reset the pools (limp-by), then give up cleanly on unservable jobs | `RecoverySupervisor` (policy) + `HordeWorkerProcessManager` (actions) |
+| 3 | The whole worker is wedged | Soft-reset the pools (limp-by), then give up cleanly on unservable jobs | `RecoverySupervisor` (policy) + `WorkerRecoveryCoordinator` (assessment/actions) |
 
 Cutting across all three are two durable records used for diagnosis and orphan
 cleanup: the [action ledger](#the-action-ledger) and the
@@ -103,7 +103,7 @@ holds anyway:
   a job that never ran, a window that widens on slower disks and larger models, so
   only a return to idle from a state where inference actually ran can mean a result
   was lost. The periodic watchdog below covers the remaining shapes.
-- **Periodic watchdog** (`HordeWorkerProcessManager._reconcile_orphaned_in_progress_jobs`):
+- **Periodic watchdog** (`WorkerRecoveryCoordinator.reconcile_orphaned_in_progress_jobs`):
   each control-loop tick, any `in_progress` job that **no live slot is actively
   working** is punted (retryably) once it has been un-owned for a short grace
   window. The grace rides out the brief dispatch race between marking a job
@@ -131,27 +131,27 @@ manager-side **actions**:
   [`RecoveryAction`][horde_worker_regen.process_management.lifecycle.recovery_supervisor.RecoveryAction].
   Keeping it pure (it takes a wedge boolean and a clock) makes the escalation
   timing unit-testable with a fake clock.
-- `HordeWorkerProcessManager` owns the wedge **assessment** and the **actions**.
-  `_assess_wedge()` decides the worker is wedged only on definitive signals: every
+- [`WorkerRecoveryCoordinator`][horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator.WorkerRecoveryCoordinator]
+  owns the wedge **assessment** and the **actions**; `HordeWorkerProcessManager` calls it directly from the control loop. `assess_wedge()` decides the worker is wedged only on definitive signals: every
   inference slot quarantined, the safety pool crash-looping with no healthy
   process, a **sustained** structural queue deadlock (pending inference work with
   every process idle, held long enough to rule out the transient all-idle gap
   between jobs), or a recurring [orphaned-job](#stranded-in-progress-jobs) punt
   storm. A busy, slow, replacing, or model-loading worker is never wedged, and a
   queue deliberately held while a heavy model establishes whole-card residency is
-  excused by a bounded grace. `_run_recovery_supervisor()` runs each control-loop
+  excused by a bounded grace. `run_recovery_supervisor()` runs each control-loop
   tick and applies the returned action.
 
 The escalation, in order:
 
-1. **Soft reset (bounded)** (`_perform_soft_reset`): rebuild the process pools
+1. **Soft reset (bounded)** (`perform_soft_reset`): rebuild the process pools
    in place (kill and respawn every child, un-quarantine slots) and drop one
    **limp-by** notch, reducing effective concurrency (`max_threads`) so a worker
    that wedges under load can keep limping along. The parent process and the TUI
    stay attached. A transient wedge (a bad model load, a one-off deadlock)
    recovers here. If the episode later recovers after a sustained clean streak,
    limp-by is cleared exactly once and configured concurrency is restored.
-2. **Give up cleanly** (`_give_up_on_wedged_jobs`): once resets clearly are not
+2. **Give up cleanly** (`give_up_on_wedged_jobs`): once resets clearly are not
    helping (e.g. a deterministic crash-on-start), stop fighting: fault the jobs
    that cannot be served so the horde reissues them, rather than wedging forever.
    The worker keeps running and keeps popping.

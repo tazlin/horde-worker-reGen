@@ -115,10 +115,13 @@ authoritative post-scan reports from early partial ones.
 The popper uses this to keep advertised models aligned with reality:
 `_select_models_for_pop` filters the pop request down to models actually present
 (`filter_present`), so the worker never accepts a job for a model still
-downloading. Once the first authoritative scan completes, the manager kicks off
-the initial download of any configured-but-missing models.
+downloading. Once the first authoritative scan completes, `ModelDownloadCoordinator` kicks off
+the initial download of any configured-but-missing models and lazily starts
+inference/safety processes when their model gates clear.
 
-The configured image-model set is **authoritative on every config reload**, in
+[`ModelDownloadCoordinator`][horde_worker_regen.process_management.models.download_coordinator.ModelDownloadCoordinator]
+owns this parent-side reconciliation and startup gating. The configured
+image-model set is **authoritative on every config reload**, in
 both directions. Adding a model fetches it in the background without a restart;
 removing one prunes it from the download queue and aborts it if it is the
 in-flight download (`request_downloads(..., desired_image_models=...)` carries the

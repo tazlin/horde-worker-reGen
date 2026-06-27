@@ -62,12 +62,12 @@ class TestAssessWedgeIgnoresTransientChurn:
         """A worker mid-preload (transient queue deadlock) is not the SOS wedge that faults the head."""
         pm = make_testable_process_manager()
         # Precondition: nothing else makes this worker wedged (no quarantined pool, no orphan storm).
-        assert pm._is_inference_pool_unrecoverable() is False
+        assert pm._recovery_coordinator.is_inference_pool_unrecoverable() is False
         dispatcher = pm._message_dispatcher
         dispatcher._in_queue_deadlock = True
         dispatcher._last_queue_deadlock_detected_time = time.time() - _TRANSIENT_AGE_SECONDS
 
-        assert pm._assess_wedge() is False
+        assert pm._recovery_coordinator.assess_wedge() is False
 
     def test_assess_wedge_true_for_sustained_queue_deadlock(self) -> None:
         """A sustained queue deadlock still trips the SOS wedge so a genuine wedge is not ignored."""
@@ -76,4 +76,4 @@ class TestAssessWedgeIgnoresTransientChurn:
         dispatcher._in_queue_deadlock = True
         dispatcher._last_queue_deadlock_detected_time = time.time() - _SUSTAINED_AGE_SECONDS
 
-        assert pm._assess_wedge() is True
+        assert pm._recovery_coordinator.assess_wedge() is True

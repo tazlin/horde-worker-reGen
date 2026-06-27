@@ -61,7 +61,7 @@ Five long-lived asyncio tasks are started by
 | `_api_get_user_info_loop()` | 15s     | Fetch user/kudos info                                                     |
 | `AlchemyCoordinator.run()`  | 1s      | Pop, dispatch, and submit alchemy forms (only when `alchemist: true`)    |
 
-A sixth (`_bridge_data_loop`, 1s) hot-reloads `bridgeData.yaml` into
+A sixth (`BridgeDataReloader.bridge_data_loop`, 1s) hot-reloads `bridgeData.yaml` into
 [`RuntimeConfig`][horde_worker_regen.process_management.config.runtime_config.RuntimeConfig] unless config
 came from environment variables.
 

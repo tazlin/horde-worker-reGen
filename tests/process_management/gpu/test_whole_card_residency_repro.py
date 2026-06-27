@@ -838,10 +838,10 @@ class TestHeavyHeadLoadGrace:
         dispatcher = pm._message_dispatcher
         dispatcher._in_queue_deadlock = True
         dispatcher._last_queue_deadlock_detected_time = time.time() - 60.0
-        assert pm._assess_wedge() is True
+        assert pm._recovery_coordinator.assess_wedge() is True
 
         pm._inference_scheduler._heavy_head_admitted_at = time.time()
-        assert pm._assess_wedge() is False
+        assert pm._recovery_coordinator.assess_wedge() is False
 
 
 def _sole_residency_scheduler(

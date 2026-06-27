@@ -261,15 +261,17 @@ class TestManagerDownloadHandling:
     def _manager_in_download_mode(self, **bridge_overrides: object) -> Mock:
         manager = make_testable_process_manager(**bridge_overrides)  # type: ignore
         manager._enable_background_downloads = True
-        manager._download_wait_started = time.time()
+        manager._download_coordinator._enable_background_downloads = True
+        manager._download_coordinator.download_wait_started = time.time()
         manager._process_lifecycle = Mock(download_process_info=None)
         manager._process_lifecycle._num_process_recoveries = 0
+        manager._download_coordinator._process_lifecycle = manager._process_lifecycle
         return manager  # type: ignore[return-value]
 
     def test_first_report_requests_missing_and_starts_inference(self) -> None:
         """The first report requests the missing models and starts inference once one is present."""
         manager = self._manager_in_download_mode(image_models_to_load=["a", "b"])
-        manager._on_download_availability(_availability_message(["a"]))
+        manager._download_coordinator.on_download_availability(_availability_message(["a"]))
 
         assert manager._model_availability.present == {"a"}
         manager._process_lifecycle.request_downloads.assert_called_once()
@@ -277,22 +279,22 @@ class TestManagerDownloadHandling:
         assert args[0] == ["b"]
         assert kwargs["download_aux"] is True
         manager._process_lifecycle.start_inference_processes.assert_called_once()
-        assert manager._inference_processes_started is True
+        assert manager._download_coordinator.inference_processes_started is True
 
     def test_empty_report_defers_inference_but_still_requests(self) -> None:
         """An empty first report requests downloads but defers inference startup."""
         manager = self._manager_in_download_mode(image_models_to_load=["a", "b"])
-        manager._on_download_availability(_availability_message([]))
+        manager._download_coordinator.on_download_availability(_availability_message([]))
 
         manager._process_lifecycle.request_downloads.assert_called_once()
         assert sorted(manager._process_lifecycle.request_downloads.call_args.args[0]) == ["a", "b"]
         manager._process_lifecycle.start_inference_processes.assert_not_called()
-        assert manager._inference_processes_started is False
+        assert manager._download_coordinator.inference_processes_started is False
 
     def test_all_present_skips_request_and_starts_inference(self) -> None:
         """When everything is already present, no download is requested and inference starts."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
-        manager._on_download_availability(_availability_message(["a"]))
+        manager._download_coordinator.on_download_availability(_availability_message(["a"]))
 
         manager._process_lifecycle.request_downloads.assert_not_called()
         manager._process_lifecycle.start_inference_processes.assert_called_once()
@@ -300,9 +302,9 @@ class TestManagerDownloadHandling:
     def test_subsequent_reports_do_not_re_request_or_double_start(self) -> None:
         """Later reports neither re-request downloads nor restart inference."""
         manager = self._manager_in_download_mode(image_models_to_load=["a", "b"])
-        manager._on_download_availability(_availability_message([]))
-        manager._on_download_availability(_availability_message(["a"]))
-        manager._on_download_availability(_availability_message(["a", "b"]))
+        manager._download_coordinator.on_download_availability(_availability_message([]))
+        manager._download_coordinator.on_download_availability(_availability_message(["a"]))
+        manager._download_coordinator.on_download_availability(_availability_message(["a", "b"]))
 
         # The download request is only sent once (on the first report).
         manager._process_lifecycle.request_downloads.assert_called_once()
@@ -314,21 +316,23 @@ class TestManagerDownloadHandling:
         """An early scanning report (scan_complete False) defers both the request and inference."""
         manager = self._manager_in_download_mode(image_models_to_load=["a", "b"])
         scanning = DownloadStatusSnapshot(phase=DownloadPhase.SCANNING)
-        manager._on_download_availability(_availability_message([], scan_complete=False, status=scanning))
+        manager._download_coordinator.on_download_availability(
+            _availability_message([], scan_complete=False, status=scanning)
+        )
 
         manager._process_lifecycle.request_downloads.assert_not_called()
         manager._process_lifecycle.start_inference_processes.assert_not_called()
-        assert manager._initial_download_requested is False
+        assert manager._download_coordinator.initial_download_requested is False
 
         # The first authoritative (scan-complete) report then drives the request and startup.
-        manager._on_download_availability(_availability_message(["a"]))
+        manager._download_coordinator.on_download_availability(_availability_message(["a"]))
         manager._process_lifecycle.request_downloads.assert_called_once()
         manager._process_lifecycle.start_inference_processes.assert_called_once()
 
     def test_snapshot_marks_lora_blocked_by_active_download(self) -> None:
         """The supervisor snapshot explains temporary LoRA pop suppression."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"], allow_lora=True)
-        manager._on_download_availability(
+        manager._download_coordinator.on_download_availability(
             _availability_message(
                 ["a"],
                 status=DownloadStatusSnapshot(
@@ -347,7 +351,7 @@ class TestManagerDownloadHandling:
     def test_snapshot_does_not_mark_lora_blocked_when_lora_disabled(self) -> None:
         """Active downloads do not imply a temporary LoRA override when LoRA is off by config."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"], allow_lora=False)
-        manager._on_download_availability(
+        manager._download_coordinator.on_download_availability(
             _availability_message(
                 ["a"],
                 status=DownloadStatusSnapshot(
@@ -370,9 +374,11 @@ class TestConfigReloadTriggersDownloads:
     def _manager_in_download_mode(self, **bridge_overrides: object) -> Mock:
         manager = make_testable_process_manager(**bridge_overrides)  # type: ignore
         manager._enable_background_downloads = True
+        manager._download_coordinator._enable_background_downloads = True
         manager._process_lifecycle = Mock()
+        manager._download_coordinator._process_lifecycle = manager._process_lifecycle
         # Past the one-shot startup trigger, so only the reload path can drive a new request.
-        manager._initial_download_requested = True
+        manager._download_coordinator.initial_download_requested = True
         return manager  # type: ignore[return-value]
 
     def _mark_present(self, manager: Mock, present: set[str]) -> None:
@@ -409,7 +415,7 @@ class TestConfigReloadTriggersDownloads:
         manager._process_lifecycle = Mock()
         self._mark_present(manager, {"a"})
 
-        manager._reconcile_downloads(run_aux_if_incomplete=False)
+        manager._download_coordinator.reconcile_downloads(run_aux_if_incomplete=False)
 
         manager._process_lifecycle.request_downloads.assert_not_called()
 
@@ -507,8 +513,10 @@ class TestDownloadsOnlyMode:
     def _manager(self, **bridge_overrides: object) -> Mock:
         manager = make_testable_process_manager(**bridge_overrides)  # type: ignore
         manager._enable_background_downloads = True
+        manager._download_coordinator._enable_background_downloads = True
         manager._process_lifecycle = Mock()
-        manager._initial_download_requested = True
+        manager._download_coordinator._process_lifecycle = manager._process_lifecycle
+        manager._download_coordinator.initial_download_requested = True
         return manager  # type: ignore[return-value]
 
     def _mark_present(self, manager: Mock, present: set[str]) -> None:
@@ -517,7 +525,7 @@ class TestDownloadsOnlyMode:
     def test_enter_hold_sets_state_and_starts_download_process(self) -> None:
         """Entering the hold flags the state and ensures the download process is running."""
         manager = self._manager(image_models_to_load=["a"])
-        manager._enter_downloads_only_hold()
+        manager._download_coordinator.enter_downloads_only_hold()
 
         assert manager._state.downloads_only_hold is True
         manager._process_lifecycle.start_download_process.assert_called_once()
@@ -528,7 +536,7 @@ class TestDownloadsOnlyMode:
         self._mark_present(manager, {"a"})
         manager._state.downloads_only_hold = True
 
-        manager._maybe_start_inference_processes()
+        manager._download_coordinator.maybe_start_inference_processes()
 
         manager._process_lifecycle.start_inference_processes.assert_not_called()
 
@@ -538,7 +546,7 @@ class TestDownloadsOnlyMode:
         self._mark_present(manager, {"a"})
         manager._state.downloads_only_hold = True
 
-        manager._leave_downloads_only_hold()
+        manager._download_coordinator.leave_downloads_only_hold()
 
         assert manager._state.downloads_only_hold is False
         manager._process_lifecycle.start_inference_processes.assert_called_once()
@@ -550,7 +558,7 @@ class TestDownloadsOnlyMode:
         # picker's own models are still to fetch.
         self._mark_present(manager, {"a"})
 
-        manager._download_models_on_demand(["x", "y"], include_aux=True)
+        manager._download_coordinator.download_models_on_demand(["x", "y"], include_aux=True)
 
         manager._process_lifecycle.request_downloads.assert_called_once()
         args, kwargs = manager._process_lifecycle.request_downloads.call_args
@@ -570,10 +578,10 @@ class TestDownloadsOnlyMode:
         manager = self._manager(image_models_to_load=["a"])
         self._mark_present(manager, {"a"})
 
-        manager._download_models_on_demand(["x"], include_aux=False)
+        manager._download_coordinator.download_models_on_demand(["x"], include_aux=False)
         # A subsequent config-driven reconcile (e.g. the reload path) with no config change at all.
         manager._process_lifecycle.request_downloads.reset_mock()
-        manager._reconcile_downloads(run_aux_if_incomplete=False)
+        manager._download_coordinator.reconcile_downloads(run_aux_if_incomplete=False)
 
         manager._process_lifecycle.request_downloads.assert_called_once()
         kwargs = manager._process_lifecycle.request_downloads.call_args.kwargs
@@ -641,17 +649,21 @@ class TestManagerSafetyDeferral:
     def _manager_in_download_mode(self, **bridge_overrides: object) -> Mock:
         manager = make_testable_process_manager(**bridge_overrides)  # type: ignore
         manager._enable_background_downloads = True
-        manager._download_wait_started = time.time()
+        manager._download_coordinator._enable_background_downloads = True
+        manager._download_coordinator.download_wait_started = time.time()
         manager._process_lifecycle = Mock()
+        manager._download_coordinator._process_lifecycle = manager._process_lifecycle
         return manager  # type: ignore[return-value]
 
     def test_safety_present_report_starts_safety(self) -> None:
         """A report that the safety models are present starts the safety process once."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
-        manager._on_download_availability(_availability_message(["a"], safety_models_present=True))
+        manager._download_coordinator.on_download_availability(
+            _availability_message(["a"], safety_models_present=True)
+        )
 
         manager._process_lifecycle.start_safety_processes.assert_called_once()
-        assert manager._safety_processes_started is True
+        assert manager._download_coordinator.safety_processes_started is True
 
     def test_safety_absent_and_not_yet_attempted_defers(self) -> None:
         """A transient post-scan report (ensure not yet attempted) must not trip the launch."""
@@ -660,7 +672,7 @@ class TestManagerSafetyDeferral:
             phase=DownloadPhase.DOWNLOADING,
             current=CurrentDownloadStatus(model_name="safety models", feature="safety models", target_dir=""),
         )
-        manager._on_download_availability(
+        manager._download_coordinator.on_download_availability(
             _availability_message(
                 ["a"],
                 safety_models_present=False,
@@ -670,13 +682,13 @@ class TestManagerSafetyDeferral:
         )
 
         manager._process_lifecycle.start_safety_processes.assert_not_called()
-        assert manager._safety_processes_started is False
+        assert manager._download_coordinator.safety_processes_started is False
 
     def test_safety_started_when_attempted_without_success(self) -> None:
         """If the ensure finished without producing them, start safety to self-fetch/surface the error."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
         idle = DownloadStatusSnapshot(phase=DownloadPhase.IDLE)
-        manager._on_download_availability(
+        manager._download_coordinator.on_download_availability(
             _availability_message(
                 ["a"],
                 safety_models_present=False,
@@ -686,32 +698,38 @@ class TestManagerSafetyDeferral:
         )
 
         manager._process_lifecycle.start_safety_processes.assert_called_once()
-        assert manager._safety_processes_started is True
+        assert manager._download_coordinator.safety_processes_started is True
 
     def test_safety_grace_fallback_when_no_report(self) -> None:
         """A download process that never reports cannot wedge startup past the grace window."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
-        manager._download_wait_started = time.time() - (manager._DOWNLOAD_STARTUP_GRACE_SECONDS + 1.0)
+        manager._download_coordinator.download_wait_started = time.time() - (
+            manager._download_coordinator.DOWNLOAD_STARTUP_GRACE_SECONDS + 1.0
+        )
 
-        manager._maybe_start_safety_processes()
+        manager._download_coordinator.maybe_start_safety_processes()
 
         manager._process_lifecycle.start_safety_processes.assert_called_once()
-        assert manager._safety_processes_started is True
+        assert manager._download_coordinator.safety_processes_started is True
 
     def test_safety_no_grace_fallback_before_window(self) -> None:
         """Before the grace window elapses (and with no report), the safety launch stays deferred."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
 
-        manager._maybe_start_safety_processes()
+        manager._download_coordinator.maybe_start_safety_processes()
 
         manager._process_lifecycle.start_safety_processes.assert_not_called()
-        assert manager._safety_processes_started is False
+        assert manager._download_coordinator.safety_processes_started is False
 
     def test_safety_starts_only_once(self) -> None:
         """Repeated present reports do not relaunch the safety pool."""
         manager = self._manager_in_download_mode(image_models_to_load=["a"])
-        manager._on_download_availability(_availability_message(["a"], safety_models_present=True))
-        manager._on_download_availability(_availability_message(["a"], safety_models_present=True))
+        manager._download_coordinator.on_download_availability(
+            _availability_message(["a"], safety_models_present=True)
+        )
+        manager._download_coordinator.on_download_availability(
+            _availability_message(["a"], safety_models_present=True)
+        )
 
         manager._process_lifecycle.start_safety_processes.assert_called_once()
 

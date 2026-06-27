@@ -111,9 +111,9 @@ class TestRamReclaimCycleIsNotAStructuralWedge:
         _latch_sustained_queue_deadlock(pm)
 
         # Sanity: the pool is not otherwise broken; the only signal is the deliberate reclaim window.
-        assert pm._is_inference_pool_unrecoverable() is False
+        assert pm._recovery_coordinator.is_inference_pool_unrecoverable() is False
         # RED: the cycled slot is mid-respawn by the worker's own deliberate reclaim, not a wedge.
-        assert pm._assess_wedge() is False
+        assert pm._recovery_coordinator.assess_wedge() is False
 
     async def test_single_head_after_reclaim_is_not_wedged(self) -> None:
         """Queue depth of one: a single pending head after a reclaim cycle is still not a wedge."""
@@ -126,7 +126,7 @@ class TestRamReclaimCycleIsNotAStructuralWedge:
         _perform_ram_reclaim_cycle(pm)
         _latch_sustained_queue_deadlock(pm)
 
-        assert pm._assess_wedge() is False
+        assert pm._recovery_coordinator.assess_wedge() is False
 
     async def test_mixed_model_backlog_after_reclaim_is_not_wedged(self) -> None:
         """A heterogeneous pending queue (the head plus differing models behind it) is still not a wedge."""
@@ -139,7 +139,7 @@ class TestRamReclaimCycleIsNotAStructuralWedge:
         _perform_ram_reclaim_cycle(pm)
         _latch_sustained_queue_deadlock(pm)
 
-        assert pm._assess_wedge() is False
+        assert pm._recovery_coordinator.assess_wedge() is False
 
     async def test_reclaim_with_idle_sibling_present_is_not_wedged(self) -> None:
         """Config variant: a healthy idle sibling exists alongside the cycled slot.
@@ -158,7 +158,7 @@ class TestRamReclaimCycleIsNotAStructuralWedge:
         _perform_ram_reclaim_cycle(pm)
         _latch_sustained_queue_deadlock(pm)
 
-        assert pm._assess_wedge() is False
+        assert pm._recovery_coordinator.assess_wedge() is False
 
 
 class TestRamReclaimCycleGiveUpKeepsBacklog:
@@ -184,7 +184,7 @@ class TestRamReclaimCycleGiveUpKeepsBacklog:
 
         pending_before = len(list(pm._job_tracker.jobs_pending_inference))
         assert pending_before == 2
-        pm._give_up_on_wedged_jobs()
+        pm._recovery_coordinator.give_up_on_wedged_jobs()
 
         # RED: the jobs are servable once the cycled slot comes up; the reclaim window must not drop them.
         assert len(list(pm._job_tracker.jobs_pending_inference)) == pending_before
@@ -200,7 +200,7 @@ class TestRamReclaimCycleGiveUpKeepsBacklog:
         _perform_ram_reclaim_cycle(pm)
         _latch_sustained_queue_deadlock(pm)
 
-        pm._give_up_on_wedged_jobs()
+        pm._recovery_coordinator.give_up_on_wedged_jobs()
 
         assert len(list(pm._job_tracker.jobs_pending_inference)) == 1
 
@@ -222,7 +222,7 @@ class TestRamReclaimGraceIsScoped:
 
         _latch_sustained_queue_deadlock(pm)
 
-        assert pm._assess_wedge() is True
+        assert pm._recovery_coordinator.assess_wedge() is True
 
     async def test_give_up_faults_backlog_on_genuine_wedge_without_reclaim(self) -> None:
         """On a genuine wedge (no reclaim), give-up must still reissue the stuck head as before."""
@@ -233,7 +233,7 @@ class TestRamReclaimGraceIsScoped:
         await _queue_pending_inference(pm, ["unschedulable"])
 
         _latch_sustained_queue_deadlock(pm)
-        pm._give_up_on_wedged_jobs()
+        pm._recovery_coordinator.give_up_on_wedged_jobs()
 
         assert len(list(pm._job_tracker.jobs_pending_inference)) == 0
 
@@ -260,4 +260,4 @@ class TestRamReclaimGraceIsScoped:
         _perform_ram_reclaim_cycle(pm)
         _latch_sustained_queue_deadlock(pm)
 
-        assert pm._assess_wedge() is False
+        assert pm._recovery_coordinator.assess_wedge() is False

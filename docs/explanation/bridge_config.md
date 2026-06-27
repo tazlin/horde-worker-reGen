@@ -26,10 +26,11 @@ At startup, `BridgeDataLoader` reads `bridgeData.yaml` (or
 model. The validated model is stored in
 [`RuntimeConfig`][horde_worker_regen.process_management.config.runtime_config.RuntimeConfig].
 
-During normal operation, the `_bridge_data_loop` asyncio task re-reads the file
-every second and calls `RuntimeConfig.update()` if it changed. Components read
-`RuntimeConfig.bridge_data` whenever they need the current values; no locks, no
-notifications. The hot-reload is best-effort; there is no atomicity guarantee
+During normal operation, [`BridgeDataReloader`][horde_worker_regen.process_management.config.bridge_data_reloader.BridgeDataReloader]
+runs the `bridge_data_loop` asyncio task, re-reads the file every second, and
+applies valid changes through the process manager. The apply step updates
+`RuntimeConfig`, then components read `RuntimeConfig.bridge_data` whenever they
+need the current values; no locks, no notifications. The hot-reload is best-effort; there is no atomicity guarantee
 across multiple reads.
 
 A file reload is applied live, including the download subsystem: the pause /
@@ -41,7 +42,7 @@ category is newly enabled. None of these require a worker or download-process
 restart. The set of fields that genuinely cannot change live (worker identity,
 GPU selection, and other structural choices) is small; those need a restart.
 
-If configuration was provided via environment variables, the `_bridge_data_loop`
+If configuration was provided via environment variables, the `bridge_data_loop`
 is **not started** and the config is **restart-only**: change the environment
 variables and restart the worker to apply them. This reflects the typical use
 case of env var config (e.g. Docker), where dynamic updates are less common and

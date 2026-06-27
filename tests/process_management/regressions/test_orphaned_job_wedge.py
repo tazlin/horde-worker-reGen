@@ -110,7 +110,7 @@ async def test_watchdog_punts_orphaned_in_progress_job_after_grace() -> None:
     assert job.id_ is not None
 
     # No inference process exists in the map, so nothing owns this in-progress job: it is orphaned.
-    pm._reconcile_orphaned_in_progress_jobs()
+    pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
     # Within the grace window it is only being watched, not yet punted.
     assert pm._job_tracker.get_stage(job.id_) == JobStage.INFERENCE_IN_PROGRESS
 
@@ -118,12 +118,14 @@ async def test_watchdog_punts_orphaned_in_progress_job_after_grace() -> None:
     # worker's bounded-retry policy the punt requeues the job (a fresh dispatch attempt) rather than
     # faulting it outright; either way it is no longer pinned in progress, and the punt is recorded so
     # a recurring storm can escalate.
-    pm._orphan_in_progress_since[job.id_] = time.time() - (pm._ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1)
-    pm._reconcile_orphaned_in_progress_jobs()
+    pm._recovery_coordinator.orphan_in_progress_since[job.id_] = time.time() - (
+        pm._recovery_coordinator.ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1
+    )
+    pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
 
     assert pm._job_tracker.get_stage(job.id_) != JobStage.INFERENCE_IN_PROGRESS
     assert pm._job_tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
-    assert len(pm._orphan_punt_history) == 1
+    assert len(pm._recovery_coordinator.orphan_punt_history) == 1
 
 
 async def test_watchdog_leaves_an_owned_in_progress_job_alone() -> None:
@@ -139,25 +141,27 @@ async def test_watchdog_leaves_an_owned_in_progress_job_alone() -> None:
     assert job.id_ is not None
 
     # Even with the clock backdated, an owned job is not an orphan and must be left in progress.
-    pm._orphan_in_progress_since[job.id_] = time.time() - (pm._ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1)
-    pm._reconcile_orphaned_in_progress_jobs()
+    pm._recovery_coordinator.orphan_in_progress_since[job.id_] = time.time() - (
+        pm._recovery_coordinator.ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1
+    )
+    pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
 
     assert pm._job_tracker.get_stage(job.id_) == JobStage.INFERENCE_IN_PROGRESS
-    assert pm._orphan_punt_history == []
+    assert pm._recovery_coordinator.orphan_punt_history == []
 
 
 def test_repeated_orphan_punts_escalate_to_wedge() -> None:
     """A storm of orphan punts surfaces as a wedge so the recovery supervisor can limp the worker by."""
     pm = make_testable_process_manager()
 
-    assert pm._orphan_wedge_active() is False
-    assert pm._assess_wedge() is False
+    assert pm._recovery_coordinator.orphan_wedge_active() is False
+    assert pm._recovery_coordinator.assess_wedge() is False
 
     now = time.time()
-    pm._orphan_punt_history = [now] * pm._ORPHAN_PUNT_WEDGE_THRESHOLD
+    pm._recovery_coordinator.orphan_punt_history = [now] * pm._recovery_coordinator.ORPHAN_PUNT_WEDGE_THRESHOLD
 
-    assert pm._orphan_wedge_active() is True
-    assert pm._assess_wedge() is True
+    assert pm._recovery_coordinator.orphan_wedge_active() is True
+    assert pm._recovery_coordinator.assess_wedge() is True
 
 
 def test_download_only_hold_suppresses_the_wedge_verdict() -> None:
@@ -169,14 +173,16 @@ def test_download_only_hold_suppresses_the_wedge_verdict() -> None:
     worker goes live or starts, restoring the normal wedge detection.
     """
     pm = make_testable_process_manager()
-    pm._orphan_punt_history = [time.time()] * pm._ORPHAN_PUNT_WEDGE_THRESHOLD
-    assert pm._assess_wedge() is True  # the wedge condition is genuinely present
+    pm._recovery_coordinator.orphan_punt_history = [time.time()] * pm._recovery_coordinator.ORPHAN_PUNT_WEDGE_THRESHOLD
+    assert pm._recovery_coordinator.assess_wedge() is True  # the wedge condition is genuinely present
 
     pm._state.downloads_only_hold = True
-    assert pm._assess_wedge() is False  # ...but the download-only hold suppresses any wedge-driven reap
+    assert (
+        pm._recovery_coordinator.assess_wedge() is False
+    )  # ...but the download-only hold suppresses any wedge-driven reap
 
     pm._state.downloads_only_hold = False  # cleared on go-live / start
-    assert pm._assess_wedge() is True  # ...and normal wedge detection resumes
+    assert pm._recovery_coordinator.assess_wedge() is True  # ...and normal wedge detection resumes
 
 
 async def test_detected_deadlock_escalates_to_recovery_wedge() -> None:
@@ -193,7 +199,7 @@ async def test_detected_deadlock_escalates_to_recovery_wedge() -> None:
     pm._message_dispatcher._last_queue_deadlock_detected_time = time.time() - 60
 
     assert pm._message_dispatcher.get_deadlock_snapshot().has_active_deadlock() is True
-    assert pm._assess_wedge() is True
+    assert pm._recovery_coordinator.assess_wedge() is True
 
 
 async def test_safety_tail_during_lull_is_not_a_wedge() -> None:
@@ -222,17 +228,17 @@ async def test_safety_tail_during_lull_is_not_a_wedge() -> None:
     snapshot = pm._message_dispatcher.get_deadlock_snapshot()
     assert snapshot.has_active_deadlock() is True  # the loose detector still flags it (diagnostics)
     assert snapshot.indicates_structural_wedge() is False  # but it is not a structural wedge
-    assert pm._assess_wedge() is False
+    assert pm._recovery_coordinator.assess_wedge() is False
 
 
 def test_stale_orphan_punts_age_out_of_the_wedge_window() -> None:
     """Punts older than the window do not count, so a long-ago blip is not treated as an active wedge."""
     pm = make_testable_process_manager()
-    old = time.time() - (pm._ORPHAN_PUNT_WINDOW_SECONDS + 1)
-    pm._orphan_punt_history = [old] * (pm._ORPHAN_PUNT_WEDGE_THRESHOLD + 2)
+    old = time.time() - (pm._recovery_coordinator.ORPHAN_PUNT_WINDOW_SECONDS + 1)
+    pm._recovery_coordinator.orphan_punt_history = [old] * (pm._recovery_coordinator.ORPHAN_PUNT_WEDGE_THRESHOLD + 2)
 
-    assert pm._orphan_wedge_active() is False
-    assert pm._orphan_punt_history == []  # pruned as a side effect
+    assert pm._recovery_coordinator.orphan_wedge_active() is False
+    assert pm._recovery_coordinator.orphan_punt_history == []  # pruned as a side effect
 
 
 async def test_give_up_reissues_head_when_pool_healthy_but_queue_wedged() -> None:
@@ -260,10 +266,10 @@ async def test_give_up_reissues_head_when_pool_healthy_but_queue_wedged() -> Non
     # not the transient all-idle gap while the scheduler preloads the next model.
     pm._message_dispatcher._last_queue_deadlock_detected_time = time.time() - 60
     assert pm._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge() is True
-    assert pm._is_inference_capacity_available() is True
+    assert pm._recovery_coordinator.is_inference_capacity_available() is True
     assert len(pm._job_tracker.jobs_pending_inference) == 1
 
-    pm._give_up_on_wedged_jobs()
+    pm._recovery_coordinator.give_up_on_wedged_jobs()
 
     # The head was reissued (faulted to PENDING_SUBMIT) rather than left to spin behind a healthy pool.
     assert len(pm._job_tracker.jobs_pending_inference) == 0

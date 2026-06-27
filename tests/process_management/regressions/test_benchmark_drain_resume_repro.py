@@ -5,8 +5,8 @@ queue, enters the download-only hold, and scales the inference processes to zero
 ``target_processes=0``). The worker stays alive and is meant to resume serving when the operator presses
 "Go live".
 
-But ``_apply_set_concurrency`` sets ``_inference_processes_started = True`` as a side effect, and
-``_leave_downloads_only_hold`` (GO_LIVE) restores inference only through ``_maybe_start_inference_processes``,
+But ``_apply_set_concurrency`` marks the download coordinator's inference startup latch as true, and
+``leave_downloads_only_hold`` (GO_LIVE) restores inference only through ``maybe_start_inference_processes``,
 which short-circuits the moment that flag is set. Nothing else regrows the pool from zero during normal
 operation (the only auto-scaling paths shrink under VRAM pressure or restore a whole-card residency they
 themselves established). So after a benchmark drain, Go live resumes job popping while the inference pool sits
@@ -24,8 +24,8 @@ from tests.process_management.conftest import make_testable_process_manager
 class _CountingInferenceLifecycle:
     """A process-lifecycle double that tracks only the inference-process count the drain/resume flow moves.
 
-    Records enough of the lifecycle surface that ``_enter_downloads_only_hold`` / ``_apply_set_concurrency`` /
-    ``_leave_downloads_only_hold`` exercise: scaling sets the live count, the up-front starter restores it to
+    Records enough of the lifecycle surface that ``enter_downloads_only_hold`` / ``_apply_set_concurrency`` /
+    ``leave_downloads_only_hold`` exercise: scaling sets the live count, the up-front starter restores it to
     the provisioned size, and the count is readable back. Everything else the flow may touch is a no-op.
     """
 
@@ -60,6 +60,7 @@ def _manager_with_counting_lifecycle(*, provisioned: int) -> tuple[object, _Coun
     """A background-download manager that is up and serving, wired to a counting inference lifecycle."""
     manager = make_testable_process_manager()
     manager._enable_background_downloads = True
+    manager._download_coordinator._enable_background_downloads = True
     manager._model_availability.update(
         present={"stable_diffusion"},
         currently_downloading=None,
@@ -69,9 +70,10 @@ def _manager_with_counting_lifecycle(*, provisioned: int) -> tuple[object, _Coun
     )
     lifecycle = _CountingInferenceLifecycle(provisioned=provisioned)
     manager._process_lifecycle = lifecycle  # type: ignore[assignment]
+    manager._download_coordinator._process_lifecycle = lifecycle  # type: ignore[assignment]
     # The worker was already serving when the benchmark asked for the GPU.
-    manager._inference_processes_started = True
-    manager._safety_processes_started = True
+    manager._download_coordinator.inference_processes_started = True
+    manager._download_coordinator.safety_processes_started = True
     return manager, lifecycle
 
 
@@ -80,12 +82,12 @@ def test_go_live_after_drain_restores_inference_capacity() -> None:
     manager, lifecycle = _manager_with_counting_lifecycle(provisioned=2)
 
     # The benchmark frees the GPU: hold, then scale inference to zero.
-    manager._enter_downloads_only_hold()  # type: ignore[attr-defined]
+    manager._download_coordinator.enter_downloads_only_hold()  # type: ignore[attr-defined]
     manager._apply_set_concurrency(target_threads=None, target_processes=0)  # type: ignore[attr-defined]
     assert lifecycle.num_loaded_inference_processes() == 0  # GPU freed for the benchmark
 
     # The operator presses Go live to resume serving once the benchmark has finished.
-    manager._leave_downloads_only_hold()  # type: ignore[attr-defined]
+    manager._download_coordinator.leave_downloads_only_hold()  # type: ignore[attr-defined]
 
     assert lifecycle.num_loaded_inference_processes() > 0, (
         "Go live left the inference pool at zero after the benchmark drain scaled it down; the worker resumes "
@@ -96,18 +98,18 @@ def test_go_live_after_drain_restores_inference_capacity() -> None:
 def test_go_live_after_drain_unblocks_the_lazy_starter() -> None:
     """Concretely: the lazy inference starter must be allowed to run again after a scale-to-zero drain.
 
-    ``_apply_set_concurrency`` latches ``_inference_processes_started`` True; if Go live does not clear that
-    latch (or otherwise rescale up), ``_maybe_start_inference_processes`` can never restart the pool, and a
+    ``_apply_set_concurrency`` latches ``inference_processes_started`` True; if Go live does not clear that
+    latch (or otherwise rescale up), ``maybe_start_inference_processes`` can never restart the pool, and a
     worker that gave up the GPU for a benchmark never gets it back.
     """
     manager, lifecycle = _manager_with_counting_lifecycle(provisioned=3)
 
-    manager._enter_downloads_only_hold()  # type: ignore[attr-defined]
+    manager._download_coordinator.enter_downloads_only_hold()  # type: ignore[attr-defined]
     manager._apply_set_concurrency(target_threads=None, target_processes=0)  # type: ignore[attr-defined]
 
-    manager._leave_downloads_only_hold()  # type: ignore[attr-defined]
+    manager._download_coordinator.leave_downloads_only_hold()  # type: ignore[attr-defined]
 
     assert lifecycle.start_inference_calls > 0 or lifecycle.inference_count > 0, (
         "after the drain, Go live neither restarted nor rescaled the inference pool; "
-        "_maybe_start_inference_processes stayed latched off by the scale-to-zero's _inference_processes_started."
+        "maybe_start_inference_processes stayed latched off by the scale-to-zero's inference_processes_started."
     )

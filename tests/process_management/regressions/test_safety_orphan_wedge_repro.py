@@ -99,15 +99,17 @@ class TestSafetyOrphanReconciler:
         assert job_id is not None
 
         # Within grace: only watched, never disturbed.
-        await pm._reconcile_orphaned_safety_jobs()
+        await pm._recovery_coordinator.reconcile_orphaned_safety_jobs()
         assert pm._job_tracker.get_stage(job_id) == JobStage.SAFETY_CHECKING
 
         # Backdate the grace clock past the window: now it is requeued for a fresh check, not stranded.
-        pm._orphan_safety_since[job_id] = time.time() - (pm._ORPHAN_SAFETY_GRACE_SECONDS + 1)
-        await pm._reconcile_orphaned_safety_jobs()
+        pm._recovery_coordinator.orphan_safety_since[job_id] = time.time() - (
+            pm._recovery_coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1
+        )
+        await pm._recovery_coordinator.reconcile_orphaned_safety_jobs()
 
         assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SAFETY_CHECK
-        assert pm._safety_requeue_count[job_id] == 1
+        assert pm._recovery_coordinator.safety_requeue_count[job_id] == 1
         # Its images are kept so they are actually re-checked, never submitted unchecked.
         assert job_info.job_image_results is not None
         assert job_info.safety_evaluated is False
@@ -131,9 +133,11 @@ class TestSafetyOrphanReconciler:
         for job_info in job_infos:
             job_id = job_info.sdk_api_job_info.id_
             assert job_id is not None
-            pm._orphan_safety_since[job_id] = time.time() - (pm._ORPHAN_SAFETY_GRACE_SECONDS + 1)
+            pm._recovery_coordinator.orphan_safety_since[job_id] = time.time() - (
+                pm._recovery_coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1
+            )
 
-        await pm._reconcile_orphaned_safety_jobs()
+        await pm._recovery_coordinator.reconcile_orphaned_safety_jobs()
 
         assert pm._job_tracker.jobs_being_safety_checked == ()
         assert len(pm._job_tracker.jobs_pending_safety_check) == 5
@@ -152,11 +156,13 @@ class TestSafetyOrphanReconciler:
         assert job_id is not None
 
         # This job has already exhausted its re-check attempts.
-        pm._safety_requeue_count[job_id] = pm._SAFETY_REQUEUE_MAX
-        pm._orphan_safety_since[job_id] = time.time() - (pm._ORPHAN_SAFETY_GRACE_SECONDS + 1)
+        pm._recovery_coordinator.safety_requeue_count[job_id] = pm._recovery_coordinator.SAFETY_REQUEUE_MAX
+        pm._recovery_coordinator.orphan_safety_since[job_id] = time.time() - (
+            pm._recovery_coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1
+        )
 
         assert pm._state.self_throttle_paused is False
-        await pm._reconcile_orphaned_safety_jobs()
+        await pm._recovery_coordinator.reconcile_orphaned_safety_jobs()
 
         # Faulted with no image (the image is never submitted unchecked) and reported for reissue.
         assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT
@@ -173,15 +179,17 @@ class TestSafetyOrphanReconciler:
         for pid in [p.process_id for p in pm._process_map.values() if p.process_type == HordeProcessType.SAFETY]:
             del pm._process_map[pid]
         pm._process_lifecycle._safety_recovery_history = [time.time()] * 100
-        assert pm._is_safety_pool_unrecoverable() is True
+        assert pm._recovery_coordinator.is_safety_pool_unrecoverable() is True
 
         job_info = _safety_job_info()
         await _strand_in_safety_checking(pm, job_info)
         job_id = job_info.sdk_api_job_info.id_
         assert job_id is not None
-        pm._orphan_safety_since[job_id] = time.time() - (pm._ORPHAN_SAFETY_GRACE_SECONDS + 1)
+        pm._recovery_coordinator.orphan_safety_since[job_id] = time.time() - (
+            pm._recovery_coordinator.ORPHAN_SAFETY_GRACE_SECONDS + 1
+        )
 
-        await pm._reconcile_orphaned_safety_jobs()
+        await pm._recovery_coordinator.reconcile_orphaned_safety_jobs()
 
         # Even on its first orphan tick: no re-check loop, straight to a no-image fault + soft pause.
         assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT

@@ -109,7 +109,7 @@ Five (plus one optional) long-lived asyncio tasks are started by
 | `_api_get_user_info_loop()` | 15 s    | Fetch user/kudos info                                                                     |
 | `AlchemyCoordinator.run()`  | 1 s     | Pop, dispatch, and submit alchemy forms (only when `alchemist: true`; otherwise idle)    |
 
-A sixth task (`_bridge_data_loop`, 1 s) hot-reloads `bridgeData.yaml` into
+A sixth task (`BridgeDataReloader.bridge_data_loop`, 1 s) hot-reloads `bridgeData.yaml` into
 `RuntimeConfig` unless the config came from environment variables.
 
 These tasks run concurrently in the same asyncio event loop. The

@@ -65,7 +65,7 @@ class TestInferenceSlotOwnership:
         idle_slot.last_job_referenced = job
         assert job.id_ is not None
 
-        assert pm._inference_slot_owns_job(job.id_) is False
+        assert pm._recovery_coordinator.inference_slot_owns_job(job.id_) is False
 
     async def test_idle_preloaded_slot_with_stale_reference_does_not_own_job(self) -> None:
         """A ``PRELOADED_MODEL`` slot (ready for its *next* job) is idle and cannot own an in-progress job.
@@ -87,7 +87,7 @@ class TestInferenceSlotOwnership:
         preloaded_slot.last_job_referenced = job
         assert job.id_ is not None
 
-        assert pm._inference_slot_owns_job(job.id_) is False
+        assert pm._recovery_coordinator.inference_slot_owns_job(job.id_) is False
 
     async def test_busy_slot_running_job_owns_it(self) -> None:
         """A slot actively sampling (``INFERENCE_STARTING``) genuinely owns its job; the fix must keep this."""
@@ -105,7 +105,7 @@ class TestInferenceSlotOwnership:
         busy_slot.last_job_referenced = job
         assert job.id_ is not None
 
-        assert pm._inference_slot_owns_job(job.id_) is True
+        assert pm._recovery_coordinator.inference_slot_owns_job(job.id_) is True
 
 
 class TestWatchdogPuntsIdleShieldedOrphan:
@@ -131,11 +131,13 @@ class TestWatchdogPuntsIdleShieldedOrphan:
         # Backdate the grace clock so a single reconcile pass is past the window. With the bug the entry
         # is pruned before it can be acted on (the job is wrongly "owned"), so the backdate is irrelevant
         # and the job stays pinned; that divergence is what makes this RED.
-        pm._orphan_in_progress_since[job.id_] = time.time() - (pm._ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1)
-        pm._reconcile_orphaned_in_progress_jobs()
+        pm._recovery_coordinator.orphan_in_progress_since[job.id_] = time.time() - (
+            pm._recovery_coordinator.ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1
+        )
+        pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
 
         assert pm._job_tracker.get_stage(job.id_) != JobStage.INFERENCE_IN_PROGRESS
-        assert len(pm._orphan_punt_history) == 1
+        assert len(pm._recovery_coordinator.orphan_punt_history) == 1
 
     async def test_watchdog_punts_job_shielded_only_by_preloaded_slot(self) -> None:
         """Variation: the shielding slot is ``PRELOADED_MODEL`` (processes 1 and 3 in the incident)."""
@@ -153,8 +155,10 @@ class TestWatchdogPuntsIdleShieldedOrphan:
         preloaded_slot.last_job_referenced = job
         assert job.id_ is not None
 
-        pm._orphan_in_progress_since[job.id_] = time.time() - (pm._ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1)
-        pm._reconcile_orphaned_in_progress_jobs()
+        pm._recovery_coordinator.orphan_in_progress_since[job.id_] = time.time() - (
+            pm._recovery_coordinator.ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1
+        )
+        pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
 
         assert pm._job_tracker.get_stage(job.id_) != JobStage.INFERENCE_IN_PROGRESS
 
@@ -182,11 +186,13 @@ class TestWatchdogPuntsIdleShieldedOrphan:
         stale_idle.last_job_referenced = job
         assert job.id_ is not None
 
-        pm._orphan_in_progress_since[job.id_] = time.time() - (pm._ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1)
-        pm._reconcile_orphaned_in_progress_jobs()
+        pm._recovery_coordinator.orphan_in_progress_since[job.id_] = time.time() - (
+            pm._recovery_coordinator.ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1
+        )
+        pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
 
         assert pm._job_tracker.get_stage(job.id_) == JobStage.INFERENCE_IN_PROGRESS
-        assert pm._orphan_punt_history == []
+        assert pm._recovery_coordinator.orphan_punt_history == []
 
 
 class TestPhantomInProgressJobWedgesDispatch:
@@ -238,8 +244,10 @@ class TestPhantomInProgressJobWedgesDispatch:
         assert await pm._inference_scheduler.get_next_job_and_process() is None
 
         # The watchdog runs every control-loop tick; advance its grace clock and let it act.
-        pm._orphan_in_progress_since[phantom_job.id_] = time.time() - (pm._ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1)
-        pm._reconcile_orphaned_in_progress_jobs()
+        pm._recovery_coordinator.orphan_in_progress_since[phantom_job.id_] = time.time() - (
+            pm._recovery_coordinator.ORPHAN_IN_PROGRESS_GRACE_SECONDS + 1
+        )
+        pm._recovery_coordinator.reconcile_orphaned_in_progress_jobs()
 
         # The phantom is no longer pinning the in-progress count...
         assert pm._job_tracker.get_stage(phantom_job.id_) != JobStage.INFERENCE_IN_PROGRESS
