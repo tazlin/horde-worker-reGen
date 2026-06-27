@@ -533,14 +533,29 @@ class TestWedgeDispatchDiagnostic:
     was filed as a generic scheduler bug.
     """
 
-    def _wedge_scheduler(self) -> tuple[InferenceScheduler, JobTracker]:
-        """A staged wedge with the Flux head and an SDXL job both queued, residency held for Flux."""
+    def _wedge_scheduler(
+        self, *, extra_sibling: bool = False,
+    ) -> tuple[InferenceScheduler, JobTracker]:
+        """A staged wedge with the Flux head and SDXL jobs queued, residency held for Flux.
+
+        With ``extra_sibling=True``, three processes are present: the Flux holder plus two idle SDXL
+        siblings. The budget target of 2 on the 24 GB card leaves an excess sibling that must be torn
+        down; while it remains, the pre-staged head is not ready and the diagnostic fires.
+        """
         flux_holder = make_mock_process_info(4, model_name=_FLUX_MODEL, state=HordeProcessState.PRELOADED_MODEL)
-        sdxl_idle = make_mock_process_info(3, model_name=_RESIDENT_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
-        for proc in (flux_holder, sdxl_idle):
+        procs: dict[int, object] = {4: flux_holder}
+        if extra_sibling:
+            sdxl_idle_2 = make_mock_process_info(2, model_name=_OTHER_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
+            for proc in (sdxl_idle_2,):
+                proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+                proc.vram_usage_mb = _PER_PROCESS_OVERHEAD_MB
+            procs[2] = sdxl_idle_2
+        sdxl_idle_3 = make_mock_process_info(3, model_name=_RESIDENT_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
+        for proc in (flux_holder, sdxl_idle_3):
             proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
             proc.vram_usage_mb = _PER_PROCESS_OVERHEAD_MB
-        process_map = ProcessMap({3: sdxl_idle, 4: flux_holder})
+        procs[3] = sdxl_idle_3
+        process_map = ProcessMap({pid: proc for pid, proc in procs.items()})  # type: ignore[arg-type]
         horde_model_map = HordeModelMap(root={})
         horde_model_map.update_entry(
             horde_model_name=_FLUX_MODEL, load_state=ModelLoadState.LOADED_IN_RAM, process_id=4
@@ -560,10 +575,14 @@ class TestWedgeDispatchDiagnostic:
         """The stall reason must name the wedge and the pinned sibling, matching the detector's regex.
 
         The phrase ``whole-card residency stuck: cannot reach sole residency`` is the seam the
-        ``detect_whole_card_convergence_wedge`` detector keys off; the reason must also identify the protected
-        sibling (process 3 holding the queued SDXL model) so the post-mortem points straight at the cause.
+        ``detect_whole_card_convergence_wedge`` detector keys off; the reason must also identify the
+        protected sibling holding a queued model so the post-mortem points straight at the cause.
+
+        Uses three processes (one excess beyond the 2-process budget target on a 24 GB card) so the
+        convergence is genuinely stuck: the stored forecast reports the teardown as not exhausted
+        because the process count exceeds the target.
         """
-        scheduler, job_tracker = self._wedge_scheduler()
+        scheduler, job_tracker = self._wedge_scheduler(extra_sibling=True)
         flux_head = await track_popped_job_async(
             job_tracker,
             make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),

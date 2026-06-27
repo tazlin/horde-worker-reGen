@@ -1178,6 +1178,17 @@ class InferenceScheduler:
         found, device_index = self._residency_holder_for_model(job.model)
         if not found:
             return False
+        # The pre-staged head's model may be in RAM only (evicted from VRAM by a budget reclamation
+        # that predates the fix in _residency_protects_from_unload). A teardown that is otherwise
+        # exhausted (process count at target, safety settled) must not keep the head parked solely
+        # because fits_weights_now reads False from the model not being in VRAM -- the model will be
+        # loaded into VRAM at sampling time. Re-use the held residency's stored forecast, which was
+        # computed with the model's weights in VRAM, rather than recalculating from the degraded state.
+        stored = self._residency_state(device_index).forecast
+        if stored is not None:
+            # The stored forecast reflects the residency's actual budget-relative target and the
+            # weight footprint at establishment time; only re-derive when it was never captured.
+            return not self._whole_card_teardown_exhausted(stored, device_index=device_index)
         baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
         forecast = self._forecast_streaming(job, baseline, device_index=device_index)
         return not self._whole_card_teardown_exhausted(forecast, device_index=device_index)
@@ -2506,6 +2517,7 @@ class InferenceScheduler:
                             )
                         context_reduction_demanded = (
                             self._whole_card_residency_enabled()
+                            and is_head_blocker
                             and max_resident is not None
                             and self._process_map.num_loaded_inference_processes(device_index=target_device_index)
                             > max_resident
@@ -3473,6 +3485,13 @@ class InferenceScheduler:
             return False
 
         if under_pressure:
+            # A model holding a whole-card residency must never be evicted from VRAM, even under
+            # budget pressure: evicting it undermines the residency convergence (the pre-staged head
+            # cannot reach sole residency and dispatch is permanently blocked until save-our-ship
+            # soft-resets the pools). Only the residency holder is spared; other models are still
+            # reclaimable.
+            if any(state.model == model_name for _, state in self._held_residencies()):
+                return True
             return False
 
         if affinity_active(len(wanted_models), self._max_inference_processes) and model_name in wanted_models:
