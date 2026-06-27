@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .correlate import SessionContext, find_child_crash
+from .governor_signatures import GOVERNOR_ENTER_RE, GOVERNOR_EXIT_RE, GOVERNOR_LABELS
 from .log_ingest import LogRecord
 from .sessions import SessionEndReason
 
@@ -952,6 +953,91 @@ def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
     ]
 
 
+_GOVERNOR_DOMINANCE_FRACTION = 0.25
+"""A governor engaged for at least this share of the session is worth surfacing as a throughput shaper."""
+_GOVERNOR_DOMINANCE_MIN_SECONDS = 60.0
+"""...but only when its absolute engaged time is non-trivial, so a short session does not flag on noise."""
+
+
+def _governor_engaged_seconds(session: object) -> dict[str, float]:
+    """Reconstruct each pop-governor's total engaged seconds from its ENTER/EXIT spell boundaries.
+
+    Pairs each ENTER with the next EXIT for the same governor; a spell still open at the last record counts
+    to the session's end. Keyed by the governor's machine name. Returns an empty mapping when no boundary
+    lines are present (an older worker, or one with no governor ever engaging).
+    """
+    records = session.records  # type: ignore[attr-defined]
+    end_ts = session.end_ts  # type: ignore[attr-defined]
+    engaged: dict[str, float] = {}
+    open_since: dict[str, object] = {}
+    for record in records:
+        if record.timestamp is None:
+            continue
+        enter = GOVERNOR_ENTER_RE.search(record.message)
+        if enter:
+            open_since[enter.group("name")] = record.timestamp
+            continue
+        exit_match = GOVERNOR_EXIT_RE.search(record.message)
+        if exit_match:
+            name = exit_match.group("name")
+            started = open_since.pop(name, None)
+            if started is not None:
+                engaged[name] = engaged.get(name, 0.0) + max(0.0, (record.timestamp - started).total_seconds())
+    for name, started in open_since.items():
+        if end_ts is not None:
+            engaged[name] = engaged.get(name, 0.0) + max(0.0, (end_ts - started).total_seconds())
+    return engaged
+
+
+def detect_pop_governor_dominance(context: SessionContext) -> list[Finding]:
+    """A pop/scheduling governor that held the worker back for a large share of the session.
+
+    Governors (whole-card residency, the large-model switch/re-entry limiters, backpressure, the unservable
+    holdback, the various pauses) are each legitimate, but one consuming a big fraction of the session is a
+    throughput-shaping signal worth surfacing: it points at the lever (a model mix, a config duration, a slow
+    safety stage) the operator can act on, without itself being a fault.
+    """
+    session = context.session
+    duration = session.duration_seconds
+    if duration is None or duration <= 0:
+        return []
+    engaged = _governor_engaged_seconds(session)
+    dominant = sorted(
+        (
+            (name, seconds)
+            for name, seconds in engaged.items()
+            if seconds >= _GOVERNOR_DOMINANCE_MIN_SECONDS and (seconds / duration) >= _GOVERNOR_DOMINANCE_FRACTION
+        ),
+        key=lambda item: -item[1],
+    )
+    if not dominant:
+        return []
+    phrases = [
+        f"{GOVERNOR_LABELS.get(name, name)} ({seconds / duration * 100:.0f}% of the session, {seconds / 60:.1f} min)"
+        for name, seconds in dominant
+    ]
+    return [
+        Finding(
+            id="pop_governor_dominance",
+            severity=Severity.INFO,
+            title="A pop governor shaped much of the session",
+            verdict=(
+                "The worker spent a large share of the session with a pop/scheduling governor engaged: "
+                + "; ".join(phrases)
+                + ". This is not a fault, but it is the dominant lever on throughput for this session."
+            ),
+            remediation=(
+                "If throughput was lower than expected, this names where the time went. Whole-card residency or "
+                "the large-model limiters point at the model mix and their configured durations "
+                "(whole_card_residency_cooldown_seconds, large_model_switch_min_seconds, "
+                "large_model_reentry_cooldown_seconds); backpressure points at a slow safety stage; the "
+                "unservable holdback points at a model the device cannot run."
+            ),
+            evidence=[_evidence(r) for r in _matching(session.records, GOVERNOR_ENTER_RE)[:3]],
+        ),
+    ]
+
+
 def detect_session_summary(context: SessionContext) -> list[Finding]:
     """An always-present rollup: how the session ended and its recovery/fault headline numbers."""
     session = context.session
@@ -987,6 +1073,7 @@ DETECTORS: list[Detector] = [
     detect_whole_card_residency_churn,
     detect_head_dispatch_stall,
     detect_consecutive_failure_pause,
+    detect_pop_governor_dominance,
     detect_stuck_inference_step,
     detect_oom,
     detect_swallowed_oom,

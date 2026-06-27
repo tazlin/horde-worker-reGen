@@ -23,6 +23,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from horde_worker_regen.analysis.governor_signatures import (
+    GOVERNOR_ENTER_RE,
+    GOVERNOR_EXIT_RE,
+    GOVERNOR_LABELS,
+)
 from horde_worker_regen.analysis.session_duty import analyze_stats_sessions, render_session_duty_report
 from horde_worker_regen.stats_operations import default_stats_dir
 
@@ -140,6 +145,12 @@ class EpochReport:
     config: EpochConfig
     windows: list[DutyWindow] = field(default_factory=list)
     min_disk_free_gb: float | None = None
+    governor_seconds: dict[str, float] = field(default_factory=dict)
+    """Per pop-governor engaged seconds across the epoch (reconstructed from the ENTER/EXIT spell lines)."""
+
+    def governor_attribution(self) -> dict[str, float]:
+        """Per-governor engaged time, biggest first, for the epoch's duty-loss attribution."""
+        return dict(sorted(self.governor_seconds.items(), key=lambda kv: kv[1], reverse=True))
 
     @property
     def duration_minutes(self) -> float | None:
@@ -266,11 +277,28 @@ def build_epoch_report(index: int, lines: list[str]) -> EpochReport:
     windows: list[DutyWindow] = []
     min_disk: float | None = None
     last_ts: datetime | None = None
+    # Pop-governor spell reconstruction: pair each ENTER with the next EXIT for the same governor; a spell
+    # still open at the epoch's last timestamp counts to there. Attributes idle/non-pop time to the condition
+    # that caused it, alongside the duty-band shortfall.
+    governor_open: dict[str, datetime] = {}
+    governor_seconds: dict[str, float] = {}
 
     for line in lines:
         ts = _parse_ts(line)
         if ts is not None:
             last_ts = ts
+
+        enter = GOVERNOR_ENTER_RE.search(line)
+        if enter is not None and ts is not None:
+            governor_open[enter.group("name")] = ts
+            continue
+        governor_exit = GOVERNOR_EXIT_RE.search(line)
+        if governor_exit is not None and ts is not None:
+            opened = governor_open.pop(governor_exit.group("name"), None)
+            if opened is not None:
+                name = governor_exit.group("name")
+                governor_seconds[name] = governor_seconds.get(name, 0.0) + max(0.0, (ts - opened).total_seconds())
+            continue
 
         window = parse_duty_window(line, ts)
         if window is not None:
@@ -301,6 +329,11 @@ def build_epoch_report(index: int, lines: list[str]) -> EpochReport:
             free = float(disk_match.group("free"))
             min_disk = free if min_disk is None else min(min_disk, free)
 
+    # Close any governor spell still open at the epoch's end so its time is not lost.
+    for name, opened in governor_open.items():
+        if last_ts is not None:
+            governor_seconds[name] = governor_seconds.get(name, 0.0) + max(0.0, (last_ts - opened).total_seconds())
+
     start = _parse_ts(lines[0]) if lines else None
     return EpochReport(
         index=index,
@@ -309,6 +342,7 @@ def build_epoch_report(index: int, lines: list[str]) -> EpochReport:
         config=config,
         windows=windows,
         min_disk_free_gb=min_disk,
+        governor_seconds=governor_seconds,
     )
 
 
@@ -366,6 +400,16 @@ def render_report(reports: list[EpochReport]) -> str:
         else:
             out.append("   reload churn: none reported (pre-instrumentation log, or no churn)")
 
+        governors = report.governor_attribution()
+        if governors:
+            epoch_seconds = (duration or 0.0) * 60.0
+            parts = []
+            for name, seconds in list(governors.items())[:4]:
+                label = GOVERNOR_LABELS.get(name, name)
+                share = f" ({seconds / epoch_seconds * 100:.0f}%)" if epoch_seconds > 0 else ""
+                parts.append(f"{label} {seconds / 60:.1f}m{share}")
+            out.append("   pop governors engaged: " + "  ".join(parts))
+
         if report.min_disk_free_gb is not None:
             out.append(f"   (!) disk pressure: dipped to {report.min_disk_free_gb:.1f} GB free (can stall downloads)")
         out.append("")
@@ -382,6 +426,7 @@ def _report_to_dict(report: EpochReport) -> dict[str, object]:
         "window_count": len(report.windows),
         "mean_duty_percent": report.mean_duty(),
         "mean_busy_percent": report.mean_busy(),
+        "governor_seconds": report.governor_attribution(),
         "min_duty_percent": min(report.duty_values()) if report.windows else None,
         "max_duty_percent": max(report.duty_values()) if report.windows else None,
         "band_distribution": report.band_distribution(),

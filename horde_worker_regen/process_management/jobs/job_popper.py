@@ -29,7 +29,10 @@ from horde_worker_regen.process_management.gpu.gpu_pop_shaping import (
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.jobs.job_models import APIWorkerMessage
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
-from horde_worker_regen.process_management.jobs.large_model_pop_governor import LargeModelPopGovernor
+from horde_worker_regen.process_management.jobs.large_model_pop_governor import (
+    LargeModelGovernorStatus,
+    LargeModelPopGovernor,
+)
 from horde_worker_regen.process_management.jobs.source_image_downloader import SourceImageDownloader
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.feature_readiness import (
@@ -447,6 +450,35 @@ class JobPopper:
             )
             return models.difference(decision.withheld)
         return models
+
+    def large_model_governor_status(self, *, now: float, residency_active: bool) -> LargeModelGovernorStatus:
+        """Report the live engagement of the two large-model limiters, for the governor registry.
+
+        Resolves the configured durations and the current large-model incumbents the same way the pop filter
+        does, then asks the governor for a read-only status (no mutation of its throttle timers).
+        """
+        bridge_data = self._runtime_config.bridge_data
+        switch_min, reentry = self._resolve_large_model_pop_durations(bridge_data)
+        return self._large_model_pop_governor.describe(
+            incumbent_large_models=self._large_models_loaded_or_queued(),
+            residency_active=residency_active,
+            now=now,
+            switch_min_seconds=switch_min,
+            reentry_cooldown_seconds=reentry,
+        )
+
+    def is_post_inference_backlogged(self) -> bool:
+        """Public read of the post-inference backpressure gate, for the governor registry."""
+        return self._is_post_inference_backlogged()
+
+    @property
+    def is_in_error_backoff(self) -> bool:
+        """Whether the pop throttler is backing off the API after recent pop errors."""
+        return self._pop_throttler.is_in_error_backoff
+
+    def megapixelstep_wait_remaining(self, bridge_data: reGenBridgeData, *, now: float) -> float | None:
+        """Seconds the megapixelstep wait is still holding pops, or None when it is not engaged."""
+        return self._pop_throttler.megapixelstep_wait_remaining(bridge_data, now=now)
 
     def set_canned_job_source(self, source: CannedJobSource | None) -> None:
         """Swap the canned job source at runtime (a warm benchmark worker's level boundary)."""

@@ -11,7 +11,11 @@ from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Button, Static
 
-from horde_worker_regen.process_management.ipc.supervisor_channel import StatsRollupRow, WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    PopGovernorsSnapshot,
+    StatsRollupRow,
+    WorkerStateSnapshot,
+)
 from horde_worker_regen.tui.formatters import format_percent, human_bytes, human_duration, short_baseline, shorten
 
 
@@ -46,6 +50,7 @@ class StatsView(Vertical):
         yield Button("Enable JSONL export", id="stats-export-button")
         with VerticalScroll(id="stats-body"):
             yield Static(id="stats-headlines")
+            yield Static(id="stats-governors")
             yield Static(id="stats-export")
             yield Static(id="stats-by-model")
             yield Static(id="stats-by-baseline")
@@ -62,6 +67,11 @@ class StatsView(Vertical):
         button = self.query_one("#stats-export-button", Button)
         button.label = "Disable JSONL export" if snapshot.stats_export.enabled else "Enable JSONL export"
         self.query_one("#stats-headlines", Static).update(self._render_headlines(snapshot))
+        governors_static = self.query_one("#stats-governors", Static)
+        has_governors = bool(snapshot.pop_governors.governors)
+        governors_static.display = has_governors
+        if has_governors:
+            governors_static.update(self._render_governors(snapshot.pop_governors))
         self.query_one("#stats-export", Static).update(self._render_export(snapshot))
         self.query_one("#stats-by-model", Static).update(
             self._render_rollups("By model totals", snapshot.stats_model_rollups)
@@ -121,6 +131,39 @@ class StatsView(Vertical):
         if export.last_write_error:
             lines.append(Text(f"Last write error: {export.last_write_error}", style="red"))
         return Panel(Group(*lines), title="JSONL export", title_align="left", border_style="grey37", padding=(0, 1))
+
+    @staticmethod
+    def _render_governors(governors: PopGovernorsSnapshot) -> Panel:
+        """Render the per-governor session aggregates: how often each engaged and how long it held.
+
+        Lets an operator compare how much of the session each pop/scheduling governor consumed (the share is
+        the clearest signal of which condition is shaping throughput), with the currently-engaged ones marked.
+        Ordered by the registry: active governors first, then by total time.
+        """
+        table = Table(expand=True, border_style="grey37", header_style="bold")
+        table.add_column("Governor", no_wrap=True)
+        table.add_column("State", no_wrap=True)
+        table.add_column("Times", justify="right")
+        table.add_column("Total", justify="right")
+        table.add_column("% session", justify="right")
+        for governor in governors.governors:
+            if governor.active:
+                if governor.expected_remaining_seconds is not None:
+                    state = Text(
+                        f"active (~{human_duration(governor.expected_remaining_seconds)} left)", style="yellow"
+                    )
+                else:
+                    state = Text(f"active ({human_duration(governor.current_spell_seconds)})", style="yellow")
+            else:
+                state = Text("idle", style="grey50")
+            table.add_row(
+                governor.label,
+                state,
+                f"{governor.triggers:,}",
+                human_duration(governor.total_active_seconds),
+                f"{governor.fraction_of_session * 100:.1f}%",
+            )
+        return Panel(table, title="Pop governors", title_align="left", border_style="grey37", padding=(0, 1))
 
     @staticmethod
     def _render_rollups(title: str, rows: list[StatsRollupRow]) -> Panel:

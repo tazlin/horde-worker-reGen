@@ -71,6 +71,8 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     JobFeatureSummary,
     JobQueueEntry,
     OrchestrationIntentSnapshot,
+    PopGovernorsSnapshot,
+    PopGovernorStatus,
     ProcessSnapshot,
     RecentJobRecord,
     StatsSample,
@@ -126,6 +128,11 @@ from horde_worker_regen.process_management.scheduling.performance_model import (
     PerformanceModel,
     load_seed_its_by_signature,
 )
+from horde_worker_regen.process_management.scheduling.pop_governor_registry import (
+    PopGovernorReading,
+    PopGovernorRegistry,
+)
+from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.workers.safety_orchestrator import SafetyOrchestrator
@@ -945,6 +952,10 @@ class HordeWorkerProcessManager:
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
         )
 
+        # Tracks the live spell and session totals of every pop/scheduling governor, fed once per control-loop
+        # tick by _update_pop_governors so its ENTER/EXIT log lines fire regardless of whether a TUI is attached.
+        self._pop_governor_registry = PopGovernorRegistry()
+
         self._alchemy_coordinator = AlchemyCoordinator(
             state=self._state,
             process_map=self._process_map,
@@ -1530,6 +1541,7 @@ class HordeWorkerProcessManager:
         self.print_status_method()
         self._maybe_log_duty_cycle()
         self._sample_disk_space()
+        self._update_pop_governors()
         self._publish_supervisor_snapshot()
 
         await self._sleep(self._loop_interval / 2)
@@ -2548,6 +2560,202 @@ class HordeWorkerProcessManager:
             max_resident_processes=state.max_resident_processes,
         )
 
+    def _update_pop_governors(self) -> None:
+        """Feed the governor registry this tick's readings, so spells advance and ENTER/EXIT lines log.
+
+        Runs every control-loop tick (not only when a snapshot is published), so the grep-friendly boundary
+        lines and the session aggregates are produced whether or not a TUI is attached. Wrapped so a transient
+        read failure on one cycle skips that update rather than disturbing the control loop, which must never
+        raise here.
+        """
+        now = time.time()
+        try:
+            self._pop_governor_registry.update(self._collect_pop_governor_readings(now), now=now)
+        except Exception as e:  # never let observability bookkeeping break the control loop
+            logger.debug(f"Pop-governor update skipped this tick: {type(e).__name__} {e}")
+
+    def _collect_pop_governor_readings(self, now: float) -> list[PopGovernorReading]:
+        """Read every known pop/scheduling governor's current engagement into a list of readings.
+
+        Each governor is a *condition* that holds back or reshapes job pops; the readings are levels (engaged
+        now, why, expected remaining), and the registry derives the spell edges. Timers are supplied where a
+        governor releases on a clock (residency cooldown, the switch/re-entry windows, the consecutive-failure
+        and self-throttle pauses, the megapixelstep wait); the rest clear when their underlying state changes
+        and report no fixed remaining.
+        """
+        bridge_data = self.bridge_data
+        readings: list[PopGovernorReading] = []
+
+        residency = self._inference_scheduler.whole_card_residency_state()
+        readings.append(
+            PopGovernorReading(
+                name="whole_card_residency",
+                label="Whole-card residency",
+                active=residency.active,
+                reason=(f"{residency.model} holds the card ({residency.phase})" if residency.active else None),
+                expected_remaining_seconds=residency.cooldown_remaining_seconds if residency.active else None,
+            ),
+        )
+
+        large = self._job_popper.large_model_governor_status(
+            now=now,
+            residency_active=self._inference_scheduler.is_whole_card_residency_active(),
+        )
+        readings.append(
+            PopGovernorReading(
+                name="large_model_switch",
+                label="Large-model switch throttle",
+                active=large.switch_active,
+                reason=large.switch_reason,
+                expected_remaining_seconds=large.switch_remaining_seconds,
+            ),
+        )
+        readings.append(
+            PopGovernorReading(
+                name="large_model_reentry",
+                label="Large-model re-entry cooldown",
+                active=large.reentry_active,
+                reason=large.reentry_reason,
+                expected_remaining_seconds=large.reentry_remaining_seconds,
+            ),
+        )
+
+        backlogged = self._job_popper.is_post_inference_backlogged()
+        readings.append(
+            PopGovernorReading(
+                name="post_inference_backpressure",
+                label="Post-inference backpressure",
+                active=backlogged,
+                reason="safety stage backlogged; holding pops so jobs do not age past their deadline"
+                if backlogged
+                else None,
+            ),
+        )
+
+        held_unservable = [
+            model
+            for model in bridge_data.image_models_to_load
+            if is_model_locally_unservable_for(bridge_data, self._job_tracker, model)
+        ]
+        readings.append(
+            PopGovernorReading(
+                name="unservable_model_holdback",
+                label="Unservable-model holdback",
+                active=bool(held_unservable),
+                reason=(
+                    f"{len(held_unservable)} model(s) held after repeated faults: {', '.join(sorted(held_unservable))}"
+                )
+                if held_unservable
+                else None,
+            ),
+        )
+
+        failure_pause = bool(self._state.too_many_consecutive_failed_jobs)
+        failure_remaining = (
+            CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS - (now - self._state.too_many_consecutive_failed_jobs_time)
+            if failure_pause
+            else None
+        )
+        readings.append(
+            PopGovernorReading(
+                name="consecutive_failure_pause",
+                label="Consecutive-failure pause",
+                active=failure_pause,
+                reason="paused pops after three consecutive faulted jobs" if failure_pause else None,
+                expected_remaining_seconds=max(0.0, failure_remaining) if failure_remaining is not None else None,
+            ),
+        )
+
+        readings.append(
+            PopGovernorReading(
+                name="pop_error_backoff",
+                label="Pop error-backoff",
+                active=self._job_popper.is_in_error_backoff,
+                reason="backing off the API after recent pop errors" if self._job_popper.is_in_error_backoff else None,
+            ),
+        )
+
+        lora_by_disk = bool(bridge_data.allow_lora and self._state.lora_disk_exhausted)
+        lora_by_download = bool(bridge_data.allow_lora and self._model_availability.background_download_active)
+        lora_reason = None
+        if lora_by_disk:
+            lora_reason = "LoRA cache volume below its free-space floor"
+        elif lora_by_download:
+            lora_reason = "LoRA support suppressed while background downloads run"
+        readings.append(
+            PopGovernorReading(
+                name="lora_pop_backoff",
+                label="LoRA pop backoff",
+                active=lora_by_disk or lora_by_download,
+                reason=lora_reason,
+            ),
+        )
+
+        self_throttle = bool(self._state.self_throttle_paused)
+        throttle_remaining = (self._state.self_throttle_paused_until - now) if self_throttle else None
+        readings.append(
+            PopGovernorReading(
+                name="self_throttle_pause",
+                label="Self-throttle pause",
+                active=self_throttle,
+                reason="paused itself after resource/OOM faults to avoid dropping jobs" if self_throttle else None,
+                expected_remaining_seconds=max(0.0, throttle_remaining) if throttle_remaining is not None else None,
+            ),
+        )
+
+        mps_remaining = self._job_popper.megapixelstep_wait_remaining(bridge_data, now=now)
+        readings.append(
+            PopGovernorReading(
+                name="megapixelstep_wait",
+                label="Megapixelstep wait",
+                active=mps_remaining is not None,
+                reason="letting long-running jobs make progress before popping more"
+                if mps_remaining is not None
+                else None,
+                expected_remaining_seconds=mps_remaining,
+            ),
+        )
+
+        stickiness = getattr(bridge_data, "horde_model_stickiness", 0)
+        loaded_count = sum(1 for p in self._process_map.values() if p.loaded_horde_model_name is not None)
+        stickiness_active = bool(
+            isinstance(stickiness, (int, float))
+            and not isinstance(stickiness, bool)
+            and stickiness > 0
+            and len(bridge_data.image_models_to_load) > self.max_inference_processes
+            and loaded_count >= self.max_inference_processes,
+        )
+        readings.append(
+            PopGovernorReading(
+                name="model_stickiness",
+                label="Model stickiness",
+                active=stickiness_active,
+                reason="preferring already-resident models (stickiness)" if stickiness_active else None,
+            ),
+        )
+
+        return readings
+
+    def _pop_governors_status(self) -> PopGovernorsSnapshot:
+        """Project the governor registry onto the wire snapshot the TUI renders."""
+        elapsed = max(0.0, time.time() - self.session_start_time)
+        views = self._pop_governor_registry.views(now=time.time(), session_elapsed_seconds=elapsed)
+        governors = [
+            PopGovernorStatus(
+                name=view.name,
+                label=view.label,
+                active=view.active,
+                reason=view.reason,
+                current_spell_seconds=view.current_spell_seconds,
+                expected_remaining_seconds=view.expected_remaining_seconds,
+                triggers=view.triggers,
+                total_active_seconds=view.total_active_seconds,
+                fraction_of_session=view.fraction_of_session,
+            )
+            for view in views
+        ]
+        return PopGovernorsSnapshot(governors=governors, any_active=any(v.active for v in views))
+
     def _build_card_snapshots(self) -> list[CardSnapshot]:
         """Project per-card multi-GPU state onto wire models, one per driven card.
 
@@ -2799,6 +3007,7 @@ class HordeWorkerProcessManager:
             orchestration_intent=orchestration_intent,
             work_ledger=self._build_work_ledger(recent_jobs),
             whole_card_residency=self._whole_card_residency_status(),
+            pop_governors=self._pop_governors_status(),
             per_card=self._build_card_snapshots(),
             system_memory=SystemMemorySnapshot.from_summary(self._sample_system_memory()),
         )

@@ -12,6 +12,8 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     FeatureReadinessSummary,
     JobQueueEntry,
     OrchestrationIntentSnapshot,
+    PopGovernorsSnapshot,
+    PopGovernorStatus,
     ProcessSnapshot,
     SystemMemorySnapshot,
     WholeCardResidencyStatus,
@@ -659,3 +661,50 @@ def test_residency_panel_armed_when_only_possible() -> None:
 
     assert "armed" in text
     assert "Weights" not in text
+
+
+def test_governors_panel_shows_active_with_countdown() -> None:
+    """An active timed governor renders with its label, reason, and a remaining-time countdown."""
+    governors = PopGovernorsSnapshot(
+        governors=[
+            PopGovernorStatus(
+                name="large_model_reentry",
+                label="Large-model re-entry cooldown",
+                active=True,
+                reason="cooling down before serving any very-large model",
+                current_spell_seconds=12.0,
+                expected_remaining_seconds=33.0,
+                triggers=1,
+                total_active_seconds=12.0,
+                fraction_of_session=0.1,
+            ),
+        ],
+        any_active=True,
+    )
+    text = _render(OverviewView._render_governors_panel(governors, detailed=False))
+
+    assert "Pop governors" in text
+    assert "Large-model re-entry cooldown" in text
+    assert "left" in text  # the countdown
+
+
+def test_governors_panel_details_lists_released_history() -> None:
+    """In details mode a governor that has released is shown dim with its trigger count and total time."""
+    governors = PopGovernorsSnapshot(
+        governors=[
+            PopGovernorStatus(
+                name="whole_card_residency",
+                label="Whole-card residency",
+                active=False,
+                triggers=3,
+                total_active_seconds=90.0,
+                fraction_of_session=0.3,
+            ),
+        ],
+        any_active=False,
+    )
+    text = _render(OverviewView._render_governors_panel(governors, detailed=True))
+
+    assert "Whole-card residency" in text
+    assert "3x" in text
+    assert "30% of session" in text

@@ -141,6 +141,19 @@ class PopThrottler:
         )
         return False
 
+    def megapixelstep_wait_remaining(self, bridge_data: reGenBridgeData, *, now: float) -> float | None:
+        """Seconds the megapixelstep pause is still holding pops, or None when it is not engaged.
+
+        Read-only: reads the trigger state :meth:`should_wait_for_megapixelsteps` set and recomputes the wait
+        against the *current* pending megapixelsteps, so the estimate tracks the queue draining. Returns None
+        when no wait is active (no trigger, or the wait has elapsed).
+        """
+        if not self._job_tracker._triggered_max_pending_megapixelsteps:
+            return None
+        elapsed = now - self._job_tracker._triggered_max_pending_megapixelsteps_time
+        remaining = self._calculate_megapixelstep_wait(bridge_data) - elapsed
+        return remaining if remaining > 0 else None
+
     def _should_preserve_standby_job(self, bridge_data: reGenBridgeData) -> bool:
         """Return whether popping should continue to fill the first standby slot."""
         queue_size = bridge_data.queue_size

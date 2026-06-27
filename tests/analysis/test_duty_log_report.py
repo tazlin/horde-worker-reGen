@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from horde_worker_regen.analysis.duty_log_report import (
     analyze_log,
+    build_epoch_report,
     parse_duty_window,
+    render_report,
     split_into_epochs,
 )
 
@@ -89,3 +91,44 @@ class TestEpochReport:
         reports = analyze_log(_LOG.splitlines())
         gaps = list(reports[0].mean_gaps())
         assert gaps[0] == "queue wait"  # 21.5 mean >> submit ~3.8
+
+
+_GOV_PREFIX = "horde_worker_regen.process_management.scheduling.pop_governor_registry:_default_log:200"
+
+
+def _gov_enter(ts: str, name: str = "large_model_reentry") -> str:
+    return f"2026-06-19 {ts} | INFO | {_GOV_PREFIX} - Pop governor ENTER: {name} (cooling down); expected ~180s"
+
+
+def _gov_exit(ts: str, name: str = "large_model_reentry") -> str:
+    return f"2026-06-19 {ts} | INFO | {_GOV_PREFIX} - Pop governor EXIT: {name} after 3m00s (1x this session, 3m00s total)"
+
+
+def test_epoch_attributes_pop_governor_spell_time() -> None:
+    """An ENTER/EXIT pair within an epoch is reconstructed into per-governor engaged seconds and rendered."""
+    lines = [
+        "2026-06-19 18:21:00.000 | DEBUG | horde_worker_regen.process_management.process_manager:__init__:503 - Models to load: [...]",
+        _gov_enter("18:22:00.000"),
+        "2026-06-19 18:23:00.000 | WARNING | horde_worker_regen.process_management.process_manager:_log_duty_cycle_summary:1955 - GPU duty cycle 50% over last 180s (target 90%, source=nvml, busy=78%). jobs: 1 done | 0 pending | 0 in-flight; processes: inf#1=WAITING_FOR_JOB",
+        _gov_exit("18:25:00.000"),
+    ]
+
+    report = build_epoch_report(0, lines)
+
+    assert report.governor_seconds.get("large_model_reentry") == 180.0
+    rendered = render_report([report])
+    assert "pop governors engaged" in rendered
+    assert "the large-model re-entry cooldown" in rendered
+
+
+def test_open_governor_spell_counts_to_epoch_end() -> None:
+    """A spell still open at the last record is attributed up to that point, not dropped."""
+    lines = [
+        "2026-06-19 18:21:00.000 | DEBUG | horde_worker_regen.process_management.process_manager:__init__:503 - Models to load: [...]",
+        _gov_enter("18:22:00.000", name="whole_card_residency"),
+        "2026-06-19 18:24:00.000 | WARNING | horde_worker_regen.process_management.process_manager:_log_duty_cycle_summary:1955 - GPU duty cycle 50% over last 180s (target 90%, source=nvml, busy=78%). jobs: 1 done | 0 pending | 0 in-flight; processes: inf#1=WAITING_FOR_JOB",
+    ]
+
+    report = build_epoch_report(0, lines)
+
+    assert report.governor_seconds.get("whole_card_residency") == 120.0

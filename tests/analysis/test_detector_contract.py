@@ -101,6 +101,23 @@ def _no_images(ts: str) -> str:
     return f"2026-06-24 {ts} | WARNING | x:y:1 - Job faulted: no images were produced"
 
 
+def _governor_enter(ts: str, *, name: str = "large_model_reentry") -> str:
+    """PopGovernorRegistry: a governor spell opening (the ENTER boundary the dominance detector pairs)."""
+    return (
+        f"2026-06-24 {ts} | INFO | horde_worker_regen.process_management.scheduling.pop_governor_registry:_default_log:200 - "
+        f"Pop governor ENTER: {name} (cooling down before serving any very-large model after the last drained); "
+        "expected ~600s"
+    )
+
+
+def _governor_exit(ts: str, *, name: str = "large_model_reentry") -> str:
+    """PopGovernorRegistry: a governor spell closing (the EXIT boundary carrying the session totals)."""
+    return (
+        f"2026-06-24 {ts} | INFO | horde_worker_regen.process_management.scheduling.pop_governor_registry:_default_log:200 - "
+        f"Pop governor EXIT: {name} after 10m00s (1x this session, 10m00s total)"
+    )
+
+
 def _startup_line() -> str:
     """The main-process logger-setup line that opens a session (the segmentation boundary)."""
     return f"2026-06-24 18:29:20.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}"
@@ -144,6 +161,11 @@ CONTRACTS: dict[str, Contract] = {
     "detect_forced_maintenance": Contract(
         bridge=_bridge(_give_up("15:19:08.000", jobs=4), _maintenance_pop("15:19:10.000")),
         severity=Severity.CRITICAL,
+    ),
+    "detect_pop_governor_dominance": Contract(
+        # A 10-minute re-entry-cooldown spell over a ~10.5-minute session: well past the dominance share.
+        bridge=_bridge(_governor_enter("18:30:00.000"), _governor_exit("18:40:00.000")),
+        severity=Severity.INFO,
     ),
     "detect_scheduler_starvation_wedge": Contract(
         bridge=_bridge(

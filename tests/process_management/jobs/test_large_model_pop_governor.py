@@ -152,6 +152,57 @@ class TestReentryCooldown:
         assert _evaluate(governor, candidate={_FLUX}, incumbent={_FLUX}, now=16.0, reentry=45.0) == frozenset()
 
 
+class TestDescribe:
+    """The read-only ``describe`` reports window engagement without perturbing the throttle timers."""
+
+    def test_switch_window_reports_active_and_remaining(self) -> None:
+        """With a large model in play and the interval not elapsed, the switch window reads active."""
+        governor = LargeModelPopGovernor()
+        _evaluate(governor, candidate={_FLUX}, incumbent={_FLUX}, now=0.0, switch=30.0)
+        status = governor.describe(
+            incumbent_large_models=frozenset({_FLUX}),
+            residency_active=False,
+            now=10.0,
+            switch_min_seconds=30.0,
+            reentry_cooldown_seconds=0.0,
+        )
+        assert status.switch_active is True
+        assert status.switch_remaining_seconds == 20.0
+        assert status.reentry_active is False
+
+    def test_describe_does_not_mutate_timers(self) -> None:
+        """Calling describe must not advance the switch anchor (a status poll is side-effect free)."""
+        governor = LargeModelPopGovernor()
+        _evaluate(governor, candidate={_FLUX}, incumbent={_FLUX}, now=0.0, switch=30.0)
+        for _ in range(3):
+            governor.describe(
+                incumbent_large_models=frozenset({_FLUX}),
+                residency_active=False,
+                now=10.0,
+                switch_min_seconds=30.0,
+                reentry_cooldown_seconds=0.0,
+            )
+        # The throttle still withholds a different large model exactly as if describe had never been called.
+        assert _evaluate(governor, candidate={_FLUX, _ZIMAGE}, incumbent={_FLUX}, now=10.0, switch=30.0) == frozenset(
+            {_ZIMAGE},
+        )
+
+    def test_reentry_window_reports_active_after_drain(self) -> None:
+        """Once the re-entry window has opened, describe reports it active with the remaining cooldown."""
+        governor = LargeModelPopGovernor()
+        _evaluate(governor, candidate={_FLUX}, incumbent={_FLUX}, now=0.0, reentry=45.0)
+        _evaluate(governor, candidate={_FLUX}, incumbent=set(), now=10.0, reentry=45.0)  # window opens at t=10
+        status = governor.describe(
+            incumbent_large_models=frozenset(),
+            residency_active=False,
+            now=20.0,
+            switch_min_seconds=0.0,
+            reentry_cooldown_seconds=45.0,
+        )
+        assert status.reentry_active is True
+        assert status.reentry_remaining_seconds == 35.0
+
+
 class TestIdleEscape:
     """A fully idle worker (empty local queue) is never left withholding its only available work."""
 

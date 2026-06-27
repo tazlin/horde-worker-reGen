@@ -19,6 +19,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CardSnapshot,
     FeatureReadinessSummary,
     JobQueueEntry,
+    PopGovernorsSnapshot,
     ProcessSnapshot,
     RecentJobRecord,
     WholeCardResidencyStatus,
@@ -215,6 +216,7 @@ class OverviewView(Vertical):
                     yield Static(id="overview-gpus")
                     yield Static(id="overview-pipeline")
                     yield Static(id="overview-intent")
+                    yield Static(id="overview-governors")
                 yield Static(id="overview-trends")
             yield Static(id="overview-queue")
             yield Static(id="overview-work")
@@ -303,6 +305,15 @@ class OverviewView(Vertical):
         show_gpus = not thin and snapshot is not None and bool(snapshot.per_card)
         self.query_one("#overview-gpus", Static).display = show_gpus
 
+        # The pop-governor strip surfaces whatever is currently holding back or reshaping pops. It appears when
+        # a governor is engaged (so a teardown/cooldown/backpressure is never a silent mystery), and in details
+        # mode also when any governor has a session history worth reviewing.
+        governors = snapshot.pop_governors if snapshot is not None else None
+        show_governors = (
+            not thin and governors is not None and (governors.any_active or (detailed and bool(governors.governors)))
+        )
+        self.query_one("#overview-governors", Static).display = show_governors
+
         if snapshot is not None:
             self._maybe_record_trends(snapshot)
 
@@ -316,6 +327,10 @@ class OverviewView(Vertical):
         )
         if snapshot is not None:
             self.query_one("#overview-intent", Static).update(self._render_intent(snapshot, detailed=detailed))
+            if show_governors and governors is not None:
+                self.query_one("#overview-governors", Static).update(
+                    self._render_governors_panel(governors, detailed=detailed),
+                )
             if show_gpus:
                 self.query_one("#overview-gpus", Static).update(self._render_gpus_strip(snapshot, detailed=detailed))
             self.query_one("#overview-trends", Static).update(self._render_trends(snapshot))
@@ -663,6 +678,57 @@ class OverviewView(Vertical):
             title_align="left",
             subtitle=subtitle,
             subtitle_align="right",
+            border_style=border,
+            padding=(0, 1),
+            expand=False,
+        )
+
+    @staticmethod
+    def _render_governors_panel(governors: PopGovernorsSnapshot, *, detailed: bool) -> Panel:
+        """Render the pop/scheduling governors currently holding back or reshaping job pops.
+
+        Active governors lead, each with its reason and either a live countdown (timed windows: a residency
+        cooldown, the switch/re-entry windows, the consecutive-failure or self-throttle pause, the
+        megapixelstep wait) or the elapsed spell duration (condition-based gates). In details mode, governors
+        that have engaged earlier this session are appended dim with their trigger count and total time, so an
+        operator can see how much each one has cost even once it has released.
+        """
+        grid = Table.grid(padding=(0, 1))
+        grid.add_column(width=2)  # status dot
+        grid.add_column(style="bold", no_wrap=True)  # label
+        grid.add_column()  # reason / timing
+
+        active = [g for g in governors.governors if g.active]
+        history = [g for g in governors.governors if not g.active and g.triggers > 0]
+
+        for governor in active:
+            if governor.expected_remaining_seconds is not None:
+                timing = Text(f"~{human_duration(governor.expected_remaining_seconds)} left", style="yellow")
+            else:
+                timing = Text(f"{human_duration(governor.current_spell_seconds)} so far", style="yellow")
+            reason = f" {governor.reason}" if governor.reason else ""
+            grid.add_row(Text("●", style="yellow"), governor.label, Text.assemble(reason.strip(), "  ", timing))
+
+        if not active:
+            grid.add_row(Text("·", style="grey50"), Text("none engaged", style="grey50"), "")
+
+        if detailed and history:
+            for governor in history:
+                summary = f"{governor.triggers}x, {human_duration(governor.total_active_seconds)} total"
+                pct = (
+                    f" ({governor.fraction_of_session * 100:.0f}% of session)" if governor.fraction_of_session else ""
+                )
+                grid.add_row(
+                    Text("○", style="grey50"),
+                    Text(governor.label, style="grey50"),
+                    Text(summary + pct, style="grey50"),
+                )
+
+        border = "yellow" if governors.any_active else "grey37"
+        return Panel(
+            grid,
+            title="Pop governors",
+            title_align="left",
             border_style=border,
             padding=(0, 1),
             expand=False,

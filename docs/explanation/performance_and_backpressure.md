@@ -471,6 +471,30 @@ a large model. The timing state lives in a pure, worker-wide
 both limiters are off by default (zero / inherited-zero durations) and independent of
 `whole_card_exclusive_residency`.
 
+### Governor observability
+
+These limiters, whole-card residency, and the other conditions that hold back or reshape pops (post-inference
+backpressure, the unservable-model holdback, the consecutive-failure and self-throttle pauses, pop
+error-backoff, the LoRA pop backoff, the megapixelstep wait, model stickiness) are all *governors*. They funnel
+into one
+[`PopGovernorRegistry`][horde_worker_regen.process_management.scheduling.pop_governor_registry.PopGovernorRegistry],
+fed once per control-loop tick, which tracks each governor's current *spell* (when it engaged, why, how much
+longer it is expected to last) and its session totals (how many times it engaged and how long in aggregate).
+This makes every governor visible the same way:
+
+- **Logs.** The registry emits a grep-friendly `Pop governor ENTER: <name> (<reason>); expected ~<N>s` at each
+  spell start and `Pop governor EXIT: <name> after <N>s (<count>x, <N>s total)` at each end -- independent of
+  whether a TUI is attached, so the boundaries are always in `bridge.log`.
+- **TUI.** The Overview shows a *Pop governors* strip naming whatever is engaged with a live countdown; the
+  Stats tab shows a per-governor table (engagements, total time, % of session).
+- **Tooling.** `horde-log` ingests the ENTER/EXIT lines and a
+  [`detect_pop_governor_dominance`][horde_worker_regen.analysis.detectors.detect_pop_governor_dominance] finding
+  flags a governor that consumed a large share of the session; `horde-duty-report` attributes per-epoch
+  engaged time to each governor alongside the duty-band shortfall, so idle/non-pop time has a named cause.
+
+The grep-friendly boundary format is the contract between the worker and the log/duty tooling; the regexes live
+in [`governor_signatures`][horde_worker_regen.analysis.governor_signatures].
+
 ## Alchemy backpressure
 
 When `alchemist: true`,

@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 11
+SUPERVISOR_PROTOCOL_VERSION = 12
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -54,6 +54,8 @@ deps+on-disk readiness the worker uses to decide which gated features it offers 
 v10 added ``orchestration_intent`` and ``work_ledger`` so the Overview can show the worker's current
 decision and promote per-job state out of the process table.
 v11 added worker-owned stats samples/history, model/baseline rollups, and the stats JSONL export control.
+v12 added ``pop_governors`` (:class:`PopGovernorsSnapshot`): the live + session-aggregate state of every
+pop/scheduling governor holding back or reshaping job pops, for the Overview strip and the stats tab.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -629,6 +631,45 @@ class WholeCardResidencyStatus(BaseModel):
     """The forecast's largest co-resident process count that still avoids streaming."""
 
 
+class PopGovernorStatus(BaseModel):
+    """One pop/scheduling governor's live spell plus session aggregates, for the dashboard and tooling.
+
+    A governor is any condition that holds back or reshapes job pops (whole-card residency, the large-model
+    switch throttle and re-entry cooldown, post-inference backpressure, the unservable-model holdback, the
+    consecutive-failure pause, pop error-backoff, a LoRA download backoff, model stickiness, the megapixelstep
+    wait, the self-throttle). These fields let the TUI show *which* governor is engaged and *for how long*,
+    and let the stats tab compare how much of the session each one consumed.
+    """
+
+    name: str
+    """Stable machine key (snake_case), e.g. ``large_model_switch``."""
+    label: str
+    """Short human-friendly name for the dashboard."""
+    active: bool = False
+    """Whether the governor is engaged right now."""
+    reason: str | None = None
+    """Short human-readable cause for the current engagement, when active."""
+    current_spell_seconds: float = 0.0
+    """How long the current spell has been engaged (0 when idle)."""
+    expected_remaining_seconds: float | None = None
+    """Estimated seconds until release, or None when the governor has no fixed timer."""
+    triggers: int = 0
+    """How many times this governor has engaged this session."""
+    total_active_seconds: float = 0.0
+    """Aggregate engaged time this session (completed spells plus the live one)."""
+    fraction_of_session: float = 0.0
+    """``total_active_seconds`` as a fraction of the session length so far (0..1)."""
+
+
+class PopGovernorsSnapshot(BaseModel):
+    """The set of pop/scheduling governors with history or a live spell, plus a roll-up flag."""
+
+    governors: list[PopGovernorStatus] = Field(default_factory=list)
+    """Per-governor live + aggregate state, active first (see ``PopGovernorRegistry.views``)."""
+    any_active: bool = False
+    """Whether any governor is currently engaged (a quick "is the worker being held back" flag)."""
+
+
 _CARD_VRAM_PRESSURE_FLOOR_MB = 1024.0
 """Free VRAM below this (or below ~8% of the card) reads as VRAM pressure (a near-OOM heads-up)."""
 
@@ -866,6 +907,9 @@ class WorkerStateSnapshot(BaseModel):
 
     whole_card_residency: WholeCardResidencyStatus = Field(default_factory=WholeCardResidencyStatus)
     """Whole-card exclusive-residency posture: whether it can engage, and live detail when it has."""
+
+    pop_governors: PopGovernorsSnapshot = Field(default_factory=PopGovernorsSnapshot)
+    """The pop/scheduling governors holding back or reshaping job pops, with live + session-aggregate state."""
 
     per_card: list[CardSnapshot] = Field(default_factory=list)
     """Per-card multi-GPU view, one entry per driven card (exactly one on a single-GPU host)."""

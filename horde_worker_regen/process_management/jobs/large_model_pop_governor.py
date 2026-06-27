@@ -42,6 +42,23 @@ class LargeModelPopDecision:
     was withheld."""
 
 
+@dataclass(frozen=True)
+class LargeModelGovernorStatus:
+    """A read-only view of the two large-model limiters' current engagement, for observability.
+
+    Distinct from :class:`LargeModelPopDecision` (which models to withhold *this* pop): this reports whether
+    each window is open right now and how much longer it is expected to last, so the dashboard and the
+    governor registry can show the limiter as engaged independent of whether a candidate happens to be queued.
+    """
+
+    switch_active: bool
+    switch_remaining_seconds: float | None
+    switch_reason: str | None
+    reentry_active: bool
+    reentry_remaining_seconds: float | None
+    reentry_reason: str | None
+
+
 class LargeModelPopGovernor:
     """Stateful tracker for the large-model switch throttle and re-entry cooldown.
 
@@ -114,6 +131,56 @@ class LargeModelPopGovernor:
                 return LargeModelPopDecision(withheld=different, reason="switch throttle")
 
         return LargeModelPopDecision(withheld=frozenset(), reason=None)
+
+    def describe(
+        self,
+        *,
+        incumbent_large_models: frozenset[str],
+        residency_active: bool,
+        now: float,
+        switch_min_seconds: float,
+        reentry_cooldown_seconds: float,
+    ) -> LargeModelGovernorStatus:
+        """Report whether each limiter window is open right now, and how much longer, without mutating state.
+
+        Reads the timing state the last :meth:`evaluate` recorded (the pop loop calls evaluate every cycle, so
+        it is current) and applies the same gate conditions read-only, so a status poll never perturbs the
+        throttle. ``incumbent_large_models`` and ``residency_active`` are the live observations the caller
+        already has; the windows themselves are anchored on the recorded timers.
+        """
+        switch_active = False
+        switch_remaining: float | None = None
+        switch_reason: str | None = None
+        if switch_min_seconds > 0 and incumbent_large_models:
+            elapsed = now - self._last_distinct_large_introduced_at
+            if elapsed < switch_min_seconds:
+                switch_active = True
+                switch_remaining = max(0.0, switch_min_seconds - elapsed)
+                switch_reason = "holding off a different very-large model while one is loaded/queued"
+
+        reentry_active = False
+        reentry_remaining: float | None = None
+        reentry_reason: str | None = None
+        if (
+            reentry_cooldown_seconds > 0
+            and not incumbent_large_models
+            and not residency_active
+            and self._reentry_started_at is not None
+        ):
+            elapsed = now - self._reentry_started_at
+            if elapsed < reentry_cooldown_seconds:
+                reentry_active = True
+                reentry_remaining = max(0.0, reentry_cooldown_seconds - elapsed)
+                reentry_reason = "cooling down before serving any very-large model after the last drained"
+
+        return LargeModelGovernorStatus(
+            switch_active=switch_active,
+            switch_remaining_seconds=switch_remaining,
+            switch_reason=switch_reason,
+            reentry_active=reentry_active,
+            reentry_remaining_seconds=reentry_remaining,
+            reentry_reason=reentry_reason,
+        )
 
     def _update_state(
         self,
