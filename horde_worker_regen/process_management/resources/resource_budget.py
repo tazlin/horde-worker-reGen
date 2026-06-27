@@ -129,6 +129,15 @@ class BudgetVerdict:
         )
 
 
+_WHOLE_CARD_WARRANT_FRACTION = 0.4
+"""Share of total VRAM a model's persistent footprint (weights + bounded floor) must reach before the
+disruptive whole-card residency machinery is justified for it. Below this the model regains ample room by
+evicting a sibling *model*, so its sibling process *contexts* are never the binding constraint -- routing it
+onto the whole-card path can only come from an over-counted per-context overhead. Hardware-relative by
+design: an SDXL checkpoint (~5GB) is well under this fraction of a 24GB card (co-resides) but over it on a
+small card (where it genuinely contends), which is exactly when a teardown is and is not appropriate."""
+
+
 @dataclass(frozen=True)
 class StreamForecast:
     """Forecast of whether loading a model will make ComfyUI stream its weights from host RAM.
@@ -367,6 +376,26 @@ class StreamForecast:
             and self.fits_alone
             and not self.needs_exclusive_residency
         )
+
+    @property
+    def is_card_demanding(self) -> bool:
+        """Whether the model's persistent footprint is a large enough share of the card to justify reserving it.
+
+        The whole-card residency machinery (reserve the device, move safety off-GPU, stop sibling contexts,
+        hold through a cooldown) is disruptive and only pays off for a model whose weights genuinely dominate
+        the card. A model whose weights-plus-bounded-floor occupy only a small fraction of total VRAM always
+        regains ample room by evicting a sibling *model*, so its sibling *contexts* are never the binding
+        constraint; a teardown demand for it can only come from an over-counted per-context overhead. A
+        ``wants_whole_card`` baseline short-circuits True (the tier asserts it never shares well). Conservatively
+        True when the footprint cannot be sized, preserving the prior, more eager behavior. See
+        :data:`_WHOLE_CARD_WARRANT_FRACTION`; the share is taken against total VRAM so the verdict is
+        hardware-relative.
+        """
+        if self.wants_whole_card:
+            return True
+        if self.weights_mb is None or self.total_vram_mb is None or self.total_vram_mb <= 0:
+            return True
+        return (self.weights_mb + self._effective_base_reserve) >= self.total_vram_mb * _WHOLE_CARD_WARRANT_FRACTION
 
     @property
     def streams_unavoidably(self) -> bool:

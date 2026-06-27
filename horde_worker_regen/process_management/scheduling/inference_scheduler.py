@@ -363,6 +363,9 @@ class InferenceScheduler:
         self._scheduler_diagnostic_log_state = {}
         # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
         self._unservable_admit_notified: dict[str, bool] = {}
+        # One-shot log throttle, keyed by model, for the "declined a whole-card residency" notice (a teardown
+        # demand the warrant gate did not trust; see _whole_card_warranted / _log_whole_card_declined).
+        self._whole_card_declined_notified: dict[str, bool] = {}
         # Rate-limit state for line-skip rejection logs, keyed by "candidate_id:reason"; see
         # _log_line_skip_rejection. Maps the key to the monotonic time it was last emitted.
         self._line_skip_rejection_log_state: dict[str, float] = {}
@@ -740,6 +743,52 @@ class InferenceScheduler:
         """Whether preventative whole-card exclusive residency is on (config, tolerant of mocked config)."""
         enabled = self._runtime_config.bridge_data.whole_card_exclusive_residency
         return enabled is True
+
+    def _whole_card_warranted(self, forecast: StreamForecast) -> bool:
+        """Whether a teardown demand is trustworthy enough to engage the whole-card residency machinery.
+
+        Reserving the whole card has a large blast radius -- it stops sibling processes (which may be serving
+        other queued heads), moves safety off-GPU, and holds the device through a cooldown -- so it must only
+        fire on a demand that is not a measurement artifact. Two signals qualify it:
+
+        - a genuinely card-demanding model (its persistent footprint dominates the device, or its baseline is
+          declared whole-card on intent): the teardown is warranted regardless of how contexts are counted; or
+        - a per-additional-context cost that was actually *measured* (the probe's second-context delta or a
+          derived idle-floor): the contention the demand rests on is real, not an over-count.
+
+        When neither holds -- a card-light model on a host where the marginal context cost could not be
+        measured -- the per-context overhead falls back to the full first-context cost, which charges the
+        one-time CUDA runtime against every context and can collapse the structural floor below a model that
+        physically co-resides with room to spare. Engaging a whole-card residency off that phantom reserves the
+        card for a model that never needed it (and, held through the cooldown, can then starve a later head of a
+        different model). So the caller falls through to the ordinary model-eviction path instead, whose
+        terminal admit still gates on real free VRAM, rather than reserving the device on an unmeasured guess.
+        """
+        if forecast.is_card_demanding:
+            return True
+        return self._marginal_process_overhead_mb() is not None
+
+    def _log_whole_card_declined(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast) -> None:
+        """Record (once per model) that a whole-card teardown demand was declined as untrustworthy.
+
+        Names why a model that the budget/forecast wanted to give the whole card was instead served by
+        ordinary eviction: its footprint does not dominate the device and the per-additional-context cost was
+        not measured, so the demand rests on the fallback that charges the one-time runtime cost against every
+        context. Surfaces the numbers behind that call (the model's weight share of the card and whether the
+        marginal was measured) so a teardown that does *not* happen is as visible in the logs as one that does.
+        """
+        if self._whole_card_declined_notified.get(job.model or "", False):
+            return
+        self._whole_card_declined_notified[job.model or ""] = True
+        weights = forecast.weights_mb
+        total = forecast.total_vram_mb
+        share = f"{(weights / total) * 100:.0f}%" if weights is not None and total else "unknown"
+        logger.opt(ansi=True).info(
+            f"<fg #7b7d7d>Declined a whole-card residency for {job.model}: its weights (~{weights or 0:.0f}MB, "
+            f"{share} of the {total or 0:.0f}MB card) do not dominate the device and the per-context overhead is "
+            f"unmeasured (using the conservative first-context fallback), so a teardown demand cannot be trusted. "
+            f"Serving it co-resident via model eviction instead of reserving the card.</>",
+        )
 
     def _residency_state(self, device_index: int | None) -> _WholeCardResidency:
         """Return the (lazily-created) whole-card residency state for ``device_index``.
@@ -2302,7 +2351,13 @@ class InferenceScheduler:
                 # the same head_job contract the budget-eviction branches below follow: a later job never
                 # displaces a resident head. A non-head heavy job falls through to the ordinary verdict and
                 # defers until it becomes the head.
-                if self._whole_card_residency_enabled() and needs_teardown_path and is_head_blocker:
+                whole_card_demanded = self._whole_card_residency_enabled() and needs_teardown_path and is_head_blocker
+                if whole_card_demanded and not self._whole_card_warranted(forecast):
+                    # The teardown demand is not trustworthy (a card-light model on a host with no measured
+                    # per-context cost): decline the reservation and fall through to ordinary eviction rather
+                    # than reserving the device on an over-counted-context phantom.
+                    self._log_whole_card_declined(job, forecast)
+                elif whole_card_demanded:
                     first_time = not self._job_tracker.is_admitted_exclusive(job)
                     self._job_tracker.mark_admitted_exclusive(job)
                     if self._should_prestage_whole_card_head(
@@ -2471,12 +2526,18 @@ class InferenceScheduler:
                                 vram_verdict.reserve_mb,
                                 device_index=target_device_index,
                             )
-                        if (
+                        context_reduction_demanded = (
                             self._whole_card_residency_enabled()
                             and max_resident is not None
                             and self._process_map.num_loaded_inference_processes(device_index=target_device_index)
                             > max_resident
-                        ):
+                        )
+                        if context_reduction_demanded and not self._whole_card_warranted(forecast):
+                            # The reduction depth rests on the per-context overhead; when that is the unmeasured
+                            # fallback for a card-light model, the demand is an over-count phantom. Decline it and
+                            # fall through to the ordinary evict-all admit rather than reserving the card.
+                            self._log_whole_card_declined(job, forecast)
+                        elif context_reduction_demanded:
                             first_time = not self._job_tracker.is_admitted_exclusive(job)
                             self._job_tracker.mark_admitted_exclusive(job)
                             self._establish_whole_card_residency(

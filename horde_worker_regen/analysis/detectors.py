@@ -89,6 +89,16 @@ _WHOLE_CARD_WEDGE_RE = re.compile(r"whole-card residency stuck: cannot reach sol
 # VRAM-budget defer (the card looks idle) unless attributed to the held non-head residency, so it gets its own
 # detector keyed on the worker's _diagnose_dispatch_stall phrase for it.
 _WHOLE_CARD_NONHEAD_RE = re.compile(r"whole-card residency is held for non-head model")
+# A whole-card residency being established: the worker reserved the device for a model, tearing the process
+# pool down to fewer contexts (and cycling safety off-GPU). One is routine; many in a session is reservation
+# churn -- the signature of models being driven onto the whole-card path that do not need it (on a high-VRAM
+# card a model whose weights are a small fraction of total VRAM co-resides, so a teardown demand for it usually
+# means the per-context overhead was over-counted). The phrase is the worker's establish-announce line.
+_WHOLE_CARD_ESTABLISH_RE = re.compile(r"Whole-card residency: reserving the device for")
+# The worker declining to reserve the card for a model whose teardown demand it does not trust (a card-light
+# model on a host with no measured per-context cost). Surfaced as the positive counterpart: it confirms the
+# trust gate is actively preventing reservation churn rather than the churn simply being absent.
+_WHOLE_CARD_DECLINED_RE = re.compile(r"Declined a whole-card residency for")
 
 # The stuck-step watchdog reaping a slot whose ComfyUI generation looped on one sampling step. The slot
 # kept heart-beating (so the silence watchdog stayed blind), which is exactly why this needs its own
@@ -102,6 +112,10 @@ _QUEUE_AGING_LATENCY_RATIO = 3.0
 # A run of server-side slow-aborts at or above this is a spiral (the horde will force maintenance),
 # not a stray slow job.
 _SLOW_ABORT_SPIRAL_THRESHOLD = 3
+
+# A whole-card residency established at or above this many times in a session is reservation churn (the
+# process pool repeatedly torn down and rebuilt, safety cycled off/on the GPU), not a single deliberate hold.
+_WHOLE_CARD_CHURN_THRESHOLD = 3
 
 # A pool that flapped through at least this many soft resets is "stuck recovering", not a one-off blip.
 _SOFT_RESET_FLAP_THRESHOLD = 2
@@ -662,7 +676,7 @@ def detect_consecutive_failure_pause(context: SessionContext) -> list[Finding]:
 
 
 def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
-    """The safety stage stranding jobs whose verdict never returned (the db0 forced-maintenance cause).
+    """The safety stage stranding jobs whose verdict never returned (a forced-maintenance cause).
 
     A job sent to safety whose result is lost is invisible to the orchestrator and sits in SAFETY_CHECKING
     forever; the backlog pins pipeline slots and, with the queue unable to drain, latches the wedge that
@@ -822,6 +836,62 @@ def detect_whole_card_nonhead_residency_starvation(context: SessionContext) -> l
     ]
 
 
+def detect_whole_card_residency_churn(context: SessionContext) -> list[Finding]:
+    """The whole card was reserved repeatedly in a session: reservation churn, not a deliberate hold.
+
+    Establishing a whole-card residency reserves the device, reduces the live process count, and cycles the
+    safety process off the GPU; restoring it reverses all three. Doing that a handful of times in a session is
+    thrash, and on a high-VRAM card it usually means a model that does not need the card is being driven onto
+    the whole-card path: a model whose weights are a small fraction of total VRAM co-resides comfortably, so a
+    teardown demand for it points at the per-context overhead being over-counted (the per-additional-context
+    cost was not measured, so the one-time runtime cost is charged against every context, collapsing the
+    structural free-VRAM floor). The churn alone caps throughput (reload + safety cycling per swap); paired
+    with soft resets or dropped jobs it is the reservation feeding a starvation wedge.
+    """
+    establishes = _matching(context.session.records, _WHOLE_CARD_ESTABLISH_RE)
+    if len(establishes) < _WHOLE_CARD_CHURN_THRESHOLD:
+        return []
+    soft_resets = _matching(context.session.records, _SOFT_RESET_RE)
+    dropped = _total_dropped_jobs(context.session.records)
+    declined = _matching(context.session.records, _WHOLE_CARD_DECLINED_RE)
+    escalated = bool(soft_resets) or dropped > 0
+    return [
+        Finding(
+            id="whole_card_residency_churn",
+            severity=Severity.CRITICAL if escalated else Severity.WARNING,
+            title="Whole-card residency reserved and restored repeatedly (reservation churn)",
+            verdict=(
+                f"The whole card was reserved {len(establishes)} time(s) this session, each time reducing the "
+                "live process count and cycling safety off the GPU, then restoring them. Sustained reservation "
+                "churn is the signature of a model being given the card that does not need it; on a high-VRAM "
+                "card a model whose weights are a small fraction of total VRAM co-resides, so a teardown demand "
+                "for it usually means the per-context overhead was over-counted (an unmeasured marginal). "
+                + (
+                    f"It escalated: the recovery supervisor soft-reset the pools {len(soft_resets)} time(s) and "
+                    f"faulted {dropped} backlog job(s)."
+                    if escalated
+                    else "It did not escalate to a soft reset here, but the reload + safety cycling caps throughput."
+                )
+                + (
+                    f" The trust gate declined {len(declined)} further reservation(s), so it is actively damping "
+                    "the churn."
+                    if declined
+                    else ""
+                )
+            ),
+            remediation=(
+                "Confirm the reserved models are genuinely card-filling. If they are not (a small-weight model "
+                "on a large card), make sure the per-additional-context VRAM cost is measured -- the probe's "
+                "second-context delta or a clean all-idle baseline -- so the structural free-VRAM floor is not "
+                "the one-time runtime cost multiplied by the process count. A correctly measured marginal lets "
+                "such a model co-reside instead of reserving the card."
+            ),
+            evidence=[_evidence(r) for r in (establishes[:2] + soft_resets[:1])],
+            see_also="scheduler_starvation_wedge",
+        ),
+    ]
+
+
 def detect_head_dispatch_stall(context: SessionContext) -> list[Finding]:
     """A head-of-queue job that did not dispatch despite pending work and an idle, model-resident process.
 
@@ -914,6 +984,7 @@ DETECTORS: list[Detector] = [
     detect_safety_stage_stall,
     detect_whole_card_convergence_wedge,
     detect_whole_card_nonhead_residency_starvation,
+    detect_whole_card_residency_churn,
     detect_head_dispatch_stall,
     detect_consecutive_failure_pause,
     detect_stuck_inference_step,

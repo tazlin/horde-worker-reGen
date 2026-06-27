@@ -41,6 +41,7 @@ from tests.analysis.test_detectors import (
     _safety_requeue,
     _server_slow_abort,
     _soft_reset,
+    _whole_card_reserve,
 )
 
 # --- Golden lines for detectors whose trigger is not already a reusable helper in test_detectors. ---
@@ -184,6 +185,14 @@ CONTRACTS: dict[str, Contract] = {
             _soft_reset("13:01:30.000"),
         ),
         severity=Severity.CRITICAL,
+    ),
+    "detect_whole_card_residency_churn": Contract(
+        bridge=_bridge(
+            _whole_card_reserve("07:54:50.000"),
+            _whole_card_reserve("07:55:45.000", model="CyberRealistic Pony"),
+            _whole_card_reserve("07:57:46.000"),
+        ),
+        severity=Severity.WARNING,
     ),
     "detect_consecutive_failure_pause": Contract(
         bridge=_bridge(_consecutive_pause("15:19:11.000")),

@@ -541,6 +541,16 @@ def _dispatch_stall(ts: str, *, reason: str, model: str = "AlbedoBase XL (SDXL)"
     )
 
 
+def _whole_card_reserve(ts: str, *, model: str = "AlbedoBase XL (SDXL)") -> str:
+    """inference_scheduler._establish_whole_card_residency: the worker reserving the device for a model."""
+    return (
+        f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.scheduling.inference_scheduler:_establish_whole_card_residency:1043 - "
+        f"Whole-card residency: reserving the device for {model} (inference processes 4 -> 3 of 4, target 3) and "
+        "moving safety off-GPU. Its weights + activations need the whole ~24GB card; co-resident siblings/safety "
+        "would force the driver to stream activations to host RAM and run several times slower."
+    )
+
+
 _DISPATCH_GATE_REASON = (
     "its model is resident and idle on process 1, but the concurrency cap is reached (in_progress=1, cap=1)"
 )
@@ -692,6 +702,46 @@ class TestWholeCardNonHeadResidencyStarvation:
         findings = _diagnose(tmp_path, bridge)
         assert "whole_card_nonhead_residency_starvation" in findings
         assert "head_dispatch_stall" not in findings
+
+
+class TestWholeCardResidencyChurn:
+    """Repeated whole-card reservations in a session: the over-eager-reservation signature."""
+
+    def _bridge(self, *lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-25 07:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def test_repeated_reservations_are_flagged_as_churn(self, tmp_path: Path) -> None:
+        """Three reservations in a session is churn, surfaced as a warning when it did not escalate."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _whole_card_reserve("07:54:50.000"),
+                _whole_card_reserve("07:55:45.000", model="CyberRealistic Pony"),
+                _whole_card_reserve("07:57:46.000"),
+            ),
+        )
+        assert "whole_card_residency_churn" in findings
+        assert findings["whole_card_residency_churn"].severity is Severity.WARNING
+
+    def test_churn_with_soft_reset_is_critical(self, tmp_path: Path) -> None:
+        """Reservation churn that escalated to a soft reset is the wedge-feeding case (critical)."""
+        findings = _diagnose(
+            tmp_path,
+            self._bridge(
+                _whole_card_reserve("07:54:50.000"),
+                _whole_card_reserve("07:55:45.000"),
+                _whole_card_reserve("07:57:46.000"),
+                _soft_reset("07:59:45.000"),
+            ),
+        )
+        assert findings["whole_card_residency_churn"].severity is Severity.CRITICAL
+
+    def test_a_single_reservation_is_not_churn(self, tmp_path: Path) -> None:
+        """One deliberate reservation is normal and must not fire (only sustained cycling does)."""
+        findings = _diagnose(tmp_path, self._bridge(_whole_card_reserve("07:54:50.000")))
+        assert "whole_card_residency_churn" not in findings
 
 
 class TestHeadDispatchStall:
