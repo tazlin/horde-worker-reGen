@@ -995,7 +995,11 @@ class InferenceScheduler:
         current = self._process_map.num_loaded_inference_processes(device_index=device_index)
         after = current
         if target < current:
-            after = self._process_lifecycle.scale_inference_processes(target, device_index=device_index)
+            after = self._process_lifecycle.scale_inference_processes(
+                target,
+                device_index=device_index,
+                whole_card_model=job.model,
+            )
 
         safety_paused = self._pause_safety_for_residency_if_idle(device_index)
 
@@ -3392,6 +3396,10 @@ class InferenceScheduler:
 
         self._pending_line_skip = None
 
+        # A job dispatched: any prior stall reason is now stale. Clear it so the
+        # orchestrator intent's "Holding dispatch" does not stick after the stall resolves.
+        self._dispatch_stall_last_reason = None
+
         return True
 
     def _compute_wanted_models(self) -> set[str]:
@@ -3490,9 +3498,7 @@ class InferenceScheduler:
             # cannot reach sole residency and dispatch is permanently blocked until save-our-ship
             # soft-resets the pools). Only the residency holder is spared; other models are still
             # reclaimable.
-            if any(state.model == model_name for _, state in self._held_residencies()):
-                return True
-            return False
+            return any(state.model == model_name for _, state in self._held_residencies())
 
         if affinity_active(len(wanted_models), self._max_inference_processes) and model_name in wanted_models:
             return True

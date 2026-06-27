@@ -141,8 +141,9 @@ def _wire_scheduler_with_real_plm(
 
 
 class TestNonHeadContextReductionBlocked:
-    """The verdict-driven ``context_reduction_demanded`` path must not grant a whole-card residency to a
-    job that is not the head of the queue.
+    """The verdict-driven ``context_reduction_demanded`` path must not grant a whole-card residency.
+
+    It must not grant residency to a job that is not the head of the queue.
 
     The ``whole_card_demanded`` (forecast-driven) path already gates on ``is_head_blocker``; the
     verdict-driven path was missing that guard, so a deeper-queue job whose VRAM budget failed could
@@ -191,11 +192,17 @@ class TestNonHeadContextReductionBlocked:
         _orig_establish = scheduler._establish_whole_card_residency
 
         def _track_establish(
-            job: object, forecast: object, *, announce: bool = False,  # noqa: ARG001
-            target_override: object = None, device_index: object = None,  # noqa: ARG001
+            job: object,
+            forecast: object,
+            *,
+            announce: bool = False,  # noqa: ARG001
+            target_override: object = None,
+            device_index: object = None,  # noqa: ARG001
         ) -> None:
             establish_called_for.append(str(job.model))  # type: ignore[union-attr]
-            _orig_establish(job, forecast, announce=announce, target_override=target_override, device_index=device_index)
+            _orig_establish(
+                job, forecast, announce=announce, target_override=target_override, device_index=device_index
+            )
 
         scheduler._establish_whole_card_residency = _track_establish  # type: ignore[assignment]
 
@@ -249,9 +256,7 @@ class TestNonHeadContextReductionBlocked:
         # )
         # We check that _whole_card_residency_enabled() returns True AND the residency map
         # is never set to a model for a non-head job.
-        assert scheduler._whole_card_residency_enabled() is True, (
-            "whole-card residency must be enabled for this test"
-        )
+        assert scheduler._whole_card_residency_enabled() is True, "whole-card residency must be enabled for this test"
 
         # The head path (whole_card_demanded) requires is_head_blocker; set up a head scenario.
         flux_proc = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
@@ -284,8 +289,9 @@ class TestNonHeadContextReductionBlocked:
 
 
 class TestWholeCardResidencyProtectsFromVramEviction:
-    """A whole-card residency holder's model must be protected from VRAM eviction, even when the
-    budget is under pressure and looking for idle VRAM to reclaim.
+    """A whole-card residency holder's model must be protected from VRAM eviction.
+
+    This must hold even when the budget is under pressure and looking for idle VRAM to reclaim.
 
     ``_residency_protects_from_unload`` short-circuited to ``False`` when ``under_pressure=True``,
     so a budget reclamation triggered for any job (including a non-head job) could evict the
@@ -361,9 +367,7 @@ class TestWholeCardResidencyProtectsFromVramEviction:
             vram=True,
             under_pressure=True,
         )
-        assert protected is False, (
-            f"non-residency model {_RESIDENT_SDXL!r} must remain evictable under pressure"
-        )
+        assert protected is False, f"non-residency model {_RESIDENT_SDXL!r} must remain evictable under pressure"
 
     async def test_vram_eviction_spares_residency_holder(self) -> None:
         """End-to-end: ``unload_models_from_vram`` under pressure must skip the residency holder's process.
@@ -389,9 +393,10 @@ class TestWholeCardResidencyProtectsFromVramEviction:
                 HordeControlModelMessage,
             )
 
-            if isinstance(msg, HordeControlMessage) and msg.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
-                unloaded_from.append(flux_process.process_id)
-            elif isinstance(msg, HordeControlModelMessage) and msg.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+            if (
+                isinstance(msg, HordeControlMessage | HordeControlModelMessage)
+                and msg.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+            ):
                 unloaded_from.append(flux_process.process_id)
             return orig_send(msg)
 
@@ -402,9 +407,10 @@ class TestWholeCardResidencyProtectsFromVramEviction:
                 HordeControlModelMessage,
             )
 
-            if isinstance(msg, HordeControlMessage) and msg.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
-                unloaded_from.append(sdxl_process.process_id)
-            elif isinstance(msg, HordeControlModelMessage) and msg.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+            if (
+                isinstance(msg, HordeControlMessage | HordeControlModelMessage)
+                and msg.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+            ):
                 unloaded_from.append(sdxl_process.process_id)
             return orig_send(msg)
 
@@ -421,9 +427,72 @@ class TestWholeCardResidencyProtectsFromVramEviction:
         )
 
 
+class TestInitialEstablishUsesWholeCardAwareShrink:
+    """Initial whole-card establishment must use the same narrowed scale-down as convergence.
+
+    The convergence loop already passes ``whole_card_model`` so queued-model siblings behind the head do not
+    pin the card above the residency target. The immediate establish path needs the same narrowing: it runs
+    when the card is otherwise idle, so there is no later "live job drained" transition to rescue the head.
+    """
+
+    async def test_initial_establish_stops_idle_queued_sibling(self) -> None:
+        """A head claiming the whole card immediately must stop an idle sibling holding a queued model."""
+        flux_holder = make_mock_process_info(1, model_name=_FLUX_MODEL, state=HordeProcessState.WAITING_FOR_JOB)
+        sdxl_idle = make_mock_process_info(2, model_name=_RESIDENT_SDXL, state=HordeProcessState.WAITING_FOR_JOB)
+        for proc in (flux_holder, sdxl_idle):
+            proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+            proc.vram_usage_mb = _PER_PROCESS_OVERHEAD_MB
+        process_map = ProcessMap({1: flux_holder, 2: sdxl_idle})
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(
+            horde_model_name=_FLUX_MODEL,
+            load_state=ModelLoadState.LOADED_IN_RAM,
+            process_id=1,
+        )
+        horde_model_map.update_entry(
+            horde_model_name=_RESIDENT_SDXL,
+            load_state=ModelLoadState.LOADED_IN_VRAM,
+            process_id=2,
+        )
+
+        job_tracker = JobTracker()
+        scheduler = _wire_scheduler_with_real_plm(
+            process_map=process_map,
+            job_tracker=job_tracker,
+            horde_model_map=horde_model_map,
+            bridge_data=_deadlock_bridge_data(),
+        )
+        flux_job = await track_popped_job_async(
+            job_tracker,
+            make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),
+        )
+        await track_popped_job_async(job_tracker, make_job_pop_response(_RESIDENT_SDXL))
+
+        forecast = StreamForecast(
+            weights_mb=_FLUX_WEIGHTS_MB,
+            reserve_mb=6500.0,
+            base_reserve_mb=_VRAM_RESERVE_MB,
+            free_now_mb=_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB,
+            free_if_alone_mb=_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB,
+            free_after_model_evict_mb=_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB,
+            total_vram_mb=_DEVICE_TOTAL_VRAM_MB,
+            per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+            wants_whole_card=True,
+        )
+        assert forecast.max_resident_processes() == 1
+
+        scheduler._establish_whole_card_residency(flux_job, forecast, announce=False)
+
+        assert process_map.num_loaded_inference_processes() == 1, (
+            "initial whole-card establishment must use the whole-card-aware shrink; the idle queued-model "
+            "sibling must not pin the card above the head's target"
+        )
+
+
 class TestPrestagedHeadProgressesWithRamOnlyModel:
-    """A pre-staged whole-card head whose model is only in RAM (evicted from VRAM) must still
-    reach dispatch once the teardown is otherwise exhausted.
+    """A pre-staged whole-card head whose model is only in RAM must still reach dispatch.
+
+    This covers the evicted-from-VRAM case once the teardown is otherwise exhausted.
 
     ``_prestaged_whole_card_not_ready`` was recalculating the forecast on every scheduling tick.
     When the model had been evicted from VRAM the fresh forecast's ``fits_weights_now`` could
@@ -475,13 +544,12 @@ class TestPrestagedHeadProgressesWithRamOnlyModel:
         # When teardown is exhausted (at target count, no safety needed, fits_weights_now),
         # _prestaged_whole_card_not_ready must return False so the head can dispatch.
         exhausted = scheduler._whole_card_teardown_exhausted(forecast)
-        assert exhausted is True, (
-            "with sole residency and fitting weights, the teardown must read exhausted"
-        )
+        assert exhausted is True, "with sole residency and fitting weights, the teardown must read exhausted"
 
         # The key assertion: with teardown exhausted, the pre-staged head must be ready.
         flux_head = await track_popped_job_async(
-            job_tracker, make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),
+            job_tracker,
+            make_job_pop_response(_FLUX_MODEL, width=1216, height=1216),
         )
         not_ready = scheduler._prestaged_whole_card_not_ready(flux_head)
         assert not_ready is False, (
@@ -603,9 +671,7 @@ class TestFullDeadlockScenario:
         # After convergence: the SDXL sibling should be torn down (reaching the budget target).
         target_count = forecast.max_resident_processes()
         live_count = process_map.num_loaded_inference_processes()
-        assert live_count == target_count, (
-            f"convergence must reduce process count to {target_count}, got {live_count}"
-        )
+        assert live_count == target_count, f"convergence must reduce process count to {target_count}, got {live_count}"
 
         # The Flux head must be ready to dispatch.
         flux_head = job_tracker.jobs_pending_inference[0]
