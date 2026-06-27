@@ -304,7 +304,7 @@ The scheduler suppresses that eviction for one dispatch when, and only when, bot
 When both hold, the dispatch carries a "keep resident after" hint to the engine, which skips the post-job
 VRAM cleanup so the following same-model job samples immediately with no reload. Retention is granted on
 evidence, never assumed: a disabled budget or unmeasured VRAM falls back to eviction, and even a granted
-retention is a soft hold — the engine's force-load overflow guard and the worker's under-pressure
+retention is a soft hold. The engine's force-load overflow guard and the worker's under-pressure
 reclaim can still evict it, so a wrong call degrades to a reload rather than an out-of-memory. This is the
 mechanism that lets a sticky or homogeneous workload realise back-to-back sampling on its hot model
 without paying the [structural reload](duty-cycle.md#the-structural-ceiling-on-vram-constrained-cards)
@@ -418,6 +418,21 @@ scheduler computes the largest live-context count that still fits the job's peak
 model and forcing a full reload storm. This is the structural remedy for the `threads > 1` co-residence
 thrash: it fires exactly when the admission verdict would otherwise reject the head every tick and route
 it into an evict-all admit.
+
+Both of those teardown paths (the streaming forecast's `needs_teardown` and the verdict-driven context
+reduction) are gated on the demand being **trustworthy** before the worker engages the disruptive whole-card
+machinery (reserve the device, move safety off-GPU, hold through a cooldown). A teardown is trusted when the
+model is genuinely **card-demanding**; its weights-plus-floor occupy a meaningful fraction of total VRAM, or
+its baseline wants the whole card on intent **or** when the per-additional-context cost was actually
+*measured* (a probe delta or a clean idle floor), so the contention it rests on is real. When neither holds,
+a model whose weights are a small fraction of the card on a host that could not measure the marginal. The
+per-context overhead is the conservative first-context fallback, which over-counts contexts and can manufacture
+a teardown demand a model that physically co-resides never needs. The scheduler **declines** the reservation
+there and serves the model by ordinary eviction (whose terminal admit still gates on real free VRAM), logging
+why. This keeps a small-weight model on a large card (an SDXL checkpoint on a 24 GB device, say) co-resident
+rather than reserving the card for it; on a smaller card the same checkpoint *is* card-demanding, so a teardown
+there remains available. It is the difference between a teardown justified by measured contention and one
+conjured by an unmeasured over-count.
 
 ## Alchemy backpressure
 
