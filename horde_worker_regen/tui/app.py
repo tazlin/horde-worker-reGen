@@ -400,6 +400,7 @@ class HordeWorkerTUI(App[None]):
         # and fire a toast exactly once when the horde forces maintenance via the pop response.
         self._prev_pop_maintenance_mode: bool = False
         self._update_info: UpdateInfo | None = None
+        self._start_time: float = 0.0
         # True once a graceful quit (Ctrl+Q/Ctrl+C) has been requested; on a second quit attempt while
         # this flag is set, the app escalates to force-kill the worker immediately instead of waiting
         # for the graceful drain deadline.
@@ -446,10 +447,23 @@ class HordeWorkerTUI(App[None]):
             return True
         return encoding.lower().replace("-", "") not in ("utf8", "utf8sig")
 
+    def _build_title(self) -> str:
+        elapsed = int(time.monotonic() - self._start_time)
+        h, remainder = divmod(elapsed, 3600)
+        m, s = divmod(remainder, 60)
+        clock = f"{h:02d}:{m:02d}:{s:02d}"
+        suffix = " (Update Available)" if self._update_info is not None else ""
+        return f"AI Horde Worker - v{__version__} [{clock}]{suffix}"
+
+    def _refresh_title(self) -> None:
+        self.title = self._build_title()
+
     def on_mount(self) -> None:
         """Begin the refresh loop, then run first-run setup or the usual start/onboarding prompts."""
+        self._start_time = time.monotonic()
         configure_fidelity(self._detect_low_fidelity(self.console.encoding))
         self.set_interval(0.1, self._tick)
+        self.set_interval(1.0, self._refresh_title)
         # Resolve the models volume from config before any disk figures are computed, so free space and
         # on-disk checks match the worker's configured cache_home instead of defaulting to ./models.
         with contextlib.suppress(Exception):
@@ -512,7 +526,7 @@ class HordeWorkerTUI(App[None]):
         if info is None:
             return
         self._update_info = info
-        self.title = f"AI Horde Worker - v{__version__} (Update Available)"
+        self._refresh_title()
         with contextlib.suppress(Exception):
             self.query_one(OverviewView).set_update_available(info)
         self.notify(
