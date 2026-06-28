@@ -400,6 +400,10 @@ class HordeWorkerTUI(App[None]):
         # and fire a toast exactly once when the horde forces maintenance via the pop response.
         self._prev_pop_maintenance_mode: bool = False
         self._update_info: UpdateInfo | None = None
+        # True once a graceful quit (Ctrl+Q/Ctrl+C) has been requested; on a second quit attempt while
+        # this flag is set, the app escalates to force-kill the worker immediately instead of waiting
+        # for the graceful drain deadline.
+        self._graceful_quit_in_progress = False
 
     def compose(self) -> ComposeResult:
         """Lay out the header, status bar, tabbed views, and footer."""
@@ -1606,10 +1610,23 @@ class HordeWorkerTUI(App[None]):
 
         When running as a browser session on Windows (attached to a worker host), the worker
         survives this close. A warning modal explains this and offers the user a way back.
+
+        The first Ctrl+Q/Ctrl+C starts a graceful shutdown (drain in-flight jobs, submit results,
+        then exit). Pressing it again while that graceful stop is underway escalates to an
+        immediate force-kill of the worker process tree, so the TUI is never stuck waiting on a
+        worker whose control loop is frozen (UNRESPONSIVE).
         """
         if sys.platform == "win32" and isinstance(self._supervisor, AttachedWorkerSupervisor):
             self.push_screen(WebQuitWarningModal(), self._on_web_quit_choice)
             return
+        if self._graceful_quit_in_progress:
+            # The operator pressed quit again while a graceful stop is already in progress.
+            # Escalate: force-kill the worker immediately and exit.
+            self.notify("Force-stopping worker (repeated quit)…")
+            self._supervisor.force_kill()
+            self.exit()
+            return
+        self._graceful_quit_in_progress = True
         self._do_quit()
 
     def _on_web_quit_choice(self, confirmed: bool | None) -> None:
@@ -1618,6 +1635,7 @@ class HordeWorkerTUI(App[None]):
         ``None`` (the modal dismissed without a choice, e.g. Escape) is treated as "do not quit".
         """
         if confirmed:
+            self._graceful_quit_in_progress = True
             self._do_quit()
 
     def _do_quit(self) -> None:

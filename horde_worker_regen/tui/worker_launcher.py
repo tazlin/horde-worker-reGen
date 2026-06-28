@@ -685,6 +685,29 @@ class WorkerSupervisor:
         if set_stopped_status:
             self._set_status(SupervisorStatus.STOPPED)
 
+    def force_kill(self) -> None:
+        """Force-kill the worker process tree immediately, without waiting for a graceful drain.
+
+        Best-effort sends a SHUTDOWN command first (the pipe buffer may accept it even if the worker's
+        control loop is frozen), then kills the worker and all its GPU-resident children without any grace
+        period. Cleans up the pipe and process handle so the state machine reads ``STOPPED`` afterward.
+
+        This is the escalation path when the operator presses Ctrl+Q/Ctrl+C repeatedly while the worker
+        is UNRESPONSIVE: the first press tries a graceful stop, and a second (or third) skips straight
+        to the kill rather than blocking on the join timeout.
+        """
+        self._intentional_stop = True
+        process = self._process
+        if process is not None and process.is_alive():
+            self.send_command(SupervisorControlMessage(command=SupervisorCommand.SHUTDOWN))
+            self._force_kill_tree(process)
+            # A brief join so the OS can reap the process before we drop the handle.
+            with contextlib.suppress(Exception):
+                process.join(2.0)
+        self._cleanup_process()
+        self._graceful_stop_deadline = 0.0
+        self._set_status(SupervisorStatus.STOPPED)
+
     def close(self) -> None:
         """Release the worker when the frontend exits.
 

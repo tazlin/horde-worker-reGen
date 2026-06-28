@@ -114,6 +114,13 @@ class SupervisorLike(Protocol):
     def request_set_stats_export(self, enabled: bool) -> bool:
         """Ask the worker to enable or disable stats JSONL export."""
 
+    def force_kill(self) -> None:
+        """Force-kill the worker process tree immediately, without waiting for a graceful drain.
+
+        The owning supervisor kills the local worker tree; the attach supervisor sends a stop intent
+        and closes the connection (the host owns the real process tree).
+        """
+
 
 class AttachedWorkerSupervisor:
     """Presents the supervisor interface while the real worker lives on a separate host process."""
@@ -185,6 +192,15 @@ class AttachedWorkerSupervisor:
     def restart(self) -> None:
         """Ask the host to restart the worker as a single intent (sent even across a brief disconnect)."""
         self._send_lifecycle(sp.LIFECYCLE_RESTART)
+
+    def force_kill(self) -> None:
+        """Ask the host to stop the worker, then detach this session immediately.
+
+        In attached mode the real process tree lives on the host, so this sends a stop lifecycle
+        message and tears down the connection without waiting for confirmation.
+        """
+        self.stop()
+        self.close()
 
     def close(self) -> None:
         """Detach this session without stopping the worker (it lives on the host)."""
