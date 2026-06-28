@@ -1144,9 +1144,29 @@ class InferenceScheduler:
                 continue
             forecast = state.forecast
             target = (forecast.max_resident_processes() or 1) if forecast is not None else 1
-            if self._process_map.num_loaded_inference_processes(device_index=device_index) > target:
+            current = self._process_map.num_loaded_inference_processes(device_index=device_index)
+            if current > target:
                 self._process_lifecycle.scale_inference_processes(
                     target,
+                    device_index=device_index,
+                    whole_card_model=model,
+                )
+            elif (
+                current > 1
+                and forecast is not None
+                and forecast.weights_mb is not None
+                and not self._whole_card_weights_fit_now(forecast, device_index=device_index)
+            ):
+                # The budget says this many contexts co-reside with the weights (current ≤ target), but
+                # the live free-VRAM reading says the weights do not fit *right now* -- typically because
+                # sibling *models* still hold VRAM that model eviction has not yet reclaimed, or the
+                # device has not drained.  Stop one idle sibling so its CUDA context (~marginal MB) is
+                # freed; on a card where the marginal is measured that freed VRAM is often enough to let
+                # the weights-fit check flip to True next tick, so the head dispatches without waiting for
+                # natural model eviction or an SOS soft-reset.  The shrink is paced one process per tick
+                # (the next tick re-evaluates against the updated free VRAM), so it never overshoots.
+                self._process_lifecycle.scale_inference_processes(
+                    current - 1,
                     device_index=device_index,
                     whole_card_model=model,
                 )
@@ -1192,7 +1212,23 @@ class InferenceScheduler:
         if stored is not None:
             # The stored forecast reflects the residency's actual budget-relative target and the
             # weight footprint at establishment time; only re-derive when it was never captured.
-            return not self._whole_card_teardown_exhausted(stored, device_index=device_index)
+            if self._whole_card_teardown_exhausted(stored, device_index=device_index):
+                return False
+            # The teardown is not exhausted.  The remaining blocker may only be the stored
+            # forecast's stale fits_weights_now (its free_now_mb was captured before the
+            # convergence shrink stopped idle siblings and freed VRAM).  When the process
+            # count is already at or below target and safety is settled, check the live
+            # device free-VRAM reading: if the weights fit *now*, the head can proceed.
+            target = stored.max_resident_processes() or 1
+            count_settled = self._process_map.num_loaded_inference_processes(device_index=device_index) <= target
+            safety_settled = (
+                not self._residency_should_pause_safety(device_index) or self._process_lifecycle.is_safety_gpu_paused
+            )
+            return not (
+                count_settled
+                and safety_settled
+                and self._whole_card_weights_fit_now(stored, device_index=device_index)
+            )
         baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
         forecast = self._forecast_streaming(job, baseline, device_index=device_index)
         return not self._whole_card_teardown_exhausted(forecast, device_index=device_index)
@@ -1209,6 +1245,22 @@ class InferenceScheduler:
             if state.model == model:
                 return (True, device_index)
         return (False, None)
+
+    def _whole_card_weights_fit_now(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
+        """Whether the residency model's weights fit in the *current* measured free VRAM.
+
+        Like :meth:`StreamForecast.fits_weights_now` but keyed on the live device free-VRAM reading rather
+        than the forecast's stored ``free_now_mb`` (which was captured at pre-stage time and may be stale).
+        The stored forecast contributes the weight footprint and the base reserve; only the free-VRAM
+        measurement is refreshed.  Unknown measurement (cold start) returns False so the shrink is not
+        triggered on a guess.
+        """
+        if forecast.weights_mb is None:
+            return False
+        free_now = self._measured_free_vram_mb(device_index=device_index)
+        if free_now is None:
+            return False
+        return (free_now - forecast.weights_mb) >= forecast._effective_base_reserve  # noqa: SLF001
 
     def _whole_card_teardown_exhausted(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
         """Whether a whole-card residency has done all it can and the head can now load best-effort.
