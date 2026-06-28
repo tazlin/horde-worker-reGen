@@ -162,11 +162,7 @@ class OverviewView(Vertical):
         width: 100%;
     }
     OverviewView #overview-intent-row {
-        layout: grid;
-        grid-size: 3;
-        grid-columns: 1fr 1fr 1fr;
-        grid-rows: auto;
-        grid-gutter: 0 1;
+        layout: vertical;
         height: auto;
         width: 100%;
     }
@@ -174,6 +170,16 @@ class OverviewView(Vertical):
         width: 100%;
         height: auto;
         margin: 0;
+    }
+    OverviewView.-details-wide #overview-intent-row {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr 1fr;
+        grid-rows: auto;
+        grid-gutter: 1 1;
+    }
+    OverviewView.-details-wide #overview-queue {
+        column-span: 2;
     }
     """
     """Row containers stay vertical by default, then detailed mode opts into horizontal adjacency when the
