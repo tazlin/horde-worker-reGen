@@ -1432,6 +1432,42 @@ class HordeWorkerProcessManager:
             # Sleep briefly (not the full user info interval) so shutdown is detected promptly.
             await asyncio.sleep(1)
 
+    async def _periodic_update_check_loop(self) -> None:
+        """Re-check for a newer worker release every 30 minutes and surface in logs.
+
+        The initial check runs from ``_start_release_update_check`` at startup; this loop keeps
+        the verdict current for long-running workers so a release published mid-session is noticed.
+        The result is recorded via :func:`horde_worker_regen.update_check.apply_update_check_result`
+        so the periodic status report picks it up without further plumbing.
+        """
+        from horde_worker_regen.update_check import (
+            UPDATE_CHECK_INTERVAL_SECONDS,
+            apply_update_check_result,
+            check_for_update,
+            current_version,
+            update_check_disabled,
+        )
+
+        if update_check_disabled():
+            return
+
+        while True:
+            await asyncio.sleep(UPDATE_CHECK_INTERVAL_SECONDS)
+            if self.is_time_for_shutdown() or self._state.shut_down:
+                break
+            try:
+                info = check_for_update()
+            except Exception:  # noqa: BLE001 - an update check must never affect the worker
+                continue
+            apply_update_check_result(info)
+            if info is None:
+                logger.info(f"Worker v{current_version()} is up to date.")
+            else:
+                logger.warning(
+                    f"Update available: v{current_version()} -> v{info.latest_version}. Update with "
+                    "'update.cmd'/'update.sh', or by re-running the installer.",
+                )
+
     _status_message_frequency = 20.0
     """The rate in seconds at which to print status messages with details about the current state of the worker."""
     _last_status_message_time = 0.0
@@ -3370,6 +3406,7 @@ class HordeWorkerProcessManager:
                 self._api_get_user_info_loop(),
                 self._job_submitter.run(),
                 self._alchemy_coordinator.run(),
+                self._periodic_update_check_loop(),
             ]
             if not self.bridge_data._loaded_from_env_vars:
                 coroutines.append(self._bridge_data_reloader.bridge_data_loop())

@@ -215,17 +215,17 @@ def _run_release_update_check() -> None:
     When a newer release is found it is recorded in ``AIWORKER_NEWER_RELEASE_AVAILABLE`` so the periodic
     status report can re-nag. Any failure is swallowed: an update check must never affect the worker.
     """
-    from horde_worker_regen.update_check import NEWER_RELEASE_ENV_VAR, check_for_update, current_version
+    from horde_worker_regen.update_check import apply_update_check_result, check_for_update, current_version
 
     try:
         info = check_for_update()
     except Exception as update_error:  # noqa: BLE001 - an update check must never affect the worker
         logger.debug(f"Release update check failed: {update_error}")
         return
+    apply_update_check_result(info)
     if info is None:
         logger.info(f"Worker v{current_version()} is up to date.")
         return
-    os.environ[NEWER_RELEASE_ENV_VAR] = info.latest_version
     logger.warning(
         f"Update available: v{current_version()} -> v{info.latest_version}. Update with "
         "'update.cmd'/'update.sh', or by re-running the installer.",

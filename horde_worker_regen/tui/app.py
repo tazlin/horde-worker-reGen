@@ -455,6 +455,9 @@ class HordeWorkerTUI(App[None]):
         with contextlib.suppress(Exception):
             apply_beta_model_env(self._config_path)
         self._maybe_check_for_updates()
+        from horde_worker_regen.update_check import UPDATE_CHECK_INTERVAL_SECONDS
+
+        self.set_interval(UPDATE_CHECK_INTERVAL_SECONDS, self._periodic_update_check)
         self._warm_model_catalog()
         if self._should_run_setup_wizard():
             self._run_setup_wizard()
@@ -490,6 +493,14 @@ class HordeWorkerTUI(App[None]):
         if os.environ.get("AI_HORDE_TESTING") or os.environ.get("HORDE_WORKER_NO_UPDATE_CHECK"):
             return
         self.run_worker(self._update_check(), group="update-check", exclusive=True)
+
+    def _periodic_update_check(self) -> None:
+        """Re-check for a newer release every 30 minutes (called by the interval timer).
+
+        Delegates to :meth:`_maybe_check_for_updates` so the same guards (fake mode, disabled, tests)
+        and the same result-surfacing logic apply.
+        """
+        self._maybe_check_for_updates()
 
     async def _update_check(self) -> None:
         """Notify (non-blocking) when a newer release is available and how to get it."""

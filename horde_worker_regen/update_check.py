@@ -25,6 +25,9 @@ _DEFAULT_REPO = "Haidra-Org/horde-worker-reGen"
 RELEASES_URL = "https://github.com/Haidra-Org/horde-worker-reGen/releases/latest"
 _TIMEOUT_SECONDS = 6.0
 
+UPDATE_CHECK_INTERVAL_SECONDS = 1800.0
+"""How often (in seconds) the worker re-checks for a newer release (30 minutes)."""
+
 NEWER_RELEASE_ENV_VAR = "AIWORKER_NEWER_RELEASE_AVAILABLE"
 """Set to the newer release version once a startup check finds one, so periodic logs can re-nag."""
 
@@ -161,11 +164,30 @@ def check_for_update(current: str | None = None) -> UpdateInfo | None:
     return UpdateInfo(latest_version=tag.lstrip("vV"), html_url=str(release.get("html_url") or RELEASES_URL))
 
 
+def apply_update_check_result(info: UpdateInfo | None) -> None:
+    """Set or clear ``NEWER_RELEASE_ENV_VAR`` to match an update check result.
+
+    Callers (the headless worker's periodic loop, the TUI's periodic check) pass the result of
+    :func:`check_for_update` here so the env-var-driven log nag in
+    :class:`~horde_worker_regen.reporting.status_reporter.StatusReporter` stays in sync with the
+    latest verdict.
+
+    Args:
+        info: The result of :func:`check_for_update`, or None when up to date or unreachable.
+    """
+    if info is None:
+        os.environ.pop(NEWER_RELEASE_ENV_VAR, None)
+    else:
+        os.environ[NEWER_RELEASE_ENV_VAR] = info.latest_version
+
+
 __all__ = [
     "DISABLE_ENV_VAR",
     "NEWER_RELEASE_ENV_VAR",
     "RELEASES_URL",
+    "UPDATE_CHECK_INTERVAL_SECONDS",
     "UpdateInfo",
+    "apply_update_check_result",
     "check_for_update",
     "current_version",
     "update_check_disabled",
