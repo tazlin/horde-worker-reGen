@@ -162,21 +162,33 @@ def derive(
 
     checks = _build_checks(snapshot, snapshot_age, optimistic_server_maintenance=optimistic_server_maintenance)
 
+    stale = snapshot_age is not None and snapshot_age > _stale_threshold(snapshot)
+    # A worker that announced it is shutting down and then goes quiet is finishing its teardown, not
+    # wedged: ending its inference/safety children and unwinding the control loop legitimately stops it
+    # stamping liveness for a stretch. Reading that silence as UNRESPONSIVE is exactly the false alarm
+    # operators saw on a clean stop, so shutdown is checked *before* staleness. A genuine hang here is
+    # still bounded: the supervisor force-kills a worker that overruns its graceful-stop deadline and the
+    # phase then flips to STOPPED.
+    if snapshot.shutting_down:
+        detail = (
+            "Finishing teardown; it has gone quiet while stopping its processes."
+            if stale
+            else "Finishing in-flight jobs before exit."
+        )
+        return HealthReport(
+            WorkerPhase.SHUTTING_DOWN,
+            HealthStatus.INFO,
+            "Shutting down…",
+            detail,
+            checks,
+            True,
+        )
     if snapshot_age is not None and snapshot_age > _stale_threshold(snapshot):
         return HealthReport(
             WorkerPhase.UNRESPONSIVE,
             HealthStatus.ERROR,
             "Worker not responding",
             f"No update received for {human_duration(snapshot_age)}. The worker may be stuck or overloaded.",
-            checks,
-            True,
-        )
-    if snapshot.shutting_down:
-        return HealthReport(
-            WorkerPhase.SHUTTING_DOWN,
-            HealthStatus.INFO,
-            "Shutting down…",
-            "Finishing in-flight jobs before exit.",
             checks,
             True,
         )

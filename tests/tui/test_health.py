@@ -91,6 +91,34 @@ def test_unresponsive_on_stale_snapshot() -> None:
     assert report.severity is HealthStatus.ERROR
 
 
+def test_stale_but_shutting_down_reads_as_shutting_down_not_unresponsive() -> None:
+    """A worker that announced shutdown and then went quiet is tearing down, not wedged.
+
+    This is the clean-stop false alarm: once the control loop ends the inference/safety children and
+    unwinds, it stops stamping liveness, so the snapshot ages past the staleness threshold. Because the
+    last snapshot said ``shutting_down``, that silence must read as SHUTTING_DOWN, not UNRESPONSIVE.
+    """
+    report = derive(
+        _snapshot(processes=[_process("WAITING_FOR_JOB")], shutting_down=True),
+        SupervisorStatus.RUNNING,
+        30.0,
+    )
+    assert report.phase is WorkerPhase.SHUTTING_DOWN
+    assert report.severity is HealthStatus.INFO
+    assert "teardown" in report.detail.lower()
+
+
+def test_shutting_down_with_fresh_snapshot_is_still_shutting_down() -> None:
+    """A shutting-down worker that is still reporting shows the in-flight-drain detail."""
+    report = derive(
+        _snapshot(processes=[_process("INFERENCE_STARTING")], shutting_down=True),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    assert report.phase is WorkerPhase.SHUTTING_DOWN
+    assert "in-flight" in report.detail.lower()
+
+
 def test_brief_silence_under_base_threshold_is_not_unresponsive() -> None:
     """A silence between the old (8s) and new (20s) base threshold must not read as unresponsive."""
     report = derive(_snapshot(processes=[_process("WAITING_FOR_JOB")]), SupervisorStatus.RUNNING, 15.0)

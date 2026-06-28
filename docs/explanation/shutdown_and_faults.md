@@ -40,7 +40,14 @@ There are two termination paths:
 6. [`JobSubmitter`][horde_worker_regen.process_management.jobs.job_submitter.JobSubmitter] continues
    submitting pending results.
 7. When all jobs are finalized (all stage collections empty), the main loop
-   exits.
+   exits. Every background loop (popper, submitter, user-info, alchemy, and the
+   periodic update check) polls the shutdown flag on a short cadence rather than
+   waiting out its own interval, so none of them holds the gathered task group
+   (and thus the process) open after the drain finishes. This matters for the
+   dashboard: once the control loop stops it no longer stamps liveness, so a
+   process that lingered would age into a false `UNRESPONSIVE`; the supervisor
+   also reads a `shutting_down` snapshot as "Shutting down" rather than
+   "not responding" while the teardown completes.
 8. A timed backstop bounds the drain. If no accepted work remains anywhere in
    the pipeline (no inference, safety, submit, or alchemy work), the backstop
    uses a short grace and then force-kills/reaps children because there is no

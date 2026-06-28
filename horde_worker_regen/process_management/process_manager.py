@@ -1432,6 +1432,15 @@ class HordeWorkerProcessManager:
             # Sleep briefly (not the full user info interval) so shutdown is detected promptly.
             await asyncio.sleep(1)
 
+    _UPDATE_CHECK_SHUTDOWN_POLL_SECONDS = 1.0
+    """How often the update-check loop wakes to notice an in-flight shutdown while waiting out its
+    30-minute interval. The interval itself is long, but waiting it out in one ``asyncio.sleep`` would
+    keep this task (and so the ``asyncio.gather`` over every loop, and so the whole process) alive until
+    the next wake-up after a shutdown was requested. With the control loop already done, nothing would
+    stamp liveness during that gap and the TUI would age the worker into a false UNRESPONSIVE long after
+    it had really stopped. Polling on this cadence instead lets the loop exit within a second of shutdown,
+    matching the other background loops."""
+
     async def _periodic_update_check_loop(self) -> None:
         """Re-check for a newer worker release every 30 minutes and surface in logs.
 
@@ -1439,6 +1448,10 @@ class HordeWorkerProcessManager:
         the verdict current for long-running workers so a release published mid-session is noticed.
         The result is recorded via :func:`horde_worker_regen.update_check.apply_update_check_result`
         so the periodic status report picks it up without further plumbing.
+
+        The long interval is waited out in short slices (not a single sleep) so a shutdown requested
+        mid-interval is honoured promptly rather than pinning the process open until the next wake-up;
+        see :attr:`_UPDATE_CHECK_SHUTDOWN_POLL_SECONDS`.
         """
         from horde_worker_regen.update_check import (
             UPDATE_CHECK_INTERVAL_SECONDS,
@@ -1451,10 +1464,14 @@ class HordeWorkerProcessManager:
         if update_check_disabled():
             return
 
+        next_check_at = time.monotonic() + UPDATE_CHECK_INTERVAL_SECONDS
         while True:
-            await asyncio.sleep(UPDATE_CHECK_INTERVAL_SECONDS)
+            await asyncio.sleep(self._UPDATE_CHECK_SHUTDOWN_POLL_SECONDS)
             if self.is_time_for_shutdown() or self._state.shut_down:
                 break
+            if time.monotonic() < next_check_at:
+                continue
+            next_check_at = time.monotonic() + UPDATE_CHECK_INTERVAL_SECONDS
             try:
                 info = check_for_update()
             except Exception:  # noqa: BLE001 - an update check must never affect the worker

@@ -6,9 +6,12 @@ no-op sleep injected it can be driven deterministically without wall-clock delay
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from unittest.mock import Mock
+
+import pytest
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -176,3 +179,34 @@ class TestControlLoopTick:
 
         assert job in process_manager._job_tracker.jobs_in_progress
         inf_proc.pipe_connection.send.assert_called()  # type: ignore[attr-defined]
+
+
+class TestPeriodicUpdateCheckLoopShutdown:
+    """The update-check loop must not pin the process open across its 30-minute interval on shutdown.
+
+    The loop waits a long interval between checks; if it waited it out in a single sleep it would keep
+    ``asyncio.gather`` (and so the whole worker process) alive until the next wake-up after a stop was
+    requested. With the control loop already finished, nothing would stamp liveness during that gap and
+    the TUI would age the worker into a false UNRESPONSIVE long after it had really stopped. The loop must
+    instead exit within a poll interval of the shutdown flag flipping.
+    """
+
+    async def test_loop_exits_promptly_when_shut_down(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With shut_down set, the loop returns within a couple of poll intervals despite the long interval."""
+        process_manager = _make_tickable_manager()
+        # Make the poll cadence tight so the bounded wait_for below is comfortably above it, and keep the
+        # check interval at its real (long) value so a regression to a single long sleep would hang here.
+        monkeypatch.setattr(process_manager, "_UPDATE_CHECK_SHUTDOWN_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(
+            "horde_worker_regen.update_check.update_check_disabled",
+            lambda: False,
+        )
+        # Setting the flag before the loop starts means its first poll should observe it and break; no real
+        # update check should ever run (it sits behind the long interval the loop never reaches here).
+        process_manager._state.shut_down = True
+        unexpected_check = Mock(side_effect=AssertionError("check_for_update ran during shutdown"))
+        monkeypatch.setattr("horde_worker_regen.update_check.check_for_update", unexpected_check)
+
+        await asyncio.wait_for(process_manager._periodic_update_check_loop(), timeout=2.0)
+
+        unexpected_check.assert_not_called()
