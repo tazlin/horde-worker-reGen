@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
@@ -31,6 +33,10 @@ class StatsView(Vertical):
             self.enabled = enabled
 
     DEFAULT_CSS = """
+    StatsView #stats-maintenance-clock {
+        height: 1;
+        padding: 0 1;
+    }
     StatsView #stats-body {
         height: 1fr;
     }
@@ -44,9 +50,11 @@ class StatsView(Vertical):
         """Initialize the tab with no snapshot yet."""
         super().__init__()
         self._snapshot: WorkerStateSnapshot | None = None
+        self._maintenance_started_at: float | None = None
 
     def compose(self) -> ComposeResult:
         """Lay out export control and the scrollable stats body."""
+        yield Static(id="stats-maintenance-clock")
         yield Button("Enable JSONL export", id="stats-export-button")
         with VerticalScroll(id="stats-body"):
             yield Static(id="stats-headlines")
@@ -54,6 +62,30 @@ class StatsView(Vertical):
             yield Static(id="stats-export")
             yield Static(id="stats-by-model")
             yield Static(id="stats-by-baseline")
+
+    def on_mount(self) -> None:
+        """Hide the maintenance clock banner until maintenance is active."""
+        self.query_one("#stats-maintenance-clock").display = False
+        self.set_interval(1.0, self._refresh_maintenance_clock)
+
+    def update_maintenance_start(self, started_at: float | None) -> None:
+        """Set or clear the maintenance start timestamp; the 1s timer handles rendering."""
+        self._maintenance_started_at = started_at
+
+    def _refresh_maintenance_clock(self) -> None:
+        """Rerender the maintenance-duration banner every second."""
+        static = self.query_one("#stats-maintenance-clock", Static)
+        if self._maintenance_started_at is None:
+            static.display = False
+            return
+        elapsed = int(time.monotonic() - self._maintenance_started_at)
+        h, remainder = divmod(elapsed, 3600)
+        m, s = divmod(remainder, 60)
+        text = Text()
+        text.append(" MAINTENANCE ", style="bold white on dark_orange")
+        text.append(f"  In maintenance mode for {h:02d}:{m:02d}:{s:02d}", style="bold yellow")
+        static.update(text)
+        static.display = True
 
     def update_snapshot(self, snapshot: WorkerStateSnapshot | None) -> None:
         """Refresh all stats panels from the latest worker snapshot."""

@@ -399,6 +399,8 @@ class HordeWorkerTUI(App[None]):
         # Tracks the previous-tick value of last_pop_maintenance_mode to detect False → True transitions
         # and fire a toast exactly once when the horde forces maintenance via the pop response.
         self._prev_pop_maintenance_mode: bool = False
+        self._prev_maintenance_mode: bool = False
+        self._maintenance_started_at: float | None = None
         self._update_info: UpdateInfo | None = None
         self._start_time: float = 0.0
         # True once a graceful quit (Ctrl+Q/Ctrl+C) has been requested; on a second quit attempt while
@@ -684,6 +686,12 @@ class HordeWorkerTUI(App[None]):
         if pop_maint and not self._prev_pop_maintenance_mode:
             self.notify("Server maintenance active: the horde has stopped sending jobs.", severity="warning")
         self._prev_pop_maintenance_mode = pop_maint
+        maintenance_mode = snapshot.maintenance_mode if snapshot is not None else False
+        if maintenance_mode and not self._prev_maintenance_mode:
+            self._maintenance_started_at = time.monotonic()
+        elif not maintenance_mode:
+            self._maintenance_started_at = None
+        self._prev_maintenance_mode = maintenance_mode
         now = time.time()
         snapshot_age = (now - snapshot.timestamp) if snapshot is not None else None
         # Judge responsiveness on liveness (the loop's last tick), not on full-snapshot freshness:
@@ -736,6 +744,8 @@ class HordeWorkerTUI(App[None]):
                 )
                 self.query_one(InsightsView).update_snapshot(snapshot)
                 self.query_one(StatsView).update_snapshot(snapshot)
+            self.query_one(StatsView).update_maintenance_start(self._maintenance_started_at)
+            self.query_one(DiagnosticsView).update_maintenance_start(self._maintenance_started_at)
             self.query_one(BenchmarkView).update_view(
                 self._benchmark_supervisor.run_state,
                 self._benchmark_supervisor.status,

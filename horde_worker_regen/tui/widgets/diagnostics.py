@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import time
 from concurrent.futures import Executor, ProcessPoolExecutor
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -78,6 +79,10 @@ class DiagnosticsView(Vertical):
     """Run the log-triage detectors over the worker's logs and show ranked, actionable findings."""
 
     DEFAULT_CSS = """
+    DiagnosticsView #diag-maintenance-clock {
+        height: 1;
+        padding: 0 1;
+    }
     DiagnosticsView #diag-controls {
         height: 3;
         padding: 0 1;
@@ -128,6 +133,7 @@ class DiagnosticsView(Vertical):
     def __init__(self) -> None:
         """Initialize the empty result cache and run guards."""
         super().__init__()
+        self._maintenance_started_at: float | None = None
         self._diagnoses: list[SessionDiagnosisView] = []
         """Cached per-session detector results from the last pass; the selector switches between them."""
         self._run_in_flight = False
@@ -149,6 +155,7 @@ class DiagnosticsView(Vertical):
 
     def compose(self) -> ComposeResult:
         """Lay out the session selector, the run button, a status line, and the scrollable results."""
+        yield Static(id="diag-maintenance-clock")
         with Horizontal(id="diag-controls"):
             yield Label("Scope", classes="diag-cap")
             yield Select(
@@ -172,6 +179,7 @@ class DiagnosticsView(Vertical):
 
     def on_mount(self) -> None:
         """Show the idle hint, and tick a clock so the analysis age (and staleness) stays current."""
+        self.query_one("#diag-maintenance-clock").display = False
         self._set_status("Choose a scope, then press Run analysis (works whether or not the worker is running).")
         self.query_one("#diag-results", Static).update(
             Text("No analysis yet; press Run analysis to triage the worker logs.", style="grey50"),
@@ -179,6 +187,10 @@ class DiagnosticsView(Vertical):
         # A 1s tick keeps the "now" clock and the age/staleness readout live without re-parsing; it only
         # rewrites a one-line Static, so it is cheap even while the tab is in the background.
         self.set_interval(1.0, self._refresh_timing)
+
+    def update_maintenance_start(self, started_at: float | None) -> None:
+        """Set or clear the maintenance start timestamp; the 1s timer handles rendering."""
+        self._maintenance_started_at = started_at
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Run the analysis at the currently-selected scope when the operator asks (the only trigger)."""
@@ -407,15 +419,23 @@ class DiagnosticsView(Vertical):
         return spaced
 
     def _refresh_timing(self) -> None:
-        """Update the one-line timing readout: when the analysis ran, the time now, and its age.
-
-        Once the displayed analysis is older than :data:`_STALE_AFTER_SECONDS`, the line flips to a bold
-        stale warning, because the worker may have logged new incidents the on-screen findings predate.
-        """
+        """Update the one-line timing readout and the maintenance-mode duration banner every second."""
         try:
+            maint_static = self.query_one("#diag-maintenance-clock", Static)
             timing = self.query_one("#diag-timing", Static)
         except NoMatches:
             return
+        if self._maintenance_started_at is None:
+            maint_static.display = False
+        else:
+            elapsed = int(time.monotonic() - self._maintenance_started_at)
+            h, remainder = divmod(elapsed, 3600)
+            m, s = divmod(remainder, 60)
+            maint_text = Text()
+            maint_text.append(" MAINTENANCE ", style="bold white on dark_orange")
+            maint_text.append(f"  In maintenance mode for {h:02d}:{m:02d}:{s:02d}", style="bold yellow")
+            maint_static.update(maint_text)
+            maint_static.display = True
         if self._analyzed_at is None:
             timing.update("")
             return
