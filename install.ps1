@@ -15,6 +15,7 @@
 #                                  (default: detected from the GPU driver)
 #   $env:HORDE_WORKER_FEATURES    optional feature extras: comma/space list of post-processing, controlnet,
 #                                 or 'none' (default: all on NVIDIA/CPU, none on other backends)
+#   $env:HORDE_WORKER_VERSION     install a specific release tag (e.g. v1.2.3) instead of the latest release
 #   $env:HORDE_WORKER_ASSUME_YES  accept the install notice without prompting (required when non-interactive)
 #   $env:HORDE_WORKER_SHORTCUTS   create Desktop/Start Menu shortcuts without prompting
 #   $env:HORDE_WORKER_NO_SHORTCUTS skip shortcut creation entirely
@@ -35,7 +36,16 @@ if (-not $RepoSlug) { $RepoSlug = "Haidra-Org/horde-worker-reGen" }
 if ($RepoSlug -notmatch "^[^/]+/[^/]+$") { Write-Error "HORDE_WORKER_REPO must be 'owner/repo' (got '$RepoSlug')."; exit 1 }
 $Owner, $Repo = $RepoSlug.Split("/", 2)
 $Asset = "horde-worker-reGen.zip"
-$ReleaseUrl = "https://github.com/$Owner/$Repo/releases/latest/download/$Asset"
+$VersionTag = [Environment]::GetEnvironmentVariable("HORDE_WORKER_VERSION")
+if ($VersionTag -and $VersionTag -match "[\s/\\]") {
+    Write-Error "HORDE_WORKER_VERSION must be a single release tag with no spaces or slashes (got '$VersionTag')."
+    exit 1
+}
+if ($VersionTag) {
+    $ReleaseUrl = "https://github.com/$Owner/$Repo/releases/download/$VersionTag/$Asset"
+} else {
+    $ReleaseUrl = "https://github.com/$Owner/$Repo/releases/latest/download/$Asset"
+}
 
 function Get-Option([string]$Name, [string]$Default) {
     $value = [Environment]::GetEnvironmentVariable($Name)

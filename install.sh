@@ -15,6 +15,7 @@
 #                            (default: detected from the GPU/driver)
 #   HORDE_WORKER_FEATURES    optional feature extras to install: comma/space list of post-processing,
 #                            controlnet, or 'none' (default: all on NVIDIA/CPU, none on other backends)
+#   HORDE_WORKER_VERSION     install a specific release tag (e.g. v1.2.3) instead of the latest release
 #   HORDE_WORKER_ASSUME_YES  accept the install notice without prompting (required when piped, no terminal)
 #   HORDE_WORKER_SHORTCUTS   create the applications-menu entry without prompting
 #   HORDE_WORKER_NO_SHORTCUTS skip the applications-menu entry entirely
@@ -34,7 +35,15 @@ esac
 OWNER="${REPO_SLUG%/*}"
 REPO="${REPO_SLUG#*/}"
 ASSET="horde-worker-reGen.zip"
-RELEASE_URL="https://github.com/$OWNER/$REPO/releases/latest/download/$ASSET"
+HORDE_WORKER_VERSION="${HORDE_WORKER_VERSION:-}"
+if [ -n "$HORDE_WORKER_VERSION" ]; then
+    case "$HORDE_WORKER_VERSION" in
+        *[[:space:]/\\]*) echo "ERROR: HORDE_WORKER_VERSION must be a single release tag with no spaces or slashes (got '$HORDE_WORKER_VERSION')." >&2; exit 1 ;;
+    esac
+    RELEASE_URL="https://github.com/$OWNER/$REPO/releases/download/$HORDE_WORKER_VERSION/$ASSET"
+else
+    RELEASE_URL="https://github.com/$OWNER/$REPO/releases/latest/download/$ASSET"
+fi
 
 # Default into a named subfolder of the current directory, not the home drive: the worker plus its model
 # downloads run to many GB. A subfolder keeps the loose-file bundle self-contained.
