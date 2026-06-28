@@ -664,10 +664,19 @@ class TestMarginalProcessOverhead:
         assert forecast.free_if_alone_mb == pytest.approx(24074.0 - 4266.0)
 
     def test_marginal_flips_teardown_to_model_eviction(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The over-counted overhead demands a sibling-process teardown; the marginal makes it co-resident."""
+        """The over-counted overhead raises the (diagnostic) sibling-teardown flag; the marginal lowers it.
+
+        ``requires_sibling_teardown`` is the diagnostic that still tracks the activation-keyed over-count: the
+        over-counted overhead raises it, and a measured marginal restores ``fits_after_model_evict`` and lowers
+        it. The *grant* decision (``needs_exclusive_residency``) no longer follows that activation-keyed flag --
+        it is decided on the persistent weight footprint, so a moderate 4.9 GB model is never granted sole
+        residency regardless of the over-count. This is the safer outcome for the probe-overhead wedge: the
+        phantom over-count can no longer drive a teardown demand the scheduler acts on (it acts on
+        ``needs_exclusive_residency`` / ``needs_process_count_reduction``, both persistent-keyed).
+        """
         over_counted = self._forecast(monkeypatch, per_process_overhead_mb=4266.0, marginal_process_overhead_mb=None)
         assert over_counted.requires_sibling_teardown is True
-        assert over_counted.needs_exclusive_residency is True
+        assert over_counted.needs_exclusive_residency is False
 
         with_marginal = self._forecast(monkeypatch, per_process_overhead_mb=4266.0, marginal_process_overhead_mb=391.0)
         assert with_marginal.requires_sibling_teardown is False

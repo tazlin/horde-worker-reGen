@@ -158,6 +158,9 @@ class TestSchedulerActuatesProcessReduction:
         admitted = scheduler.preload_models()
 
         assert admitted is False, "the head must defer while the card is cleared, not force-admit into an OOM"
-        # The remedy: a sibling process is stopped down to the fitting count (3), not all the way to one.
-        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(3, device_index=None)
+        # The remedy: a sibling process is stopped down to the fitting count (3), not all the way to one. The
+        # shrink is tagged with the whole-card model so it spares the head's holder while reducing the contexts.
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(
+            3, device_index=None, whole_card_model="CyberRealistic Pony"
+        )
         assert scheduler._sibling_teardown_for_model == "CyberRealistic Pony"

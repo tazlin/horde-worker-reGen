@@ -41,17 +41,19 @@ from tests.process_management.conftest import (
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
-# A 24GB card. Flux fp8 needs sole residency here (its weights + reserve do not fit co-resident while
-# siblings hold the card) but its weights fit alone, so it is a clean whole-card head.
-_DEVICE_TOTAL_VRAM_MB = 24074
-_PER_PROCESS_OVERHEAD_MB = 4213
+# A 16GB card. Flux fp8 genuinely needs sole residency here: its ~11.5GB weights leave under a full sibling
+# model's worth of room (``_CORESIDENT_SIBLING_MODEL_FLOOR_MB``) at sole residency, so it is a true whole-card
+# head -- the case this file's head-gate must serve while still refusing a *non-head* Flux. (On a roomy 24GB
+# card Flux fp8 co-resides instead, which is a different regime covered by the budget-wins-on-a-roomy-card path.)
+_DEVICE_TOTAL_VRAM_MB = 16375
+_PER_PROCESS_OVERHEAD_MB = 1288
 _VRAM_RESERVE_MB = 2048
 _RAM_RESERVE_MB = 4096
 
 _FLUX_MODEL = "Flux.1-Schnell fp8 (Compact)"
 _FLUX_BASELINE = "flux_schnell"
 _FLUX_WEIGHTS_MB = 11500.0
-_FLUX_SAMPLING_PEAK_MB = 15218.0  # fits alone on 24GB, so the residency is the clean "needs sole residency" case
+_FLUX_SAMPLING_PEAK_MB = 13500.0  # weights still fit alone on 16GB (the residency is the clean sole-residency case)
 
 _HEAD_SDXL = "Juggernaut XL"  # a light SDXL head, ready to dispatch
 _OTHER_SDXL = "CyberRealistic Pony"

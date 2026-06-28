@@ -217,11 +217,12 @@ class TestWholeCardTerminalAdmitHonorsRamFloor:
     ) -> None:
         """A weight-dominant (whole-card) head is not terminal-admitted when the host is out of RAM."""
         scheduler, process_map = _ram_pressured_scheduler(monkeypatch)
-        # Force the whole-card path: weights that stream co-resident but fit the measured free VRAM now, so
-        # with a single process the teardown is immediately exhausted and the head reaches whole_card_terminal
-        # (the "admit best-effort onto the cleared device" branch) -- which currently skips the RAM verdict.
-        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: 5000.0)
-        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 5000.0)
+        # Force the whole-card path: weights heavy enough to leave no room for a sibling model at sole residency
+        # (so the model genuinely needs the card, not merely co-resides) yet that still fit the measured free VRAM
+        # now, so with a single process the teardown is immediately exhausted and the head reaches
+        # whole_card_terminal (the "admit best-effort onto the cleared device" branch) -- which skips the RAM verdict.
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: 8000.0)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 8000.0)
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=1)
 
         head_job = make_job_pop_response("Flux.1-Schnell fp8 (Compact)")

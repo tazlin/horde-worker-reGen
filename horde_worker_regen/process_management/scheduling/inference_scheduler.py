@@ -128,6 +128,17 @@ that it cycles the safety process, so the plain ``_MIN_STRUCTURAL_QUEUE_WEDGE_SE
 otherwise soft-reset the pools mid-setup. Bounded so a residency that genuinely never loads still trips
 the supervisor."""
 
+_WHOLE_CARD_DRAIN_SETTLE_SECONDS = 20.0
+"""How long after a whole-card teardown reaches sole residency the head waits for the live free-VRAM reading to
+confirm the drain before loading best-effort regardless.
+
+A teardown frees the stopped siblings' VRAM asynchronously, so the live measurement can lag or be briefly
+unavailable. The live reading dispatches the head the moment it confirms; this bound guarantees the head is
+never parked indefinitely on a stuck or missing measurement -- once the teardown has been structurally complete
+this long it loads on the structural ``fits_alone`` guarantee (the grant precondition for a residency).
+Comfortably under ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS`` so the head always dispatches before the recovery
+supervisor would treat the held queue as a structural wedge."""
+
 _WHOLE_CARD_RESTORE_GRACE_SECONDS = 60.0
 """How long after a whole-card residency is *restored* the recovery supervisor keeps ignoring a queue
 wedge. Restoring respawns the torn-down sibling inference processes and cycles the safety process back
@@ -1144,29 +1155,9 @@ class InferenceScheduler:
                 continue
             forecast = state.forecast
             target = (forecast.max_resident_processes() or 1) if forecast is not None else 1
-            current = self._process_map.num_loaded_inference_processes(device_index=device_index)
-            if current > target:
+            if self._process_map.num_loaded_inference_processes(device_index=device_index) > target:
                 self._process_lifecycle.scale_inference_processes(
                     target,
-                    device_index=device_index,
-                    whole_card_model=model,
-                )
-            elif (
-                current > 1
-                and forecast is not None
-                and forecast.weights_mb is not None
-                and not self._whole_card_weights_fit_now(forecast, device_index=device_index)
-            ):
-                # The budget says this many contexts co-reside with the weights (current ≤ target), but
-                # the live free-VRAM reading says the weights do not fit *right now* -- typically because
-                # sibling *models* still hold VRAM that model eviction has not yet reclaimed, or the
-                # device has not drained.  Stop one idle sibling so its CUDA context (~marginal MB) is
-                # freed; on a card where the marginal is measured that freed VRAM is often enough to let
-                # the weights-fit check flip to True next tick, so the head dispatches without waiting for
-                # natural model eviction or an SOS soft-reset.  The shrink is paced one process per tick
-                # (the next tick re-evaluates against the updated free VRAM), so it never overshoots.
-                self._process_lifecycle.scale_inference_processes(
-                    current - 1,
                     device_index=device_index,
                     whole_card_model=model,
                 )
@@ -1202,33 +1193,15 @@ class InferenceScheduler:
         found, device_index = self._residency_holder_for_model(job.model)
         if not found:
             return False
-        # The pre-staged head's model may be in RAM only (evicted from VRAM by a budget reclamation
-        # that predates the fix in _residency_protects_from_unload). A teardown that is otherwise
-        # exhausted (process count at target, safety settled) must not keep the head parked solely
-        # because fits_weights_now reads False from the model not being in VRAM -- the model will be
-        # loaded into VRAM at sampling time. Re-use the held residency's stored forecast, which was
-        # computed with the model's weights in VRAM, rather than recalculating from the degraded state.
+        # Re-use the residency's stored forecast for the readiness check rather than re-deriving from the
+        # current (possibly degraded) state: it carries the stable weight footprint, the budget-relative target,
+        # and the fits_alone guarantee captured at establishment, which the live device reading and the bounded
+        # drain backstop in _whole_card_teardown_exhausted then resolve against the real, post-teardown VRAM.
         stored = self._residency_state(device_index).forecast
         if stored is not None:
             # The stored forecast reflects the residency's actual budget-relative target and the
             # weight footprint at establishment time; only re-derive when it was never captured.
-            if self._whole_card_teardown_exhausted(stored, device_index=device_index):
-                return False
-            # The teardown is not exhausted.  The remaining blocker may only be the stored
-            # forecast's stale fits_weights_now (its free_now_mb was captured before the
-            # convergence shrink stopped idle siblings and freed VRAM).  When the process
-            # count is already at or below target and safety is settled, check the live
-            # device free-VRAM reading: if the weights fit *now*, the head can proceed.
-            target = stored.max_resident_processes() or 1
-            count_settled = self._process_map.num_loaded_inference_processes(device_index=device_index) <= target
-            safety_settled = (
-                not self._residency_should_pause_safety(device_index) or self._process_lifecycle.is_safety_gpu_paused
-            )
-            return not (
-                count_settled
-                and safety_settled
-                and self._whole_card_weights_fit_now(stored, device_index=device_index)
-            )
+            return not self._whole_card_teardown_exhausted(stored, device_index=device_index)
         baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
         forecast = self._forecast_streaming(job, baseline, device_index=device_index)
         return not self._whole_card_teardown_exhausted(forecast, device_index=device_index)
@@ -1246,33 +1219,24 @@ class InferenceScheduler:
                 return (True, device_index)
         return (False, None)
 
-    def _whole_card_weights_fit_now(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
-        """Whether the residency model's weights fit in the *current* measured free VRAM.
-
-        Like :meth:`StreamForecast.fits_weights_now` but keyed on the live device free-VRAM reading rather
-        than the forecast's stored ``free_now_mb`` (which was captured at pre-stage time and may be stale).
-        The stored forecast contributes the weight footprint and the base reserve; only the free-VRAM
-        measurement is refreshed.  Unknown measurement (cold start) returns False so the shrink is not
-        triggered on a guess.
-        """
-        if forecast.weights_mb is None:
-            return False
-        free_now = self._measured_free_vram_mb(device_index=device_index)
-        if free_now is None:
-            return False
-        return (free_now - forecast.weights_mb) >= forecast._effective_base_reserve  # noqa: SLF001
-
     def _whole_card_teardown_exhausted(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
         """Whether a whole-card residency has done all it can and the head can now load best-effort.
 
         The whole-card branch defers a heavy head while a teardown can still make room: idle siblings left to
-        stop, the safety process still on-GPU, or their freed VRAM still draining. This returns True only once
-        none of those remain: the live inference-process count is already at (or below) the forecast's target,
-        safety is off-GPU if this residency needs it, and the device has drained enough that the weights will
-        load now (``fits_weights_now``). A model that reaches this state but still cannot fit co-resident (its
-        activation peak overflows even sole residency) can never converge by deferring, so the scheduler loads
-        it onto the cleared card best-effort and lets it sample slowly under the over-budget step grace rather
-        than wedging the queue until the recovery supervisor soft-resets the pools.
+        stop, the safety process still on-GPU, or their freed VRAM still draining. The first two are the
+        *structural* hold and are decided on topology alone (live process count at or below the forecast's
+        target, safety off-GPU if this residency needs it). Once both hold the teardown is structurally
+        complete: the model fits alone (``fits_alone``, the grant precondition for a whole-card residency), so
+        the only remaining question is whether the asynchronously-freed VRAM has actually materialised.
+
+        That last step is resolved against the live device, not the stale establishment forecast (whose
+        ``free_now_mb`` was captured before the teardown freed the siblings' VRAM, so reading it would park the
+        head forever once it drains): the *live* free-VRAM reading dispatches the head the moment it confirms the
+        drain (safe to read here, at sole residency, where it only rises as the stopped contexts release), and a
+        bounded ``_WHOLE_CARD_DRAIN_SETTLE_SECONDS`` backstop admits it on the structural ``fits_alone`` guarantee
+        if the measurement is unavailable or lags -- so the head never parks indefinitely. A model that still
+        cannot fit co-resident even at sole residency loads best-effort the same way and samples slowly under the
+        over-budget step grace rather than wedging the queue until the recovery supervisor soft-resets.
 
         ``device_index`` scopes the live-context count and the safety check to one card on a multi-GPU host;
         None is the single-GPU / worker-wide case.
@@ -1282,7 +1246,40 @@ class InferenceScheduler:
             return False
         if self._residency_should_pause_safety(device_index) and not self._process_lifecycle.is_safety_gpu_paused:
             return False
-        return forecast.fits_weights_now
+        if self._whole_card_weights_fit_live(forecast, device_index=device_index):
+            return True
+        return forecast.fits_alone and self._whole_card_drain_backstop_elapsed(device_index)
+
+    def _whole_card_weights_fit_live(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
+        """Whether the residency model's weights fit the *live* measured free VRAM (read only at sole residency).
+
+        Keyed on the live device reading rather than the forecast's stored ``free_now_mb`` (captured at
+        establishment, before the teardown freed the siblings' VRAM). Only the caller's structural-completion
+        guard makes this safe to trust: at sole residency the reading is monotonic -- it only rises as the
+        stopped siblings' contexts release -- so it never reads deceptively high the way an instantaneous
+        reading does during startup (idle contexts not yet allocated reading as free). Unknown weight or
+        measurement returns False so the bounded structural backstop, not a guess, drives the fallback.
+        """
+        if forecast.weights_mb is None:
+            return False
+        free_now = self._measured_free_vram_mb(device_index=device_index)
+        if free_now is None:
+            return False
+        return (free_now - forecast.weights_mb) >= forecast._effective_base_reserve  # noqa: SLF001
+
+    def _whole_card_drain_backstop_elapsed(self, device_index: int | None) -> bool:
+        """Whether the bounded drain-settle window has elapsed since this residency was established.
+
+        The deterministic backstop for the dispatch gate: once a structurally-complete teardown has held for
+        ``_WHOLE_CARD_DRAIN_SETTLE_SECONDS`` without the live reading confirming the drain, the head is admitted
+        on the structural ``fits_alone`` guarantee rather than parking forever. Measured from ``established_at``
+        (the teardown completes shortly after establishment, and this is gated behind the structural-complete
+        check at the call site), so a stuck or unavailable free-VRAM measurement can never wedge the head.
+        """
+        state = self._whole_card_residencies.get(device_index)
+        if state is None or state.established_at == 0.0:
+            return False
+        return (time.time() - state.established_at) >= _WHOLE_CARD_DRAIN_SETTLE_SECONDS
 
     def is_whole_card_residency_active(self) -> bool:
         """Whether any card currently holds a whole-card residency lease (its cooldown still running).

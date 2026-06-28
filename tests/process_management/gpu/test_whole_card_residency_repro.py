@@ -23,6 +23,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
 from horde_worker_regen.process_management.resources import resource_budget
 from horde_worker_regen.process_management.resources.resource_budget import (
     StreamForecast,
@@ -376,8 +377,11 @@ class TestWholeCardSiblingTeardown:
 
         assert admitted is False, "the whole-card head must defer until the device is cleared"
         assert job_tracker.is_admitted_exclusive(head_job) is True
-        # Flux needs the whole card: teardown all the way down to one inference process.
-        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(1, device_index=None)
+        # Flux needs the whole card: teardown all the way down to one inference process. The shrink is tagged
+        # with the whole-card model so it spares that head's holder (and stops queued-model siblings).
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(
+            1, device_index=None, whole_card_model=_FLUX_MODEL
+        )
         assert scheduler._sibling_teardown_for_model == _FLUX_MODEL
 
     async def test_siblings_restored_after_whole_card_job_drains(
@@ -666,6 +670,10 @@ def _live_forecast(
         num_inference_processes=_LIVE_NUM_PROCESSES,
         configured_reserve_floor_mb=float(_VRAM_RESERVE_MB),
         num_extra_resident_contexts=_LIVE_SAFETY_CONTEXTS,
+        # Production-faithful: the real scheduler sets this from the model's size tier, so an EXTRA_LARGE
+        # baseline (Flux) takes the whole-card-intent branch as it does live. Without it Flux would be judged
+        # purely on weight-dominance, which a roomy-context card no longer treats as needing the whole card.
+        wants_whole_card=model_size_tier(model, baseline) >= ModelSizeTier.EXTRA_LARGE,
     )
 
 
