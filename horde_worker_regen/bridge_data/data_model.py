@@ -369,7 +369,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     steady-state step, so the pre-first-step window uses this generous timeout and only falls back to the
     tighter ``inference_step_timeout`` once sampling progress has been observed. The watchdog floors the
     effective first-step grace at ``inference_step_timeout``, so a value below it has no effect."""
-    inference_stuck_step_repeat_limit: int = Field(default=6, ge=3, le=100)
+    inference_stuck_step_repeat_limit: int = Field(default=20, ge=3, le=100)
     """How many times a slot may report the *same* sampling step without advancing before it is reaped.
 
     Guards a wedge the time-based ``inference_step_timeout`` cannot see: when the underlying ComfyUI

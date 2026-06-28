@@ -38,7 +38,7 @@ def _make_plm(
     bridge_data.safety_on_gpu = False
     bridge_data.process_timeout = 120
     bridge_data.inference_step_timeout = 60
-    bridge_data.inference_stuck_step_repeat_limit = 6
+    bridge_data.inference_stuck_step_repeat_limit = 20
     bridge_data.preload_timeout = 120
     bridge_data.download_timeout = 120
     bridge_data.post_process_timeout = 60

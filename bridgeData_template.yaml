@@ -448,7 +448,7 @@ contended_step_timeout: 120
 # never looks silent, yet it never returns a result. A healthy job reports each step exactly once, so any
 # sustained repeat is anomalous. Lower for faster recovery; raise if a legitimate pipeline re-reports a
 # step a few times before advancing.
-inference_stuck_step_repeat_limit: 6
+inference_stuck_step_repeat_limit: 20
 
 # Maximum time (seconds) to allow an auxiliary model (LoRA, etc.) to download before it is killed.
 download_timeout: 121
