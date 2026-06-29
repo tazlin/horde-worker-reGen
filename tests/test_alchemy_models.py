@@ -286,10 +286,12 @@ class _StubState:
         shutting_down: bool = False,
         supervisor_paused: bool = False,
         self_throttle_paused: bool = False,
+        gpu_torch_incompatible: bool = False,
     ) -> None:
         self.shutting_down = shutting_down
         self.supervisor_paused = supervisor_paused
         self.self_throttle_paused = self_throttle_paused
+        self.gpu_torch_incompatible = gpu_torch_incompatible
 
 
 class _StubRuntimeConfig:

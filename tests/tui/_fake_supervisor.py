@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot, WorkerFatalConfigError
 from horde_worker_regen.tui.attach import SupervisorLike
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode
 
@@ -73,6 +73,8 @@ class FakeSupervisor:
         self.stats_export: list[bool] = []
         self.set_concurrency_calls: list[tuple[int | None, int | None]] = []
         """Every ``request_set_concurrency`` call as ``(target_processes, target_threads)``."""
+
+        self.last_fatal_error: WorkerFatalConfigError | None = None
 
     # region lifecycle and status
 
