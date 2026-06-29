@@ -196,8 +196,8 @@ class TestProbeOverheadTeardownWedge:
         # The capture runs on the scheduling path; trigger it directly here.
         scheduler._maybe_capture_idle_context_residency()
 
-        assert scheduler._measured_idle_context_residency_mb == pytest.approx(_IDLE_DEVICE_USED_ALL_CONTEXTS_MB)
-        assert scheduler._idle_residency_process_count == _NUM_INFERENCE_PROCESSES
+        assert scheduler._overhead._idle_context_residency_mb == pytest.approx(_IDLE_DEVICE_USED_ALL_CONTEXTS_MB)
+        assert scheduler._overhead._idle_residency_process_count == _NUM_INFERENCE_PROCESSES
         expected = (_IDLE_DEVICE_USED_ALL_CONTEXTS_MB - _PROBE_SINGLE_PROCESS_OVERHEAD_MB) / (
             _NUM_INFERENCE_PROCESSES - 1
         )
@@ -211,7 +211,7 @@ class TestProbeOverheadTeardownWedge:
             process_info.loaded_horde_model_name = "AMPonyXL"
         scheduler._maybe_capture_idle_context_residency()
 
-        assert scheduler._measured_idle_context_residency_mb is None
+        assert scheduler._overhead._idle_context_residency_mb is None
         assert scheduler._marginal_process_overhead_mb() is None
 
     def test_probe_marginal_takes_precedence_over_idle_residency(self) -> None:
@@ -239,7 +239,7 @@ class TestProbeOverheadTeardownWedge:
         for process_info in scheduler._process_map.values():
             process_info.loaded_horde_model_name = "AMPonyXL"
         scheduler._maybe_capture_idle_context_residency()
-        assert scheduler._measured_idle_context_residency_mb is None  # no idle-residency fallback available
+        assert scheduler._overhead._idle_context_residency_mb is None  # no idle-residency fallback available
 
         scheduler.set_measured_marginal_overhead_mb(455.0)
         assert scheduler._marginal_process_overhead_mb() == pytest.approx(455.0)
