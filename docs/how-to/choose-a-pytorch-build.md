@@ -67,6 +67,13 @@ GPU's compute capability via `nvidia-smi --query-gpu=compute_cap`, not just the 
 override the build by hand if you have confirmed your card is in the range above. A Blackwell card on a
 CUDA 12.x driver needs a **driver update** (to a CUDA 13 driver) before `cu130` can load.
 
+This check is not one-time. Every `update-runtime` / sync re-reads the live GPU and clamps the resolved
+build into the card's architecture window before installing, so a build that cannot run is never put on
+disk. A worker that recorded `cu126` before a Blackwell card was installed (or before this clamp
+existed) therefore self-heals to `cu130` on its next update, and even a hand-forced
+`HORDE_WORKER_BACKEND=cu126` on a Blackwell card is corrected upward (an unrunnable build helps nobody)
+with a note explaining the swap. The corrected build is re-recorded so the fix sticks.
+
 > **Audio (torchaudio) is not installed.** It has no `+cu132` wheel and audio generation is currently
 > unsupported, so the worker omits it (a missing torchaudio is stubbed at runtime; image/video work is
 > unaffected). If you specifically need it, install a build matching your torch index ad hoc, e.g.

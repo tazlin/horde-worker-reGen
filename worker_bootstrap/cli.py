@@ -237,16 +237,44 @@ def _write_overrides(path: Path, text: str) -> bool:
     return True
 
 
+def _reconcile_backend(root: Path, token: str) -> str:
+    """Clamp the resolved token to the live GPU's arch window so an unrunnable build is never installed.
+
+    A persisted ``bin/backend`` (or the cu126 default) can name a build with no kernel image for the
+    card (a cu126 token on a Blackwell GPU, say), which torch only rejects at the first kernel launch
+    ("no CUDA kernels for this GPU"). When the live capability says the token cannot run, swap to the
+    build that can and re-persist it so the correction sticks across future syncs instead of reasserting
+    the broken token on every update. A non-CUDA token, or an unreadable capability, is left untouched.
+    """
+    reconciled = detect.reconcile_backend_for_gpu(token)
+    if reconciled == token:
+        return token
+    print(
+        f"Adjusting the torch build from {token} to {reconciled}: this GPU's compute capability has no "
+        f"kernel image in the {token} wheel, so {token} would install but fail at the first kernel launch. "
+        f"Installing {reconciled} instead (and recording it for future updates).",
+        file=sys.stderr,
+    )
+    backend_mod.write_backend_file(paths.backend_file(root), reconciled)
+    return reconciled
+
+
 def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -> int:
     """Disclose, gain consent, ensure git, seed config, then run the sync (with preview) or ROCm path."""
     token = backend_mod.resolve_backend(
         cli_flag=cli_flag,
         env_value=os.environ.get(_BACKEND_ENV),
         file_value=backend_mod.read_backend_file(paths.backend_file(root)),
+        # Detect here too (not only at install/detect time): an absent bin/backend must pick the build
+        # this machine can actually run rather than blindly defaulting to cu126.
+        detected=detect.detect_backend(),
     )
     if token == detect.AMD_UNSUPPORTED:
         _print_amd_unsupported()
         return 2
+    # Belt-and-suspenders: detection can be bypassed by a stale persisted token or a forced override, so
+    # cross-check whatever was resolved against the live GPU and clamp an unrunnable build before installing.
+    token = _reconcile_backend(root, token)
 
     # Disclose what is about to be installed (and from where) and gain consent before any heavy download.
     # The git line tells the user up front whether their existing git is used or a portable one is fetched.

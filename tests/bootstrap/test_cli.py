@@ -19,6 +19,9 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, list[tup
     )
     monkeypatch.delenv("HORDE_WORKER_BACKEND", raising=False)
     monkeypatch.setattr(cli.detect, "detect_backend", lambda: "cu126")
+    # The sync path reconciles the resolved token against the live GPU's compute capability. Stub it to
+    # "unreadable" so the default is a no-op; tests that exercise the arch self-heal override this.
+    monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (0, 0))
     # Keep launch tests hermetic: no launch-time update check reaches the network unless a test opts in.
     monkeypatch.setenv("HORDE_WORKER_AUTO_UPDATE", "off")
 
@@ -75,6 +78,50 @@ def test_sync_shortcut_flag(env: tuple[Path, list]) -> None:
     _, calls = env
     assert cli.main(["sync", "--cu130"]) == 0
     assert calls == [("sync", "cu130")]
+
+
+def test_sync_self_heals_stale_cu126_on_blackwell(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A persisted cu126 on a Blackwell GPU is clamped up to cu130 (and re-persisted), not reinstalled.
+
+    cu126 carries no sm_120 kernel image, so reinstalling it would leave torch unable to launch a single
+    kernel ("PyTorch cannot run this GPU"). The live compute capability must override the stale token.
+    """
+    root, calls = env
+    backend.write_backend_file(root / "bin" / "backend", "cu126")
+    monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (12, 0))
+    assert cli.main(["sync"]) == 0
+    assert calls == [("sync", "cu130")]
+    assert backend.read_backend_file(root / "bin" / "backend") == "cu130"
+
+
+def test_sync_detects_backend_when_no_file(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no persisted bin/backend, sync uses live detection rather than blindly defaulting to cu126."""
+    _, calls = env
+    monkeypatch.setattr(cli.detect, "detect_backend", lambda: "cu130")
+    assert cli.main(["sync"]) == 0
+    assert calls == [("sync", "cu130")]
+
+
+def test_sync_overrides_unrunnable_explicit_backend(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even an explicit --backend cu126 is clamped on a Blackwell GPU: an unrunnable build helps nobody."""
+    root, calls = env
+    monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (12, 0))
+    assert cli.main(["sync", "--backend", "cu126"]) == 0
+    assert calls == [("sync", "cu130")]
+    assert backend.read_backend_file(root / "bin" / "backend") == "cu130"
+
+
+def test_sync_keeps_cpu_choice_without_probing(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deliberate CPU/alchemist token is never probed or clamped (reconcile is CUDA-only)."""
+    root, calls = env
+    backend.write_backend_file(root / "bin" / "backend", "cpu")
+
+    def _boom() -> tuple[int, int]:
+        raise AssertionError("reconcile probed nvidia-smi for a non-CUDA token")
+
+    monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", _boom)
+    assert cli.main(["sync"]) == 0
+    assert calls == [("sync", "cpu")]
 
 
 def test_launch_web_passthrough(env: tuple[Path, list]) -> None:

@@ -63,8 +63,10 @@ def resolve_backend(
     """Resolve the backend by precedence: CLI flag > env var > ``bin/backend`` > detection > default.
 
     The first non-empty source wins, then the result is passed through :func:`remap_legacy` so a stale
-    cu128 becomes cu126. Detection is an optional input so callers that must not probe hardware (e.g.
-    ``sync``) can omit it.
+    cu128 becomes cu126. Detection is an optional input so a caller that cannot or should not probe
+    hardware can omit it (the default then applies). Note that a persisted ``file_value`` outranks
+    ``detected``: a stale token can still win here, so an install path should additionally reconcile the
+    result against the live GPU (see :func:`worker_bootstrap.detect.reconcile_backend_for_gpu`).
     """
     for candidate in (cli_flag, env_value, file_value, detected, default):
         if candidate and candidate.strip():

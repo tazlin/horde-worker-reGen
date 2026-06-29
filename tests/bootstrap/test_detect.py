@@ -91,6 +91,50 @@ def test_cuda_build_architecture_window(
 
 
 @pytest.mark.parametrize(
+    ("token", "compute_cap", "expected"),
+    [
+        # A stale cu126 token on a Blackwell card is lifted to cu130 (cu126 has no sm_120 kernel image).
+        (detect.CU126, (12, 0), detect.CU130),
+        (detect.CU126, (10, 0), detect.CU130),  # datacenter Blackwell sm_100
+        # In-window and newer tokens are left alone for a Blackwell card.
+        (detect.CU130, (12, 0), detect.CU130),
+        (detect.CU132, (12, 0), detect.CU132),
+        # A pre-Turing card is held at cu126 even if a CUDA 13 token was persisted.
+        (detect.CU132, (6, 1), detect.CU126),
+        (detect.CU130, (5, 2), detect.CU126),
+        # In-window cards keep whatever runnable token they were given.
+        (detect.CU126, (8, 6), detect.CU126),
+        (detect.CU132, (8, 6), detect.CU132),
+        # Unreadable capability -> leave the token untouched (no second-guessing).
+        (detect.CU126, (0, 0), detect.CU126),
+    ],
+)
+def test_reconcile_backend_for_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+    token: str,
+    compute_cap: tuple[int, int],
+    expected: str,
+) -> None:
+    """A resolved CUDA token is re-clamped to the live GPU's arch window so an unrunnable build self-heals."""
+    monkeypatch.setattr(detect, "_nvidia_compute_cap", lambda: compute_cap)
+    assert detect.reconcile_backend_for_gpu(token) == expected
+
+
+@pytest.mark.parametrize("token", [detect.CPU, detect.ROCM, detect.ROCM_WINDOWS, detect.AMD_UNSUPPORTED])
+def test_reconcile_backend_leaves_non_cuda_tokens_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+    token: str,
+) -> None:
+    """Non-CUDA tokens pass through unchanged and never trigger an nvidia-smi probe."""
+
+    def _boom() -> tuple[int, int]:
+        raise AssertionError("probed nvidia-smi for a non-CUDA token")
+
+    monkeypatch.setattr(detect, "_nvidia_compute_cap", _boom)
+    assert detect.reconcile_backend_for_gpu(token) == token
+
+
+@pytest.mark.parametrize(
     ("nvidia", "cuda_version", "compute_cap", "amd", "rocm", "expected"),
     [
         (True, (12, 8), (8, 6), False, False, detect.CU126),

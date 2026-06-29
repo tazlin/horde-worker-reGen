@@ -216,6 +216,31 @@ def _nvidia_compute_cap() -> tuple[int, int]:
     return parse_compute_cap(out)
 
 
+def _clamp_build_to_arch(build: str, compute_cap: tuple[int, int]) -> str:
+    """Clamp a CUDA build token into the GPU's valid architecture window.
+
+    A build token names a CUDA toolkit line but is not itself proof the wheel carries a kernel image for
+    the installed card, whether the token came from the driver-version pick, a persisted ``bin/backend``,
+    or a forced override. cu126 carries sm_50..sm_90; the CUDA 13 wheels carry sm_75..sm_120 (pre-Turing
+    was dropped in CUDA 13). A build outside the card's window has no kernel image and dies at the first
+    kernel launch (cudaErrorNoKernelImageForDevice), so the token is clamped both ways:
+
+    * a Blackwell+ card (> ``_CU126_MAX_COMPUTE_CAP``) is lifted off cu126 onto cu130; cu126 can never run
+      it, whereas cu130 runs once the (separately warned) driver is updated;
+    * a pre-Turing card (< ``_CUDA13_MIN_COMPUTE_CAP``) is held at cu126; the CUDA 13 wheels dropped it,
+      and cu126 still runs on the newer driver.
+
+    A non-CUDA token (cpu/rocm) and an unreadable ``compute_cap`` of (0, 0) are returned unchanged.
+    """
+    if compute_cap == (0, 0) or build not in (CU126, CU130, CU132):
+        return build
+    if compute_cap > _CU126_MAX_COMPUTE_CAP:
+        return CU130 if build == CU126 else build
+    if compute_cap < _CUDA13_MIN_COMPUTE_CAP:
+        return CU126
+    return build
+
+
 def _cuda_build(version: tuple[int, int], compute_cap: tuple[int, int] = (0, 0)) -> str:
     """Pick the newest locked CUDA build the driver allows, clamped to the GPU's valid arch window.
 
@@ -227,17 +252,9 @@ def _cuda_build(version: tuple[int, int], compute_cap: tuple[int, int] = (0, 0))
       older or an unreadable (0, 0) version -> cu126. Tuple ordering keeps this version-aware
       (so e.g. (13, 1) < (13, 2)).
     * Architecture window: the driver version is only a ceiling, not proof the wheel has kernels for the
-      card. cu126 carries sm_50..sm_90; the CUDA 13 wheels carry sm_75..sm_120 (pre-Turing was dropped
-      in CUDA 13). A build outside the card's window has no kernel image and dies at the first kernel
-      launch (cudaErrorNoKernelImageForDevice), so the driver-based pick is clamped both ways:
-        - a Blackwell+ card (> ``_CU126_MAX_COMPUTE_CAP``) is floored onto cu130 even on a CUDA 12.x
-          driver; cu126 can never run it, whereas cu130 runs once the (separately warned) driver is
-          updated;
-        - a pre-Turing card (< ``_CUDA13_MIN_COMPUTE_CAP``) is held at cu126 even on a CUDA 13 driver --
-          the CUDA 13 wheels dropped it, and cu126 still runs on the newer driver.
-
-    ``compute_cap`` (0, 0) (unreadable: nvidia-smi absent or an old driver without the field) skips the
-    window clamp and keeps the driver-only pick, preserving the prior behaviour.
+      card, so the driver-based pick is clamped into the card's valid window (see
+      :func:`_clamp_build_to_arch`). ``compute_cap`` (0, 0) skips the clamp and keeps the driver-only
+      pick, preserving the prior behaviour.
     """
     if version >= (13, 2):
         build = CU132
@@ -245,14 +262,24 @@ def _cuda_build(version: tuple[int, int], compute_cap: tuple[int, int] = (0, 0))
         build = CU130
     else:
         build = CU126
+    return _clamp_build_to_arch(build, compute_cap)
 
-    if compute_cap == (0, 0):
-        return build
-    if compute_cap > _CU126_MAX_COMPUTE_CAP:
-        return CU130 if build == CU126 else build
-    if compute_cap < _CUDA13_MIN_COMPUTE_CAP:
-        return CU126
-    return build
+
+def reconcile_backend_for_gpu(token: str) -> str:
+    """Re-clamp an already-resolved backend token to the live GPU's architecture window.
+
+    A persisted ``bin/backend`` token (or the cu126 default) can name a torch build with no kernel image
+    for the installed GPU: a cu126 token kept from before a Blackwell card was installed, say, which the
+    sync path would otherwise reinstall on every update, leaving torch unable to launch a single kernel
+    ("no CUDA kernels for this GPU"). Re-reading the live compute capability and re-applying the same
+    arch-window clamp :func:`_cuda_build` uses lets such a token self-heal at install time.
+
+    A non-CUDA token (cpu/rocm) is returned untouched and never triggers an nvidia-smi probe; an
+    unreadable capability likewise returns the token unchanged.
+    """
+    if token not in (CU126, CU130, CU132):
+        return token
+    return _clamp_build_to_arch(token, _nvidia_compute_cap())
 
 
 def detect_backend() -> str:
