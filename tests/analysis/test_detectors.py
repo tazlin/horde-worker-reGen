@@ -218,9 +218,10 @@ class TestForcedMaintenance:
     """
 
     def _bridge(self, *lines: str) -> str:
-        return "\n".join(
-            [f"2026-06-25 13:59:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines]
-        )
+        return "\n".join([
+            f"2026-06-25 13:59:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+            *lines,
+        ])
 
     def test_forced_for_dropped_jobs_is_critical(self, tmp_path: Path) -> None:
         """A maintenance pop citing dropped jobs, alongside local give-up faults, is a critical finding."""
@@ -303,9 +304,10 @@ class TestSchedulerStarvationWedge:
     """
 
     def _bridge(self, *lines: str) -> str:
-        return "\n".join(
-            [f"2026-06-25 13:59:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines]
-        )
+        return "\n".join([
+            f"2026-06-25 13:59:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+            *lines,
+        ])
 
     def test_wedge_with_soft_reset_and_giveup_is_critical(self, tmp_path: Path) -> None:
         """Starvation that escalated to a soft reset and faulted jobs is the critical root-cause finding."""
@@ -351,9 +353,10 @@ class TestSlowGenerationDropSpiral:
     """
 
     def _bridge(self, *lines: str) -> str:
-        return "\n".join(
-            [f"2026-06-25 05:09:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines]
-        )
+        return "\n".join([
+            f"2026-06-25 05:09:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+            *lines,
+        ])
 
     def test_sustained_aborts_with_maintenance_is_critical(self, tmp_path: Path) -> None:
         """A run of slow-aborts that drew maintenance is the critical root-cause finding, with the metrics."""
@@ -445,9 +448,10 @@ class TestConsecutiveFailurePause:
     """The worker self-pausing job pops after three consecutive faults."""
 
     def _bridge(self, *lines: str) -> str:
-        return "\n".join(
-            [f"2026-06-25 13:59:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines]
-        )
+        return "\n".join([
+            f"2026-06-25 13:59:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}",
+            *lines,
+        ])
 
     def test_pause_detected(self, tmp_path: Path) -> None:
         """The self-pause is surfaced as a warning so the fault cause gets investigated."""

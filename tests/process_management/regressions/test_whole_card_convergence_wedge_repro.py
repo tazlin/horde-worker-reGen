@@ -534,7 +534,9 @@ class TestWedgeDispatchDiagnostic:
     """
 
     def _wedge_scheduler(
-        self, *, extra_sibling: bool = False,
+        self,
+        *,
+        extra_sibling: bool = False,
     ) -> tuple[InferenceScheduler, JobTracker]:
         """A staged wedge with the Flux head and SDXL jobs queued, residency held for Flux.
 
