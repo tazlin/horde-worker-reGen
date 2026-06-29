@@ -49,6 +49,13 @@ normal case; this is generous headroom for a loaded box. Exhausting it means the
 leaves nothing to serve, so the launcher winds down just as it would for a host that came up and then died.
 """
 
+_HOST_WATCH_STOP_JOIN_SECONDS = 5.0
+"""How long :func:`main` waits for the liveness watcher to unwind after signalling it to stop.
+
+Generous over the watcher's own connect timeout and stop-poll interval, so a deliberate launcher unwind
+joins the watcher rather than leaving it as a daemon that could later fire its process-killing leash.
+"""
+
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     """Parse the web-server command-line arguments."""
@@ -221,18 +228,31 @@ def _shutdown_host(process: subprocess.Popen[bytes], address: tuple[str, int]) -
         process.terminate()
 
 
-def _await_host_socket(address: tuple[str, int], *, grace_seconds: float) -> socket.socket | None:
+def _await_host_socket(
+    address: tuple[str, int],
+    *,
+    grace_seconds: float,
+    stop_event: threading.Event | None = None,
+) -> socket.socket | None:
     """Connect to the host, retrying until it is reachable or ``grace_seconds`` elapses (then None).
 
     The launcher may have just spawned the host, which needs a moment to bind; the attached case
-    (a host already running) connects on the first try.
+    (a host already running) connects on the first try. A set ``stop_event`` abandons the wait at once and
+    returns None, so the launcher can unwind the watcher without blocking out the full grace.
     """
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return None
         try:
             return socket.create_connection(address, timeout=_HOST_WATCH_CONNECT_TIMEOUT_SECONDS)
         except OSError:
-            time.sleep(0.5)
+            # Interruptible wait: a set stop_event ends the retry immediately, otherwise pause and retry.
+            if stop_event is not None:
+                if stop_event.wait(0.5):
+                    return None
+            else:
+                time.sleep(0.5)
     return None
 
 
@@ -241,6 +261,7 @@ def _watch_host_liveness(
     on_host_gone: Callable[[], None],
     *,
     grace_seconds: float = _HOST_WATCH_STARTUP_GRACE_SECONDS,
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Hold a connection to the host and call ``on_host_gone`` once it goes away (the launcher's leash).
 
@@ -250,12 +271,20 @@ def _watch_host_liveness(
     socket is the reliable, pid-reuse-immune way to learn it is gone, and it covers both the spawned and
     the attached case. A clean socket close is the authoritative signal; an explicit ``host_shutdown``
     frame, when present, just lets the caller log the host's exit with intent.
+
+    ``on_host_gone`` is the launcher's process-killing leash (it hard-exits), so it must fire only for a host
+    that genuinely went away, never for a launcher that is unwinding on purpose. A set ``stop_event`` means
+    the latter: the watcher then returns without firing the leash. Binding the watcher to that event is what
+    keeps it from outliving its launcher as a daemon that later kills the process (e.g. once ``serve()``
+    returns, including in tests that exercise :func:`main` with a non-blocking server).
     """
-    sock = _await_host_socket(address, grace_seconds=grace_seconds)
+    sock = _await_host_socket(address, grace_seconds=grace_seconds, stop_event=stop_event)
     if sock is not None:
         try:
             with sock:
                 while True:
+                    if stop_event is not None and stop_event.is_set():
+                        break
                     message = sp.recv_frame(sock)
                     if message is None:
                         break  # the host closed the connection: it is gone
@@ -263,6 +292,8 @@ def _watch_host_liveness(
                         break  # the host announced it is tearing down
         except (OSError, ValueError):
             pass
+    if stop_event is not None and stop_event.is_set():
+        return  # the launcher is unwinding deliberately; the host-gone leash must not fire
     on_host_gone()
 
 
@@ -465,10 +496,14 @@ def main(argv: list[str] | None = None) -> None:
         _schedule_dashboard_open(web_host, web_port, app_window=not args.browser)
 
     # Follow the host to the grave: if it exits on its own (notably the tray's "Stop worker && exit"),
-    # this launcher must not linger as an orphaned console serving a dead host.
+    # this launcher must not linger as an orphaned console serving a dead host. The watcher's leash hard-exits
+    # the process, so it is bound to this launcher's lifetime: once serve() returns the launcher is unwinding
+    # on its own terms, so the watcher is stopped first and never lingers as a daemon that could later fire.
+    watch_stop = threading.Event()
     watcher = threading.Thread(
         target=_watch_host_liveness,
         args=(host_address, _wind_down_launcher),
+        kwargs={"stop_event": watch_stop},
         name="host-liveness-watch",
         daemon=True,
     )
@@ -478,8 +513,10 @@ def main(argv: list[str] | None = None) -> None:
     try:
         server.serve()
     finally:
+        watch_stop.set()
         if host_process is not None:
             _shutdown_host(host_process, host_address)
+        watcher.join(timeout=_HOST_WATCH_STOP_JOIN_SECONDS)
 
 
 if __name__ == "__main__":

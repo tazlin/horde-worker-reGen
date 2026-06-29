@@ -1,6 +1,7 @@
 """Configures pytest and creates fixtures."""
 
 # import hordelib
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -27,16 +28,102 @@ def _cuda_device_present() -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class _OrderPhase:
+    """One bucket in the fast-to-slow run order, matched by marker, ``tests/`` sub-package, or module name.
+
+    The three matcher kinds are kept distinct so a coincidental name overlap can never pull a test into the
+    wrong bucket: ``packages`` matches a *directory* under ``tests/`` (the namespace), while ``module_prefixes``
+    matches a top-level test module by filename stem. That separation is why ``benchmark`` (the namespace) runs
+    last without dragging along a unit test merely named ``..._benchmark_...`` that lives elsewhere.
+    """
+
+    name: str
+    markers: frozenset[str] = field(default_factory=frozenset)
+    packages: frozenset[str] = field(default_factory=frozenset)
+    module_prefixes: tuple[str, ...] = ()
+
+
+# Phases that run first, fastest at the top. Cheap, high-signal tests go here so an obvious break surfaces
+# without waiting on the slow namespaces below.
+_ORDER_PHASES_FIRST: tuple[_OrderPhase, ...] = (
+    _OrderPhase("bootstrap", packages=frozenset({"bootstrap"})),
+    _OrderPhase("utils", module_prefixes=("test_utils_",)),
+)
+
+# Phases that run last, in this order. Marker-driven phases (``e2e``, ``gpu``) match wherever the marker is
+# applied; add a new slow namespace by appending an _OrderPhase, no other change required.
+_ORDER_PHASES_LAST: tuple[_OrderPhase, ...] = (
+    _OrderPhase("process_management", packages=frozenset({"process_management"})),
+    _OrderPhase("tui", packages=frozenset({"tui"})),
+    _OrderPhase("bridge_data", module_prefixes=("test_bridge_data",)),
+    _OrderPhase("analysis", packages=frozenset({"analysis"})),
+    _OrderPhase("benchmark", packages=frozenset({"benchmark"})),
+    _OrderPhase("e2e", markers=frozenset({"e2e"}), packages=frozenset({"e2e"})),
+    _OrderPhase("gpu", markers=frozenset({"gpu"})),
+)
+
+_TESTS_ROOT = Path(__file__).parent
+
+
+def _item_package_and_stem(item: pytest.Item) -> tuple[frozenset[str], str]:
+    """Return an item's ``tests/`` directory components and its module filename stem.
+
+    Matching against real path components (not the nodeid string) is what keeps the buckets robust: a test
+    named ``test_is_benchmark_stale`` in ``tests/test_app_state.py`` reports stem ``test_app_state`` and no
+    ``benchmark`` directory, so the ``benchmark`` namespace phase cannot claim it.
+    """
+    try:
+        rel = item.path.relative_to(_TESTS_ROOT)
+    except ValueError:
+        return frozenset(), ""
+    return frozenset(rel.parts[:-1]), rel.stem
+
+
+def _phase_matches(phase: _OrderPhase, marks: frozenset[str], packages: frozenset[str], stem: str) -> bool:
+    """Whether ``item`` (described by its markers/packages/stem) belongs to ``phase``."""
+    if marks & phase.markers:
+        return True
+    if packages & phase.packages:
+        return True
+    return any(stem.startswith(prefix) for prefix in phase.module_prefixes)
+
+
+def _run_order_rank(item: pytest.Item) -> int:
+    """Sort key placing first-phase items below 0, unmatched at 0, and last-phase items above 0.
+
+    Among the last phases the *latest* match wins, so an absolute-last marker (e.g. ``gpu``) sorts after the
+    namespace it physically lives in. A last-phase match always outranks a first-phase one.
+    """
+    marks = frozenset(marker.name for marker in item.iter_markers())
+    packages, stem = _item_package_and_stem(item)
+
+    last_offsets = [
+        offset for offset, phase in enumerate(_ORDER_PHASES_LAST) if _phase_matches(phase, marks, packages, stem)
+    ]
+    if last_offsets:
+        return 1 + max(last_offsets)
+    for offset, phase in enumerate(_ORDER_PHASES_FIRST):
+        if _phase_matches(phase, marks, packages, stem):
+            return offset - len(_ORDER_PHASES_FIRST)
+    return 0
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip ``gpu``-marked tests when no CUDA device is present (keeps CI and GPU-less boxes green)."""
-    if not any(item.get_closest_marker("gpu") for item in items):
-        return
-    if _cuda_device_present():
-        return
-    skip_gpu = pytest.mark.skip(reason="no CUDA device available (run on a GPU box to exercise @pytest.mark.gpu)")
-    for item in items:
-        if item.get_closest_marker("gpu"):
-            item.add_marker(skip_gpu)
+    """Skip ``gpu``-marked tests when no CUDA device is present and sort tests fastest-first.
+
+    GPU tests should only run if its possible (torch on the box) *or* if the user has explicitly requested it
+    (e.g. via `pytest -m gpu`). The run order is defined by ``_ORDER_PHASES_FIRST`` / ``_ORDER_PHASES_LAST``;
+    the sort is stable, so tests sharing a phase keep their collection order (siblings in a namespace stay
+    together).
+    """
+    if not _cuda_device_present() and "gpu" not in (config.getoption("-m") or ""):
+        skip_gpu = pytest.mark.skip(reason="no CUDA device available (run on a GPU box to exercise @pytest.mark.gpu)")
+        for item in items:
+            if item.get_closest_marker("gpu"):
+                item.add_marker(skip_gpu)
+
+    items.sort(key=_run_order_rank)
 
 
 @pytest.fixture(scope="session", autouse=True)

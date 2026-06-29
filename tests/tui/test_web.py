@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 
 import pytest
 
@@ -163,3 +165,47 @@ def test_main_serves_anyway_when_lan_bound(monkeypatch: pytest.MonkeyPatch) -> N
     web.main(["--host", "0.0.0.0", "--no-browser"])
 
     assert served == ["served"]
+
+
+def _host_watcher_alive() -> bool:
+    """Whether a host-liveness watcher thread is currently running."""
+    return any(thread.name == "host-liveness-watch" and thread.is_alive() for thread in threading.enumerate())
+
+
+def test_main_stops_host_watcher_so_its_leash_cannot_kill_the_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When ``serve()`` returns, ``main`` must stop the liveness watcher so its hard-exit leash never fires late.
+
+    The watcher is a daemon whose on-host-gone callback hard-exits the whole process. Left running after the
+    launcher unwinds (a non-blocking ``serve()``, as here and under any test exercising ``main``), it would
+    later conclude the absent host is gone and ``os._exit`` an unrelated, still-running process. Binding it to
+    the launcher's lifetime must both stop the thread and suppress the leash on a deliberate unwind.
+    """
+    monkeypatch.setattr(web, "_is_graphical_environment", lambda: True)
+    # No host is spawned and nothing listens on the port, so without the lifetime binding the watcher would
+    # exhaust its grace and fire the leash after main() has already returned.
+    monkeypatch.setattr(web, "_host_running", lambda address: True)
+    monkeypatch.setattr(web, "_schedule_dashboard_open", lambda *a, **k: None)
+
+    wound_down = threading.Event()
+    monkeypatch.setattr(web, "_wind_down_launcher", wound_down.set)
+
+    class _FakeServer:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def serve(self) -> None:
+            pass
+
+    import textual_serve.server
+
+    monkeypatch.setattr(textual_serve.server, "Server", _FakeServer)
+
+    web.main(["--no-browser"])
+
+    # main() joins the watcher on unwind, so it should already be gone; allow a brief margin regardless.
+    deadline = time.time() + 5.0
+    while time.time() < deadline and _host_watcher_alive():
+        time.sleep(0.05)
+
+    assert not _host_watcher_alive(), "the host-liveness watcher outlived the launcher; it could later kill the process"
+    assert not wound_down.is_set(), "the launcher's hard-exit leash fired during a deliberate unwind"
