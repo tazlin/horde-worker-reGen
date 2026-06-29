@@ -24,9 +24,9 @@ it downloads anything it shows a notice of what it will install and from where, 
 **Windows:** download
 **[HordeWorker-Setup.exe](https://github.com/Haidra-Org/horde-worker-reGen/releases/latest/download/HordeWorker-Setup.exe)**,
 double-click it, and click through the wizard. It shows what it will install (and the third-party
-licenses) and asks you to accept. The shortcut checkboxes start unticked: tick them if you want Desktop or
-Start Menu shortcuts. If Windows shows "Windows protected your PC", click **More info**, then
-**Run anyway**; the installer simply is not code-signed yet.
+licenses) and asks you to accept. A **Start Menu** shortcut is created by default (untick it if you would
+rather not); the **desktop** shortcut is offered unticked. If Windows shows "Windows protected your PC",
+click **More info**, then **Run anyway**; the installer simply is not code-signed yet.
 
 **Linux:** paste this into a terminal and press Enter:
 
@@ -85,9 +85,12 @@ trusts them, so do not worry if early numbers look modest.
 - The window you launched from **is** the worker. Closing it (or pressing `Ctrl+C` in it) stops the
   worker. Closing just the browser tab is fine; the worker keeps running and you can reopen the
   dashboard to reconnect.
-- To start it again later: on Windows, use the **AI Horde Worker** shortcut if you created one, otherwise
+- To start it again later: on Windows, use the **AI Horde Worker** Start Menu shortcut, otherwise
   run `horde-worker.cmd` in the install folder; on Linux, run `./horde-worker.sh` in the install folder.
   The slow one-time setup only happens once, so reopening is quick, and your settings are remembered.
+- If you open the install folder and the many scripts there look daunting, double-click **`_Start_Here.html`**.
+  It opens in your browser and explains the one thing to run, where your settings live, and what every other
+  file is for.
 
 ## Where to go next
 

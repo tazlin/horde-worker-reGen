@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Horde Worker - Start Here</title>
+<style>
+  :root {
+    --bg: #1b1d23;
+    --panel: #23262e;
+    --panel-2: #2b2f39;
+    --text: #e7e9ee;
+    --muted: #a8adba;
+    --accent: #ff5a5f;
+    --accent-2: #6ea8fe;
+    --border: #3a3f4b;
+    --code-bg: #15171c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
+    line-height: 1.6;
+    font-size: 16px;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 32px 24px 64px; }
+  header { border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 28px; }
+  h1 { margin: 0 0 6px; font-size: 30px; }
+  h2 { margin: 36px 0 10px; font-size: 22px; border-left: 4px solid var(--accent); padding-left: 12px; }
+  h3 { margin: 22px 0 6px; font-size: 17px; color: var(--accent-2); }
+  p { margin: 10px 0; }
+  .lede { color: var(--muted); font-size: 17px; }
+  a { color: var(--accent-2); }
+  a:hover { color: #9cc2ff; }
+  code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 1px 6px;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 0.92em;
+  }
+  .run-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 22px;
+    margin: 18px 0;
+  }
+  .run-card .big {
+    font-size: 18px;
+    font-weight: 600;
+  }
+  .run-card code { background: #11141a; font-size: 1em; padding: 2px 8px; }
+  .muted { color: var(--muted); }
+  .legend { margin: 14px 0; }
+  .legend-group {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin: 12px 0;
+  }
+  .legend-group h3 { margin-top: 0; }
+  .legend-group dl { margin: 0; }
+  .legend-group dt { font-weight: 600; margin-top: 8px; }
+  .legend-group dt code { color: var(--accent-2); }
+  .legend-group dd { margin: 2px 0 0 0; color: var(--muted); }
+  .warn {
+    background: var(--panel-2);
+    border-left: 4px solid #e0b341;
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: var(--muted);
+  }
+  ul { margin: 8px 0; padding-left: 22px; }
+  li { margin: 4px 0; }
+  footer { margin-top: 44px; border-top: 1px solid var(--border); padding-top: 16px; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>AI Horde Worker</h1>
+  <p class="lede">
+    This worker shares your GPU with the <a href="https://aihorde.net">AI Horde</a> to generate images for
+    people around the world. It is free and open source, licensed under the GNU AGPL-3.0 (see the
+    <code>LICENSE</code> file in this folder).
+  </p>
+</header>
+
+<h2>How to run it</h2>
+
+<div class="run-card">
+  <p class="big">Double-click <code>horde-worker.cmd</code> in this folder.</p>
+  <p class="muted">
+    If you let the installer create an <strong>AI Horde Worker</strong> Start Menu (or desktop) shortcut,
+    you can click that instead and never open this folder at all.
+  </p>
+</div>
+
+<p>
+  The first launch sets itself up: it downloads the software needed to run, Python and PyTorch, which takes 
+  a few minutes, then opens a <strong>dashboard in your web browser</strong>. A short wizard there walks 
+  you through the only things you need to provide:
+</p>
+
+<ul>
+  <li>Your free <strong>AI Horde API key</strong> (get one at <a href="https://aihorde.net/register">aihorde.net/register</a>) and a <strong>worker name</strong>.</li>
+  <li><strong>Which models to serve</strong> (a sensible default is chosen for your GPU).</li>
+  <li>An optional <strong>benchmark</strong> that tunes the worker for your machine.</li>
+</ul>
+
+<p>
+  When you click <strong>Start</strong>, your chosen models download and the worker begins earning kudos.
+  The window you launched from <em>is</em> the worker: closing it stops the worker. Closing only the browser
+  tab is fine, the worker keeps running and you can reopen the dashboard.
+</p>
+
+<p class="muted">
+  The curious: <code>horde-worker.cmd</code> opens the browser dashboard by default
+  (<code>--web</code>). Run it with <code>--terminal</code> for an in-console text UI, or
+  <code>--headless</code> for no UI at all.
+</p>
+
+<h2>Your configuration</h2>
+
+<p>
+  Your settings (API key, worker name, and more) live in <code>bridgeData.yaml</code> in this folder. You do
+  not need to edit it by hand: the dashboard's <strong>Config</strong> tab edits it for you. It is preserved
+  across updates and reinstalls, so you only set it up once.
+</p>
+
+<h2>What are all these other files?</h2>
+
+<p>
+  This folder holds every script for every way of running and maintaining the worker. You only ever need the
+  one above. Here is what the rest are, so nothing here is a mystery. On Windows the <code>.cmd</code> files
+  are the ones that apply; the matching <code>.sh</code> files are the Linux/macOS equivalents.
+</p>
+
+<div class="legend">
+
+  <div class="legend-group">
+    <h3>Run the worker</h3>
+    <dl>
+      <dt><code>horde-worker</code></dt>
+      <dd>The main launcher. Opens the browser dashboard. This is the one to use.</dd>
+      <dt><code>horde-bridge</code></dt>
+      <dd>Runs the worker directly with no dashboard, using your <code>bridgeData.yaml</code>. For advanced/headless setups.</dd>
+      <dt><code>preload-models</code></dt>
+      <dd>Downloads your selected models ahead of time without starting the worker.</dd>
+    </dl>
+  </div>
+
+  <div class="legend-group">
+    <h3>Keep it up to date</h3>
+    <dl>
+      <dt><code>update</code></dt>
+      <dd>Full in-place upgrade to the latest release.</dd>
+      <dt><code>update-runtime</code></dt>
+      <dd>Re-syncs just the dependencies (a lighter update).</dd>
+    </dl>
+  </div>
+
+  <div class="legend-group">
+    <h3>For AMD / ROCm on Linux only</h3>
+    <dl>
+      <dt><code>*-rocm.sh</code></dt>
+      <dd>ROCm variants of the scripts above (for example <code>horde-bridge-rocm.sh</code>). Ignore these unless you run an AMD GPU on Linux.</dd>
+    </dl>
+  </div>
+
+  <div class="legend-group">
+    <h3>If something goes wrong</h3>
+    <dl>
+      <dt><code>create-logs-bundle</code></dt>
+      <dd>Packages your recent logs into a single file to attach when asking for help.</dd>
+    </dl>
+  </div>
+
+  <div class="legend-group">
+    <h3>Behind the scenes</h3>
+    <p class="warn">You should not need to run any of these directly; the launchers above use them for you.</p>
+    <dl>
+      <dt><code>runtime</code>, <code>bootstrap.py</code></dt>
+      <dd>Set up and manage the private Python environment.</dd>
+      <dt><code>run_worker.py</code>, <code>download_models.py</code>, <code>convert_config_to_env.py</code></dt>
+      <dd>Internal helpers the launchers call.</dd>
+      <dt><code>detect-backend.ps1</code></dt>
+      <dd>Detects your GPU so the right PyTorch build is installed.</dd>
+      <dt><code>bin\</code>, <code>.venv\</code></dt>
+      <dd>The package manager and the installed environment. Leave them alone.</dd>
+    </dl>
+  </div>
+
+</div>
+
+<h2>Full documentation (online)</h2>
+
+<p>These render with formatting and clickable links in your browser:</p>
+
+<ul>
+  <li><a href="https://github.com/Haidra-Org/horde-worker-reGen">Project home &amp; README</a></li>
+  <li><a href="https://github.com/Haidra-Org/horde-worker-reGen/blob/main/docs/tutorials/getting-started.md">Getting started (nothing to a running worker)</a></li>
+  <li><a href="https://github.com/Haidra-Org/horde-worker-reGen/blob/main/docs/how-to/use-the-dashboard.md">Using the dashboard</a></li>
+  <li><a href="https://github.com/Haidra-Org/horde-worker-reGen/blob/main/docs/how-to/configure-for-your-gpu.md">Configuring the worker for your GPU</a></li>
+  <li><a href="https://github.com/Haidra-Org/horde-worker-reGen/blob/main/docs/how-to/update-the-worker.md">Updating the worker</a></li>
+  <li><a href="https://github.com/Haidra-Org/horde-worker-reGen/blob/main/docs/how-to/troubleshoot.md">Troubleshooting</a></li>
+  <li>Questions? Join <a href="https://discord.com/channels/781145214752129095/1076124012305993768">#local-workers on Discord</a>.</li>
+</ul>
+
+<footer>
+  AI Horde Worker (horde-worker-reGen) - GNU AGPL-3.0. Source, full third-party license texts, and docs at
+  <a href="https://github.com/Haidra-Org/horde-worker-reGen">github.com/Haidra-Org/horde-worker-reGen</a>.
+</footer>
+
+</div>
+</body>
+</html>

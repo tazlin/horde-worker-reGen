@@ -19,8 +19,9 @@ No command line needed. Download
 **[HordeWorker-Setup.exe](https://github.com/Haidra-Org/horde-worker-reGen/releases/latest/download/HordeWorker-Setup.exe)**,
 double-click it, and click through the installer. It shows what it will install and the third-party
 licenses and asks you to accept, then installs per-user (no administrator rights) and opens the dashboard
-when it finishes. Desktop and Start Menu shortcuts are offered as checkboxes that start unticked; tick
-them if you want them.
+when it finishes. A **Start Menu** shortcut is created by default (untick it to skip it); a **desktop**
+shortcut is offered as an unticked checkbox. The install folder also gets a browser-rendering
+**`_Start_Here.html`** that explains what to run and what every file is for.
 
 If Windows SmartScreen shows "Windows protected your PC", the installer is not code-signed yet. Click
 **More info**, then **Run anyway**.

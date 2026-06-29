@@ -65,9 +65,12 @@ UninstallDisplayName=AI Horde Worker
 ; Do not re-enable an ISCC SignTool here.
 
 [Tasks]
-; Shortcuts are opt-in (unchecked by default), matching the one-line installers' conservative default.
-Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Shortcuts (optional):"; Flags: unchecked
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts (optional):"; Flags: unchecked
+; The Start Menu shortcut is on by default: a graphical installer creating a Start Menu entry is the
+; conventional behavior, and it is what lets a non-technical user relaunch the worker without opening the
+; install folder and hunting through the wall of scripts. The desktop icon stays opt-in (unchecked) to keep
+; the desktop uncluttered for users who do not want it.
+Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Shortcuts:"
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
 
 [InstallDelete]
 ; Remove the worker's Python import roots before [Files] lays down the new bundle, so a reinstall/upgrade
@@ -80,12 +83,16 @@ Type: filesandordirs; Name: "{app}\horde_worker_regen"
 Type: filesandordirs; Name: "{app}\worker_bootstrap"
 
 [Files]
-; Everything in the staged bundle, minus detect-backend.ps1 which is handled explicitly below.
-Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "detect-backend.ps1"; Flags: recursesubdirs ignoreversion
+; Everything in the staged bundle, minus detect-backend.ps1 and release-versions.txt which are handled
+; explicitly below. release-versions.txt is only needed at install time (the version picker reads it
+; from {tmp}); it is not installed into the application folder.
+Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "detect-backend.ps1, release-versions.txt"; Flags: recursesubdirs ignoreversion
 ; Install the shared GPU detector for the one-line installer's benefit / future re-detection...
 Source: "{#StageDir}\detect-backend.ps1"; DestDir: "{app}"; Flags: ignoreversion
 ; ...and also make it available to ExtractTemporaryFile so the wizard can detect the GPU before install.
 Source: "{#StageDir}\detect-backend.ps1"; Flags: dontcopy
+; The release version list, baked at build time, so the version picker page does not need a live API call.
+Source: "{#StageDir}\release-versions.txt"; Flags: dontcopy skipifsourcedoesntexist
 ; Seed bridgeData.yaml from the template on a fresh install only, and never remove it on uninstall, so a
 ; user's API key and worker name survive reinstalls and upgrades (matches install.ps1).
 Source: "{#StageDir}\bridgeData_template.yaml"; DestDir: "{app}"; DestName: "bridgeData.yaml"; Flags: onlyifdoesntexist uninsneveruninstall
@@ -121,6 +128,41 @@ var
   PriorUninstaller: String;
   ChoicePage: TInputOptionWizardPage;
   WantsExit: Boolean;
+  VersionPage: TWizardPage;
+  VersionCombo: TNewComboBox;
+  VersionLabel: TNewStaticText;
+  SelectedVersion: String;
+  ReleasesFetched: Boolean;
+
+const
+  VersionDefaultLabel = 'Latest stable (recommended)';
+  ReleaseAssetName = 'horde-worker-reGen.zip';
+
+// Read the release version list from the file baked into the installer at build time
+// (packaging/fetch-releases.ps1 writes it into the stage before ISCC runs). Each line is a
+// release tag, newest first. Populates VersionCombo with the tags.
+// Returns True when at least one tag was loaded from the file.
+function LoadReleaseVersions(): Boolean;
+var
+  VersionsPath: String;
+  Lines: TArrayOfString;
+  i: Integer;
+begin
+  Result := False;
+  ExtractTemporaryFile('release-versions.txt');
+  VersionsPath := ExpandConstant('{tmp}\release-versions.txt');
+  if not LoadStringsFromFile(VersionsPath, Lines) then
+    exit;
+  for i := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    if Trim(Lines[i]) <> '' then
+      VersionCombo.Items.Add(Trim(Lines[i]));
+  end;
+  // >1 because item 0 is the default label already added at page-creation time.
+  Result := VersionCombo.Items.Count > 1;
+  if Result then
+    VersionCombo.ItemIndex := 0;
+end;
 
 function ReadPriorFromRoot(RootKey: Integer): Boolean;
 var
@@ -234,6 +276,32 @@ begin
   ChoicePage.Add('Move to a new location (removes the current install first)');
   ChoicePage.Add('Uninstall the existing installation and exit');
   ChoicePage.SelectedValueIndex := 0;
+
+  // Version selection page: appears after the license page, before the destination page.
+  // The combo box is populated from release-versions.txt, which is baked into the installer
+  // at build time (by packaging/fetch-releases.ps1). If the file is absent (offline build),
+  // only the default "Latest stable" choice is shown and the install proceeds normally.
+  VersionPage := CreateCustomPage(wpLicense,
+    'Choose version',
+    'Select the release version to install.');
+  VersionLabel := TNewStaticText.Create(VersionPage);
+  VersionLabel.Caption := 'Version:';
+  VersionLabel.Top := ScaleY(0);
+  VersionLabel.Left := ScaleX(0);
+  VersionLabel.Parent := VersionPage.Surface;
+
+  VersionCombo := TNewComboBox.Create(VersionPage);
+  VersionCombo.Top := VersionLabel.Top + VersionLabel.Height + ScaleY(6);
+  VersionCombo.Left := ScaleX(0);
+  VersionCombo.Width := ScaleX(300);
+  VersionCombo.Style := csDropDownList;
+  VersionCombo.Parent := VersionPage.Surface;
+  VersionCombo.Items.Add(VersionDefaultLabel);
+  VersionCombo.ItemIndex := 0;
+
+  // Fetch the release list now (blocks ~1-2 s on the network). If it fails the page
+  // still shows the default choice and the install proceeds with the bundled version.
+  ReleasesFetched := LoadReleaseVersions();
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
@@ -309,25 +377,84 @@ begin
       Result := False;
     end;
   end;
+
+  if CurPageID = VersionPage.ID then
+  begin
+    // Capture the selected version. An empty string means "use the bundled version" (the
+    // default label was selected). Otherwise the value is the GitHub release tag to download.
+    if (VersionCombo.ItemIndex > 0) and (VersionCombo.ItemIndex < VersionCombo.Items.Count) then
+      SelectedVersion := VersionCombo.Items[VersionCombo.ItemIndex]
+    else
+      SelectedVersion := '';
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  DownloadUrl, TmpZip, ExtractDir, psCmd, AppDir: String;
+  ResultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
+    AppDir := ExpandConstant('{app}');
+
     // Persist the detected backend so the deferred first-launch bootstrap (horde-worker.cmd -> runtime.cmd
     // -> bootstrap.py, which reads bin/backend) installs the right PyTorch build instead of defaulting to
     // CUDA on a CPU-only machine. The wizard still detects here because uv (and thus bootstrap.py) does not
     // exist until first launch.
     if DetectedBackend = '' then
       DetectedBackend := 'cu126';
-    ForceDirectories(ExpandConstant('{app}\bin'));
-    SaveStringToFile(ExpandConstant('{app}\bin\backend'), DetectedBackend, False);
+    ForceDirectories(AppDir + '\bin');
+    SaveStringToFile(AppDir + '\bin\backend', DetectedBackend, False);
     // Record that consent was captured by the license page so the deferred first-launch sync
     // (horde-worker.cmd -> runtime.cmd -> bootstrap.py) does not prompt the user a second time.
-    SaveStringToFile(ExpandConstant('{app}\bin\install-consent'), 'consent recorded (graphical installer)' + #13#10, False);
+    SaveStringToFile(AppDir + '\bin\install-consent', 'consent recorded (graphical installer)' + #13#10, False);
     // Record how this worker was installed and from where, so the self-updater can keep the Add/Remove
     // Programs version honest and pull future releases from the right origin.
-    SaveStringToFile(ExpandConstant('{app}\bin\install-info'), 'method=exe' + #13#10 + 'repo={#Repo}' + #13#10, False);
+    SaveStringToFile(AppDir + '\bin\install-info', 'method=exe' + #13#10 + 'repo={#Repo}' + #13#10, False);
+
+    // If the user selected a specific version (not the default "Latest stable"), download that
+    // release's bundle and overlay it onto the install. The bundled (latest) files are already in
+    // place from [Files]; the overlay replaces them with the chosen version's source. This reuses
+    // the same download URL pattern as the one-line installer.
+    if SelectedVersion <> '' then
+    begin
+      DownloadUrl := 'https://github.com/{#Repo}/releases/download/' + SelectedVersion + '/' + ReleaseAssetName;
+      TmpZip := ExpandConstant('{tmp}\' + ReleaseAssetName);
+      ExtractDir := ExpandConstant('{tmp}\version-bundle');
+
+      // Download the release zip via PowerShell (Invoke-WebRequest, pre-installed on Windows).
+      psCmd := '-NoProfile -ExecutionPolicy Bypass -Command "' +
+        '$ProgressPreference = ''SilentlyContinue'';' +
+        'try {' +
+        '  Invoke-WebRequest -Uri ''' + DownloadUrl + ''' -OutFile ''' + TmpZip + ''' -UseBasicParsing -ErrorAction Stop' +
+        '} catch { exit 1 }"';
+
+      if Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+              psCmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+      begin
+        // Extract using in-box tar.exe (Windows 10 1803+).
+        ForceDirectories(ExtractDir);
+        if Exec(ExpandConstant('{sys}\tar.exe'),
+                '-xf "' + TmpZip + '" -C "' + ExtractDir + '"',
+                '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+        begin
+          // Re-prune the Python import roots before copying the selected version's files
+          // so modules deleted between the bundled (latest) version and the chosen version
+          // do not linger and shadow the selected code. This mirrors what [InstallDelete]
+          // already did for the initial bundle lay-down.
+          DelTree(AppDir + '\horde_worker_regen', True, True, True);
+          DelTree(AppDir + '\worker_bootstrap', True, True, True);
+          // Copy extracted files over the install, overwriting the bundled version.
+          Exec(ExpandConstant('{sys}\xcopy.exe'),
+               '"' + ExtractDir + '\*" "' + AppDir + '" /E /I /Y /Q /H',
+               '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+        end;
+      end;
+      // Best-effort: if the download or extraction fails, the bundled (latest) files remain
+      // in place and the install proceeds. The failure is silent because the first launch will
+      // self-update to the latest version anyway, and a failed explicit version choice is not
+      // worse than the bundled default.
+    end;
   end;
 end;

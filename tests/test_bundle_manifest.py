@@ -80,6 +80,29 @@ def test_inno_installer_sources_the_staging() -> None:
     assert "detect-backend.ps1" in text, "HordeWorker.iss should ship/extract detect-backend.ps1"
 
 
+def test_start_here_orientation_file_is_bundled() -> None:
+    """The browser-rendering 'Start Here' orientation page must ship so every install method drops it.
+
+    It is the non-technical user's signpost in the install folder (README.md only opens in Notepad), so if
+    it falls out of the manifest the EXE/zip/one-line installs would silently ship without it.
+    """
+    assert "_Start_Here.html" in _manifest_entries(), "_Start_Here.html must be bundled"
+
+
+def test_inno_installer_defaults_start_menu_shortcut_on() -> None:
+    """The graphical installer must pre-check the Start Menu shortcut, so a non-technical user is left with a
+    way to relaunch without hunting through the install folder. Guards against silently flipping it back to
+    unchecked.
+    """
+    text = (REPO_ROOT / "packaging" / "inno" / "HordeWorker.iss").read_text(encoding="utf-8")
+    start_menu_line = next(
+        (line for line in text.splitlines() if 'Name: "startmenuicon"' in line and line.strip().startswith("Name:")),
+        None,
+    )
+    assert start_menu_line is not None, "HordeWorker.iss must declare the startmenuicon task"
+    assert "unchecked" not in start_menu_line, "the startmenuicon task must default ON (no 'unchecked' flag)"
+
+
 def test_disclosure_notices_are_bundled() -> None:
     """Both disclosure files must ship so every front-end can show the same notice and licenses."""
     entries = _manifest_entries()

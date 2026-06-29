@@ -140,6 +140,14 @@ jobs:
           name: worker-bundle-stage
           path: stage
 
+      - name: Bake release version list into the stage
+        shell: pwsh
+        run: |
+          .\packaging\fetch-releases.ps1 -Repo "$env:GITHUB_REPOSITORY" -OutFile stage\release-versions.txt
+          if (-not (Test-Path stage\release-versions.txt)) {
+            Write-Warning "Could not fetch release versions; the installer version picker will only offer the default."
+          }
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y

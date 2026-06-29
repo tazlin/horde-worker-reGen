@@ -201,6 +201,19 @@ try {
         ForEach-Object { Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue }
     Write-Note ("Staged {0} top-level entries." -f (Get-ChildItem $stageDir).Count)
 
+    # --- 2b. Fetch available release versions for the installer's version picker -----------
+    Write-Step 'Fetching release version list for the installer'
+    $fetchScript = Join-Path $RepoRoot 'packaging\fetch-releases.ps1'
+    $versionsFile = Join-Path $stageDir 'release-versions.txt'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fetchScript `
+        -Repo 'Haidra-Org/horde-worker-reGen' -OutFile $versionsFile -MaxAgeMinutes 60
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $versionsFile)) {
+        Write-Warn 'Could not fetch release versions (network may be unavailable). The installer version picker will only offer the default choice.'
+    } else {
+        $count = (Get-Content $versionsFile | Where-Object { $_ -match '\S' }).Count
+        Write-Note "Baked $count release tags into the installer stage."
+    }
+
     # --- 3. Pack: zip + SHA256SUMS + lockfile check ----------------------------------------
     if (-not $SkipPack) {
         Write-Step "Packing $zipPath"

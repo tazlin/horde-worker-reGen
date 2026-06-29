@@ -35,8 +35,9 @@ browser, and walks you through entering your [AI Horde API key](https://aihorde.
 (free, instant registration) and picking which models to serve. Models download in the background
 while the worker starts. Re-running the same command later updates the software.
 
-Desktop shortcuts are optional - the installers ask before creating any, and the `.exe`'s
-shortcut checkboxes start unticked.
+The `.exe` creates a Start Menu shortcut by default (a desktop one is offered unticked); the one-line
+installers ask before creating any shortcut. The `.exe` also drops a browser-readable `_Start_Here.html`
+in the install folder that explains what to run and what every other file is for.
 
 The [Getting started guide](docs/tutorials/getting-started.md) has screenshots and answers
 common first-run questions.

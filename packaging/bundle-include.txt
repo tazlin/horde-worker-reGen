@@ -10,6 +10,12 @@ LICENSE
 # and the aggregated third-party license notices (also the .exe's License page).
 INSTALL_NOTICE.txt
 THIRD-PARTY-NOTICES.md
+# Browser-rendering orientation page placed at the install-folder root. Unlike README.md (which opens in
+# Notepad with no formatting or links on a typical Windows box), this opens in the default browser by
+# double-click: it explains the one thing to run, where config lives, and a plain-language legend for the
+# other scripts. The leading underscore floats it to the top of the folder listing in Explorer; the name
+# has no spaces because the CI staging loop word-splits each manifest entry to expand globs.
+_Start_Here.html
 README.md
 README_advanced.md
 bridgeData_template.yaml
