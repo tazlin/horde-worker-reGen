@@ -10,9 +10,9 @@ form is admitted only when *effective* free VRAM/RAM (measured free minus what i
 alchemy work has already committed) covers the form's predicted cost. The two flows therefore
 cannot independently admit against the same free VRAM the way two separate gates once could.
 
-Graph forms (upscalers, facefixers, strip_background) are dispatched to inference processes; CLIP
-forms (caption, interrogation, nsfw) to the safety process. Dispatch is keyed on
-:class:`WorkerCapability`, not process type.
+Graph forms (upscalers, facefixers, strip_background) are dispatched to inference processes;
+text-output forms (caption, interrogation, nsfw, vectorize) to the safety process. Dispatch is keyed
+on :class:`WorkerCapability`, not process type.
 """
 
 from __future__ import annotations
@@ -44,7 +44,8 @@ from horde_sdk.generation_parameters.alchemy.consts import (
 )
 from loguru import logger
 
-from horde_worker_regen.capabilities import strip_background_available
+from horde_worker_regen.capabilities import strip_background_available, vectorize_available
+from horde_worker_regen.consts import VECTORIZE_FORM_NAME
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
@@ -62,6 +63,10 @@ from horde_worker_regen.process_management.resources.resource_budget import Comm
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind, capability_for_alchemy_form
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource
 from horde_worker_regen.runtime_version import runtime_version
+from horde_worker_regen.server_capabilities import (
+    refresh_server_capabilities,
+    server_supports_interrogation_form,
+)
 
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -115,7 +120,7 @@ def required_capability(form: str) -> WorkerCapability:
     return capability_for_alchemy_form(form)
 
 
-DEFAULT_ALCHEMY_FORMS: tuple[str, ...] = ("caption", "nsfw", "interrogation", "post-process")
+DEFAULT_ALCHEMY_FORMS: tuple[str, ...] = ("caption", "nsfw", "interrogation", "post-process", VECTORIZE_FORM_NAME)
 """Forms an alchemist offers when ``bridge_data.forms`` is left unset (an empty list means "all").
 
 The SDK's ``default_forms`` validator does not fire for the default empty list, so both the dispatch
@@ -140,6 +145,16 @@ def expand_offered_forms(bridge_data: reGenBridgeData) -> list[str]:
         offered.append("interrogation")
     if "nsfw" in configured:
         offered.append("nsfw")
+    # vectorize needs both vtracer (the worker-only `vectorize` extra) AND a server that lists the
+    # form: a lean install would fault on it, and a server that does not yet support it rejects the
+    # whole pop. The server gate is fail-closed until probed, so the worker can ship ahead of the
+    # server's go-live and only begins offering the form once the server advertises it.
+    if (
+        VECTORIZE_FORM_NAME in configured
+        and vectorize_available()
+        and server_supports_interrogation_form(VECTORIZE_FORM_NAME)
+    ):
+        offered.append(VECTORIZE_FORM_NAME)
     if "post-process" in configured:
         offered.extend(m.value for m in KNOWN_UPSCALERS if m != KNOWN_UPSCALERS.BACKEND_DEFAULT)
         offered.extend(m.value for m in KNOWN_FACEFIXERS if m != KNOWN_FACEFIXERS.BACKEND_DEFAULT)
@@ -823,6 +838,7 @@ class AlchemyCoordinator:
         while True:
             with logger.catch():
                 try:
+                    await refresh_server_capabilities()
                     self._sample_vram()
                     await self.api_alchemy_pop()
                     self.dispatch_pending_forms()

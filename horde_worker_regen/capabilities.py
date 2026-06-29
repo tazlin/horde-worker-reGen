@@ -95,6 +95,22 @@ def controlnet_available() -> bool:
     return FEATURE_KIND.controlnet in _available_features()
 
 
+@functools.lru_cache(maxsize=1)
+def vectorize_available() -> bool:
+    """Return whether the image vectorizer (``vtracer``) is installed and runnable here.
+
+    Unlike the other probes, vectorization is a worker-only alchemy op (raster -> SVG) that does
+    not route through hordelib, so its dependency lives in the worker's own ``vectorize`` extra
+    rather than hordelib's feature registry. A plain import probe is therefore the right check.
+    """
+    try:
+        import vtracer  # noqa: F401
+    except Exception as exc:
+        logger.debug("Could not import vtracer to probe vectorize availability; assuming unavailable: {}", exc)
+        return False
+    return True
+
+
 def controlnet_install_hint() -> str:
     """Build the actionable "install the controlnet extra" fragment naming the missing packages.
 

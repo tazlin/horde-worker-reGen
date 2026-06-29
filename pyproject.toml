@@ -26,7 +26,7 @@ dependencies = [
     "aiodns>=3.0.0,<4.0.0",
     "qrcode==7.4.2",
     "certifi",
-    "horde_sdk~=0.21.0",
+    "horde_sdk~=0.22.0",
     "horde_safety~=0.3.0",
     # Requires horde-engine (hordelib) 3.2.11+: in addition to the 3.2.5+ feature set (torchvision range,
     # no hard torchaudio dep, optional-feature extras + capability registry consumed by
@@ -93,6 +93,10 @@ cpu = ["torch", "torchvision"]
 # cannot be excluded per-job until the AI Horde API supports it), so its single extra covers it all.
 post-processing = ["horde-engine[rembg]"]
 controlnet = ["horde-engine[controlnet]"]
+# Image vectorizer alchemy form (raster -> SVG). vtracer is a pure-python/Rust wheel that ships for
+# every platform and needs no model download, so unlike the extras above it is not backend-gated; it
+# is optional only because vectorize is a niche alchemy op not every operator wants to offer.
+vectorize = ["vtracer>=0.6.0"]
 
 [project.urls]
 "Homepage" = "https://github.com/Haidra-Org/horde-worker-reGen"

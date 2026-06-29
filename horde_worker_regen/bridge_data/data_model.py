@@ -7,12 +7,13 @@ import os
 from dataclasses import dataclass
 from typing import Self
 
+from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ALCHEMY_FORMS
 from horde_sdk.worker.dispatch.ai_horde.bridge_data import CombinedHordeBridgeData
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from ruamel.yaml import YAML
 
-from horde_worker_regen.consts import TOTAL_LORA_DOWNLOAD_TIMEOUT
+from horde_worker_regen.consts import TOTAL_LORA_DOWNLOAD_TIMEOUT, WORKER_KNOWN_EXTRA_ALCHEMY_FORMS
 from horde_worker_regen.locale_info.regen_bridge_data_fields import BRIDGE_DATA_FIELD_DESCRIPTIONS
 
 
@@ -799,6 +800,27 @@ class reGenBridgeData(CombinedHordeBridgeData):
             return AIWORKER_DREAMER_WORKER_NAME
 
         return value
+
+    @field_validator("forms")
+    def validate_alchemy_forms(cls, v: list[str]) -> list[str]:
+        """Validate alchemy forms against the SDK enum plus this worker's extra known forms.
+
+        Overrides the SDK's stricter validator (which rejects any form not in its ``KNOWN_ALCHEMY_FORMS``
+        enum) so the worker can offer forms it serves ahead of an SDK release: the SDK's pop/async wire
+        models already accept unknown form names as plain strings, but its bridge-data validator does not,
+        which would otherwise make the config un-loadable. Real typos still raise; only the explicitly
+        worker-known extras (see :data:`WORKER_KNOWN_EXTRA_ALCHEMY_FORMS`) are additionally accepted.
+        """
+        if not isinstance(v, list):
+            raise ValueError("forms must be a list")
+        validated_forms: list[str] = []
+        known_forms = set(KNOWN_ALCHEMY_FORMS.__members__) | set(WORKER_KNOWN_EXTRA_ALCHEMY_FORMS)
+        for form in v:
+            normalized = str(form).lower().replace("-", "_")
+            if normalized not in known_forms:
+                raise ValueError(f"Invalid form: {normalized}")
+            validated_forms.append(normalized)
+        return validated_forms
 
     def prepare_custom_models(self) -> None:
         """Prepare the custom models."""

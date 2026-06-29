@@ -2,7 +2,10 @@
 
 from collections import deque
 
+import PIL.Image
+import pytest
 from horde_sdk.ai_horde_api import GENERATION_STATE
+from pydantic import ValidationError
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.ipc.messages import (
@@ -11,6 +14,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeAlchemyResultMessage,
     HordeControlFlag,
 )
+from horde_worker_regen.process_management.jobs import alchemy_popper
 from horde_worker_regen.process_management.jobs.alchemy_popper import (
     AlchemyCoordinator,
     AlchemyHeadroomEstimator,
@@ -51,8 +55,8 @@ class TestRequiredCapability:
             assert required_capability(form) == WorkerCapability.ALCHEMY_GRAPH, form
 
     def test_clip_forms_route_to_safety_process(self) -> None:
-        """CLIP-stack forms require ALCHEMY_CLIP (the safety process)."""
-        for form in ("caption", "interrogation", "nsfw"):
+        """Text-output forms require ALCHEMY_CLIP (the safety process)."""
+        for form in ("caption", "interrogation", "nsfw", "vectorize"):
             assert required_capability(form) == WorkerCapability.ALCHEMY_CLIP, form
 
 
@@ -87,6 +91,41 @@ class TestExpandOfferedForms:
         offered = expand_offered_forms(bridge_data)
         assert offered == ["nsfw"]
 
+    def test_vectorize_offered_when_available_and_server_supports(self, monkeypatch: object) -> None:
+        """Vectorize is offered when vtracer is installed and the server advertises the form."""
+        monkeypatch.setattr(alchemy_popper, "vectorize_available", lambda: True)  # type: ignore[attr-defined]
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["vectorize"])
+        assert expand_offered_forms(bridge_data) == ["vectorize"]
+
+    def test_vectorize_dropped_when_unavailable(self, monkeypatch: object) -> None:
+        """Vectorize is dropped on a lean install lacking vtracer, so we never advertise a faulting form."""
+        monkeypatch.setattr(alchemy_popper, "vectorize_available", lambda: False)  # type: ignore[attr-defined]
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["vectorize"])
+        assert expand_offered_forms(bridge_data) == []
+
+    def test_vectorize_dropped_when_server_unsupported(self, monkeypatch: object) -> None:
+        """Vectorize is withheld until the server advertises it, so we can ship ahead of go-live.
+
+        Offering a form the server's enum rejects would make it reject the entire pop, so the gate is
+        fail-closed: vtracer present but server support unknown/absent means the form is not offered.
+        """
+        monkeypatch.setattr(alchemy_popper, "vectorize_available", lambda: True)  # type: ignore[attr-defined]
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: False)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["vectorize"])
+        assert expand_offered_forms(bridge_data) == []
+
+    def test_config_accepts_vectorize_but_rejects_typos(self) -> None:
+        """The worker's forms validator accepts the worker-known vectorize form yet still rejects typos.
+
+        The worker overrides the SDK's stricter forms validator so it can offer vectorize against a
+        published SDK that does not yet list it, without weakening typo protection.
+        """
+        assert self._bridge_data(forms=["vectorize"]).forms == ["vectorize"]
+        with pytest.raises(ValidationError):
+            self._bridge_data(forms=["vectorrize"])
+
 
 class TestAlchemySubmitShapes:
     """The submit wire format matches the legacy alchemist protocol."""
@@ -98,6 +137,14 @@ class TestAlchemySubmitShapes:
             time_popped=0.0,
         )
         assert submit.submit_result == {"caption": "a test image"}
+
+    def test_vectorize_submits_inline_svg(self) -> None:
+        """Vectorize is a text form: its SVG result submits inline with no R2 upload."""
+        submit = PendingAlchemySubmitJob(
+            result_message=_result_message("vectorize", result_payload={"vectorize": "<svg></svg>"}),
+            time_popped=0.0,
+        )
+        assert submit.submit_result == {"vectorize": "<svg></svg>"}
 
     def test_image_form_submits_r2_sentinel(self) -> None:
         """Image forms submit the R2 sentinel after upload."""
@@ -130,6 +177,28 @@ class TestAlchemySubmitShapes:
             amount=1,
         )
         assert "CodeFormers" in request.forms
+
+
+class TestVectorizeOp:
+    """The vectorizer turns a raster image into an SVG string."""
+
+    def test_vectorize_image_returns_svg(self) -> None:
+        """_vectorize_image traces a raster into a non-empty SVG string."""
+        from horde_worker_regen.process_management.workers.safety_process import HordeSafetyProcess
+
+        # The op only touches PIL + vtracer, so a bare instance (no safety models) is enough.
+        process = HordeSafetyProcess.__new__(HordeSafetyProcess)
+
+        image = PIL.Image.new("RGB", (32, 32))
+        for x in range(32):
+            for y in range(32):
+                image.putpixel((x, y), (255, 0, 0) if (x // 8 + y // 8) % 2 == 0 else (0, 0, 255))
+
+        svg = process._vectorize_image(image)
+
+        assert isinstance(svg, str)
+        assert "<svg" in svg
+        assert len(svg) > 0
 
 
 class _StubProcessInfo:

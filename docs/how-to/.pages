@@ -10,5 +10,6 @@ nav:
     - run-on-amd-rocm.md
     - choose-a-pytorch-build.md
     - run-in-docker.md
+    - add-an-alchemy-mode.md
     - troubleshoot.md
     - enable-winget-publishing.md

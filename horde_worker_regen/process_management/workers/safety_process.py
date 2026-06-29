@@ -30,6 +30,7 @@ from horde_sdk.generation_parameters.alchemy.consts import (
 from loguru import logger
 
 from horde_worker_regen import ASSETS_FOLDER_PATH
+from horde_worker_regen.consts import is_vectorize_form
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
@@ -265,6 +266,20 @@ class HordeSafetyProcess(HordeProcess):
             ]
         return results
 
+    def _vectorize_image(self, image: PIL.Image.Image) -> str:
+        """Trace a raster image into an SVG string with vtracer.
+
+        vtracer is a worker-local optional dependency (the ``vectorize`` extra); the form is only
+        offered when it imports, so an absent install surfaces as a faulted form rather than a
+        silently dropped one. PNG is used as the intermediate because it is lossless and vtracer
+        accepts the raw bytes directly.
+        """
+        import vtracer
+
+        png_buffer = BytesIO()
+        image.save(png_buffer, format="PNG")
+        return vtracer.convert_raw_image_to_svg(png_buffer.getvalue(), img_format="png")
+
     def _send_alchemy_job_metrics(self, form: AlchemyFormSpec) -> None:
         """Snapshot hordelib's metrics collector for this form and forward it (best effort)."""
         try:
@@ -286,7 +301,12 @@ class HordeSafetyProcess(HordeProcess):
             logger.warning(f"Failed to send alchemy job metrics: {type(e).__name__} {e}")
 
     def start_alchemy(self, form: AlchemyFormSpec) -> None:
-        """Run a CLIP-stack alchemy form (caption/interrogation/nsfw) and report the result."""
+        """Run a non-graph alchemy form (caption/interrogation/nsfw/vectorize) and report the result.
+
+        These forms produce a text/JSON result rather than an image, so they run on the safety
+        process (which already owns the CLIP stack) instead of an inference process, and their
+        result is delivered in the submit payload without an R2 image upload.
+        """
         self.send_process_state_change_message(
             process_state=HordeProcessState.ALCHEMY_STARTING,
             info=f"Starting alchemy form {form.form} ({form.form_id})",
@@ -310,6 +330,8 @@ class HordeSafetyProcess(HordeProcess):
                 if nsfw_result is None:
                     raise RuntimeError("NSFW check returned no result")
                 result_payload = {"nsfw": nsfw_result.is_nsfw}
+            elif is_vectorize_form(form.form):
+                result_payload = {"vectorize": self._vectorize_image(image)}
             else:
                 raise ValueError(f"Unknown alchemy form for safety process: {form.form}")
 
