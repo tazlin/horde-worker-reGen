@@ -221,6 +221,10 @@ class JobTracker:
         self._model_overbudget_fault_counts: dict[tuple[str, int | None], int] = {}
         self._model_last_overbudget_fault_time: dict[tuple[str, int | None], float] = {}
         self._recent_resource_fault_times: list[float] = []
+        # Post-processing over-commit faults (the planner's unhostable-peak faults and watchdog-reaped
+        # post-processing-stage stalls), for the feature-level circuit breaker that disables post-processing
+        # after a run of them. Feature-level, not per-model, so a flat timestamp list suffices.
+        self._recent_post_processing_fault_times: list[float] = []
 
         # Cumulative completed inference results per card, for the dashboard's per-card jobs/hr trend. Keyed
         # like the fault streaks (device_index, None on a single-GPU host); monotonic across the session.
@@ -313,6 +317,23 @@ class JobTracker:
         current = time.time() if now is None else now
         cutoff = current - window_seconds
         return sum(1 for t in self._recent_resource_fault_times if t >= cutoff)
+
+    def note_post_processing_overcommit_fault(self) -> None:
+        """Record one post-processing VRAM-over-commit fault for the feature-level circuit breaker.
+
+        Fed from both the scheduler (a peak the planner cannot host, faulted at dispatch) and the process
+        lifecycle (a slot reaped silent in post-processing). Feature-level, so no per-model streak is kept.
+        """
+        now = time.time()
+        self._recent_post_processing_fault_times.append(now)
+        cutoff = now - self._RESOURCE_FAULT_RETENTION_SECONDS
+        self._recent_post_processing_fault_times = [t for t in self._recent_post_processing_fault_times if t >= cutoff]
+
+    def count_recent_post_processing_faults(self, window_seconds: float, now: float | None = None) -> int:
+        """Return how many post-processing over-commit faults occurred within the last ``window_seconds``."""
+        current = time.time() if now is None else now
+        cutoff = current - window_seconds
+        return sum(1 for t in self._recent_post_processing_fault_times if t >= cutoff)
 
     def note_card_inference_result(self, device_index: int | None) -> None:
         """Count one completed inference result against the card it ran on (the per-card jobs/hr source)."""

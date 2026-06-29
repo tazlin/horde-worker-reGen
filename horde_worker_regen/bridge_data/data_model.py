@@ -579,9 +579,51 @@ class reGenBridgeData(CombinedHordeBridgeData):
     this on (the default), the scheduler subtracts the predicted post-processing peak of every job currently
     in post-processing from the free VRAM it gates dispatch, the overlap cap, and the residency forecast
     against -- so a freshly-released slot is not handed VRAM an in-flight job is about to claim (the cause of
-    the post-processing-phase thrash that trips the post-process watchdog on a shared GPU). The reserve
-    self-scales to zero whenever nothing is post-processing, so roomy cards are unaffected. Set false to
-    restore the prior instantaneous behavior. Only used when `enable_vram_budget` is true."""
+    the post-processing-phase thrash that trips the post-process watchdog on a shared GPU). It also gates the
+    overlap/pre-staging cap against the *imminent* peak of a job that is still sampling, so a second
+    concurrent sample is not co-scheduled onto a card already owed a large upscale peak (the overlap that
+    over-commits the device mid-flight, which a dispatch-time check alone cannot see). The reserve self-scales
+    to zero whenever nothing in flight will post-process, so roomy cards are unaffected. Set false to restore
+    the prior instantaneous behavior. Only used when `enable_vram_budget` is true."""
+
+    post_processing_active_reclaim_enabled: bool = Field(default=True)
+    """Proactively reclaim cross-process VRAM before a job's own post-processing peak lands.
+
+    The post-processing budget reserve (`post_processing_budget_reserve_enabled`) protects an in-flight job's
+    upscaler/face-fixer peak from *new* dispatch, but it never charges the dispatching job's *own* peak
+    against its placement. So a job admitted on its sampling footprint can reach its 4x-upscale peak (~8.5 GB
+    for an SDXL image) on a card already full of warm sibling models and process contexts, where the upscaler
+    allocates into near-zero free VRAM and tile-thrashes until the post-process watchdog reaps the slot. When
+    true, at dispatch the scheduler sizes that own peak against the measured
+    headroom and, if it will not fit even after the job's own weights are freed in-child, frees cross-process
+    room (an idle sibling's resident model, then a context) so the room is ready by the time the peak lands.
+    On by default (the over-commit it prevents otherwise reaches the post-process watchdog); only used when
+    `enable_vram_budget` is true. Complements the overlap gate of `post_processing_budget_reserve_enabled`
+    (which withholds a *concurrent* sample from co-scheduling onto an imminent peak) and pairs with
+    `post_processing_fault_breaker_enabled`, which protects the worker if a peak still cannot be hosted."""
+
+    post_processing_fault_breaker_enabled: bool = Field(default=True)
+    """Disable post-processing on this worker after repeated post-processing VRAM-over-commit faults.
+
+    A post-processing peak that cannot be hosted (a single-process worker on a tiny card, or a card a job
+    over-commits) faults the job; the horde reassigns it, but a worker that keeps faulting trips the horde's
+    forced-maintenance, the very spiral this guards against. When true (the default), the worker counts
+    post-processing-over-commit faults (both the planner's unhostable-peak faults and watchdog-reaped
+    post-processing stalls) in a rolling window and, once they exceed `post_processing_fault_threshold`
+    within `post_processing_fault_window_seconds`, stops *popping* post-processing-requesting jobs and logs an
+    operator advisory to downgrade settings. The suppression is session-latched (it clears only on restart),
+    since the over-commit is structural and auto-recovery would simply re-trip it."""
+
+    post_processing_fault_threshold: int = Field(default=4, ge=1)
+    """The breaker trips when *more than* this many post-processing-over-commit faults occur within
+    `post_processing_fault_window_seconds` (so the default tolerates 4 and trips on the 5th).
+
+    Only used when `post_processing_fault_breaker_enabled` is true."""
+
+    post_processing_fault_window_seconds: int = Field(default=1800, ge=60)
+    """Rolling window (seconds) over which `post_processing_fault_threshold` is counted.
+
+    Only used when `post_processing_fault_breaker_enabled` is true."""
 
     vram_per_process_overhead_mb: int = Field(default=0, ge=0)
     """Per-process VRAM (MB) one inference process consumes for its torch/CUDA context with no model loaded.

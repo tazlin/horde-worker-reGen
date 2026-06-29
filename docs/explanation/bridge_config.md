@@ -111,6 +111,11 @@ for how it works.
 | `ram_reserve_mb`     | `4096`  | Available system RAM (MB) kept in reserve so resident-in-RAM models do not force the OS to page to disk.                                                               |
 | `ram_pressure_pause_percent` | `90.0` | Absolute whole-host RAM danger floor. At/above this usage percentage the worker degrades (refuses new model loads, sheds idle resident processes, pauses pops) until RAM recovers, rather than loading weights through an out-of-RAM host and being OS OOM-killed. |
 | `ram_pressure_min_free_mb`   | `1024` | Free-RAM (MB) companion floor: the worker also degrades below this many MB free. The effective floor is `max((100 - ram_pressure_pause_percent)% of total RAM, this)`, so the percentage protects large-RAM hosts and the absolute floor protects small ones. |
+| `post_processing_budget_reserve_enabled` | `true` | Subtract the predicted post-processing peak of in-flight jobs from the free VRAM the budget gates new dispatch/overlap against, so a freshly-released slot is not handed VRAM an in-flight upscaler is about to claim. Self-scales to zero when nothing is post-processing. |
+| `post_processing_active_reclaim_enabled` | `true` | Proactively reclaim cross-process VRAM before a job's *own* post-processing peak lands (see below). |
+| `post_processing_fault_breaker_enabled` | `true` | Disable post-processing on this worker after repeated post-processing over-commit faults, so it stops feeding the horde's forced-maintenance spiral (see below). |
+| `post_processing_fault_threshold` | `4` | The breaker trips when *more than* this many post-processing over-commit faults occur within the window (tolerates 4, trips on the 5th). |
+| `post_processing_fault_window_seconds` | `1800` | Rolling window (seconds) over which `post_processing_fault_threshold` is counted. |
 
 The `ram_pressure_*` floor is distinct from `ram_reserve_mb`: the reserve is a
 *marginal* per-job admission check, while the pressure floor is the *absolute*
@@ -143,6 +148,54 @@ inference processes can start a new job while the previous job's post-processing
 (image encoding, etc.) is still running. This is a throughput optimization for
 fast GPUs. (Distinct from `allow_post_processing`, which controls whether the
 worker advertises post-processing capability to the API at pop time.)
+
+### Post-processing VRAM over-commit
+
+A job's upscaler/face-fixer peak lands *after* sampling and can be far larger
+than its sampling footprint: a 4x upscale on an SDXL image needs roughly 8.5 GB
+at peak. The preload budget deliberately admits a job on its sampling cost alone
+(folding the transient post-processing spike into placement would misroute
+ordinary upscale jobs onto the heavy-head path). On a contended card (warm
+sibling models plus several process contexts already resident), that peak can
+allocate into near-zero free VRAM and tile-thrash silently until the
+post-process watchdog reaps the slot, faulting the job. ComfyUI's own
+`free_memory` can only release *this* process's weights; the sibling models and
+contexts that fill the card are cross-process and only the orchestrator can
+reclaim them.
+
+Two protections close that gap, both on by default. The decisive one is an
+**overlap gate** on the imminent peak, part of
+`post_processing_budget_reserve_enabled`. The over-commit usually emerges
+*mid-flight*: while one job is still sampling, `post_process_job_overlap`
+pre-stages a second concurrent sample, and by the time the first job reaches its
+upscaler the card already holds both. A dispatch-time check cannot see that --
+at each job's dispatch neither peak is live yet. So the reserve also charges the
+*imminent* post-processing peak of any in-flight job that is still sampling
+against the overlap/pre-staging cap: a second concurrent sample is withheld when
+the card is already owed a large upscale peak. It self-scales to zero when
+nothing in flight will post-process, so ordinary overlap is unaffected.
+
+`post_processing_active_reclaim_enabled` is the complement for the non-overlap
+saturated case. At dispatch the scheduler sizes the dispatching job's own
+post-processing peak against the measured headroom and, only when it will not fit
+even after the job's own weights are freed in-child, frees cross-process room --
+an idle sibling's model, then a context, so the room is ready by the time the
+peak lands. A peak nothing the orchestrator can reclaim will host (a
+single-process worker on a small card) faults gracefully so the horde reissues
+the job, rather than dispatching it into a guaranteed stall. It is evidence-gated:
+with the peak unknown or free VRAM unmeasured it does nothing, and on a roomy card
+where the peak already fits it is a no-op.
+
+`post_processing_fault_breaker_enabled` is the self-protective backstop. If
+post-processing peaks keep failing to host (more than
+`post_processing_fault_threshold` over-commit faults within
+`post_processing_fault_window_seconds`), the worker stops advertising
+post-processing so the horde stops sending it upscale/face-fix jobs it cannot
+host, ending the fault-to-forced-maintenance spiral, and logs an advisory to
+downgrade settings. The suppression is session-latched: the over-commit is
+structural, so it clears only on restart. See
+[Resilience and recovery](resilience_and_recovery.md) for how it sits alongside
+the other self-protective throttles.
 
 ### Alchemy
 

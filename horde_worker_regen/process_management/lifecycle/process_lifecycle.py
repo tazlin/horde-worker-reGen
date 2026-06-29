@@ -1636,6 +1636,12 @@ class ProcessLifecycleManager:
                 self._initiate_safety_replacement()
                 self._replace_all_safety_process()
             if process_info.process_type == HordeProcessType.INFERENCE:
+                # A slot reaped silent in post-processing is a post-processing VRAM over-commit: the
+                # upscaler/face-fixer peak could not be hosted and the allocation thrashed until this
+                # timeout. Feed the feature-level circuit breaker so a run of these disables post-processing
+                # before the worker keeps faulting into the horde's forced-maintenance.
+                if state == HordeProcessState.INFERENCE_POST_PROCESSING:
+                    self._job_tracker.note_post_processing_overcommit_fault()
                 self._replace_inference_process(process_info)
             return True
         return False

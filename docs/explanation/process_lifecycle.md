@@ -111,6 +111,19 @@ the wedged call itself: hordelib swallows exceptions raised inside the progress
 callback, so reaping is the parent's job.) The `detect_stuck_inference_step`
 [log detector](../reference/logs.md) recognizes the reap line after the fact.
 
+A reap in the **post-processing** state has a specific cause worth naming: a VRAM
+over-commit. The upscaler/face-fixer peak lands after sampling and is never
+charged against the job's placement, so on a contended card it allocates into
+near-zero free VRAM and tile-thrashes silently until the
+`post_process_timeout + 3 × max_batch` silence reaps the slot. Each such reap
+feeds the post-processing fault breaker (see
+[Resilience and recovery](resilience_and_recovery.md)); the
+`detect_post_processing_vram_stall` detector attributes the reap line to the
+over-commit. The preventative fix is the scheduler's active post-processing
+reclaim (`post_processing_active_reclaim_enabled`, see
+[bridge config](bridge_config.md#post-processing-vram-over-commit)), which frees
+cross-process VRAM before the peak lands so the reap never happens.
+
 When a process exceeds its timeout, it is **replaced immediately** within the
 same call (see below); there is no separate notification sent to the message
 dispatcher. After any recovery, a short `recently_recovered` guard suppresses

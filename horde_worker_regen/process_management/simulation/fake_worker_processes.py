@@ -71,6 +71,10 @@ from horde_worker_regen.process_management.simulation.fault_injection import (
     FaultKind,
     FaultProfile,
 )
+from horde_worker_regen.process_management.simulation.sim_vram import (
+    SimVramLedger,
+    simulate_post_processing_allocation,
+)
 
 
 def _hang_forever(process_label: str, reason: str) -> None:
@@ -98,6 +102,9 @@ class FakeInferenceProcess(HordeProcess):
     _fail_every_n: int
     _jobs_started: int = 0
     _fault_profile: FaultProfile
+    _sim_vram_ledger: SimVramLedger | None = None
+    _sim_weights_mb: float = 0.0
+    _sim_context_mb: float = 0.0
 
     def __init__(
         self,
@@ -112,6 +119,9 @@ class FakeInferenceProcess(HordeProcess):
         job_delay_seconds: float = 0.0,
         fail_every_n: int = 0,
         fault_profile: FaultProfile | None = None,
+        sim_vram_ledger: SimVramLedger | None = None,
+        sim_weights_mb: float = 0.0,
+        sim_context_mb: float = 0.0,
     ) -> None:
         """Initialise the fake inference process.
 
@@ -129,6 +139,13 @@ class FakeInferenceProcess(HordeProcess):
                 images. Defaults to 0 (never fail).
             fault_profile (FaultProfile | None, optional): A misbehaviour script (hang, crash, drop \
                 heartbeats, slow, OOM, corrupt message). Defaults to a no-op profile.
+            sim_vram_ledger (SimVramLedger | None, optional): A shared simulated-VRAM ledger. When given, \
+                the process registers its weights/context on it and reports ledger-derived device VRAM, so \
+                the orchestrator's budget/forecast see a simulated device. Defaults to None (inert).
+            sim_weights_mb (float, optional): This process's resident model-weight footprint to register on \
+                the ledger when a model is loaded. Defaults to 0.0.
+            sim_context_mb (float, optional): This process's fixed CUDA-context overhead to register on the \
+                ledger at startup. Defaults to 0.0.
         """
         super().__init__(
             process_id=process_id,
@@ -142,6 +159,14 @@ class FakeInferenceProcess(HordeProcess):
         self._job_delay_seconds = job_delay_seconds
         self._fail_every_n = fail_every_n
         self._fault_profile = fault_profile if fault_profile is not None else FaultProfile()
+        self._sim_vram_ledger = sim_vram_ledger
+        self._sim_weights_mb = sim_weights_mb
+        self._sim_context_mb = sim_context_mb
+
+        if self._sim_vram_ledger is not None:
+            # A process's CUDA context is committed for its whole life and only a teardown reclaims it, so
+            # register it up front (its weights are added later, when a model preloads).
+            self._sim_vram_ledger.set_context_overhead(self.device_index, self.process_id, self._sim_context_mb)
 
         if self._fault_profile.crash_on_start:
             # Die while still in PROCESS_STARTING (super().__init__ already announced it), simulating a
@@ -155,12 +180,20 @@ class FakeInferenceProcess(HordeProcess):
 
     @override
     def get_vram_usage_mb(self) -> int:
-        """Return a fixed fake VRAM usage value."""
+        """Return device-wide used VRAM from the simulated ledger, or a fixed 0 when none is wired in.
+
+        The real child reports ``torch_total - torch_free`` (device-wide used), which the orchestrator
+        turns into free VRAM; reporting the ledger's device-wide used figure feeds the same seam.
+        """
+        if self._sim_vram_ledger is not None:
+            return int(self._sim_vram_ledger.device_used_mb(self.device_index))
         return 0
 
     @override
     def get_vram_total_mb(self) -> int:
-        """Return a fixed fake VRAM total value."""
+        """Return the simulated card's total VRAM from the ledger, or a fixed 0 when none is wired in."""
+        if self._sim_vram_ledger is not None:
+            return int(self._sim_vram_ledger.total_mb(self.device_index))
         return 0
 
     def on_horde_model_state_change(
@@ -209,6 +242,11 @@ class FakeInferenceProcess(HordeProcess):
 
         time_start = time.time()
         self._active_model_name = horde_model_name
+
+        if self._sim_vram_ledger is not None:
+            # The model's weights are now resident on this slot: charge them to the simulated device so
+            # siblings (and this process's own later post-processing) see the committed VRAM.
+            self._sim_vram_ledger.set_resident_weights(self.device_index, self.process_id, self._sim_weights_mb)
 
         self.on_horde_model_state_change(
             process_state=HordeProcessState.PRELOADED_MODEL,
@@ -272,6 +310,8 @@ class FakeInferenceProcess(HordeProcess):
         if profile.corrupt_on_job_n == self._jobs_started:
             self._emit_corrupt_result(job_info)
 
+        self._maybe_run_fake_post_processing()
+
         n_iter = job_info.payload.n_iter if job_info.payload.n_iter else 1
         job_image_results = None
         if not should_fail:
@@ -333,6 +373,41 @@ class FakeInferenceProcess(HordeProcess):
             HordeProcessState.WAITING_FOR_JOB,
             info="Waiting for job",
         )
+
+    def _maybe_run_fake_post_processing(self) -> None:
+        """Run a simulated post-processing phase against the VRAM ledger, stalling if the peak cannot fit.
+
+        Inert unless the fault profile sets ``post_processing_peak_mb`` and a ledger is wired in. Otherwise
+        the process enters ``INFERENCE_POST_PROCESSING`` and tries to allocate the peak: the process frees
+        its own model (ComfyUI's per-process ``free_memory``), then, if the simulated device still lacks
+        room (a sibling-residency / context over-commit it cannot self-reclaim), it hangs, emitting no
+        further messages so the parent's post-processing watchdog reaps it, reproducing the post-processing
+        over-commit stall and recovery. With room, the peak fits and the method returns so the job completes
+        normally.
+        """
+        peak_mb = self._fault_profile.post_processing_peak_mb
+        if peak_mb is None or self._sim_vram_ledger is None:
+            return
+
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.INFERENCE_POST_PROCESSING,
+            info="Post Processing.",
+        )
+        fits = simulate_post_processing_allocation(
+            self._sim_vram_ledger,
+            device_index=self.device_index,
+            process_id=self.process_id,
+            post_processing_peak_mb=float(peak_mb),
+        )
+        if not fits:
+            _hang_forever(
+                f"fake inference {self.process_id}",
+                f"post-processing peak {peak_mb}MB does not fit "
+                f"{self._sim_vram_ledger.device_free_mb(self.device_index):.0f}MB free after self-eviction",
+            )
+        # The peak fit; release it now that this fake's post-processing is "done" so the slot's residency
+        # returns to just its weights for the next scheduling decision.
+        self._sim_vram_ledger.clear_transient(self.device_index, self.process_id)
 
     def _run_fake_alchemy(self, form: AlchemyFormSpec) -> None:
         """Pretend to run an alchemy form, emitting the same message sequence as the real process."""
@@ -398,6 +473,11 @@ class FakeInferenceProcess(HordeProcess):
 
             self._run_fake_inference(message.sdk_api_job_info)
         elif message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+            if self._sim_vram_ledger is not None:
+                # The orchestrator told this slot to free VRAM: it frees only its own model (the
+                # cross-process rule). This is the lever by which orchestrator reclaim makes room for a
+                # *sibling's* imminent post-processing peak, the dynamic the harness exists to observe.
+                self._sim_vram_ledger.free_own_models(self.device_index, self.process_id)
             if self._active_model_name is not None:
                 self.on_horde_model_state_change(
                     process_state=HordeProcessState.UNLOADED_MODEL_FROM_VRAM,
@@ -613,6 +693,9 @@ def start_fake_inference_process(
     gpu_sampling_lease: Semaphore | None = None,
     fail_every_n: int = 0,
     fault_profile: FaultProfile | None = None,
+    sim_vram_ledger: SimVramLedger | None = None,
+    sim_weights_mb: float = 0.0,
+    sim_context_mb: float = 0.0,
 ) -> None:
     """Start a fake inference process.
 
@@ -621,8 +704,11 @@ def start_fake_inference_process(
     accepted and ignored; ``dry_run_inference_delay`` controls how long fake jobs take.
     ``fail_every_n`` makes every nth job report a faulted result (0 = never), and
     ``fault_profile`` scripts richer misbehaviour (hang, crash, drop heartbeats, slow, OOM,
-    corrupt message), letting harnesses exercise the recovery paths. Inject either with
-    ``functools.partial`` (partials of module-level functions stay picklable under spawn).
+    corrupt message), letting harnesses exercise the recovery paths. ``sim_vram_ledger`` (with
+    ``sim_weights_mb`` / ``sim_context_mb``) wires this fake to a shared simulated-VRAM ledger so a
+    ``fault_profile.post_processing_peak_mb`` drives deterministic post-processing VRAM pressure
+    (stall-and-recover vs. complete) without a GPU. Inject any of these with ``functools.partial``
+    (partials of module-level functions stay picklable under spawn).
     """
     enable_child_faulthandler(f"fake_inference_{process_id}")
     logger.remove()
@@ -639,6 +725,9 @@ def start_fake_inference_process(
             job_delay_seconds=dry_run_inference_delay,
             fail_every_n=fail_every_n,
             fault_profile=fault_profile,
+            sim_vram_ledger=sim_vram_ledger,
+            sim_weights_mb=sim_weights_mb,
+            sim_context_mb=sim_context_mb,
         )
         worker_process.main_loop()
     except Exception as e:

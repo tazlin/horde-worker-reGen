@@ -65,6 +65,7 @@ from horde_worker_regen.process_management.simulation.fake_worker_processes impo
     start_fake_safety_process,
 )
 from horde_worker_regen.process_management.simulation.fault_injection import FaultProfile
+from horde_worker_regen.process_management.simulation.sim_vram import SimVramLedger
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
 
@@ -134,6 +135,20 @@ class HarnessConfig:
 
     safety_fault_profile: FaultProfile | None = None
     """If set (fake process mode only), scripts the safety fakes' misbehaviour on the eval path."""
+
+    sim_vram_ledger: SimVramLedger | None = None
+    """If set (fake process mode only), a shared simulated-device-VRAM ledger the inference fakes report
+    from and allocate against. Paired with an ``inference_fault_profile`` carrying ``post_processing_peak_mb``
+    it drives deterministic post-processing VRAM pressure (stall + recovery vs. completion) without a GPU.
+    The caller owns the backing ``multiprocessing.Manager`` and must keep it alive for the run."""
+
+    sim_inference_weights_mb: float = 0.0
+    """Per-inference-process resident model-weight footprint (MB) to register on ``sim_vram_ledger`` when a
+    model loads. Ignored without a ledger."""
+
+    sim_inference_context_mb: float = 0.0
+    """Per-inference-process fixed CUDA-context overhead (MB) to register on ``sim_vram_ledger`` at startup.
+    Ignored without a ledger."""
 
     fake_initially_available_models: list[str] | None = None
     """Optional fake-mode model set present before the fake download process starts.
@@ -464,6 +479,10 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
             inference_kwargs["fail_every_n"] = config.fail_every_n
         if config.inference_fault_profile is not None:
             inference_kwargs["fault_profile"] = config.inference_fault_profile
+        if config.sim_vram_ledger is not None:
+            inference_kwargs["sim_vram_ledger"] = config.sim_vram_ledger
+            inference_kwargs["sim_weights_mb"] = config.sim_inference_weights_mb
+            inference_kwargs["sim_context_mb"] = config.sim_inference_context_mb
         inference_entry_point = (
             functools.partial(start_fake_inference_process, **inference_kwargs)
             if inference_kwargs

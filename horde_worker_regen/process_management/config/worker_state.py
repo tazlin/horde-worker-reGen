@@ -51,6 +51,19 @@ class WorkerState:
     self_throttle_paused_until: float = 0.0
     """Wall-clock time the self-throttle pop-pause auto-resumes; 0 when not throttling."""
 
+    post_processing_disabled_by_breaker: bool = False
+    """Session-latched: the post-processing fault breaker tripped on repeated unhostable post-processing peaks.
+
+    A post-processing peak that cannot be hosted (a single-process worker on a tiny card, or a card a job
+    over-commits) faults the job and, reaped, accumulates toward this breaker. While true the job popper stops
+    advertising post-processing support (see the popper's ``pop_allow_post_processing``) so the worker is no
+    longer handed upscale/face-fix jobs it cannot host, ending the fault->forced-maintenance spiral. The
+    over-commit is structural, so this clears only on restart (auto-recovery would simply re-trip it) and is
+    deliberately NOT cleared by a save-our-ship soft reset; the operator should downgrade settings."""
+
+    post_processing_breaker_tripped_at: float = 0.0
+    """Wall-clock time the post-processing breaker tripped; 0 when not tripped (for the operator advisory/TUI)."""
+
     lora_disk_exhausted: bool = False
     """The LoRA cache volume is below its free-space floor and eviction could not clear it.
 

@@ -159,6 +159,32 @@ The escalation, in order:
 With `exit_on_unhandled_faults` set, the worker exits instead of limping; SOS is
 the default-on alternative that prioritises continued operation.
 
+## Self-protective feature throttles
+
+The horde forces a worker into maintenance when it "drops too many jobs". Layers
+1-3 keep a *struggling* worker serving, but some failures are **structural**: a
+capability the worker advertises that this hardware simply cannot honour. Faulting
+those jobs and waiting for the next one only feeds the forced-maintenance spiral.
+So the worker also withdraws the failing capability before that happens.
+
+The **post-processing fault breaker** is the instance of this for post-processing.
+A post-processing peak that cannot be hosted (see
+[post-processing VRAM over-commit](bridge_config.md#post-processing-vram-over-commit))
+faults the job, and a watchdog-reaped post-processing stall does the same. Both
+feed a rolling-window counter
+([`JobTracker.count_recent_post_processing_faults`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker.count_recent_post_processing_faults]);
+once it exceeds `post_processing_fault_threshold` within
+`post_processing_fault_window_seconds`, the worker stops advertising
+post-processing at pop time, so the horde stops sending it upscale/face-fix jobs,
+and logs an operator advisory to downgrade settings. The suppression is
+**session-latched** (it survives a soft reset and clears only on restart)
+because the over-commit is structural and auto-recovery would simply re-trip it.
+It mirrors the per-model unservable breaker and the self-maintenance throttle: a
+worker that protects its own standing on the horde rather than bleeding dropped
+jobs until the server intervenes. The active reclaim
+(`post_processing_active_reclaim_enabled`) is the preventative complement that
+keeps the breaker from being needed in the first place.
+
 ## The action ledger
 
 [`ActionLedger`][horde_worker_regen.process_management.ipc.action_ledger.ActionLedger]

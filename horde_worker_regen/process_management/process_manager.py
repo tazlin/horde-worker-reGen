@@ -1094,6 +1094,37 @@ class HordeWorkerProcessManager:
             "worker into maintenance. In-flight jobs will finish.",
         )
 
+    def _apply_post_processing_fault_breaker(self) -> None:
+        """Session-latch off post-processing after repeated unhostable post-processing-peak faults.
+
+        A post-processing peak that cannot be hosted (a single-process worker on a tiny card, or a card a job
+        over-commits) faults the job; the horde reissues it, but a worker that keeps faulting trips the
+        horde's forced-maintenance, the very spiral this guards against. When such faults (the scheduler's
+        unhostable-peak faults and the lifecycle's reaped post-processing stalls) exceed the configured
+        threshold within the window, stop advertising post-processing so the worker is no longer handed
+        upscale/face-fix jobs it cannot host, and advise the operator to downgrade. Session-latched: the
+        over-commit is structural, so it clears only on restart (auto-recovery would simply re-trip it).
+        """
+        if not self.bridge_data.post_processing_fault_breaker_enabled:
+            return
+        if self._state.post_processing_disabled_by_breaker:
+            return
+        threshold = self.bridge_data.post_processing_fault_threshold
+        window = self.bridge_data.post_processing_fault_window_seconds
+        now = time.time()
+        recent = self._job_tracker.count_recent_post_processing_faults(window, now=now)
+        if recent <= threshold:
+            return
+        self._state.post_processing_disabled_by_breaker = True
+        self._state.post_processing_breaker_tripped_at = now
+        logger.warning(
+            f"Post-processing fault breaker tripped: {recent} post-processing over-commit fault(s) in the last "
+            f"{window:.0f}s (threshold {threshold}). Disabling post-processing on this worker for the rest of "
+            "the session so it stops being handed upscale/face-fix jobs it cannot host (which keep faulting and "
+            "risk the horde forcing maintenance). To restore it, downgrade settings (lower max_threads or "
+            "queue_size, or enable post_processing_active_reclaim_enabled) and restart the worker.",
+        )
+
     def set_maintenance(self, enabled: bool) -> None:
         """Set the named worker's *server-side* maintenance flag via the horde API (blocking).
 
@@ -1512,6 +1543,7 @@ class HordeWorkerProcessManager:
             self._download_coordinator.maybe_start_safety_processes()
             self._download_coordinator.maybe_start_inference_processes()
             self._apply_self_maintenance_throttle()
+            self._apply_post_processing_fault_breaker()
             if self._state.server_maintenance_cleared_by_job_pop and self._worker_details_maintenance:
                 logger.info("Clearing cached worker-details maintenance: a new job was popped successfully.")
                 self._worker_details_maintenance = False

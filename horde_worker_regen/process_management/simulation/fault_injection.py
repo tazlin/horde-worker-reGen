@@ -36,6 +36,7 @@ class FaultKind(enum.StrEnum):
     SLOW = "slow"
     OOM = "oom"
     CORRUPT_MESSAGE = "corrupt_message"
+    POST_PROCESSING_STALL = "post_processing_stall"
 
 
 # Tag prefix the fake stamps onto a faulted result's ``info`` so the main process (and tests) can
@@ -78,6 +79,14 @@ class FaultProfile(BaseModel):
     """On this job ordinal, emit a misrouted/garbage message before the real result, exercising the
     dispatcher's tolerance of malformed or mismatched messages."""
 
+    post_processing_peak_mb: int | None = None
+    """When set (and a simulated-VRAM ledger is wired in), every job enters an ``INFERENCE_POST_PROCESSING``
+    phase after sampling and tries to allocate this peak against the ledger. If the simulated device cannot
+    host it once the process frees its *own* models (a sibling-residency / context over-commit the process
+    cannot self-reclaim), the upscaler stalls: the process stops emitting heartbeats so the post-processing
+    watchdog reaps it, the post-processing over-commit recovery. With room, the peak fits and the job
+    completes normally. Without a ledger this field is inert (the fake reports no real device state)."""
+
     def is_noop(self) -> bool:
         """Return True if this profile requests no misbehaviour at all."""
         return self == FaultProfile()
@@ -101,4 +110,6 @@ class FaultProfile(BaseModel):
             kinds.add(FaultKind.OOM)
         if self.corrupt_on_job_n is not None:
             kinds.add(FaultKind.CORRUPT_MESSAGE)
+        if self.post_processing_peak_mb is not None:
+            kinds.add(FaultKind.POST_PROCESSING_STALL)
         return kinds

@@ -782,3 +782,60 @@ class TestHeadDispatchStall:
             ],
         )
         assert "head_dispatch_stall" not in _diagnose(tmp_path, bridge)
+
+
+class TestPostProcessingVramStall:
+    """A slot reaped silent in post-processing, plus the breaker advisory that escalates the session.
+
+    The watchdog reap line is the base signal (a single one is an actionable warning); the breaker-trip
+    advisory and any forced maintenance escalate it to critical. The detector must also fire on a
+    breaker-only session, since the planner's unhostable-peak faults can trip the breaker with no watchdog
+    stall line of their own.
+    """
+
+    def _bridge(self, *lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-28 16:53:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    @staticmethod
+    def _stall(ts: str, *, slot: int = 3) -> str:
+        """process_lifecycle._check_and_replace_process: the post-processing-stage watchdog reaping a slot."""
+        return (
+            f"2026-06-28 {ts} | ERROR    | horde_worker_regen.process_management.lifecycle.process_lifecycle:_check_and_replace_process:1618 - "
+            f"HordeProcessInfo(process_id={slot}, last_process_state=HordeProcessState.INFERENCE_POST_PROCESSING, "
+            f"loaded_horde_model_name=AAM XL AnimeMix) seems to be stuck post processing, replacing it"
+        )
+
+    @staticmethod
+    def _breaker(ts: str) -> str:
+        """process_manager._apply_post_processing_fault_breaker: the breaker tripping (operator advisory)."""
+        return (
+            f"2026-06-28 {ts} | WARNING | horde_worker_regen.process_management.process_manager:_apply_post_processing_fault_breaker:1090 - "
+            "Post-processing fault breaker tripped: 5 post-processing over-commit fault(s) in the last 1800s "
+            "(threshold 4). Disabling post-processing on this worker for the rest of the session."
+        )
+
+    def test_lone_stall_is_warning(self, tmp_path: Path) -> None:
+        """A single watchdog reap with no escalation is an actionable warning."""
+        findings = _diagnose(tmp_path, self._bridge(self._stall("16:53:42.000")))
+        assert "post_processing_vram_stall" in findings
+        assert findings["post_processing_vram_stall"].severity is Severity.WARNING
+
+    def test_breaker_trip_escalates_to_critical(self, tmp_path: Path) -> None:
+        """The breaker advisory escalates the stall finding to critical and is named in the verdict."""
+        findings = _diagnose(tmp_path, self._bridge(self._stall("16:53:42.000"), self._breaker("16:55:00.000")))
+        finding = findings["post_processing_vram_stall"]
+        assert finding.severity is Severity.CRITICAL
+        assert "breaker tripped" in finding.verdict
+
+    def test_breaker_only_still_fires(self, tmp_path: Path) -> None:
+        """The detector fires on a breaker-only session (the planner-fault path leaves no stall line)."""
+        findings = _diagnose(tmp_path, self._bridge(self._breaker("16:55:00.000")))
+        assert "post_processing_vram_stall" in findings
+        assert findings["post_processing_vram_stall"].severity is Severity.CRITICAL
+
+    def test_silent_without_signals(self, tmp_path: Path) -> None:
+        """A crash-on-start recovery is not a post-processing stall, so the detector stays silent."""
+        bridge = self._bridge(_recovery("16:53:31.000", 1, reason="inference process replaced (crashed or hung)"))
+        assert "post_processing_vram_stall" not in _diagnose(tmp_path, bridge)

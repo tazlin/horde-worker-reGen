@@ -33,6 +33,7 @@ class _StubState:
     shutting_down = False
     supervisor_paused = False
     self_throttle_paused = False
+    gpu_torch_incompatible = False
 
 
 class _StubRuntimeConfig:

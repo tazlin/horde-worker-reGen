@@ -184,7 +184,7 @@ class TestStuckOnNonAdvancingStep:
 
     def test_wedged_slot_is_reaped_despite_fresh_heartbeats(self) -> None:
         """A non-silent slot past the repeat limit is replaced (the bug: it never was)."""
-        proc = self._starting_slot(repeats=6)
+        proc = self._starting_slot(repeats=21)
         plm = _make_plm(process_map=ProcessMap({1: proc}))
         plm._replace_inference_process = Mock()  # type: ignore[method-assign]
 

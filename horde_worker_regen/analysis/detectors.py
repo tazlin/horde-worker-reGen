@@ -106,6 +106,20 @@ _WHOLE_CARD_DECLINED_RE = re.compile(r"Declined a whole-card residency for")
 # detector rather than folding into a generic hang. The phrase is the worker's verbatim reap line.
 _STUCK_STEP_RE = re.compile(r"stuck on a non-advancing sampling step|stuck-step watchdog")
 
+# The post-processing-stage watchdog reaping a slot that went silent in INFERENCE_POST_PROCESSING. The
+# upscaler/face-fixer peak (a 4x SDXL upscale is ~8.5 GB) lands after sampling and is never charged against
+# the job's placement, so on a card already holding warm sibling models and several contexts it allocates
+# into near-zero free VRAM and tile-thrashes silently until the post_process_timeout + 3*max_batch silence
+# reaps the slot. Distinct from a generic hang: the cause is a VRAM over-commit at the post-sampling peak,
+# and the remedy is the active post-processing reclaim (free cross-process room before the peak), not a
+# longer timeout. The phrase is the worker's verbatim reap line (process_lifecycle._check_and_replace_process).
+_POST_PROCESSING_STALL_RE = re.compile(r"seems to be stuck post processing")
+# The feature-level circuit breaker disabling post-processing after a run of over-commit faults. Its trip
+# line is the operator advisory: it confirms the spiral reached the self-protective latch (post-processing is
+# now off until restart), so a session carrying it is escalated and the remediation points at the restart +
+# downgrade. The phrase is the worker's verbatim breaker-trip line (process_manager).
+_POST_PROCESSING_BREAKER_RE = re.compile(r"Post-processing fault breaker tripped")
+
 # A median pop->submit latency this many times the median generation time means jobs are aging in the
 # pipeline queue, not in generation (the post-inference safety-backlog signature).
 _QUEUE_AGING_LATENCY_RATIO = 3.0
@@ -314,6 +328,70 @@ def detect_stuck_inference_step(context: SessionContext) -> list[Finding]:
                 "being reaped, raise `inference_stuck_step_repeat_limit`."
             ),
             evidence=[_evidence(r) for r in stuck[:4]],
+        ),
+    ]
+
+
+def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
+    """A slot reaped silent in post-processing: the upscaler/face-fixer peak over-committed the card.
+
+    A post-processing job is admitted on its sampling footprint, but the much larger peak that lands *after*
+    sampling (a 4x SDXL upscale is ~8.5 GB) is never charged against its placement. On a card already holding
+    warm sibling models and several process contexts, the upscaler allocates into near-zero free VRAM and
+    tile-thrashes silently until the post-processing-stage watchdog reaps the slot. ComfyUI's own
+    ``free_memory`` can only release *this* process's weights; the sibling models and contexts are
+    cross-process and only the orchestrator can reclaim them, so the in-child retry never finds room. Each
+    reap strands the in-flight job and burns a process recovery; the same job stalling twice faults it, and
+    repeated faulting trips the horde's forced maintenance.
+    """
+    stalls = _matching(context.session.records, _POST_PROCESSING_STALL_RE)
+    breaker_trips = _matching(context.session.records, _POST_PROCESSING_BREAKER_RE)
+    if not stalls and not breaker_trips:
+        return []
+    post_processing_recoveries = [r for r in context.recoveries if r.last_state == "INFERENCE_POST_PROCESSING"]
+    dropped = _total_dropped_jobs(context.session.records)
+    forced_maintenance = bool(_matching(context.session.records, _MAINTENANCE_POP_RE))
+    escalated = dropped > 0 or forced_maintenance or bool(breaker_trips)
+    verdict = (
+        f"{len(stalls)} time(s) an inference slot went silent in post-processing and was reaped by the "
+        "post-processing-stage watchdog. The upscaler/face-fixer peak that lands after sampling (a 4x SDXL "
+        "upscale is ~8.5 GB) was never charged against the job's placement, so on a contended card it "
+        "allocated into near-zero free VRAM and tile-thrashed until the silence timeout fired. The in-child "
+        "retry cannot recover: ComfyUI frees only this process's own weights, while the sibling models and "
+        "contexts that fill the card are reclaimable only by the orchestrator."
+    )
+    if breaker_trips:
+        verdict += (
+            " The self-protective breaker tripped: post-processing is now disabled on this worker for the rest "
+            "of the session (it kept being handed jobs it could not host)."
+        )
+    if dropped > 0 or forced_maintenance:
+        verdict += f" It escalated: {dropped} backlog job(s) were faulted" + (
+            " and the horde forced the worker into maintenance." if forced_maintenance else "."
+        )
+    return [
+        Finding(
+            id="post_processing_vram_stall",
+            severity=Severity.CRITICAL if escalated else Severity.WARNING,
+            title="Post-processing stalled on an over-committed card",
+            verdict=verdict,
+            remediation=(
+                "Enable the active post-processing reclaim (`post_processing_active_reclaim_enabled`) so the "
+                "scheduler frees cross-process VRAM (an idle sibling model, then a context) before the peak "
+                "lands. As a stopgap, lower concurrency/queue or disable post-processing on this card; a 4x "
+                "upscale needs ~8.5 GB free at peak that a multi-context card cannot spare. The "
+                "`post_processing_fault_breaker_enabled` breaker disables post-processing automatically after "
+                "repeated stalls so the worker stops feeding the forced-maintenance spiral"
+                + (
+                    "; it has already tripped here, so restart the worker after downgrading settings to "
+                    "restore post-processing."
+                    if breaker_trips
+                    else "."
+                )
+            ),
+            evidence=[_evidence(r) for r in (stalls[:4] + breaker_trips[:1])]
+            + [_evidence(r.record) for r in post_processing_recoveries[:2]],
+            see_also="vram_ram_budget_subsystem",
         ),
     ]
 
@@ -1075,6 +1153,7 @@ DETECTORS: list[Detector] = [
     detect_consecutive_failure_pause,
     detect_pop_governor_dominance,
     detect_stuck_inference_step,
+    detect_post_processing_vram_stall,
     detect_oom,
     detect_swallowed_oom,
     detect_orphan_wedge,

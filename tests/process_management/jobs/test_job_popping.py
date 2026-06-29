@@ -353,6 +353,45 @@ class TestFeatureReadinessGate:
         assert request.allow_controlnet is True
 
 
+class TestPostProcessingBreakerSuppression:
+    """A latched post-processing fault breaker withholds post-processing from the pop request."""
+
+    @staticmethod
+    async def _pop_and_capture_request(*, state: WorkerState) -> object:
+        """Drive one full pop with the given worker state and return the built job-pop request."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()  # clear the session warm-up gate so a pop happens
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            state=state,
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+        )
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
+        return session.submit_request.call_args.args[0]
+
+    async def test_latched_breaker_withholds_post_processing(self) -> None:
+        """With the breaker latched, the pop advertises ``allow_post_processing=False``."""
+        state = WorkerState()
+        state.post_processing_disabled_by_breaker = True
+
+        request = await self._pop_and_capture_request(state=state)
+
+        assert request.allow_post_processing is False
+
+    async def test_unlatched_breaker_advertises_post_processing(self) -> None:
+        """With the breaker not latched, post-processing is advertised as configured (the default path)."""
+        request = await self._pop_and_capture_request(state=WorkerState())
+
+        assert request.allow_post_processing is True
+
+
 class TestPopAhead:
     """Tests for hunger detection and the urgent (throttle-bypassing) pop path."""
 

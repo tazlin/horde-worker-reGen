@@ -91,6 +91,15 @@ def _stuck_step(ts: str, *, slot: int = 3, repeats: int = 3060) -> str:
     )
 
 
+def _post_processing_stall(ts: str, *, slot: int = 3) -> str:
+    """process_lifecycle._check_and_replace_process: the post-processing-stage watchdog reaping a slot."""
+    return (
+        f"2026-06-28 {ts} | ERROR    | horde_worker_regen.process_management.lifecycle.process_lifecycle:_check_and_replace_process:1618 - "
+        f"HordeProcessInfo(process_id={slot}, last_process_state=HordeProcessState.INFERENCE_POST_PROCESSING, "
+        f"loaded_horde_model_name=AAM XL AnimeMix) seems to be stuck post processing, replacing it"
+    )
+
+
 def _oom(ts: str) -> str:
     """An explicit CUDA out-of-memory fault surfaced from an inference slot."""
     return f"2026-06-24 {ts} | ERROR | x:y:1 - CUDA out of memory. Tried to allocate 2.00 GiB"
@@ -224,6 +233,10 @@ CONTRACTS: dict[str, Contract] = {
         bridge=_bridge(_stuck_step("09:48:02.000")),
         severity=Severity.WARNING,
     ),
+    "detect_post_processing_vram_stall": Contract(
+        bridge=_bridge(_post_processing_stall("16:53:42.000")),
+        severity=Severity.WARNING,
+    ),
     "detect_oom": Contract(
         bridge=_bridge(_oom("18:00:10.000")),
         severity=Severity.CRITICAL,
@@ -266,7 +279,7 @@ def test_every_detector_has_a_contract_fixture() -> None:
     """No detector ships without a golden-signature fixture (the omission guard).
 
     Adding a detector to ``DETECTORS`` without a contract here fails this test, forcing the author to
-    record the log signature the detector keys off -- the single manual step the contract requires.
+    record the log signature the detector keys off, which is the single manual step the contract requires.
     """
     registered = {detector.__name__ for detector in DETECTORS}
     assert registered == set(CONTRACTS), {
