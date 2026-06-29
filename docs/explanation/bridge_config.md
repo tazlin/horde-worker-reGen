@@ -177,14 +177,23 @@ nothing in flight will post-process, so ordinary overlap is unaffected.
 
 `post_processing_active_reclaim_enabled` is the complement for the non-overlap
 saturated case. At dispatch the scheduler sizes the dispatching job's own
-post-processing peak against the measured headroom and, only when it will not fit
-even after the job's own weights are freed in-child, frees cross-process room --
-an idle sibling's model, then a context, so the room is ready by the time the
-peak lands. A peak nothing the orchestrator can reclaim will host (a
-single-process worker on a small card) faults gracefully so the horde reissues
-the job, rather than dispatching it into a guaranteed stall. It is evidence-gated:
-with the peak unknown or free VRAM unmeasured it does nothing, and on a roomy card
-where the peak already fits it is a no-op.
+post-processing peak against the *effective* headroom: the measured free VRAM less
+the room in-flight sibling work has committed or will imminently commit (the same
+not-yet-realised reserve the overlap gate subtracts), so an optimistic or stale
+free reading cannot make the peak look like it fits a card that is about to fill.
+When the peak overflows that headroom it frees cross-process room, choosing for
+what it can actually reclaim. If an idle sibling holds an evictable model it frees
+that first -- even when freeing the dispatching job's own weights would nominally
+cover the peak -- because on a contended card that sibling model is the room the
+upscaler needs and the child's in-process `free_memory` cannot reach it. Only when
+no reclaimable sibling holds room does it defer to that in-child own-weights free,
+then to stopping an idle context on the contended card. A peak nothing the
+orchestrator can reclaim will host (a single-process worker on a small card) faults
+gracefully so the horde reissues the job, rather than dispatching it into a
+guaranteed stall. It is evidence-gated: with the peak unknown or free VRAM
+unmeasured it does nothing, and on a roomy card where the peak already fits it is a
+no-op. Each decision is logged at debug with the peak, the effective free, and the
+chosen action, so a stall the reclaim declined to prevent leaves a trace.
 
 `post_processing_fault_breaker_enabled` is the self-protective backstop. If
 post-processing peaks keep failing to host (more than

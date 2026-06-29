@@ -3576,56 +3576,101 @@ class InferenceScheduler:
 
         The peak (:func:`predict_job_post_processing_vram_mb`) is the upscaler/face-fixer cost that lands
         after sampling, once the card already holds this job's weights, its process contexts, and any warm
-        sibling models. When it overflows the measured headroom the worker must reclaim room before the
+        sibling models. When it overflows the available headroom the worker must reclaim room before the
         upscaler allocates, or the allocation streams/thrashes until the post-processing watchdog replaces
         the process.
 
+        The peak is measured against *effective* free VRAM: the measured free reading less the VRAM in-flight
+        sibling work has committed or will imminently commit (the same not-yet-realised reserve the
+        concurrent-dispatch gate subtracts), so an optimistic or stale reading does not let the peak look like
+        it fits a card that is about to fill.
+
         The decision is evidence-gated: an unavailable peak estimate or unmeasured free VRAM yields a
         :attr:`PostProcessingReclaimAction.NONE` plan (never act on absent telemetry, mirroring
-        :meth:`_should_keep_model_resident`). When the peak fits the measured headroom there is nothing to
-        do. Otherwise the cheapest action that hosts it is chosen: freeing the job's own (idle-during-upscale)
-        weights, which ComfyUI does in-child (:attr:`DELEGATE_IN_PROCESS`); evicting a different model on an
-        idle sibling (:attr:`EVICT_SIBLING_MODEL`); stopping an idle sibling's context
-        (:attr:`REDUCE_CONTEXT`); or, when none of those can host it (a single-process worker on a tiny card),
-        :attr:`INSUFFICIENT`, which faults the job gracefully rather than thrashing the card.
+        :meth:`_should_keep_model_resident`). When the peak fits the effective headroom there is nothing to
+        do. Otherwise the action is chosen for the room it can actually reclaim: when an idle sibling holds an
+        evictable model, freeing it (:attr:`EVICT_SIBLING_MODEL`) is preferred, since that resident model is
+        the cross-process room the upscaler needs and ComfyUI's in-child free cannot reach it; failing a
+        reclaimable sibling, delegating to ComfyUI freeing the job's own (idle-during-upscale) weights
+        in-child (:attr:`DELEGATE_IN_PROCESS`) when that alone suffices on an uncontended card; else stopping
+        an idle sibling's bare context (:attr:`REDUCE_CONTEXT`); or, when none of those can host it (a
+        single-process worker on a tiny card), :attr:`INSUFFICIENT`, which faults the job gracefully rather
+        than thrashing the card.
         """
         baseline = self._model_metadata.get_baseline(dispatched_job.model) if dispatched_job.model else None
         post_processing_peak_mb = predict_job_post_processing_vram_mb(dispatched_job, baseline)
         if post_processing_peak_mb is None or post_processing_peak_mb <= 0.0:
+            logger.debug(
+                f"Post-processing reclaim: no post-processing peak estimate for job "
+                f"{str(dispatched_job.id_)[:8]} ({dispatched_job.model}); not reserving (action NONE).",
+            )
             return PostProcessingReclaimPlan(action=PostProcessingReclaimAction.NONE)
 
         measured_free_mb = self._measured_free_vram_mb(device_index=device_index)
         if measured_free_mb is None:
+            logger.debug(
+                f"Post-processing reclaim: no measured free VRAM for device {device_index}; not reserving "
+                f"for job {str(dispatched_job.id_)[:8]} ({dispatched_job.model}) (action NONE).",
+            )
             return PostProcessingReclaimPlan(action=PostProcessingReclaimAction.NONE)
-        if post_processing_peak_mb <= measured_free_mb:
-            return PostProcessingReclaimPlan(action=PostProcessingReclaimAction.NONE)
+
+        # The measured free reading lags VRAM that in-flight sibling work has committed (peaks already
+        # post-processing) or will imminently commit (jobs still sampling/staging that will post-process):
+        # the same not-yet-realised cost the concurrent-dispatch gate subtracts. Charging it here too keeps
+        # an optimistic or stale free reading from making the peak look like it fits a card that is about to
+        # fill, which would otherwise leave the upscaler to allocate into a full card. (This job is not yet
+        # in-flight at plan time, so it is excluded from both reserves and never charged against itself.)
+        committed_reserve_mb = self._committed_vram_reserve_mb(device_index=device_index)
+        imminent_reserve_mb = self._imminent_post_processing_reserve_mb(device_index=device_index)
+        effective_free_mb = measured_free_mb - committed_reserve_mb - imminent_reserve_mb
 
         own_weights_mb = predict_job_weight_mb(dispatched_job, baseline) or 0.0
-        if post_processing_peak_mb <= measured_free_mb + own_weights_mb:
-            return PostProcessingReclaimPlan(action=PostProcessingReclaimAction.DELEGATE_IN_PROCESS)
-
-        shortfall_mb = post_processing_peak_mb - (measured_free_mb + own_weights_mb)
         idle_siblings = self._idle_post_processing_reclaim_siblings(
             dispatching_process_id=dispatching_process_id,
             device_index=device_index,
         )
         evictable_sibling = self._evictable_sibling_model_process(dispatched_job.model, idle_siblings)
-        if evictable_sibling is not None:
-            return PostProcessingReclaimPlan(
+        shortfall_mb = post_processing_peak_mb - effective_free_mb
+
+        if post_processing_peak_mb <= effective_free_mb:
+            plan = PostProcessingReclaimPlan(action=PostProcessingReclaimAction.NONE)
+        elif evictable_sibling is not None:
+            # The peak does not fit the effective free VRAM and an idle sibling holds an evictable model: free
+            # it. This is preferred over the in-child own-weights delegation even when freeing this job's own
+            # weights would nominally cover the peak, because on a contended card the room the upscaler needs
+            # is occupied by the *sibling's* resident model, which ComfyUI's in-child free cannot reclaim.
+            # Relying on the own-weights credit while a sibling fills the card lets the upscaler allocate into
+            # a full card and stall until the watchdog reaps the slot.
+            plan = PostProcessingReclaimPlan(
                 action=PostProcessingReclaimAction.EVICT_SIBLING_MODEL,
                 target_process_id=evictable_sibling.process_id,
                 shortfall_mb=shortfall_mb,
             )
-        if idle_siblings:
-            return PostProcessingReclaimPlan(
+        elif post_processing_peak_mb <= effective_free_mb + own_weights_mb:
+            # No reclaimable sibling holds the room, but freeing this job's own (idle-during-upscale) weights,
+            # which ComfyUI does in-child once sampling ends, yields enough on an otherwise-uncontended card.
+            plan = PostProcessingReclaimPlan(action=PostProcessingReclaimAction.DELEGATE_IN_PROCESS)
+        elif idle_siblings:
+            plan = PostProcessingReclaimPlan(
                 action=PostProcessingReclaimAction.REDUCE_CONTEXT,
                 target_process_id=idle_siblings[0].process_id,
                 shortfall_mb=shortfall_mb,
             )
-        return PostProcessingReclaimPlan(
-            action=PostProcessingReclaimAction.INSUFFICIENT,
-            shortfall_mb=shortfall_mb,
+        else:
+            plan = PostProcessingReclaimPlan(
+                action=PostProcessingReclaimAction.INSUFFICIENT,
+                shortfall_mb=shortfall_mb,
+            )
+
+        logger.debug(
+            f"Post-processing reclaim plan for job {str(dispatched_job.id_)[:8]} ({dispatched_job.model}) on "
+            f"device {device_index}: {plan.action.name} (peak ~{post_processing_peak_mb:.0f}MB vs effective "
+            f"free {effective_free_mb:.0f}MB [measured {measured_free_mb:.0f}MB - committed "
+            f"{committed_reserve_mb:.0f}MB - imminent {imminent_reserve_mb:.0f}MB]; own-weights "
+            f"~{own_weights_mb:.0f}MB; {len(idle_siblings)} idle sibling(s), evictable="
+            f"{evictable_sibling is not None}).",
         )
+        return plan
 
     async def _enact_post_processing_reclaim(
         self,
@@ -3659,13 +3704,21 @@ class InferenceScheduler:
             return True
 
         if action is PostProcessingReclaimAction.REDUCE_CONTEXT:
-            current_loaded = self._process_map.num_loaded_inference_processes()
-            needed = max(1, len(self._job_tracker.jobs_in_progress))
+            # Size the reduction from the contended card itself, not the worker-wide pool: on a multi-GPU host
+            # a worker-wide count would leave the per-card scale a no-op (the target never drops below the
+            # card's own context count) and the peak would go unrelieved. None is the single-GPU/worker-wide
+            # case, sized as before.
+            if device_index is None:
+                current_loaded = self._process_map.num_loaded_inference_processes()
+                needed = max(1, len(self._job_tracker.jobs_in_progress))
+            else:
+                current_loaded = self._process_map.num_loaded_inference_processes(device_index=device_index)
+                needed = max(1, self._card_inference_load(device_index))
             target = max(1, min(current_loaded - 1, needed))
             logger.warning(
-                f"Post-processing reclaim: reducing inference contexts to {target} (from {current_loaded}) to "
-                f"host job {str(dispatched_job.id_)[:8]}'s ~{plan.shortfall_mb:.0f}MB post-processing shortfall; "
-                "no idle sibling held an evictable model.",
+                f"Post-processing reclaim: reducing inference contexts on device {device_index} to {target} "
+                f"(from {current_loaded}) to host job {str(dispatched_job.id_)[:8]}'s "
+                f"~{plan.shortfall_mb:.0f}MB post-processing shortfall; no idle sibling held an evictable model.",
             )
             self._process_lifecycle.scale_inference_processes(target, device_index=device_index)
             return True
