@@ -121,8 +121,67 @@ worker self-limits to what it can serve rather than popping jobs it would fault.
 > (`tests/test_torch_memory.py` in hordelib, `tests/process_management/resources/test_system_resources.py` in
 > the worker). They are expected to work on ROCm/XPU/MPS but are not yet hardware-verified there.
 
+## CPU / alchemist-only mode (running without a usable GPU)
+
+A worker can run with **no accelerator at all**, on the CPU torch build. CPU image generation is
+impractically slow (~100x), so a CPU install runs in **alchemist-only mode**: image generation (the
+"dreamer" role) is disabled, while the CPU-friendly alchemy forms (upscale, face-fix, interrogation,
+captioning) stay on offer. This is the onboarding ramp for users without a viable GPU, and a deliberate
+option for a GPU owner who wants to leave the card free for other work.
+
+### Why ComfyUI needs to be told to use CPU
+
+ComfyUI's device state (`comfy.model_management.cpu_state`) defaults to *GPU* and only switches to CPU
+on its `--cpu` CLI flag (or an Apple MPS auto-detect): it is **not** driven by `torch.cuda.is_available()`
+being `False`. So on a CPU-only torch build it would still take the CUDA branch in `get_torch_device()`
+and die with `RuntimeError: No CUDA GPUs are available` during hordelib's startup VRAM probe. hordelib
+therefore detects a CPU-only build (`hordelib.utils.torch_memory.torch_build_is_cpu_only`, which checks
+the *build* has no CUDA/HIP/XPU/MPS backend, not merely that a device is missing at runtime) and injects
+`--cpu` itself in `do_comfy_import`. This is build-based on purpose: a CUDA build whose GPU is merely
+masked or has a broken driver is **not** forced onto CPU, so a misconfigured GPU surfaces rather than
+silently running 100x slower.
+
+### The intended-backend sentinel
+
+The installer records the chosen torch build in `bin/backend` (`cu132`/`rocm`/`cpu`/...). A `cpu` token
+is the worker's signal for CPU / alchemist-only mode. `horde_worker_regen/compute_mode.py` is the
+torch-free reader of that intent (the orchestrator and TUI must not load torch just to learn the mode),
+and `HORDE_WORKER_BACKEND` overrides it for a one-off run. The runtime ground truth is the separate
+`accelerator_probe`; `compute_mode.reconcile_with_probe` warns when the two disagree (a GPU install with
+a broken driver, or a CPU install on a box that does have a GPU).
+
+### What CPU mode changes
+
+- **Capability coercion** (`capabilities.coerce_bridge_data_to_capabilities`): on a CPU install the
+  image model list and `dynamic_models` are coerced off so the worker never advertises or pops an image
+  job. Alchemy is left untouched. (This sits alongside the `rembg`/`onnxruntime` coercions above.)
+- **Alchemist-only boot**: the inference process no longer treats an empty image-model database as a
+  fatal error when no image models are configured, and the download coordinator starts inference without
+  waiting for an image model that will never arrive. One inference process still spawns so the alchemy
+  graph forms have somewhere to run.
+- **Fresh-install config**: a CPU install seeds `bridgeData.yaml` with `alchemist: true` so the worker is
+  useful out of the box.
+- **TUI**: the overview shows a `Compute: CPU (alchemist-only)` row (a GPU install is unchanged).
+
+### Switching CPU ⇄ GPU
+
+Switching compute backend means swapping the torch build, so it is a re-run of the installer/updater with
+a different backend, which rewrites `bin/backend` and re-syncs torch:
+
+```bash
+# Switch an install to CPU / alchemist-only:
+./update-runtime.sh --cpu      # (update-runtime.cmd --cpu on Windows)
+# Switch back to a GPU build:
+./update-runtime.sh --cu132    # or the build the detector picks for your driver/GPU
+```
+
+The first install (`install.sh` / the `.exe`) also **offers** CPU/alchemist-only interactively when it
+auto-detects a GPU, and selects CPU automatically when no GPU is found.
+
 ## Release coupling
 
 The accelerator abstraction lives in `hordelib` (`horde-engine`). The worker depends on a **published
 `horde-engine`** release, so these helpers reach the worker only once a `horde-engine` version that
-includes them is published and the worker's pin is bumped.
+includes them is published and the worker's pin is bumped. The CPU-mode `--cpu` injection
+(`torch_build_is_cpu_only` + `do_comfy_import`) is part of that coupling: it ships to the worker only
+with a `horde-engine` release that includes it.

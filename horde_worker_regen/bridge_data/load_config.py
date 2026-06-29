@@ -7,7 +7,7 @@ from collections.abc import Iterable, Mapping
 from enum import auto
 from pathlib import Path
 
-from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
 from horde_model_reference.model_reference_manager import ModelReferenceManager
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api.ai_horde_clients import AIHordeAPIManualClient
@@ -373,20 +373,47 @@ class BridgeDataLoader:
         # Pass the config flag through so the resolver strips large baselines (Flux, Stable Cascade) for the
         # stats-based families (`top N`/`bottom N`) too, not only the `all` instruction. Without this the SDK
         # param defaults to True and those families could surface a large model even with the flag off.
+        # horde_sdk's ImageModelLoadResolver indexes ``all_model_references[image_generation]`` without
+        # guarding a missing key (it guards a None *value*, not an absent *category*). When the image
+        # generation reference is unavailable, every model meta-instruction (``top N``, ``all <baseline>``,
+        # inpainting, ...) raises KeyError and crashes worker startup here. Detect that and skip the SDK
+        # expansion: with no image reference there is nothing to expand to, and an alchemist-only/CPU worker
+        # reaches this legitimately. Beta-model expansion is independent of the SDK and still runs.
+        image_generation_available = bool(
+            horde_model_reference_manager.get_all_model_references().get(MODEL_REFERENCE_CATEGORY.image_generation),
+        )
+        if not image_generation_available and (
+            bridge_data.meta_load_instructions or bridge_data.meta_skip_instructions
+        ):
+            logger.warning(
+                "The image generation model reference is unavailable, so model meta-instructions "
+                f"(load={bridge_data.meta_load_instructions}, skip={bridge_data.meta_skip_instructions}) cannot "
+                "be expanded; no image models will be resolved from them. This is expected on an "
+                "alchemist-only/CPU worker; otherwise check that the image model reference downloaded.",
+            )
+
         resolved_models = None
         if bridge_data.meta_load_instructions is not None:
-            resolved_models = load_resolver.resolve_meta_instructions(
-                list(bridge_data.meta_load_instructions),
-                AIHordeAPIManualClient(),
-                load_large_models=bridge_data.load_large_models,
+            resolved_models = (
+                load_resolver.resolve_meta_instructions(
+                    list(bridge_data.meta_load_instructions),
+                    AIHordeAPIManualClient(),
+                    load_large_models=bridge_data.load_large_models,
+                )
+                if image_generation_available
+                else set()
             )
             resolved_models |= _beta_models_for_meta_instructions(bridge_data.meta_load_instructions, beta_records)
 
         if bridge_data.meta_skip_instructions is not None:
-            skip_models: set[str] = load_resolver.resolve_meta_instructions(
-                list(bridge_data.meta_skip_instructions),
-                AIHordeAPIManualClient(),
-                load_large_models=bridge_data.load_large_models,
+            skip_models: set[str] = (
+                load_resolver.resolve_meta_instructions(
+                    list(bridge_data.meta_skip_instructions),
+                    AIHordeAPIManualClient(),
+                    load_large_models=bridge_data.load_large_models,
+                )
+                if image_generation_available
+                else set()
             )
             skip_models |= _beta_models_for_meta_instructions(bridge_data.meta_skip_instructions, beta_records)
             existing_skip_models = set(bridge_data.image_models_to_skip)

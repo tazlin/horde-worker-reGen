@@ -251,6 +251,17 @@ class ModelDownloadCoordinator:
             return
 
         availability = self._model_availability
+
+        # An alchemist-only worker (no image models configured, e.g. a CPU install) will never see an
+        # image model land, so it must not wait for one: start inference as soon as the on-disk scan has
+        # completed, so the alchemy graph forms have their process. Without this the worker would wait
+        # forever (none of the model-present branches below can fire with an empty configured set).
+        if not self.bridge_data.image_models_to_load and self.bridge_data.alchemist and availability.scan_complete:
+            logger.info("Alchemist-only worker (no image models configured); starting inference processes")
+            self._process_lifecycle.start_inference_processes()
+            self.inference_processes_started = True
+            return
+
         if availability.scan_complete and len(availability.present or set()) > 0:
             logger.info("At least one model is present on disk; starting inference processes")
             self._process_lifecycle.start_inference_processes()

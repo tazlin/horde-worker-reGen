@@ -551,6 +551,24 @@ class TestDownloadsOnlyMode:
         assert manager._state.downloads_only_hold is False
         manager._process_lifecycle.start_inference_processes.assert_called_once()
 
+    def test_alchemist_only_worker_starts_inference_without_image_models(self) -> None:
+        """An alchemist-only worker (no image models) starts inference once the on-disk scan completes."""
+        manager = self._manager(image_models_to_load=[], alchemist=True)
+        self._mark_present(manager, set())  # scan complete, zero image models present
+
+        manager._download_coordinator.maybe_start_inference_processes()
+
+        manager._process_lifecycle.start_inference_processes.assert_called_once()
+
+    def test_no_models_and_no_alchemist_does_not_start_inference(self) -> None:
+        """With neither image models nor alchemist there is nothing to serve, so inference does not start."""
+        manager = self._manager(image_models_to_load=[], alchemist=False)
+        self._mark_present(manager, set())
+
+        manager._download_coordinator.maybe_start_inference_processes()
+
+        manager._process_lifecycle.start_inference_processes.assert_not_called()
+
     def test_on_demand_download_adds_to_desired_set_and_kicks_aux(self) -> None:
         """A picker request joins the one desired set and fetches what is missing, optionally running aux."""
         manager = self._manager(image_models_to_load=["a"])

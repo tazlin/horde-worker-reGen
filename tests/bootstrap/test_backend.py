@@ -18,6 +18,78 @@ def test_remap_legacy(token: str, expected: str) -> None:
     assert backend.remap_legacy(token) == expected
 
 
+def test_offer_cpu_returns_cpu_on_c_answer() -> None:
+    """Choosing CPU at the prompt overrides an auto-detected GPU build."""
+    token = backend.choose_backend_interactively(
+        "cu132",
+        explicitly_chosen=False,
+        interactive=True,
+        prompt=lambda _: "c",
+        emit=lambda _: None,
+    )
+    assert token == "cpu"
+
+
+def test_offer_cpu_default_keeps_gpu() -> None:
+    """Pressing enter (or anything but C) keeps the detected GPU build."""
+    token = backend.choose_backend_interactively(
+        "cu132",
+        explicitly_chosen=False,
+        interactive=True,
+        prompt=lambda _: "",
+        emit=lambda _: None,
+    )
+    assert token == "cu132"
+
+
+def test_offer_cpu_respects_explicit_choice() -> None:
+    """An explicit --backend / env choice is never second-guessed (no prompt)."""
+
+    def _boom(_: str) -> str:
+        raise AssertionError("must not prompt when the backend was chosen explicitly")
+
+    token = backend.choose_backend_interactively(
+        "cu132",
+        explicitly_chosen=True,
+        interactive=True,
+        prompt=_boom,
+        emit=lambda _: None,
+    )
+    assert token == "cu132"
+
+
+def test_offer_cpu_no_prompt_when_non_interactive() -> None:
+    """A non-interactive run never prompts and keeps the detected build."""
+
+    def _boom(_: str) -> str:
+        raise AssertionError("must not prompt in a non-interactive run")
+
+    token = backend.choose_backend_interactively(
+        "cu132",
+        explicitly_chosen=False,
+        interactive=False,
+        prompt=_boom,
+        emit=lambda _: None,
+    )
+    assert token == "cu132"
+
+
+def test_offer_cpu_no_prompt_when_already_cpu() -> None:
+    """When no GPU was detected (token already cpu) there is nothing to choose, so no prompt."""
+
+    def _boom(_: str) -> str:
+        raise AssertionError("must not prompt when the detected build is already cpu")
+
+    token = backend.choose_backend_interactively(
+        "cpu",
+        explicitly_chosen=False,
+        interactive=True,
+        prompt=_boom,
+        emit=lambda _: None,
+    )
+    assert token == "cpu"
+
+
 def test_resolve_precedence() -> None:
     """CLI flag > env > file > detection > default, with the cu128 remap applied to the winner."""
     assert backend.resolve_backend(cli_flag="cu130", env_value="cpu", file_value="cu126") == "cu130"

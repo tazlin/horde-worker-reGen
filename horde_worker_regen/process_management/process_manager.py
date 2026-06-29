@@ -192,6 +192,14 @@ class SystemResources:
         os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
         accelerators = probe_accelerators()
+
+        # Warn once if the declared compute backend (bin/backend) disagrees with what the hardware probe
+        # actually found: a GPU install whose driver is broken (would run on CPU or fault), or a CPU
+        # install on a box that does have a usable accelerator.
+        from horde_worker_regen.compute_mode import log_compute_mode_reconciliation
+
+        log_compute_mode_reconciliation([accelerator.kind for accelerator in accelerators])
+
         device_map = TorchDeviceMap(root={})
         for accelerator in accelerators:
             device_map.root[accelerator.index] = TorchDeviceInfo(

@@ -159,6 +159,7 @@ class HordeInferenceProcess(HordeProcess):
         dry_run_skip_inference: bool = False,
         dry_run_inference_delay: float = 1.0,
         gpu_sampling_lease: Semaphore | None = None,
+        expect_image_models: bool = True,
     ) -> None:
         """Initialise the HordeInferenceProcess.
 
@@ -178,6 +179,9 @@ class HordeInferenceProcess(HordeProcess):
             gpu_sampling_lease (Semaphore | None, optional): Shared lease registered with hordelib to \
                 serialize the GPU denoising loop across processes. None disables coordination. Defaults to None.
             device_index (int, optional): The stable index of the GPU this process is pinned to. Defaults to 0.
+            expect_image_models (bool, optional): Whether this worker is configured to serve image \
+                generation. False for an alchemist-only (e.g. CPU) worker that loads no image models, where \
+                an empty image-model database is expected rather than a fatal misconfiguration. Defaults to True.
         """
         super().__init__(
             process_id=process_id,
@@ -191,6 +195,7 @@ class HordeInferenceProcess(HordeProcess):
         self._aux_model_lock = aux_model_lock
         self._dry_run_skip_inference = dry_run_skip_inference
         self._dry_run_inference_delay = dry_run_inference_delay
+        self._expect_image_models = expect_image_models
 
         self._inference_semaphore = inference_semaphore
         self._vae_decode_semaphore = vae_decode_semaphore
@@ -254,7 +259,11 @@ class HordeInferenceProcess(HordeProcess):
                 )
                 sys.exit(1)
 
-            if len(SharedModelManager.manager.compvis.available_models) == 0:
+            # An alchemist-only worker (e.g. a CPU install) legitimately loads no image models; alchemy
+            # graph and CLIP forms run through their own managers, so an empty image-model database is
+            # expected there rather than a fatal misconfiguration. Only image-serving workers require a
+            # model to be present.
+            if self._expect_image_models and len(SharedModelManager.manager.compvis.available_models) == 0:
                 # A model may have only just landed via the background download process; re-scan the
                 # on-disk database a few times before giving up, so we do not hard-crash on a race
                 # with a just-completed download. The main process only starts inference once at least

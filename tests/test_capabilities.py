@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 from hordelib.feature_impact import FEATURE_KIND
 
-from horde_worker_regen import capabilities
+from horde_worker_regen import capabilities, compute_mode
 from horde_worker_regen.process_management.jobs.alchemy_popper import expand_offered_forms
 
 _ALL_FEATURES = frozenset(FEATURE_KIND)
@@ -147,3 +147,58 @@ def test_expand_offered_forms_keeps_strip_background_when_available(monkeypatch:
     offered = expand_offered_forms(bd)  # type: ignore[arg-type]
 
     assert "strip_background" in offered
+
+
+def _patch_cpu_install(monkeypatch: pytest.MonkeyPatch, *, cpu: bool) -> None:
+    """Force the CPU-only install gate (the bin/backend sentinel reader) for a coercion test."""
+    monkeypatch.setattr(compute_mode, "is_cpu_only_install", lambda **_: cpu)
+
+
+def _cpu_bridge_data(**overrides: object) -> SimpleNamespace:
+    bd = _bridge_data(
+        image_models_to_load=["Deliberate", "AlbedoBase XL (SDXL)"],
+        dynamic_models=True,
+        alchemist=True,
+    )
+    for key, value in overrides.items():
+        setattr(bd, key, value)
+    return bd
+
+
+def test_cpu_install_disables_image_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CPU-only install clears the image model list and dynamic loading, keeping alchemist on."""
+    _patch_features(monkeypatch, _ALL_FEATURES)
+    _patch_cpu_install(monkeypatch, cpu=True)
+    bd = _cpu_bridge_data()
+
+    coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
+
+    assert bd.image_models_to_load == []
+    assert bd.dynamic_models is False
+    assert bd.alchemist is True  # the CPU-friendly role is never forced off
+    assert any("image_models_to_load" in c for c in coercions)
+    assert any("dynamic_models" in c for c in coercions)
+
+
+def test_non_cpu_install_leaves_image_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A GPU install does not touch the image model list."""
+    _patch_features(monkeypatch, _ALL_FEATURES)
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _cpu_bridge_data()
+
+    coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
+
+    assert bd.image_models_to_load == ["Deliberate", "AlbedoBase XL (SDXL)"]
+    assert bd.dynamic_models is True
+    assert coercions == []
+
+
+def test_cpu_install_idempotent_when_already_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-running on an already-disabled CPU config reports nothing (hot-reload safe)."""
+    _patch_features(monkeypatch, _ALL_FEATURES)
+    _patch_cpu_install(monkeypatch, cpu=True)
+    bd = _cpu_bridge_data(image_models_to_load=[], dynamic_models=False)
+
+    coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
+
+    assert coercions == []

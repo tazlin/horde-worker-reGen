@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
+
+_CPU_TOKEN = "cpu"
 
 # Builds whose torch wheels are pinned in uv.lock and installable with ``uv sync --locked --extra <build>``.
 # Used only as fallback guidance text; the authoritative list is read from pyproject.toml at runtime. ROCm
@@ -67,6 +70,45 @@ def resolve_backend(
         if candidate and candidate.strip():
             return remap_legacy(candidate)
     return default
+
+
+def choose_backend_interactively(
+    detected_token: str,
+    *,
+    explicitly_chosen: bool,
+    interactive: bool,
+    prompt: Callable[[str], str] = input,
+    emit: Callable[[str], None] = print,
+) -> str:
+    """Offer an interactive user the choice of CPU / alchemist-only mode when a GPU build was detected.
+
+    Returns the backend token to install. The choice exists so a user can deliberately run the worker
+    without a GPU (CPU build, image generation disabled, alchemy-only) even on a machine that has one, for
+    example to leave the GPU free for other work. A CPU-only build installs no CUDA and is ~100x slower.
+
+    The detected token is returned unchanged when the user already chose a backend explicitly (a CLI flag
+    or ``HORDE_WORKER_BACKEND``), when the run is non-interactive, or when no GPU was detected at all
+    (the token is already ``cpu`` and there is nothing to choose). Only an auto-detected GPU build prompts.
+
+    Args:
+        detected_token: The backend token detection resolved (e.g. ``cu132`` or ``cpu``).
+        explicitly_chosen: Whether the backend came from a CLI flag or env var (so do not second-guess it).
+        interactive: Whether a terminal prompt is possible.
+        prompt: Input function (injectable for tests).
+        emit: Output function (injectable for tests).
+    """
+    if explicitly_chosen or not interactive or detected_token == _CPU_TOKEN:
+        return detected_token
+
+    emit(
+        f"A GPU backend ({detected_token}) was detected. You can instead install the CPU-only build to run "
+        "in alchemist-only mode (image generation disabled; upscaling, face-fixing and interrogation only). "
+        "CPU is ~100x slower and mainly useful without a usable GPU, or to leave the GPU free for other work.",
+    )
+    answer = prompt("Install for [G]PU (recommended) or [C]PU only / alchemist-only? [G/c] ").strip().lower()
+    if answer in ("c", "cpu"):
+        return _CPU_TOKEN
+    return detected_token
 
 
 def locked_extras(pyproject_path: Path) -> list[str]:

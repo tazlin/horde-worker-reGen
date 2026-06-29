@@ -40,9 +40,12 @@ def _print_amd_unsupported() -> None:
 
 
 def _print_cpu_notice() -> None:
-    """Warn that no GPU was found and the (slow) CPU build will be used."""
+    """Explain that the CPU build runs in alchemist-only mode (image generation disabled)."""
     print(
-        "No NVIDIA or AMD GPU detected; using the CPU build (~100x slower, mainly for testing).",
+        "Using the CPU build: image generation is disabled (CPU inference is ~100x slower), so the worker "
+        "runs in alchemist-only mode (upscaling, face-fixing, interrogation). Set alchemist: true in "
+        "bridgeData.yaml (done automatically for a fresh CPU install). Reinstall a GPU build later with "
+        "update-runtime --cu132 (or the matching build) to enable image generation.",
         file=sys.stderr,
     )
 
@@ -261,7 +264,11 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -
         print(git_resolution.message, file=sys.stderr)
         return 1
 
-    config_seed.seed_config(template=paths.template_config(root), target=paths.bridge_config(root))
+    config_seed.seed_config(
+        template=paths.template_config(root),
+        target=paths.bridge_config(root),
+        backend_token=token,
+    )
     from worker_bootstrap import rocm
 
     if rocm.is_rocm_token(token):
@@ -344,6 +351,20 @@ def _ensure_synced(uv: str, root: Path, *, cli_flag: str | None, options: _SyncO
     return _sync(uv, root, cli_flag=cli_flag, options=options)
 
 
+def _offer_cpu_mode(args: argparse.Namespace, token: str) -> str:
+    """Let an interactive user opt into CPU/alchemist-only mode when a GPU build was auto-detected.
+
+    A backend chosen explicitly (a ``--backend`` flag or ``HORDE_WORKER_BACKEND``) is respected as-is; a
+    non-interactive run never prompts. See :func:`worker_bootstrap.backend.choose_backend_interactively`.
+    """
+    explicitly_chosen = bool(args.backend) or bool(os.environ.get(_BACKEND_ENV))
+    return backend_mod.choose_backend_interactively(
+        token,
+        explicitly_chosen=explicitly_chosen,
+        interactive=consent.is_interactive(),
+    )
+
+
 def _cmd_detect(args: argparse.Namespace, root: Path, uv: str) -> int:  # noqa: ARG001  (uv unused here)
     """Detect (and optionally persist) the backend token, honouring a flag/env override."""
     token = backend_mod.resolve_backend(
@@ -354,6 +375,7 @@ def _cmd_detect(args: argparse.Namespace, root: Path, uv: str) -> int:  # noqa: 
     if token == detect.AMD_UNSUPPORTED:
         _print_amd_unsupported()
         return 2
+    token = _offer_cpu_mode(args, token)
     if token == detect.CPU:
         _print_cpu_notice()
     if args.write:
@@ -566,6 +588,7 @@ def _cmd_install(args: argparse.Namespace, root: Path, uv: str) -> int:
     if token == detect.AMD_UNSUPPORTED:
         _print_amd_unsupported()
         return 2
+    token = _offer_cpu_mode(args, token)
     if token == detect.CPU:
         _print_cpu_notice()
     backend_mod.write_backend_file(paths.backend_file(root), token)

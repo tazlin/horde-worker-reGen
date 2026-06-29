@@ -151,6 +151,35 @@ def test_meta_all_instruction_includes_beta_model() -> None:
     assert "Canonical-Model" in result
 
 
+def test_meta_instructions_skipped_when_image_generation_reference_absent() -> None:
+    """An absent image_generation reference must not crash config load via the SDK resolver.
+
+    horde_sdk's ``ImageModelLoadResolver`` indexes ``all_model_references[image_generation]`` without
+    guarding a missing key, so when the image reference is unavailable (a failed reference load, or an
+    alchemist-only/CPU worker) every meta-instruction raised KeyError and crashed ``BridgeDataLoader.load``.
+    The guard skips the SDK expansion instead.
+    """
+    bridge = _make_bridge(image_models_to_load=[], meta_load_instructions=["top 2"])
+
+    # Primed to explode exactly like the real SDK would when image_generation is missing.
+    exploding_resolver = Mock()
+    exploding_resolver.resolve_meta_instructions.side_effect = KeyError("image_generation")
+
+    # A manager whose references lack the image_generation category entirely (the real failure shape).
+    manager = Mock()
+    manager.get_all_model_references.return_value = {}
+
+    with (
+        patch.object(load_config, "beta_aware_image_records", return_value={}),
+        patch.object(load_config, "_make_image_model_load_resolver", return_value=exploding_resolver),
+        patch.object(load_config, "AIHordeAPIManualClient", Mock()),
+    ):
+        result = BridgeDataLoader._resolve_meta_instructions(bridge, manager)
+
+    exploding_resolver.resolve_meta_instructions.assert_not_called()
+    assert result == []
+
+
 def _resolve_with_stub_resolver(bridge: SimpleNamespace) -> Mock:
     """Run ``_resolve_meta_instructions`` over ``bridge`` with the SDK resolver/beta records stubbed out.
 

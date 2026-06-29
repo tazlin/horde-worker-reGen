@@ -747,6 +747,9 @@ class ProcessLifecycleManager:
                 "dry_run_skip_inference": bridge_data.dry_run_skip_inference,
                 "dry_run_inference_delay": bridge_data.dry_run_inference_delay,
                 "gpu_sampling_lease": card.gpu_sampling_lease if self._gpu_sampling_lease_enabled else None,
+                # An alchemist-only worker (no image models configured, e.g. a CPU install) must not
+                # treat an empty image-model database as a fatal error in the child.
+                "expect_image_models": bool(card.config.image_models_to_load),
             },
         )
         process.start()

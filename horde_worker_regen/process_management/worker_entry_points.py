@@ -218,6 +218,7 @@ def start_inference_process(
     dry_run_skip_inference: bool = False,
     dry_run_inference_delay: float = 1.0,
     gpu_sampling_lease: Semaphore | None = None,
+    expect_image_models: bool = True,
 ) -> None:
     """Start an inference process.
 
@@ -246,6 +247,9 @@ def start_inference_process(
         dry_run_inference_delay (float, optional): Seconds to sleep when dry-run inference is active. Defaults to 1.0.
         gpu_sampling_lease (Semaphore | None, optional): Shared lease for cross-process GPU sampling
             coordination, registered with hordelib. None disables it. Defaults to None.
+        expect_image_models (bool, optional): Whether this worker serves image generation. False for an
+            alchemist-only worker (e.g. a CPU install) that loads no image models, so an empty image-model
+            database is expected rather than a fatal error. Defaults to True.
     """
     _spawn_timing_mark(process_id, "inference", "entry")
     # Must precede the first torch/hordelib import below so the allocator reads it, and the device mask
@@ -364,6 +368,7 @@ def start_inference_process(
             dry_run_skip_inference=dry_run_skip_inference,
             dry_run_inference_delay=dry_run_inference_delay,
             gpu_sampling_lease=gpu_sampling_lease,
+            expect_image_models=expect_image_models,
         )
 
         _spawn_timing_mark(process_id, "inference", "process-constructed")

@@ -146,6 +146,50 @@ def _install_hint(feature: FEATURE_KIND) -> str:
     )
 
 
+def _coerce_cpu_only_mode(bridge_data: reGenBridgeData, *, log: bool) -> list[str]:
+    """Disable image generation (the dreamer role) when this is a CPU-only / alchemist-only install.
+
+    Returns the coercion descriptions applied (empty when this is not a CPU install or there was nothing
+    to disable). Clears the resolved image model list and turns off dynamic model loading so the worker
+    never advertises or pops an image job it would run impractically slowly on CPU. Alchemy is left
+    untouched: its graph forms (upscale, face-fix) and CLIP forms (interrogation, caption) run acceptably
+    on CPU, so an alchemist-enabled worker stays useful. A CPU install with alchemist disabled would have
+    nothing to do, which is surfaced as a warning rather than silently forcing the role on.
+    """
+    from horde_worker_regen.compute_mode import is_cpu_only_install
+
+    if not is_cpu_only_install():
+        return []
+
+    coercions: list[str] = []
+
+    if bridge_data.image_models_to_load:
+        bridge_data.image_models_to_load = []
+        message = (
+            "image_models_to_load coerced to empty: this is a CPU-only (alchemist-only) install "
+            "(bin/backend is 'cpu'), so image generation is disabled. Reinstall a GPU build "
+            "(e.g. update-runtime --cu132) to enable image generation."
+        )
+        coercions.append(message)
+        if log:
+            logger.warning(message)
+
+    if bridge_data.dynamic_models:
+        bridge_data.dynamic_models = False
+        message = "dynamic_models coerced to False: image generation is disabled on a CPU-only install."
+        coercions.append(message)
+        if log:
+            logger.warning(message)
+
+    if not bridge_data.alchemist and log:
+        logger.warning(
+            "This is a CPU-only install with image generation disabled and alchemist=False, so the worker "
+            "has nothing to serve. Set alchemist: true in bridgeData.yaml to run alchemy forms on CPU.",
+        )
+
+    return coercions
+
+
 def coerce_bridge_data_to_capabilities(bridge_data: reGenBridgeData, *, log: bool = True) -> list[str]:
     """Coerce advertised features off when the packages backing them are not installed.
 
@@ -167,9 +211,16 @@ def coerce_bridge_data_to_capabilities(bridge_data: reGenBridgeData, *, log: boo
     if bridge_data.dry_run_skip_inference:
         return []
 
-    from hordelib.feature_impact import FEATURE_KIND
-
     coercions: list[str] = []
+
+    # A CPU-only / alchemist-only install cannot serve image generation (CPU inference is impractically
+    # slow), so the dreamer role is disabled by definition while the pure-CPU alchemy forms stay on offer.
+    # This is gated on the install's declared intent (the torch-free bin/backend sentinel), not a torch
+    # probe, so it stays cheap on the hot reload path. Done before the hordelib feature probes because it
+    # needs none of them.
+    coercions.extend(_coerce_cpu_only_mode(bridge_data, log=log))
+
+    from hordelib.feature_impact import FEATURE_KIND
 
     if not strip_background_available() and bridge_data.allow_post_processing:
         bridge_data.allow_post_processing = False

@@ -26,7 +26,7 @@ dependencies = [
     "aiodns>=3.0.0,<4.0.0",
     "qrcode==7.4.2",
     "certifi",
-    "horde_sdk~=0.22.0",
+    "horde_sdk~=0.22.1",
     "horde_safety~=0.3.0",
     # Requires horde-engine (hordelib) 3.2.11+: in addition to the 3.2.5+ feature set (torchvision range,
     # no hard torchaudio dep, optional-feature extras + capability registry consumed by
@@ -34,7 +34,7 @@ dependencies = [
     # (hordelib.vram_planning.compute_inference_reserve_mb / compute_weight_budget_mb) and the runtime
     # weight-streaming telemetry (get_loaded_weights_offloaded_mb) the worker's streaming forecast and
     # whole-card exclusive residency depend on.
-    "horde_engine[layerdiffuse,upscale-extra]>=3.9.3,<4.0.0",
+    "horde_engine[layerdiffuse,upscale-extra]>=3.10.0,<4.0.0",
     "horde_model_reference>=7.0.2,<8.0.0",
     "python-dotenv",
     "ruamel.yaml",

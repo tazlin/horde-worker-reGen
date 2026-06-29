@@ -840,6 +840,14 @@ class OverviewView(Vertical):
             "",
             "",
         )
+
+        # Context-sensitive: call out a CPU / alchemist-only install (image generation disabled). A GPU
+        # install is the default and adds no row, keeping the usual dashboard unchanged.
+        from horde_worker_regen.compute_mode import compute_mode_display_label
+
+        compute_label = compute_mode_display_label()
+        if compute_label is not None:
+            table.add_row("Compute", compute_label, "", "")
         return table
 
     @staticmethod
