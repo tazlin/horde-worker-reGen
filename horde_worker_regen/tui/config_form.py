@@ -27,6 +27,13 @@ MODELS_TO_SKIP_KEY = "models_to_skip"
 # Alchemy forms a worker may offer (template spelling, hyphenated).
 ALCHEMY_FORMS = ("caption", "nsfw", "interrogation", "post-process")
 
+# The reserved placeholder names shipped in bridgeData_template.yaml. The horde rejects a worker that
+# tries to register under one (names are unique horde-wide), so the editor must require the operator to
+# replace them. Kept as literals here so this module stays free of the heavy reGenBridgeData import; a
+# drift guard (tests/tui/test_config_form_defaults.py) pins them to the model's real field defaults.
+DREAMER_NAME_RESERVED_DEFAULT = "An Awesome Dreamer"
+ALCHEMIST_NAME_RESERVED_DEFAULT = "An Awesome Alchemist"
+
 
 class FieldKind(enum.StrEnum):
     """How a config field is edited and coerced."""
@@ -1268,6 +1275,52 @@ def coerce_value(field: ConfigField, raw: object) -> Any:  # noqa: ANN401 - kind
             return [str(item).strip() for item in raw if str(item).strip()]
         return [line.strip() for line in str(raw).splitlines() if line.strip()]
     return str(raw)
+
+
+def validate_identity_names(
+    dreamer_name: str,
+    *,
+    alchemist_enabled: bool,
+    alchemist_name: str,
+) -> list[tuple[str, str]]:
+    """Return ``(field_key, message)`` errors for any invalid worker identity name.
+
+    Worker names are unique horde-wide and bound to the API key that first registers them, and each
+    worker *type* (image "dreamer", alchemy "alchemist") registers as its own separately-named worker.
+    A blank, still-default, or colliding name otherwise aborts the worker at startup (or fails with a
+    cryptic credentials error at pop time), so the editor blocks a save that would produce one. The
+    alchemist name is only checked when alchemy is enabled; an empty list means the names are valid.
+    """
+    errors: list[tuple[str, str]] = []
+    dreamer = dreamer_name.strip()
+    if not dreamer:
+        errors.append(("dreamer_name", "Dreamer name is required (it is your worker's unique horde-wide name)"))
+    elif dreamer == DREAMER_NAME_RESERVED_DEFAULT:
+        errors.append(
+            (
+                "dreamer_name",
+                "Dreamer name is still the default placeholder; set a unique one (worker names are unique "
+                "horde-wide and the default is rejected)",
+            ),
+        )
+
+    if alchemist_enabled:
+        alchemist = alchemist_name.strip()
+        if not alchemist:
+            errors.append(("alchemist_name", "Alchemist name is required when alchemy is enabled"))
+        elif alchemist == ALCHEMIST_NAME_RESERVED_DEFAULT:
+            errors.append(
+                ("alchemist_name", "Alchemist name is still the default placeholder; set a unique one"),
+            )
+        elif dreamer and alchemist.lower() == dreamer.lower():
+            errors.append(
+                (
+                    "alchemist_name",
+                    "Alchemist name must differ from the dreamer name (each worker type registers separately "
+                    "on the horde)",
+                ),
+            )
+    return errors
 
 
 def current_value(field: ConfigField, data: Any) -> Any:  # noqa: ANN401 - kind-dependent

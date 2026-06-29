@@ -16,6 +16,7 @@ from horde_worker_regen.app_state import (
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities
 from horde_worker_regen.process_management.config.worker_identity import WorkerNameConfigError, verify_worker_identity
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerFatalConfigError
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 
 _KNOWN_GOOD_MIN_SESSION_SECONDS = 600.0
@@ -59,6 +60,15 @@ def start_working(
         verify_worker_identity(bridge_data)
     except WorkerNameConfigError as name_error:
         logger.error(str(name_error))
+        # Tell a supervising TUI the *specific* reason so it can show the remedy and stop relaunching a
+        # config that can never succeed; headless runs (no supervisor pipe) have the log above.
+        if supervisor_connection is not None:
+            try:
+                supervisor_connection.send(
+                    WorkerFatalConfigError(title="Worker name problem", detail=str(name_error)),
+                )
+            except Exception as send_error:  # noqa: BLE001 - a broken pipe must not mask the original exit
+                logger.debug(f"Could not notify the supervisor of the worker-name error: {send_error}")
         sys.exit(1)
 
     # Disable any advertised feature whose backend packages are not installed (e.g. controlnet /

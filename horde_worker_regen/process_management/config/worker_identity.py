@@ -74,6 +74,12 @@ def _validate_worker_names_local(bridge_data: reGenBridgeData) -> None:
     dreamer_default = fields["dreamer_worker_name"].default
     alchemist_default = fields["alchemist_name"].default
 
+    if not bridge_data.dreamer_worker_name.strip():
+        raise WorkerNameConfigError(
+            "Your worker name (`dreamer_name`) is empty. Set a unique name in bridgeData.yaml; it is your "
+            "worker's horde-wide identity.",
+        )
+
     if bridge_data.dreamer_worker_name == dreamer_default:
         raise WorkerNameConfigError(
             f"Your worker name is still the default ({dreamer_default!r}). Set a unique `dreamer_name` "
@@ -81,6 +87,11 @@ def _validate_worker_names_local(bridge_data: reGenBridgeData) -> None:
         )
 
     if bridge_data.alchemist:
+        if not bridge_data.alchemist_name.strip():
+            raise WorkerNameConfigError(
+                "Alchemy is enabled but `alchemist_name` is empty. Set a unique `alchemist_name` in "
+                "bridgeData.yaml; each worker type registers as a separate, uniquely-named worker.",
+            )
         if bridge_data.alchemist_name == alchemist_default:
             raise WorkerNameConfigError(
                 f"Alchemy is enabled but `alchemist_name` is still the default ({alchemist_default!r}). "

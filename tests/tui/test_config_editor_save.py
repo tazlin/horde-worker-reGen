@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Input, TabbedContent
+from textual.widgets import Input, Switch, TabbedContent
 
 from horde_worker_regen.tui.config_form import load_config
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
@@ -144,3 +144,99 @@ async def test_invalid_edit_reports_error_and_jumps_to_offending_tab(tmp_path: P
         assert editor._save() is False
         await pilot.pause()
         assert editor.query_one("#config-subtabs", TabbedContent).active == "cfgtab-lora"
+
+
+@pytest.mark.e2e
+async def test_default_dreamer_name_blocks_save_and_jumps_to_essentials(tmp_path: Path) -> None:
+    """The reserved-default dreamer name cannot be saved; the editor jumps to its Essentials tab.
+
+    Identity names are validated unconditionally (not only when edited), so the still-default name
+    blocks the save even with no other change, which is exactly the config that aborts the worker.
+    """
+    app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "An Awesome Dreamer"\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        assert editor._save() is False
+        await pilot.pause()
+        assert editor.query_one("#config-subtabs", TabbedContent).active == "cfgtab-essentials"
+
+
+@pytest.mark.e2e
+async def test_empty_dreamer_name_blocks_save(tmp_path: Path) -> None:
+    """A blank dreamer name blocks the save (it is the worker's required horde-wide identity)."""
+    app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "Good Name"\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-dreamer_name", Input).value = "   "
+        assert editor._save() is False
+
+
+@pytest.mark.e2e
+async def test_alchemy_default_name_blocks_save_and_jumps_to_alchemy(tmp_path: Path) -> None:
+    """With alchemy enabled, the reserved-default alchemist name blocks the save and jumps to Alchemy."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "Good Name"\nalchemist: true\nalchemist_name: "An Awesome Alchemist"\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        assert editor._save() is False
+        await pilot.pause()
+        assert editor.query_one("#config-subtabs", TabbedContent).active == "cfgtab-alchemy"
+
+
+@pytest.mark.e2e
+async def test_alchemy_name_equal_to_dreamer_blocks_save(tmp_path: Path) -> None:
+    """With alchemy enabled, an alchemist name equal to the dreamer name blocks the save."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "Same Name"\nalchemist: true\nalchemist_name: "Same Name"\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        assert editor._save() is False
+
+
+@pytest.mark.e2e
+async def test_alchemy_name_only_required_when_enabled(tmp_path: Path) -> None:
+    """A default/blank alchemist name does not block the save while alchemy is disabled."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "Good Name"\nalchemist: false\nalchemist_name: "An Awesome Alchemist"\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-max_threads", Input).value = "2"
+        assert editor._save() is True
+
+
+@pytest.mark.e2e
+async def test_valid_identity_names_save(tmp_path: Path) -> None:
+    """Replacing the default dreamer name with a unique one saves it to disk."""
+    app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "An Awesome Dreamer"\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-dreamer_name", Input).value = "My Unique Worker"
+        assert editor._save() is True
+        await pilot.pause()
+
+    assert load_config(path)["dreamer_name"] == "My Unique Worker"
+
+
+@pytest.mark.e2e
+async def test_alchemy_toggle_via_widget_drives_name_requirement(tmp_path: Path) -> None:
+    """Turning alchemy on in the form (without saving it first) makes the alchemist name required."""
+    app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "Good Name"\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-alchemist", Switch).value = True
+        assert editor._save() is False
+        await pilot.pause()
+        assert editor.query_one("#config-subtabs", TabbedContent).active == "cfgtab-alchemy"

@@ -51,6 +51,18 @@ class TestLocalNameValidation:
                 _bridge_data(alchemist=True, alchemist_name=_ALCHEMIST_DEFAULT, dry_run_skip_api=True),
             )
 
+    def test_blank_dreamer_name_fails(self) -> None:
+        """A blank/whitespace dreamer name (e.g. a hand-edited config) is rejected without the network."""
+        with pytest.raises(WorkerNameConfigError):
+            verify_worker_identity(_bridge_data(dreamer="   ", dry_run_skip_api=True))
+
+    def test_blank_alchemist_name_fails_when_alchemy_enabled(self) -> None:
+        """With alchemy enabled, a blank alchemist name is rejected without the network."""
+        with pytest.raises(WorkerNameConfigError):
+            verify_worker_identity(
+                _bridge_data(dreamer="Unique Dreamer", alchemist=True, alchemist_name="", dry_run_skip_api=True),
+            )
+
     def test_alchemist_name_equal_to_dreamer_fails(self) -> None:
         """The dreamer and alchemist names must differ when alchemy is enabled."""
         with pytest.raises(WorkerNameConfigError):

@@ -10,6 +10,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     ProcessSnapshot,
     WholeCardResidencyStatus,
     WorkerConfigSummary,
+    WorkerFatalConfigError,
     WorkerStateSnapshot,
 )
 from horde_worker_regen.tui.health import (
@@ -55,6 +56,19 @@ def test_supervisor_crashed_and_restarting() -> None:
     assert derive(None, SupervisorStatus.CRASHED, None).phase is WorkerPhase.CRASHED
     assert derive(None, SupervisorStatus.RESTARTING, None).phase is WorkerPhase.RESTARTING
     assert derive(None, SupervisorStatus.STOPPED, None).phase is WorkerPhase.STOPPED
+
+
+def test_crashed_with_fatal_error_shows_specific_reason() -> None:
+    """A fatal config error replaces the generic crash message with its title and remedy detail."""
+    fatal = WorkerFatalConfigError(
+        title="Worker name problem",
+        detail="Worker name 'Foo' is already registered to another account; choose a different name.",
+    )
+    report = derive(None, SupervisorStatus.CRASHED, None, fatal_error=fatal)
+    assert report.phase is WorkerPhase.CRASHED
+    assert report.headline == "Worker name problem"
+    assert "already registered to another account" in report.detail
+    assert "will not restart until this is fixed" in report.detail
 
 
 def test_serving_when_a_process_is_inferencing() -> None:

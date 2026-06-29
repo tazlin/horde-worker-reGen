@@ -24,6 +24,7 @@ from loguru import logger
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SupervisorCommand,
     SupervisorControlMessage,
+    WorkerFatalConfigError,
     WorkerStateSnapshot,
 )
 from horde_worker_regen.tui import socket_protocol as sp
@@ -39,6 +40,9 @@ class SupervisorLike(Protocol):
     latest_snapshot: WorkerStateSnapshot | None
     last_liveness_wall_time: float | None
     """Wall-clock time of the worker loop's last liveness signal, or None if it never reported one."""
+    last_fatal_error: WorkerFatalConfigError | None
+    """The worker's reported non-retryable config problem, or None. The attach client leaves this None
+    (the host socket does not relay it), so served mode shows the generic crash message."""
 
     @property
     def status(self) -> SupervisorStatus:
@@ -139,6 +143,7 @@ class AttachedWorkerSupervisor:
 
         self.latest_snapshot: WorkerStateSnapshot | None = None
         self.last_liveness_wall_time: float | None = None
+        self.last_fatal_error: WorkerFatalConfigError | None = None
         self._status = SupervisorStatus.STOPPED
         self._restart_attempts = 0
         self._worker_running = False

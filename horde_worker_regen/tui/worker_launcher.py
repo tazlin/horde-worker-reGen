@@ -29,6 +29,7 @@ from loguru import logger
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SupervisorCommand,
     SupervisorControlMessage,
+    WorkerFatalConfigError,
     WorkerLivenessFrame,
     WorkerStateSnapshot,
 )
@@ -234,6 +235,10 @@ class WorkerSupervisor:
         self._last_tick_wall: float | None = None
         """Parent wall-clock time of the previous :meth:`tick`, used to spot a supervisor-side stall (see
         :data:`_SUPERVISOR_STALL_RESET_SECONDS`)."""
+        self.last_fatal_error: WorkerFatalConfigError | None = None
+        """The reason the worker reported a fatal, non-retryable config problem (e.g. a taken worker name)
+        before exiting, or None. Set from the worker's frame, retained through the resulting CRASHED state
+        so the dashboard can show it, and cleared on the next operator-initiated :meth:`start`/:meth:`restart`."""
         self.on_snapshot: Callable[[WorkerStateSnapshot], None] | None = None
         self.on_status_change: Callable[[SupervisorStatus], None] | None = None
 
@@ -261,6 +266,7 @@ class WorkerSupervisor:
         self._intentional_stop = False
         self._graceful_stop_deadline = 0.0
         self._restart_attempts = 0
+        self.last_fatal_error = None
         self._spawn()
 
     def _spawn(self, *, status: SupervisorStatus = SupervisorStatus.STARTING) -> None:
@@ -344,6 +350,10 @@ class WorkerSupervisor:
                         loop_advanced = True
                     self.last_liveness_wall_time = message.loop_alive_wall_time
                     got_any_frame = True
+                elif isinstance(message, WorkerFatalConfigError):
+                    # The worker is about to exit on a config it cannot run; remember why so the next
+                    # observed exit is treated as terminal (no relaunch) and the dashboard can explain it.
+                    self.last_fatal_error = message
         except (EOFError, OSError):
             # Pipe closed (child exiting); tick() will observe the dead process and react.
             pass
@@ -498,6 +508,16 @@ class WorkerSupervisor:
 
     def _handle_unexpected_exit(self, process: BaseProcess) -> None:
         """React to a worker that exited on its own: relaunch within budget, else mark crashed."""
+        # A worker that reported a fatal config problem (e.g. a taken worker name) cannot succeed on a
+        # relaunch, so stop here without consuming the restart budget; the dashboard reads the reason off
+        # ``last_fatal_error``. Cleared only by an operator-initiated start/restart (after they fix it).
+        if self.last_fatal_error is not None:
+            self._set_status(SupervisorStatus.CRASHED)
+            logger.error(
+                f"Worker will not start: {self.last_fatal_error.title} - {self.last_fatal_error.detail} "
+                "Not restarting until the configuration is fixed.",
+            )
+            return
         # Reserve the alarming CRASHED state for the terminal case (auto-restart off, or the restart
         # budget exhausted); a recoverable relaunch should read as a calm "Restarting…" from the instant
         # the exit is observed, not flash red first.
@@ -663,6 +683,7 @@ class WorkerSupervisor:
         self._intentional_stop = False
         self._graceful_stop_deadline = 0.0
         self._restart_attempts = 0
+        self.last_fatal_error = None
         self._spawn(status=SupervisorStatus.RESTARTING)
 
     def stop(self, *, timeout: float = GRACEFUL_STOP_TIMEOUT_SECONDS, set_stopped_status: bool = True) -> None:

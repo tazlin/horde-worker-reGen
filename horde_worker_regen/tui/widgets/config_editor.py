@@ -31,6 +31,7 @@ from horde_worker_regen.tui.config_form import (
     format_number,
     load_config,
     save_config,
+    validate_identity_names,
 )
 from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
 from horde_worker_regen.tui.widgets.model_list_editor import ModelListEditor
@@ -488,13 +489,18 @@ class ConfigEditorView(Vertical):
             except ValueError as error:
                 errors.append((field, str(error)))
 
+        # The worker identity names are validated unconditionally (not only when edited): a blank,
+        # still-default, or colliding name is exactly the config that aborts the worker at startup, so
+        # the save is blocked until it is fixed even if the operator was editing something else.
+        identity_errors = self._identity_name_errors()
+
         gpu_editor = self._gpu_editor()
         gpu_dirty = gpu_editor.is_dirty() if gpu_editor is not None else False
         # The per-card editor validates and writes its own nested block; an error here aborts the save
         # alongside any flat-field error so the operator sees both at once.
         gpu_errors = gpu_editor.apply_to(self._data) if gpu_editor is not None else []
-        if errors or gpu_errors:
-            self._report_save_errors(errors + gpu_errors)
+        if errors or identity_errors or gpu_errors:
+            self._report_save_errors(errors + identity_errors + gpu_errors)
             return False
         if not coerced and not gpu_dirty:
             self._set_status("No changes to save.", "green")
@@ -539,6 +545,42 @@ class ConfigEditorView(Vertical):
         else:
             raw = ""
         return coerce_value(field, raw)
+
+    def _identity_name_errors(self) -> list[tuple[ConfigField, str]]:
+        """Validate the worker identity names from the live widgets, mapped onto their ConfigFields.
+
+        Reads the dreamer name, the alchemist toggle, and the alchemist name straight from their
+        widgets so an unsaved edit is judged, falling back to the on-disk value if a widget cannot be
+        read. Delegates the actual rules to ``validate_identity_names`` and keys each error to its
+        ConfigField so ``_report_save_errors`` can jump to the right sub-tab.
+        """
+        dreamer = self._string_widget_value("dreamer_name")
+        alchemist_enabled = self._bool_widget_value("alchemist")
+        alchemist = self._string_widget_value("alchemist_name")
+        return [
+            (_FIELD_BY_KEY[key], message)
+            for key, message in validate_identity_names(
+                dreamer,
+                alchemist_enabled=alchemist_enabled,
+                alchemist_name=alchemist,
+            )
+        ]
+
+    def _string_widget_value(self, key: str) -> str:
+        """The current text of a string field's input, falling back to the loaded config on a read error."""
+        try:
+            widget = self.query_one(f"#cfg-{key}", Input)
+            return widget.value
+        except Exception:  # noqa: BLE001 - a DOM read glitch must fall back, not crash the save
+            return str(current_value(_FIELD_BY_KEY[key], self._data))
+
+    def _bool_widget_value(self, key: str) -> bool:
+        """The current state of a boolean field's switch, falling back to the loaded config on a read error."""
+        try:
+            widget = self.query_one(f"#cfg-{key}", Switch)
+            return widget.value
+        except Exception:  # noqa: BLE001 - a DOM read glitch must fall back, not crash the save
+            return bool(current_value(_FIELD_BY_KEY[key], self._data))
 
     def _report_save_errors(self, errors: list[tuple[ConfigField, str]]) -> None:
         """Surface every validation error at once and jump to the first offending field.

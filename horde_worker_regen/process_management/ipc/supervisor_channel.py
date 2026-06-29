@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 13
+SUPERVISOR_PROTOCOL_VERSION = 14
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -56,6 +56,9 @@ decision and promote per-job state out of the process table.
 v11 added worker-owned stats samples/history, model/baseline rollups, and the stats JSONL export control.
 v12 added ``pop_governors`` (:class:`PopGovernorsSnapshot`): the live + session-aggregate state of every
 pop/scheduling governor holding back or reshaping job pops, for the Overview strip and the stats tab.
+v14 added :class:`WorkerFatalConfigError`, a one-shot frame the worker sends before exiting on a fatal,
+non-retryable configuration problem (e.g. a worker name taken by another account) so the supervisor can
+stop relaunching and the dashboard can show the specific reason and remedy instead of a generic crash.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -562,6 +565,24 @@ class FeatureReadinessSummary(BaseModel):
 
     gated: list[FeatureReadiness] = Field(default_factory=list)
     informational: list[FeatureInfoRow] = Field(default_factory=list)
+
+
+class WorkerFatalConfigError(BaseModel):
+    """A one-shot frame the worker sends before exiting on a fatal, non-retryable config problem.
+
+    Some misconfigurations can never succeed on a relaunch: a worker name taken by another account, a
+    name still left at its reserved default, or the dreamer/alchemist names colliding. The worker
+    detects these at startup (before spawning any children) and sends this frame so the supervisor stops
+    burning its restart budget on a config that cannot work, and the dashboard shows the specific reason
+    and remedy rather than a generic "crashed". ``detail`` carries the full human explanation, including
+    how to fix it.
+    """
+
+    protocol_version: int = SUPERVISOR_PROTOCOL_VERSION
+    title: str = "Worker configuration problem"
+    """A short headline for the dashboard (e.g. "Worker name problem")."""
+    detail: str = ""
+    """The full operator-facing explanation and remedy."""
 
 
 class WorkerLivenessFrame(BaseModel):

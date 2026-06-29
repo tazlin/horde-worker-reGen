@@ -16,7 +16,13 @@ from typing import Any
 from pydantic_core import PydanticUndefined
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
-from horde_worker_regen.tui.config_form import CONFIG_FIELDS, FieldKind
+from horde_worker_regen.tui.config_form import (
+    ALCHEMIST_NAME_RESERVED_DEFAULT,
+    CONFIG_FIELDS,
+    DREAMER_NAME_RESERVED_DEFAULT,
+    FieldKind,
+    validate_identity_names,
+)
 
 # Keys whose editor display is intentionally blank to prompt the operator to set their own value,
 # even though the model carries a placeholder/default. Aligning these to the SDK placeholder
@@ -73,3 +79,43 @@ def test_editor_defaults_match_worker_defaults() -> None:
             )
 
     assert not mismatches, "config editor defaults drift from reGenBridgeData:\n" + "\n".join(mismatches)
+
+
+def test_reserved_name_constants_match_model_defaults() -> None:
+    """The editor's hardcoded reserved-name placeholders must equal the model's real field defaults.
+
+    The config editor is import-light and cannot load reGenBridgeData at runtime, so it carries the
+    reserved placeholder names as literals; this guard keeps them from drifting from the template the
+    horde actually rejects.
+    """
+    assert reGenBridgeData.model_fields["dreamer_worker_name"].default == DREAMER_NAME_RESERVED_DEFAULT
+    assert reGenBridgeData.model_fields["alchemist_name"].default == ALCHEMIST_NAME_RESERVED_DEFAULT
+
+
+def test_validate_identity_names_rules() -> None:
+    """The identity-name validator flags blank/default/colliding names and accepts valid ones."""
+    # Valid: unique dreamer, alchemy off (alchemist name not checked).
+    assert validate_identity_names("My Dreamer", alchemist_enabled=False, alchemist_name="") == []
+
+    blank = validate_identity_names("  ", alchemist_enabled=False, alchemist_name="")
+    assert [key for key, _ in blank] == ["dreamer_name"]
+
+    default = validate_identity_names(DREAMER_NAME_RESERVED_DEFAULT, alchemist_enabled=False, alchemist_name="")
+    assert [key for key, _ in default] == ["dreamer_name"]
+
+    # Alchemy on: a blank alchemist name is required, the default is rejected, and it must differ.
+    assert [key for key, _ in validate_identity_names("D", alchemist_enabled=True, alchemist_name="")] == [
+        "alchemist_name",
+    ]
+    assert [
+        key
+        for key, _ in validate_identity_names(
+            "D", alchemist_enabled=True, alchemist_name=ALCHEMIST_NAME_RESERVED_DEFAULT
+        )
+    ] == ["alchemist_name"]
+    assert [
+        key for key, _ in validate_identity_names("Dreamer", alchemist_enabled=True, alchemist_name="dreamer")
+    ] == [
+        "alchemist_name",
+    ]
+    assert validate_identity_names("Dreamer", alchemist_enabled=True, alchemist_name="Alchemist") == []

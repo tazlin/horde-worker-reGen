@@ -706,6 +706,7 @@ class HordeWorkerTUI(App[None]):
             liveness_age,
             offline_checks=offline_checks,
             optimistic_server_maintenance=self._intended_server_maintenance is True,
+            fatal_error=self._supervisor.last_fatal_error,
         )
         try:
             self._update_status_bar(report, snapshot)

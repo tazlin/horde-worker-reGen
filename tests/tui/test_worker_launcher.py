@@ -10,6 +10,7 @@ from loguru import logger
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkerConfigSummary,
+    WorkerFatalConfigError,
     WorkerLivenessFrame,
     WorkerStateSnapshot,
 )
@@ -183,6 +184,37 @@ def test_recoverable_crash_shows_restarting_not_crashed() -> None:
 
     assert supervisor.status is SupervisorStatus.RESTARTING
     assert ctx.process_count == 1  # backoff not yet elapsed, so no relaunch happened on this tick
+
+
+def test_fatal_config_error_is_terminal_and_not_restarted() -> None:
+    """A worker that reports a fatal config problem before exiting is left CRASHED without relaunching.
+
+    A taken/invalid worker name can never succeed on a relaunch, so the supervisor must stop instead of
+    burning its restart budget, and it retains the reason so the dashboard can show the remedy.
+    """
+    ctx = _FakeCtx()
+    supervisor = WorkerSupervisor(
+        WorkerLaunchOptions(),
+        mode=WorkerProcessMode.FAKE,
+        ctx=ctx,  # type: ignore[arg-type]
+        restart_backoff_seconds=0.0,
+    )
+    supervisor.start()
+    assert ctx.last_process is not None
+
+    fatal = WorkerFatalConfigError(title="Worker name problem", detail="That name belongs to another account.")
+    supervisor._connection = _ScriptedConn([fatal])  # type: ignore[assignment]
+    ctx.last_process.kill_it()
+    supervisor.tick()
+
+    assert supervisor.status is SupervisorStatus.CRASHED
+    assert supervisor.last_fatal_error is fatal
+    assert supervisor.restart_attempts == 0  # the restart budget was not consumed
+    assert ctx.process_count == 1  # no relaunch
+
+    # An operator-initiated start (after fixing the config) clears the retained reason.
+    supervisor.start()
+    assert supervisor.last_fatal_error is None
 
 
 def test_no_auto_restart_leaves_worker_stopped() -> None:

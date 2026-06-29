@@ -14,7 +14,7 @@ import os
 import shutil
 from pathlib import Path
 
-from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerFatalConfigError, WorkerStateSnapshot
 from horde_worker_regen.tui.formatters import human_bytes, human_duration
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
 
@@ -120,12 +120,15 @@ def derive(
     *,
     offline_checks: list[HealthCheck] | None = None,
     optimistic_server_maintenance: bool = False,
+    fatal_error: WorkerFatalConfigError | None = None,
 ) -> HealthReport:
     """Compute the worker's phase and health checklist (handles the no-snapshot startup case too).
 
     ``offline_checks`` are pre-flight checks the caller computes from the filesystem (see
     :func:`build_offline_checks`); they are shown while there is no live snapshot so the panel is
-    useful before the worker starts rather than empty. This function itself stays pure.
+    useful before the worker starts rather than empty. ``fatal_error`` is the worker's reported
+    non-retryable config problem (e.g. a taken worker name); when set on a crashed worker it replaces
+    the generic crash message with the specific reason and remedy. This function itself stays pure.
     """
     pre_flight = offline_checks or []
     if supervisor_status is SupervisorStatus.STOPPED:
@@ -133,6 +136,15 @@ def derive(
             WorkerPhase.STOPPED, HealthStatus.INFO, "Worker stopped", "The worker is not running.", pre_flight, False
         )
     if supervisor_status is SupervisorStatus.CRASHED:
+        if fatal_error is not None:
+            return HealthReport(
+                WorkerPhase.CRASHED,
+                HealthStatus.ERROR,
+                fatal_error.title,
+                f"{fatal_error.detail} The worker will not restart until this is fixed.",
+                pre_flight,
+                False,
+            )
         return HealthReport(
             WorkerPhase.CRASHED,
             HealthStatus.ERROR,
