@@ -256,6 +256,27 @@ def _config_number(value: object) -> float | None:
     return float(value)
 
 
+class _WholeCardDemandOutcome(enum.Enum):
+    """How the whole-card residency decision resolves a budget-gated head's preload.
+
+    Returned by :meth:`InferenceScheduler._decide_whole_card_demand` so the budget-admission orchestrator
+    can map each outcome to proceed/defer without re-deriving the residency state.
+    """
+
+    FALL_THROUGH = enum.auto()
+    """No whole-card reservation applies (not demanded, or declined as untrustworthy); continue to the
+    ordinary VRAM/RAM verdict."""
+    PRESTAGE = enum.auto()
+    """The head's weights are pre-staging into spare RAM while a live job drains; skip the verdict and
+    send the preload now (convergence collapses the card to sole residency before it samples)."""
+    DEFER = enum.auto()
+    """The reservation is mid-teardown (idle siblings stopping, safety cycling off-GPU, freed VRAM
+    draining); defer this cycle and re-evaluate against the reduced topology next tick."""
+    TERMINAL_ADMIT = enum.auto()
+    """Teardown is structurally exhausted yet the activation-inclusive peak still overflows even sole
+    residency; admit best-effort onto the cleared card under the over-budget step grace."""
+
+
 @dataclass
 class _WholeCardResidency:
     """Mutable whole-card exclusive-residency state for one card (the worker, on a single-GPU host).
@@ -2357,6 +2378,348 @@ class InferenceScheduler:
 
         return True
 
+    def _decide_whole_card_demand(
+        self,
+        job: ImageGenerateJobPopResponse,
+        available_process: HordeProcessInfo,
+        forecast: StreamForecast,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        *,
+        is_head_blocker: bool,
+        target_device_index: int | None,
+    ) -> _WholeCardDemandOutcome:
+        """Decide whether the head should claim the whole card and drive the residency side effects.
+
+        Whole-card exclusive residency (preventative): the forecast judges whether loading this model
+        alongside the currently-resident models would drive the device into weight streaming. A heavy model
+        loaded while others stay resident across sibling processes can collapse free VRAM to near zero, at
+        which point ComfyUI offloads weights or the driver's system-memory fallback spills per-step
+        activations; both stream over the bus and the slow job risks being mistaken for a hang and killed.
+        When the model would stream co-resident but fits with the card to itself, it is given sole residency
+        before it loads: marked exclusive (so ``has_exclusive_job_in_progress`` suppresses other staging),
+        then enough VRAM is freed. The forecast distinguishes two remedies, applying the least-disruptive:
+        evicting sibling *models* (their processes stay up), or stopping idle sibling *processes* when their
+        fixed per-process contexts are themselves the over-commit (a context is only reclaimed by exit).
+
+        Only the head may claim the card: reserving it tears down the siblings serving the lighter heads
+        ahead of a deeper-queue job, so a non-head heavy job returns ``FALL_THROUGH`` and defers via the
+        ordinary verdict until it becomes the head. See :class:`_WholeCardDemandOutcome` for each result.
+        """
+        # A model needs the teardown path either because it is weight-dominant (needs sole residency) or
+        # because the live sibling process contexts have squeezed its bounded weights off the card though it
+        # co-resides once the process count is reduced. Both are served by the same machinery: establish
+        # residency, stop idle siblings down to max_resident_processes, and admit once the weights fit.
+        needs_teardown_path = forecast.needs_exclusive_residency or forecast.needs_process_count_reduction
+        whole_card_demanded = self._whole_card_residency_enabled() and needs_teardown_path and is_head_blocker
+        if not whole_card_demanded:
+            return _WholeCardDemandOutcome.FALL_THROUGH
+        if not self._whole_card_warranted(forecast):
+            # The teardown demand is not trustworthy (a card-light model on a host with no measured
+            # per-context cost): decline the reservation and fall through to ordinary eviction rather than
+            # reserving the device on an over-counted-context phantom.
+            self._log_whole_card_declined(job, forecast)
+            return _WholeCardDemandOutcome.FALL_THROUGH
+
+        first_time = not self._job_tracker.is_admitted_exclusive(job)
+        self._job_tracker.mark_admitted_exclusive(job)
+        if self._should_prestage_whole_card_head(
+            job,
+            baseline,
+            forecast,
+            available_process,
+            device_index=target_device_index,
+        ):
+            # A live job still holds the device, but the heavy head's weights can begin loading into a spare
+            # process's RAM right now: preload_model is a RAM-only load (weights move to VRAM at sampling
+            # time), so it does not contend with the in-flight job's VRAM. Record the residency and send the
+            # preload; _converge_whole_card_residency then collapses the live process count to sole VRAM
+            # residency before the staged model samples. The heavy disk->RAM load overlaps the in-flight job
+            # instead of waiting for the device to drain first.
+            self._begin_whole_card_residency(
+                job,
+                forecast,
+                announce=first_time,
+                device_index=target_device_index,
+            )
+            return _WholeCardDemandOutcome.PRESTAGE
+
+        # Claim the device: stop idle siblings to the model's max-resident count and, on the very edge, move
+        # safety off-GPU too. Announces (once) why, for the operator. Held through the cooldown so a burst of
+        # heavy jobs reuses one residency instead of churning per job.
+        self._establish_whole_card_residency(
+            job,
+            forecast,
+            announce=first_time,
+            device_index=target_device_index,
+        )
+        # Evict the idle resident models on the *other* processes (sparing the slot that will load this
+        # model, and never a live in-progress model) so their VRAM returns to the driver. A live sibling is
+        # left to drain; the preload simply waits until the device is clear.
+        self.unload_models_from_vram(
+            available_process,
+            under_pressure=True,
+            for_head_of_queue=True,
+            device_index=target_device_index,
+        )
+        if not self._whole_card_teardown_exhausted(forecast, device_index=target_device_index):
+            # Still tearing down idle siblings, cycling safety off-GPU, or waiting for their freed VRAM to
+            # drain: defer and let a later tick re-evaluate against the reduced topology.
+            return _WholeCardDemandOutcome.DEFER
+        # Teardown is structurally exhausted (already at the target process count, safety settled) yet the
+        # activation-inclusive peak still overflows even sole residency, so co-residency can never be reached.
+        # The weights DO fit alone, so admit best-effort onto the now-cleared card under the over-budget step
+        # grace instead of deferring every tick until the supervisor soft-resets.
+        return _WholeCardDemandOutcome.TERMINAL_ADMIT
+
+    def _apply_resource_verdicts(
+        self,
+        job: ImageGenerateJobPopResponse,
+        available_process: HordeProcessInfo,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        forecast: StreamForecast,
+        *,
+        is_head_blocker: bool,
+        target_device_index: int | None,
+        no_live_resource_consumer: bool,
+    ) -> bool:
+        """Apply the VRAM then RAM budget verdicts for a preload, reclaiming or admitting as needed.
+
+        Returns True to proceed with the preload (the resources fit, or a head was admitted best-effort
+        after reclamation was exhausted), False to defer this cycle. When a resource does not fit, idle
+        residents are reclaimed (overriding residency under pressure, escalating for the head of the queue);
+        a head on an otherwise-idle device whose shortfall no reclaim can close is admitted best-effort and
+        tagged over-budget rather than wedging the queue. The VRAM-not-fits path may instead reduce the live
+        process count when the contexts (not the resident models) are the over-commit.
+        """
+        if job.model is None:
+            raise ValueError(f"job.model is None ({job})")
+
+        vram_verdict = self._vram_budget.check_job(
+            job,
+            baseline,
+            self._measured_free_vram_mb(device_index=target_device_index),
+            committed_reserve_mb=self._committed_vram_reserve_mb(device_index=target_device_index),
+        )
+        if not vram_verdict.fits:
+            if not self._vram_budget_defer_notified:
+                logger.opt(ansi=True).warning(
+                    f"<fg #f0beff>VRAM budget deferring preload of {job.model}: {vram_verdict.reason()}. "
+                    "Reclaiming idle VRAM.</>",
+                )
+                self._vram_budget_defer_notified = True
+            freed = self.unload_models_from_vram(
+                available_process,
+                under_pressure=True,
+                device_index=target_device_index,
+            )
+            if not freed and is_head_blocker:
+                # Gentle reclaim found nothing to free because every idle resident copy is another queued
+                # job's model. The head of the queue must still make progress, so escalate and reclaim one of
+                # them to give the head room.
+                freed = self.unload_models_from_vram(
+                    available_process,
+                    under_pressure=True,
+                    for_head_of_queue=True,
+                    device_index=target_device_index,
+                )
+            # Reclamation is exhausted when nothing more could be freed: the predicted peak + reserve exceeds
+            # achievable free VRAM even with every idle resident copy evicted. The burden estimate is a
+            # deliberately conservative single-resident-peak figure, but a large combined checkpoint is
+            # streamed through VRAM component-by-component by the backend, so its true peak is well under the
+            # summed estimate. A head-of-queue job must therefore be given the device rather than deferred
+            # forever (which would wedge the queue and fault the head anyway). Admit it best-effort when no
+            # live job holds the device, after also reclaiming system RAM from idle residents: a heavy head
+            # loads its checkpoint through RAM first, so admitting it onto a RAM-pressured host is a likely
+            # load-time fault. Tag it so a crash/hang of its over-committed slot is classified as a resource
+            # failure (earning the bounded, isolated retry) instead of a plain re-dispatch.
+            if not (is_head_blocker and not freed and no_live_resource_consumer):
+                return False
+
+            # Circuit-breaker: a model the device genuinely cannot run faults every over-budget attempt no
+            # matter how it is isolated. Once its consecutive-fault streak crosses the configured threshold it
+            # is held back (not admitted here, not popped in the popper) for a cooldown, so the worker stops
+            # dropping jobs faster than the horde server tolerates and is never forced into maintenance.
+            if self._is_model_locally_unservable(job.model, device_index=target_device_index):
+                if not self._unservable_admit_notified.get(job.model, False):
+                    logger.opt(ansi=True).warning(
+                        f"<fg #ff8c69>Model {job.model} keeps faulting over the VRAM budget; held "
+                        f"back as locally unservable and not admitted. "
+                        f"{self._process_map.residency_snapshot()}</>",
+                    )
+                    self._unservable_admit_notified[job.model] = True
+                return False
+            self._unservable_admit_notified.pop(job.model, None)
+
+            # Before evicting every resident model and admitting the head exclusively, check whether the live
+            # process *contexts* are the over-commit rather than the resident models. The weight-based teardown
+            # gates leave a moderate head co-resident because its weights fit after a model eviction, but its
+            # activation peak does not fit while this many contexts are live (the threads>1 regime, where each
+            # extra context retains VRAM the allocator never returns). When more inference contexts are live
+            # than the head's weights-plus-reserve can co-reside with (``max_resident_processes``, sized from
+            # the measured per-context cost), reducing the process count is the structural remedy: it returns a
+            # context's retained VRAM so the head and a sibling model co-reside and pipeline. Evicting every
+            # model and loading exclusively instead strands the models the next jobs reuse and churns a full
+            # reload per job. The depth is sized from the verdict's own rejected peak so the reduction fires
+            # exactly when admission would reject.
+            max_resident = None
+            if vram_verdict.predicted_mb is not None:
+                max_resident = self._max_coresident_for_peak_mb(
+                    vram_verdict.predicted_mb,
+                    vram_verdict.reserve_mb,
+                    device_index=target_device_index,
+                )
+            context_reduction_demanded = (
+                self._whole_card_residency_enabled()
+                and is_head_blocker
+                and max_resident is not None
+                and self._process_map.num_loaded_inference_processes(device_index=target_device_index) > max_resident
+            )
+            if context_reduction_demanded and not self._whole_card_warranted(forecast):
+                # The reduction depth rests on the per-context overhead; when that is the unmeasured fallback
+                # for a card-light model, the demand is an over-count phantom. Decline it and fall through to
+                # the ordinary evict-all admit rather than reserving the card.
+                self._log_whole_card_declined(job, forecast)
+            elif context_reduction_demanded:
+                first_time = not self._job_tracker.is_admitted_exclusive(job)
+                self._job_tracker.mark_admitted_exclusive(job)
+                self._establish_whole_card_residency(
+                    job,
+                    forecast,
+                    announce=first_time,
+                    target_override=max_resident,
+                    device_index=target_device_index,
+                )
+                self.unload_models_from_vram(
+                    available_process,
+                    under_pressure=True,
+                    for_head_of_queue=True,
+                    device_index=target_device_index,
+                )
+                return False
+
+            self.unload_models(under_pressure=True, for_head_of_queue=True)
+            self._mark_overbudget_admit(job)
+            self._log_overbudget_admit(job)
+            return True
+
+        self._vram_budget_defer_notified = False
+
+        ram_verdict = self._ram_budget.check_job(
+            job,
+            baseline,
+            self._measured_available_ram_mb(),
+            committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
+        )
+        if not ram_verdict.fits:
+            if not self._ram_budget_defer_notified:
+                logger.opt(ansi=True).warning(
+                    f"<fg #f0beff>RAM budget deferring preload of {job.model}: "
+                    f"{ram_verdict.reason()}. Reclaiming idle RAM.</>",
+                )
+                self._ram_budget_defer_notified = True
+            reclaimed = self.unload_models(under_pressure=True)
+            if not reclaimed and is_head_blocker:
+                # Gentle reclaim freed nothing; for the head of the queue, escalate to reclaim a queued
+                # model's RAM before falling back to cycling an allocator-stuck idle slot.
+                reclaimed = self.unload_models(under_pressure=True, for_head_of_queue=True)
+            if not reclaimed:
+                cycled = self._replace_stale_ram_unload_process()
+                # Cycling a stuck idle slot reclaims RAM by restarting it, so wait for that. Only when even
+                # cycling finds nothing to reclaim (and no live job holds RAM) is the head truly unservable by
+                # waiting; admit it best-effort then, mirroring the VRAM branch, rather than starving it.
+                if not (is_head_blocker and not cycled and no_live_resource_consumer):
+                    return False
+                logger.opt(ansi=True).warning(
+                    f"<fg #f0beff>RAM budget cannot fit head-of-queue model {job.model} even after "
+                    "reclaiming all idle RAM, and no live job holds memory; admitting it best-effort "
+                    "rather than wedging the queue.</>",
+                )
+            else:
+                return False
+        else:
+            self._ram_budget_defer_notified = False
+
+        return True
+
+    def _admit_preload_under_budget(
+        self,
+        job: ImageGenerateJobPopResponse,
+        available_process: HordeProcessInfo,
+        *,
+        is_head_blocker: bool,
+    ) -> bool:
+        """Return whether ``job`` may be admitted for preload under the active VRAM/RAM budget.
+
+        True means proceed to send the preload; False means defer this cycle. Performs the residency,
+        reclamation, and best-effort-admit side effects the verdict requires. The decision is: forecast
+        weight streaming, resolve a whole-card residency demand (which may pre-stage, defer, or terminally
+        admit the head), apply the head-of-queue starvation backstop, then fall to the ordinary VRAM/RAM
+        verdict. Every decision below is scoped to the card this preload would land on (None keeps the
+        worker-wide reading on a single-GPU host, so the path is byte-identical there).
+        """
+        if job.model is None:
+            raise ValueError(f"job.model is None ({job})")
+
+        baseline = self._model_metadata.get_baseline(job.model)
+        target_device_index = available_process.device_index if self._multi_gpu_routing_active else None
+        # A single model loaded onto an otherwise-idle GPU cannot reintroduce the multi-process over-commit
+        # the budget guards against; the over-commit case is several *concurrent* resident models. So when no
+        # job is in-flight (holding this card), a starved head may be admitted best-effort rather than
+        # deferred forever.
+        if target_device_index is None:
+            no_live_resource_consumer = len(self._job_tracker.jobs_in_progress) == 0
+        else:
+            no_live_resource_consumer = len(self._jobs_in_progress_on_card(target_device_index)) == 0
+
+        forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
+        # Trace the forecast for every budget-gated load so the logs show the residency dynamics, not just the
+        # action taken. Unchanged observations are coalesced by _log_stream_forecast; decision or headroom
+        # changes still log immediately.
+        self._log_stream_forecast(job, forecast)
+
+        whole_card = self._decide_whole_card_demand(
+            job,
+            available_process,
+            forecast,
+            baseline,
+            is_head_blocker=is_head_blocker,
+            target_device_index=target_device_index,
+        )
+        if whole_card is _WholeCardDemandOutcome.DEFER:
+            return False
+        if whole_card is _WholeCardDemandOutcome.PRESTAGE:
+            # A RAM-only pre-stage of a whole-card head: the VRAM budget deliberately does not fit it
+            # co-resident (that is *why* it gets the whole card), so skip the verdict and send the preload.
+            return True
+        if whole_card is _WholeCardDemandOutcome.TERMINAL_ADMIT:
+            self._log_whole_card_terminal_admit(job)
+            self._mark_overbudget_admit(job)
+            return True
+
+        # Head-of-queue starvation backstop (see _HEAD_STARVATION_FORCE_ADMIT_SECONDS): once the head has been
+        # budget-deferred on an otherwise-idle device past the wedge horizon, stop deferring and admit it
+        # best-effort. Reclamation is structurally exhausted by then, so continuing to defer only wedges the
+        # queue until the recovery supervisor soft-resets every pool and faults the whole backlog: strictly
+        # worse than loading one head onto an idle card. This rescues a plain over-budget head that the
+        # verdicts keep rejecting (e.g. a head failing the RAM budget against allocator-stranded idle RAM).
+        force_admit_starved_head = (
+            is_head_blocker and self._head_starved_seconds(job) >= _HEAD_STARVATION_FORCE_ADMIT_SECONDS
+        )
+        if force_admit_starved_head:
+            self._log_head_starvation_force_admit(job)
+            self._mark_overbudget_admit(job)
+            return True
+
+        return self._apply_resource_verdicts(
+            job,
+            available_process,
+            baseline,
+            forecast,
+            is_head_blocker=is_head_blocker,
+            target_device_index=target_device_index,
+            no_live_resource_consumer=no_live_resource_consumer,
+        )
+
     def preload_models(self) -> bool:
         """Preload models that are likely to be used soon.
 
@@ -2540,305 +2903,12 @@ class InferenceScheduler:
             # multi-process over-commit that OOMs the GPU and against resident weights paging RAM to
             # disk. When a resource does not fit, start reclaiming it from idle resident models
             # (overriding residency under pressure) and defer this preload rather than over-committing.
-            if self._budget_active():
-                baseline = self._model_metadata.get_baseline(job.model)
-                # On a multi-GPU host every budget / forecast / residency decision below is scoped to the card
-                # this preload would land on (the slot chosen above). None keeps the worker-wide reading on a
-                # single-GPU host, so the whole block is byte-identical there.
-                target_device_index = available_process.device_index if self._multi_gpu_routing_active else None
-                # A single model loaded onto an otherwise-idle GPU cannot reintroduce the multi-process
-                # over-commit the budget guards against; the over-commit case is several *concurrent*
-                # resident models. So when no job is in-flight (holding the device, i.e. this card, on a
-                # multi-GPU host), a starved head may be admitted best-effort rather than deferred forever.
-                if target_device_index is None:
-                    no_live_resource_consumer = len(self._job_tracker.jobs_in_progress) == 0
-                else:
-                    no_live_resource_consumer = len(self._jobs_in_progress_on_card(target_device_index)) == 0
-
-                # Whole-card exclusive residency (preventative): forecast whether loading this model alongside
-                # the currently-resident models would drive the device into weight streaming. A heavy model
-                # (such as a large diffusion checkpoint) loaded while other models stay resident across sibling
-                # processes can collapse free VRAM to near zero, at which point either ComfyUI offloads weights
-                # or, once free VRAM nears zero, the GPU driver's system-memory fallback spills the per-step
-                # activations; both stream over the bus, sampling slows by several times, and the slow job
-                # risks being mistaken for a hang and killed. When the model would stream co-resident but fits
-                # with the card to itself, give it sole residency *before* it loads: mark it exclusive (the
-                # has_exclusive_job_in_progress hook then suppresses any other model's staging/dispatch), then
-                # free enough VRAM and defer until the device recovers. The forecast distinguishes two
-                # remedies, applying the least-disruptive one that works:
-                #   - evicting sibling *models* is enough -> just unload them (their processes stay up);
-                #   - the siblings' fixed per-process contexts (~1 GB each, the cost of importing torch) are
-                #     themselves the over-commit -> stop idle sibling processes, because a context is only
-                #     reclaimed by the process exiting, never by emptying the allocator cache.
-                # A live sibling job is never disturbed (for_head_of_queue spares live work, and only idle
-                # processes are stopped), so the model simply waits for the device to drain. Models that would
-                # stream even with the whole card to themselves (streams_unavoidably) fall through to the
-                # best-effort admit below.
-                forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
-                # Trace the forecast for every budget-gated load so the logs show the residency dynamics
-                # (the numbers behind a stream/no-stream decision), not just the action taken. Kept at DEBUG
-                # because it can be per-pending-job per-tick; unchanged observations are coalesced by
-                # _log_stream_forecast, while decision or headroom changes still log immediately.
-                self._log_stream_forecast(job, forecast)
-                whole_card_terminal = False
-                early_prestage = False
-                # A model needs the teardown path either because it is weight-dominant (needs sole residency)
-                # or because the live sibling *process contexts* have squeezed its bounded weights off the card
-                # though it co-resides once the process count is reduced (needs_process_count_reduction, i.e. the
-                # soak's blind spot, where a moderate SDXL head was deferred until the starvation backstop
-                # force-admitted it into an OOM). Both are served by the same machinery: establish residency,
-                # stop idle siblings down to max_resident_processes (sole residency for the former, a partial
-                # reduction for the latter), and admit once the weights fit. The process-count-reduction case is
-                # held exclusive through the teardown so a second model cannot re-fill the card mid-reduction;
-                # the residency cooldown then restores concurrency.
-                needs_teardown_path = forecast.needs_exclusive_residency or forecast.needs_process_count_reduction
-                # Only the head (the next job to dispatch) may claim the whole card. The residency reserves the
-                # entire device and tears its siblings down; granting it to a deeper-queue heavy job would
-                # collapse the very processes serving the lighter heads ahead of it, starving them while the
-                # card is held for a job whose turn has not come (and held until that job drains). This honors
-                # the same head_job contract the budget-eviction branches below follow: a later job never
-                # displaces a resident head. A non-head heavy job falls through to the ordinary verdict and
-                # defers until it becomes the head.
-                whole_card_demanded = self._whole_card_residency_enabled() and needs_teardown_path and is_head_blocker
-                if whole_card_demanded and not self._whole_card_warranted(forecast):
-                    # The teardown demand is not trustworthy (a card-light model on a host with no measured
-                    # per-context cost): decline the reservation and fall through to ordinary eviction rather
-                    # than reserving the device on an over-counted-context phantom.
-                    self._log_whole_card_declined(job, forecast)
-                elif whole_card_demanded:
-                    first_time = not self._job_tracker.is_admitted_exclusive(job)
-                    self._job_tracker.mark_admitted_exclusive(job)
-                    if self._should_prestage_whole_card_head(
-                        job,
-                        baseline,
-                        forecast,
-                        available_process,
-                        device_index=target_device_index,
-                    ):
-                        # A live job still holds the device, so the card cannot be claimed yet, but the heavy
-                        # head's weights can begin loading into a spare process's RAM right now: preload_model is
-                        # a RAM-only load (the weights move to VRAM at sampling time), so it does not contend with
-                        # the in-flight job's VRAM. Record the residency and fall through to the preload send;
-                        # _converge_whole_card_residency then collapses the live process count to sole VRAM
-                        # residency (stopping idle siblings, then the former busy process once its job drains)
-                        # before the staged model samples. RAM-gated so a second multi-GB checkpoint is never
-                        # forced onto a RAM-pressured host. This is the load-ASAP win: the heavy disk->RAM load
-                        # overlaps the in-flight job instead of waiting for the device to drain first.
-                        self._begin_whole_card_residency(
-                            job,
-                            forecast,
-                            announce=first_time,
-                            device_index=target_device_index,
-                        )
-                        early_prestage = True
-                    else:
-                        # Claim the device: stop idle siblings to the model's max-resident count and, on the very
-                        # edge, move safety off-GPU too. Announces (once) why, for the operator. Held through the
-                        # cooldown so a burst of heavy jobs reuses one residency instead of churning per job.
-                        self._establish_whole_card_residency(
-                            job,
-                            forecast,
-                            announce=first_time,
-                            device_index=target_device_index,
-                        )
-                        # Evict the idle resident models on the *other* processes (sparing the slot that will load
-                        # this model, and never a live in-progress model) so their VRAM returns to the driver. A
-                        # live sibling is left to drain; the preload simply waits until the device is clear.
-                        self.unload_models_from_vram(
-                            available_process,
-                            under_pressure=True,
-                            for_head_of_queue=True,
-                            device_index=target_device_index,
-                        )
-                        if not self._whole_card_teardown_exhausted(forecast, device_index=target_device_index):
-                            # Still tearing down idle siblings, cycling safety off-GPU, or waiting for their freed
-                            # VRAM to drain: defer and let a later tick re-evaluate against the reduced topology.
-                            return False
-                        # Teardown is structurally exhausted (already at the target process count, safety settled)
-                        # yet the activation-inclusive peak still overflows even sole residency, so co-residency
-                        # can never be reached. The weights DO fit alone (fits_weights_now), so fall through to the
-                        # best-effort admit and load onto the now-cleared card, where it samples slowly under the
-                        # over-budget step grace, instead of deferring every tick until the supervisor soft-resets.
-                        whole_card_terminal = True
-
-                # Head-of-queue starvation backstop (see _HEAD_STARVATION_FORCE_ADMIT_SECONDS): once the head
-                # has been budget-deferred on an otherwise-idle device past the wedge horizon, stop deferring
-                # and admit it best-effort. Reclamation is structurally exhausted by then (an earlier tick
-                # would have freed room otherwise), so continuing to defer only wedges the queue until the
-                # recovery supervisor soft-resets every pool and faults the whole backlog: strictly worse than
-                # loading one head onto an idle card. A whole-card head reaches the shared admit only once its
-                # teardown is exhausted (``whole_card_terminal`` above); this timer-based backstop rescues a
-                # plain over-budget head that the verdicts keep rejecting (e.g. a head failing the RAM budget
-                # against allocator-stranded idle RAM that no reclaim path can return).
-                force_admit_starved_head = (
-                    not early_prestage
-                    and is_head_blocker
-                    and self._head_starved_seconds(job) >= _HEAD_STARVATION_FORCE_ADMIT_SECONDS
-                )
-                if early_prestage:
-                    # A RAM-only pre-stage of a whole-card head: the VRAM budget deliberately does not fit it
-                    # co-resident (that is *why* it gets the whole card), so skip the VRAM/RAM verdict and fall
-                    # through to the preload send. The RAM fit was already checked in the pre-stage decision.
-                    pass
-                elif whole_card_terminal or force_admit_starved_head:
-                    if whole_card_terminal:
-                        self._log_whole_card_terminal_admit(job)
-                    else:
-                        self._log_head_starvation_force_admit(job)
-                    self._mark_overbudget_admit(job)
-                else:
-                    vram_verdict = self._vram_budget.check_job(
-                        job,
-                        baseline,
-                        self._measured_free_vram_mb(device_index=target_device_index),
-                        committed_reserve_mb=self._committed_vram_reserve_mb(device_index=target_device_index),
-                    )
-                    if not vram_verdict.fits:
-                        if not self._vram_budget_defer_notified:
-                            logger.opt(ansi=True).warning(
-                                f"<fg #f0beff>VRAM budget deferring preload of {job.model}: {vram_verdict.reason()}. "
-                                "Reclaiming idle VRAM.</>",
-                            )
-                            self._vram_budget_defer_notified = True
-                        freed = self.unload_models_from_vram(
-                            available_process,
-                            under_pressure=True,
-                            device_index=target_device_index,
-                        )
-                        if not freed and is_head_blocker:
-                            # Gentle reclaim found nothing to free because every idle resident copy is
-                            # another queued job's model. The head of the queue must still make progress,
-                            # so escalate and reclaim one of them to give the head room.
-                            freed = self.unload_models_from_vram(
-                                available_process,
-                                under_pressure=True,
-                                for_head_of_queue=True,
-                                device_index=target_device_index,
-                            )
-                        # Reclamation is exhausted when nothing more could be freed: the predicted peak + reserve
-                        # exceeds achievable free VRAM even with every idle resident copy evicted. The burden
-                        # estimate is a deliberately conservative single-resident-peak figure, but a large
-                        # combined checkpoint (text encoder + diffusion weights + VAE in one file) is streamed
-                        # through VRAM component-by-component by the backend, so its true peak is the largest
-                        # single component, well under the summed estimate. A head-of-queue job must therefore
-                        # be given the device rather than deferred forever (which would wedge the queue and
-                        # fault the head anyway). Admit it best-effort when no live job holds the device, after
-                        # also reclaiming system RAM from idle residents: a heavy head loads its checkpoint
-                        # through RAM first, so admitting it onto a RAM-pressured host is a likely load-time
-                        # fault. Tag it so a crash/hang of its over-committed slot is classified as a resource
-                        # failure (earning the bounded, isolated retry) instead of a plain re-dispatch onto
-                        # another equally over-committed slot.
-                        if not (is_head_blocker and not freed and no_live_resource_consumer):
-                            return False
-
-                        # Circuit-breaker: a model the device genuinely cannot run faults every over-budget
-                        # attempt no matter how it is isolated. Once its consecutive-fault streak crosses the
-                        # configured threshold it is held back (not admitted here, not popped in the popper) for
-                        # a cooldown, so the worker stops dropping jobs faster than the horde server tolerates
-                        # and is never forced into maintenance. The self-throttle backstop catches the aggregate.
-                        if self._is_model_locally_unservable(job.model, device_index=target_device_index):
-                            if not self._unservable_admit_notified.get(job.model, False):
-                                logger.opt(ansi=True).warning(
-                                    f"<fg #ff8c69>Model {job.model} keeps faulting over the VRAM budget; held "
-                                    f"back as locally unservable and not admitted. "
-                                    f"{self._process_map.residency_snapshot()}</>",
-                                )
-                                self._unservable_admit_notified[job.model] = True
-                            return False
-                        self._unservable_admit_notified.pop(job.model, None)
-
-                        # Before evicting every resident model and admitting the head exclusively, check whether
-                        # the live process *contexts* are the over-commit rather than the resident models. The
-                        # weight-based teardown gates above leave a moderate head co-resident because its weights
-                        # fit after a model eviction, but its activation peak does not fit while this many
-                        # contexts are live (the threads>1 regime, where each extra context retains VRAM the
-                        # allocator never returns). When more inference contexts are live than the head's
-                        # weights-plus-reserve can co-reside with (``max_resident_processes``, sized from the
-                        # measured per-context cost), reducing the process count is the structural remedy: it
-                        # returns a context's retained VRAM so the head and a sibling model co-reside and
-                        # pipeline. Evicting every model and loading exclusively instead strands the models the
-                        # next jobs reuse and churns a full reload per job. Only idle siblings are stopped (the
-                        # all-idle branch we are in), and the residency cooldown restores concurrency afterwards.
-                        # The depth is sized from the verdict's own rejected peak (not the forecast's lighter
-                        # resident-weight estimate) so the reduction fires exactly when admission would reject.
-                        max_resident = None
-                        if vram_verdict.predicted_mb is not None:
-                            max_resident = self._max_coresident_for_peak_mb(
-                                vram_verdict.predicted_mb,
-                                vram_verdict.reserve_mb,
-                                device_index=target_device_index,
-                            )
-                        context_reduction_demanded = (
-                            self._whole_card_residency_enabled()
-                            and is_head_blocker
-                            and max_resident is not None
-                            and self._process_map.num_loaded_inference_processes(device_index=target_device_index)
-                            > max_resident
-                        )
-                        if context_reduction_demanded and not self._whole_card_warranted(forecast):
-                            # The reduction depth rests on the per-context overhead; when that is the unmeasured
-                            # fallback for a card-light model, the demand is an over-count phantom. Decline it and
-                            # fall through to the ordinary evict-all admit rather than reserving the card.
-                            self._log_whole_card_declined(job, forecast)
-                        elif context_reduction_demanded:
-                            first_time = not self._job_tracker.is_admitted_exclusive(job)
-                            self._job_tracker.mark_admitted_exclusive(job)
-                            self._establish_whole_card_residency(
-                                job,
-                                forecast,
-                                announce=first_time,
-                                target_override=max_resident,
-                                device_index=target_device_index,
-                            )
-                            self.unload_models_from_vram(
-                                available_process,
-                                under_pressure=True,
-                                for_head_of_queue=True,
-                                device_index=target_device_index,
-                            )
-                            return False
-
-                        self.unload_models(under_pressure=True, for_head_of_queue=True)
-                        self._mark_overbudget_admit(job)
-                        self._log_overbudget_admit(job)
-                    else:
-                        self._vram_budget_defer_notified = False
-
-                        ram_verdict = self._ram_budget.check_job(
-                            job,
-                            baseline,
-                            self._measured_available_ram_mb(),
-                            committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
-                        )
-                        if not ram_verdict.fits:
-                            if not self._ram_budget_defer_notified:
-                                logger.opt(ansi=True).warning(
-                                    f"<fg #f0beff>RAM budget deferring preload of {job.model}: "
-                                    f"{ram_verdict.reason()}. Reclaiming idle RAM.</>",
-                                )
-                                self._ram_budget_defer_notified = True
-                            reclaimed = self.unload_models(under_pressure=True)
-                            if not reclaimed and is_head_blocker:
-                                # Gentle reclaim freed nothing; for the head of the queue, escalate to reclaim a
-                                # queued model's RAM before falling back to cycling an allocator-stuck idle slot.
-                                reclaimed = self.unload_models(under_pressure=True, for_head_of_queue=True)
-                            if not reclaimed:
-                                cycled = self._replace_stale_ram_unload_process()
-                                # Cycling a stuck idle slot reclaims RAM by restarting it, so wait for that.
-                                # Only when even cycling finds nothing to reclaim (and no live job holds RAM)
-                                # is the head truly unservable by waiting; admit it best-effort then, mirroring
-                                # the VRAM branch, rather than starving it.
-                                if not (is_head_blocker and not cycled and no_live_resource_consumer):
-                                    return False
-                                logger.opt(ansi=True).warning(
-                                    f"<fg #f0beff>RAM budget cannot fit head-of-queue model {job.model} even after "
-                                    "reclaiming all idle RAM, and no live job holds memory; admitting it best-effort "
-                                    "rather than wedging the queue.</>",
-                                )
-                            else:
-                                return False
-                        else:
-                            self._ram_budget_defer_notified = False
+            if self._budget_active() and not self._admit_preload_under_budget(
+                job,
+                available_process,
+                is_head_blocker=is_head_blocker,
+            ):
+                return False
 
             return self._send_preload(job, available_process)
 
@@ -3031,6 +3101,132 @@ class InferenceScheduler:
             }
         logger.debug(f"Line-skip candidate {candidate_id} {message}")
 
+    def _select_line_skip_candidate(
+        self,
+        displaced_job: ImageGenerateJobPopResponse,
+        *,
+        next_n_jobs: list[ImageGenerateJobPopResponse],
+        candidate_job_size: int,
+    ) -> NextJobAndProcess | None:
+        """Select a small, ready job that may bypass ``displaced_job`` while its slot is non-sampling.
+
+        Scans the pending jobs for the first resident on an idle process that holds a *different* model
+        than the blocked head, carries no LoRAs, is not a degraded retry, and is within the
+        per-performance-mode size limit. Returns a :class:`NextJobAndProcess` carrying the
+        :class:`LineSkip` record, or None when nothing qualifies. Rejections are logged (rate-limited).
+        """
+        for candidate_small_job in next_n_jobs:
+            candidate_id = str(candidate_small_job.id_)[:8]
+            job_has_loras = (
+                candidate_small_job.payload.loras is not None and len(candidate_small_job.payload.loras) > 0
+            )
+            if candidate_small_job.model is None:
+                self._log_line_skip_rejection(candidate_id, "missing_model", "rejected: missing model.")
+                continue
+            if candidate_small_job.model == displaced_job.model:
+                self._log_line_skip_rejection(
+                    candidate_id,
+                    "same_model",
+                    f"rejected: same model as blocked job {str(displaced_job.id_)[:8]}.",
+                )
+                continue
+            if job_has_loras:
+                self._log_line_skip_rejection(candidate_id, "has_loras", "rejected: candidate has LoRAs.")
+                continue
+            if self._job_tracker.is_degraded_dispatch_pending(candidate_small_job):
+                self._log_line_skip_rejection(
+                    candidate_id,
+                    "degraded",
+                    "rejected: degraded retry must run isolated.",
+                )
+                continue
+
+            candidate_process_with_model = self._resident_process_for_job(candidate_small_job)
+            if candidate_process_with_model is None:
+                self._log_line_skip_rejection(
+                    candidate_id,
+                    "not_resident",
+                    f"rejected: model {candidate_small_job.model} is not resident.",
+                )
+                continue
+
+            candidate_effective_mps = self.get_single_job_effective_megapixelsteps(candidate_small_job)
+            if candidate_effective_mps > candidate_job_size:
+                self._log_line_skip_rejection(
+                    candidate_id,
+                    "emps",
+                    f"rejected: {candidate_effective_mps} eMPS exceeds {candidate_job_size} eMPS limit.",
+                )
+                continue
+
+            if not candidate_process_with_model.can_accept_job():
+                self._log_line_skip_rejection(
+                    candidate_id,
+                    "process_state",
+                    f"rejected: process {candidate_process_with_model.process_id} is "
+                    f"{candidate_process_with_model.last_process_state.name}.",
+                )
+                continue
+
+            logger.debug(
+                f"Line-skip candidate {candidate_id} accepted: {candidate_small_job.model}, "
+                f"{candidate_effective_mps} eMPS <= {candidate_job_size}, process "
+                f"{candidate_process_with_model.process_id} can accept work.",
+            )
+            return NextJobAndProcess(
+                next_job=candidate_small_job,
+                process_with_model=candidate_process_with_model,
+                line_skip=LineSkip(displaced_job=displaced_job),
+            )
+
+        return None
+
+    async def _handle_process_missing(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        process_with_model: HordeProcessInfo | None,
+    ) -> None:
+        """Recover when the head's model was expected resident but no process holds it.
+
+        Expires the stale model-map entry, clears any process still tagged with the model, and releases
+        the job from in-progress so a fresh preload can be scheduled. Guarded by ``_model_recently_missing``
+        so the recovery runs at most once until a model loads again.
+        """
+        if self._model_recently_missing:
+            return
+        logger.warning(
+            f"Expected to find a process with model {job.model} but none was found. Attempt to load it now...",
+        )
+        logger.debug(f"Horde model map: {self._horde_model_map}")
+        logger.debug(f"Process map: {self._process_map}")
+
+        if job.model is not None:
+            logger.debug(f"Expiring entry for model {job.model}")
+            self._horde_model_map.expire_entry(job.model)
+
+            if process_with_model is not None:
+                logger.debug(f"Clearing process {process_with_model.process_id} of model {job.model}")
+
+                horde_model_baseline = self._model_metadata.get_baseline(job.model)
+
+                self._process_map.on_model_load_state_change(
+                    process_id=process_with_model.process_id,
+                    horde_model_name=job.model,
+                    horde_model_baseline=horde_model_baseline,
+                )
+
+            logger.debug(f"Horde model map: {self._horde_model_map}")
+            logger.debug(f"Process map: {self._process_map}")
+
+            self._model_recently_missing = True
+
+            logger.debug(f"Last missing time: {self._model_recently_missing_time}")
+            self._model_recently_missing_time = time.time()
+
+            if not await self._job_tracker.release_in_progress(job):
+                logger.debug(f"Job {job.id_} not found in jobs_in_progress.")
+
     async def get_next_job_and_process(
         self,
         information_only: bool = False,
@@ -3089,74 +3285,6 @@ class InferenceScheduler:
         elif bridge_data.moderate_performance_mode:
             candidate_job_size = 50
 
-        def select_line_skip_candidate(displaced_job: ImageGenerateJobPopResponse) -> NextJobAndProcess | None:
-            """Select a small, ready job that may bypass ``displaced_job`` while its slot is non-sampling."""
-            for candidate_small_job in next_n_jobs:
-                candidate_id = str(candidate_small_job.id_)[:8]
-                job_has_loras = (
-                    candidate_small_job.payload.loras is not None and len(candidate_small_job.payload.loras) > 0
-                )
-                if candidate_small_job.model is None:
-                    self._log_line_skip_rejection(candidate_id, "missing_model", "rejected: missing model.")
-                    continue
-                if candidate_small_job.model == displaced_job.model:
-                    self._log_line_skip_rejection(
-                        candidate_id,
-                        "same_model",
-                        f"rejected: same model as blocked job {str(displaced_job.id_)[:8]}.",
-                    )
-                    continue
-                if job_has_loras:
-                    self._log_line_skip_rejection(candidate_id, "has_loras", "rejected: candidate has LoRAs.")
-                    continue
-                if self._job_tracker.is_degraded_dispatch_pending(candidate_small_job):
-                    self._log_line_skip_rejection(
-                        candidate_id,
-                        "degraded",
-                        "rejected: degraded retry must run isolated.",
-                    )
-                    continue
-
-                candidate_process_with_model = self._resident_process_for_job(candidate_small_job)
-                if candidate_process_with_model is None:
-                    self._log_line_skip_rejection(
-                        candidate_id,
-                        "not_resident",
-                        f"rejected: model {candidate_small_job.model} is not resident.",
-                    )
-                    continue
-
-                candidate_effective_mps = self.get_single_job_effective_megapixelsteps(candidate_small_job)
-                if candidate_effective_mps > candidate_job_size:
-                    self._log_line_skip_rejection(
-                        candidate_id,
-                        "emps",
-                        f"rejected: {candidate_effective_mps} eMPS exceeds {candidate_job_size} eMPS limit.",
-                    )
-                    continue
-
-                if not candidate_process_with_model.can_accept_job():
-                    self._log_line_skip_rejection(
-                        candidate_id,
-                        "process_state",
-                        f"rejected: process {candidate_process_with_model.process_id} is "
-                        f"{candidate_process_with_model.last_process_state.name}.",
-                    )
-                    continue
-
-                logger.debug(
-                    f"Line-skip candidate {candidate_id} accepted: {candidate_small_job.model}, "
-                    f"{candidate_effective_mps} eMPS <= {candidate_job_size}, process "
-                    f"{candidate_process_with_model.process_id} can accept work.",
-                )
-                return NextJobAndProcess(
-                    next_job=candidate_small_job,
-                    process_with_model=candidate_process_with_model,
-                    line_skip=LineSkip(displaced_job=displaced_job),
-                )
-
-            return None
-
         # On a multi-GPU host the head's resident process names the card this dispatch would land on, so the
         # concurrency cap is scoped to that card: its own in-progress count vs its own ceilings. The scope is
         # dropped (worker-wide, as on a single-GPU host) when the head is not yet resident (no target card) or
@@ -3199,46 +3327,15 @@ class InferenceScheduler:
                     f"max_threads={self._max_concurrent_inference_processes}, "
                     f"gpu_sampling_lease_enabled={bridge_data.gpu_sampling_lease_enabled}).",
                 )
-                bypass = select_line_skip_candidate(next_job)
+                bypass = self._select_line_skip_candidate(
+                    next_job,
+                    next_n_jobs=next_n_jobs,
+                    candidate_job_size=candidate_job_size,
+                )
                 if bypass is not None:
                     self._pending_line_skip = bypass
                     return bypass
             return None
-
-        async def handle_process_missing(job: ImageGenerateJobPopResponse) -> None:
-            if self._model_recently_missing:
-                return
-            logger.warning(
-                f"Expected to find a process with model {job.model} but none was found. Attempt to load it now...",
-            )
-            logger.debug(f"Horde model map: {self._horde_model_map}")
-            logger.debug(f"Process map: {self._process_map}")
-
-            if job.model is not None:
-                logger.debug(f"Expiring entry for model {job.model}")
-                self._horde_model_map.expire_entry(job.model)
-
-                if process_with_model is not None:
-                    logger.debug(f"Clearing process {process_with_model.process_id} of model {job.model}")
-
-                    horde_model_baseline = self._model_metadata.get_baseline(job.model)
-
-                    self._process_map.on_model_load_state_change(
-                        process_id=process_with_model.process_id,
-                        horde_model_name=job.model,
-                        horde_model_baseline=horde_model_baseline,
-                    )
-
-                logger.debug(f"Horde model map: {self._horde_model_map}")
-                logger.debug(f"Process map: {self._process_map}")
-
-                self._model_recently_missing = True
-
-                logger.debug(f"Last missing time: {self._model_recently_missing_time}")
-                self._model_recently_missing_time = time.time()
-
-                if not await self._job_tracker.release_in_progress(job):
-                    logger.debug(f"Job {job.id_} not found in jobs_in_progress.")
 
         if process_with_model is None:
             if next_job.model is None:
@@ -3271,7 +3368,7 @@ class InferenceScheduler:
                     or information_only
                 ):
                     return None
-                await handle_process_missing(next_job)
+                await self._handle_process_missing(next_job, process_with_model=process_with_model)
                 return None
 
         if not process_with_model.can_accept_job():
@@ -3279,7 +3376,11 @@ class InferenceScheduler:
                 self.post_process_job_overlap_allowed
                 and process_with_model.last_process_state == HordeProcessState.INFERENCE_POST_PROCESSING
             ):
-                line_skip_selection = select_line_skip_candidate(next_job)
+                line_skip_selection = self._select_line_skip_candidate(
+                    next_job,
+                    next_n_jobs=next_n_jobs,
+                    candidate_job_size=candidate_job_size,
+                )
                 if line_skip_selection is None:
                     return None
                 next_job = line_skip_selection.next_job
@@ -3615,6 +3716,86 @@ class InferenceScheduler:
 
         logger.debug(f"All Batch IDs: {next_job.ids}")
 
+    async def _dispatch_inference_message(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+        *,
+        keep_model_resident_after: bool,
+        dispatched_device_index: int | None,
+        degraded_dispatch: bool,
+    ) -> None:
+        """Send the START_INFERENCE command and record the outcome: mark started on success, fault on failure.
+
+        On a successful send, marks the job started, stamps the slot's in-flight timing for the
+        graded-slowdown monitor, records the dispatch in the action ledger, and advances the process state.
+        On a failed send, faults the job so the horde reissues it.
+        """
+        if next_job.model is None:
+            raise ValueError(f"next_job.model is None ({next_job})")
+
+        bridge_data = self._runtime_config.bridge_data
+        if process_with_model.safe_send_message(
+            HordeInferenceControlMessage(
+                control_flag=HordeControlFlag.START_INFERENCE,
+                horde_model_name=next_job.model,
+                sdk_api_job_info=next_job,
+                keep_model_resident_after=keep_model_resident_after,
+                aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
+                    bridge_data,
+                ),
+            ),
+        ):
+            await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)
+            horde_model_baseline = self._model_metadata.get_baseline(next_job.model)
+
+            dispatch_detail: dict[str, str | int | float | bool | None] = {
+                "model": next_job.model,
+                "steps": next_job.payload.ddim_steps,
+            }
+            expected_seconds = self._expected_sampling_seconds(next_job, horde_model_baseline)
+            if expected_seconds is not None:
+                dispatch_detail["expected_sampling_seconds"] = round(expected_seconds, 2)
+
+            # Stamp the in-flight timing onto the slot so the graded-slowdown monitor can measure this
+            # job against its expected sampling time; the level resets so notices escalate per dispatch.
+            process_with_model.current_inference_started_at = time.time()
+            process_with_model.current_first_step_at = None
+            process_with_model.current_job_expected_sampling_seconds = expected_seconds
+            process_with_model.current_job_slowdown_level = 0
+
+            if degraded_dispatch:
+                self._job_tracker.clear_degraded_dispatch(next_job)
+                dispatch_detail["degraded_retry"] = True
+                logger.warning(
+                    f"  Degraded, isolated retry dispatched for job {str(next_job.id_)[:8]} "
+                    "after a prior resource failure.",
+                )
+
+            self._process_lifecycle.action_ledger.record(
+                LedgerEventType.INFERENCE_DISPATCHED,
+                process_id=process_with_model.process_id,
+                os_pid=process_with_model.os_pid,
+                launch_identifier=process_with_model.process_launch_identifier,
+                job_id=str(next_job.id_) if next_job.id_ is not None else None,
+                detail=dispatch_detail,
+            )
+
+            process_with_model.last_control_flag = HordeControlFlag.START_INFERENCE
+            process_with_model.last_job_referenced = next_job
+            process_with_model.loaded_horde_model_name = next_job.model
+            process_with_model.loaded_horde_model_baseline = horde_model_baseline
+
+        else:
+            logger.error(
+                f"Failed to start inference for job {next_job.id_} on process {process_with_model.process_id}",
+            )
+            await self._job_tracker.handle_job_fault(
+                faulted_job=next_job,
+                process_info=process_with_model,
+                process_timeout=bridge_data.process_timeout,
+            )
+
     async def start_inference(self) -> bool:
         """Start inference for the next job in jobs_pending_inference, if possible.
 
@@ -3719,66 +3900,13 @@ class InferenceScheduler:
                 self._pending_line_skip = None
                 return True
 
-        if process_with_model.safe_send_message(
-            HordeInferenceControlMessage(
-                control_flag=HordeControlFlag.START_INFERENCE,
-                horde_model_name=next_job.model,
-                sdk_api_job_info=next_job,
-                keep_model_resident_after=keep_model_resident_after,
-                aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
-                    self._runtime_config.bridge_data,
-                ),
-            ),
-        ):
-            await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)
-            horde_model_baseline = self._model_metadata.get_baseline(next_job.model)
-
-            dispatch_detail: dict[str, str | int | float | bool | None] = {
-                "model": next_job.model,
-                "steps": next_job.payload.ddim_steps,
-            }
-            expected_seconds = self._expected_sampling_seconds(next_job, horde_model_baseline)
-            if expected_seconds is not None:
-                dispatch_detail["expected_sampling_seconds"] = round(expected_seconds, 2)
-
-            # Stamp the in-flight timing onto the slot so the graded-slowdown monitor can measure this
-            # job against its expected sampling time; the level resets so notices escalate per dispatch.
-            process_with_model.current_inference_started_at = time.time()
-            process_with_model.current_first_step_at = None
-            process_with_model.current_job_expected_sampling_seconds = expected_seconds
-            process_with_model.current_job_slowdown_level = 0
-
-            if degraded_dispatch:
-                self._job_tracker.clear_degraded_dispatch(next_job)
-                dispatch_detail["degraded_retry"] = True
-                logger.warning(
-                    f"  Degraded, isolated retry dispatched for job {str(next_job.id_)[:8]} "
-                    "after a prior resource failure.",
-                )
-
-            self._process_lifecycle.action_ledger.record(
-                LedgerEventType.INFERENCE_DISPATCHED,
-                process_id=process_with_model.process_id,
-                os_pid=process_with_model.os_pid,
-                launch_identifier=process_with_model.process_launch_identifier,
-                job_id=str(next_job.id_) if next_job.id_ is not None else None,
-                detail=dispatch_detail,
-            )
-
-            process_with_model.last_control_flag = HordeControlFlag.START_INFERENCE
-            process_with_model.last_job_referenced = next_job
-            process_with_model.loaded_horde_model_name = next_job.model
-            process_with_model.loaded_horde_model_baseline = horde_model_baseline
-
-        else:
-            logger.error(
-                f"Failed to start inference for job {next_job.id_} on process {process_with_model.process_id}",
-            )
-            await self._job_tracker.handle_job_fault(
-                faulted_job=next_job,
-                process_info=process_with_model,
-                process_timeout=bridge_data.process_timeout,
-            )
+        await self._dispatch_inference_message(
+            next_job,
+            process_with_model,
+            keep_model_resident_after=keep_model_resident_after,
+            dispatched_device_index=dispatched_device_index,
+            degraded_dispatch=degraded_dispatch,
+        )
 
         self._pending_line_skip = None
 
@@ -4142,6 +4270,31 @@ class InferenceScheduler:
 
         return False
 
+    def _is_heavy_model_and_workflow(
+        self,
+        job: ImageGenerateJobPopResponse,
+        stable_diffusion_reference: dict[str, ImageGenerationModelRecord],
+    ) -> bool:
+        """Return whether the job's model and workflow are heavy enough to serialise behind in-flight work.
+
+        True for an SDXL model running a known-slow workflow, or any model in ``VRAM_HEAVY_MODELS``. Used to
+        hold a heavy batch head back while a thread is already busy, so stacked weight loads and activation
+        peaks do not thrash a sampler into a watchdog teardown.
+        """
+        model = job.model
+        if model is None:
+            return False
+        next_model_baseline = stable_diffusion_reference.get(model)
+        next_workflow = job.payload.workflow
+        heavy = (
+            next_model_baseline is not None
+            and next_model_baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+            and next_workflow in KNOWN_SLOW_WORKFLOWS
+        )
+        if model in VRAM_HEAVY_MODELS:
+            heavy = True
+        return heavy
+
     async def run_scheduling_cycle(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
         """Run a single scheduling cycle: preload, detect heavy model/batch, start inference, unload.
 
@@ -4155,21 +4308,9 @@ class InferenceScheduler:
         if not self.preload_models():
             next_job_and_process = await self.get_next_job_and_process(information_only=True)
 
-            next_job_heavy_model_and_workflow = False
-            if next_job_and_process is not None:
-                next_model = next_job_and_process.next_job.model
-                if next_model is not None:
-                    next_model_baseline = stable_diffusion_reference.get(next_model)
-                    next_workflow = next_job_and_process.next_job.payload.workflow
-
-                    next_job_heavy_model_and_workflow = (
-                        next_model_baseline is not None
-                        and next_model_baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
-                        and next_workflow in KNOWN_SLOW_WORKFLOWS
-                    )
-
-                    if next_model in VRAM_HEAVY_MODELS:
-                        next_job_heavy_model_and_workflow = True
+            next_job_heavy_model_and_workflow = next_job_and_process is not None and self._is_heavy_model_and_workflow(
+                next_job_and_process.next_job, stable_diffusion_reference
+            )
 
             keep_single_inference, single_inf_reason = self._process_map.keep_single_inference(
                 stable_diffusion_model_reference=stable_diffusion_reference,
