@@ -425,6 +425,11 @@ class InferenceScheduler:
         # A single-GPU worker uses exactly one entry under the None key, identical to the prior scalar fields.
         # See _WholeCardResidency for the per-card fields and _residency_state for the accessor.
         self._whole_card_residencies: dict[int | None, _WholeCardResidency] = {}
+        # Device indices whose idle inference contexts the RAM-pressure footprint reduction shed below their
+        # planned per-card count. The reduction keeps one context per driven card so no GPU is stranded, and
+        # records each card it shrank here so the recovery path can grow it back once the host clears the
+        # danger floor. Multi-GPU only; the worker-wide (single-GPU) reduction does not populate it.
+        self._ram_pressure_shed_cards: set[int] = set()
         # When a heavy head was last admitted best-effort off the whole-card path (the over-budget exclusive
         # branch, for a model that streams even alone). Its load equally holds the queue, so this bounds a
         # wedge grace that the whole-card establishment grace does not cover. 0.0 when none is loading.
@@ -1800,13 +1805,112 @@ class InferenceScheduler:
         danger floor, the structural remedy is fewer resident contexts, not another load on top. Targets the
         count needed for in-flight work (at least one), shedding at least one idle sibling; only idle
         processes are stopped (``scale_inference_processes`` never kills a busy slot), so live work is spared.
+
+        On a multi-GPU host the reduction is applied per card so it never empties a card of every context: a
+        worker-wide shrink would let the worldwide victim search stop every idle process regardless of card,
+        leaving a card with zero contexts (and so an idle GPU) until restored. The single-GPU / worker-wide
+        path is unchanged.
         """
+        if self._multi_gpu_routing_active:
+            self._reduce_processes_per_card_under_ram_pressure()
+            return
         current = self._process_map.num_loaded_inference_processes()
         if current <= 1:
             return
         needed = max(1, len(self._job_tracker.jobs_in_progress))
         target = max(1, min(current - 1, needed))
         self._process_lifecycle.scale_inference_processes(target, device_index=None)
+
+    def _reduce_processes_per_card_under_ram_pressure(self) -> None:
+        """Shed idle contexts on each driven card while leaving every card at least one resident context.
+
+        Each card is reduced toward the count its own in-flight work needs (at least one), so no GPU is
+        stranded by the worker-wide victim search. Every card actually shrunk is recorded in
+        :attr:`_ram_pressure_shed_cards` so :meth:`_restore_processes_after_ram_pressure` grows it back once
+        the host clears the danger floor.
+        """
+        for device_index in sorted(self._card_runtimes):
+            current = self._process_map.num_loaded_inference_processes(device_index=device_index)
+            if current <= 1:
+                continue
+            needed = max(1, self._card_inference_load(device_index))
+            target = max(1, min(current - 1, needed))
+            after = self._process_lifecycle.scale_inference_processes(target, device_index=device_index)
+            if after < current:
+                self._ram_pressure_shed_cards.add(device_index)
+
+    def _estimated_resident_context_ram_mb(self) -> float:
+        """Conservative system-RAM cost (MB) of one more resident inference context.
+
+        Taken as the largest live inference process's measured resident RAM, which captures the model
+        working set the allocator retains and will not free without a respawn. Falls back to the configured
+        RAM reserve when no process has reported usage yet (only before any model has loaded; a card is only
+        ever restored after a reduction that itself implies loaded, RAM-holding processes, so the measured
+        value is the normal case).
+        """
+        live_context_ram_mb = [
+            process_info.ram_usage_bytes / (1024 * 1024)
+            for process_info in self._process_map.values()
+            if process_info.process_type == HordeProcessType.INFERENCE and process_info.ram_usage_bytes > 0
+        ]
+        if live_context_ram_mb:
+            return max(live_context_ram_mb)
+        return self._ram_budget.reserve_mb
+
+    def _ram_headroom_for_additional_context_mb(self) -> float:
+        """Measured system-RAM headroom (MB) above the reserve and committed reserves for one more context."""
+        available_ram_mb = self._measured_available_ram_mb()
+        committed_ram_mb = self._reserve_ledger.total_ram_mb()
+        return available_ram_mb - committed_ram_mb - self._ram_budget.reserve_mb
+
+    def _restore_processes_after_ram_pressure(self) -> None:
+        """Grow cards shed by the RAM-pressure reduction back toward plan as system RAM proves it can hold them.
+
+        The reduction sheds idle contexts to walk the host back above its absolute RAM floor; nothing else
+        re-establishes them, so without this a card that lost its contexts to a RAM spike sits idle for the
+        rest of the run while the surviving card serializes the work. Mirrors the whole-card residency restore
+        and is scoped to the pressure episode: only cards the reduction recorded are grown back, only once RAM
+        is no longer under pressure and the self-throttle pop-pause has lapsed, and never a card a whole-card
+        residency is deliberately holding down (that path runs its own restore).
+
+        Growth is RAM-gated and incremental: one context per card per cycle, and only while measured RAM
+        headroom can hold another resident working set (estimated from the largest live context). This keeps
+        the restore from fighting the budget on a host whose full process plan over-commits the shared RAM
+        pool, where growing straight back to plan would re-trip the reduction and oscillate. A card stays
+        pending until it reaches its plan or RAM proves it cannot sustain more.
+        """
+        if not self._ram_pressure_shed_cards:
+            return
+        if self._ram_pressure_verdict().under_pressure:
+            return
+        if self._state.self_throttle_paused and time.time() < self._state.self_throttle_paused_until:
+            return
+
+        cards_held_by_residency = {index for index, _residency in self._held_residencies()}
+        per_context_ram_mb = self._estimated_resident_context_ram_mb()
+        cards_to_stop_tracking: set[int] = set()
+        for device_index in sorted(self._ram_pressure_shed_cards):
+            card = self._card_runtimes.get(device_index)
+            if card is None or device_index in cards_held_by_residency:
+                # A residency-held (or unknown) card is restored by its own path; stop tracking it here.
+                cards_to_stop_tracking.add(device_index)
+                continue
+            current = self._process_map.num_loaded_inference_processes(device_index=device_index)
+            if current >= card.target_process_count:
+                cards_to_stop_tracking.add(device_index)
+                continue
+            if self._ram_headroom_for_additional_context_mb() < per_context_ram_mb:
+                # No RAM to sustain another resident context yet; keep the card pending and retry next cycle.
+                continue
+            after = self._process_lifecycle.scale_inference_processes(current + 1, device_index=device_index)
+            logger.opt(ansi=True).info(
+                f"<fg #7b7d7d>System RAM has headroom; restoring an inference context on device {device_index} "
+                f"({current} -> {after} of {card.target_process_count}) so the card resumes serving.</>",
+            )
+            if after >= card.target_process_count:
+                cards_to_stop_tracking.add(device_index)
+
+        self._ram_pressure_shed_cards -= cards_to_stop_tracking
 
     def _committed_post_processing_reserve_mb(self, *, device_index: int | None = None) -> float:
         """Sum the imminent post-processing-phase VRAM peaks of jobs currently in post-processing (MB).
@@ -4232,6 +4336,7 @@ class InferenceScheduler:
         bridge_data = self._runtime_config.bridge_data
 
         self._refresh_model_demand()
+        self._restore_processes_after_ram_pressure()
 
         if not self.preload_models():
             next_job_and_process = await self.get_next_job_and_process(information_only=True)

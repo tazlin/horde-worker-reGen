@@ -207,5 +207,7 @@ def test_main_stops_host_watcher_so_its_leash_cannot_kill_the_process(monkeypatc
     while time.time() < deadline and _host_watcher_alive():
         time.sleep(0.05)
 
-    assert not _host_watcher_alive(), "the host-liveness watcher outlived the launcher; it could later kill the process"
+    assert not _host_watcher_alive(), (
+        "the host-liveness watcher outlived the launcher; it could later kill the process"
+    )
     assert not wound_down.is_set(), "the launcher's hard-exit leash fired during a deliberate unwind"

@@ -348,6 +348,35 @@ so the budget never wedges a worker that has not yet reported memory. Set
 `enable_vram_budget: false` to restore the prior availability-only behavior (not
 recommended on a shared or consumer GPU).
 
+Separately from the *marginal* fit check above, an **absolute system-RAM danger
+floor** guards against the kernel OOM-killer. When measured available RAM falls
+below the floor the worker pauses job pops (the self-throttle, auto-resumed on
+recovery), evicts idle resident models, and **reduces the resident
+inference-process count** so each idle context's pinned weights return to the OS.
+On a multi-GPU host that reduction is applied **per card**, leaving at least one
+context on every driven card: a worker-wide collapse would let the victim search
+empty a whole card of contexts and idle that GPU until something restored it. Each
+card the reduction shrank is then grown back to its planned per-card process count
+once RAM clears the floor and the pop-pause has lapsed (a card a whole-card
+residency is deliberately holding down is left to that residency's own restore).
+
+The reductions above are the runtime backstop; the **plan-time process count** is
+sized to the hardware up front so the worker rarely has to reach for them. The
+resolved per-card plan is `queue_size + ceiling` processes, which is sound per card
+but, summed across a multi-GPU host, double-counts the single shared system-RAM
+pool (a second card doubles VRAM, not RAM) and ignores the post-processing VRAM
+peak. So when the worker drives more than one card,
+[`cap_card_process_counts`][horde_worker_regen.process_management.process_manager.cap_card_process_counts]
+lowers each card's spawned-process count so the card keeps the upscale peak's VRAM
+free on top of its resident contexts, and the worker-wide resident-context count
+fits system RAM, never below one context per card and only ever reducing the
+resolved plan. It uses conservative footprint estimates (no model reference or
+measurement exists at startup); the measured runtime budget then refines the live
+count downward under real pressure. A single-GPU host never double-counts the RAM
+pool, so the cap is multi-GPU only and the single-card plan stays byte-identical
+(its per-card post-processing headroom is the runtime post-processing reclaim's
+job, not the plan's).
+
 On a multi-GPU worker the whole admission decision is scoped to the card a preload
 would land on (the slot chosen for it). A device-pinned child reports only its own
 card's VRAM, so [`get_free_vram_mb`][horde_worker_regen.process_management.lifecycle.process_map.ProcessMap.get_free_vram_mb]
