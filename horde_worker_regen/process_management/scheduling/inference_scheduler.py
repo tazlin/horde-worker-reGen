@@ -243,6 +243,19 @@ Two SDXL jobs stacking their weight loads and activation peaks is the over-subsc
 a sampler into a watchdog teardown, so the running job must be most of the way done first."""
 
 
+def _config_number(value: object) -> float | None:
+    """Return ``value`` as a float when it is a real (non-bool) int/float, else None.
+
+    Config attributes and startup measurements may arrive partially mocked (a ``Mock``, ``None``, or a
+    ``bool``, which is an ``int`` subclass) in tests and during a reload. The budget and overhead gates
+    treat any such non-numeric reading as "unset" and fall back to their safe default rather than acting
+    on it. Callers apply their own threshold (``>= 0``, ``> 0``, ...) to the returned number.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 @dataclass
 class _WholeCardResidency:
     """Mutable whole-card exclusive-residency state for one card (the worker, on a single-GPU host).
@@ -603,20 +616,14 @@ class InferenceScheduler:
         """
         bridge_data = self._runtime_config.bridge_data
         enabled = bridge_data.enable_vram_budget
-        vram_reserve = bridge_data.vram_reserve_mb
-        ram_reserve = bridge_data.ram_reserve_mb
-        numeric_reserves = (
-            isinstance(vram_reserve, (int, float))
-            and not isinstance(vram_reserve, bool)
-            and isinstance(ram_reserve, (int, float))
-            and not isinstance(ram_reserve, bool)
-        )
-        if not isinstance(enabled, bool) or not numeric_reserves:
+        vram_reserve = _config_number(bridge_data.vram_reserve_mb)
+        ram_reserve = _config_number(bridge_data.ram_reserve_mb)
+        if not isinstance(enabled, bool) or vram_reserve is None or ram_reserve is None:
             return False
         if not enabled:
             return False
-        self._vram_budget.set_reserve_mb(float(vram_reserve))
-        self._ram_budget.set_reserve_mb(float(ram_reserve))
+        self._vram_budget.set_reserve_mb(vram_reserve)
+        self._ram_budget.set_reserve_mb(ram_reserve)
         return True
 
     def _is_model_locally_unservable(self, model: str | None, *, device_index: int | None = None) -> bool:
@@ -651,10 +658,25 @@ class InferenceScheduler:
             f"wedging the queue. {self._process_map.residency_snapshot()}</>",
         )
 
+    def _mark_overbudget_admit(self, job: ImageGenerateJobPopResponse) -> None:
+        """Tag ``job`` as an over-budget best-effort admit, opening the heavy-head load grace on first admit.
+
+        Records the load-grace start the first time the job is admitted (so its multi-gigabyte load is not
+        mistaken for a structural wedge; see :meth:`heavy_head_load_grace_active`). When over-budget
+        exclusive mode is configured, also marks it exclusive so the scheduler suppresses concurrent
+        pre-staging and dispatch for its duration, leaving the device un-contended while it completes.
+        """
+        if not self._job_tracker.is_admitted_over_budget(job):
+            self._heavy_head_admitted_at = time.time()
+        self._job_tracker.mark_admitted_over_budget(job)
+        if self._runtime_config.bridge_data.overbudget_exclusive_mode:
+            self._job_tracker.mark_admitted_exclusive(job)
+
     def set_measured_per_process_overhead_mb(self, overhead_mb: int | float) -> None:
         """Record the startup-measured per-process VRAM overhead (MB) for the streaming forecast."""
-        if isinstance(overhead_mb, (int, float)) and not isinstance(overhead_mb, bool) and overhead_mb >= 0:
-            self._measured_per_process_overhead_mb = float(overhead_mb)
+        coerced = _config_number(overhead_mb)
+        if coerced is not None and coerced >= 0:
+            self._measured_per_process_overhead_mb = coerced
 
     def set_measured_marginal_overhead_mb(self, marginal_mb: int | float) -> None:
         """Record the startup-measured *marginal* per-additional-context VRAM cost (MB) from the probe.
@@ -663,8 +685,9 @@ class InferenceScheduler:
         startup-window over-count without waiting for siblings to reach idle. 0 (or unmeasurable) leaves the
         scheduler on its idle-residency fallback.
         """
-        if isinstance(marginal_mb, (int, float)) and not isinstance(marginal_mb, bool) and marginal_mb >= 0:
-            self._measured_marginal_overhead_mb = float(marginal_mb)
+        coerced = _config_number(marginal_mb)
+        if coerced is not None and coerced >= 0:
+            self._measured_marginal_overhead_mb = coerced
 
     def _per_process_overhead_mb(self) -> float:
         """Return the per-process VRAM overhead (MB) to assume: configured override, else measured, else 0.
@@ -674,9 +697,9 @@ class InferenceScheduler:
         This is the *first/sole* context cost (it includes the one-time CUDA runtime allocation), used to size
         ``free_if_alone``; the per-additional-context cost is :meth:`_marginal_process_overhead_mb`.
         """
-        configured = self._runtime_config.bridge_data.vram_per_process_overhead_mb
-        if isinstance(configured, (int, float)) and not isinstance(configured, bool) and configured > 0:
-            return float(configured)
+        configured = _config_number(self._runtime_config.bridge_data.vram_per_process_overhead_mb)
+        if configured is not None and configured > 0:
+            return configured
         return self._measured_per_process_overhead_mb
 
     def _maybe_capture_idle_context_residency(self) -> None:
@@ -1781,12 +1804,10 @@ class InferenceScheduler:
         the module default so the pressure check never crashes the scheduling cycle on a bad attribute.
         """
         bridge_data = self._runtime_config.bridge_data
-        pause = bridge_data.ram_pressure_pause_percent
-        min_free = bridge_data.ram_pressure_min_free_mb
-        pause_ok = isinstance(pause, (int, float)) and not isinstance(pause, bool)
-        min_free_ok = isinstance(min_free, (int, float)) and not isinstance(min_free, bool)
-        pause_pct = float(pause) if pause_ok else 90.0
-        min_free_mb = float(min_free) if min_free_ok else 1024.0
+        pause = _config_number(bridge_data.ram_pressure_pause_percent)
+        min_free = _config_number(bridge_data.ram_pressure_min_free_mb)
+        pause_pct = pause if pause is not None else 90.0
+        min_free_mb = min_free if min_free is not None else 1024.0
         return pause_pct, min_free_mb
 
     def _ram_pressure_verdict(self) -> RamPressureVerdict:
@@ -2242,6 +2263,100 @@ class InferenceScheduler:
 
         return False
 
+    def _preload_blocked_by_ram_pressure(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Return whether the host's absolute RAM danger floor forces this preload to defer.
+
+        When system RAM is below its danger floor, governs the pressure (sheds idle footprint, pauses
+        pops) and reports True so the caller defers rather than routing a new model's weights through a
+        host already on the edge. Clears the one-shot notice and reports False when RAM is healthy.
+        """
+        ram_pressure = self._ram_pressure_verdict()
+        if not ram_pressure.under_pressure:
+            self._ram_pressure_notified = False
+            return False
+        self._govern_ram_pressure(ram_pressure)
+        if not self._ram_pressure_notified:
+            logger.opt(ansi=True).warning(
+                f"<fg #ff8c69>RAM danger floor reached: deferring preload of {job.model} "
+                f"({ram_pressure.reason()}). Shedding idle footprint and pausing pops.</>",
+            )
+            self._ram_pressure_notified = True
+        return True
+
+    def _send_preload(self, job: ImageGenerateJobPopResponse, available_process: HordeProcessInfo) -> bool:
+        """Send the preload command for ``job``'s model to ``available_process`` and record the load.
+
+        Resets the preload-delay and head-starvation trackers, sends the PRELOAD_MODEL message inside a
+        telemetry span, and on a successful send records the churn/ledger entry and advances the model map
+        and process map into the LOADING state. Returns True (a preload was issued this cycle).
+        """
+        if job.model is None:
+            raise ValueError(f"job.model is None ({job})")
+
+        self._preload_delay_notified = False
+        self._clear_head_starvation_timer()
+        logger.debug(f"Preloading model {job.model} on process {available_process.process_id}")
+        logger.debug(f"Available inference processes: {self._process_map}")
+        only_active_models = {
+            model_name: model_info
+            for model_name, model_info in self._horde_model_map.root.items()
+            if model_info.horde_model_load_state.is_active()
+        }
+        logger.debug(f"Horde model map (active): {only_active_models}")
+
+        will_load_loras = job.payload.loras is not None and len(job.payload.loras) > 0
+        seamless_tiling_enabled = job.payload.tiling is not None and job.payload.tiling
+
+        # A swap is a preload that displaces a *different* model already resident on this process;
+        # that prior model's load work is thrown away. A fresh slot (None) or re-preload of the same
+        # model is not churn. Captured before the send so the process's prior model is still readable.
+        prior_model = available_process.loaded_horde_model_name
+        is_model_swap = prior_model is not None and prior_model != job.model
+
+        with span_preload_model(model_name=job.model, process_id=available_process.process_id):
+            preload_sent = available_process.safe_send_message(
+                HordePreloadInferenceModelMessage(
+                    control_flag=HordeControlFlag.PRELOAD_MODEL,
+                    horde_model_name=job.model,
+                    will_load_loras=will_load_loras,
+                    seamless_tiling_enabled=seamless_tiling_enabled,
+                    sdk_api_job_info=job,
+                    aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
+                        self._runtime_config.bridge_data,
+                    ),
+                ),
+            )
+
+        if preload_sent:
+            available_process.last_control_flag = HordeControlFlag.PRELOAD_MODEL
+            if is_model_swap:
+                self._record_churn("model_swap")
+            self._process_lifecycle.action_ledger.record(
+                LedgerEventType.PRELOAD_REQUESTED,
+                process_id=available_process.process_id,
+                os_pid=available_process.os_pid,
+                launch_identifier=available_process.process_launch_identifier,
+                job_id=str(job.id_) if job.id_ is not None else None,
+                detail={"model": job.model},
+            )
+
+            self._horde_model_map.update_entry(
+                horde_model_name=job.model,
+                load_state=ModelLoadState.LOADING,
+                process_id=available_process.process_id,
+            )
+
+            model_baseline = self._model_metadata.get_baseline(job.model)
+
+            self._process_map.on_model_load_state_change(
+                process_id=available_process.process_id,
+                horde_model_name=job.model,
+                horde_model_baseline=model_baseline,
+                last_job_referenced=job,
+            )
+
+        return True
+
     def preload_models(self) -> bool:
         """Preload models that are likely to be used soon.
 
@@ -2310,18 +2425,8 @@ class InferenceScheduler:
             # can pass on a job's small estimate while the whole host is on the edge (resident weights + the
             # safety process + other apps). Instead of loading, shed idle footprint and pause pops until RAM
             # recovers. Gated on the budget being active (the same switch the rest of the memory machinery uses).
-            if self._budget_active():
-                ram_pressure = self._ram_pressure_verdict()
-                if ram_pressure.under_pressure:
-                    self._govern_ram_pressure(ram_pressure)
-                    if not self._ram_pressure_notified:
-                        logger.opt(ansi=True).warning(
-                            f"<fg #ff8c69>RAM danger floor reached: deferring preload of {job.model} "
-                            f"({ram_pressure.reason()}). Shedding idle footprint and pausing pops.</>",
-                        )
-                        self._ram_pressure_notified = True
-                    return False
-                self._ram_pressure_notified = False
+            if self._budget_active() and self._preload_blocked_by_ram_pressure(job):
+                return False
 
             # An exclusively-admitted over-budget job has the whole device; do not stage another model's
             # weights concurrently (a second resident load is exactly what spills the exclusive job's
@@ -2580,13 +2685,7 @@ class InferenceScheduler:
                         self._log_whole_card_terminal_admit(job)
                     else:
                         self._log_head_starvation_force_admit(job)
-                    if not self._job_tracker.is_admitted_over_budget(job):
-                        # First admit of this heavy head: open the bounded load grace so the supervisor does
-                        # not read its multi-gigabyte load as a structural wedge (see heavy_head_load_grace_active).
-                        self._heavy_head_admitted_at = time.time()
-                    self._job_tracker.mark_admitted_over_budget(job)
-                    if self._runtime_config.bridge_data.overbudget_exclusive_mode:
-                        self._job_tracker.mark_admitted_exclusive(job)
+                    self._mark_overbudget_admit(job)
                 else:
                     vram_verdict = self._vram_budget.check_job(
                         job,
@@ -2700,18 +2799,7 @@ class InferenceScheduler:
                             return False
 
                         self.unload_models(under_pressure=True, for_head_of_queue=True)
-                        if not self._job_tracker.is_admitted_over_budget(job):
-                            # First admit of this heavy head: open the bounded load grace (see
-                            # heavy_head_load_grace_active) so its load is not mistaken for a structural wedge.
-                            self._heavy_head_admitted_at = time.time()
-                        self._job_tracker.mark_admitted_over_budget(job)
-                        # Exclusive-first: contention arises when a *second* process loads another model while
-                        # the over-budget job samples, pushing free VRAM to ~0 and spilling its weights to
-                        # system RAM. Flag the job exclusive so the scheduler suppresses concurrent pre-staging
-                        # and dispatch for its duration, leaving the device un-contended so it can complete
-                        # (slowly, under the over-budget step grace) instead of being killed as a hang.
-                        if self._runtime_config.bridge_data.overbudget_exclusive_mode:
-                            self._job_tracker.mark_admitted_exclusive(job)
+                        self._mark_overbudget_admit(job)
                         self._log_overbudget_admit(job)
                     else:
                         self._vram_budget_defer_notified = False
@@ -2752,69 +2840,7 @@ class InferenceScheduler:
                         else:
                             self._ram_budget_defer_notified = False
 
-            self._preload_delay_notified = False
-            self._clear_head_starvation_timer()
-            logger.debug(f"Preloading model {job.model} on process {available_process.process_id}")
-            logger.debug(f"Available inference processes: {self._process_map}")
-            only_active_models = {
-                model_name: model_info
-                for model_name, model_info in self._horde_model_map.root.items()
-                if model_info.horde_model_load_state.is_active()
-            }
-            logger.debug(f"Horde model map (active): {only_active_models}")
-
-            will_load_loras = job.payload.loras is not None and len(job.payload.loras) > 0
-            seamless_tiling_enabled = job.payload.tiling is not None and job.payload.tiling
-
-            # A swap is a preload that displaces a *different* model already resident on this process;
-            # that prior model's load work is thrown away. A fresh slot (None) or re-preload of the same
-            # model is not churn. Captured before the send so the process's prior model is still readable.
-            prior_model = available_process.loaded_horde_model_name
-            is_model_swap = prior_model is not None and prior_model != job.model
-
-            with span_preload_model(model_name=job.model, process_id=available_process.process_id):
-                preload_sent = available_process.safe_send_message(
-                    HordePreloadInferenceModelMessage(
-                        control_flag=HordeControlFlag.PRELOAD_MODEL,
-                        horde_model_name=job.model,
-                        will_load_loras=will_load_loras,
-                        seamless_tiling_enabled=seamless_tiling_enabled,
-                        sdk_api_job_info=job,
-                        aux_download_deadline_seconds=self._process_lifecycle.aux_download_deadline_for_dispatch(
-                            self._runtime_config.bridge_data,
-                        ),
-                    ),
-                )
-
-            if preload_sent:
-                available_process.last_control_flag = HordeControlFlag.PRELOAD_MODEL
-                if is_model_swap:
-                    self._record_churn("model_swap")
-                self._process_lifecycle.action_ledger.record(
-                    LedgerEventType.PRELOAD_REQUESTED,
-                    process_id=available_process.process_id,
-                    os_pid=available_process.os_pid,
-                    launch_identifier=available_process.process_launch_identifier,
-                    job_id=str(job.id_) if job.id_ is not None else None,
-                    detail={"model": job.model},
-                )
-
-                self._horde_model_map.update_entry(
-                    horde_model_name=job.model,
-                    load_state=ModelLoadState.LOADING,
-                    process_id=available_process.process_id,
-                )
-
-                model_baseline = self._model_metadata.get_baseline(job.model)
-
-                self._process_map.on_model_load_state_change(
-                    process_id=available_process.process_id,
-                    horde_model_name=job.model,
-                    horde_model_baseline=model_baseline,
-                    last_job_referenced=job,
-                )
-
-            return True
+            return self._send_preload(job, available_process)
 
         return False
 
@@ -3527,6 +3553,68 @@ class InferenceScheduler:
         self._job_tracker.note_post_processing_overcommit_fault()
         return False
 
+    def _log_job_dispatch_details(self, next_job: ImageGenerateJobPopResponse) -> None:
+        """Log the model, conditioning extras, and the resolution/steps/sampler line for a dispatching job.
+
+        Side-effect-only diagnostics emitted just before an inference dispatch; it reads the job payload
+        and writes log lines, mutating no scheduler state.
+        """
+        color_format_string = "<fg #f0beff>{message}</>"
+
+        logger.opt(ansi=True).info(
+            color_format_string.format(
+                message=f"  Model: {next_job.model}",
+            ),
+        )
+        if next_job.source_image is not None:
+            logger.opt(ansi=True).info(
+                color_format_string.format(
+                    message="  Using source image",
+                ),
+            )
+
+        extra_info = ""
+        if next_job.payload.control_type is not None:
+            extra_info += f"Control type: {next_job.payload.control_type}"
+        if next_job.payload.loras:
+            if extra_info:
+                extra_info += ", "
+            extra_info += f"{len(next_job.payload.loras)} LoRAs"
+        if next_job.payload.tis:
+            if extra_info:
+                extra_info += ", "
+            extra_info += f"{len(next_job.payload.tis)} TIs"
+        if next_job.payload.post_processing is not None and len(next_job.payload.post_processing) > 0:
+            if extra_info:
+                extra_info += ", "
+            extra_info += f"Post processing: {next_job.payload.post_processing}"
+        if next_job.payload.hires_fix:
+            if extra_info:
+                extra_info += ", "
+            extra_info += "HiRes fix"
+
+        if next_job.payload.workflow is not None:
+            if extra_info:
+                extra_info += ", "
+            extra_info += f"Workflow: {next_job.payload.workflow}"
+
+        if extra_info:
+            logger.opt(ansi=True).info(
+                color_format_string.format(
+                    message=f"  {extra_info}",
+                ),
+            )
+
+        logger.opt(ansi=True).info(
+            color_format_string.format(
+                message=f"  {next_job.payload.width}x{next_job.payload.height} for "
+                f"{next_job.payload.ddim_steps} steps "
+                f"with sampler {next_job.payload.sampler_name} for a batch of {next_job.payload.n_iter}",
+            ),
+        )
+
+        logger.debug(f"All Batch IDs: {next_job.ids}")
+
     async def start_inference(self) -> bool:
         """Start inference for the next job in jobs_pending_inference, if possible.
 
@@ -3600,59 +3688,7 @@ class InferenceScheduler:
         if next_job.model is None:
             raise ValueError(f"next_job.model is None ({next_job})")
 
-        logger.opt(ansi=True).info(
-            color_format_string.format(
-                message=f"  Model: {next_job.model}",
-            ),
-        )
-        if next_job.source_image is not None:
-            logger.opt(ansi=True).info(
-                color_format_string.format(
-                    message="  Using source image",
-                ),
-            )
-
-        extra_info = ""
-        if next_job.payload.control_type is not None:
-            extra_info += f"Control type: {next_job.payload.control_type}"
-        if next_job.payload.loras:
-            if extra_info:
-                extra_info += ", "
-            extra_info += f"{len(next_job.payload.loras)} LoRAs"
-        if next_job.payload.tis:
-            if extra_info:
-                extra_info += ", "
-            extra_info += f"{len(next_job.payload.tis)} TIs"
-        if next_job.payload.post_processing is not None and len(next_job.payload.post_processing) > 0:
-            if extra_info:
-                extra_info += ", "
-            extra_info += f"Post processing: {next_job.payload.post_processing}"
-        if next_job.payload.hires_fix:
-            if extra_info:
-                extra_info += ", "
-            extra_info += "HiRes fix"
-
-        if next_job.payload.workflow is not None:
-            if extra_info:
-                extra_info += ", "
-            extra_info += f"Workflow: {next_job.payload.workflow}"
-
-        if extra_info:
-            logger.opt(ansi=True).info(
-                color_format_string.format(
-                    message=f"  {extra_info}",
-                ),
-            )
-
-        logger.opt(ansi=True).info(
-            color_format_string.format(
-                message=f"  {next_job.payload.width}x{next_job.payload.height} for "
-                f"{next_job.payload.ddim_steps} steps "
-                f"with sampler {next_job.payload.sampler_name} for a batch of {next_job.payload.n_iter}",
-            ),
-        )
-
-        logger.debug(f"All Batch IDs: {next_job.ids}")
+        self._log_job_dispatch_details(next_job)
 
         process_with_model.batch_amount = next_job.payload.n_iter
         # Record the card this job runs on (None on a single-GPU host) so its over-budget fault streak is
