@@ -259,6 +259,38 @@ def _reconcile_backend(root: Path, token: str) -> str:
     return reconciled
 
 
+def _verify_installed_torch_arch(uv: str, root: Path, token: str) -> None:
+    """Compare the freshly-installed torch wheel's kernels against the live GPU, warning on a true mismatch.
+
+    Closes the loop on the *prediction* the build selection makes: the build was chosen on the belief it
+    has kernels for this GPU, so if the installed wheel's own arch list proves otherwise, the table in
+    :mod:`worker_bootstrap.detect` is out of date for this card. That is a worker bug, not something the
+    user can fix by reinstalling the same build, so it is surfaced here as a maintainer-actionable report
+    (with a user stopgap) rather than left to the worker's later generic "unsupported GPU" runtime fault.
+
+    Best-effort and never fatal: the install already succeeded on disk. A genuinely too-old driver is a
+    different case and is not flagged here -- the wheel would still list the card's architecture, so this
+    fires only on a real kernel-image gap.
+    """
+    arch_list = runner.query_torch_arch_list(uv, root=root)
+    if not arch_list or not any(arch.startswith("sm_") for arch in arch_list):
+        return  # torch absent, or a CPU/ROCm build whose arch tags do not apply
+    capability = detect.live_compute_capability()
+    if capability == (0, 0) or detect.gpu_arch_supported(arch_list, capability):
+        return
+    cap_tag = f"sm_{capability[0]}{capability[1]}"
+    print(
+        f"WARNING: the torch build just installed ({token}) has no CUDA kernels for this GPU "
+        f"(compute capability {capability[0]}.{capability[1]}, {cap_tag}); the wheel was built for "
+        f"{' '.join(arch_list)}. This build was selected believing it would run this GPU, so this is "
+        f"most likely a worker bug: the build-selection table in worker_bootstrap.detect is out of date "
+        f"for {cap_tag}. Please report it (quoting this message) at "
+        f"https://github.com/Haidra-Org/horde-worker-reGen/issues . As a stopgap, forcing a newer build "
+        f"with HORDE_WORKER_BACKEND (for example cu132) may work if one carries kernels for your card.",
+        file=sys.stderr,
+    )
+
+
 def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -> int:
     """Disclose, gain consent, ensure git, seed config, then run the sync (with preview) or ROCm path."""
     token = backend_mod.resolve_backend(
@@ -315,6 +347,9 @@ def _sync(uv: str, root: Path, *, cli_flag: str | None, options: _SyncOptions) -
     print(f"Installing dependencies for GPU backend: {token} (features: {features_note})")
     rc = _run_sync(uv, root, token, feature_extras, options)
     if rc == 0:
+        # Verify the prediction against ground truth now that torch is on disk: an arch mismatch here
+        # means the build map is stale, which the user cannot fix by reinstalling the same build.
+        _verify_installed_torch_arch(uv, root, token)
         _maybe_prune(uv, root, options)
         _write_sync_stamp(root)
     return rc

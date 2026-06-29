@@ -246,3 +246,32 @@ def uv_run(uv: str, command: list[str], *, root: Path | None = None, no_sync: bo
         args.append("--no-sync")
     args += command
     return run_uv(uv, args, root=root)
+
+
+def query_torch_arch_list(uv: str, *, root: Path | None = None) -> list[str] | None:
+    """Return the installed torch wheel's compiled CUDA arch list, or None when it can't be determined.
+
+    Reads ``torch.cuda.get_arch_list()`` in the venv, which is a static property of the wheel (the
+    architectures it was built for) and needs no GPU or CUDA context, so this is cheap and works headless.
+    Used by the post-sync self-check to compare what the just-installed wheel can run against the live
+    GPU. Best-effort: torch absent, a CPU/ROCm build, a timeout, or any snippet error returns None so the
+    check simply skips rather than ever turning a successful install into a reported failure.
+    """
+    root = root or paths.install_root()
+    snippet = "import torch; print(','.join(torch.cuda.get_arch_list()))"
+    try:
+        result = subprocess.run(
+            [uv, "run", "--no-sync", "python", "-c", snippet],
+            cwd=str(root),
+            env=build_child_env(root),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    tokens = [token.strip() for token in result.stdout.strip().split(",") if token.strip()]
+    return tokens or None

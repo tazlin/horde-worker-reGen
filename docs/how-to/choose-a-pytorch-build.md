@@ -74,6 +74,14 @@ existed) therefore self-heals to `cu130` on its next update, and even a hand-for
 `HORDE_WORKER_BACKEND=cu126` on a Blackwell card is corrected upward (an unrunnable build helps nobody)
 with a note explaining the swap. The corrected build is re-recorded so the fix sticks.
 
+Build selection is still a *prediction* (the installer must choose a wheel before torch exists, so it
+maps your GPU's compute capability onto a build from a table). As a backstop, the sync re-checks that
+prediction against reality once torch is on disk: it reads the installed wheel's actual kernel list and,
+if it still cannot run your GPU, prints a warning asking you to report it. That message means the
+selection table is out of date for your card (a worker bug), not that your hardware is unsupported, so a
+plain reinstall will not fix it: please file an issue, and try forcing a newer build with
+`HORDE_WORKER_BACKEND` as a stopgap.
+
 > **Audio (torchaudio) is not installed.** It has no `+cu132` wheel and audio generation is currently
 > unsupported, so the worker omits it (a missing torchaudio is stubbed at runtime; image/video work is
 > unaffected). If you specifically need it, install a build matching your torch index ad hoc, e.g.

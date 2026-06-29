@@ -22,6 +22,9 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, list[tup
     # The sync path reconciles the resolved token against the live GPU's compute capability. Stub it to
     # "unreadable" so the default is a no-op; tests that exercise the arch self-heal override this.
     monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (0, 0))
+    # The post-sync self-check would otherwise spawn `uv run python -c import torch`. Stub it to "no arch
+    # list" so it is a no-op by default; the dedicated post-sync tests override this to a real arch list.
+    monkeypatch.setattr(cli.runner, "query_torch_arch_list", lambda uv, **kw: None)
     # Keep launch tests hermetic: no launch-time update check reaches the network unless a test opts in.
     monkeypatch.setenv("HORDE_WORKER_AUTO_UPDATE", "off")
 
@@ -122,6 +125,52 @@ def test_sync_keeps_cpu_choice_without_probing(env: tuple[Path, list], monkeypat
     monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", _boom)
     assert cli.main(["sync"]) == 0
     assert calls == [("sync", "cpu")]
+
+
+def test_sync_warns_when_installed_wheel_lacks_kernels(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The post-sync check flags a wheel that cannot run the GPU as a worker bug (stale build map)."""
+    _, calls = env
+    # Blackwell sm_120 card: the arch floor first upgrades the install to cu130, but (in this stubbed
+    # world) the installed wheel still only covers through Hopper -- a residual gap the table failed to
+    # predict, which reinstalling the same build cannot fix.
+    monkeypatch.setattr(cli.runner, "query_torch_arch_list", lambda uv, **kw: ["sm_80", "sm_90"])
+    monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (12, 0))
+    assert cli.main(["sync"]) == 0  # the install still succeeded; the warning never fails it
+    err = capsys.readouterr().err
+    assert "no CUDA kernels for this GPU" in err
+    assert "sm_120" in err
+    assert "worker bug" in err
+    assert calls == [("sync", "cu130")]  # the floor upgraded cu126 -> cu130 before the post-check ran
+
+
+def test_sync_silent_when_installed_wheel_supports_gpu(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A wheel that does carry kernels for the live GPU produces no post-sync warning."""
+    _, _ = env
+    monkeypatch.setattr(cli.runner, "query_torch_arch_list", lambda uv, **kw: ["sm_90", "sm_100", "sm_120"])
+    monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (12, 0))
+    assert cli.main(["sync"]) == 0
+    assert "no CUDA kernels" not in capsys.readouterr().err
+
+
+def test_sync_post_check_skips_non_cuda_wheel(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ROCm/CPU wheel (no sm_ tags) short-circuits before the compatibility predicate is consulted."""
+    _, _ = env
+    monkeypatch.setattr(cli.runner, "query_torch_arch_list", lambda uv, **kw: ["gfx1100", "gfx1151"])
+
+    def _boom(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("ran the arch-compatibility predicate on a non-CUDA wheel")
+
+    # Spy on the predicate (not the compute-cap probe, which the reconcile step legitimately uses): the
+    # post-sync check must return on the missing sm_ tags before it ever evaluates compatibility.
+    monkeypatch.setattr(cli.detect, "gpu_arch_supported", _boom)
+    assert cli.main(["sync"]) == 0
+    assert "no CUDA kernels" not in capsys.readouterr().err
 
 
 def test_launch_web_passthrough(env: tuple[Path, list]) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from horde_worker_regen.process_management.workers.inference_process import _gpu_arch_supported
+from worker_bootstrap import detect
 
 # The compiled architecture set a stable cu126 wheel reports (matches the worker's real install logs):
 # binary cubins through Hopper, no Blackwell and no forward PTX.
@@ -43,3 +44,28 @@ def test_gpu_arch_supported_ignores_malformed_entries() -> None:
     """Non sm_/compute_ tags (e.g. a ROCm gfx target) are skipped rather than crashing the check."""
     assert _gpu_arch_supported(["gfx1100", "sm_90"], (9, 0)) is True
     assert _gpu_arch_supported(["gfx1100"], (9, 0)) is False
+
+
+@pytest.mark.parametrize(
+    ("arch_list", "capability", "expected"),
+    [
+        (_CU126_ARCH, (12, 0), False),
+        (_CU130_ARCH, (12, 0), True),
+        (_CU130_ARCH, (6, 1), False),
+        (["sm_80", "sm_86"], (8, 9), True),
+        (["sm_80", "sm_86"], (9, 0), False),
+        (["sm_90", "compute_90"], (12, 0), True),
+        (["gfx1100", "sm_90"], (9, 0), True),
+    ],
+)
+def test_worker_and_bootstrap_arch_predicates_agree(
+    arch_list: list[str], capability: tuple[int, int], expected: bool
+) -> None:
+    """The worker's runtime predicate and worker_bootstrap.detect's copy must stay byte-for-byte in step.
+
+    They are deliberate duplicates: ``worker_bootstrap`` is not importable from the packaged worker, so the
+    inference process cannot share the bootstrap's implementation. This guard fails if either drifts, since
+    a silent divergence would let the installer and the runtime disagree about which GPUs a build can run.
+    """
+    assert _gpu_arch_supported(arch_list, capability) == expected
+    assert detect.gpu_arch_supported(arch_list, capability) == expected

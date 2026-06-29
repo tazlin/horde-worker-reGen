@@ -216,6 +216,35 @@ def _nvidia_compute_cap() -> tuple[int, int]:
     return parse_compute_cap(out)
 
 
+def gpu_arch_supported(arch_list: list[str], capability: tuple[int, int]) -> bool:
+    """Whether a CUDA torch build compiled for ``arch_list`` has a usable kernel/PTX for ``capability``.
+
+    ``arch_list`` is what ``torch.cuda.get_arch_list()`` reports for the *installed* wheel: ``sm_<n>``
+    binary cubins and/or ``compute_<n>`` PTX. A device of compute capability (major, minor) can run:
+
+    * a binary ``sm_<n>`` kernel of the *same major* whose minor is <= the device minor (cubins are
+      forward-compatible only within a major), or
+    * any ``compute_<n>`` PTX whose (major, minor) <= the device, JIT-compiled at load time.
+
+    If neither exists, every kernel launch raises ``cudaErrorNoKernelImageForDevice``. This is the
+    authoritative *post-install* compatibility test (the wheel describing itself), as opposed to the
+    *pre-install* prediction :func:`_cuda_build` makes from a hardcoded table. The worker's inference
+    process keeps its own copy of this logic because ``worker_bootstrap`` is not importable from the
+    packaged worker; a guard test pins the two implementations together.
+    """
+    dev_major, dev_minor = capability
+    for entry in arch_list:
+        kind, _, ver = entry.partition("_")
+        if not ver.isdigit() or len(ver) < 2:
+            continue
+        major, minor = int(ver[:-1]), int(ver[-1])
+        if kind == "sm" and major == dev_major and minor <= dev_minor:
+            return True
+        if kind == "compute" and (major, minor) <= (dev_major, dev_minor):
+            return True
+    return False
+
+
 def _clamp_build_to_arch(build: str, compute_cap: tuple[int, int]) -> str:
     """Clamp a CUDA build token into the GPU's valid architecture window.
 
@@ -239,6 +268,15 @@ def _clamp_build_to_arch(build: str, compute_cap: tuple[int, int]) -> str:
     if compute_cap < _CUDA13_MIN_COMPUTE_CAP:
         return CU126
     return build
+
+
+def live_compute_capability() -> tuple[int, int]:
+    """Return the live GPU's highest compute capability via nvidia-smi, or (0, 0) when unreadable.
+
+    A public accessor for the post-install architecture check: it answers "what card is actually here?"
+    without importing torch, so the bootstrap can compare it against the installed wheel's arch list.
+    """
+    return _nvidia_compute_cap()
 
 
 def _cuda_build(version: tuple[int, int], compute_cap: tuple[int, int] = (0, 0)) -> str:
