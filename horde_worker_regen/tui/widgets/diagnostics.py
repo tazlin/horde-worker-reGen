@@ -4,7 +4,7 @@ This is the in-TUI equivalent of ``horde-log diagnose``: it calls the same first
 (:func:`horde_worker_regen.analysis.diagnose.diagnose`) and renders the structured
 :class:`~horde_worker_regen.analysis.detectors.Finding` objects it returns. Findings are rendered
 *generically* from their fields (severity, title, verdict, evidence, remediation) rather than per
-incident class, so a newly-added detector appears here with no change to this widget -- the only
+incident class, so a newly-added detector appears here with no change to this widget; the only
 coupling to the analysis layer is the shape of ``Finding``.
 
 The analysis parses an append-across-restarts log and runs every detector, which is CPU-bound and can
@@ -200,8 +200,8 @@ class DiagnosticsView(Vertical):
     def on_select_changed(self, event: Select.Changed) -> None:
         """Mark a pending run when the scope changes; re-render from cache when the session changes.
 
-        Changing the scope deliberately does *not* start an analysis -- the operator presses Run
-        analysis when ready -- so a slow pass is never kicked off by merely browsing the dropdown.
+        Changing the scope deliberately does *not* start an analysis: the operator presses Run
+        analysis when ready, so a slow pass is never kicked off by merely browsing the dropdown.
         """
         if self._updating_select:
             return

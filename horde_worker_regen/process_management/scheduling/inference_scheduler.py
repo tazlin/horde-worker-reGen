@@ -182,7 +182,7 @@ confirm the drain before loading best-effort regardless.
 
 A teardown frees the stopped siblings' VRAM asynchronously, so the live measurement can lag or be briefly
 unavailable. The live reading dispatches the head the moment it confirms; this bound guarantees the head is
-never parked indefinitely on a stuck or missing measurement -- once the teardown has been structurally complete
+never parked indefinitely on a stuck or missing measurement; once the teardown has been structurally complete
 this long it loads on the structural ``fits_alone`` guarantee (the grant precondition for a residency).
 Comfortably under ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS`` so the head always dispatches before the recovery
 supervisor would treat the held queue as a structural wedge."""
@@ -209,7 +209,7 @@ RAM (``_replace_stale_ram_unload_process``) the recovery supervisor keeps ignori
 cycle restarts the slot (a ~20s spawn) and the next head must then preload onto it (another ~20s+), a
 window in which the queue is legitimately unservable through no fault of the pool. Without this grace
 that deliberate, bounded hold ages past ``_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS`` (20s) and is mistaken for
-a structural wedge -- soft-resetting the pools and faulting the perfectly-servable backlog (in a
+a structural wedge, soft-resetting the pools and faulting the perfectly-servable backlog (in a
 sole-process configuration this drops every queued job over a window the worker itself created).
 Covers the respawn + preload window; bounded so a cycle that genuinely never recovers still trips the
 supervisor."""
@@ -248,8 +248,8 @@ class _WholeCardResidency:
     """Mutable whole-card exclusive-residency state for one card (the worker, on a single-GPU host).
 
     A heavy model can claim a whole card to itself by stopping that card's idle sibling inference contexts
-    (a context's VRAM is only reclaimed when its process exits) and -- on the card the safety process sits
-    on -- moving safety off-GPU. The scheduler keys one of these per device index so two heavy models on
+    (a context's VRAM is only reclaimed when its process exits) and, on the card the safety process sits
+    on, moving safety off-GPU. The scheduler keys one of these per device index so two heavy models on
     different cards each hold their own residency independently. A single-GPU worker keeps exactly one
     instance under the ``None`` key, so its behaviour is identical to the pre-multi-GPU scalar fields.
     """
@@ -395,7 +395,7 @@ class InferenceScheduler:
         # via set_measured_per_process_overhead_mb. The streaming forecast subtracts it from total VRAM to
         # estimate the free achievable under sole residency. 0 until measured (free-if-alone == total then).
         # NB: this is the *first/sole* context cost (it includes the one-time, device-wide CUDA runtime
-        # allocation), NOT the marginal cost of an additional sibling context -- see
+        # allocation), NOT the marginal cost of an additional sibling context; see
         # _measured_idle_context_residency_mb below, from which the marginal is derived.
         self._measured_per_process_overhead_mb: float = 0.0
         # Startup-measured *marginal* VRAM cost of each additional sibling context (the probe's second-context
@@ -406,7 +406,7 @@ class InferenceScheduler:
         self._measured_marginal_overhead_mb: float = 0.0
         # Lowest device-wide *used* VRAM observed while every loaded inference process is idle with no model
         # resident (the clean all-contexts baseline, typically at startup). This is the true combined cost of
-        # all process contexts -- the one-time CUDA runtime plus one context each -- so the marginal cost of an
+        # all process contexts, the one-time CUDA runtime plus one context each, so the marginal cost of an
         # additional context is (residency - per_process_overhead) / (count - 1). A runtime fallback for the
         # probe's direct marginal measurement: sizes free_after_model_evict from measurement instead of
         # multiplying the one-time cost by the process count. None until seen.
@@ -418,7 +418,7 @@ class InferenceScheduler:
         # allocator/runtime retains multi-GB per context, as a real inference context does once it has loaded a
         # checkpoint), the *effective* floor is the maximum, not the minimum. A probe measured against a minimal
         # holder under-counts this, so once the effective floor is known it supersedes the probe in deriving the
-        # per-context marginal -- otherwise the forecast believes in reclaimable VRAM the device never returns
+        # per-context marginal; otherwise the forecast believes in reclaimable VRAM the device never returns
         # and routes every load into an evict-all admit. None until seen.
         self._measured_effective_idle_used_mb: float | None = None
         self._effective_idle_process_count: int = 0
@@ -735,9 +735,9 @@ class InferenceScheduler:
         so it also covers the startup window where siblings have not yet reached idle). Failing that (the probe
         could not measure it on this backend), derives it from the measured all-contexts idle residency:
         ``residency = per_process_overhead + (count - 1) * marginal``, so ``marginal = (residency -
-        per_process_overhead) / (count - 1)``. Returns None when neither is available -- no probe delta, and no
+        per_process_overhead) / (count - 1)``. Returns None when neither is available: no probe delta, and no
         clean idle baseline (or only one process up, or a residency at/below the first-context overhead, an
-        inconsistent reading) -- in which case the forecast conservatively reuses the first-context overhead
+        inconsistent reading), in which case the forecast conservatively reuses the first-context overhead
         per additional context.
         """
         per_process = self._per_process_overhead_mb()
@@ -769,8 +769,8 @@ class InferenceScheduler:
     def _whole_card_warranted(self, forecast: StreamForecast) -> bool:
         """Whether a teardown demand is trustworthy enough to engage the whole-card residency machinery.
 
-        Reserving the whole card has a large blast radius -- it stops sibling processes (which may be serving
-        other queued heads), moves safety off-GPU, and holds the device through a cooldown -- so it must only
+        Reserving the whole card has a large blast radius: it stops sibling processes (which may be serving
+        other queued heads), moves safety off-GPU, and holds the device through a cooldown, so it must only
         fire on a demand that is not a measurement artifact. Two signals qualify it:
 
         - a genuinely card-demanding model (its persistent footprint dominates the device, or its baseline is
@@ -778,8 +778,8 @@ class InferenceScheduler:
         - a per-additional-context cost that was actually *measured* (the probe's second-context delta or a
           derived idle-floor): the contention the demand rests on is real, not an over-count.
 
-        When neither holds -- a card-light model on a host where the marginal context cost could not be
-        measured -- the per-context overhead falls back to the full first-context cost, which charges the
+        When neither holds (a card-light model on a host where the marginal context cost could not be
+        measured), the per-context overhead falls back to the full first-context cost, which charges the
         one-time CUDA runtime against every context and can collapse the structural floor below a model that
         physically co-resides with room to spare. Engaging a whole-card residency off that phantom reserves the
         card for a model that never needed it (and, held through the cooldown, can then starve a later head of a
@@ -891,9 +891,9 @@ class InferenceScheduler:
         """Largest live inference-process count that still fits ``peak_mb`` plus ``reserve_mb``.
 
         Sizes the context-reduction depth from the *same* conservative figure the VRAM verdict rejects on
-        (the burden estimate), not the forecast's resident-weight estimate. The two estimators differ -- the
+        (the burden estimate), not the forecast's resident-weight estimate. The two estimators differ: the
         forecast judges co-residence from the resident weight footprint while the admission verdict uses the
-        fuller per-job burden peak -- so a moderate head can read co-resident in the forecast yet be rejected
+        fuller per-job burden peak, so a moderate head can read co-resident in the forecast yet be rejected
         by the verdict every tick, the gap that routes it into the evict-all admit. Reasoning the teardown
         depth from the verdict's own peak makes the structural remedy fire exactly when admission would
         otherwise reject and thrash. The loader's first context costs the full one-time overhead; each
@@ -993,7 +993,7 @@ class InferenceScheduler:
         """Whether a whole-card residency on this card should also move the single safety process off-GPU.
 
         Requires safety configured-and-on-GPU (:meth:`_whole_card_safety_off_gpu_enabled`) and that this is
-        the card the one safety process is pinned to -- the lowest-index driven card. A residency on a
+        the card the one safety process is pinned to, i.e. the lowest-index driven card. A residency on a
         non-safety card never disturbs safety. The worker-wide key (``None``, single-GPU) always qualifies.
         """
         if not self._whole_card_safety_off_gpu_enabled():
@@ -1030,7 +1030,7 @@ class InferenceScheduler:
         The siblings' fixed per-process CUDA contexts (not their models) over-commit the device, and a context
         is only reclaimed by the process exiting (``torch.cuda.empty_cache`` returns cached blocks but never a
         context). Reduce the live inference-process count to the largest that still leaves room for this model's
-        weights plus its activation reserve, and -- on the very edge (Flux on a 16GB card) -- also move the
+        weights plus its activation reserve, and, on the very edge (Flux on a 16GB card), also move the
         safety process off-GPU so its context is freed too. The model is remembered so the residency is held
         and then restored once its job drains (after the configured cooldown). Only idle inference processes
         are stopped; a busy sibling is left to finish its job.
@@ -1095,7 +1095,7 @@ class InferenceScheduler:
           loads immediately, with nothing to overlap);
         - the head is not already resident or loading somewhere (nothing left to pre-stage);
         - there is an idle spare to hand the preload to (never the live job's own process); and
-        - system RAM can hold the head's *weights* alongside the in-flight job -- the operator's "assuming the
+        - system RAM can hold the head's *weights* alongside the in-flight job, i.e. the operator's "assuming the
           RAM can support it" (see :meth:`_prestage_weights_fit_ram`). A RAM shortfall falls back to the prior
           claim-the-card-and-wait behavior.
 
@@ -1160,7 +1160,7 @@ class InferenceScheduler:
         The device cannot be claimed while a live job holds it, but the heavy head's weights can load into a
         spare's RAM now. This sets the same residency bookkeeping :meth:`_establish_whole_card_residency` does
         (so the cooldown, the restore, and the recovery-supervisor wedge grace all cover the pre-stage load and
-        the convergence that follows), minus the process teardown and safety pause -- those are deferred to
+        the convergence that follows), minus the process teardown and safety pause: those are deferred to
         :meth:`_converge_whole_card_residency`, which runs once the head is staged and the device frees.
 
         ``device_index`` scopes the pre-staged residency to one card on a multi-GPU host; None is the
@@ -1189,7 +1189,7 @@ class InferenceScheduler:
         is actually resident on a process could kill the very spare the pre-stage wants to use, so this waits
         until the head is resident or loading on a process. From then on the scale-down is told this is a
         whole-card collapse (``whole_card_model``), so it spares only that head's holder and stops the *other*
-        idle siblings -- including ones holding a model still queued behind the head, which the generic
+        idle siblings, including ones holding a model still queued behind the head, which the generic
         scale-down guard would otherwise protect and thereby pin the count above the target forever. Those
         queued jobs wait and reload once the head drains (see :meth:`_restore_siblings_after_whole_card`).
         Reclaiming the siblings' CUDA contexts and moving safety off-GPU leaves the staged head the whole card
@@ -1231,12 +1231,12 @@ class InferenceScheduler:
         A pre-staged whole-card head is loaded into RAM (see :meth:`_begin_whole_card_residency`) before the
         device is reserved, so dispatching it would commit its weights to VRAM while idle siblings (or the
         just-drained busy process) still hold their CUDA contexts, forcing the first step to stream. This
-        returns True until the residency has converged -- the live inference-process count is at the forecast's
+        returns True until the residency has converged, i.e. the live inference-process count is at the forecast's
         target, safety is off-GPU if this residency needs it, and the card has drained enough to load the
         weights (the same :meth:`_whole_card_teardown_exhausted` gate the non-pre-staged path loads under).
 
-        Returns False for any job that is not the currently-held residency's model, so ordinary dispatch -- and
-        the non-pre-staged whole-card path, which only preloads once already at sole residency -- is unaffected.
+        Returns False for any job that is not the currently-held residency's model, so ordinary dispatch (and
+        the non-pre-staged whole-card path, which only preloads once already at sole residency) is unaffected.
         """
         found, device_index = self._residency_holder_for_model(job.model)
         if not found:
@@ -1282,7 +1282,7 @@ class InferenceScheduler:
         head forever once it drains): the *live* free-VRAM reading dispatches the head the moment it confirms the
         drain (safe to read here, at sole residency, where it only rises as the stopped contexts release), and a
         bounded ``_WHOLE_CARD_DRAIN_SETTLE_SECONDS`` backstop admits it on the structural ``fits_alone`` guarantee
-        if the measurement is unavailable or lags -- so the head never parks indefinitely. A model that still
+        if the measurement is unavailable or lags, so the head never parks indefinitely. A model that still
         cannot fit co-resident even at sole residency loads best-effort the same way and samples slowly under the
         over-budget step grace rather than wedging the queue until the recovery supervisor soft-resets.
 
@@ -1303,8 +1303,8 @@ class InferenceScheduler:
 
         Keyed on the live device reading rather than the forecast's stored ``free_now_mb`` (captured at
         establishment, before the teardown freed the siblings' VRAM). Only the caller's structural-completion
-        guard makes this safe to trust: at sole residency the reading is monotonic -- it only rises as the
-        stopped siblings' contexts release -- so it never reads deceptively high the way an instantaneous
+        guard makes this safe to trust: at sole residency the reading is monotonic, only rising as the
+        stopped siblings' contexts release, so it never reads deceptively high the way an instantaneous
         reading does during startup (idle contexts not yet allocated reading as free). Unknown weight or
         measurement returns False so the bounded structural backstop, not a guess, drives the fallback.
         """
@@ -1378,7 +1378,7 @@ class InferenceScheduler:
         When the RAM budget cannot fit the next head and cycles an idle slot to return allocator-retained
         RAM to the OS (:meth:`_replace_stale_ram_unload_process`), the slot respawns and the head must then
         preload onto it. The queue is unservable across that window, but by the worker's own deliberate,
-        bounded action -- not a wedge. While true the recovery supervisor must not treat the held queue as a
+        bounded action, not a wedge. While true the recovery supervisor must not treat the held queue as a
         structural wedge and fault the servable backlog. Bounded by ``_RAM_RECLAIM_CYCLE_GRACE_SECONDS`` so a
         cycle that genuinely never recovers still trips the supervisor. Public: read by the process manager's
         wedge assessment.
@@ -1391,7 +1391,7 @@ class InferenceScheduler:
         """Return ``(model, phase)`` for the whole-card residency held on ``device_index`` (per-card view).
 
         ``model`` is None when this card holds no residency; otherwise ``phase`` is ``establishing`` while the
-        establish grace is still in effect, else ``holding`` -- the same phase split the worker-wide
+        establish grace is still in effect, else ``holding``; this is the same phase split the worker-wide
         :meth:`whole_card_residency_state` reports. The single-GPU worker-wide residency lives under the
         ``None`` key, so a single-GPU caller reads it by passing ``device_index=None``. Reads without creating:
         a card with no residency is left absent from the map.
@@ -1491,7 +1491,7 @@ class InferenceScheduler:
         Held while the residency model is still pending or in progress, and for the configured cooldown after
         that, so a burst of heavy jobs reuses one residency rather than each thrashing the process count and
         the safety process. Once neither condition holds, that card's sibling processes are grown back to its
-        ceiling and -- if the residency was on the safety card -- the safety process is restored to the GPU.
+        ceiling and, if the residency was on the safety card, the safety process is restored to the GPU.
         Restores every drained card's residency independently; a no-op when none is outstanding.
         """
         now = time.time()
@@ -1580,7 +1580,7 @@ class InferenceScheduler:
         The scheduler returns ``None`` from :meth:`get_next_job_and_process` at several points without saying
         why, so a stuck queue with idle processes leaves no record of which gate parked the head. This
         re-derives that reason for the diagnostic, with the most detail for the genuinely suspicious case --
-        the head's model is resident on an *idle* process yet nothing dispatches -- since that is the
+        the head's model is resident on an *idle* process yet nothing dispatches, since that is the
         scheduler-bug-shaped stall that is otherwise invisible.
         """
         process = self._resident_process_for_job(head)
@@ -1602,12 +1602,12 @@ class InferenceScheduler:
             if nonhead_residency_model is not None:
                 return (
                     f"its model is not resident because a whole-card residency is held for non-head model "
-                    f"{nonhead_residency_model!r} -- the card is reserved for that model and its siblings were "
+                    f"{nonhead_residency_model!r}: the card is reserved for that model and its siblings were "
                     f"torn down, so this head cannot load until that residency restores"
                 )
             return (
                 "its model is not resident and no preload has been admitted "
-                "(usually a VRAM/RAM budget defer -- see the budget lines above)"
+                "(usually a VRAM/RAM budget defer; see the budget lines above)"
             )
         if not process.can_accept_job():
             return (
@@ -1641,7 +1641,7 @@ class InferenceScheduler:
 
         # A held whole-card residency parks its own pre-staged head until the live inference-process count
         # collapses to the forecast's target (sole residency). The convergence teardown is meant to stop the
-        # idle siblings -- including ones holding a model queued behind the head -- sparing only the head's
+        # idle siblings, including ones holding a model queued behind the head, sparing only the head's
         # holder. If the head is still parked with such a sibling un-torn-down, the convergence shrink has not
         # collapsed the pool, and the head will be deferred until the recovery supervisor soft-resets. Name
         # that specific state rather than reporting a gate-less "scheduler stall", so the post-mortem points at
@@ -1653,7 +1653,7 @@ class InferenceScheduler:
                 pinned = ", ".join(f"process {pid} holds queued model {model!r}" for pid, model in blockers)
                 return (
                     f"its model is resident and idle on process {process.process_id}, but the whole-card "
-                    f"residency stuck: cannot reach sole residency because {pinned} -- the convergence teardown "
+                    f"residency stuck: cannot reach sole residency because {pinned}; the convergence teardown "
                     f"should have stopped that idle sibling (only the head's holder is spared), so the shrink "
                     f"has not collapsed the pool and the head never dispatches"
                 )
@@ -1664,7 +1664,7 @@ class InferenceScheduler:
 
         return (
             f"its model is resident and idle on process {process.process_id} but dispatch was withheld with no "
-            "matching gate -- this is a scheduler stall worth reporting"
+            "matching gate; this is a scheduler stall worth reporting"
         )
 
     def _whole_card_convergence_blockers(
@@ -1731,7 +1731,7 @@ class InferenceScheduler:
         self._dispatch_stall_log_time = now
         logger.opt(ansi=True).warning(
             f"<fg #ff8c69>Inference dispatch stalled: head {str(head.id_)[:8]} ({head.model}) has been parked "
-            f"{self._head_starved_seconds(head):.0f}s -- {reason}.</>",
+            f"{self._head_starved_seconds(head):.0f}s: {reason}.</>",
         )
 
     def _log_head_starvation_force_admit(self, job: ImageGenerateJobPopResponse) -> None:
@@ -1998,7 +1998,7 @@ class InferenceScheduler:
             concurrent_ceiling = self._max_concurrent_inference_processes
             process_ceiling = self._max_inference_processes
 
-        # The post-processing overlap bump raises the cap *because* a process is post-processing -- but that
+        # The post-processing overlap bump raises the cap *because* a process is post-processing, but that
         # process is holding (or about to hold) its upscaler/face-fixer VRAM peak, the worst moment to admit
         # another job. Grant the bump only while the device still has staging headroom once the in-flight
         # post-processing reserve is held back; otherwise drop it so the post-proc peaks of several jobs
@@ -2305,8 +2305,8 @@ class InferenceScheduler:
 
             # Absolute system-RAM floor (degrade, never crash): loading a new model routes its weights through
             # system RAM first, so admitting one while the host is already below its danger floor is the OS
-            # OOM kill, not progress. This gates every admit path -- best-effort, head-starvation force-admit,
-            # and whole-card-terminal all sit below this point -- independent of the marginal RAM budget, which
+            # OOM kill, not progress. This gates every admit path (best-effort, head-starvation force-admit,
+            # and whole-card-terminal all sit below this point), independent of the marginal RAM budget, which
             # can pass on a job's small estimate while the whole host is on the edge (resident weights + the
             # safety process + other apps). Instead of loading, shed idle footprint and pause pops until RAM
             # recovers. Gated on the budget being active (the same switch the rest of the memory machinery uses).
@@ -2443,7 +2443,7 @@ class InferenceScheduler:
                 target_device_index = available_process.device_index if self._multi_gpu_routing_active else None
                 # A single model loaded onto an otherwise-idle GPU cannot reintroduce the multi-process
                 # over-commit the budget guards against; the over-commit case is several *concurrent*
-                # resident models. So when no job is in-flight (holding the device -- this card, on a
+                # resident models. So when no job is in-flight (holding the device, i.e. this card, on a
                 # multi-GPU host), a starved head may be admitted best-effort rather than deferred forever.
                 if target_device_index is None:
                     no_live_resource_consumer = len(self._job_tracker.jobs_in_progress) == 0
@@ -2479,7 +2479,7 @@ class InferenceScheduler:
                 early_prestage = False
                 # A model needs the teardown path either because it is weight-dominant (needs sole residency)
                 # or because the live sibling *process contexts* have squeezed its bounded weights off the card
-                # though it co-resides once the process count is reduced (needs_process_count_reduction -- the
+                # though it co-resides once the process count is reduced (needs_process_count_reduction, i.e. the
                 # soak's blind spot, where a moderate SDXL head was deferred until the starvation backstop
                 # force-admitted it into an OOM). Both are served by the same machinery: establish residency,
                 # stop idle siblings down to max_resident_processes (sole residency for the former, a partial
@@ -2956,7 +2956,7 @@ class InferenceScheduler:
 
         Single-GPU: identical to :meth:`ProcessMap.get_first_available_inference_process`, so the preload path
         is byte-identical. Multi-GPU: restrict to cards eligible for this job and pick the placement card by the
-        same sticky-then-least-loaded policy dispatch uses -- a card already holding this model first (avoid a
+        same sticky-then-least-loaded policy dispatch uses: a card already holding this model first (avoid a
         duplicate load), then the card running the fewest inference jobs (balance fresh loads). Returns the
         first available slot on the best such card, or None when no eligible card has a free slot.
         """
@@ -4180,6 +4180,6 @@ class InferenceScheduler:
                 if not started_any:
                     # Nothing dispatched this cycle though the queue has work: if the head has been parked
                     # long enough to be a real stall (not a between-jobs gap), explain *why* it is not
-                    # dispatching. Throttled, read-only -- it never changes scheduling.
+                    # dispatching. Throttled, read-only; it never changes scheduling.
                     self._log_dispatch_stall_if_needed(stable_diffusion_reference)
                     self.unload_models()

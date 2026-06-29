@@ -7,7 +7,7 @@ checkpoint is re-fetched). A cached "valid" verdict is about the *previous* file
 after a re-download the cache must be evicted for those keys. It currently is not, which produces two faults:
 
 * A corrupt re-download is reported *present* from a stale cache entry (the feature is offered, then faults at
-  job time -- exactly the failure the validation gate exists to prevent).
+  job time: exactly the failure the validation gate exists to prevent).
 * The annotator verify's recovery window cannot withhold ControlNet on the presence path as its own comments
   intend, because the refresh reads the stale "valid" verdict throughout.
 

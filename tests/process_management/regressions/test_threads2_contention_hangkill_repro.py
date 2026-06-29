@@ -3,7 +3,7 @@
 Under threads=2 contention, hung-kill recoveries accumulate against healthy jobs: each has
 ``exitcode=None`` (the child is alive), ``last_state=INFERENCE_STARTING``, and a preceding
 ``SLOWDOWN_DETECTED`` at 4x-8x "expected sampling time". The reaped jobs, when re-run, sample at normal
-speed -- they were killed during the startup/loading window, not during a genuine sampling slowdown, and
+speed; they were killed during the startup/loading window, not during a genuine sampling slowdown, and
 the watchdogs that judged them are blind to what a job's features make legitimate.
 
 Two job-feature-driven mechanisms, which the live data shows compounding:

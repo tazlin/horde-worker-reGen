@@ -215,7 +215,7 @@ class BenchmarkDownloadModal(ModalScreen[bool]):
         return [row.name for row in self._plan.models if self._row_status(row, live) == _STATUS_TO_DOWNLOAD]
 
     def _missing_image_model_names(self) -> list[str]:
-        """Return the missing *image* model names only -- the set requested as image models by name.
+        """Return the missing *image* model names only: the set requested as image models by name.
 
         Feature files (controlnet checkpoints, post-processors, annotators) are deliberately excluded: they are
         fetched through the download subsystem's aux pass (each via its own model manager), so requesting them

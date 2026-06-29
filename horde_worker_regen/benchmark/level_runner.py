@@ -247,8 +247,8 @@ def run_level(level_json_path: Path, out_dir: Path, *, process_mode: str = "real
     faulthandler_file = faulthandler_path.open("w", encoding="utf-8")
     faulthandler.enable(file=faulthandler_file)
     # C-level backstop: dump all thread stacks shortly after the level's own timeout (before the
-    # controller hard-kills a wedged subprocess), so even a hang that holds the GIL -- which the Python
-    # stall-watchdog thread below could not interrupt -- still leaves a trace.
+    # controller hard-kills a wedged subprocess), so even a hang that holds the GIL (which the Python
+    # stall-watchdog thread below could not interrupt) still leaves a trace.
     faulthandler.dump_traceback_later(
         level.timeout_seconds + _HANG_DUMP_MARGIN_SECONDS,
         repeat=False,
@@ -256,8 +256,8 @@ def run_level(level_json_path: Path, out_dir: Path, *, process_mode: str = "real
     )
 
     # Progress-aware stall watchdog: dumps thread stacks if the run stops making progress. This catches a
-    # soft wedge (e.g. the startup hang before any child spawns) that faulthandler.enable() -- fatal
-    # signals only -- never would, and that the always-on heartbeat thread otherwise masks.
+    # soft wedge (e.g. the startup hang before any child spawns) that faulthandler.enable() (fatal
+    # signals only) never would, and that the always-on heartbeat thread otherwise masks.
     stall_watchdog = _StallWatchdog(
         stall_seconds=_STALL_DUMP_SECONDS,
         dump=lambda elapsed: _dump_thread_stacks(faulthandler_file, elapsed),

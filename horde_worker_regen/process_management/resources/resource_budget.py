@@ -132,19 +132,19 @@ class BudgetVerdict:
 _WHOLE_CARD_WARRANT_FRACTION = 0.4
 """Share of total VRAM a model's persistent footprint (weights + bounded floor) must reach before the
 disruptive whole-card residency machinery is justified for it. Below this the model regains ample room by
-evicting a sibling *model*, so its sibling process *contexts* are never the binding constraint -- routing it
+evicting a sibling *model*, so its sibling process *contexts* are never the binding constraint; routing it
 onto the whole-card path can only come from an over-counted per-context overhead. Hardware-relative by
 design: an SDXL checkpoint (~5GB) is well under this fraction of a 24GB card (co-resides) but over it on a
 small card (where it genuinely contends), which is exactly when a teardown is and is not appropriate."""
 
 
 _CORESIDENT_SIBLING_MODEL_FLOOR_MB = 5000.0
-"""Free VRAM (MB) -- beyond a model's own weights + bounded floor at sole residency -- that must remain for the
+"""Free VRAM (MB), beyond a model's own weights + bounded floor at sole residency, that must remain for the
 card to count as having room for *another full model* to co-reside. Sized to a representative full checkpoint
 (an SDXL-class ~5GB model). A whole-card-intent (EXTRA_LARGE) model yields its sole-residency intent only on a
 card this roomy: there, it can co-reside with a sibling model and its "never shares well" contract is upheld by
 the concurrency overlap gate (no co-*sampling*) rather than by reserving the device. Below this floor (a heavy
-model on a tight card -- e.g. a ~10GB model on 16GB, where ~3GB is left) co-residing a second model would
+model on a tight card, e.g. a ~10GB model on 16GB where ~3GB is left), co-residing a second model would
 thrash, so intent still claims the card. This counts room for a *model*, not for an empty CUDA *context* (which
 ``max_resident_processes`` measures and which can read high even when no real model fits)."""
 
@@ -292,7 +292,7 @@ class StreamForecast:
         The persistent-footprint counterpart to :attr:`_weights_dominant`: it decides whether a (non-whole-card-
         intent) model needs *sole* residency, so stopping siblings down to one process is the only fit. Keyed on
         ``_fits_weights`` (weights + bounded floor) against the same sole-occupancy-plus-one-sibling-context
-        ceiling, so a transient activation spike never forces a process teardown -- a moderate-weight model whose
+        ceiling, so a transient activation spike never forces a process teardown: a moderate-weight model whose
         weights *do* fit beside a context is instead left to co-reside (evicting a sibling model) or, if the live
         contexts over-commit its weights, to a *partial* reduction via :attr:`needs_process_count_reduction`
         (which keeps the surviving contexts rather than collapsing to one). Only a model whose persistent weights
@@ -310,7 +310,7 @@ class StreamForecast:
     def _has_room_for_coresident_model(self) -> bool:
         """Whether sole-residency free VRAM holds another full model beside these weights (a genuinely roomy card).
 
-        Distinguishes "many empty contexts fit" (what :meth:`max_resident_processes` counts -- a context is cheap)
+        Distinguishes "many empty contexts fit" (what :meth:`max_resident_processes` counts, a context is cheap)
         from "a real sibling *model* fits", which is what decides whether a whole-card-intent model can co-reside
         without thrashing. Measured as the free VRAM left at sole residency after this model's weights and bounded
         floor, against :data:`_CORESIDENT_SIBLING_MODEL_FLOOR_MB`. False when unsized, so intent is preserved on a
@@ -379,7 +379,7 @@ class StreamForecast:
         - **Ordinary models** co-reside by default and need *sole* residency only when their persistent weights
           are too heavy to fit beside even one sibling context (:attr:`_persistent_weights_dominant`). A
           moderate-weight model with a large transient activation estimate (a 4.9 GB SDXL at a big batch) never
-          trips this -- its weights leave ample room, so the spike is absorbed by evicting a sibling *model* and
+          trips this: its weights leave ample room, so the spike is absorbed by evicting a sibling *model* and
           sampling under the over-budget step grace. If the live contexts over-commit the weights, the *partial*
           :attr:`needs_process_count_reduction` (which keeps the surviving contexts rather than collapsing to one)
           covers that instead.
@@ -413,8 +413,8 @@ class StreamForecast:
         stopping idle sibling processes, distinct from the sole residency a weight-dominant model needs.
 
         This catches an over-commit the weight-dominant gate misses: four ~4 GB CUDA contexts on a 24 GB card
-        leave under 4 GB free even with every sibling model evicted -- below an SDXL checkpoint's ~4.9 GB of
-        weights -- so the model literally cannot load until a sibling *process* stops. ``_weights_dominant``
+        leave under 4 GB free even with every sibling model evicted, below an SDXL checkpoint's ~4.9 GB of
+        weights, so the model literally cannot load until a sibling *process* stops. ``_weights_dominant``
         (and therefore
         ``needs_exclusive_residency`` / ``requires_sibling_teardown``) miss it: their self-plus-one-sibling
         ceiling judges the moderate weights "not card-filling", so no teardown is triggered and the head is
@@ -446,7 +446,7 @@ class StreamForecast:
         ``wants_whole_card`` baseline short-circuits True (the tier asserts it never shares well). This is the
         teardown *warrant* (is a teardown demand trustworthy), kept deliberately conservative: it only matters
         once a teardown is actually demanded (``needs_exclusive_residency`` / the context-reduction path), which a
-        roomy EXTRA_LARGE model never reaches because it co-resides -- so leaving this eager never over-grants, it
+        roomy EXTRA_LARGE model never reaches because it co-resides, so leaving this eager never over-grants, it
         only avoids declining a genuine context-reduction. Conservatively True when the footprint cannot be sized,
         preserving the prior, more eager behavior. See :data:`_WHOLE_CARD_WARRANT_FRACTION`; the share is taken
         against total VRAM so the verdict is hardware-relative.
@@ -480,7 +480,7 @@ class StreamForecast:
         to 1. Its intent is that it never *co-samples* (enforced separately by the concurrency overlap gate),
         not that every sibling *context* must be torn down: a context that holds no model and is not sampling
         costs only its (cheap) per-context VRAM, so on a card whose VRAM genuinely holds the weights-plus-reserve
-        alongside one or more idle sibling contexts -- a Flux fp8 checkpoint (~11.5GB) on a 24GB card -- keeping
+        alongside one or more idle sibling contexts (a Flux fp8 checkpoint (~11.5GB) on a 24GB card), keeping
         those contexts avoids a full teardown-and-respawn every time the heavy head cycles (the residency churn
         that capped throughput). On a card with no such room (the same fp8 weights on a 16GB card) the budget
         returns 1, so the behavior stays hardware-relative. Only when the footprint cannot be sized at all does a
@@ -725,7 +725,7 @@ def forecast_weight_streaming(
     else:
         # free_if_alone is the absolute ceiling: the model's own process is the only context on the card,
         # which for whole-card residency means safety is moved off-GPU too. So the extra (safety) context is
-        # NOT charged here -- a model only "streams unavoidably" when it overflows even that ceiling.
+        # NOT charged here; a model only "streams unavoidably" when it overflows even that ceiling.
         free_if_alone_mb = max(0.0, float(total_vram_mb) - overhead)
         # free_after_model_evict is the current reality with every process's context materialised, including
         # the safety-on-GPU context, since stopping idle *inference* siblings cannot reclaim it. The loading

@@ -387,7 +387,7 @@ class JobSubmitter:
         # reported so the horde reissues it, then removed from the queue by the normal finalize path
         # below. Raising here instead (as the old code did for each of these conditions) left the same
         # un-submittable job at the head of jobs_pending_submit, so api_submit_job re-picked it every
-        # loop iteration and spun forever -- emitting thousands of identical tracebacks and, because
+        # loop iteration and spun forever, emitting thousands of identical tracebacks and, because
         # is_time_for_shutdown() waits for the submit queue to drain, wedging shutdown entirely. A
         # job with images but no safety verdict (censored is None) must never be uploaded as-is: it
         # could leak uncensored NSFW/CSAM content, so faulting is the only safe response.

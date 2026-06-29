@@ -338,13 +338,13 @@ def _live_log_overlap_scheduler(
 
     - process 1 is mid-inference on an SDXL-class checkpoint (``INFERENCE_STARTING``), device-free ~9329 MB;
     - processes 2/3/4 are idle and **model-free** (bare ~1288 MB CUDA context each, ~1GB RSS);
-    - the queue is ``[SDXL(in-progress), Flux(pending, head)]`` -- Flux is the head, behind the in-flight SDXL
+    - the queue is ``[SDXL(in-progress), Flux(pending, head)]``; Flux is the head, behind the in-flight SDXL
       job, so it is the legitimate whole-card pre-stage target;
     - the box has 64GB RAM but one process already holds ~25GB RSS, so available RAM is well under Flux's
       conservative ``predict_job_ram_mb`` burden (~24GB) plus the 4GB reserve.
 
     Under those numbers the pre-stage RAM gate (which keyed on the full activation-inclusive burden) declined
-    and the worker fell back to the kill-them-all establish path -- the regression these tests pin.
+    and the worker fell back to the kill-them-all establish path: the regression these tests pin.
     """
     busy = make_mock_process_info(1, model_name=_RESIDENT_SDXL, state=HordeProcessState.INFERENCE_STARTING)
     busy.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
@@ -479,7 +479,7 @@ class TestPrestagedHeadWaitsForSoleResidency:
     """A pre-staged head must not sample until the residency has collapsed to sole VRAM residency.
 
     Sampling commits the weights to VRAM, so dispatching before the idle siblings (or the just-drained busy
-    process) have released their CUDA contexts would force the first step to stream over the bus -- exactly
+    process) have released their CUDA contexts would force the first step to stream over the bus, exactly
     the streaming storm the residency exists to prevent. The head keeps its head-of-queue spot and dispatches
     the instant the card is clear.
     """

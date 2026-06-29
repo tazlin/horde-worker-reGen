@@ -65,7 +65,7 @@ class AuxDownloadDeadlineExceeded(Exception):
 
     Caught at the control-message boundary (never propagated to the generic handler, which would end the
     process): the child cancels the stalled downloads, faults the job back to the parent, and returns to
-    ``WAITING_FOR_JOB`` with its model still resident -- replacing a whole-process teardown with a
+    ``WAITING_FOR_JOB`` with its model still resident, replacing a whole-process teardown with a
     slot-local fault.
     """
 
@@ -100,7 +100,7 @@ def _gpu_arch_supported(arch_list: list[str], capability: tuple[int, int]) -> bo
       forward-compatible only within a major), or
     * any ``compute_<n>`` PTX whose (major, minor) <= the device, JIT-compiled at load time.
 
-    If neither exists, every kernel launch raises ``cudaErrorNoKernelImageForDevice`` -- which ComfyUI
+    If neither exists, every kernel launch raises ``cudaErrorNoKernelImageForDevice``, which ComfyUI
     swallows into a generic "no images produced" fault. This predicts that before the first launch.
     """
     dev_major, dev_minor = capability

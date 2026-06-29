@@ -752,7 +752,7 @@ class TestUnloadModels:
         A process with ``loaded_horde_model_name=None`` that was already told to unload from VRAM must
         not receive the same IPC command on every scheduling cycle. The guard that the non-None branch
         has (``last_control_flag != UNLOAD_MODELS_FROM_VRAM``) is missing from the None (else) branch,
-        resulting in unbounded re-sends -- the livelock that triggers a save-our-ship soft reset when
+        resulting in unbounded re-sends: the livelock that triggers a save-our-ship soft reset when
         the whole-card residency convergence hangs waiting for a sibling that keeps being prodded to
         unload models it does not have.
         """
@@ -781,7 +781,7 @@ class TestUnloadModels:
         # its response ("No models to unload from VRAM") has not yet arrived or been processed, so
         # re-sending the same command is wasted IPC that causes the convergence livelock.
         sched.unload_models_from_vram(target)
-        # The last_control_flag must still be UNLOAD_MODELS_FROM_VRAM -- the command was NOT re-sent
+        # The last_control_flag must still be UNLOAD_MODELS_FROM_VRAM; the command was NOT re-sent
         # because the guard suppressed the duplicate, meaning safe_send_message was not called again.
         assert empty.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM, (
             "second call must NOT re-send: the last_control_flag guard must suppress the duplicate "

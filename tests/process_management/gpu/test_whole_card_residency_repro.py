@@ -64,7 +64,7 @@ class TestStreamForecastClassification:
 
         # ComfyUI's minimum_inference_memory is platform-dependent (the Windows reserve is higher and a
         # 16GB card adds a bonus), so derive the floor for the running platform rather than hardcoding one
-        # value -- a constant tuned on Windows (~1519MB) fails on the Linux CI runner (~1219MB).
+        # value: a constant tuned on Windows (~1519MB) fails on the Linux CI runner (~1219MB).
         comfy_floor = float(compute_inference_reserve_mb(_DEVICE_TOTAL_VRAM_MB))
         # A config floor above the ComfyUI floor wins.
         assert effective_inference_reserve_mb(_DEVICE_TOTAL_VRAM_MB, 2048.0) == 2048.0
@@ -1044,7 +1044,7 @@ _DEVICE_TOTAL_VRAM_MB_4090 = 24074.0
 # The first inference process's device-wide used VRAM at its memory report: dominated by the one-time CUDA
 # runtime allocation, NOT a true per-additional-context cost. The forecast takes this as per_process_overhead.
 _MEASURED_OVERHEAD_4090_MB = 4112.0
-# The probe's measured marginal (second-context delta) on a 4090 -- the real cost of each additional inference
+# The probe's measured marginal (second-context delta) on a 4090: the real cost of each additional inference
 # context, ~9x smaller than the one-time-inclusive overhead.
 _MEASURED_MARGINAL_4090_MB = 455.0
 _SDXL_WEIGHTS_MB = 4900.0  # the registry seed for an SDXL checkpoint
@@ -1057,7 +1057,7 @@ def _build_4090_startup_scheduler() -> tuple[InferenceScheduler, ProcessMap, Job
 
     Process 1 is up and idle (model-free), reporting the device-wide free; the other four are still
     PROCESS_STARTING, which is the startup window in which the first job is popped. While any process is not
-    yet WAITING_FOR_JOB the clean all-contexts idle baseline cannot be captured -- but the probe's directly
+    yet WAITING_FOR_JOB the clean all-contexts idle baseline cannot be captured; but the probe's directly
     measured marginal (injected here, as the manager does at startup) covers exactly this window, so the
     forecast sizes free_after_model_evict from the real per-context cost rather than overhead-times-N.
     """
@@ -1105,7 +1105,7 @@ class TestSdxlStartupResidencyRace:
 
         Without a marginal the forecast would model free_after_model_evict as 24074 - 4112 - 4*4112 == 3514MB
         (below the 4900MB weights) and demand a sibling-process teardown. The probe's ~455MB marginal sizes it
-        as 24074 - 4112 - 4*455 == 18142MB instead, so the ~4.9GB checkpoint co-resides -- no teardown.
+        as 24074 - 4112 - 4*455 == 18142MB instead, so the ~4.9GB checkpoint co-resides; no teardown.
         """
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _SDXL_WEIGHTS_MB)
         monkeypatch.setattr(

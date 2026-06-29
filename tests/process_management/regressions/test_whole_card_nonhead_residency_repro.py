@@ -5,7 +5,7 @@ The shape of the wedge, on a single 24GB card with ``whole_card_exclusive_reside
   * The head of the queue is an ordinary SDXL job whose model is resident on an idle process (ready to
     dispatch). A heavy Flux fp8 job sits *behind* it, deeper in the queue.
   * Flux's forecast reads ``needs_exclusive_residency``, so the scheduler grants it a whole-card residency
-    (pre-staging it, then converging to sole residency) -- even though it is not the head.
+    (pre-staging it, then converging to sole residency), even though it is not the head.
 
 Granting the residency to the deep Flux job reserves the entire card and tears down the sibling processes
 serving the heads ahead of it (including the head's own resident process). The real head then has no
@@ -43,7 +43,7 @@ from tests.process_management.scheduling.test_inference_scheduling import _make_
 
 # A 16GB card. Flux fp8 genuinely needs sole residency here: its ~11.5GB weights leave under a full sibling
 # model's worth of room (``_CORESIDENT_SIBLING_MODEL_FLOOR_MB``) at sole residency, so it is a true whole-card
-# head -- the case this file's head-gate must serve while still refusing a *non-head* Flux. (On a roomy 24GB
+# head: the case this file's head-gate must serve while still refusing a *non-head* Flux. (On a roomy 24GB
 # card Flux fp8 co-resides instead, which is a different regime covered by the budget-wins-on-a-roomy-card path.)
 _DEVICE_TOTAL_VRAM_MB = 16375
 _PER_PROCESS_OVERHEAD_MB = 1288
@@ -243,7 +243,7 @@ class TestHeadFluxStillClaimsCard:
         """A deep Flux must claim the card only after the SDXL job ahead of it drains and Flux becomes the head.
 
         First cycle (SDXL head pending ahead): no residency for Flux. After the SDXL head is dispatched, Flux is
-        the head and the residency must then be established -- the deferral is until its turn, not forever.
+        the head and the residency must then be established; the deferral is until its turn, not forever.
         """
         _seed_flux_needs_exclusive(monkeypatch)
         head_proc = _resident(1, _HEAD_SDXL, HordeProcessState.WAITING_FOR_JOB)

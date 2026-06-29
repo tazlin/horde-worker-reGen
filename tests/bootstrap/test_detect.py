@@ -60,13 +60,13 @@ def test_parse_compute_cap(smi_output: str, expected: tuple[int, int]) -> None:
 @pytest.mark.parametrize(
     ("version", "compute_cap", "expected"),
     [
-        # Floor -- Blackwell (sm_120 / sm_100) has no kernel image in cu126, so lift to cu130.
+        # Floor: Blackwell (sm_120 / sm_100) has no kernel image in cu126, so lift to cu130.
         ((12, 8), (12, 0), detect.CU130),  # old CUDA 12.x driver, known Blackwell card
         ((0, 0), (12, 0), detect.CU130),  # driver CUDA unreadable but the card is known Blackwell
         ((10, 0), (10, 0), detect.CU130),  # sm_100 datacenter Blackwell, same floor
         ((13, 0), (12, 0), detect.CU130),  # driver already covers Blackwell -> floor is a no-op
         ((13, 2), (12, 0), detect.CU132),  # newest driver-supported build still wins for Blackwell
-        # Ceiling -- pre-Turing (Maxwell/Pascal/Volta) was dropped from the CUDA 13 wheels, so hold cu126
+        # Ceiling: pre-Turing (Maxwell/Pascal/Volta) was dropped from the CUDA 13 wheels, so hold cu126
         # even when the driver is new enough for cu130/cu132 (cu126 still runs on the newer driver).
         ((13, 2), (6, 1), detect.CU126),  # Pascal GTX 10-series on a CUDA 13.2 driver
         ((13, 0), (5, 2), detect.CU126),  # Maxwell on a CUDA 13.0 driver

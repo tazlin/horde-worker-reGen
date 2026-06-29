@@ -117,8 +117,8 @@ class WorkerState:
     The safety stage is a single (often CPU-bound) process downstream of inference, and nothing bounded
     its queue: when inference outruns safety the post-inference backlog grew until jobs aged past their
     horde ttl and were server-aborted as "too slow". The job popper reads this (with
-    ``recent_job_ttl``) to apply post-inference backpressure -- stop popping while the safety backlog
-    can no longer clear within the deadline -- so the pipeline self-limits to its slowest stage instead
+    ``recent_job_ttl``) to apply post-inference backpressure: stop popping while the safety backlog
+    can no longer clear within the deadline, so the pipeline self-limits to its slowest stage instead
     of spiralling into forced maintenance. See :meth:`record_safety_duration`."""
 
     recent_job_ttl: float | None = None

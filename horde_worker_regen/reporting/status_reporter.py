@@ -186,8 +186,8 @@ class StatusReporter:
             time_spent_no_jobs_available,
         )
 
-        # Per-stage aging (only when something is actually aging): makes a downstream stall -- jobs sitting
-        # in SAFETY_CHECKING or PENDING_SUBMIT while inference keeps finishing -- visible at a glance.
+        # Per-stage aging (only when something is actually aging): makes a downstream stall (jobs sitting
+        # in SAFETY_CHECKING or PENDING_SUBMIT while inference keeps finishing) visible at a glance.
         if stage_age_line:
             logging_function(f"<fg #7dcea0>  {stage_age_line}</>")
 

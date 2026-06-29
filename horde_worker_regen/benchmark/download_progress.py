@@ -28,7 +28,7 @@ class DownloadModelRow(BaseModel):
     is_aux: bool = False
     """True for an auxiliary/feature file (controlnet checkpoint, post-processor, annotator) rather than an
     image checkpoint. These are fetched through the download subsystem's aux pass (each via its own model
-    manager), NOT requested by name as image models -- doing so routes them to the image manager, which has no
+    manager), NOT requested by name as image models; doing so routes them to the image manager, which has no
     record of them and fails. A surface requesting a download must keep these out of the image-model set."""
 
 

@@ -505,7 +505,7 @@ class TestPrestagedHeadProgressesWithRamOnlyModel:
 
         ``_prestaged_whole_card_not_ready`` recalculates the forecast every tick. If the model is in RAM
         (not VRAM), ``fits_weights_now`` might return False even though the card is otherwise ready.
-        The head must still be allowed to dispatch -- the model will be loaded into VRAM at sampling time.
+        The head must still be allowed to dispatch; the model will be loaded into VRAM at sampling time.
         """
         flux_holder = make_mock_process_info(1, model_name=_FLUX_MODEL, state=HordeProcessState.WAITING_FOR_JOB)
         flux_holder.total_vram_mb = _DEVICE_TOTAL_VRAM_MB

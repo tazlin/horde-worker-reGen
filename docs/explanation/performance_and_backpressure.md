@@ -486,7 +486,7 @@ longer it is expected to last) and its session totals (how many times it engaged
 This makes every governor visible the same way:
 
 - **Logs.** The registry emits a grep-friendly `Pop governor ENTER: <name> (<reason>); expected ~<N>s` at each
-  spell start and `Pop governor EXIT: <name> after <N>s (<count>x, <N>s total)` at each end -- independent of
+  spell start and `Pop governor EXIT: <name> after <N>s (<count>x, <N>s total)` at each end, independent of
   whether a TUI is attached, so the boundaries are always in `bridge.log`.
 - **TUI.** The Overview shows a *Pop governors* strip naming whatever is engaged with a live countdown; the
   Stats tab shows a per-governor table (engagements, total time, % of session).

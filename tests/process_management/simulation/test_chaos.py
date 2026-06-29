@@ -198,8 +198,8 @@ def test_slow_crash_on_start_is_quarantined_despite_window(monkeypatch: pytest.M
 
     This is the empirical shape of the observed benchmark wedge: an inference child crashed during
     ``hordelib.initialise()`` (a broken dependency) every launch, but each crash took ~30-250s, so the
-    sliding-window breaker -- which only fires on more than ``CRASH_LOOP_MAX_REPLACEMENTS`` replacements
-    *within* ``CRASH_LOOP_WINDOW_SECONDS`` -- could never accumulate enough before the early ones aged
+    sliding-window breaker, which only fires on more than ``CRASH_LOOP_MAX_REPLACEMENTS`` replacements
+    *within* ``CRASH_LOOP_WINDOW_SECONDS``, could never accumulate enough before the early ones aged
     out. The slot respawned for the full level timeout (~15 min, 0 jobs). The consecutive crash-on-start
     streak quarantines it regardless of how slow each crash is.
     """

@@ -36,7 +36,7 @@ class HordeProcessInfo:
     """The multiprocessing process object for this process.
 
     Typed as ``BaseProcess`` (not ``multiprocessing.Process``) because the parent creates children
-    from an explicit spawn context (``ctx.Process(...)``), which returns a ``SpawnProcess`` -- a
+    from an explicit spawn context (``ctx.Process(...)``), which returns a ``SpawnProcess``, a
     sibling of ``multiprocessing.Process``, both subclassing ``BaseProcess``.
     """
     pipe_connection: Connection
@@ -135,7 +135,7 @@ class HordeProcessInfo:
     """Consecutive non-advancing sampling-progress reports the child has forwarded for the current job.
 
     0 during healthy sampling (each step is reported once). Climbs only when the child keeps receiving
-    progress callbacks at the same step without advancing -- the signature of a ComfyUI generation
+    progress callbacks at the same step without advancing: the signature of a ComfyUI generation
     wedged on a single step (typically the final one) that will never return a result. The heartbeats
     that carry this keep arriving, so the silence-based hang watchdog cannot see the wedge; this count
     is what the stuck-step watchdog reaps on instead."""

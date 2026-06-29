@@ -578,7 +578,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     face-fixer allocates VRAM, so the measured free figure transiently overstates what is available. With
     this on (the default), the scheduler subtracts the predicted post-processing peak of every job currently
     in post-processing from the free VRAM it gates dispatch, the overlap cap, and the residency forecast
-    against -- so a freshly-released slot is not handed VRAM an in-flight job is about to claim (the cause of
+    against, so a freshly-released slot is not handed VRAM an in-flight job is about to claim (the cause of
     the post-processing-phase thrash that trips the post-process watchdog on a shared GPU). It also gates the
     overlap/pre-staging cap against the *imminent* peak of a job that is still sampling, so a second
     concurrent sample is not co-scheduled onto a card already owed a large upscale peak (the overlap that

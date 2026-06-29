@@ -2,12 +2,12 @@
 
 Observed in a live session on a contended 16GB ``max_threads=1`` worker. The sequence:
 
-1. A brief all-idle gap between jobs set the queue-deadlock flag (``_in_queue_deadlock``) -- the normal
+1. A brief all-idle gap between jobs set the queue-deadlock flag (``_in_queue_deadlock``): the normal
    transient state while the scheduler picks the next model.
 2. The scheduler then dispatched the head (a heavy SDXL job with LoRAs + post-processing) onto a healthy
    slot, which began running it. The queue condition was resolved: a job was in progress on a live slot.
 3. ``detect_deadlock`` could not clear the queue-deadlock flag, though, because its clear branch also
-   requires ``num_starting_processes() == 0`` -- and a sibling slot, cycled moments earlier to reclaim
+   requires ``num_starting_processes() == 0`` and a sibling slot, cycled moments earlier to reclaim
    RAM, was still in ``PROCESS_STARTING`` (slow to spin up under host contention). The flag latched.
 4. ~20s later ``indicates_structural_wedge()`` flipped true on the stale flag, ``_assess_wedge()``
    returned true, and the recovery supervisor performed a save-our-ship soft reset: it rebuilt the
@@ -46,8 +46,8 @@ async def test_queue_deadlock_clears_when_job_in_progress_despite_starting_sibli
     """detect_deadlock must clear the queue-deadlock flag once a job is in progress, even if a slot starts.
 
     The clear branch is currently gated on ``num_starting_processes() == 0``, so a sibling slow to spin up
-    (a routine RAM-reclaim re-spawn on a contended host) latches a flag whose precondition -- an all-idle,
-    stuck queue -- no longer holds.
+    (a routine RAM-reclaim re-spawn on a contended host) latches a flag whose precondition, an all-idle,
+    stuck queue, no longer holds.
     """
     pm = make_testable_process_manager()
     pm._state.last_job_pop_time = time.time() - 60  # the last pop is not recent; detection is live
@@ -77,7 +77,7 @@ async def test_worker_with_job_in_progress_is_not_assessed_as_wedged() -> None:
     """A worker actively running a job on a healthy slot must not be assessed as structurally wedged.
 
     Even granting the latched flag, ``_assess_wedge`` must not green-light a save-our-ship soft reset
-    while real inference is advancing -- the reset rebuilds the whole pool and faults the in-flight job.
+    while real inference is advancing: the reset rebuilds the whole pool and faults the in-flight job.
     """
     pm = make_testable_process_manager()
     pm._state.last_job_pop_time = time.time() - 60

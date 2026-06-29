@@ -95,7 +95,7 @@ def test_building_the_gpu_sampler_reader_does_not_load_torch() -> None:
     """The GPU duty-cycle sampler runs in the orchestrator, so building its reader must not pull torch.
 
     Regression tripwire: the reader once delegated to ``get_accelerator_utilization_percent``, which gates on
-    the active torch backend and so ``import torch`` -- pulling torch into the parent and tripping a
+    the active torch backend and so ``import torch``, pulling torch into the parent and tripping a
     partial-init circular import at worker startup. Import-time guards miss it because torch only entered when
     the reader was *built* at ``start()``. NVML utilization is torch-free, so this must stay clean.
     """

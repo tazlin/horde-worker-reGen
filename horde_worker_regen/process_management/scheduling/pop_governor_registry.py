@@ -11,8 +11,8 @@ This registry is the one place that turns those scattered conditions into an obs
 Each scheduling cycle the worker reports every governor's current state as a :class:`PopGovernorReading`; the
 registry tracks, per governor, the *spell* it is currently in (when it started, why, how much longer it is
 expected to last) plus session totals (how many times it has engaged and how long it has held in aggregate).
-It emits a grep-friendly ``ENTER``/``EXIT`` log line at each spell boundary -- the contract the log-triage and
-duty-cycle tooling parse -- and exposes a snapshot the TUI renders live.
+It emits a grep-friendly ``ENTER``/``EXIT`` log line at each spell boundary (the contract the log-triage and
+duty-cycle tooling parse) and exposes a snapshot the TUI renders live.
 
 The registry is pure beyond its tracking state and its injected logger: the caller supplies ``now`` and the
 readings, so it has no clock or I/O of its own and is fully table-testable. All callers run on the single

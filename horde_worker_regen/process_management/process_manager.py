@@ -173,8 +173,8 @@ class SystemResources:
         """Detect system resources via psutil and hordelib's backend-agnostic accelerator inventory.
 
         Device discovery goes through the out-of-process accelerator probe rather than ``torch.cuda``
-        directly, for two reasons. It stays backend-agnostic (every ComfyUI-supported backend -- CUDA/ROCm,
-        Intel XPU, Apple MPS, DirectML, CPU -- populates the device map; a bare ``torch.cuda.device_count()``
+        directly, for two reasons. It stays backend-agnostic (every ComfyUI-supported backend (CUDA/ROCm,
+        Intel XPU, Apple MPS, DirectML, CPU) populates the device map; a bare ``torch.cuda.device_count()``
         loop would yield no devices on non-CUDA backends). And it keeps this process torch-free: detect()
         runs in the long-lived orchestrator, enumerating accelerators loads torch (~500MB), so
         :func:`probe_accelerators` pays that cost in a short-lived subprocess that frees it on exit.
@@ -989,8 +989,8 @@ class HordeWorkerProcessManager:
 
         Resolves each driven card's effective config and concurrency sizes, creates (or reuses an injected)
         :class:`MultiprocessingPrimitives` sized per card, and assembles one :class:`CardRuntime` per card.
-        Masking is enabled only when there is a real choice to make -- more than one card, or an explicit
-        ``gpu_device_indices`` selection -- so a default single-GPU host stays unmasked and byte-identical.
+        Masking is enabled only when there is a real choice to make: more than one card, or an explicit
+        ``gpu_device_indices`` selection, so a default single-GPU host stays unmasked and byte-identical.
         A host with no detected accelerator (CPU/dry-run) yields a single notional card 0.
 
         Args:
@@ -2069,8 +2069,8 @@ class HordeWorkerProcessManager:
     def _build_stage_age_line(self) -> str | None:
         """A one-line per-stage census with the oldest age in each stage, or None when nothing is tracked.
 
-        Ordered along the pipeline so a backlog that is *aging* (not just deep) -- e.g. jobs sitting in
-        SAFETY_CHECKING while inference keeps finishing -- is obvious. Emitted only inside the already-rate-
+        Ordered along the pipeline so a backlog that is *aging* (not just deep), e.g. jobs sitting in
+        SAFETY_CHECKING while inference keeps finishing, is obvious. Emitted only inside the already-rate-
         limited status dump, so it adds no new log frequency.
         """
         summary = self._job_tracker.stage_age_summary()

@@ -42,7 +42,7 @@ _RESOURCE_FAILURE_MARKERS: tuple[str, ...] = (
 Covers torch CUDA/cuBLAS allocator messages, the AMD/HIP equivalent, the chaos harness's injected
 out-of-memory marker (``FAULT_INFO_PREFIX`` + ``FaultKind.OOM`` in ``fault_injection``), and the
 swallowed-OOM surface form (hordelib's ``no images were produced`` when ComfyUI caught the driver OOM and
-the pipeline yielded no output node) -- see the module docstring for why the empty-result case is folded
+the pipeline yielded no output node); see the module docstring for why the empty-result case is folded
 in on a multi-process worker."""
 
 

@@ -1,7 +1,7 @@
 """Launch and supervise a benchmark ramp as a subprocess for the TUI.
 
 The TUI cannot run a benchmark in-process: a real ramp needs exclusive use of the GPU (so a running worker is
-first drained and scaled to zero inference processes -- or, as a backstop, stopped -- to free the card) and
+first drained and scaled to zero inference processes (or, as a backstop, stopped) to free the card) and
 spawns its own level subprocesses. So the supervisor launches ``horde-benchmark ramp``
 as a child process pointed at a known output directory, and follows its progress by tailing that run's
 ``progress.jsonl``, the same durable stream the CLI writes (see

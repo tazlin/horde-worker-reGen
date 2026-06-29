@@ -4,7 +4,7 @@ Reading the accelerator inventory (each device's index, name, and total VRAM) go
 backend-agnostic :func:`hordelib.utils.torch_memory.enumerate_accelerators`. That call has to interrogate
 the active GPU backend, which loads torch (~500MB RSS) into whatever process makes it. The worker's
 long-lived orchestrator process and the interactive config wizard are deliberately torch-free (see
-``AGENTS.md`` -- only the inference/safety children, which need torch for their core function, should pay
+``AGENTS.md``; only the inference/safety children, which need torch for their core function, should pay
 that cost), so they must not enumerate accelerators in-process.
 
 This module runs the enumeration in a short-lived subprocess and returns the result as plain validated
@@ -15,7 +15,7 @@ supports (CUDA/ROCm, Intel XPU, Apple MPS, DirectML, CPU), not just NVIDIA.
 Beyond the inventory, the subprocess also measures two VRAM figures the streaming forecast needs: the
 *first/sole* process's context cost (the one-time CUDA runtime allocation plus one context), and the
 *marginal* cost of each additional sibling context. The marginal is measured directly by bringing up a
-second context-holding process and reading the device-wide used delta -- so the forecast can size
+second context-holding process and reading the device-wide used delta, so the forecast can size
 ``free_after_model_evict`` from the real per-process cost instead of charging the whole one-time-inclusive
 overhead per process (which over-counts badly on a big card and is what wedged a 24GB worker). The delta is
 only visible cross-process where the platform reports true device-wide VRAM; Linux does, Windows WDDM does
@@ -37,7 +37,7 @@ from pydantic import BaseModel
 _RESULT_PREFIX = "ACCEL_PROBE_JSON:"
 
 # A minimal second process that materialises *its own* backend context on the same device (a real kernel
-# launch, so the runtime/context fully allocates -- enumeration alone does not), announces it, then idles
+# launch, so the runtime/context fully allocates (enumeration alone does not), announces it, then idles
 # until the probe kills it. Run via ``python -c`` from the probe (below), so it stays a plain source string.
 _HOLDER_SOURCE = """
 import sys
@@ -96,7 +96,7 @@ try:
         _block = torch.ones((512, 512), device=_dev)
         float((_block @ _block).sum().item())
 
-    # First/sole context: materialise this process's context and read device-wide used -- the one-time runtime
+    # First/sole context: materialise this process's context and read device-wide used (the one-time runtime
     # cost plus one context (plus any fixed device baseline, e.g. a desktop compositor), the figure that
     # survives at sole residency, which the forecast subtracts from total VRAM for free_if_alone.
     try:
@@ -107,7 +107,7 @@ try:
 
     # Marginal cost of an *additional* sibling context: bring up a second process that materialises its own
     # context, then measure the device-wide used delta. The one-time runtime (and any device baseline) is
-    # already counted, so the delta is what each extra inference process really costs -- the per-context figure
+    # already counted, so the delta is what each extra inference process really costs (the per-context figure
     # the forecast multiplies by (process count - 1) for free_after_model_evict, instead of charging the whole
     # one-time-inclusive overhead per process. Best-effort: any failure leaves it 0 and the worker falls back.
     _marginal_mb = 0
@@ -192,7 +192,7 @@ def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelera
     """Return the machine's accelerators by enumerating them in a short-lived subprocess.
 
     Keeps the calling (orchestrator/wizard) process torch-free: the subprocess loads torch, answers, and
-    exits. Never raises -- any failure (no backend, subprocess error or timeout, malformed output) is
+    exits. Never raises: any failure (no backend, subprocess error or timeout, malformed output) is
     logged at debug and yields an empty list, so the caller degrades to "no devices detected" rather than
     crashing. The subprocess reuses this interpreter (``sys.executable``), so it sees the same hordelib.
     """

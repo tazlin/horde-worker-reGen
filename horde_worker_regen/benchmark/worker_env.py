@@ -5,7 +5,7 @@ The harness builds *synthetic* bridge data and forces ``_loaded_from_env_vars`` 
 run, by contrast, sets ``AIWORKER_CACHE_HOME`` from the config's ``cache_home`` at startup
 (``horde_worker_regen.load_env_vars``). Without that, the real inference children fall back to
 hordelib's CWD-relative ``./models`` weights root (``UserSettings.get_model_directory``), find no
-checkpoints, and exit with "No models available" -- wedging the first level until its timeout.
+checkpoints, and exit with "No models available", wedging the first level until its timeout.
 
 Calling :func:`ensure_worker_env` once at the top of the benchmark process tree (CLI and the
 isolated level runner) restores parity with a real worker run, so the benchmark measures the user's

@@ -6,8 +6,8 @@ linking a reader to a doc page over duplicating it here.
 
 > [!IMPORTANT]
 > **Update the docs in the same change that alters behavior. This is not optional.**
-> Any substantial change -- a new module, a new config field, a changed scheduling/budget/recovery rule,
-> a new IPC message or protocol bump, a renamed entry point -- MUST land with the matching `docs/` edits in
+> Any substantial change (a new module, a new config field, a changed scheduling/budget/recovery rule,
+> a new IPC message or protocol bump, a renamed entry point) MUST land with the matching `docs/` edits in
 > the *same* commit/PR. Treat stale docs as a bug in the change, not a follow-up.
 > - **Narrative docs are hand-written and will silently rot** unless you edit them: the `explanation/`,
 >   `how-to/`, `tutorials/`, and `reference/` pages (e.g. `explanation/performance_and_backpressure.md`,
@@ -133,7 +133,7 @@ uv run pytest tests/process_management/
 ## Gotchas
 
 - **The orchestrator must stay torch-free.** The main process orchestrates; it never runs inference, so
-  it must never load torch (~500MB RSS) -- only the inference/safety/download children should. Two traps:
+  it must never load torch (~500MB RSS); only the inference/safety/download children should. Two traps:
   (1) `hordelib.api` is a convenience facade that *eagerly* loads torch, so importing *any* symbol from it
   (even a pure-Python helper like `estimate_job_burden`) drags torch in. In parent/host/planning code,
   import from the torch-free *origin* submodule instead: `hordelib.feature_impact` (burden math),

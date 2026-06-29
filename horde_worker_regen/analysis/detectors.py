@@ -60,7 +60,7 @@ _SERVER_SLOW_ABORT_RE = re.compile(r"took too long to process and has been abort
 _SLOWDOWN_GRADE_RE = re.compile(r"is ([\d.]+)x its expected sampling time")
 # Each successful submit reports how long the job spent between pop and submit, and how long generation
 # itself took. A large gap between the two means jobs aged in the pipeline (typically the single safety
-# stage backing up), not in generation -- a different cause, and fix, than a genuinely slow GPU.
+# stage backing up), not in generation: a different cause, and fix, than a genuinely slow GPU.
 _SUBMIT_LATENCY_RE = re.compile(r"Job popped ([\d.]+) seconds ago and took ([\d.]+) to generate")
 # The wall-clock the safety stage took per check; a high average is the safety stage being the pipeline
 # bottleneck (e.g. CPU safety with safety_on_gpu off).
@@ -92,7 +92,7 @@ _WHOLE_CARD_WEDGE_RE = re.compile(r"whole-card residency stuck: cannot reach sol
 _WHOLE_CARD_NONHEAD_RE = re.compile(r"whole-card residency is held for non-head model")
 # A whole-card residency being established: the worker reserved the device for a model, tearing the process
 # pool down to fewer contexts (and cycling safety off-GPU). One is routine; many in a session is reservation
-# churn -- the signature of models being driven onto the whole-card path that do not need it (on a high-VRAM
+# churn: the signature of models being driven onto the whole-card path that do not need it (on a high-VRAM
 # card a model whose weights are a small fraction of total VRAM co-resides, so a teardown demand for it usually
 # means the per-context overhead was over-counted). The phrase is the worker's establish-announce line.
 _WHOLE_CARD_ESTABLISH_RE = re.compile(r"Whole-card residency: reserving the device for")
@@ -759,7 +759,7 @@ def detect_safety_stage_stall(context: SessionContext) -> list[Finding]:
 
     A job sent to safety whose result is lost is invisible to the orchestrator and sits in SAFETY_CHECKING
     forever; the backlog pins pipeline slots and, with the queue unable to drain, latches the wedge that
-    ends in dropped jobs. The worker now recovers it (re-check), or -- when safety cannot be relied on --
+    ends in dropped jobs. The worker now recovers it (re-check), or (when safety cannot be relied on),
     faults it with no image and soft-pauses pops. This surfaces that recovery so a maintenance episode is
     attributed to the *downstream safety stall* rather than to inference. Backpressure alone (the worker
     correctly throttling intake to a slow safety stage) is the benign, lower-severity case.
@@ -834,7 +834,7 @@ def detect_whole_card_convergence_wedge(context: SessionContext) -> list[Finding
 
     The wedge fingerprint: a heavy whole-card head (e.g. Flux fp8) is pre-staged into a spare process, but an
     idle sibling still holds a model that is queued *behind* the head, and the live process count never reaches
-    the forecast target -- so the pre-staged head is deferred every tick until the recovery supervisor
+    the forecast target, so the pre-staged head is deferred every tick until the recovery supervisor
     soft-resets the pools (faulting the head and forcing process recoveries). The whole-card convergence
     teardown is supposed to stop exactly that idle sibling (sparing only the head's holder), so reaching this
     state means the convergence shrink did not engage for this process/queue shape. It is distinct from a
@@ -878,7 +878,7 @@ def detect_whole_card_nonhead_residency_starvation(context: SessionContext) -> l
     it, so the real head has no resident process and cannot load while the card is reserved for a job whose
     turn has not come (held until that job drains). The head parks, the queue deadlocks, and the recovery
     supervisor soft-resets and faults the backlog. The whole-card residency is meant to be granted only to the
-    head, so a firing here means a non-head model claimed the card -- distinct from a genuine VRAM-budget
+    head, so a firing here means a non-head model claimed the card, distinct from a genuine VRAM-budget
     over-deferral, which this would otherwise be mistaken for (the card looks idle with ample free VRAM).
     """
     starvations = _matching(context.session.records, _WHOLE_CARD_NONHEAD_RE)
@@ -960,8 +960,8 @@ def detect_whole_card_residency_churn(context: SessionContext) -> list[Finding]:
             ),
             remediation=(
                 "Confirm the reserved models are genuinely card-filling. If they are not (a small-weight model "
-                "on a large card), make sure the per-additional-context VRAM cost is measured -- the probe's "
-                "second-context delta or a clean all-idle baseline -- so the structural free-VRAM floor is not "
+                "on a large card), make sure the per-additional-context VRAM cost is measured (the probe's "
+                "second-context delta or a clean all-idle baseline), so the structural free-VRAM floor is not "
                 "the one-time runtime cost multiplied by the process count. A correctly measured marginal lets "
                 "such a model co-reside instead of reserving the card."
             ),

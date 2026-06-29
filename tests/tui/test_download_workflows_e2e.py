@@ -352,7 +352,7 @@ def test_benchmark_download_delegate_starts_a_stopped_worker_into_a_download_onl
     """With the worker stopped, the delegate starts it GPU-idle and queues the hold + request for the pipe.
 
     The benchmark never self-downloads: a stopped worker is brought up into a download-only hold (so the GPU
-    stays uncommitted) and the chosen models -- with aux -- are queued to be sent once its control pipe is up.
+    stays uncommitted) and the chosen models (with aux) are queued to be sent once its control pipe is up.
     """
     fake, app = _make_app(tmp_path, auto_start=True)
     # The app is not mounted here, so on_mount's auto-start has not run: the worker is not live yet.

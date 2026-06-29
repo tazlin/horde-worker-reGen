@@ -3,7 +3,7 @@
 Two subsystems must agree on which models are "very large": the scheduler's concurrency/whole-card residency
 machinery (a large model never co-samples and may claim the card) and the job popper's large-model pop
 limiters (throttle switching to a *different* large model, and a re-entry cooldown after they drain). Keeping
-the classification in one torch-free module is what stops the two halves from drifting apart -- a model the
+the classification in one torch-free module is what stops the two halves from drifting apart: a model the
 scheduler treats as whole-card but the popper offers freely would defeat the limiter, and vice versa.
 
 The classification is by baseline (and the named VRAM-heavy checkpoints), not by a live VRAM measurement, so

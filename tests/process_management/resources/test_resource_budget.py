@@ -226,7 +226,7 @@ class TestPreloadBudgetGate:
         )
         monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
         # Reclaim always "succeeds", so the RAM branch defers every tick and the existing best-effort
-        # admit (which requires reclaim to be exhausted) never triggers -- a perpetual wedge.
+        # admit (which requires reclaim to be exhausted) never triggers: a perpetual wedge.
         monkeypatch.setattr(scheduler, "unload_models", lambda *a, **k: True)
 
         # First tick: the head cannot be admitted and the wedge begins; the starvation clock starts.

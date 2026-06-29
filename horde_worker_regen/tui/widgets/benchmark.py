@@ -791,7 +791,7 @@ class BenchmarkView(VerticalScroll):
         Three states, not two: a level that fits this machine but is missing models, controlnet checkpoints,
         or annotators is not "ready" (it would download mid-run) nor a "skip" (it runs once fetched), so it
         reads as an actionable yellow "Download first". A genuine skip is a prediction, not a failure, so it
-        reads grey -- yellow only when its remedy is itself a download the operator can act on (a huge-tier
+        reads grey; yellow only when its remedy is itself a download the operator can act on (a huge-tier
         checkpoint real-mode will not fetch mid-run). The full diagnostic sentence stays in the resource detail.
         """
         if row.needs_download:

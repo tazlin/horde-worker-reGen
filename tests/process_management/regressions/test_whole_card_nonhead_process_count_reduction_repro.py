@@ -32,8 +32,8 @@ measure the marginal falls through to ordinary model eviction instead of reservi
 
 These tests pin: the card-fraction classification (``StreamForecast.is_card_demanding``), the scheduler's
 trust gate (``_whole_card_warranted``), that the verdict-driven establish is vetoed for a card-light model
-with an unmeasured marginal, that the forecast-driven establish is likewise vetoed, and -- when a teardown
-*is* warranted -- that only the head may claim the card (the ``is_head_blocker`` backstop). The dispatch
+with an unmeasured marginal, that the forecast-driven establish is likewise vetoed, and (when a teardown
+*is* warranted) that only the head may claim the card (the ``is_head_blocker`` backstop). The dispatch
 diagnostic attribution is pinned too.
 """
 
@@ -278,7 +278,7 @@ class TestVerdictDrivenEstablishGatedByWarrant:
 
     def _run(self, *, marginal_mb: float | None) -> tuple[InferenceScheduler, ImageGenerateJobPopResponse]:
         # Four idle contexts pin device-free low; with no resident models, gentle reclaim frees nothing, so a
-        # budget-rejected head reaches the context-reduction sizing -- the verdict-driven establish path. The
+        # budget-rejected head reaches the context-reduction sizing: the verdict-driven establish path. The
         # per-context cost is pinned directly (rather than via captured baselines) so the test isolates the
         # warrant gate: ``None`` is the host that could not measure the marginal.
         process_map = _idle_context_map(_LIVE_CONTEXT_COUNT, free_mb=4709.0)

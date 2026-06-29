@@ -4,7 +4,7 @@ A 24 GB RTX 4090 on Linux running four inference processes with several resident
 card and then sit in a permanent queue deadlock ("Model causing deadlock: AlbedoBase XL 3.1", "Scale down:
 no idle inference process available to stop right now") until the supervisor shuts it down. No fault, no
 OOM, just a stall: the streaming forecast for the head model reports ``needs_exclusive=True,
-needs_teardown=True`` -- it wants an *idle sibling inference process stopped* to reclaim a CUDA context --
+needs_teardown=True``; it wants an *idle sibling inference process stopped* to reclaim a CUDA context,
 but when every process is kept resident there is no idle process to stop and the demanded remedy can never
 run.
 
@@ -14,7 +14,7 @@ once at startup from the accelerator probe, which records a *single fresh proces
 because the first process to touch the device also pays a large one-time CUDA runtime/kernel allocation that
 every later process *shares*. The forecast then treats that figure as a strictly per-process cost and
 multiplies it by the live process count: ``free_after_model_evict = total - N * overhead``. With ``N=4`` that
-is ``24074 - 4*4266 = 7010 MB`` -- yet the device's *measured* residency with all four idle contexts and no
+is ``24074 - 4*4266 = 7010 MB``; yet the device's *measured* residency with all four idle contexts and no
 models loaded is only ``5440 MB`` used (``~1360 MB`` marginal per process), i.e. ``18634 MB`` genuinely free.
 The 3x over-count collapses the forecast's view of reclaimable VRAM, flipping a model that is servable by
 evicting a sibling *model* into one that demands stopping a sibling *process*, and the worker wedges.
@@ -60,7 +60,7 @@ _NUM_INFERENCE_PROCESSES = 4
 
 _IDLE_DEVICE_USED_ALL_CONTEXTS_MB = 5440
 """Device-wide used VRAM with all four CUDA contexts materialised and *no model loaded*. This is the real
-cost of the contexts, ~1360 MB marginal per process -- the figure the forecast's ``free_after_model_evict``
+cost of the contexts, ~1360 MB marginal per process: the figure the forecast's ``free_after_model_evict``
 should reflect."""
 
 _PROBE_SINGLE_PROCESS_OVERHEAD_MB = 4266
@@ -73,7 +73,7 @@ _SDXL_WEIGHTS_MB = 4900.0
 """``weights ~4900 MB``, the AlbedoBase XL 3.1 checkpoint's stream-forecast weight estimate."""
 
 _SDXL_SAMPLING_PEAK_MB = 17128.0
-"""Chosen so the activation-inclusive reserve is ``17128 - 4900 = 12228 MB`` -- the reserve the
+"""Chosen so the activation-inclusive reserve is ``17128 - 4900 = 12228 MB``: the reserve the
 deadlock-causing forecast assembles ("weights ~4900 MB + 12228 MB reserve")."""
 
 _BASE_INFERENCE_RESERVE_MB = 2000.0
@@ -161,7 +161,7 @@ class TestProbeOverheadTeardownWedge:
         ``high_memory_mode`` keeps every process resident, so ``requires_sibling_teardown`` /
         ``needs_exclusive_residency`` (both of which can only be satisfied by stopping an *idle* sibling
         process) are unsatisfiable and wedge the worker. With the device's true idle residency the model fits
-        once a sibling model is evicted -- a remedy ``high_memory_mode`` permits -- so neither teardown flag
+        once a sibling model is evicted, a remedy ``high_memory_mode`` permits, so neither teardown flag
         should be set. They are today, purely because the probed overhead understates the reclaimable VRAM.
         """
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _SDXL_WEIGHTS_MB)

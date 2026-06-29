@@ -69,7 +69,7 @@ _VRAM_RESERVE_MB = 3096.0
 _RAM_RESERVE_MB = 8192.0
 
 # A card-filling EXTRA_LARGE checkpoint (whole-card by name) and a moderate-weight SDXL whose activation reserve
-# can balloon at a large batch/resolution -- the two model classes the grant decision must tell apart.
+# can balloon at a large batch/resolution: the two model classes the grant decision must tell apart.
 _FLUX_MODEL = "Flux.1-Schnell fp8 (Compact)"  # EXTRA_LARGE by name (consts.VRAM_HEAVY_MODELS)
 _FLUX_WEIGHTS_MB = 11500.0
 _FLUX_ESTABLISH_RESERVE_MB = 4646.0
@@ -484,7 +484,7 @@ class TestMakingRoomNeverStrandsInflight:
     async def test_head_of_queue_eviction_spares_an_in_progress_model(self) -> None:
         """The last-resort head-of-queue reclaim never evicts a live in-progress model.
 
-        A reclaim that unloaded an in-flight job's model would strand that job too -- a second wedge the room-making
+        A reclaim that unloaded an in-flight job's model would strand that job too: a second wedge the room-making
         path must never cause.
         """
         # Process one is the head's loader (spared as the target); process two runs an in-progress SDXL job;

@@ -1,11 +1,11 @@
 """Regression tests for the safety-orphan wedge and the safety-before-submit invariant.
 
 The safety orchestrator only ever acts on ``jobs_pending_safety_check``. A job already handed to the
-safety process that never returns a verdict -- because the safety process was replaced or a result message
-was dropped -- is invisible to the orchestrator: nothing re-checks it, nothing clears it from
+safety process that never returns a verdict, because the safety process was replaced or a result message
+was dropped, is invisible to the orchestrator: nothing re-checks it, nothing clears it from
 ``jobs_being_safety_checked``. Stranded jobs pin pipeline slots; with the queue then unable to drain the
 worker can latch a structural deadlock, soft-reset its pools, and give up on the pending inference
-backlog -- an escalating chain that ends in horde-forced maintenance.
+backlog: an escalating chain that ends in horde-forced maintenance.
 
 These tests cover the watchdog fix and the overriding invariant: an image is **never** submitted unless
 the safety process actually returned a verdict for it.

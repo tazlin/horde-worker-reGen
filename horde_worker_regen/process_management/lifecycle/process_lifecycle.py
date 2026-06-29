@@ -67,7 +67,7 @@ CRASH_LOOP_MAX_START_FAILURES: int = 3
 This is the rate-independent companion to the sliding-window breaker above. A slot that *never*
 advances past ``PROCESS_STARTING`` before dying has not proven it can initialise at all (a broken
 dependency, a missing model, an import error). Such a failure is deterministic, so each restart costs
-the full, slow cold-start before failing again -- and if that cold-start is slower than
+the full, slow cold-start before failing again, and if that cold-start is slower than
 ``CRASH_LOOP_WINDOW_SECONDS / CRASH_LOOP_MAX_REPLACEMENTS`` the window breaker can never accumulate
 enough replacements *within the window* to trip (the early ones age out), so the slot would respawn
 forever. Counting consecutive start-failures regardless of spacing catches exactly that case. The
@@ -794,7 +794,7 @@ class ProcessLifecycleManager:
 
         Args:
             target_count: The desired inference-process count for the scoped pool.
-            device_index: When given, grow/shrink only that card's pool toward ``target_count`` -- new
+            device_index: When given, grow/shrink only that card's pool toward ``target_count``; new
                 processes spawn on that card and only idle processes on that card are stopped (the per-card
                 lever a whole-card residency uses to reduce one card's live contexts on a multi-GPU host).
                 When None, the worker-wide pool, bounded by the launched-process ceiling (the single-GPU /
@@ -804,7 +804,7 @@ class ProcessLifecycleManager:
                 whole-card residency means the heavy head owns the card and the queued siblings deliberately
                 wait (their models reload once the head drains, see
                 :meth:`InferenceScheduler._restore_siblings_after_whole_card`). Only the residency holder (the
-                process the head is staged/resident on) is spared -- otherwise a sibling holding a model queued
+                process the head is staged/resident on) is spared; otherwise a sibling holding a model queued
                 *behind* the head pins the count above the target and the residency can never converge, wedging
                 the queue. Busy processes are still never killed (the victim selection skips them), so live work
                 is unaffected. Leave None for the ordinary benchmark / pressure shrink.
@@ -861,7 +861,7 @@ class ProcessLifecycleManager:
         The residency holder is whichever inference process the heavy head is staged or resident on (its
         ``loaded_horde_model_name`` is ``whole_card_model``; a ``PRELOADED_MODEL`` head sets that name). Unlike
         :meth:`get_processes_with_model_for_queued_job`, an idle sibling holding some *other* queued model is
-        deliberately left stoppable -- collapsing to sole residency is the whole point, and that sibling's
+        deliberately left stoppable: collapsing to sole residency is the whole point, and that sibling's
         queued job waits and reloads after the head drains. When ``device_index`` is set the shrink is scoped
         to one card, so every inference process on another card is also off-limits.
         """
@@ -1026,7 +1026,7 @@ class ProcessLifecycleManager:
 
         Recovery is gated on *intent*, not on the last reported state. A child reaches ``PROCESS_ENDED``
         both when the parent asked it to (shutdown/scale-down/replacement) and when it caught a fatal
-        error and exited via its own graceful shutdown path -- for example a ``PRELOAD_MODEL`` handler
+        error and exited via its own graceful shutdown path, for example a ``PRELOAD_MODEL`` handler
         that raised, which sets the child's end flag and emits ``PROCESS_ENDED`` indistinguishably from
         an intended end (an observed soak wedge: process died mid-preload, reported ``PROCESS_ENDED``,
         and was never replaced, stranding the popped job forever). Keying off intent rather than state
@@ -1320,7 +1320,7 @@ class ProcessLifecycleManager:
         no exception and no fault ``info`` for the ordinary classifier to read. The low-RAM check is what
         distinguishes this from the worker's own hang-kill (also ``-9``) on a healthy host: when RAM is fine
         a ``-9`` stays an ordinary crash/hang. Reads the configured floor defensively (a partially-mocked or
-        older config falls back to the module defaults) and never raises -- any error reads False, leaving
+        older config falls back to the module defaults) and never raises; any error reads False, leaving
         the slot on its ordinary crash path.
         """
         raw_exitcode = getattr(process_info.mp_process, "exitcode", None)
@@ -1395,7 +1395,7 @@ class ProcessLifecycleManager:
         # Decide retryability against the incident state *before* this strike is recorded: a lone transient
         # stall (no incident yet) still earns its one ordinary retry, but a stall while a download outage is
         # already active is faulted terminally below instead of requeued straight back into the same failing
-        # download -- which the logs show just stalls and tears the slot down a second time (every doomed job
+        # download, which the logs show just stalls and tears the slot down a second time (every doomed job
         # was costing two process recoveries, not one).
         aux_stall_retryable = not self._state.lora_download_backoff.is_escalation_active(time.time())
 
@@ -1432,7 +1432,7 @@ class ProcessLifecycleManager:
             # by max_inference_attempts) rather than faulted outright. The crash gives no resource signal,
             # so it takes the ordinary retry, not the degraded path. The exception is an aux-download stall
             # during an active download outage: an immediate retry only re-enters the same failing download
-            # and tears down a second slot, so it is faulted terminally (the horde reassigns the job) -- the
+            # and tears down a second slot, so it is faulted terminally (the horde reassigns the job); the
             # job outcome is the same as the eventual out-of-attempts fault, at half the process churn.
             self._job_tracker.handle_job_fault_now(
                 faulted_job=job_to_remove,
@@ -1479,7 +1479,7 @@ class ProcessLifecycleManager:
         if failed_model is not None:
             # The slot reported it could not load this model, then exited cleanly (its backend may be in an
             # indeterminate state). The fault belongs to the *model*, not the slot, so this is labelled a
-            # model-load failure -- not the misleading "crashed or hung" -- and is deliberately kept out of
+            # model-load failure (not the misleading "crashed or hung") and is deliberately kept out of
             # the slot crash-loop/start-failure breakers: those count *slot* sickness, and feeding a poison
             # model's failures into them would quarantine a perfectly healthy slot. The model itself is
             # quarantined by record_model_load_failure once it crosses the threshold.
@@ -1935,7 +1935,7 @@ class ProcessLifecycleManager:
         # download-and-scan window and, deliberately, throughout download-only mode. Require at least one
         # process to exist before the all-timed-out verdict can hold, and never declare it while the worker
         # is explicitly held for downloads (it runs no inference by design; the hold is the authority that
-        # this is intentional, not a wedge -- it is cleared on go-live / start).
+        # this is intentional, not a wedge; it is cleared on go-live / start).
         all_processes_timed_out = (
             bool(self._process_map)
             and not self._state.downloads_only_hold

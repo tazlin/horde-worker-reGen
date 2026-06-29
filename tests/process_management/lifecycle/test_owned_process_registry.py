@@ -132,7 +132,7 @@ def test_kill_all_owned(tmp_path: Path, sleeper: subprocess.Popen[bytes]) -> Non
 
 
 def test_kill_process_tree_kills_descendants(tmp_path: Path) -> None:
-    """kill_process_tree reaps a parent *and* its children -- the orphan source on cancel/hung-level kill.
+    """kill_process_tree reaps a parent *and* its children: the orphan source on cancel/hung-level kill.
 
     A benchmark cancel that targeted only the controller left the level runner and its GPU-resident
     worker children alive (no parent-child lifetime link under spawn on Windows). This spawns a parent

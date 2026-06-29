@@ -833,8 +833,8 @@ class HordeDownloadProcess(HordeProcess):
             return
         # Marker fast-path: when a prior process already ran every preprocessor for the pinned annotator
         # commit, the verify would boot a whole ComfyUI/torch/CUDA stack in this (otherwise offline)
-        # download process only to re-confirm the on-disk marker. Read the marker here -- import-safe, needing
-        # neither ``hordelib.initialise`` nor a GPU -- so the expensive boot is paid only when a verify is
+        # download process only to re-confirm the on-disk marker. Read the marker here (import-safe, needing
+        # neither ``hordelib.initialise`` nor a GPU), so the expensive boot is paid only when a verify is
         # genuinely due (a fresh install or an annotator pin bump). File integrity is covered separately by the
         # per-file sidecar validation that already gates ``annotators_present`` above.
         if self._annotators_verified_for_pin() is True:
@@ -1344,7 +1344,7 @@ class HordeDownloadProcess(HordeProcess):
         """
         # The boot is the dominant cost of the verify, so honor the marker before paying it: a warm marker
         # means a prior process already ran every preprocessor for this pin and ``preload_annotators`` would
-        # return immediately anyway -- but only after ``initialise`` had already booted ComfyUI. (The enqueue
+        # return immediately anyway, but only after ``initialise`` had already booted ComfyUI. (The enqueue
         # gate normally skips a warm-marker verify outright; this also protects any direct/raced caller.)
         if self._annotators_verified_for_pin() is True:
             return True

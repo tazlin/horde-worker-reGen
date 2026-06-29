@@ -9,7 +9,7 @@ pause to a long one, then resetting once downloads have been healthy for a while
 
 The state is a plain container mutated only from the single-threaded main-process scheduling loop (the
 job popper reads it, the process lifecycle writes a strike when it reaps a stuck aux-download slot), so
-it needs no locking -- the same convention the other ``WorkerState`` flags follow.
+it needs no locking; the same convention the other ``WorkerState`` flags follow.
 """
 
 from __future__ import annotations

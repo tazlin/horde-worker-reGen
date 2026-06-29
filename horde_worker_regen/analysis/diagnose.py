@@ -1,7 +1,7 @@
 """The single first-class entry point for log triage: logs in, ranked findings out.
 
-The ``horde-log diagnose`` CLI and the TUI Diagnostics tab both want the same thing -- segment a log
-path into sessions and run every detector over them -- and both want the structured
+The ``horde-log diagnose`` CLI and the TUI Diagnostics tab both want the same thing: segment a log
+path into sessions and run every detector over them, returning the structured
 :class:`~horde_worker_regen.analysis.detectors.Finding` objects, not printed text. Keeping that
 orchestration here (rather than inside the argparse layer) lets either caller import it directly
 without shelling out, and guarantees they cannot drift apart: the CLI renders what this returns, the

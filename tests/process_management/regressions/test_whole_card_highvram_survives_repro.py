@@ -2,7 +2,7 @@
 
 The failure mode this guards: on a 24 GB card an ``Flux.1-Schnell fp8 (Compact)`` head reserves the whole
 device, collapsing the live inference-process count to one and cycling safety off the GPU, even though the
-card has ample headroom -- free VRAM sits at 15-16 GB while it holds sole residency, against an fp8 weight
+card has ample headroom: free VRAM sits at 15-16 GB while it holds sole residency, against an fp8 weight
 footprint of ~11.5 GB. A small-fraction model on a large card handed the card it does not need produces
 sustained reservation churn (reload + safety cycling) that caps throughput.
 
@@ -31,8 +31,8 @@ Behavior these tests pin:
     teardown + respawn each time the heavy head cycles. (The concurrency overlap gate, which already forbids
     an EXTRA_LARGE job from sharing a busy card, keeps two heavy jobs from sampling at once, so preserving the
     context is safe.)
-  * The behavior stays hardware-relative: the same fp8 weights on a 16 GB card -- where the budget genuinely
-    leaves no room for a second context -- still collapse to sole residency.
+  * The behavior stays hardware-relative: the same fp8 weights on a 16 GB card, where the budget genuinely
+    leaves no room for a second context, still collapse to sole residency.
   * The budget math itself is willing: with ``wants_whole_card`` cleared, the identical forecast already sizes
     two resident contexts. The collapse-to-one is purely the intent override discarding that headroom.
 
@@ -101,7 +101,7 @@ class TestHighVramWholeCardPreservesProcesses:
         Weights 11.5 GB + reserve 2.5 GB = 14 GB leaves ~10 GB on a 24 GB card. Even charged the pessimistic
         ~3.4 GB marginal, that holds the loading process's full first context (4.27 GB) plus one additional
         sibling context: a residency target of two. The current ``wants_whole_card`` collapse hard-returns
-        one, tearing down a sibling process the card has room for -- the reservation churn this guards against.
+        one, tearing down a sibling process the card has room for: the reservation churn this guards against.
         """
         forecast = _flux_forecast(total_vram_mb=_CARD_24GB_MB, wants_whole_card=True)
 
@@ -125,7 +125,7 @@ class TestHighVramWholeCardPreservesProcesses:
     def test_flux_fp8_on_16gb_still_collapses_to_sole_residency(self) -> None:
         """Guard: on a 16 GB card the same fp8 weights genuinely leave no room, so one process is correct.
 
-        The desired fix must stay hardware-relative -- it preserves processes only where the budget proves
+        The desired fix must stay hardware-relative: it preserves processes only where the budget proves
         they fit. Here weights 11.5 GB + reserve 2.5 GB = 14 GB leaves ~2.4 GB, below even the first context,
         so sole residency is right and must be unchanged.
         """

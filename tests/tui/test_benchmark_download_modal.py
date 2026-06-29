@@ -1,7 +1,7 @@
 """Pilot tests for the benchmark download modal: plan rendering, live-worker overlay, and delegation.
 
 Drives the real :class:`BenchmarkDownloadModal` under Textual's ``run_test``: the plan subprocess is faked so
-no real benchmark runs. The modal is confirmation-only -- it never downloads in-process -- so the tests assert
+no real benchmark runs. The modal is confirmation-only (it never downloads in-process), so the tests assert
 that the plan reflects a live worker's authoritative state and that confirming hands the missing models to the
 download delegate (the worker's own orchestration).
 """

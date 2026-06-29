@@ -2,12 +2,12 @@
 
 The shape of the wedge, on a single 24GB card with ``whole_card_exclusive_residency`` enabled:
 
-  * The head of the queue is a heavy Flux fp8 job whose forecast is ``needs_exclusive_residency`` -- it must
+  * The head of the queue is a heavy Flux fp8 job whose forecast is ``needs_exclusive_residency``; it must
     take the card (evict sibling models, sample alone), so the residency machine pre-stages it into a spare
     process's RAM and then tries to *converge* to the forecast's budget target by stopping the excess idle
     siblings. On this 24GB box the target is two processes (the Flux holder plus one idle context the card has
     room for); the loop must stop the siblings beyond that.
-  * Behind the head, the queue still holds ordinary SDXL jobs -- and the excess idle sibling processes are
+  * Behind the head, the queue still holds ordinary SDXL jobs; and the excess idle sibling processes are
     still resident with exactly those models.
 
 Originally ``_converge_whole_card_residency`` asked the *generic* ``scale_inference_processes`` to reduce the
@@ -22,7 +22,7 @@ lapsed, soft-resetting the pools, faulting the Flux job, and forcing process rec
 The fix: ``_converge_whole_card_residency`` now tells the scale-down it is a whole-card collapse by passing
 ``whole_card_model``, which narrows the teardown-exclusion set to spare only the head's holder (and other
 cards), not every idle queued-model sibling. Whole-card residency means the heavy head owns the card's
-sampling and the queued siblings beyond the budget target deliberately wait -- their jobs reload once the head
+sampling and the queued siblings beyond the budget target deliberately wait; their jobs reload once the head
 drains. Busy processes are still never torn down.
 
 These tests pin that fixed behaviour: the whole-card-aware shrink reaches the budget target even when the
@@ -132,9 +132,9 @@ def _flux_whole_card_forecast(*, free_now_mb: float) -> StreamForecast:
 
     ``wants_whole_card`` no longer collapses ``max_resident_processes()`` straight to 1: the depth is the same
     budget arithmetic an ordinary model uses (total - weights - reserve, against the per-context overhead),
-    which on this 24GB card with the ~11.5GB fp8 weights leaves room for one idle sibling context -- a target
-    of two. ``free_now_mb`` controls whether the card reads drained (so ``fits_weights_now`` -- the final
-    teardown-exhausted gate -- can pass once the count is at target).
+    which on this 24GB card with the ~11.5GB fp8 weights leaves room for one idle sibling context: a target
+    of two. ``free_now_mb`` controls whether the card reads drained (so ``fits_weights_now``, the final
+    teardown-exhausted gate, can pass once the count is at target).
     """
     return StreamForecast(
         weights_mb=_FLUX_WEIGHTS_MB,
@@ -351,7 +351,7 @@ class TestScaleDownProtectsQueuedSiblingModel:
     async def test_busy_sibling_is_never_the_victim(self) -> None:
         """GREEN guard: convergence must never stop a *busy* process even when it would help reach target.
 
-        Not a wedge to fix -- a sanity check that the fix for the queued-model case must keep: a process
+        Not a wedge to fix; a sanity check that the fix for the queued-model case must keep: a process
         mid-inference is never a teardown victim, so a reduction request that can only be satisfied by killing
         a busy process correctly makes no progress (the in-flight job drains first).
         """
@@ -429,7 +429,7 @@ class TestConvergenceLoopWedge:
         a genuine teardown for the convergence loop the pool starts with *more* siblings than that: the loop
         must stop one to reach the target. Each entry of ``sibling_models`` is one idle sibling process (a model
         name pins it to a queued job; None leaves it model-free). The wedge fires when every excess sibling
-        holds a *queued* model -- the generic scale-down would protect them all and pin the count above target.
+        holds a *queued* model; the generic scale-down would protect them all and pin the count above target.
         """
         flux_holder = make_mock_process_info(4, model_name=_FLUX_MODEL, state=holder_state)
         siblings = [
@@ -464,7 +464,7 @@ class TestConvergenceLoopWedge:
         Three processes (the Flux holder plus two idle siblings, each holding a model still queued behind the
         head) against a budget target of two: the loop must stop one queued-model sibling. The pre-fix generic
         shrink protected *every* queued-model sibling, so the count stayed at 3 > target and
-        ``_whole_card_teardown_exhausted`` never returned True -- the exact state that wedged the queue. The
+        ``_whole_card_teardown_exhausted`` never returned True: the exact state that wedged the queue. The
         whole-card-aware shrink now spares only the head's holder, so it reaches the target.
         """
         scheduler, process_map, job_tracker, forecast = self._staged_wedge(

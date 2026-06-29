@@ -3,7 +3,7 @@
 Deterministic, GPU-free regression tests for the ``cache_home`` propagation fix and the
 no-local-models pre-flight. The bug: the benchmark never set ``AIWORKER_CACHE_HOME``, so real
 inference children resolved hordelib's CWD-relative ``./models`` fallback, found no checkpoints,
-and crash-looped with "No models available" -- wedging the first level until its timeout.
+and crash-looped with "No models available", wedging the first level until its timeout.
 """
 
 from __future__ import annotations

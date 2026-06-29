@@ -1,7 +1,7 @@
 """Background GPU core-utilization sampling for the benchmark.
 
 The benchmark measures *sampling rate* (it/s) while a job is on the GPU, but that says
-nothing about how much of the wall clock the GPU is actually busy -- the gaps *between*
+nothing about how much of the wall clock the GPU is actually busy; the gaps *between*
 jobs (VAE decode, post-processing, encode, IPC hand-off, scheduling latency) are exactly
 where uptime is lost. This sampler polls the device's core-utilization percentage on a
 background thread for the duration of a run, so the report can state a GPU duty cycle.
@@ -10,7 +10,7 @@ Utilization is read through hordelib's NVML helper
 (:func:`hordelib.utils.nvml.get_device_utilization_percent`), which returns the NVIDIA figure and ``None``
 on any non-NVIDIA host. This sampler runs in the *orchestrator* process, which must stay torch-free (see
 the torch-free orchestrator invariant): the backend-agnostic ``get_accelerator_utilization_percent`` gates
-on the active torch backend and so does ``import torch`` -- pulling torch into the parent and tripping a
+on the active torch backend and so does ``import torch``, pulling torch into the parent and tripping a
 partial-init circular import. Core utilization is NVML-only telemetry today regardless (CUDA via NVML;
 every other backend reports ``None``), so reading NVML directly is behaviourally identical here while
 keeping the parent torch-free. NVML returns ``None`` off NVIDIA, so non-NVIDIA backends still report no

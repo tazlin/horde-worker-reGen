@@ -4,7 +4,7 @@ A queue that alternates distinct very-large models (Flux -> Z-Image -> Flux -> F
 pathological for a single GPU: each switch to a *different* large model forces the whole-card residency
 machinery to tear the pool down, evict the resident model, and stream a fresh multi-GB checkpoint from disk,
 so the worker spends most of its time loading rather than generating. These limiters act at the only place
-the worker controls what work it takes -- the set of models it *offers* in the horde pop request -- so no job
+the worker controls what work it takes: the set of models it *offers* in the horde pop request, so no job
 is ever popped and then dropped (dropping is what trips the horde's "too many drops" maintenance).
 
 Two independent mechanisms, each disabled by a zero duration:

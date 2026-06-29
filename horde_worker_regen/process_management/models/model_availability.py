@@ -1,7 +1,7 @@
 """Tracks which image models are present on disk, as reported by the download process.
 
 Public members:
-    ``ModelAvailability`` -- single-writer/many-reader holder for the on-disk model set.
+    ``ModelAvailability``: single-writer/many-reader holder for the on-disk model set.
 """
 
 from __future__ import annotations

@@ -8,7 +8,7 @@ therefore sits far below what the streaming forecast predicts is reclaimable, be
 matmul holder that never allocates a model's worth of cache. The gap between forecast-optimism and
 reclaim-reality is harmless at ``max_threads=1`` (only one or two contexts) but at ``max_threads=2`` the
 extra contexts make it large enough that every head-of-queue model fails its activation-reserve check,
-finds nothing left to evict, and is force-admitted *exclusive* -- evicting every resident model. The next
+finds nothing left to evict, and is force-admitted *exclusive*, evicting every resident model. The next
 job then reloads from cold, so the worker churns full reloads and duty cycle collapses below the
 ``max_threads=1`` baseline instead of rising.
 
@@ -160,7 +160,7 @@ class TestForecastReflectsContextOvercommit:
     def test_optimistic_marginal_wrongly_reads_model_eviction_suffices(self) -> None:
         """The probe optimism is the poisoned input: it believes evicting models leaves ample room.
 
-        This is the reading the live worker acted on -- ``free_after_model_evict`` predicts ~17.9 GB, so the
+        This is the reading the live worker acted on: ``free_after_model_evict`` predicts ~17.9 GB, so the
         forecast judges that simply evicting a sibling model would make room, and the scheduler keeps trying
         that (and failing, because the device never returns the VRAM) instead of reducing the context count.
         The same head flips to model-eviction-insufficient once the true marginal is used.
@@ -232,7 +232,7 @@ class TestConcurrentSlotModelDiversity:
 
         The FIFO head (the next A) wants the process already sampling its model, which cannot accept work.
         A selection that only looks at the head returns nothing, so the second inference process sits idle
-        while B -- resident on it and ready -- waits at the back of the queue. Threading B alongside the
+        while B, resident on it and ready, waits at the back of the queue. Threading B alongside the
         running A processes a distinct model for free under the A run and avoids loading a duplicate copy of
         A onto a second process; idling the thread leaves that throughput on the table.
         """

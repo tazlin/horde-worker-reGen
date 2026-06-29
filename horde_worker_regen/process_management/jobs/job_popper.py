@@ -147,7 +147,7 @@ def _select_models_for_pop(
                 # busy; in that case no pop occurs (intentional: there is
                 # no process available to accept a new job).
                 models = free_models
-            logger.debug(f"Sticky models -- popping only {models}")
+            logger.debug(f"Sticky models: popping only {models}")
             if len(configured) > 10:
                 logger.warning(
                     "Model stickiness is intended mostly for slow disks and works best with few models. "

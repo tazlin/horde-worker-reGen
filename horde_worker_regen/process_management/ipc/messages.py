@@ -23,7 +23,7 @@ AUX_DOWNLOAD_FAILED_INFO = "aux-download-deadline-exceeded"
 
 The child sets it when an aux (LoRa/TI) download blows the dispatch deadline carried on its control message;
 the parent's message dispatcher recognises it to register a LoRA-download backoff strike and apply the
-backoff-aware retry policy -- the same response as a watchdog teardown, but without tearing the process down."""
+backoff-aware retry policy: the same response as a watchdog teardown, but without tearing the process down."""
 
 
 class ModelLoadState(enum.Enum):
@@ -146,7 +146,7 @@ class HordeProcessState(enum.Enum):
     the first kernel launch with ``no kernel image is available for execution on the device`` (which ComfyUI
     hides behind a generic "no images produced" fault). The child carries the device/build detail in ``info``.
     The orchestrator latches a worker-state flag from this and stops popping jobs, and the TUI surfaces it
-    prominently -- all without importing torch (the invariant is that only the torch-bearing inference child
+    prominently, all without importing torch (the invariant is that only the torch-bearing inference child
     ever touches torch; the parent and TUI learn of the problem through this torch-free signal)."""
 
 
@@ -436,7 +436,7 @@ class HordeControlModelMessage(HordeControlMessage):
     """Wall-clock budget for this job's auxiliary (LoRa/TI) downloads before the child gives up.
 
     Set by the parent to its own (backoff-aware) stuck-aux watchdog timeout minus a margin, so the child
-    cancels a stalled download and faults the job *itself* -- keeping the inference process alive -- a beat
+    cancels a stalled download and faults the job *itself*, keeping the inference process alive, a beat
     before the watchdog would otherwise tear the whole process down. ``None`` means no child-side deadline
     (the watchdog remains the only backstop), preserving behaviour for any sender that does not set it."""
 

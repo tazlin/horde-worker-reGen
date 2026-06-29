@@ -4,9 +4,9 @@ The raw :class:`HordeProcessState` collapses several materially different idle s
 ``WAITING_FOR_JOB`` reading: a slot holding a model in VRAM that a queued job is about to use looks
 identical to one holding no model at all. That makes a primed, multi-threaded worker read as mostly idle
 in the status line and the TUI process table. Temperature restores the distinction the scheduler already
-acts on -- which slots are doing GPU work now (hot), which are primed for an upcoming popped job (next),
+acts on: which slots are doing GPU work now (hot), which are primed for an upcoming popped job (next),
 which hold a ready model with nothing queued for it (warm), which are still loading one (priming), and
-which are genuinely empty (cold) -- without adding another process state to the wire protocol.
+which are genuinely empty (cold), without adding another process state to the wire protocol.
 
 This module is pure (state names as strings, no torch, no Rich), so the torch-free orchestrator's status
 line and the TUI both classify from the same source of truth.
@@ -23,7 +23,7 @@ class ProcessTemperature(StrEnum):
     HOT = "hot"
     """Actively running a job on the GPU (sampling, post-processing, alchemy, or a safety evaluation)."""
     NEXT = "next"
-    """Primed -- a model is resident or loading -- and a queued job targets that model, so it fires next."""
+    """Primed: a model is resident or loading, and a queued job targets that model, so it fires next."""
     WARM = "warm"
     """A model is resident and ready, but no queued job needs it yet (kept hot for affinity/reuse)."""
     PRIMING = "priming"

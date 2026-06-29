@@ -1,8 +1,8 @@
 """Single source of truth for which image models the worker wants on disk, and why.
 
 Public members:
-    ``DesiredState`` -- parent-side authority for the desired on-disk image-model set.
-    ``ReconcilePlan`` -- the immutable diff a reconcile produces (what to fetch, what to cancel).
+    ``DesiredState``: parent-side authority for the desired on-disk image-model set.
+    ``ReconcilePlan``: the immutable diff a reconcile produces (what to fetch, what to cancel).
 
 The worker had several independent download triggers, only one of which reconciled: the config path sent an
 authoritative set that pruned anything not configured, while the on-demand picker sent an additive request

@@ -686,8 +686,8 @@ def _setup_controller_file_logging(out_dir: Path) -> None:
 
     The controller's loguru otherwise goes only to its stderr: under the TUI that is captured to the
     run's ``console.log``, but a CLI run leaves it on the terminal only, so nothing of the controller's
-    own diagnostics (level lifecycle, abort reasons, "level died without a result", and -- in warm mode,
-    where the harness runs in-process here -- the entire warm session) survives on disk. This writes
+    own diagnostics (level lifecycle, abort reasons, "level died without a result", and (in warm mode,
+    where the harness runs in-process here) the entire warm session) survives on disk. This writes
     those to ``controller.log`` for both paths. Writes are synchronous so a controller crash keeps its
     final lines. It also points the operator at the per-process child logs, which hordelib writes to
     ``logs/`` relative to the working directory (``bridge_*``/``stdout_*``/``stderr_*``/``trace_*``),

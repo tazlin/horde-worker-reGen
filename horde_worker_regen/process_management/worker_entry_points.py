@@ -42,7 +42,7 @@ def _apply_device_pin(
     Applies the env-var portion of hordelib's ``device_pin_env`` (e.g. ``CUDA_VISIBLE_DEVICES``) so the
     child sees only its assigned card as ``cuda:0`` (or the backend equivalent), keeping every
     single-device assumption in ComfyUI/hordelib correct without changes there. Must run before the first
-    torch import. A ``None`` kind -- the default single-GPU path with no explicit card selection -- is a
+    torch import. A ``None`` kind (the default single-GPU path with no explicit card selection) is a
     no-op, so that case writes no env var and is byte-identical to before. DirectML has no env-var mask (it
     is pinned by the per-card ``--directml`` comfy arg instead) and cpu/mps need no masking, so those are
     skipped here. Best-effort: a failure to pin logs a warning and the process runs unmasked rather than

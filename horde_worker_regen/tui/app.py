@@ -368,8 +368,8 @@ class HordeWorkerTUI(App[None]):
         self._benchmark_drained_worker = False
         # True while a benchmark download is in progress: the "waiting for benchmark models" mode that shows
         # the banner, gates Run, and warns before actions that would interrupt the fetch. Tracked as a flag
-        # (not just a non-empty set) so a features-only request -- whose image-model set is empty because the
-        # controlnet/post-proc checkpoints fetch via the aux pass -- still engages the mode.
+        # (not just a non-empty set) so a features-only request, whose image-model set is empty because the
+        # controlnet/post-proc checkpoints fetch via the aux pass, still engages the mode.
         self._benchmark_waiting_active = False
         # The image model names a benchmark download requested, for the banner's N/M progress and the
         # config-subset check; feature models are not named here (the aux pass fetches them).
@@ -903,7 +903,7 @@ class HordeWorkerTUI(App[None]):
                     title="Go live while benchmark models download?",
                     body=(
                         "Going live resumes serving and may stop the benchmark-only model downloads still in "
-                        "progress -- they are not in this worker's config, so serving will not re-fetch them. "
+                        "progress; they are not in this worker's config, so serving will not re-fetch them. "
                         "Continue, or cancel and let them finish first?"
                     ),
                     confirm_label="Go live anyway",
@@ -1435,7 +1435,7 @@ class HordeWorkerTUI(App[None]):
         Completion is judged by the download subsystem rather than per-model presence: the requested set may
         include feature models (controlnet checkpoints, annotators) the worker's present-set never names, so a
         name-by-name wait would stall. The wait ends when the requested image models are all present, or when
-        the subsystem -- having been seen busy -- returns to idle (everything it was asked to fetch is done).
+        the subsystem, having been seen busy, returns to idle (everything it was asked to fetch is done).
         """
         if not self._benchmark_waiting_active:
             return
@@ -1453,7 +1453,7 @@ class HordeWorkerTUI(App[None]):
             self._benchmark_download_seen_active = True
         present = set(downloads.present_model_names)
         ready = len(self._benchmark_waiting_models & present)
-        # An empty requested set (a features-only request) is never "all present" -- those files do not appear
+        # An empty requested set (a features-only request) is never "all present": those files do not appear
         # in the present-set, so completion must come from the subsystem settling, not a vacuous subset check.
         all_present = bool(self._benchmark_waiting_models) and self._benchmark_waiting_models <= present
         subsystem_settled = self._benchmark_download_seen_active and downloads.phase is DownloadPhase.IDLE
@@ -1530,7 +1530,7 @@ class HordeWorkerTUI(App[None]):
         Three bounded steps: stop popping and let in-flight inference finish; hold the worker (so the
         scheduler will not re-grow inference) and scale its inference processes to zero; then wait for those
         GPU contexts to actually go away. Any step exceeding its budget returns False so the caller falls back
-        to a hard stop -- the GPU must be free before the benchmark can use it.
+        to a hard stop: the GPU must be free before the benchmark can use it.
         """
         self._supervisor.request_drain()
         if not self._wait_for_worker(
@@ -1538,8 +1538,8 @@ class HordeWorkerTUI(App[None]):
             timeout=_BENCHMARK_DRAIN_TIMEOUT_SECONDS,
         ):
             return False
-        # The hold keeps inference/popping deferred (so nothing re-grows) while the worker -- and its download
-        # process -- stay alive; scaling to 0 sheds the now-idle inference processes that hold GPU VRAM.
+        # The hold keeps inference/popping deferred (so nothing re-grows) while the worker, and its download
+        # process, stay alive; scaling to 0 sheds the now-idle inference processes that hold GPU VRAM.
         self._supervisor.request_downloads_only_hold()
         self._supervisor.request_set_concurrency(target_processes=0)
         return self._wait_for_worker(_no_inference_contexts, timeout=_BENCHMARK_SCALE_TIMEOUT_SECONDS)

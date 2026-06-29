@@ -11,12 +11,12 @@ force-admit and whole-card terminal) must defer rather than load into a near-cer
 should also shed idle resident processes to shrink its footprint and pause pops to stop adding pressure,
 recovering gracefully instead of crash-looping under sustained RAM exhaustion.
 
-* **Hard-refuse admit-into-OOM** -- when absolute available RAM is below the danger floor, the best-effort
+* **Hard-refuse admit-into-OOM**: when absolute available RAM is below the danger floor, the best-effort
   and head-starvation force-admit paths must defer the preload rather than send it into a near-certain
   OS kill, even for a starved head with no live job.
-* **Throttle pops under pressure** -- sustained critical RAM engages the worker-initiated self-throttle so
+* **Throttle pops under pressure**: sustained critical RAM engages the worker-initiated self-throttle so
   intake stops adding pressure and the host can recover.
-* **Reduce resident footprint first** -- idle sibling inference processes each pin multiple GB of resident
+* **Reduce resident footprint first**: idle sibling inference processes each pin multiple GB of resident
   weights the allocator will not return without a respawn, so under RAM pressure the worker sheds process
   count (the RAM analogue of ``StreamForecast.needs_process_count_reduction``) to get back under the floor.
 """
@@ -200,10 +200,10 @@ class TestHeadStarvationForceAdmitHonorsRamFloor:
 
 
 class TestWholeCardTerminalAdmitHonorsRamFloor:
-    """A whole-card model bypasses the RAM check entirely -- a second, distinct route into the OOM.
+    """A whole-card model bypasses the RAM check entirely: a second, distinct route into the OOM.
 
     A weight-dominant head (whole-card exclusive-residency path) whose teardown is structurally exhausted is
-    admitted "best-effort to load onto the cleared device" via ``whole_card_terminal`` -- a branch that
+    admitted "best-effort to load onto the cleared device" via ``whole_card_terminal``, a branch that
     short-circuits *before* the RAM verdict, so the RAM floor never even runs. On a host with critically-low
     RAM that route loads a multi-GB checkpoint into an OOM.
 
@@ -220,7 +220,7 @@ class TestWholeCardTerminalAdmitHonorsRamFloor:
         # Force the whole-card path: weights heavy enough to leave no room for a sibling model at sole residency
         # (so the model genuinely needs the card, not merely co-resides) yet that still fit the measured free VRAM
         # now, so with a single process the teardown is immediately exhausted and the head reaches
-        # whole_card_terminal (the "admit best-effort onto the cleared device" branch) -- which skips the RAM verdict.
+        # whole_card_terminal (the "admit best-effort onto the cleared device" branch), which skips the RAM verdict.
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: 8000.0)
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 8000.0)
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=1)
@@ -263,8 +263,8 @@ class TestMemoryPressureReducesResidentProcesses:
 
     Each idle inference process pins multiple GB of resident weights that ``torch``/the allocator will not
     return to the OS without a respawn. When the host is over the danger floor and idle siblings hold
-    reclaimable RAM, the structural remedy is to reduce the resident process count -- the RAM analogue of
-    ``StreamForecast.needs_process_count_reduction`` -- rather than admit a new load on top.
+    reclaimable RAM, the structural remedy is to reduce the resident process count (the RAM analogue of
+    ``StreamForecast.needs_process_count_reduction``), rather than admit a new load on top.
     """
 
     async def test_idle_siblings_are_shed_under_critical_ram(self, monkeypatch: pytest.MonkeyPatch) -> None:

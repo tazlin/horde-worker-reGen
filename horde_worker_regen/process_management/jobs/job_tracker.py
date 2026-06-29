@@ -217,7 +217,7 @@ class JobTracker:
         # before the horde server forces maintenance for "dropping too many jobs".
         # Keyed by (model, device_index): the over-budget fault streak is per card, so a model unservable on
         # a small card is still advertised/run on a larger one. device_index is None on a single-GPU host, so
-        # the keying collapses to one entry per model -- behaviourally identical to the prior model-only keys.
+        # the keying collapses to one entry per model, behaviourally identical to the prior model-only keys.
         self._model_overbudget_fault_counts: dict[tuple[str, int | None], int] = {}
         self._model_last_overbudget_fault_time: dict[tuple[str, int | None], float] = {}
         self._recent_resource_fault_times: list[float] = []

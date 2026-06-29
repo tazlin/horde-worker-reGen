@@ -9,7 +9,7 @@ orphaned-in-progress-job watchdog saw a slot that still ``can_accept_job()`` (id
 slot owned the job, and punted it after the 30s grace. The bounded retry then re-dispatched the job to
 the *same* still-stalled slot, which stalled again and was punted a second time, faulting the job to the
 horde. The slot finally drained its pipe and produced a valid result, which was dropped with
-``Job ... not found in jobs_lookup`` -- the GPU work was wasted and the requestor's job needlessly
+``Job ... not found in jobs_lookup``: the GPU work was wasted and the requestor's job needlessly
 faulted.
 
 The root cause is that ``_inference_slot_owns_job`` decides ownership purely from ``can_accept_job()``
@@ -21,8 +21,8 @@ an idle slot carrying a stale reference (the lost-result case the watchdog legit
 
 These tests assert the corrected behavior and are expected to FAIL (RED) against the current code:
 
-* ``test_freshly_dispatched_slot_owns_its_job_despite_waiting_state`` -- ownership recognition.
-* ``test_watchdog_does_not_start_orphan_clock_for_freshly_dispatched_slot`` -- the watchdog backstop.
+* ``test_freshly_dispatched_slot_owns_its_job_despite_waiting_state``: ownership recognition.
+* ``test_watchdog_does_not_start_orphan_clock_for_freshly_dispatched_slot``: the watchdog backstop.
 
 ``test_idle_slot_with_stale_reference_is_still_punted`` is the guard: it pins the watchdog's legitimate
 behavior (a truly idle slot carrying only a stale reference, no dispatch in flight, is still an orphan)
@@ -76,7 +76,7 @@ async def test_watchdog_does_not_start_orphan_clock_for_freshly_dispatched_slot(
     """The orphan watchdog must not begin tracking (let alone punt) a job whose slot was just dispatched.
 
     Because the slot is recognized as the owner, the watchdog never records the job as orphaned, so the
-    grace clock never starts and the slot keeps the job long enough to actually run it -- instead of the
+    grace clock never starts and the slot keeps the job long enough to actually run it, instead of the
     observed punt-and-requeue-to-the-same-stalled-slot loop that faulted a job that was about to succeed.
     """
     pm = make_testable_process_manager()

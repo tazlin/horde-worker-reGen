@@ -2,14 +2,14 @@
 
 The lower layers detect and recover individual failures (a slot crashes -> replaced; a slot crash-loops
 -> quarantined; a job faults -> bounded/degraded retry). This supervisor sits above them and answers a
-different question: *the worker as a whole has stopped making progress on work it has accepted -- now
+different question: *the worker as a whole has stopped making progress on work it has accepted. Now
 what?* Continued operation is the paramount goal, so the escalation is, in order:
 
 1. **Soft reset** (bounded): rebuild the worker's process pools in-place (kill and re-spawn every child,
    un-quarantine slots, reduce settings a notch for "limp-by") without restarting the parent process or
    detaching the TUI. A transient wedge (a bad model load, a one-off deadlock) recovers here.
 2. **Give up cleanly**: once the worker has been wedged long enough that resets clearly are not helping
-   (e.g. a deterministic crash-on-start), stop fighting -- fault the jobs that cannot be served so the
+   (e.g. a deterministic crash-on-start), stop fighting: fault the jobs that cannot be served so the
    horde reissues them, rather than wedging forever. The worker keeps running and keeps popping.
 
 This module is *only the policy*: it tracks how long the worker has been wedged and returns an action.

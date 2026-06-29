@@ -38,7 +38,7 @@ _COMPUTE_CAP_RE = re.compile(r"(\d+)\.(\d+)")
 #   cu126 (CUDA 12.6): sm_50..sm_90  (Maxwell through Hopper; no Blackwell)
 #   cu130/cu132 (CUDA 13.x): sm_75..sm_120  (Turing through Blackwell; pre-Turing dropped in CUDA 13)
 # A build has no kernel image for a card outside its window and dies at the first kernel launch
-# (cudaErrorNoKernelImageForDevice), so the build must be clamped into the card's valid window -- in
+# (cudaErrorNoKernelImageForDevice), so the build must be clamped into the card's valid window in
 # both directions, not just upward. See _cuda_build.
 _CU126_MAX_COMPUTE_CAP = (9, 0)  # above this (Blackwell sm_100/sm_120), cu126 has no kernels -> floor cu130
 _CUDA13_MIN_COMPUTE_CAP = (7, 5)  # below this (pre-Turing), cu130/cu132 have no kernels -> ceil cu126
@@ -231,7 +231,7 @@ def _cuda_build(version: tuple[int, int], compute_cap: tuple[int, int] = (0, 0))
       in CUDA 13). A build outside the card's window has no kernel image and dies at the first kernel
       launch (cudaErrorNoKernelImageForDevice), so the driver-based pick is clamped both ways:
         - a Blackwell+ card (> ``_CU126_MAX_COMPUTE_CAP``) is floored onto cu130 even on a CUDA 12.x
-          driver -- cu126 can never run it, whereas cu130 runs once the (separately warned) driver is
+          driver; cu126 can never run it, whereas cu130 runs once the (separately warned) driver is
           updated;
         - a pre-Turing card (< ``_CUDA13_MIN_COMPUTE_CAP``) is held at cu126 even on a CUDA 13 driver --
           the CUDA 13 wheels dropped it, and cu126 still runs on the newer driver.

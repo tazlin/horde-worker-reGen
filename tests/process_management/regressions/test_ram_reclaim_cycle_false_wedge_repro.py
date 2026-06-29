@@ -6,7 +6,7 @@ pages even after an explicit RAM unload. The failure path:
 1. A heavy head (Flux.1-Schnell fp8) finishes inference, leaving its weights' allocator pages retained
    on the sole inference process even after a RAM unload.
 2. The RAM budget refuses to preload the next head (a WAI-NSFW-illustrious-SDXL job) because the
-   retained allocation makes "available" look too low, and -- finding nothing else to reclaim -- cycles
+   retained allocation makes "available" look too low, and (finding nothing else to reclaim) cycles
    that one idle process to return the pages to the OS (``_replace_stale_ram_unload_process``). This is
    a *deliberate, healthy* reclaim, flagged ``intentional_reclaim=True`` so it is not counted as a crash.
 3. That leaves the worker momentarily with zero serving inference processes (the replacement is
@@ -22,7 +22,7 @@ and preload. The worker faulted its own backlog over a window it deliberately cr
 Root cause: a worker-initiated RAM-reclaim process cycle has no recovery *grace*. The whole-card
 residency establish/restore (``whole_card_residency_grace_active``) and the heavy-head load
 (``heavy_head_load_grace_active``) both shield their deliberately-held all-idle windows from the
-save-our-ship wedge assessment; the RAM-reclaim cycle -- an equally deliberate, equally bounded hold --
+save-our-ship wedge assessment; the RAM-reclaim cycle, an equally deliberate, equally bounded hold,
 does not, so its window is the one that trips the supervisor.
 
 These tests assert the corrected behavior and are expected to FAIL (RED) against current code: while a

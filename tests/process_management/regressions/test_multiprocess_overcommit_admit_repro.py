@@ -14,13 +14,13 @@ Read the numbers: with four ~4056 MB process contexts resident, evicting every s
 only 3794 MB free, which does not even hold the 4900 MB of weights, let alone the activation reserve. The
 only thing that can make room is stopping a sibling *process* (a CUDA context is reclaimed only by the
 process exiting). The model also fits with the card to itself (alone=20018). So the physically-correct
-remedy is a partial sibling-process teardown -- exactly what ``requires_sibling_teardown`` exists to signal.
+remedy is a partial sibling-process teardown: exactly what ``requires_sibling_teardown`` exists to signal.
 
 The blind spot:
     ``requires_sibling_teardown`` (and ``needs_exclusive_residency``) are gated behind ``_weights_dominant``,
     which is computed against a *fixed two-context* ceiling (``total_vram - 2 * per_process_overhead``: self
     plus one sibling). A moderate-weight SDXL job fits under that two-context ceiling, so it reads
-    "not weight-dominant" and the teardown remedy is suppressed -- even though there are *four* live contexts,
+    "not weight-dominant" and the teardown remedy is suppressed, even though there are *four* live contexts,
     not two, and model eviction provably cannot free enough. With no structural remedy the head is deferred
     every tick until the starvation backstop force-admits it onto a card whose contexts already consume most
     of the VRAM, and it OOMs (the "no images were produced" fault). The two-context assumption underestimates
@@ -91,7 +91,7 @@ class TestMultiProcessOvercommitForecast:
         squeeze the bounded weights off the card, but the model co-resides once the process count is reduced.
         """
         forecast = _sdxl_four_process_forecast()
-        # The weight-dominant gates stay False -- this model does not need *sole* residency, only fewer procs.
+        # The weight-dominant gates stay False: this model does not need *sole* residency, only fewer procs.
         assert forecast.needs_exclusive_residency is False
         assert forecast.requires_sibling_teardown is False
         # The new, topology-aware signal fires: stop a sibling process so the weights fit.
@@ -108,7 +108,7 @@ class TestMultiProcessOvercommitForecast:
         assert forecast.max_resident_processes() == 3
 
     def test_not_misread_as_unavoidable_streaming(self) -> None:
-        """The model fits alone, so it is servable via teardown -- never flagged unavoidably-streaming."""
+        """The model fits alone, so it is servable via teardown: never flagged unavoidably-streaming."""
         forecast = _sdxl_four_process_forecast()
         assert forecast.streams_unavoidably is False
 

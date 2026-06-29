@@ -828,12 +828,12 @@ def test_oom_kill_is_labelled_oom_and_spares_the_slot_crash_breaker(monkeypatch:
 
     When the kernel OOM-killer terminates an inference process (``exitcode=-9``) while system RAM is at or
     below the danger floor, the current reaper labels it "inference process replaced (crashed or hung)":
-    (a) misleading, because the process was fine -- the *host* ran out of memory -- and (b) harmful, because
+    (a) misleading, because the process was fine (the *host* ran out of memory) and (b) harmful, because
     it feeds the per-slot crash-loop breaker, which would quarantine a perfectly healthy slot for a host-wide
     RAM problem no slot teardown can fix.
 
     A ``-9`` exit with critically-low system RAM should be labelled an OS OOM kill (a recoverable resource
-    failure) and kept out of the per-slot crash-loop history -- the host-memory governor and pop throttle
+    failure) and kept out of the per-slot crash-loop history. The host-memory governor and pop throttle
     address the cause, not slot quarantine. A ``-9`` with healthy RAM stays an ordinary crash (covered by
     ``test_crash_replacement_still_counts_as_a_recovery``).
     """

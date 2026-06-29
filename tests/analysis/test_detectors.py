@@ -406,7 +406,7 @@ class TestSlowGenerationDropSpiral:
         """Fast generation but long pop->submit latency is diagnosed as pipeline aging, not a slow GPU.
 
         When generation is fast but jobs age in the pipeline queue (pop->submit latency well above
-        generation time), the cause is a downstream bottleneck -- typically a slow safety stage -- not a
+        generation time), the cause is a downstream bottleneck (typically a slow safety stage), not a
         slow GPU. The detector must say so rather than blaming generation throughput.
         """
         bridge = self._bridge(
@@ -537,7 +537,7 @@ def _dispatch_stall(ts: str, *, reason: str, model: str = "AlbedoBase XL (SDXL)"
     """The scheduler explaining why a head-of-queue job is not dispatching."""
     return (
         f"2026-06-25 {ts} | WARNING  | horde_worker_regen.process_management.scheduling.inference_scheduler:_log_dispatch_stall_if_needed:0 - "
-        f"Inference dispatch stalled: head 4006e936 ({model}) has been parked {parked}s -- {reason}."
+        f"Inference dispatch stalled: head 4006e936 ({model}) has been parked {parked}s: {reason}."
     )
 
 
@@ -555,14 +555,14 @@ _DISPATCH_GATE_REASON = (
     "its model is resident and idle on process 1, but the concurrency cap is reached (in_progress=1, cap=1)"
 )
 _DISPATCH_BUG_REASON = (
-    "its model is resident and idle on process 1 but dispatch was withheld with no matching gate -- this is a "
+    "its model is resident and idle on process 1 but dispatch was withheld with no matching gate; this is a "
     "scheduler stall worth reporting"
 )
 # The whole-card residency convergence attribution (inference_scheduler._diagnose_dispatch_stall): the head is
 # resident and idle, but an idle sibling holding a still-queued model was not torn down by the convergence.
 _DISPATCH_WHOLE_CARD_REASON = (
     "its model is resident and idle on process 4, but the whole-card residency stuck: cannot reach sole "
-    "residency because process 3 holds queued model 'CyberRealistic Pony' -- the convergence teardown should "
+    "residency because process 3 holds queued model 'CyberRealistic Pony'; the convergence teardown should "
     "have stopped that idle sibling (only the head's holder is spared), so the shrink has not collapsed the "
     "pool and the head never dispatches"
 )
@@ -570,7 +570,7 @@ _DISPATCH_WHOLE_CARD_REASON = (
 # model is not resident because a residency is held for a different, deeper-queue model that reserved the card.
 _DISPATCH_NONHEAD_REASON = (
     "its model is not resident because a whole-card residency is held for non-head model "
-    "'Flux.1-Schnell fp8 (Compact)' -- the card is reserved for that model and its siblings were torn down, so "
+    "'Flux.1-Schnell fp8 (Compact)'; the card is reserved for that model and its siblings were torn down, so "
     "this head cannot load until that residency restores"
 )
 

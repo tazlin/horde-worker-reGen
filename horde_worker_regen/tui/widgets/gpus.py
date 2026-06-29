@@ -2,7 +2,7 @@
 
 Each driven card gets one row: its VRAM headroom (with a near-OOM pressure flag), how many inference
 contexts it is running against its target, its throughput (it/s summed from the card's processes, plus a
-jobs/hr trend derived here from successive per-card completion counts), and -- in the F6 details view -- the
+jobs/hr trend derived here from successive per-card completion counts), and (in the F6 details view) the
 whole-card residency it may be holding and any models gone locally unservable on it. The table sheds columns
 to fit the terminal exactly like the overview tables, and the thin view collapses the whole tab to a single
 aggregate line.

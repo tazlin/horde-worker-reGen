@@ -1,8 +1,8 @@
 """Shared log signatures for the pop-governor spell boundaries.
 
 The ``PopGovernorRegistry`` emits a grep-friendly ``ENTER``/``EXIT`` line at each governor spell boundary.
-Two analysis surfaces parse those lines -- the dominance detector (:mod:`.detectors`) and the duty-cycle
-attribution (:mod:`.duty_log_report`) -- so the regexes and the human label map live here, in a module with
+Two analysis surfaces parse those lines: the dominance detector (:mod:`.detectors`) and the duty-cycle
+attribution (:mod:`.duty_log_report`), so the regexes and the human label map live here, in a module with
 no analysis-package imports, to keep a single source of truth without coupling those two modules to each
 other (which would form an import cycle through ``sessions``).
 """

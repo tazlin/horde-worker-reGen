@@ -1,8 +1,8 @@
 """Tests for the diagnose facade: the active-only/recent scoping and the lightweight view payload.
 
-These cover the efficiency knobs the TUI relies on -- reading only the live ``bridge.log`` for a quick
+These cover the efficiency knobs the TUI relies on: reading only the live ``bridge.log`` for a quick
 pass, bounding to the recent few sessions, and returning a record-free view cheap to ship across a
-process boundary -- without depending on the TUI itself.
+process boundary, without depending on the TUI itself.
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@ This is the systematic follow-up to the idle-slot ownership audit: several ``Pro
 *list of process states*. A helper whose state list is looser than its name promises is the same class
 of latent bug as the original wedge, so these lock the intended semantics down:
 
-* ``num_available_inference_processes`` must mean "can actually accept a job" -- a dead, ending,
+* ``num_available_inference_processes`` must mean "can actually accept a job": a dead, ending,
   failed, or just-unloaded slot is not capacity.
 * ``num_inference_processes`` counts inference slots only (safety/download are not inference capacity).
 * ``all_waiting_for_job`` participates in queue-deadlock detection and so must reflect the safety

@@ -1,7 +1,7 @@
 """Tests for A4/A8 heterogeneous eligibility: which cards can serve a given job.
 
 A card is eligible only if every requirement holds at once: the model's weights fit the card's per-device
-weight budget (the heterogeneous check -- a big model fits the 24GB card but not the 8GB one), the card
+weight budget (the heterogeneous check: a big model fits the 24GB card but not the 8GB one), the card
 offers the model, its config enables every feature the job needs, and the resolution is within its
 max_power. Any single failure rules the card out; an unknown fact abstains rather than excludes.
 """

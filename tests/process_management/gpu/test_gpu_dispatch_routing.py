@@ -309,7 +309,7 @@ class TestPerCardPreloadSerialization:
     Reproduction of the live two-1070 starvation: the gate exists so two checkpoints do not load onto the
     *same* device at once, but it counted preloading processes worker-wide. The busy card was almost always
     mid-preload, so every attempt to stage a model onto the idle second card was deferred and that card never
-    received its first model -- it sat ``WAITING_FOR_JOB`` forever while the other card did all the work.
+    received its first model; it sat ``WAITING_FOR_JOB`` forever while the other card did all the work.
     """
 
     async def test_idle_card_preloads_while_other_card_is_mid_preload(self) -> None:
