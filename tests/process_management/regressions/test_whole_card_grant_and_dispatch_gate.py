@@ -317,10 +317,12 @@ class TestIntentYieldsToRoomyBudget:
         gate still refuses to let it co-sample with another in-flight job, providing the protection the teardown
         otherwise would, without the churn.
         """
-        process_map = ProcessMap({
-            1: make_mock_process_info(1, model_name=_SDXL_A, state=HordeProcessState.INFERENCE_STARTING),
-            2: make_mock_process_info(2, model_name=_FLUX_MODEL, state=HordeProcessState.WAITING_FOR_JOB),
-        })
+        process_map = ProcessMap(
+            {
+                1: make_mock_process_info(1, model_name=_SDXL_A, state=HordeProcessState.INFERENCE_STARTING),
+                2: make_mock_process_info(2, model_name=_FLUX_MODEL, state=HordeProcessState.WAITING_FOR_JOB),
+            }
+        )
         job_tracker = JobTracker()
         scheduler = _make_inference_scheduler(
             process_map=process_map, job_tracker=job_tracker, bridge_data=_bridge_data(), max_concurrent=2

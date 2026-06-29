@@ -259,9 +259,7 @@ class OverviewView(Vertical):
     )
     """Statics shown in normal (and details) mode, hidden in thin mode."""
 
-    _DETAIL_NODE_IDS = (
-        "#overview-recent",
-    )
+    _DETAIL_NODE_IDS = ("#overview-recent",)
     """Statics shown only in details mode (the demoted panels)."""
 
     _NORMAL_ROW_IDS = ("#overview-core-grid", "#overview-body", "#overview-intent-row")
@@ -1265,10 +1263,7 @@ class OverviewView(Vertical):
                 notice = Text(self._trend_notice, style="italic yellow")
 
         body: Group
-        if notice is not None:
-            body = Group(notice, grid)
-        else:
-            body = Group(grid)
+        body = Group(notice, grid) if notice is not None else Group(grid)
 
         return Panel(
             body,

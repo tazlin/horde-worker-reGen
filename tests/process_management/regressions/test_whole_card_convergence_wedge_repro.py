@@ -557,7 +557,7 @@ class TestWedgeDispatchDiagnostic:
             proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
             proc.vram_usage_mb = _PER_PROCESS_OVERHEAD_MB
         procs[3] = sdxl_idle_3
-        process_map = ProcessMap({pid: proc for pid, proc in procs.items()})  # type: ignore[arg-type]
+        process_map = ProcessMap(dict(procs.items()))  # type: ignore[arg-type]
         horde_model_map = HordeModelMap(root={})
         horde_model_map.update_entry(
             horde_model_name=_FLUX_MODEL, load_state=ModelLoadState.LOADED_IN_RAM, process_id=4

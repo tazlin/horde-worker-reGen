@@ -90,9 +90,10 @@ def test_start_here_orientation_file_is_bundled() -> None:
 
 
 def test_inno_installer_defaults_start_menu_shortcut_on() -> None:
-    """The graphical installer must pre-check the Start Menu shortcut, so a non-technical user is left with a
-    way to relaunch without hunting through the install folder. Guards against silently flipping it back to
-    unchecked.
+    """The graphical installer must pre-check the Start Menu shortcut.
+
+    This is so a non-technical user is left with a way to relaunch without hunting through the install folder.
+    Guards against silently flipping it back to unchecked.
     """
     text = (REPO_ROOT / "packaging" / "inno" / "HordeWorker.iss").read_text(encoding="utf-8")
     start_menu_line = next(
