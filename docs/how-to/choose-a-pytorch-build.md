@@ -50,6 +50,23 @@ Use `cu132` for a CUDA 13.2+ driver, `cu130` for CUDA 13.0/13.1, and `cu126` for
 (the only CUDA 12 build of torch 2.12.0). Always install `torch` **and** `torchvision` from the same
 index; they must share one CUDA build.
 
+Your driver's CUDA version is only the upper bound. The build also has to contain kernels for your
+**GPU architecture**, or every job dies at the first CUDA call with `no kernel image is available for
+execution on the device` (which ComfyUI hides behind a generic "no images produced" fault). The two
+build families cover different, overlapping architecture ranges:
+
+| Build | Architectures (compute capability) | GPUs |
+| --- | --- | --- |
+| `cu126` | `sm_50`–`sm_90` | Maxwell through Hopper (incl. Ada/Ampere) |
+| `cu130` / `cu132` | `sm_75`–`sm_120` | Turing through Blackwell |
+
+So a **Blackwell** card (RTX 50-series, `sm_120`) must use `cu130`+ even though it would otherwise accept
+a CUDA 12 build, and a **pre-Turing** card (Maxwell/Pascal/Volta, e.g. GTX 10-series) must stay on
+`cu126` because CUDA 13 dropped those architectures. The installer handles this for you (it reads the
+GPU's compute capability via `nvidia-smi --query-gpu=compute_cap`, not just the driver version); only
+override the build by hand if you have confirmed your card is in the range above. A Blackwell card on a
+CUDA 12.x driver needs a **driver update** (to a CUDA 13 driver) before `cu130` can load.
+
 > **Audio (torchaudio) is not installed.** It has no `+cu132` wheel and audio generation is currently
 > unsupported, so the worker omits it (a missing torchaudio is stubbed at runtime; image/video work is
 > unaffected). If you specifically need it, install a build matching your torch index ad hoc, e.g.

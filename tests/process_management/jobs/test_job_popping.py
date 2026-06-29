@@ -128,6 +128,16 @@ class TestApiJobPopGuardClauses:
 
         assert state.last_pop_no_jobs_available is False
 
+    async def test_gpu_torch_incompatible_blocks_pop(self) -> None:
+        """The sticky torch/GPU-incompatible flag stops popping even with a fully available process pool."""
+        state = WorkerState(gpu_torch_incompatible=True, last_pop_no_jobs_available=True)
+        popper = _make_popper(state=state, process_map=_make_process_map_with_available_processes())
+
+        await popper.api_job_pop()
+
+        assert state.last_pop_no_jobs_available is False
+        assert state.gpu_torch_incompatible is True
+
     async def test_too_many_consecutive_failures_blocks_pop(self) -> None:
         """Active failure pause prevents any pop attempt."""
         state = WorkerState(

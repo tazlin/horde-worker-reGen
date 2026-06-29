@@ -4,9 +4,12 @@ Ported from ``packaging/detect-backend.ps1`` and the ``install.sh`` detection bl
 standard-library implementation backs every install channel and platform. ``detect_backend`` returns a
 build token that the locked uv extras (``cu126``/``cu130``/``cu132``/``cpu``) or an ad-hoc ROCm path
 consume. For NVIDIA it selects the newest CUDA build the driver's reported max CUDA version can run
-(13.2+ -> ``cu132``, 13.0/13.1 -> ``cu130``, anything older or unreadable -> the safe ``cu126``); see
-:func:`_cuda_build`. AMD Windows follows the current ComfyUI/AMD ROCm support matrices and routes
-recognized Radeon/Ryzen AI devices to the official ROCm Windows PyTorch stack.
+(13.2+ -> ``cu132``, 13.0/13.1 -> ``cu130``, anything older or unreadable -> the safe ``cu126``), then
+applies an architecture floor: a GPU whose compute capability exceeds what the ``cu126`` wheel carries
+kernels for (Hopper sm_90) gets at least ``cu130`` even on an older driver, because ``cu126`` has no
+kernel image for it and would die at the first kernel launch. See :func:`_cuda_build`. AMD Windows
+follows the current ComfyUI/AMD ROCm support matrices and routes recognized Radeon/Ryzen AI devices to
+the official ROCm Windows PyTorch stack.
 """
 
 from __future__ import annotations
@@ -29,6 +32,16 @@ ROCM_GFX120X = "rocm-gfx120x"
 CPU = "cpu"
 
 _CUDA_VERSION_RE = re.compile(r"CUDA Version:\s*(\d+)\.(\d+)")
+_COMPUTE_CAP_RE = re.compile(r"(\d+)\.(\d+)")
+# The locked wheels cover overlapping but different architecture windows (verified against PyTorch's
+# CUDA build matrix and the NVIDIA CUDA 13 release notes):
+#   cu126 (CUDA 12.6): sm_50..sm_90  (Maxwell through Hopper; no Blackwell)
+#   cu130/cu132 (CUDA 13.x): sm_75..sm_120  (Turing through Blackwell; pre-Turing dropped in CUDA 13)
+# A build has no kernel image for a card outside its window and dies at the first kernel launch
+# (cudaErrorNoKernelImageForDevice), so the build must be clamped into the card's valid window -- in
+# both directions, not just upward. See _cuda_build.
+_CU126_MAX_COMPUTE_CAP = (9, 0)  # above this (Blackwell sm_100/sm_120), cu126 has no kernels -> floor cu130
+_CUDA13_MIN_COMPUTE_CAP = (7, 5)  # below this (pre-Turing), cu130/cu132 have no kernels -> ceil cu126
 # Windows "Display adapters" device class; its subkeys carry a DriverDesc per adapter.
 _DISPLAY_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
 
@@ -169,19 +182,77 @@ def _nvidia_cuda_version() -> tuple[int, int]:
     return parse_cuda_version(out)
 
 
-def _cuda_build(version: tuple[int, int]) -> str:
-    """Pick the newest locked CUDA build the driver's max CUDA version can run.
+def parse_compute_cap(smi_output: str) -> tuple[int, int]:
+    """Return the highest (major, minor) compute capability in --query-gpu=compute_cap output.
 
-    A torch wheel built against CUDA toolkit T needs a driver whose max CUDA version is >= T, so the
-    newest build the driver covers wins: 13.2+ -> cu132, 13.0/13.1 -> cu130, anything older or an
-    unreadable (0, 0) version -> the safe cu126 (the only CUDA-12 build of torch 2.12.0, which also runs
-    on CUDA 13 drivers). Tuple ordering makes the comparison version-aware (so e.g. (13, 1) < (13, 2)).
+    nvidia-smi prints one ``major.minor`` per GPU (e.g. ``12.0`` for Blackwell); the highest wins so a
+    mixed-GPU box is floored onto a build that can run its newest card. (0, 0) when nothing parses.
+    """
+    caps = [(int(m.group(1)), int(m.group(2))) for m in _COMPUTE_CAP_RE.finditer(smi_output or "")]
+    return max(caps) if caps else (0, 0)
+
+
+def _nvidia_compute_cap() -> tuple[int, int]:
+    """Query the GPU's compute capability via nvidia-smi; (0, 0) when unreadable.
+
+    This is the GPU's architecture (sm_<major><minor>), distinct from the driver's CUDA ceiling: it is
+    what decides whether a given wheel actually contains a kernel image for the card. (0, 0) (nvidia-smi
+    absent, an old driver without the query field, or a parse miss) leaves :func:`_cuda_build` to decide
+    purely from the driver's CUDA version, as before.
+    """
+    exe = _nvidia_smi_path()
+    if not exe:
+        return (0, 0)
+    try:
+        out = subprocess.run(
+            [exe, "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return (0, 0)
+    return parse_compute_cap(out)
+
+
+def _cuda_build(version: tuple[int, int], compute_cap: tuple[int, int] = (0, 0)) -> str:
+    """Pick the newest locked CUDA build the driver allows, clamped to the GPU's valid arch window.
+
+    Two independent constraints decide the build, and the highest *valid* build is the newest one that
+    satisfies both:
+
+    * Driver ceiling: a torch wheel built against CUDA toolkit T needs a driver whose max CUDA version
+      is >= T. The newest build the driver covers wins: 13.2+ -> cu132, 13.0/13.1 -> cu130, anything
+      older or an unreadable (0, 0) version -> cu126. Tuple ordering keeps this version-aware
+      (so e.g. (13, 1) < (13, 2)).
+    * Architecture window: the driver version is only a ceiling, not proof the wheel has kernels for the
+      card. cu126 carries sm_50..sm_90; the CUDA 13 wheels carry sm_75..sm_120 (pre-Turing was dropped
+      in CUDA 13). A build outside the card's window has no kernel image and dies at the first kernel
+      launch (cudaErrorNoKernelImageForDevice), so the driver-based pick is clamped both ways:
+        - a Blackwell+ card (> ``_CU126_MAX_COMPUTE_CAP``) is floored onto cu130 even on a CUDA 12.x
+          driver -- cu126 can never run it, whereas cu130 runs once the (separately warned) driver is
+          updated;
+        - a pre-Turing card (< ``_CUDA13_MIN_COMPUTE_CAP``) is held at cu126 even on a CUDA 13 driver --
+          the CUDA 13 wheels dropped it, and cu126 still runs on the newer driver.
+
+    ``compute_cap`` (0, 0) (unreadable: nvidia-smi absent or an old driver without the field) skips the
+    window clamp and keeps the driver-only pick, preserving the prior behaviour.
     """
     if version >= (13, 2):
-        return CU132
-    if version >= (13, 0):
-        return CU130
-    return CU126
+        build = CU132
+    elif version >= (13, 0):
+        build = CU130
+    else:
+        build = CU126
+
+    if compute_cap == (0, 0):
+        return build
+    if compute_cap > _CU126_MAX_COMPUTE_CAP:
+        return CU130 if build == CU126 else build
+    if compute_cap < _CUDA13_MIN_COMPUTE_CAP:
+        return CU126
+    return build
 
 
 def detect_backend() -> str:
@@ -189,12 +260,13 @@ def detect_backend() -> str:
 
     Returns:
         ``cu132``/``cu130``/``cu126`` (NVIDIA: the newest build the driver's max CUDA version supports,
-        see :func:`_cuda_build`), ``rocm`` (AMD with a ROCm runtime on Linux), ``rocm-windows`` for
+        clamped to the GPU's valid architecture window, see :func:`_cuda_build`), ``rocm`` (AMD with a
+        ROCm runtime on Linux), ``rocm-windows`` for
         supported AMD Windows Radeon/Ryzen AI devices, ``amd-unsupported`` for an AMD card with no known
         installable backend, or ``cpu``.
     """
     if _nvidia_present():
-        return _cuda_build(_nvidia_cuda_version())
+        return _cuda_build(_nvidia_cuda_version(), _nvidia_compute_cap())
     if _amd_present():
         if windows_backend := _windows_amd_rocm_backend():
             return windows_backend

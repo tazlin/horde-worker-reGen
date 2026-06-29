@@ -347,6 +347,9 @@ class AlchemyCoordinator:
             return False
         if self._state.supervisor_paused or self._state.self_throttle_paused:
             return False
+        if self._state.gpu_torch_incompatible:
+            # The installed PyTorch cannot run this GPU; alchemy forms would fail the same way. Don't pop.
+            return False
         if len(self._pending_forms) + len(self._in_flight) >= max(bridge_data.queue_size, 1):
             return False
         if len(self._in_flight) >= max(bridge_data.alchemy_max_concurrency, 1):

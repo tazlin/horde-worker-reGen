@@ -39,9 +39,9 @@ def _make_snapshot() -> WorkerStateSnapshot:
     return WorkerStateSnapshot(config=config, processes=[process], num_jobs_submitted=7)
 
 
-def test_protocol_version_is_v12() -> None:
-    """Stats snapshots and export controls ride supervisor protocol v12."""
-    assert SUPERVISOR_PROTOCOL_VERSION == 12
+def test_protocol_version_is_v13() -> None:
+    """The torch/GPU-incompatible worker-state flags ride supervisor protocol v13."""
+    assert SUPERVISOR_PROTOCOL_VERSION == 13
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:

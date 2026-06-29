@@ -90,6 +90,32 @@ else:
         pass
 
 
+def _gpu_arch_supported(arch_list: list[str], capability: tuple[int, int]) -> bool:
+    """Whether the installed CUDA torch build has a usable kernel/PTX for a device of ``capability``.
+
+    ``torch.cuda.get_arch_list()`` reports the architectures the wheel was compiled for, as ``sm_<n>``
+    binary cubins and/or ``compute_<n>`` PTX. A device of compute capability (major, minor) can run:
+
+    * a binary ``sm_<n>`` kernel of the *same major* whose minor is <= the device minor (cubins are
+      forward-compatible only within a major), or
+    * any ``compute_<n>`` PTX whose (major, minor) <= the device, JIT-compiled at load time.
+
+    If neither exists, every kernel launch raises ``cudaErrorNoKernelImageForDevice`` -- which ComfyUI
+    swallows into a generic "no images produced" fault. This predicts that before the first launch.
+    """
+    dev_major, dev_minor = capability
+    for entry in arch_list:
+        kind, _, ver = entry.partition("_")
+        if not ver.isdigit() or len(ver) < 2:
+            continue
+        major, minor = int(ver[:-1]), int(ver[-1])
+        if kind == "sm" and major == dev_major and minor <= dev_minor:
+            return True
+        if kind == "compute" and (major, minor) <= (dev_major, dev_minor):
+            return True
+    return False
+
+
 @dataclass
 class _DryRunResultingImage:
     """Duck-type stand-in for hordelib's `ResultingImageReturn` used in dry-run mode."""
@@ -195,6 +221,8 @@ class HordeInferenceProcess(HordeProcess):
                 logger.critical(f"Failed to initialise HordeLib: {type(e).__name__} {e}")
                 sys.exit(1)
 
+            self._verify_torch_supports_gpu()
+
             if gpu_sampling_lease is not None:
                 # Coordinate the GPU denoising loop across inference processes: this process
                 # samples only while holding the shared lease, but stages its pipeline (model
@@ -250,6 +278,63 @@ class HordeInferenceProcess(HordeProcess):
             process_state=HordeProcessState.WAITING_FOR_JOB,
             info="Waiting for job",
         )
+
+    def _verify_torch_supports_gpu(self) -> None:
+        """Fail fast (with an actionable message) when the installed torch has no kernels for this GPU.
+
+        A torch wheel built for the wrong CUDA architecture set (e.g. a cu126 build on a Blackwell card,
+        or a CUDA 13 build on a pre-Turing card) raises ``cudaErrorNoKernelImageForDevice`` at the first
+        kernel launch. ComfyUI swallows that into a generic "no images produced" RuntimeError, so without
+        this check the cause surfaces only as a stream of faults, the resource breaker never fires, and
+        the worker self-pauses without ever naming the real problem. Detecting it here turns a silent,
+        every-job failure into one clear instruction to reinstall the matching backend.
+
+        On a mismatch the child reports ``TORCH_GPU_INCOMPATIBLE`` (so the torch-free orchestrator latches
+        a stop-popping flag and the TUI surfaces it) and exits; the crash-loop breaker then quarantines the
+        slot rather than respawning into the same failure. Reporting *before* the slot ever advertises
+        readiness guarantees the parent latches the flag before it could dispatch a job here.
+
+        Advisory and self-contained: any error querying torch is logged and ignored (the check must never
+        be what crashes the process), and non-CUDA builds (ROCm/DirectML/CPU) are skipped since their
+        arch tags do not apply.
+        """
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return
+            arch_list = torch.cuda.get_arch_list()
+            # Only CUDA builds tag architectures as sm_/compute_; ROCm reports gfx*, so skip those.
+            if not any(arch.startswith("sm_") for arch in arch_list):
+                return
+            capability = torch.cuda.get_device_capability(self.device_index)
+            if _gpu_arch_supported(arch_list, capability):
+                return
+            device_name = torch.cuda.get_device_name(self.device_index)
+        except Exception as e:
+            logger.debug(f"Could not verify torch GPU architecture support: {type(e).__name__} {e}")
+            return
+
+        cap_tag = f"sm_{capability[0]}{capability[1]}"
+        logger.critical(
+            f"The installed PyTorch has no CUDA kernels for this GPU. {device_name} is compute "
+            f"capability {capability[0]}.{capability[1]} ({cap_tag}), but this torch build only supports "
+            f"{' '.join(arch_list)}. Every job would fail at the first kernel launch with "
+            f"'no kernel image is available for execution on the device'. Reinstall the worker so the "
+            f"installer picks the matching CUDA backend for your GPU and driver (update.cmd, or re-run "
+            f"the installer), and update your NVIDIA driver if the installer asks for a newer one.",
+        )
+        # The info string is the operator-facing reason the parent relays verbatim to the TUI; keep it
+        # self-contained (no torch references the parent would have to interpret).
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.TORCH_GPU_INCOMPATIBLE,
+            info=(
+                f"PyTorch has no CUDA kernels for {device_name} (compute capability {cap_tag}). "
+                f"Reinstall the worker to get the matching CUDA backend, and update your NVIDIA driver "
+                f"if asked. The worker will not pop jobs until this is fixed."
+            ),
+        )
+        sys.exit(1)
 
     def _comfyui_callback(self, label: str, data: dict, _id: str) -> None:  # pyrefly: ignore[implicit-any-type-argument] - we don't control the type signature of this callback
         self.send_heartbeat_message(heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE)

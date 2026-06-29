@@ -67,6 +67,20 @@ class WorkerState:
     support (see ``_lora_disk_permits``) so the worker stops feeding jobs into a failing download
     path. Windows double per consecutive strike and reset after a healthy stretch."""
 
+    gpu_torch_incompatible: bool = False
+    """Session-latched: an inference child reported the installed PyTorch has no CUDA kernels for this GPU.
+
+    Set from the child's ``TORCH_GPU_INCOMPATIBLE`` report (the child is the only process that touches
+    torch; the parent learns of the mismatch through that torch-free signal). The wheel's compiled
+    architectures do not include the device's compute capability, so every job would die at the first
+    kernel launch. While true the job/alchemy poppers stop popping entirely (the GPU cannot serve any
+    work) and the TUI surfaces the reason prominently. The mismatch is a build/hardware fact, so this
+    never clears at runtime: it is fixed by reinstalling the matching backend (and restarting)."""
+
+    gpu_torch_incompatible_reason: str = ""
+    """Operator-facing explanation for ``gpu_torch_incompatible`` (the child's ``info`` string), relayed
+    verbatim to the TUI. Empty until the flag latches."""
+
     consecutive_failed_jobs: int = 0
     too_many_consecutive_failed_jobs: bool = False
     too_many_consecutive_failed_jobs_time: float = 0.0

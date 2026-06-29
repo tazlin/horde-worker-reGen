@@ -192,6 +192,18 @@ def derive(
             checks,
             True,
         )
+    if snapshot.gpu_torch_incompatible:
+        reason = snapshot.gpu_torch_incompatible_reason or (
+            "The installed PyTorch has no CUDA kernels for this GPU, so no job can run."
+        )
+        return HealthReport(
+            WorkerPhase.DEGRADED,
+            HealthStatus.ERROR,
+            "PyTorch cannot run this GPU",
+            f"{reason} The worker has stopped popping jobs until this is fixed.",
+            checks,
+            True,
+        )
     if _server_maintenance_active(snapshot, optimistic_server_maintenance=optimistic_server_maintenance):
         return HealthReport(
             WorkerPhase.MAINTENANCE,
@@ -409,6 +421,14 @@ def _build_checks(
     else:
         checks.append(HealthCheck("Models", HealthStatus.INFO, "No model loaded yet"))
 
+    if snapshot.gpu_torch_incompatible:
+        checks.append(
+            HealthCheck(
+                "PyTorch/GPU",
+                HealthStatus.ERROR,
+                snapshot.gpu_torch_incompatible_reason or "Installed PyTorch has no kernels for this GPU.",
+            )
+        )
     checks.append(_gpu_check(snapshot))
     residency_check = _residency_check(snapshot)
     if residency_check is not None:

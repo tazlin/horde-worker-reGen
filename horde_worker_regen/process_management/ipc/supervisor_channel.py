@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 12
+SUPERVISOR_PROTOCOL_VERSION = 13
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -801,6 +801,15 @@ class WorkerStateSnapshot(BaseModel):
     worker_details_paused: bool = False
     """The horde's worker-details API reports this worker paused (polled, advisory)."""
     too_many_consecutive_failed_jobs: bool = False
+
+    gpu_torch_incompatible: bool = False
+    """The installed PyTorch has no CUDA kernels for this GPU's architecture, so the worker stopped popping.
+
+    Reported by a torch-bearing inference child at startup (the parent and TUI never import torch). A
+    build/hardware mismatch: the wheel was compiled for a different set of GPU architectures than the
+    installed card. Sticky for the session; fixed by reinstalling the matching backend and restarting."""
+    gpu_torch_incompatible_reason: str | None = None
+    """Operator-facing detail for ``gpu_torch_incompatible`` (device + remedy); None when not tripped."""
 
     # Connectivity / health signals the worker already tracks (surfaced for the status monitor).
     worker_registered: bool = False

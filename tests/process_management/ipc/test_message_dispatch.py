@@ -212,6 +212,29 @@ class TestReceiveAndHandleProcessMessages:
             hmm.root.get("Z-Image-Turbo") is None or not hmm.root["Z-Image-Turbo"].horde_model_load_state.is_active()
         )
 
+    async def test_torch_gpu_incompatible_latches_worker_state_flag(self) -> None:
+        """A TORCH_GPU_INCOMPATIBLE report latches the sticky stop-popping flag and stores its reason."""
+        process_info = make_mock_process_info(0)
+        process_info.process_launch_identifier = 0
+        process_info.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        state = WorkerState()
+
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: process_info}), state=state)
+
+        msg = Mock(spec=HordeProcessStateChangeMessage)
+        msg.process_id = 0
+        msg.process_launch_identifier = 0
+        msg.process_state = HordeProcessState.TORCH_GPU_INCOMPATIBLE
+        msg.info = "PyTorch has no CUDA kernels for NVIDIA GeForce RTX 5070 (compute capability sm_120)."
+        msg.time_elapsed = None
+
+        assert state.gpu_torch_incompatible is False
+        _enqueue(message_dispatcher, msg)
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert state.gpu_torch_incompatible is True
+        assert "RTX 5070" in state.gpu_torch_incompatible_reason
+
     async def test_mismatched_launch_identifier_is_ignored(self) -> None:
         """Ignore if a message is received with a launch identifier that doesn't match the process's current one."""
         process_info = make_mock_process_info(0)

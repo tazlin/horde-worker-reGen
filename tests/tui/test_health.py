@@ -148,6 +148,35 @@ def test_degraded_on_consecutive_failures() -> None:
     assert report.phase is WorkerPhase.DEGRADED
 
 
+def test_gpu_torch_incompatible_is_degraded_error_and_names_the_reason() -> None:
+    """An incompatible-PyTorch worker surfaces as a prominent DEGRADED/ERROR report carrying the reason."""
+    reason = "PyTorch has no CUDA kernels for NVIDIA GeForce RTX 5070 (compute capability sm_120)."
+    report = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            gpu_torch_incompatible=True,
+            gpu_torch_incompatible_reason=reason,
+        ),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    assert report.phase is WorkerPhase.DEGRADED
+    assert report.severity is HealthStatus.ERROR
+    assert reason in report.detail
+    assert any(check.status is HealthStatus.ERROR and "RTX 5070" in check.detail for check in report.checks)
+
+
+def test_gpu_torch_incompatible_beats_serving() -> None:
+    """The hardware/build mismatch dominates even a (transient) inferencing process state."""
+    report = derive(
+        _snapshot(processes=[_process("INFERENCE_STARTING")], gpu_torch_incompatible=True),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    assert report.phase is WorkerPhase.DEGRADED
+    assert report.severity is HealthStatus.ERROR
+
+
 def test_paused_phase() -> None:
     """Maintenance/paused mode surfaces as PAUSED (warning)."""
     report = derive(

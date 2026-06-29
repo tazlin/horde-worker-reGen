@@ -42,28 +42,81 @@ def test_cuda_build(version: tuple[int, int], expected: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("nvidia", "cuda_version", "amd", "rocm", "expected"),
+    ("smi_output", "expected"),
     [
-        (True, (12, 8), False, False, detect.CU126),
-        (True, (13, 0), False, False, detect.CU130),
-        (True, (13, 2), False, False, detect.CU132),
-        (True, (0, 0), False, False, detect.CU126),  # nvidia present but version unreadable -> safe 12.6 build
-        (False, (0, 0), True, False, detect.AMD_UNSUPPORTED),
-        (False, (0, 0), True, True, detect.ROCM),
-        (False, (0, 0), False, False, detect.CPU),
+        ("8.6", (8, 6)),
+        ("12.0\n", (12, 0)),
+        ("8.9\n12.0\n", (12, 0)),  # mixed GPUs -> highest wins
+        ("compute_cap\n7.5", (7, 5)),
+        ("", (0, 0)),
+        ("no caps here", (0, 0)),
+    ],
+)
+def test_parse_compute_cap(smi_output: str, expected: tuple[int, int]) -> None:
+    """parse_compute_cap returns the highest compute capability in the query output ((0, 0) when absent)."""
+    assert detect.parse_compute_cap(smi_output) == expected
+
+
+@pytest.mark.parametrize(
+    ("version", "compute_cap", "expected"),
+    [
+        # Floor -- Blackwell (sm_120 / sm_100) has no kernel image in cu126, so lift to cu130.
+        ((12, 8), (12, 0), detect.CU130),  # old CUDA 12.x driver, known Blackwell card
+        ((0, 0), (12, 0), detect.CU130),  # driver CUDA unreadable but the card is known Blackwell
+        ((10, 0), (10, 0), detect.CU130),  # sm_100 datacenter Blackwell, same floor
+        ((13, 0), (12, 0), detect.CU130),  # driver already covers Blackwell -> floor is a no-op
+        ((13, 2), (12, 0), detect.CU132),  # newest driver-supported build still wins for Blackwell
+        # Ceiling -- pre-Turing (Maxwell/Pascal/Volta) was dropped from the CUDA 13 wheels, so hold cu126
+        # even when the driver is new enough for cu130/cu132 (cu126 still runs on the newer driver).
+        ((13, 2), (6, 1), detect.CU126),  # Pascal GTX 10-series on a CUDA 13.2 driver
+        ((13, 0), (5, 2), detect.CU126),  # Maxwell on a CUDA 13.0 driver
+        ((13, 0), (7, 0), detect.CU126),  # Volta sm_70 is pre-Turing and dropped too
+        # In-window cards (Turing..Hopper) take the highest build the driver supports, unchanged.
+        ((13, 2), (7, 5), detect.CU132),  # Turing sm_75 is the first arch the CUDA 13 wheels keep
+        ((12, 8), (9, 0), detect.CU126),  # Hopper on a CUDA 12.x driver
+        ((12, 8), (8, 6), detect.CU126),  # Ampere on a CUDA 12.x driver
+        ((13, 2), (8, 6), detect.CU132),  # Ampere on a CUDA 13.2 driver
+        # Arch unreadable -> keep the driver-only pick (prior behaviour).
+        ((0, 0), (0, 0), detect.CU126),
+        ((13, 2), (0, 0), detect.CU132),
+    ],
+)
+def test_cuda_build_architecture_window(
+    version: tuple[int, int],
+    compute_cap: tuple[int, int],
+    expected: str,
+) -> None:
+    """The driver-based build is clamped into the GPU's valid arch window (cu126 floor and ceiling)."""
+    assert detect._cuda_build(version, compute_cap) == expected
+
+
+@pytest.mark.parametrize(
+    ("nvidia", "cuda_version", "compute_cap", "amd", "rocm", "expected"),
+    [
+        (True, (12, 8), (8, 6), False, False, detect.CU126),
+        (True, (13, 0), (8, 6), False, False, detect.CU130),
+        (True, (13, 2), (8, 6), False, False, detect.CU132),
+        (True, (0, 0), (0, 0), False, False, detect.CU126),  # nvidia present but unreadable -> safe 12.6 build
+        # Blackwell card on an old CUDA 12.x driver is floored to cu130 by the architecture check.
+        (True, (12, 8), (12, 0), False, False, detect.CU130),
+        (False, (0, 0), (0, 0), True, False, detect.AMD_UNSUPPORTED),
+        (False, (0, 0), (0, 0), True, True, detect.ROCM),
+        (False, (0, 0), (0, 0), False, False, detect.CPU),
     ],
 )
 def test_detect_backend(
     monkeypatch: pytest.MonkeyPatch,
     nvidia: bool,
     cuda_version: tuple[int, int],
+    compute_cap: tuple[int, int],
     amd: bool,
     rocm: bool,
     expected: str,
 ) -> None:
-    """detect_backend maps hardware presence + CUDA version onto the right build token."""
+    """detect_backend maps hardware presence + CUDA version + GPU arch onto the right build token."""
     monkeypatch.setattr(detect, "_nvidia_present", lambda: nvidia)
     monkeypatch.setattr(detect, "_nvidia_cuda_version", lambda: cuda_version)
+    monkeypatch.setattr(detect, "_nvidia_compute_cap", lambda: compute_cap)
     monkeypatch.setattr(detect, "_amd_present", lambda: amd)
     monkeypatch.setattr(detect, "_rocm_runtime_present", lambda: rocm)
     monkeypatch.setattr(detect, "_windows_amd_rocm_backend", lambda: None)

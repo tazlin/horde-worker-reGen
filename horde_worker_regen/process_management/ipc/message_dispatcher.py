@@ -424,6 +424,19 @@ class MessageDispatcher:
         else:
             logger.debug(f"Process {message.process_id} changed state to {message.process_state}")
 
+        if message.process_state == HordeProcessState.TORCH_GPU_INCOMPATIBLE:
+            # A torch-bearing inference child found the installed PyTorch has no kernels for this GPU. Latch
+            # it here (the parent never imports torch) so the poppers stop popping and the TUI can surface
+            # the reason. The child carries the operator-facing detail in `info`; relay it verbatim. The
+            # mismatch is a build/hardware fact, so this is sticky for the session.
+            if not self._state.gpu_torch_incompatible:
+                logger.critical(
+                    f"Process {message.process_id} reports the installed PyTorch cannot run this GPU; "
+                    f"the worker will stop popping jobs. {message.info}",
+                )
+            self._state.gpu_torch_incompatible = True
+            self._state.gpu_torch_incompatible_reason = message.info
+
         if message.process_state == HordeProcessState.INFERENCE_STARTING:
             loaded_model_name = self._process_map[message.process_id].loaded_horde_model_name
             if loaded_model_name is None:

@@ -37,23 +37,36 @@ def _run_ps1_detector() -> str:
 
 
 @pytest.mark.parametrize(
-    ("cuda_header", "expected"),
+    ("cuda_header", "compute_cap", "expected"),
     [
-        ("CUDA Version: 13.2", "cu132"),
-        ("CUDA Version: 13.1", "cu130"),
-        ("CUDA Version: 13.0", "cu130"),
-        ("CUDA Version: 12.8", "cu126"),
+        ("CUDA Version: 13.2", "8.6", "cu132"),
+        ("CUDA Version: 13.1", "8.6", "cu130"),
+        ("CUDA Version: 13.0", "8.6", "cu130"),
+        ("CUDA Version: 12.8", "8.6", "cu126"),
+        # Blackwell (sm_120) on a CUDA 12.x driver: the architecture floor lifts both detectors to cu130.
+        ("CUDA Version: 12.8", "12.0", "cu130"),
+        # Pre-Turing (Pascal sm_61) on a CUDA 13.2 driver: the ceiling holds both detectors at cu126.
+        ("CUDA Version: 13.2", "6.1", "cu126"),
     ],
 )
 def test_detect_parity_nvidia(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cuda_header: str,
+    compute_cap: str,
     expected: str,
 ) -> None:
-    """With a stub nvidia-smi on PATH, both detectors return the same NVIDIA build token."""
+    """With a stub nvidia-smi on PATH, both detectors return the same NVIDIA build token.
+
+    The stub answers the bare ``nvidia-smi`` call with the CUDA header and the
+    ``--query-gpu=compute_cap`` call (any args) with a compute-capability line, so both the
+    driver-version and architecture-floor paths are exercised identically by each detector.
+    """
     stub = tmp_path / "nvidia-smi.bat"
-    stub.write_text(f"@echo off\necho {cuda_header}\n", encoding="ascii")
+    stub.write_text(
+        f'@echo off\r\nif "%~1"=="" (\r\necho {cuda_header}\r\n) else (\r\necho {compute_cap}\r\n)\r\n',
+        encoding="ascii",
+    )
     # Prepend the stub dir so both detectors resolve nvidia-smi to it rather than a real driver.
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
 

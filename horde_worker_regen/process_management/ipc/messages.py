@@ -138,6 +138,17 @@ class HordeProcessState(enum.Enum):
     SAFETY_FAILED = auto()
     """The process has failed evaluating safety."""
 
+    TORCH_GPU_INCOMPATIBLE = auto()
+    """The installed PyTorch has no CUDA kernels for this GPU's architecture (reported by an inference child).
+
+    A non-retryable hardware/build mismatch detected at inference-process start, once torch is loaded: the
+    wheel's compiled architectures do not include the device's compute capability, so every job would die at
+    the first kernel launch with ``no kernel image is available for execution on the device`` (which ComfyUI
+    hides behind a generic "no images produced" fault). The child carries the device/build detail in ``info``.
+    The orchestrator latches a worker-state flag from this and stops popping jobs, and the TUI surfaces it
+    prominently -- all without importing torch (the invariant is that only the torch-bearing inference child
+    ever touches torch; the parent and TUI learn of the problem through this torch-free signal)."""
+
 
 class HordeProcessMessage(BaseModel):
     """Process messages are sent from the child processes to the main process."""

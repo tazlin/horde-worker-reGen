@@ -14,8 +14,11 @@
 # The CUDA build is the newest the driver's max supported CUDA version can run (nvidia-smi's "CUDA
 # Version" header). torch 2.12.0 (the locked line) has no cu128 wheel, so a CUDA 12.x driver gets cu126
 # -- a 12.6 build runs on any CUDA 12.6+ driver (and, via NVIDIA driver backward-compatibility, on CUDA
-# 13 drivers). A 13.2+ driver gets cu132, a 13.0/13.1 driver gets cu130. This mirrors
-# worker_bootstrap.detect (tests/bootstrap/test_detect_parity.py guards that the two stay in step).
+# 13 drivers). A 13.2+ driver gets cu132, a 13.0/13.1 driver gets cu130. The pick is then floored by the
+# GPU's compute capability: the cu126 wheel carries kernels only through Hopper (sm_90), so a Blackwell
+# card (sm_120/sm_100) -- which has no kernel image in cu126 and would die at the first kernel launch --
+# is floored onto cu130 even on a CUDA 12.x driver. This mirrors worker_bootstrap.detect
+# (tests/bootstrap/test_detect_parity.py guards that the two stay in step).
 #
 # This is detection only: callers decide how to message the user and may honour a HORDE_WORKER_BACKEND
 # override before calling. Pass -OutFile to also write the token (no trailing newline) to a file, for
@@ -95,6 +98,31 @@ function Get-NvidiaCudaVersion {
     return $null
 }
 
+function Get-NvidiaComputeCap {
+    # The GPU's compute capability (sm_<major><minor>) as a [version], from nvidia-smi's structured
+    # query. This is the GPU architecture, not the driver's CUDA ceiling: it decides whether a wheel
+    # actually has a kernel image for the card. Returns the highest across GPUs, or $null when the
+    # field is unreadable (old driver / nvidia-smi absent); callers then floor nothing.
+    $exe = $null
+    $cmd = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $exe = $cmd.Source
+    } elseif (Test-Path (Join-Path $env:SystemRoot "System32\nvidia-smi.exe")) {
+        $exe = Join-Path $env:SystemRoot "System32\nvidia-smi.exe"
+    }
+    if (-not $exe) { return $null }
+    try {
+        $out = & $exe --query-gpu=compute_cap --format=csv,noheader 2>$null | Out-String
+        $best = $null
+        foreach ($m in [regex]::Matches($out, "(\d+)\.(\d+)")) {
+            $v = [version]("{0}.{1}" -f $m.Groups[1].Value, $m.Groups[2].Value)
+            if (-not $best -or $v -gt $best) { $best = $v }
+        }
+        return $best
+    } catch { }
+    return $null
+}
+
 if (Test-NvidiaGpu) {
     # Pick the newest build the driver's max CUDA version can run (mirrors worker_bootstrap.detect._cuda_build).
     $cuda = Get-NvidiaCudaVersion
@@ -104,6 +132,20 @@ if (Test-NvidiaGpu) {
         $token = "cu130"
     } else {
         $token = "cu126"
+    }
+    # Architecture window clamp (mirrors worker_bootstrap.detect._cuda_build). The driver pick can be
+    # outside the card's valid window: cu126 carries sm_50..sm_90, the CUDA 13 wheels carry sm_75..sm_120
+    # (pre-Turing dropped in CUDA 13). A build with no kernel image for the card dies at the first kernel
+    # launch, so clamp both ways. compute_cap $null (unreadable) leaves the driver pick untouched.
+    $cap = Get-NvidiaComputeCap
+    if ($cap) {
+        if ($cap -gt [version]"9.0" -and $token -eq "cu126") {
+            # Blackwell+: cu126 has no kernels, floor onto cu130.
+            $token = "cu130"
+        } elseif ($cap -lt [version]"7.5") {
+            # pre-Turing (Maxwell/Pascal/Volta): the CUDA 13 wheels dropped it, hold at cu126.
+            $token = "cu126"
+        }
     }
 } elseif (Test-AmdGpu) {
     $amdBackend = Get-WindowsAmdRocmBackend

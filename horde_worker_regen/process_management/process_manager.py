@@ -3175,6 +3175,8 @@ class HordeWorkerProcessManager:
             worker_details_maintenance=self._worker_details_maintenance,
             worker_details_paused=self._worker_details_paused,
             too_many_consecutive_failed_jobs=self._state.too_many_consecutive_failed_jobs,
+            gpu_torch_incompatible=self._state.gpu_torch_incompatible,
+            gpu_torch_incompatible_reason=(self._state.gpu_torch_incompatible_reason or None),
             worker_registered=self.user_info is not None,
             user_info_failed=self._user_info_failed,
             user_info_failed_reason=self._user_info_failed_reason,
