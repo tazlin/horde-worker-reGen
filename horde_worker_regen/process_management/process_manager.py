@@ -1606,15 +1606,19 @@ class HordeWorkerProcessManager:
             update_check_disabled,
         )
 
-        if update_check_disabled():
-            return
-
+        # This is one of the worker's main-loop tasks, which the loop's done-callback expects to run for the
+        # worker's whole lifetime: a task returning while the worker is live is treated as a fatal anomaly and
+        # triggers a graceful shutdown. So when update checks are disabled there is simply nothing to do each
+        # tick; the loop still idles until shutdown rather than returning early and tripping that path (which
+        # would otherwise shut the worker down at startup whenever checks are disabled, e.g. under the test
+        # env or an operator's opt-out).
+        checks_enabled = not update_check_disabled()
         next_check_at = time.monotonic() + UPDATE_CHECK_INTERVAL_SECONDS
         while True:
             await asyncio.sleep(self._UPDATE_CHECK_SHUTDOWN_POLL_SECONDS)
             if self.is_time_for_shutdown() or self._state.shut_down:
                 break
-            if time.monotonic() < next_check_at:
+            if not checks_enabled or time.monotonic() < next_check_at:
                 continue
             next_check_at = time.monotonic() + UPDATE_CHECK_INTERVAL_SECONDS
             try:

@@ -91,7 +91,10 @@ async def test_post_processing_stall_on_overcommitted_card_recovers_and_faults()
 
     assert not result.timed_out, result.failure_summary()
     assert result.all_jobs_accounted_for, result.failure_summary()
-    assert result.num_jobs_faulted >= 1, result.failure_summary()
+    # The fault is asserted via the auditor's submitted-faulted count, not the tracker's num_jobs_faulted:
+    # the latter is incremented only on a real horde submit, which skip_api bypasses, so it stays 0 here
+    # even though the job genuinely faulted and was reported.
+    assert result.num_jobs_submitted_faulted >= 1, result.failure_summary()
     assert result.audit_failures == []
 
 

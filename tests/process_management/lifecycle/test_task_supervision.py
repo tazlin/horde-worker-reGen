@@ -6,8 +6,12 @@ running, must trigger a graceful shutdown rather than leave the worker limping w
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import Mock
 
+import pytest
+
+import horde_worker_regen.update_check as update_check_module
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from tests.process_management.conftest import make_testable_process_manager
 
@@ -68,3 +72,24 @@ def test_exception_during_shutdown_does_not_retrigger() -> None:
     pm._handle_exception(_FakeTask(exception=RuntimeError("boom")))  # type: ignore[arg-type]
 
     pm._shutdown_manager.start_timed_shutdown.assert_not_called()  # type: ignore[attr-defined]
+
+
+async def test_disabled_update_check_loop_stays_alive_until_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A disabled update check must keep its main-loop task alive until shutdown, not return early.
+
+    The update-check loop is one of the supervised main-loop tasks, and the supervisor treats any of them
+    ending while the worker is live as fatal (see the tests above). So when update checks are disabled the
+    loop must idle until shutdown rather than returning, which would otherwise shut the worker down at
+    startup whenever checks are off (the test environment, or an operator's opt-out).
+    """
+    monkeypatch.setattr(update_check_module, "update_check_disabled", lambda: True)
+    pm = _pm_with_spied_backstop()
+    monkeypatch.setattr(pm, "_UPDATE_CHECK_SHUTDOWN_POLL_SECONDS", 0.01, raising=False)
+
+    task = asyncio.create_task(pm._periodic_update_check_loop())
+    await asyncio.sleep(0.05)  # several poll intervals
+    assert not task.done(), "the disabled update-check loop must keep running, not return while the worker is live"
+
+    pm._state.shut_down = True  # the loop's only legitimate exit: a shutdown signal
+    await asyncio.wait_for(task, timeout=1.0)
+    assert task.exception() is None
