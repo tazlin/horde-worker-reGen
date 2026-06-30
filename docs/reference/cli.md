@@ -130,11 +130,57 @@ Progressive worker benchmarking. Subcommands:
 
 | Subcommand | Purpose |
 |------------|---------|
-| `ramp` | Run the progressive ramp benchmark via the canned-job harness. |
-| `plan` | Show each level's resource requirements and predicted run/skip verdict (no worker is started). |
-| `report OUT_DIR` | Re-render the markdown report from an existing output directory. |
+| `run` | Run the capability-probe benchmark: prove what this machine can do, on one warm worker. |
+| `ramp` | The legacy ladder benchmark (cold-start per level). Superseded by `run`. |
+| `plan` | Show each probe's resource requirements and predicted run/skip verdict (no worker is started). |
+| `report OUT_DIR` | Re-render the markdown report from an existing output directory (capability or legacy). |
 | `monitor OUT_DIR` | Tail a run's `progress.jsonl` live (attach to or replay a run). |
 | `live` | Open-loop load generation against a live API (not yet implemented). |
+
+### `run`: the capability-probe benchmark
+
+`run` is the current benchmark engine. It reframes the question from "walk a ladder of levels" to
+"**prove a set of capabilities**": each probe binds a workload to the pass/fail criteria and the
+**capabilities it requires**, and the engine runs them in dependency order on **one warm worker**, so
+the worker boot and model load are paid once for the whole run rather than once per check. (The old
+`ramp` cold-started a fresh worker per level; `run` is the same coverage without that per-probe rampup.
+See [GPU duty cycle](../explanation/duty-cycle.md#per-probe-timing-warmup-versus-inference) for why an
+isolated cold probe reads as mostly startup.)
+
+A **capability** is a `(tier, kind, magnitude)` triple, e.g. "SD1.5 can run batch size 4". Each probe's
+verdict is `PROVEN`, `DISPROVEN`, `SKIPPED` (a prerequisite was unproven or the machine cannot host it),
+or `CRASHED`. A probe runs only when every capability it `requires` is already proven, so "a tier
+baseline failed → skip everything that builds on it" falls out of the dependency graph rather than an
+imperative cascade. After the static probes, the recommendation is synthesized and **soaked** under
+sustained load per passing tier, then re-synthesized so an unstable soak can downgrade it.
+
+The report is identical in spirit to `ramp`'s: a **Capabilities** surface (everything proven) separate
+from a **conservative recommended bridgeData**, with a **provenance basis** on every value (proven /
+tested-and-failed / never-tested / not-in-this-run / held-back) and a consistency check that never ships
+a setting enabled on weaker than a real pass.
+
+Key `run` options:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--tiers` | `sd15,sdxl` | Comma-separated tiers (`sd15`, `sdxl`, `flux`, `qwen`, `zimage`); heavy tiers are opt-in and self-skip when the machine cannot host them. |
+| `--process-mode {fake,dry_run,real}` | `real` | `real` benchmarks the GPU; `fake`/`dry_run` exercise the engine without inference. |
+| `--out PATH` | `benchmark_results/<timestamp>` | Output directory (`report.json`, `report.md`, `progress.jsonl`). |
+| `--jobs-per-level N` | `4` | Jobs run per probe. |
+| `--probe-timeout SECONDS` | `900` | Per-probe timeout. |
+| `--only SLUG` | — | Run a single probe by its capability slug (e.g. `sd15-controlnet`), for a remediation loop. |
+| `--no-validate` | off | Skip the post-run sustained-load soak (`--soak-minutes` sets its length). |
+| `--strict-duty` | off | Make the soak's 90% GPU-duty target a hard gate (advisory by default). |
+| `--exclude-capability KIND` | — | Drop a single capability kind (repeatable; choices are the `CapabilityKind` values, e.g. `post_processing`, `controlnet`, `alchemy_concurrent`). |
+| `--no-concurrency` / `--no-features` / `--no-alchemy` / `--include-downloads` | — | Coarse stage selection, as in `ramp`. |
+
+```bash
+# Prove sd15 + sdxl on this GPU and write the report:
+horde-benchmark run --tiers sd15,sdxl
+
+# Re-prove just one capability after a fix (single warm worker, one probe):
+horde-benchmark run --only sd15-controlnet --no-validate
+```
 
 The ramp walks an ordered ladder per tier: a conservative **baseline** (stage A), then **concurrency**
 (queue/threads/batch, B), **features** (C), **alchemy** (D), and optional **downloads** (E), followed by
