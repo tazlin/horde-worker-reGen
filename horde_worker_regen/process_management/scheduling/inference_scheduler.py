@@ -3731,10 +3731,14 @@ class InferenceScheduler:
             f"card by ~{plan.shortfall_mb:.0f}MB and no cross-process VRAM can be reclaimed to host it; "
             "faulting it rather than stalling the device.",
         )
+        # Terminal, not retryable: a local retry would only re-dispatch into the same unchanged, still
+        # overflowing card (a guaranteed second fault) and feed the breaker a second over-commit count for one
+        # job. The horde reissues the faulted job elsewhere, which is the intended recovery here.
         await self._job_tracker.handle_job_fault(
             faulted_job=dispatched_job,
             process_info=process_with_model,
             process_timeout=self._runtime_config.bridge_data.process_timeout,
+            retryable=False,
         )
         self._job_tracker.note_post_processing_overcommit_fault()
         return False

@@ -188,9 +188,15 @@ cover the peak -- because on a contended card that sibling model is the room the
 upscaler needs and the child's in-process `free_memory` cannot reach it. Only when
 no reclaimable sibling holds room does it defer to that in-child own-weights free,
 then to stopping an idle context on the contended card. A peak nothing the
-orchestrator can reclaim will host (a single-process worker on a small card) faults
-gracefully so the horde reissues the job, rather than dispatching it into a
-guaranteed stall. It is evidence-gated: with the peak unknown or free VRAM
+orchestrator can reclaim will host faults gracefully so the horde reissues the job,
+rather than dispatching it into a guaranteed stall. This is not only the tiny
+single-process card: a large card running several processes with post-processing
+overlap can have two or more siblings mid-upscale at once, whose committed peaks
+pull the effective free below zero, so even a 24 GB card declines a fresh peak when
+nothing is idle to reclaim. That fault is terminal (non-retryable): a local retry
+would only re-dispatch into the same unchanged, still-overflowing card, so the job
+is left for the horde to reissue elsewhere. It is evidence-gated: with the peak
+unknown or free VRAM
 unmeasured it does nothing, and on a roomy card where the peak already fits it is a
 no-op. Each decision is logged at debug with the peak, the effective free, and the
 chosen action, so a stall the reclaim declined to prevent leaves a trace.

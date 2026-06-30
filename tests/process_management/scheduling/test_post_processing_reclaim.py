@@ -468,7 +468,12 @@ class TestPostProcessingReclaimEnactment:
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(1, device_index=1)
 
     async def test_insufficient_faults_and_does_not_dispatch(self) -> None:
-        """The unhostable rung faults the job gracefully and signals the caller not to dispatch it."""
+        """The unhostable rung faults the job terminally (no retry into the same card) and declines dispatch.
+
+        The fault is non-retryable: a local retry would only re-dispatch the job into the same unchanged,
+        still-overflowing card, so the job is reissued by the horde instead of feeding the breaker a second
+        over-commit count for one placement failure.
+        """
         job_tracker = JobTracker()
         dispatched = make_job_pop_response(model=_MODEL)
         await track_popped_job_async(job_tracker, dispatched)
@@ -488,6 +493,7 @@ class TestPostProcessingReclaimEnactment:
 
         assert should_dispatch is False
         scheduler._job_tracker.handle_job_fault.assert_awaited_once()
+        assert scheduler._job_tracker.handle_job_fault.call_args.kwargs.get("retryable") is False
 
     @pytest.mark.parametrize(
         "action",

@@ -170,8 +170,12 @@ So the worker also withdraws the failing capability before that happens.
 The **post-processing fault breaker** is the instance of this for post-processing.
 A post-processing peak that cannot be hosted (see
 [post-processing VRAM over-commit](bridge_config.md#post-processing-vram-over-commit))
-faults the job, and a watchdog-reaped post-processing stall does the same. Both
-feed a rolling-window counter
+faults the job, and a watchdog-reaped post-processing stall does the same. The
+unhostable-peak fault is **terminal** (non-retryable): a local retry would only
+re-dispatch the job into the same unchanged, still-overflowing card (a guaranteed
+second fault), so the job is reissued by the horde elsewhere instead, and one
+placement failure feeds the breaker exactly one count. Both sources feed a
+rolling-window counter
 ([`JobTracker.count_recent_post_processing_faults`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker.count_recent_post_processing_faults]);
 once it exceeds `post_processing_fault_threshold` within
 `post_processing_fault_window_seconds`, the worker stops advertising
