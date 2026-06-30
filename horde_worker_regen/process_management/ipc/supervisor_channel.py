@@ -424,7 +424,7 @@ class StatsSample(BaseModel):
 
 
 class StatsRollupRow(BaseModel):
-    """Incremental rollup of finalized image jobs by model or baseline."""
+    """Incremental rollup of finalized jobs by model/baseline (image) or by form (alchemy)."""
 
     model: str | None = None
     baseline: str | None = None
@@ -433,6 +433,10 @@ class StatsRollupRow(BaseModel):
     sampling_seconds: float = 0.0
     e2e_seconds: float = 0.0
     batch_gt_one_jobs: int = 0
+    faulted_jobs: int = 0
+    """How many of the folded jobs/forms faulted (the by-form table surfaces this per form)."""
+    vram_high_water_mb: int = 0
+    """Peak VRAM high-water observed across the folded jobs/forms, when a child reported it (0 otherwise)."""
 
 
 class StatsExportState(BaseModel):

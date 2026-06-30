@@ -527,6 +527,10 @@ class WorkerRunMetrics:
         row.e2e_seconds += record.e2e_seconds or 0.0
         if record.batch_count > 1:
             row.batch_gt_one_jobs += 1
+        if record.faulted:
+            row.faulted_jobs += 1
+        if record.phase_metrics is not None and record.phase_metrics.vram_used_high_water_mb is not None:
+            row.vram_high_water_mb = max(row.vram_high_water_mb, record.phase_metrics.vram_used_high_water_mb)
 
     def _write_sample_event(self, sample: StatsSample) -> None:
         if not self._stats_export_enabled or self._stats_exporter is None:

@@ -193,6 +193,7 @@ class OverviewView(Vertical):
         self._gpu_duty_history: deque[tuple[float, float]] = deque(maxlen=_TREND_HISTORY)
         self._kudos_history: deque[tuple[float, float]] = deque(maxlen=_TREND_HISTORY)
         self._jobs_history: deque[tuple[float, int]] = deque(maxlen=_TREND_HISTORY)
+        self._forms_history: deque[tuple[float, int]] = deque(maxlen=_TREND_HISTORY)
         self._last_trend_sample = 0.0
         self._trend_window = OverviewTrendWindow.FIFTEEN_MINUTES
         self._trend_epoch = time.time()
@@ -401,11 +402,13 @@ class OverviewView(Vertical):
         gpu_duty = sample.gpu_duty_percent if sample is not None else snapshot.gpu_utilization_mean_percent
         kudos_per_hour = sample.kudos_per_hour if sample is not None else snapshot.kudos_per_hour
         jobs_submitted = sample.jobs_submitted if sample is not None else snapshot.num_jobs_submitted
+        forms_submitted = sample.alchemy_total_submitted if sample is not None else snapshot.alchemy_total_submitted
         if gpu_duty is not None:
             self._gpu_duty_history.append((now, gpu_duty))
         if kudos_per_hour is not None:
             self._kudos_history.append((now, kudos_per_hour))
         self._jobs_history.append((now, jobs_submitted))
+        self._forms_history.append((now, forms_submitted))
 
     def _windowed_float_series(self, samples: deque[tuple[float, float]]) -> list[float]:
         """Return fixed buckets spanning the active trend window and epoch."""
@@ -1273,6 +1276,17 @@ class OverviewView(Vertical):
         )
         return rate, deltas
 
+    def _forms_per_hour(self) -> tuple[float | None, list[float]]:
+        """Derive alchemy forms/hr and fixed-window buckets from the cumulative submitted-forms counter."""
+        rate, deltas, _sampled_span = fixed_counter_deltas(
+            list(self._forms_history),
+            self._trend_window,
+            session_start=self._trend_session_start,
+            epoch=self._trend_epoch,
+            buckets=_TREND_SPARK_WIDTH,
+        )
+        return rate, deltas
+
     @staticmethod
     def _gpus_strip_vram(card: CardSnapshot) -> Text:
         """A compact used-fraction bar plus free/total VRAM for one card, reddened under VRAM pressure."""
@@ -1353,6 +1367,18 @@ class OverviewView(Vertical):
             Text(sparkline(jobs_deltas) or "…", style="green"),
             f"{snapshot.num_jobs_submitted:,} done",
         )
+
+        # An alchemist worker gets its own throughput row, the forms/hr analogue of jobs/hr.
+        if snapshot.config.alchemist:
+            forms_rate, forms_deltas = self._forms_per_hour()
+            forms_deltas = forms_deltas[-_TREND_SPARK_WIDTH:]
+            grid.add_row(
+                "Forms/hr",
+                "-" if forms_rate is None else f"{forms_rate:,.0f}",
+                self._trend_arrow(forms_deltas),
+                Text(sparkline(forms_deltas) or "…", style="magenta"),
+                f"{snapshot.alchemy_total_submitted:,} done",
+            )
 
         busy_fraction = snapshot.gpu_utilization_busy_fraction
         if busy_fraction is None and snapshot.gpu_utilization_mean_percent is not None:

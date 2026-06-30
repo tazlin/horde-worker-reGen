@@ -18,7 +18,16 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     StatsRollupRow,
     WorkerStateSnapshot,
 )
-from horde_worker_regen.tui.formatters import format_percent, human_bytes, human_duration, short_baseline, shorten
+from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
+from horde_worker_regen.process_management.scheduling.workload_flow import capability_for_alchemy_form
+from horde_worker_regen.tui.formatters import (
+    format_percent,
+    human_bytes,
+    human_duration,
+    human_mb,
+    short_baseline,
+    shorten,
+)
 
 
 class StatsView(Vertical):
@@ -141,12 +150,16 @@ class StatsView(Vertical):
             ("Pipeline", f"{snapshot.jobs_pending_inference} queued / {snapshot.jobs_in_progress} in progress"),
         ]
         if snapshot.config.alchemist:
-            rows.append(
-                (
-                    "Alchemy",
-                    f"{snapshot.alchemy_total_submitted:,} submitted / {snapshot.alchemy_total_faulted:,} faulted",
-                ),
+            detail = f"{snapshot.alchemy_total_submitted:,} submitted / {snapshot.alchemy_total_faulted:,} faulted"
+            graph_forms = sum(
+                row.jobs for row in snapshot.stats_form_rollups if StatsView._form_kind_label(row.model) == "graph"
             )
+            clip_forms = sum(
+                row.jobs for row in snapshot.stats_form_rollups if StatsView._form_kind_label(row.model) == "clip"
+            )
+            if graph_forms or clip_forms:
+                detail += f"  ({graph_forms:,} graph / {clip_forms:,} clip)"
+            rows.append(("Alchemy", detail))
         if sample is not None:
             rows.append(("Last sample", human_duration(max(0.0, snapshot.timestamp - sample.timestamp)) + " ago"))
         for label, value in rows:
@@ -247,18 +260,32 @@ class StatsView(Vertical):
         """
         table = Table(expand=True, border_style="grey37", header_style="bold")
         table.add_column("Form", no_wrap=True)
+        table.add_column("Kind", no_wrap=True)
         table.add_column("Forms", justify="right")
+        table.add_column("Faulted", justify="right")
         table.add_column("Avg E2E", justify="right")
         table.add_column("Total E2E", justify="right")
+        table.add_column("Peak VRAM", justify="right")
         if not rows:
-            table.add_row("no finalized alchemy forms yet", "", "", "")
+            table.add_row("no finalized alchemy forms yet", "", "", "", "", "", "")
         else:
             for row in rows:
                 average = row.e2e_seconds / row.jobs if row.jobs else 0.0
+                faulted = Text(f"{row.faulted_jobs:,}", style="red" if row.faulted_jobs else "grey50")
                 table.add_row(
                     shorten(row.model, 32),
+                    StatsView._form_kind_label(row.model),
                     f"{row.jobs:,}",
+                    faulted,
                     human_duration(average),
                     human_duration(row.e2e_seconds),
+                    human_mb(row.vram_high_water_mb) if row.vram_high_water_mb else "-",
                 )
         return Panel(table, title="By alchemy form totals", title_align="left", border_style="grey37", padding=(0, 1))
+
+    @staticmethod
+    def _form_kind_label(form: str | None) -> str:
+        """Classify a form as graph (runs on an inference process) or CLIP (runs on the safety process)."""
+        if form is None:
+            return "-"
+        return "graph" if capability_for_alchemy_form(form) is WorkerCapability.ALCHEMY_GRAPH else "clip"

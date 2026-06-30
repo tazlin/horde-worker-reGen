@@ -423,6 +423,19 @@ def test_pipeline_strip_stays_job_pipeline_for_dreamer() -> None:
     assert "Inference" in strip
 
 
+def test_trends_show_forms_per_hour_only_for_alchemist() -> None:
+    """The Trends panel gains a Forms/hr row for an alchemist worker; a dreamer worker has none."""
+    alchemist = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0", alchemist=True),
+    )
+    dreamer = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0", alchemist=False),
+    )
+
+    assert "Forms/hr" in _render(OverviewView()._render_trends(alchemist))
+    assert "Forms/hr" not in _render(OverviewView()._render_trends(dreamer))
+
+
 def test_recent_jobs_retains_more_rows_when_alchemist_only() -> None:
     """Sparse alchemy work stays visible: an alchemist-only worker shows the full retained set, not 8."""
     jobs = [RecentJobRecord(job_id=f"job-{i}", is_alchemy=True, model_name=f"form{i}") for i in range(12)]
