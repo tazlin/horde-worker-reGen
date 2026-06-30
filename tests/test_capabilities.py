@@ -12,6 +12,7 @@ from hordelib.feature_impact import FEATURE_KIND
 
 from horde_worker_regen import capabilities, compute_mode
 from horde_worker_regen.process_management.jobs.alchemy_popper import expand_offered_forms
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 
 _ALL_FEATURES = frozenset(FEATURE_KIND)
 _NO_FEATURES: frozenset[FEATURE_KIND] = frozenset()
@@ -30,6 +31,8 @@ def _bridge_data(**overrides: object) -> SimpleNamespace:
         allow_controlnet=True,
         allow_sdxl_controlnet=True,
         dry_run_skip_inference=False,
+        dreamer=True,
+        alchemist=False,
     )
     for key, value in overrides.items():
         setattr(bd, key, value)
@@ -202,3 +205,59 @@ def test_cpu_install_idempotent_when_already_disabled(monkeypatch: pytest.Monkey
     coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
 
     assert coercions == []
+
+
+def test_enabled_workloads_dreamer_and_alchemist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A normal GPU dreamer+alchemist worker serves both workloads."""
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=True, alchemist=True)
+
+    assert capabilities.enabled_workloads(bd) == frozenset(  # type: ignore[arg-type]
+        {WorkloadKind.IMAGE_GENERATION, WorkloadKind.ALCHEMY},
+    )
+
+
+def test_enabled_workloads_dreamer_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The historical default (dreamer on, alchemist off) serves only image generation."""
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=True, alchemist=False)
+
+    assert capabilities.enabled_workloads(bd) == frozenset({WorkloadKind.IMAGE_GENERATION})  # type: ignore[arg-type]
+
+
+def test_enabled_workloads_alchemist_only_via_dreamer_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deselecting the dreamer role on a GPU box yields an alchemist-only worker."""
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=False, alchemist=True)
+
+    assert capabilities.enabled_workloads(bd) == frozenset({WorkloadKind.ALCHEMY})  # type: ignore[arg-type]
+
+
+def test_enabled_workloads_cpu_forces_alchemist_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CPU install cannot serve image generation even with dreamer left on."""
+    _patch_cpu_install(monkeypatch, cpu=True)
+    bd = _bridge_data(dreamer=True, alchemist=True)
+
+    assert capabilities.enabled_workloads(bd) == frozenset({WorkloadKind.ALCHEMY})  # type: ignore[arg-type]
+
+
+def test_enabled_workloads_empty_when_nothing_selected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker with both roles off serves nothing (the warning case)."""
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _bridge_data(dreamer=False, alchemist=False)
+
+    assert capabilities.enabled_workloads(bd) == frozenset()  # type: ignore[arg-type]
+
+
+def test_dreamer_false_disables_image_generation_on_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deliberate dreamer: false opt-out clears image models on a GPU install too."""
+    _patch_features(monkeypatch, _ALL_FEATURES)
+    _patch_cpu_install(monkeypatch, cpu=False)
+    bd = _cpu_bridge_data(dreamer=False, alchemist=True)
+
+    coercions = capabilities.coerce_bridge_data_to_capabilities(bd, log=False)  # type: ignore[arg-type]
+
+    assert bd.image_models_to_load == []
+    assert bd.dynamic_models is False
+    assert bd.alchemist is True
+    assert any("dreamer" in c for c in coercions)

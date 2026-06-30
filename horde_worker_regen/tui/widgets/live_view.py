@@ -144,7 +144,12 @@ class LiveView(VerticalScroll):
             state_label = f"{temperature.value.title()} · {phrase}"
             state_colour = "grey50" if stale else temperature_colour(temperature)
         body.add_row("State", Text(state_label, style=state_colour))
-        body.add_row("Model", shorten(process.loaded_horde_model_name, 40))
+        # A process running an alchemy form holds no horde image model, so the Model row would read blank;
+        # label it as alchemy work instead so the role is clear rather than looking idle/misconfigured.
+        if process.last_process_state == "ALCHEMY_STARTING" and not process.loaded_horde_model_name:
+            body.add_row("Work", Text("⚗ Alchemy", style="magenta"))
+        else:
+            body.add_row("Model", shorten(process.loaded_horde_model_name, 40))
         if process.loaded_horde_model_baseline:
             body.add_row("Baseline", process.loaded_horde_model_baseline)
         if process.current_job_width and process.current_job_height:

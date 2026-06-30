@@ -53,9 +53,21 @@ loop. What they share is threefold:
   above a *capacity* layer (the shared budget) that decides whether the device can physically hold the
   work at all.
 
-The image pipeline's [`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker] still
-owns image-generation job state; the flow abstraction is the seam a future audio/video flow plugs into
-rather than a replacement for it.
+Each flow presents a uniform
+[`FlowCoordinator`][horde_worker_regen.process_management.scheduling.workload_flow.FlowCoordinator]
+surface (`kind`, `num_in_flight`, `run`). Alchemy satisfies it directly with `AlchemyCoordinator`;
+image generation does so through
+[`ImageGenerationCoordinator`][horde_worker_regen.process_management.jobs.image_coordinator.ImageGenerationCoordinator],
+which wraps the existing image popper, submitter, and
+[`JobTracker`][horde_worker_regen.process_management.jobs.job_tracker.JobTracker] (still the owner of
+image-generation job state) rather than replacing them. The process manager holds a `WorkloadKind`-keyed
+registry of these flows and launches each flow's `run` uniformly, so the snapshot and dashboard read
+per-workload work counts the same way for every flow, and a future audio/video flow plugs into the
+registry rather than getting a bespoke launch path. Which workloads a worker actually serves is the
+separate, declarative question answered by
+[`capabilities.enabled_workloads`][horde_worker_regen.capabilities.enabled_workloads] (derived from the
+`dreamer`/`alchemist` role flags and the install), which drives process sizing and the dashboard's mode
+identity; an alchemist-only worker is simply one whose served set is `{alchemy}`.
 
 ## Why multiple processes?
 
@@ -98,19 +110,23 @@ The shared objects are:
 
 ## The asyncio tasks
 
-Five (plus one optional) long-lived asyncio tasks are started by
-`HordeWorkerProcessManager._main_loop` (`process_manager.py`):
+Several long-lived asyncio tasks are started by `HordeWorkerProcessManager._main_loop`
+(`process_manager.py`): the non-flow loops below, plus one `run()` per registered workload flow.
 
-| Task                        | Cadence | Role                                                                                      |
-| --------------------------- | ------- | ----------------------------------------------------------------------------------------- |
-| `JobPopper.run()`           | 1 s     | Pop image jobs from the API (or `CannedJobSource` in dry-run)                             |
-| `_process_control_loop()`   | 0.2 s   | Drain IPC messages, schedule inference, dispatch safety, manage processes                 |
-| `JobSubmitter.run()`        | 0.02 s  | Upload completed and safety checked images to R2 and submit complete message to horde API |
-| `_api_get_user_info_loop()` | 15 s    | Fetch user/kudos info                                                                     |
-| `AlchemyCoordinator.run()`  | 1 s     | Pop, dispatch, and submit alchemy forms (only when `alchemist: true`; otherwise idle)    |
+| Task                          | Cadence | Role                                                                                      |
+| ----------------------------- | ------- | ----------------------------------------------------------------------------------------- |
+| `_process_control_loop()`     | 0.2 s   | Drain IPC messages, schedule inference, dispatch safety, manage processes                 |
+| `_api_get_user_info_loop()`   | 15 s    | Fetch user/kudos info                                                                     |
+| `_periodic_update_check_loop()` | -     | Check for a newer worker release                                                          |
+| `ImageGenerationCoordinator.run()` | -  | Supervise the image `JobPopper` (1 s) and `JobSubmitter` (0.02 s) loops                   |
+| `AlchemyCoordinator.run()`    | 1 s     | Pop, dispatch, and submit alchemy forms (only when `alchemist: true`; otherwise idle)     |
 
-A sixth task (`BridgeDataReloader.bridge_data_loop`, 1 s) hot-reloads `bridgeData.yaml` into
-`RuntimeConfig` unless the config came from environment variables.
+The two coordinator tasks are launched uniformly from the flow registry (`self._flows`, keyed by
+`WorkloadKind`). The image flow keeps the same per-loop shutdown supervision the popper and submitter
+had as top-level tasks: each is launched carrying `_handle_exception`, so if one ends the worker shuts
+down gracefully while the other keeps draining in-flight work. A further task
+(`BridgeDataReloader.bridge_data_loop`, 1 s) hot-reloads `bridgeData.yaml` into `RuntimeConfig` unless
+the config came from environment variables.
 
 These tasks run concurrently in the same asyncio event loop. The
 `_process_control_loop` is the "brain". Every 200 ms it drains the IPC queue,

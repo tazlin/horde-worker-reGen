@@ -357,12 +357,23 @@ branded_model: true
 ## Alchemist (Image Interrogation and Post-Processing)
 #########################
 
+# Set to false to deliberately run an alchemist-only worker (no image generation) on a GPU box.
+# Leave it true (the default) for the usual dreamer or dreamer+alchemist worker. The role matrix:
+#   dreamer: true,  alchemist: false  -> image generation only (the default)
+#   dreamer: true,  alchemist: true   -> both image generation and alchemy
+#   dreamer: false, alchemist: true   -> alchemy only (one inference process for graph forms)
+#   dreamer: false, alchemist: false  -> nothing to serve (a warning is logged)
+# A CPU-only install cannot serve image generation regardless of this flag, so it always runs
+# alchemist-only there.
+dreamer: true
+
 # Set to true to also serve alchemy (interrogation) jobs alongside image generation.
 # Image jobs always take priority. By default (alchemy_allow_concurrent) alchemy may run
 # concurrently with image generation when a process lane is spare and there is VRAM
 # headroom; otherwise it waits. Graph forms (upscalers, facefixers, strip_background) run
 # on the inference processes (shared with image generation); CLIP forms (interrogation,
-# nsfw, caption) run on the safety process.
+# nsfw, caption) run on the safety process. Set alchemist: true together with dreamer: false
+# for an alchemist-only worker.
 alchemist: false
 
 # Worker name for serving alchemy jobs.

@@ -33,24 +33,29 @@ def test_noop_without_template(tmp_path: Path) -> None:
     assert not target.exists()
 
 
-def test_cpu_install_enables_alchemist(tmp_path: Path) -> None:
-    """A fresh CPU install flips the seeded alchemist flag on so the worker is useful out of the box."""
+def test_cpu_install_enables_alchemist_only(tmp_path: Path) -> None:
+    """A fresh CPU install seeds an explicit alchemist-only config (alchemist on, dreamer off)."""
     template = tmp_path / "bridgeData_template.yaml"
     target = tmp_path / "bridgeData.yaml"
-    template.write_text('api_key: 0000000000\nalchemist: false\nmodels_to_load:\n    - "top 2"\n', encoding="utf-8")
+    template.write_text(
+        'api_key: 0000000000\ndreamer: true\nalchemist: false\nmodels_to_load:\n    - "top 2"\n',
+        encoding="utf-8",
+    )
 
     assert config_seed.seed_config(template=template, target=target, backend_token="cpu") is True
 
     text = target.read_text(encoding="utf-8")
     assert "alchemist: true" in text
     assert "alchemist: false" not in text
+    assert "dreamer: false" in text
+    assert "dreamer: true" not in text
 
 
-def test_gpu_install_leaves_alchemist(tmp_path: Path) -> None:
-    """A GPU install copies the template verbatim (alchemist stays as the template had it)."""
+def test_gpu_install_leaves_roles(tmp_path: Path) -> None:
+    """A GPU install copies the template verbatim (the role flags stay as the template had them)."""
     template = tmp_path / "bridgeData_template.yaml"
     target = tmp_path / "bridgeData.yaml"
-    template.write_text("alchemist: false\n", encoding="utf-8")
+    template.write_text("dreamer: true\nalchemist: false\n", encoding="utf-8")
 
     assert config_seed.seed_config(template=template, target=target, backend_token="cu132") is True
-    assert target.read_text(encoding="utf-8") == "alchemist: false\n"
+    assert target.read_text(encoding="utf-8") == "dreamer: true\nalchemist: false\n"

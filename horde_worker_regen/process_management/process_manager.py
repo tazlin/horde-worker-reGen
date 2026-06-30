@@ -43,7 +43,7 @@ from horde_worker_regen.app_state import AppStateStore, WorkerRunRecord, default
 from horde_worker_regen.bridge_data.beta_source import beta_aware_image_records
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.bridge_data.gpu_config import resolve_all_effective_gpu_configs
-from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities
+from horde_worker_regen.capabilities import coerce_bridge_data_to_capabilities, enabled_workloads
 from horde_worker_regen.consts import (
     BRIDGE_CONFIG_FILENAME,
     VRAM_HEAVY_MODELS,
@@ -87,6 +87,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkLedgerStage,
 )
 from horde_worker_regen.process_management.jobs.alchemy_popper import DEFAULT_ALCHEMY_FORMS, AlchemyCoordinator
+from horde_worker_regen.process_management.jobs.image_coordinator import ImageGenerationCoordinator
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
@@ -133,6 +134,7 @@ from horde_worker_regen.process_management.scheduling.pop_governor_registry impo
     PopGovernorRegistry,
 )
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
+from horde_worker_regen.process_management.scheduling.workload_flow import FlowCoordinator, WorkloadKind
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.workers.safety_orchestrator import SafetyOrchestrator
@@ -310,6 +312,7 @@ def resolve_card_concurrency(
     gpu_sampling_lease_enabled: bool,
     gpu_sampling_lease_slots: int | None,
     max_threads_ceiling: int,
+    serves_image_generation: bool = True,
 ) -> CardConcurrency:
     """Resolve one card's concurrency sizes from its effective config (the per-card analogue of the globals).
 
@@ -317,11 +320,20 @@ def resolve_card_concurrency(
     process count of ``queue_size + ceiling`` collapsed to 1 for the single-model/single-thread case, and
     the lease-aware inference-semaphore size from :func:`_resolve_inference_concurrency`. Passing one card's
     effective values reproduces today's globals exactly for a single-GPU host.
+
+    When this worker does not serve image generation (``serves_image_generation`` is false: an
+    alchemist-only worker, whether by CPU install or a deliberate ``dreamer: false`` opt-out) the process
+    count is forced to one. The image-generation fleet exists to run many concurrent samplers; without
+    image work the only inference-process consumer is graph alchemy (upscale, face-fix), which serializes
+    fine through a single process while CLIP/text forms run on the safety process. The ceiling and
+    semaphore sizes are left intact so the single process is still sized correctly for what it runs.
     """
     ceiling = max(max_threads, max_threads_ceiling)
     max_concurrent = ceiling
     target_process_count = queue_size + ceiling
     if num_models_to_load == 1 and max_concurrent == 1:
+        target_process_count = 1
+    if not serves_image_generation:
         target_process_count = 1
     inference_semaphore_size, lease_slots = _resolve_inference_concurrency(
         gpu_sampling_lease_enabled=gpu_sampling_lease_enabled,
@@ -1064,6 +1076,23 @@ class HordeWorkerProcessManager:
         )
         self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
 
+        self._image_coordinator = ImageGenerationCoordinator(
+            job_popper=self._job_popper,
+            job_submitter=self._job_submitter,
+            job_tracker=self._job_tracker,
+            subtask_done_callback=self._handle_exception,
+        )
+        # One WorkloadKind-keyed registry of every workload flow this worker runs. Both flows are
+        # always present and self-gate (the image popper does not pop without models; the alchemy
+        # coordinator does not pop unless alchemist is set), so the registry mirrors today's
+        # always-running loops while giving the snapshot and TUI a uniform per-workload surface. Which
+        # workloads the worker is *for* (process sizing, the dashboard's mode identity) is a separate,
+        # declarative question answered by capabilities.enabled_workloads.
+        self._flows: dict[WorkloadKind, FlowCoordinator] = {
+            WorkloadKind.IMAGE_GENERATION: self._image_coordinator,
+            WorkloadKind.ALCHEMY: self._alchemy_coordinator,
+        }
+
         if stable_diffusion_reference is not None:
             self.stable_diffusion_reference = stable_diffusion_reference
         else:
@@ -1100,6 +1129,10 @@ class HordeWorkerProcessManager:
         bridge_data = self.bridge_data
         device_indices = sorted(self._device_map.root) or [0]
         effective_configs = resolve_all_effective_gpu_configs(bridge_data, device_indices)
+        # The dreamer/alchemist roles are worker-wide (not per-card overrides), so whether image
+        # generation is served is decided once for the whole worker. An alchemist-only worker collapses
+        # every card to a single inference process (graph alchemy serializes through it).
+        serves_image_generation = WorkloadKind.IMAGE_GENERATION in enabled_workloads(bridge_data)
         per_card_concurrency = {
             index: resolve_card_concurrency(
                 max_threads=effective_configs[index].max_threads,
@@ -1108,6 +1141,7 @@ class HordeWorkerProcessManager:
                 gpu_sampling_lease_enabled=effective_configs[index].gpu_sampling_lease_enabled,
                 gpu_sampling_lease_slots=effective_configs[index].gpu_sampling_lease_slots,
                 max_threads_ceiling=max_threads_ceiling,
+                serves_image_generation=serves_image_generation,
             )
             for index in device_indices
         }
@@ -3297,6 +3331,7 @@ class HordeWorkerProcessManager:
 
         config = WorkerConfigSummary(
             dreamer_name=bridge_data.dreamer_worker_name,
+            alchemist_name=bridge_data.alchemist_name,
             worker_version=horde_worker_regen.__version__,
             horde_username=self.user_info.username if self.user_info is not None else None,
             num_models=len(bridge_data.image_models_to_load),
@@ -3389,6 +3424,7 @@ class HordeWorkerProcessManager:
             alchemy_forms_awaiting_submit=self._alchemy_coordinator.num_forms_awaiting_submit,
             alchemy_total_submitted=self._alchemy_coordinator.num_forms_submitted,
             alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
+            enabled_workloads=sorted(workload.value for workload in enabled_workloads(bridge_data)),
             pending_jobs=self._build_pending_jobs_list(),
             orchestration_intent=orchestration_intent,
             work_ledger=self._build_work_ledger(recent_jobs),
@@ -3581,13 +3617,15 @@ class HordeWorkerProcessManager:
         self._api_sessions.set_horde_client_session(horde_session)
 
         async with aiohttp_session, horde_session:  # pyrefly: ignore
+            # The per-workload flows (image generation, alchemy) are launched uniformly from the flow
+            # registry; each flow owns its own pop/dispatch/submit loops. The image flow internally
+            # supervises the job popper and submitter, carrying the same per-loop shutdown supervision
+            # they had as top-level tasks (see ImageGenerationCoordinator.run).
             coroutines = [
                 self._process_control_loop(),
-                self._job_popper.run(),
                 self._api_get_user_info_loop(),
-                self._job_submitter.run(),
-                self._alchemy_coordinator.run(),
                 self._periodic_update_check_loop(),
+                *(flow.run() for flow in self._flows.values()),
             ]
             if not self.bridge_data._loaded_from_env_vars:
                 coroutines.append(self._bridge_data_reloader.bridge_data_loop())

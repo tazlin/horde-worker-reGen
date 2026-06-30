@@ -211,6 +211,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     # The SDK validates API keys as exactly 22 characters
     bd.api_key = "T" * 22
     bd.dreamer_worker_name = "test-worker"
+    bd.dreamer = True
     bd.horde_model_stickiness = 0
     bd.blacklist = []  # pyrefly: ignore - this field is required but not relevant to our tests, so we can just set it to an empty list
     bd.require_upfront_kudos = False
@@ -225,6 +226,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.allow_lora = True
     bd.min_lora_disk_free_gb = 1.0
     bd.alchemist = False
+    bd.alchemist_name = "test-alchemist"
     bd.alchemy_allow_concurrent = True
     bd.alchemy_max_concurrency = 1
     bd.alchemy_vram_headroom_mb = 2000

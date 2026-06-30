@@ -189,6 +189,8 @@ class WorkerConfigSummary(BaseModel):
     """
 
     dreamer_name: str
+    alchemist_name: str | None = None
+    """The worker's alchemist identity, shown in place of the dreamer name on an alchemist-only worker."""
     worker_version: str
     horde_username: str | None = None
     num_models: int = 0
@@ -925,6 +927,15 @@ class WorkerStateSnapshot(BaseModel):
     """Cumulative forms successfully submitted this session."""
     alchemy_total_faulted: int = 0
     """Cumulative forms that faulted (permanently failed) this session."""
+
+    enabled_workloads: list[str] = Field(default_factory=list)
+    """The workloads this worker serves, as ``WorkloadKind`` values (e.g. ``image_generation``,
+    ``alchemy``), sorted for stable rendering.
+
+    Carried as plain strings so this module stays free of the heavy import chain behind ``WorkloadKind``;
+    consumers reconstruct the typed enum. The dashboard uses this to identify the worker's mode (an
+    alchemist-only worker reshapes around alchemy) rather than inferring it from model counts. Empty only
+    before the first snapshot or for a worker configured to serve nothing."""
 
     pending_jobs: list[JobQueueEntry] = Field(default_factory=list)
     """Pending-inference jobs (capped at :data:`PENDING_JOBS_IN_SNAPSHOT`), oldest first."""

@@ -539,6 +539,43 @@ def test_pause_safety_on_gpu_is_noop_when_safety_not_on_gpu() -> None:
     assert plm.is_safety_gpu_paused is False
 
 
+def _captured_safety_cpu_only(plm: ProcessLifecycleManager) -> bool:
+    """Start a safety process with a mocked spawn and return the cpu_only arg it was launched with."""
+    # A real integer pid so the owned-process ledger event validates (it records os_pid).
+    plm._new_process = Mock(return_value=Mock(pid=12345))  # type: ignore[method-assign]
+    plm.start_safety_processes()
+    # The safety entry point's positional args are (pid, queue, pipe, lock, launch_id, cpu_only).
+    return bool(plm._new_process.call_args.kwargs["args"][5])
+
+
+def test_safety_forced_cpu_only_on_cpu_install_even_with_safety_on_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CPU-only torch build has no CUDA device, so the safety process must come up off-GPU.
+
+    Without this the safety models load on 'cuda' and raise during init; the configured safety_on_gpu=true
+    must be overridden by the install reality.
+    """
+    monkeypatch.setattr(
+        "horde_worker_regen.process_management.lifecycle.process_lifecycle.is_cpu_only_install",
+        lambda: True,
+    )
+    plm = _make_plm()
+    plm._runtime_config.bridge_data.safety_on_gpu = True
+
+    assert _captured_safety_cpu_only(plm) is True
+
+
+def test_safety_on_gpu_respected_on_gpu_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On a GPU install with safety_on_gpu=true and no pause, the safety process comes up on-GPU."""
+    monkeypatch.setattr(
+        "horde_worker_regen.process_management.lifecycle.process_lifecycle.is_cpu_only_install",
+        lambda: False,
+    )
+    plm = _make_plm()
+    plm._runtime_config.bridge_data.safety_on_gpu = True
+
+    assert _captured_safety_cpu_only(plm) is False
+
+
 def test_intentional_safety_cycle_not_counted_as_recovery() -> None:
     """A whole-card safety pause/restore cycle completing must not bump recoveries or the crash-loop breaker.
 

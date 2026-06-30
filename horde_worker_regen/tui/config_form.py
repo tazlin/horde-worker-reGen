@@ -513,6 +513,16 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     # Alchemist
     ConfigField(
+        "dreamer",
+        "Enable dreamer (image generation)",
+        FieldKind.BOOL,
+        "Alchemist",
+        "Serve image-generation jobs. Turn this off (with alchemist on) to run an alchemist-only worker; "
+        "a CPU-only install is always alchemist-only regardless.",
+        requires_restart=True,
+        explicit_default=True,
+    ),
+    ConfigField(
         "alchemist",
         "Enable alchemist",
         FieldKind.BOOL,

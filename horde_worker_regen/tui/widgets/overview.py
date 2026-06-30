@@ -16,6 +16,7 @@ from textual.widgets import Static
 
 from horde_worker_regen.app_state import OverviewTrendWindow, OverviewViewMode
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    RECENT_JOBS_IN_SNAPSHOT,
     CardSnapshot,
     FeatureReadinessSummary,
     JobQueueEntry,
@@ -33,6 +34,7 @@ from horde_worker_regen.process_management.lifecycle.process_temperature import 
     temperature_phrase,
 )
 from horde_worker_regen.process_management.models.feature_readiness import FeatureReadinessState
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.formatters import (
     format_its,
     format_percent,
@@ -464,6 +466,8 @@ class OverviewView(Vertical):
         body: list[Text] = [Text(report.detail, style="grey70")]
 
         if snapshot is not None:
+            if self._is_alchemist_only(snapshot):
+                body.append(self._alchemist_only_identity_line(snapshot))
             body.append(self._headline_metrics_line(snapshot))
             body.append(self._activity_line(snapshot))
             memory_line = self._memory_line(snapshot)
@@ -491,9 +495,35 @@ class OverviewView(Vertical):
         return Panel(Group(*body), title=title, title_align="left", border_style=border, padding=(0, 1))
 
     @staticmethod
-    def _headline_metrics_line(snapshot: WorkerStateSnapshot) -> Text:
-        """The session totals the dropped stat cards used to carry: submitted, kudos/hr, faulted."""
+    def _alchemist_only_identity_line(snapshot: WorkerStateSnapshot) -> Text:
+        """A prominent banner naming this worker as alchemist-only and (when known) its alchemist name."""
+        name = snapshot.config.alchemist_name
+        line = Text.assemble(("⚗ ALCHEMIST-ONLY WORKER", "bold magenta"))
+        if name:
+            line.append("  ·  ", style="grey37")
+            line.append(name, style="bold")
+        return line
+
+    @classmethod
+    def _headline_metrics_line(cls, snapshot: WorkerStateSnapshot) -> Text:
+        """The session totals the dropped stat cards used to carry: submitted, kudos/hr, faulted.
+
+        An alchemist-only worker counts alchemy forms instead of image jobs, so its headline reads in the
+        units it actually serves.
+        """
         kudos = "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"
+        if cls._is_alchemist_only(snapshot):
+            faulted_colour = "red" if snapshot.alchemy_total_faulted else "grey70"
+            return Text.assemble(
+                (f"{snapshot.alchemy_total_submitted:,}", "bold"),
+                (" forms submitted", "grey50"),
+                ("   ·   ", "grey37"),
+                (kudos, "bold cyan"),
+                (" kudos/hr", "grey50"),
+                ("   ·   ", "grey37"),
+                (f"{snapshot.alchemy_total_faulted:,}", faulted_colour),
+                (" faulted", "grey50"),
+            )
         faulted_colour = "red" if snapshot.num_jobs_faulted else "grey70"
         return Text.assemble(
             (f"{snapshot.num_jobs_submitted:,}", "bold"),
@@ -506,16 +536,32 @@ class OverviewView(Vertical):
             (" faulted", "grey50"),
         )
 
-    @staticmethod
-    def _activity_line(snapshot: WorkerStateSnapshot) -> Text:
-        """A heartbeat line conveying recent activity and freshness."""
+    @classmethod
+    def _activity_line(cls, snapshot: WorkerStateSnapshot) -> Text:
+        """A heartbeat line conveying recent activity and freshness.
+
+        Shows the in-flight counts of the work actually being served: alchemy forms for an alchemist-only
+        worker, image jobs otherwise. A mixed (dreamer + alchemist) worker appends a live alchemy count so
+        active alchemy is visible alongside image work rather than buried in a side panel.
+        """
         age = time.time() - snapshot.timestamp if snapshot.timestamp else None
         since_pop = (
             human_duration(snapshot.seconds_since_last_pop) + " ago"
             if snapshot.seconds_since_last_pop is not None
             else "never"
         )
-        return Text.assemble(
+        if cls._is_alchemist_only(snapshot):
+            return Text.assemble(
+                ("updated ", "grey50"),
+                (f"{human_duration(age)} ago", "grey70"),
+                ("  ·  last pop ", "grey50"),
+                (since_pop, "grey70"),
+                ("  ·  forms in flight ", "grey50"),
+                (str(snapshot.alchemy_forms_in_flight), "grey70"),
+                ("  ·  pending ", "grey50"),
+                (str(snapshot.alchemy_forms_pending), "grey70"),
+            )
+        line = Text.assemble(
             ("updated ", "grey50"),
             (f"{human_duration(age)} ago", "grey70"),
             ("  ·  last pop ", "grey50"),
@@ -525,6 +571,11 @@ class OverviewView(Vertical):
             ("  ·  queued ", "grey50"),
             (str(snapshot.jobs_pending_inference), "grey70"),
         )
+        alchemy_live = snapshot.alchemy_forms_in_flight + snapshot.alchemy_forms_pending
+        if snapshot.config.alchemist and alchemy_live > 0:
+            line.append("  ·  alchemy ", style="grey50")
+            line.append(str(alchemy_live), style="grey70")
+        return line
 
     @staticmethod
     def _memory_line(snapshot: WorkerStateSnapshot) -> Text | None:
@@ -828,7 +879,10 @@ class OverviewView(Vertical):
         table.add_column(justify="right", style="bold cyan", no_wrap=True)
         table.add_column()
 
-        table.add_row("Dreamer", config.dreamer_name, "Version", f"v{config.worker_version}")
+        if self._is_alchemist_only(snapshot):
+            table.add_row("Alchemist", config.alchemist_name or "-", "Version", f"v{config.worker_version}")
+        else:
+            table.add_row("Dreamer", config.dreamer_name, "Version", f"v{config.worker_version}")
         table.add_row("Horde user", config.horde_username or "-", "Uptime", uptime)
         table.add_row("Models", str(config.num_models), "Custom models", "yes" if config.custom_models else "no")
         table.add_row("Threads", str(config.max_threads), "Queue size", str(config.queue_size))
@@ -849,6 +903,41 @@ class OverviewView(Vertical):
         if compute_label is not None:
             table.add_row("Compute", compute_label, "", "")
         return table
+
+    @staticmethod
+    def _enabled_workloads(snapshot: WorkerStateSnapshot) -> frozenset[WorkloadKind]:
+        """Reconstruct the typed served-workload set from the snapshot's string values.
+
+        Unknown values (a workload a newer worker serves that this dashboard build predates) are skipped
+        rather than raising, so a forward-version worker degrades to "the workloads we recognise".
+        """
+        result: set[WorkloadKind] = set()
+        for value in snapshot.enabled_workloads:
+            try:
+                result.add(WorkloadKind(value))
+            except ValueError:
+                continue
+        return frozenset(result)
+
+    @classmethod
+    def _primary_workload(cls, snapshot: WorkerStateSnapshot) -> WorkloadKind | None:
+        """The workload the dashboard foregrounds.
+
+        Image generation when served (the usual dreamer/mixed worker, whose existing layout is
+        unchanged); otherwise the sole remaining workload (an alchemist-only worker foregrounds alchemy);
+        None when nothing is served or the worker predates the served-workload signal.
+        """
+        workloads = cls._enabled_workloads(snapshot)
+        if not workloads:
+            return None
+        if WorkloadKind.IMAGE_GENERATION in workloads:
+            return WorkloadKind.IMAGE_GENERATION
+        return next(iter(sorted(workloads, key=lambda workload: workload.value)))
+
+    @classmethod
+    def _is_alchemist_only(cls, snapshot: WorkerStateSnapshot) -> bool:
+        """Whether this worker serves alchemy and nothing else (the alchemist-only reshape trigger)."""
+        return cls._enabled_workloads(snapshot) == frozenset({WorkloadKind.ALCHEMY})
 
     @staticmethod
     def _show_alchemy_panel(snapshot: WorkerStateSnapshot) -> bool:
@@ -1085,6 +1174,8 @@ class OverviewView(Vertical):
         the trailing "Submitted" is the session running total, shown plainly so a cumulative figure is
         not mistaken for a backlog.
         """
+        alchemist_only = self._is_alchemist_only(snapshot)
+
         queue = snapshot.jobs_pending_inference
         inference = snapshot.jobs_in_progress
         safety = snapshot.jobs_pending_safety_check + snapshot.jobs_being_safety_checked
@@ -1092,19 +1183,28 @@ class OverviewView(Vertical):
         peak = max(queue, inference, safety, submit, 1)
 
         arrow = Text(" ▶ ", style="grey50")
-        flow = Text.assemble(
-            self._stage_segment("Queue", queue, peak),
-            arrow,
-            self._stage_segment("Inference", inference, peak),
-            arrow,
-            self._stage_segment("Safety", safety, peak),
-            arrow,
-            self._stage_segment("Submit", submit, peak),
-            ("    ", ""),
-            (f"✓ {snapshot.num_jobs_submitted:,} submitted", "grey62"),
-        )
-        rows: list[Text] = [flow]
+        rows: list[Text] = []
 
+        # An alchemist-only worker pops no image jobs, so its image lifecycle row is permanently empty;
+        # the alchemy flow becomes the primary (and only) pipeline content instead.
+        if not alchemist_only:
+            rows.append(
+                Text.assemble(
+                    self._stage_segment("Queue", queue, peak),
+                    arrow,
+                    self._stage_segment("Inference", inference, peak),
+                    arrow,
+                    self._stage_segment("Safety", safety, peak),
+                    arrow,
+                    self._stage_segment("Submit", submit, peak),
+                    ("    ", ""),
+                    (f"✓ {snapshot.num_jobs_submitted:,} submitted", "grey62"),
+                ),
+            )
+
+        alchemy_active = (
+            snapshot.alchemy_forms_pending + snapshot.alchemy_forms_in_flight + snapshot.alchemy_forms_awaiting_submit
+        )
         if snapshot.config.alchemist:
             alch_peak = max(
                 snapshot.alchemy_forms_pending,
@@ -1124,8 +1224,16 @@ class OverviewView(Vertical):
                 ),
             )
 
-        border = "green" if (queue or inference or safety or submit) else "grey37"
-        return Panel(Group(*rows), title="Job pipeline", title_align="left", border_style=border, padding=(0, 1))
+        if not rows:
+            rows.append(Text("idle", style="grey50"))
+
+        if alchemist_only:
+            title = "Alchemy pipeline"
+            border = "green" if alchemy_active else "grey37"
+        else:
+            title = "Job pipeline"
+            border = "green" if (queue or inference or safety or submit) else "grey37"
+        return Panel(Group(*rows), title=title, title_align="left", border_style=border, padding=(0, 1))
 
     @staticmethod
     def _trend_arrow(series: list[float]) -> Text:
@@ -1567,9 +1675,20 @@ class OverviewView(Vertical):
             lane.append(f"{label} ", style="grey62")
         return lane
 
-    @staticmethod
-    def _render_recent_jobs(snapshot: WorkerStateSnapshot, *, available_width: int | None = None) -> Panel:
-        """Render a table of recently completed jobs (newest first, last 8), shedding to fit the width."""
+    @classmethod
+    def _render_recent_jobs(
+        cls,
+        snapshot: WorkerStateSnapshot,
+        *,
+        available_width: int | None = None,
+    ) -> Panel:
+        """Render a table of recently completed jobs, newest first, shedding to fit the width.
+
+        A dreamer/mixed worker shows the most recent few (image work is frequent, so a short list stays
+        current). An alchemist-only worker shows the full retained set: alchemy work is sparse, so a
+        time-windowed "recent" view would often look empty, and an operator wants to see that work has
+        been happening over the session.
+        """
         layout = select_columns(_RECENT_COLUMNS, ceiling=DensityTier.WIDE, available_width=available_width)
         table = Table(
             title="",
@@ -1580,7 +1699,8 @@ class OverviewView(Vertical):
         )
         add_columns(table, layout.columns)
 
-        recent = list(reversed(snapshot.recent_jobs[-8:]))
+        row_limit = RECENT_JOBS_IN_SNAPSHOT if cls._is_alchemist_only(snapshot) else 8
+        recent = list(reversed(snapshot.recent_jobs[-row_limit:]))
         if not recent:
             table.add_row(*placeholder_row(layout.columns, "Model / type", "no completed jobs yet"))
         else:
@@ -1600,8 +1720,10 @@ class OverviewView(Vertical):
 
     @staticmethod
     def _recent_model_cell(job: RecentJobRecord) -> Text:
-        """The Model/type cell: ``alchemy`` for alchemy jobs, else the (shortened) model name."""
+        """The Model/type cell: the alchemy form (when known) for alchemy jobs, else the model name."""
         if job.is_alchemy:
+            if job.model_name:
+                return Text(f"⚗ {shorten(job.model_name, 22)}", style="grey62")
             return Text("alchemy", style="grey62")
         return Text(shorten(job.model_name, 24) if job.model_name else "?", style="")
 

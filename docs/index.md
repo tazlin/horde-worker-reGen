@@ -21,6 +21,7 @@ as needed.
     - [use the dashboard](how-to/use-the-dashboard.md)
     - [run headless](how-to/run-headless.md)
     - [run on AMD ROCm](how-to/run-on-amd-rocm.md)
+    - [run an alchemist-only worker](how-to/run-an-alchemist-only-worker.md)
     - [run multiple GPUs](how-to/run-multiple-gpus.md)
     - [add custom models](how-to/add-custom-models.md)
     - [run in Docker](how-to/run-in-docker.md)

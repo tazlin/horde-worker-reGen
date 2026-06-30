@@ -126,8 +126,14 @@ worker self-limits to what it can serve rather than popping jobs it would fault.
 A worker can run with **no accelerator at all**, on the CPU torch build. CPU image generation is
 impractically slow (~100x), so a CPU install runs in **alchemist-only mode**: image generation (the
 "dreamer" role) is disabled, while the CPU-friendly alchemy forms (upscale, face-fix, interrogation,
-captioning) stay on offer. This is the onboarding ramp for users without a viable GPU, and a deliberate
-option for a GPU owner who wants to leave the card free for other work.
+captioning) stay on offer. This is the onboarding ramp for users without a viable GPU.
+
+Alchemist-only is not only a CPU fallback: a GPU owner can choose it deliberately by setting
+`dreamer: false` (with `alchemist: true`) to leave the card free for other work while still serving
+alchemy. Both routes (a CPU install, or `dreamer: false`) are unified through one predicate,
+[`capabilities.enabled_workloads`][horde_worker_regen.capabilities.enabled_workloads], which turns the
+operator-facing role flags into the internal `WorkloadKind` set the rest of the worker reasons in (see
+[Architecture](architecture.md#workloads-flows)). "Alchemist-only" simply means that set is `{alchemy}`.
 
 ### Why ComfyUI needs to be told to use CPU
 
@@ -152,16 +158,21 @@ a broken driver, or a CPU install on a box that does have a GPU).
 
 ### What CPU mode changes
 
-- **Capability coercion** (`capabilities.coerce_bridge_data_to_capabilities`): on a CPU install the
-  image model list and `dynamic_models` are coerced off so the worker never advertises or pops an image
-  job. Alchemy is left untouched. (This sits alongside the `rembg`/`onnxruntime` coercions above.)
-- **Alchemist-only boot**: the inference process no longer treats an empty image-model database as a
-  fatal error when no image models are configured, and the download coordinator starts inference without
-  waiting for an image model that will never arrive. One inference process still spawns so the alchemy
-  graph forms have somewhere to run.
-- **Fresh-install config**: a CPU install seeds `bridgeData.yaml` with `alchemist: true` so the worker is
-  useful out of the box.
-- **TUI**: the overview shows a `Compute: CPU (alchemist-only)` row (a GPU install is unchanged).
+- **Capability coercion** (`capabilities.coerce_bridge_data_to_capabilities`): whenever image generation
+  is not an enabled workload (a CPU install, or `dreamer: false`), the image model list and
+  `dynamic_models` are coerced off so the worker never advertises or pops an image job. Alchemy is left
+  untouched. (This sits alongside the `rembg`/`onnxruntime` coercions above.)
+- **One inference process**: an alchemist-only worker forces each card's inference-process count to one
+  ([`resolve_card_concurrency`][horde_worker_regen.process_management.process_manager.resolve_card_concurrency]
+  with `serves_image_generation=False`) rather than spawning the image-generation fleet. The graph
+  alchemy forms serialize through that single process; CLIP/text forms run on the safety process. The
+  inference process also no longer treats an empty image-model database as fatal, and the download
+  coordinator starts inference without waiting for an image model that will never arrive.
+- **Fresh-install config**: a CPU install seeds `bridgeData.yaml` with `alchemist: true` and
+  `dreamer: false` so the role is explicit out of the box.
+- **TUI**: the overview reshapes around alchemy when alchemist-only (an "ALCHEMIST-ONLY WORKER" hero
+  identity, alchemy-centric headline and pipeline, and a longer recent-jobs view); a CPU install still
+  shows the `Compute: CPU (alchemist-only)` row. A GPU dreamer/mixed worker is unchanged.
 
 ### Switching CPU ⇄ GPU
 

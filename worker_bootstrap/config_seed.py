@@ -8,6 +8,7 @@ from pathlib import Path
 
 _CPU_TOKEN = "cpu"
 _ALCHEMIST_LINE_RE = re.compile(r"^\s*alchemist\s*:.*$")
+_DREAMER_LINE_RE = re.compile(r"^\s*dreamer\s*:.*$")
 
 
 def seed_config(*, template: Path, target: Path, backend_token: str | None = None) -> bool:
@@ -31,21 +32,29 @@ def seed_config(*, template: Path, target: Path, backend_token: str | None = Non
 
 
 def _enable_alchemist_only(target: Path) -> None:
-    """Flip the seeded config's ``alchemist`` flag on (best-effort line edit; stdlib-only).
+    """Make the seeded config explicitly alchemist-only (best-effort line edits; stdlib-only).
 
-    A CPU install has image generation disabled, so without alchemist the worker would have nothing to do.
-    Leaves the file untouched if no ``alchemist:`` line is found (an unexpectedly shaped template).
+    A CPU install has image generation disabled, so the worker is seeded as ``alchemist: true`` (it runs
+    the CPU-friendly alchemy forms) and ``dreamer: false`` (image generation deselected), so the role is
+    explicit in the file rather than relying on the runtime coercing an empty model list. Each flag is
+    edited only if its line is present, so an unexpectedly shaped template is left as-is for that flag.
     """
     try:
         lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
     except OSError:
         return
+
+    changed = False
     for index, line in enumerate(lines):
+        newline = "\n" if line.endswith("\n") else ""
         if _ALCHEMIST_LINE_RE.match(line):
-            newline = "\n" if line.endswith("\n") else ""
             lines[index] = f"alchemist: true{newline}"
-            break
-    else:
+            changed = True
+        elif _DREAMER_LINE_RE.match(line):
+            lines[index] = f"dreamer: false{newline}"
+            changed = True
+
+    if not changed:
         return
     try:
         target.write_text("".join(lines), encoding="utf-8")

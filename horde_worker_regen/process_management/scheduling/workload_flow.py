@@ -72,8 +72,11 @@ class FlowCoordinator(Protocol):
 
     Every flow pops work, dispatches it to capability-matched processes, and submits results on its own
     asyncio task. This protocol captures that contract plus a minimal observability hook; it intentionally
-    does not prescribe how a flow tracks state internally. The image pipeline is documented as the
-    IMAGE_GENERATION flow but is not (yet) forced behind this protocol; ``AlchemyCoordinator`` satisfies it.
+    does not prescribe how a flow tracks state internally. ``AlchemyCoordinator`` satisfies it directly;
+    ``ImageGenerationCoordinator`` satisfies it by wrapping the image pipeline's separate popper, submitter,
+    and tracker, so both flows are launched and observed uniformly through the process manager's registry.
+    A flow may keep dispatch elsewhere (image generation's is interwoven with the VRAM budget in the
+    control loop); the protocol covers the flow's identity, live work count, and lifecycle entry point.
     """
 
     @property

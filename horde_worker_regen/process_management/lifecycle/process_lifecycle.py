@@ -20,6 +20,7 @@ from loguru import logger
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
+from horde_worker_regen.compute_mode import is_cpu_only_install
 from horde_worker_regen.consts import VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
@@ -434,9 +435,11 @@ class ProcessLifecycleManager:
             pid = self._process_map.num_safety_processes()
             pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
 
-            # The runtime pause overrides the configured placement: while a whole-card job holds the device,
-            # the safety process must come up off-GPU so it does not re-take a CUDA context.
-            cpu_only = (not bridge_data.safety_on_gpu) or self._safety_gpu_paused
+            # A CPU-only torch build has no CUDA device to pin to, so the safety process must come up
+            # off-GPU regardless of config (otherwise loading the safety models on "cuda" raises). The
+            # runtime pause likewise overrides the configured placement: while a whole-card job holds the
+            # device, the safety process must come up off-GPU so it does not re-take a CUDA context.
+            cpu_only = is_cpu_only_install() or (not bridge_data.safety_on_gpu) or self._safety_gpu_paused
 
             # When the safety model runs on-GPU it lives on the first configured card; its mask_kind is None
             # on a default single-GPU host (so no pin, byte-identical) and set on a masked multi-GPU host.

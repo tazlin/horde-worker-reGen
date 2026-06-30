@@ -516,6 +516,22 @@ class reGenBridgeData(CombinedHordeBridgeData):
     Set stats_output_frequency (in seconds) for control over the status message.
     """
 
+    dreamer: bool = Field(default=True)
+    """If true, this worker pops and processes image-generation jobs (the dreamer role).
+
+    Defaults on, so a plain worker is a dreamer. Set it false to deliberately run an alchemist-only
+    worker on a GPU box (deselect image generation while keeping `alchemist: true`); the role matrix is:
+
+    - ``dreamer: true,  alchemist: false`` -> image generation only (the historical default).
+    - ``dreamer: true,  alchemist: true``  -> both image generation and alchemy.
+    - ``dreamer: false, alchemist: true``  -> alchemy only (no image generation).
+    - ``dreamer: false, alchemist: false`` -> nothing to serve (a warning is logged).
+
+    A CPU-only install cannot serve image generation regardless of this flag, so it is treated as
+    alchemist-only there. The single source of truth deriving served workloads from these flags is
+    :func:`horde_worker_regen.capabilities.enabled_workloads`.
+    """
+
     alchemist: bool = Field(default=False)
     """If true, this worker also pops and processes alchemy jobs (/v2/interrogate/pop).
 
@@ -830,6 +846,22 @@ class reGenBridgeData(CombinedHordeBridgeData):
             log=True,
         )
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_workload_roles(self) -> Self:
+        """Warn when no role is selected, so a worker that would serve nothing is not silent.
+
+        A CPU-only install still has alchemy to serve, so this only fires for the genuinely empty
+        ``dreamer: false, alchemist: false`` combination. The authoritative derivation of served
+        workloads (which also accounts for the CPU install) lives in
+        :func:`horde_worker_regen.capabilities.enabled_workloads`.
+        """
+        if not self.dreamer and not self.alchemist:
+            logger.warning(
+                "Both `dreamer` and `alchemist` are false, so this worker has nothing to serve. Enable "
+                "`dreamer` for image generation or `alchemist` for alchemy forms in bridgeData.yaml.",
+            )
         return self
 
     @field_validator("dreamer_worker_name", mode="after")

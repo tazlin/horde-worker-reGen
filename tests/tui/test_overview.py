@@ -15,6 +15,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PopGovernorsSnapshot,
     PopGovernorStatus,
     ProcessSnapshot,
+    RecentJobRecord,
     SystemMemorySnapshot,
     WholeCardResidencyStatus,
     WorkerConfigSummary,
@@ -27,6 +28,7 @@ from horde_worker_regen.process_management.models.feature_readiness import (
     FeatureReadinessState,
     GatedFeature,
 )
+from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
 from horde_worker_regen.tui.health import derive
 from horde_worker_regen.tui.widgets.overview import OverviewView
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus
@@ -351,6 +353,98 @@ def test_alchemy_panel_visibility_tracks_enabled_or_active_alchemy() -> None:
     assert OverviewView._show_alchemy_panel(disabled) is False
     assert OverviewView._show_alchemy_panel(enabled) is True
     assert OverviewView._show_alchemy_panel(active) is True
+
+
+def _alchemist_only_config() -> WorkerConfigSummary:
+    return WorkerConfigSummary(
+        dreamer_name="Tester",
+        alchemist_name="Wizardly Tester",
+        worker_version="12.0.0",
+        alchemist=True,
+    )
+
+
+def test_hero_shows_alchemist_only_identity_and_form_units() -> None:
+    """An alchemist-only worker self-identifies in the hero and counts forms, not image jobs."""
+    snapshot = WorkerStateSnapshot(
+        config=_alchemist_only_config(),
+        enabled_workloads=[WorkloadKind.ALCHEMY.value],
+        alchemy_total_submitted=42,
+        worker_registered=True,
+    )
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    hero = _render(OverviewView()._render_hero(report, snapshot, frame=0))
+
+    assert "ALCHEMIST-ONLY WORKER" in hero
+    assert "Wizardly Tester" in hero
+    assert "forms submitted" in hero
+    assert "jobs submitted" not in hero
+
+
+def test_hero_dreamer_has_no_alchemist_identity() -> None:
+    """A normal dreamer/mixed worker keeps the image-job headline and no alchemist-only banner."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0", alchemist=True),
+        enabled_workloads=[WorkloadKind.IMAGE_GENERATION.value, WorkloadKind.ALCHEMY.value],
+        worker_registered=True,
+    )
+    report = derive(snapshot, SupervisorStatus.RUNNING, 0.5)
+
+    hero = _render(OverviewView()._render_hero(report, snapshot, frame=0))
+
+    assert "ALCHEMIST-ONLY WORKER" not in hero
+    assert "jobs submitted" in hero
+
+
+def test_pipeline_strip_is_alchemy_primary_when_alchemist_only() -> None:
+    """The pipeline strip drops the empty image lifecycle row and titles itself for alchemy."""
+    snapshot = WorkerStateSnapshot(
+        config=_alchemist_only_config(),
+        enabled_workloads=[WorkloadKind.ALCHEMY.value],
+    )
+
+    strip = _render(OverviewView()._render_pipeline_strip(snapshot))
+
+    assert "Alchemy pipeline" in strip
+    assert "Inference" not in strip  # the image lifecycle stages are gone
+
+
+def test_pipeline_strip_stays_job_pipeline_for_dreamer() -> None:
+    """A dreamer worker keeps the image job pipeline as the primary row."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        enabled_workloads=[WorkloadKind.IMAGE_GENERATION.value],
+    )
+
+    strip = _render(OverviewView()._render_pipeline_strip(snapshot))
+
+    assert "Job pipeline" in strip
+    assert "Inference" in strip
+
+
+def test_recent_jobs_retains_more_rows_when_alchemist_only() -> None:
+    """Sparse alchemy work stays visible: an alchemist-only worker shows the full retained set, not 8."""
+    jobs = [RecentJobRecord(job_id=f"job-{i}", is_alchemy=True, model_name=f"form{i}") for i in range(12)]
+    alchemist_only = WorkerStateSnapshot(
+        config=_alchemist_only_config(),
+        enabled_workloads=[WorkloadKind.ALCHEMY.value],
+        recent_jobs=jobs,
+    )
+    dreamer = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        enabled_workloads=[WorkloadKind.IMAGE_GENERATION.value],
+        recent_jobs=jobs,
+    )
+
+    alchemist_render = _render(OverviewView._render_recent_jobs(alchemist_only))
+    dreamer_render = _render(OverviewView._render_recent_jobs(dreamer))
+
+    # The oldest retained form is visible only on the alchemist-only worker (the dreamer view shows 8).
+    assert "form0" in alchemist_render
+    assert "form0" not in dreamer_render
+    assert "form11" in alchemist_render
+    assert "form11" in dreamer_render
 
 
 def test_work_ledger_shows_job_id_progress_and_size() -> None:
