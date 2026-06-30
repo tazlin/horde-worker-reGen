@@ -8,7 +8,11 @@ from horde_sdk.generic_api.consts import ANON_API_KEY
 from pydantic import JsonValue
 from ruamel.yaml import YAML
 
-from horde_worker_regen.bridge_data.data_model import _warn_lease_without_residency, reGenBridgeData
+from horde_worker_regen.bridge_data.data_model import (
+    _warn_lease_slots_below_threads,
+    _warn_lease_without_residency,
+    reGenBridgeData,
+)
 from horde_worker_regen.bridge_data.load_config import BridgeDataLoader, ConfigFormat
 
 
@@ -56,7 +60,56 @@ class TestLeaseResidencyWarning:
         bridge_data = reGenBridgeData.model_validate(raw)
 
         assert bridge_data.gpu_sampling_lease_enabled is True
-        assert bridge_data.gpu_sampling_lease_slots == 1
+        # The template leaves the slot count unset so it tracks max_threads at runtime.
+        assert bridge_data.gpu_sampling_lease_slots is None
+
+
+class TestLeaseSlotsBelowThreadsWarning:
+    """An explicit slot count under max_threads under-serializes denoise, so it must be detected."""
+
+    def test_disabled_lease_is_never_flagged(self) -> None:
+        """A disabled lease is never flagged, regardless of the slot/threads relationship."""
+        assert (
+            _warn_lease_slots_below_threads(
+                gpu_sampling_lease_enabled=False,
+                gpu_sampling_lease_slots=1,
+                max_threads=4,
+            )
+            is False
+        )
+
+    def test_auto_slots_are_never_flagged(self) -> None:
+        """Unset slots (None) track max_threads, so the under-serialization case cannot arise."""
+        assert (
+            _warn_lease_slots_below_threads(
+                gpu_sampling_lease_enabled=True,
+                gpu_sampling_lease_slots=None,
+                max_threads=4,
+            )
+            is False
+        )
+
+    def test_explicit_slots_at_or_above_threads_not_flagged(self) -> None:
+        """An explicit count that meets the concurrency cap leaves no admitted concurrency unused."""
+        assert (
+            _warn_lease_slots_below_threads(
+                gpu_sampling_lease_enabled=True,
+                gpu_sampling_lease_slots=4,
+                max_threads=4,
+            )
+            is False
+        )
+
+    def test_explicit_slots_below_threads_is_flagged(self) -> None:
+        """An explicit count under max_threads samples fewer jobs at once than the worker admits."""
+        assert (
+            _warn_lease_slots_below_threads(
+                gpu_sampling_lease_enabled=True,
+                gpu_sampling_lease_slots=1,
+                max_threads=2,
+            )
+            is True
+        )
 
 
 def test_bridge_data_yaml() -> None:

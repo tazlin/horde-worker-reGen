@@ -34,8 +34,8 @@ class TestResolveInferenceConcurrency:
         )
         assert semaphore_size == 4
 
-    def test_default_one_slot_serializes_denoise(self) -> None:
-        """A single configured slot serializes the denoise loop."""
+    def test_explicit_one_slot_serializes_denoise(self) -> None:
+        """An explicit single slot serializes the denoise loop (e.g. the no-MPS stage-ahead trade)."""
         _, slots = _resolve_inference_concurrency(
             gpu_sampling_lease_enabled=True,
             configured_lease_slots=1,
@@ -44,8 +44,8 @@ class TestResolveInferenceConcurrency:
         )
         assert slots == 1
 
-    def test_slots_independent_of_concurrent_process_count(self) -> None:
-        """The slot count is the configured value, not bolted to the concurrent-process count."""
+    def test_explicit_slots_honored_over_concurrent_count(self) -> None:
+        """An explicit slot count is used verbatim, not bolted to the concurrent-process count."""
         _, slots = _resolve_inference_concurrency(
             gpu_sampling_lease_enabled=True,
             configured_lease_slots=2,
@@ -53,6 +53,26 @@ class TestResolveInferenceConcurrency:
             max_inference_processes=6,
         )
         assert slots == 2
+
+    def test_auto_slots_track_concurrent_count(self) -> None:
+        """Unset slots (None) track the concurrent-inference ceiling so the lease never under-serializes."""
+        _, slots = _resolve_inference_concurrency(
+            gpu_sampling_lease_enabled=True,
+            configured_lease_slots=None,
+            max_concurrent_inference_processes=2,
+            max_inference_processes=4,
+        )
+        assert slots == 2
+
+    def test_auto_slots_clamped_to_process_count(self) -> None:
+        """Auto-tracked slots can never exceed the inference-process count."""
+        _, slots = _resolve_inference_concurrency(
+            gpu_sampling_lease_enabled=True,
+            configured_lease_slots=None,
+            max_concurrent_inference_processes=8,
+            max_inference_processes=4,
+        )
+        assert slots == 4
 
     def test_slots_clamped_to_process_count(self) -> None:
         """Slots can never exceed the number of inference processes."""

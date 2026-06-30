@@ -850,7 +850,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.INT,
         "GPU sampling lease",
         "How many processes may run the denoising loop at once when gpu_sampling_lease_enabled is true. "
-        "1 serializes; values > 1 permit concurrent loops (time-sliced on Windows WDDM).",
+        "Leave blank to track Max threads. Set 1 to serialize (efficient on Windows WDDM, where concurrent "
+        "loops only time-slice); higher values permit that many concurrent loops.",
         requires_restart=True,
         minimum=1,
         maximum=16,

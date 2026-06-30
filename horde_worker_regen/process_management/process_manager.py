@@ -257,7 +257,7 @@ def _select_driven_devices(
 def _resolve_inference_concurrency(
     *,
     gpu_sampling_lease_enabled: bool,
-    configured_lease_slots: int,
+    configured_lease_slots: int | None,
     max_concurrent_inference_processes: int,
     max_inference_processes: int,
 ) -> tuple[int, int]:
@@ -268,11 +268,15 @@ def _resolve_inference_concurrency(
     inference semaphore opens up to every inference process, letting spare processes stage their
     next pipeline (model load, prompt encode) ahead instead of blocking at job start.
 
-    The lease slot count is independent of ``max_threads``: it bounds concurrent denoise loops
-    only, clamped to ``[1, max_inference_processes]`` (at least one denoise may always run, and
-    more slots than processes can never be used).
+    When ``configured_lease_slots`` is ``None`` (the default) the slot count tracks the
+    concurrent-inference ceiling, so enabling the lease never serializes the denoise below the
+    concurrency ``max_threads`` already admits. An explicit value overrides that, e.g. to pin a
+    single denoise loop on time-slicing (no-MPS) hardware while still staging the next job ahead.
+    Either way the slot count is clamped to ``[1, max_inference_processes]`` (at least one denoise
+    may always run, and more slots than processes can never be used).
     """
-    lease_slots = min(max(1, configured_lease_slots), max(1, max_inference_processes))
+    desired_slots = max_concurrent_inference_processes if configured_lease_slots is None else configured_lease_slots
+    lease_slots = min(max(1, desired_slots), max(1, max_inference_processes))
     if gpu_sampling_lease_enabled:
         return max_inference_processes, lease_slots
     return max_concurrent_inference_processes, lease_slots
@@ -304,7 +308,7 @@ def resolve_card_concurrency(
     queue_size: int,
     num_models_to_load: int,
     gpu_sampling_lease_enabled: bool,
-    gpu_sampling_lease_slots: int,
+    gpu_sampling_lease_slots: int | None,
     max_threads_ceiling: int,
 ) -> CardConcurrency:
     """Resolve one card's concurrency sizes from its effective config (the per-card analogue of the globals).

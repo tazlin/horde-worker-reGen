@@ -258,6 +258,17 @@ above; their job is to reduce *avoidable* efficiency loss and to suit the worker
   between jobs is worth the reload cost. On larger cards leaving it **off** lets the worker keep
   recently-used models staged in RAM for fast reload (the VRAM/RAM budget decides what stays resident),
   which is the pairing that actually raises duty, and only when the working set genuinely fits.
+- **`gpu_sampling_lease_enabled`** attacks the inter-job stall head-on: one process holds the lease and
+  runs the denoise loop while the others stage their next pipeline (RAM->VRAM load, prompt encode), so
+  when the sampler finishes the next job starts immediately instead of the GPU idling through warm-up.
+  It needs residency to overlap, so it is **counterproductive with `unload_models_from_vram_often: true`**
+  (the model is fully evicted between jobs, so the lease just serializes the reload behind sampling).
+  - **`gpu_sampling_lease_slots`** is the active-denoise gate (distinct from `max_threads`, which is the
+    job-*admission* gate). Leave it **unset** so it tracks `max_threads`: enabling the lease then never
+    samples fewer jobs at once than the worker already runs concurrently. Set it to **1** only on
+    hardware without CUDA MPS (e.g. Windows WDDM), where concurrent denoise loops merely time-slice the
+    GPU: there, one denoise loop plus staged-ahead siblings is the efficient shape and raising the count
+    only inflates the coverage-based duty number without lifting throughput.
 
 ## See also
 

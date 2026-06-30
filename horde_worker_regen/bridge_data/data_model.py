@@ -185,6 +185,38 @@ def _warn_lease_without_residency(
     return non_resident
 
 
+def _warn_lease_slots_below_threads(
+    *,
+    gpu_sampling_lease_enabled: bool,
+    gpu_sampling_lease_slots: int | None,
+    max_threads: int,
+    log: bool = False,
+) -> bool:
+    """Detect (and optionally warn about) pinning fewer denoise slots than the concurrency cap.
+
+    With the lease enabled the slot count is the active-denoise gate, so an explicit value below
+    ``max_threads`` samples fewer jobs at once than the worker admits. That is the correct trade only
+    where concurrent denoise loops cannot truly parallelize (no CUDA MPS, e.g. Windows WDDM), where it
+    overlaps the next job's staging behind the current denoise without paying for time-sliced sampling;
+    elsewhere it leaves requested concurrency unused. The default (``None``) tracks ``max_threads`` and
+    never trips this.
+
+    Returns:
+        True if an explicit slot count sits below the concurrency cap.
+    """
+    if not gpu_sampling_lease_enabled or gpu_sampling_lease_slots is None:
+        return False
+    below = gpu_sampling_lease_slots < max_threads
+    if below and log:
+        logger.warning(
+            f"gpu_sampling_lease_slots={gpu_sampling_lease_slots} is below max_threads={max_threads}, so the "
+            "lease will sample fewer jobs at once than the worker runs concurrently. Leave it unset to track "
+            "max_threads; an explicit lower value only helps where concurrent denoise loops time-slice rather "
+            "than parallelize (no CUDA MPS, e.g. Windows WDDM).",
+        )
+    return below
+
+
 class GpuOverride(BaseModel):
     """A per-card delta over the global config: every field optional, ``None`` meaning inherit.
 
@@ -436,16 +468,21 @@ class reGenBridgeData(CombinedHordeBridgeData):
     as well as the denoise loop, so when the model is fully evicted between jobs it serializes the
     reload behind sampling rather than overlapping it."""
 
-    gpu_sampling_lease_slots: int = Field(default=1, ge=1)
+    gpu_sampling_lease_slots: int | None = Field(default=None, ge=1)
     """How many inference processes may run the GPU denoising loop at once when
     `gpu_sampling_lease_enabled` is true (clamped to the inference-process count at runtime).
 
-    1 (the default) serializes denoising, so one process samples while the rest stage their next
-    pipeline; this is the cleanest way to keep a single GPU busy back-to-back. Values > 1 permit that
-    many concurrent denoise loops; on hardware without CUDA MPS (e.g. Windows WDDM) concurrent
-    loops time-slice the GPU rather than truly parallelizing, so this can raise the
-    coverage-based duty-cycle metric without improving throughput. No effect unless
-    `gpu_sampling_lease_enabled` is true."""
+    Leave unset (the default) to track `max_threads`: the lease is the denoise gate, so without this
+    the slot count would default to 1 and enabling the lease on a `max_threads > 1` worker would
+    silently sample fewer jobs at once than the worker admits. Auto-tracking keeps the
+    concurrent-denoise count your concurrency settings already imply.
+
+    Set an explicit value to override. 1 serializes denoising, so one process samples while the rest
+    stage their next pipeline; on hardware without CUDA MPS (e.g. Windows WDDM) concurrent denoise
+    loops time-slice the GPU rather than truly parallelizing, so an explicit value below `max_threads`
+    is the efficient choice there (it overlaps the next job's RAM->VRAM load and prompt encode behind
+    the current denoise without paying for time-sliced concurrent sampling). Values above 1 permit
+    that many concurrent denoise loops. No effect unless `gpu_sampling_lease_enabled` is true."""
 
     capture_kudos_training_data: bool = Field(default=False)
 
@@ -783,6 +820,13 @@ class reGenBridgeData(CombinedHordeBridgeData):
         _warn_lease_without_residency(
             gpu_sampling_lease_enabled=self.gpu_sampling_lease_enabled,
             unload_models_from_vram_often=self.unload_models_from_vram_often,
+            log=True,
+        )
+
+        _warn_lease_slots_below_threads(
+            gpu_sampling_lease_enabled=self.gpu_sampling_lease_enabled,
+            gpu_sampling_lease_slots=self.gpu_sampling_lease_slots,
+            max_threads=self.max_threads,
             log=True,
         )
 
