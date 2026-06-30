@@ -16,8 +16,14 @@ from horde_worker_regen.app_state import (
     KnownGoodSource,
     OnboardingChoice,
 )
-from horde_worker_regen.benchmark.enums import BenchTier, LevelOutcome
-from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
+from horde_worker_regen.benchmark.capabilities.capability import Capability, CapabilityKind, CapabilityVerdict
+from horde_worker_regen.benchmark.capabilities.result import (
+    CapabilityProbeResult,
+    CapabilityReport,
+    MachineInfo,
+    SuggestedBridgeData,
+)
+from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.progress_channel import (
     LevelPlanRow,
     LevelStarted,
@@ -26,7 +32,6 @@ from horde_worker_regen.benchmark.progress_channel import (
     RampStarted,
     SuggestionDecisionRow,
 )
-from horde_worker_regen.benchmark.report import BenchmarkReport, LevelReport, MachineInfo, SuggestedBridgeData
 from horde_worker_regen.tui.benchmark_launcher import BenchmarkOptions, BenchmarkRunState, BenchmarkSupervisorStatus
 from horde_worker_regen.tui.widgets.benchmark import BenchmarkView, _Phase
 from horde_worker_regen.tui.widgets.benchmark_history import BenchmarkHistoryModal
@@ -45,17 +50,15 @@ def _render_to_text(renderable: RenderableType) -> str:
     return capture.get()
 
 
-def _write_fake_report(run_dir: Path, *, run_id: str, created_at: float, outcome: LevelOutcome) -> None:
+def _write_fake_report(run_dir: Path, *, run_id: str, created_at: float, verdict: CapabilityVerdict) -> None:
     """Write a minimal valid report.json into a run directory for history tests."""
     run_dir.mkdir(parents=True, exist_ok=True)
-    level = next(
-        lvl for lvl in build_default_ladder(LadderOptions(tiers=[BenchTier.SD15])) if lvl.establishes_tier_baseline
-    )
-    report = BenchmarkReport(
+    baseline = Capability(tier=BenchTier.SD15, kind=CapabilityKind.BASELINE)
+    report = CapabilityReport(
         run_id=run_id,
         created_at=created_at,
         machine=MachineInfo(gpu_name="Test GPU", total_vram_mb=16000),
-        levels=[LevelReport(level=level, outcome=outcome)],
+        probes=[CapabilityProbeResult(capability=baseline, verdict=verdict)],
         suggested_bridge_data=SuggestedBridgeData(),
         tier_baselines_its={"sd15": 5.0},
     )
@@ -180,16 +183,13 @@ async def test_advanced_options_start_collapsed_and_collect_through_collapsible(
 
         view = app.query_one(BenchmarkView)
         options = view._collect_options()
-        assert options.warm is True
         assert options.force is False
 
         # Flipping a switch inside the collapsed section still flows into the collected options.
         app.query_one("#benchmark-force", Switch).value = True
-        app.query_one("#benchmark-warm", Switch).value = False
         await pilot.pause()
         updated = view._collect_options()
         assert updated.force is True
-        assert updated.warm is False
 
 
 async def test_per_axis_switch_excludes_only_that_axis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,11 +198,11 @@ async def test_per_axis_switch_excludes_only_that_axis(tmp_path: Path, monkeypat
     app = _BenchmarkHarness()
     async with app.run_test() as pilot:
         view = app.query_one(BenchmarkView)
-        assert view._collect_options().excluded_axes == []  # everything on by default
+        assert view._collect_options().excluded_capabilities == []  # everything on by default
 
         app.query_one("#benchmark-axis-controlnet", Switch).value = False
         await pilot.pause()
-        excluded = view._collect_options().excluded_axes
+        excluded = view._collect_options().excluded_capabilities
         assert excluded == ["controlnet"]
 
 
@@ -401,8 +401,12 @@ async def test_history_modal_views_report_and_compares_runs(
     """The modal renders a run's markdown report and a run-to-run diff into its detail pane."""
     monkeypatch.chdir(tmp_path)
     results_root = tmp_path / "benchmark_results"
-    _write_fake_report(results_root / "20260101-000000", run_id="old", created_at=100.0, outcome=LevelOutcome.PASSED)
-    _write_fake_report(results_root / "20260201-000000", run_id="new", created_at=200.0, outcome=LevelOutcome.FAILED)
+    _write_fake_report(
+        results_root / "20260101-000000", run_id="old", created_at=100.0, verdict=CapabilityVerdict.PROVEN
+    )
+    _write_fake_report(
+        results_root / "20260201-000000", run_id="new", created_at=200.0, verdict=CapabilityVerdict.DISPROVEN
+    )
 
     app = _HistoryHarness(results_root)
     async with app.run_test() as pilot:
@@ -423,5 +427,5 @@ async def test_history_modal_views_report_and_compares_runs(
         compared = modal._last_detail
         assert compared is not None
         compared_text = _render_to_text(compared)
-        assert "failed" in compared_text  # the regressed level shows up in the diff
+        assert "disproven" in compared_text  # the regressed probe verdict shows up in the diff
         assert "new" in compared_text and "old" in compared_text  # the run ids head the diff

@@ -240,16 +240,16 @@ def load_seed_its_by_signature(results_dir: Path | str) -> dict[str, float]:
     schema-mismatched report yields an empty seed rather than blocking worker startup. The benchmark
     import chain is loaded lazily here so this module stays import-light.
     """
+    from horde_worker_regen.benchmark.capabilities.result import CapabilityReport
     from horde_worker_regen.benchmark.enums import BenchTier
     from horde_worker_regen.benchmark.ladder import _TIER_BASELINES, _TIER_RESOLUTIONS
-    from horde_worker_regen.benchmark.report import BenchmarkReport
 
     report_path = Path(results_dir) / "report.json"
     if not report_path.exists():
         return {}
 
     try:
-        report = BenchmarkReport.model_validate_json(report_path.read_text(encoding="utf-8"))
+        report = CapabilityReport.model_validate_json(report_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as read_error:
         logger.debug(f"Could not read benchmark report at {report_path} ({read_error}); not seeding perf model.")
         return {}

@@ -22,13 +22,10 @@ from horde_sdk.generation_parameters.alchemy.consts import (
     KNOWN_UPSCALERS,
 )
 
-from horde_worker_regen.benchmark.criteria import LevelCriteria
-from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage, BenchTier
+from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.ladder import (
-    _TIER_BASELINES,
     _TIER_RESOLUTIONS,
     BENCH_TIER_MODELS,
-    RampLevel,
     tier_canned_job_overrides,
 )
 from horde_worker_regen.benchmark.report import SuggestedBridgeData
@@ -131,68 +128,4 @@ def build_soak_scenario(
     )
 
 
-_DUTY_CYCLE_TARGET_PERCENT = 90.0
-"""The GPU duty-cycle the soak drives toward; reported as an advisory, not a default pass/fail gate."""
-
-
-def build_validation_level(
-    suggested: SuggestedBridgeData,
-    tier: BenchTier,
-    *,
-    soak_seconds: float,
-    drain_timeout_seconds: float = 60.0,
-    min_its_retention: float = 0.85,
-    min_completed_jobs: int = 4,
-    target_gpu_duty_cycle_percent: float = _DUTY_CYCLE_TARGET_PERCENT,
-    strict_duty_cycle: bool = False,
-    model_pool: list[str] | None = None,
-    expect_vram_residency: bool = False,
-) -> RampLevel:
-    """Build the stage-V validation level that soaks the synthesized config for a tier.
-
-    ``model_pool`` (when it holds more than one model) spreads the soak across distinct models
-    so every inference process is exercised; the pool is also loaded by the worker via
-    ``models_to_load``. ``expect_vram_residency`` turns on the residency-defeated advisory (set
-    once the ``--highvram`` + worker-budget levers are enabled, not for the NORMAL_VRAM baseline).
-
-    GPU duty cycle is reported against ``target_gpu_duty_cycle_percent`` as an advisory by default:
-    a baseline soak legitimately misses the 90% north-star until the residency/overlap levers land,
-    so the soak passes on stability and throughput retention and surfaces the duty-cycle shortfall
-    with full attribution. ``strict_duty_cycle`` promotes the target to a hard pass/fail gate, for
-    enforcing the number on a reference machine.
-    """
-    scenario = build_soak_scenario(suggested, tier, soak_seconds=soak_seconds, model_pool=model_pool)
-    timeout_seconds = soak_seconds + drain_timeout_seconds + _SOAK_START_MARGIN_SECONDS
-
-    overrides = suggested.to_bridge_overrides()
-    if model_pool and len(model_pool) > 1:
-        overrides["models_to_load"] = list(model_pool)
-
-    pool_note = f" across {len(model_pool)} models" if model_pool and len(model_pool) > 1 else ""
-
-    return RampLevel(
-        id=f"V-{tier}-soak",
-        stage=BenchStage.VALIDATION,
-        tier=tier,
-        axis=BenchAxis.VALIDATION,
-        rung=1,
-        description=(
-            f"{tier} sustained-load validation: ~{soak_seconds:.0f}s of mixed, mostly-max-config "
-            f"traffic{pool_note} against the recommended bridgeData"
-        ),
-        scenario=scenario,
-        bridge_data_overrides=overrides,
-        timeout_seconds=timeout_seconds,
-        baseline_hordelib=_TIER_BASELINES[tier],
-        criteria=LevelCriteria(
-            gate_its_against_baseline=False,
-            min_its_retention=min_its_retention,
-            min_completed_jobs=min_completed_jobs,
-            target_gpu_utilization_percent=target_gpu_duty_cycle_percent,
-            min_gpu_duty_cycle_percent=(target_gpu_duty_cycle_percent if strict_duty_cycle else None),
-            expect_vram_residency=expect_vram_residency,
-        ),
-    )
-
-
-__all__ = ["build_soak_scenario", "build_validation_level"]
+__all__ = ["build_soak_scenario"]

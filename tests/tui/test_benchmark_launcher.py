@@ -122,36 +122,38 @@ def test_build_command_includes_selected_flags() -> None:
     )
     command = options.build_command(Path("out"))
     assert command[1] == "-u"  # unbuffered so console.log populates live during a wedged startup
-    assert command[2:5] == ["-m", "horde_worker_regen.benchmark.cli", "ramp"]
+    assert command[2:5] == ["-m", "horde_worker_regen.benchmark.cli", "run"]
     assert "real" in command
     assert "sd15,sdxl" in command
     assert "--no-validate" in command
     assert "--include-downloads" in command
 
 
-def test_build_command_maps_stage_warm_and_force_toggles() -> None:
-    """The new TUI parity toggles map to the matching ramp flags (off-by-default stages and warm)."""
+def test_build_command_maps_stage_toggles_and_force() -> None:
+    """The stage toggles map to the run flags; force is a plan-preview flag (run has no --force)."""
     options = BenchmarkOptions(
         tiers=["sd15"],
         include_concurrency=False,
         include_features=False,
         include_alchemy=False,
-        warm=False,
         force=True,
     )
     command = options.build_command(Path("out"))
-    assert {"--no-concurrency", "--no-features", "--no-alchemy", "--no-warm", "--force"} <= set(command)
+    assert command[command.index("-m") + 2] == "run"
+    assert {"--no-concurrency", "--no-features", "--no-alchemy"} <= set(command)
+    # Force is a machine-fit override for the no-boot preview, not the run.
+    assert "--force" in options.build_plan_command()
 
 
-def test_build_command_emits_one_exclude_axis_per_deselected_axis() -> None:
-    """Each excluded axis becomes its own ``--exclude-axis AXIS`` pair in both ramp and plan argv."""
-    options = BenchmarkOptions(tiers=["sd15"], excluded_axes=["controlnet", "alchemy_graph"])
+def test_build_command_emits_one_exclude_capability_per_deselected_kind() -> None:
+    """Each excluded capability becomes its own ``--exclude-capability KIND`` pair in run and plan argv."""
+    options = BenchmarkOptions(tiers=["sd15"], excluded_capabilities=["controlnet", "alchemy_graph"])
     command = options.build_command(Path("out"))
-    assert command.count("--exclude-axis") == 2
+    assert command.count("--exclude-capability") == 2
     assert "controlnet" in command
     assert "alchemy_graph" in command
-    # The same selection flows into the plan preview so the preview matches what the ramp would run.
-    assert options.build_plan_command().count("--exclude-axis") == 2
+    # The same selection flows into the plan preview so the preview matches what the run would do.
+    assert options.build_plan_command().count("--exclude-capability") == 2
 
 
 def test_build_plan_command_previews_without_running() -> None:

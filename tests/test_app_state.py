@@ -18,7 +18,6 @@ from horde_worker_regen.app_state import (
     WorkerAppState,
     WorkerRunRecord,
     benchmark_status_summary,
-    build_benchmark_record,
     compute_config_digest,
     default_app_state_path,
     is_benchmark_stale,
@@ -283,25 +282,6 @@ def test_log_benchmark_hint_silent_when_current(tmp_path: Path, monkeypatch: pyt
     finally:
         logger.remove(sink_id)
     assert not any("benchmark" in line.lower() for line in captured)
-
-
-def test_build_benchmark_record_from_report() -> None:
-    """The report-to-record adapter carries the report's stamps and flattens the suggestion."""
-    from horde_worker_regen.benchmark.report import BenchmarkReport, MachineInfo, SuggestedBridgeData
-
-    report = BenchmarkReport(
-        run_id="20260613-130000",
-        worker_version="9.9.9",
-        machine=MachineInfo(gpu_name="Adapter GPU"),
-        suggested_bridge_data=SuggestedBridgeData(max_threads=2, queue_size=2),
-    )
-
-    record = build_benchmark_record(report, results_dir="benchmark_results/20260613-130000")
-    assert record.run_id == "20260613-130000"
-    assert record.worker_version == "9.9.9"
-    assert record.gpu_name == "Adapter GPU"
-    assert record.levels_total == 0
-    assert record.suggested_bridge_data["max_threads"] == 2
 
 
 def test_build_capability_benchmark_record_counts_proven_probes() -> None:

@@ -21,9 +21,9 @@ import pytest
 
 from horde_worker_regen.benchmark.capabilities.capability import CapabilityKind, CapabilityVerdict
 from horde_worker_regen.benchmark.capabilities.catalog import CatalogOptions, build_capability_catalog
+from horde_worker_regen.benchmark.capabilities.executor import detect_machine_info
 from horde_worker_regen.benchmark.capabilities.probe import CapabilityProbe
 from horde_worker_regen.benchmark.capabilities.probe_runner import run_capability_probe_async
-from horde_worker_regen.benchmark.controller import detect_machine_info
 from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.requirements import (
     civitai_token_available,

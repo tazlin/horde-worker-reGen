@@ -24,6 +24,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Static
 
+from horde_worker_regen.benchmark.capabilities.report_render import render_markdown
 from horde_worker_regen.benchmark.history import (
     ReportComparison,
     RunSummary,
@@ -31,7 +32,6 @@ from horde_worker_regen.benchmark.history import (
     list_runs,
     load_report,
 )
-from horde_worker_regen.benchmark.report import render_markdown
 
 _RESULTS_ROOT = Path("benchmark_results")
 

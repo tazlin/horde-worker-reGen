@@ -2,21 +2,22 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.benchmark.cli import _controlnet_annotator_row, _ladder_control_types
-from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
+from horde_worker_regen.benchmark.capabilities.catalog import CatalogOptions, build_capability_catalog
+from horde_worker_regen.benchmark.cli import _catalog_control_types, _controlnet_annotator_row
+from horde_worker_regen.benchmark.enums import BenchTier
 
 
-def test_ladder_control_types_lists_the_controlnet_sweep() -> None:
-    """An sd15 feature ladder exposes its classic controlnet preprocessor sweep as distinct control types."""
-    ladder = build_default_ladder(
-        LadderOptions(
-            tiers=["sd15"],
+def test_catalog_control_types_lists_the_controlnet_sweep() -> None:
+    """An sd15 feature catalog exposes its classic controlnet preprocessor sweep as distinct control types."""
+    probes = build_capability_catalog(
+        CatalogOptions(
+            tiers=[BenchTier.SD15],
             include_concurrency=False,
             include_features=True,
             include_alchemy=False,
         ),
     )
-    control_types = _ladder_control_types(ladder)
+    control_types = _catalog_control_types(probes)
     assert "canny" in control_types
     assert "depth" in control_types
 

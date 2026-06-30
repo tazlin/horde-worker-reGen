@@ -31,7 +31,8 @@ from horde_worker_regen.app_state import (
     OverviewViewMode,
     benchmark_status_summary,
 )
-from horde_worker_regen.benchmark.enums import BenchAxis, BenchTier
+from horde_worker_regen.benchmark.capabilities.capability import CapabilityKind
+from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.progress_channel import LevelPlanRow, decode_plan_rows
 from horde_worker_regen.tui.benchmark_launcher import (
     BenchmarkOptions,
@@ -122,7 +123,7 @@ def _tier_switch_id(tier: BenchTier) -> str:
 class _AxisToggle(typing.NamedTuple):
     """One individually selectable ramp axis as presented in the Advanced panel."""
 
-    axis: BenchAxis
+    axis: CapabilityKind
     label: str
     help_text: str
 
@@ -131,30 +132,36 @@ _AXIS_GROUPS: tuple[tuple[str, tuple[_AxisToggle, ...]], ...] = (
     (
         "Concurrency",
         (
-            _AxisToggle(BenchAxis.QUEUE_SIZE, "Queue depth", "Preload the next job while one samples (queue_size)."),
-            _AxisToggle(BenchAxis.THREADS, "Thread count", "Run two inference jobs at once (max_threads)."),
-            _AxisToggle(BenchAxis.BATCH, "Batch size", "Sample several images per step (n_iter / max_batch)."),
+            _AxisToggle(
+                CapabilityKind.QUEUE_SIZE, "Queue depth", "Preload the next job while one samples (queue_size)."
+            ),
+            _AxisToggle(CapabilityKind.THREADS, "Thread count", "Run two inference jobs at once (max_threads)."),
+            _AxisToggle(CapabilityKind.BATCH, "Batch size", "Sample several images per step (n_iter / max_batch)."),
         ),
     ),
     (
         "Features",
         (
-            _AxisToggle(BenchAxis.HIRES_FIX, "Hires-fix", "A second, upscaled sampling pass."),
+            _AxisToggle(CapabilityKind.HIRES_FIX, "Hires-fix", "A second, upscaled sampling pass."),
             _AxisToggle(
-                BenchAxis.POST_PROCESSING, "Post-processing", "Upscalers and face-fixers on generated images."
+                CapabilityKind.POST_PROCESSING, "Post-processing", "Upscalers and face-fixers on generated images."
             ),
-            _AxisToggle(BenchAxis.CONTROLNET, "Controlnet", "Classic preprocessor controlnet (SD1.5)."),
-            _AxisToggle(BenchAxis.QR_CODE, "QR-code controlnet", "The QR-code workflow (the SDXL controlnet path)."),
+            _AxisToggle(CapabilityKind.CONTROLNET, "Controlnet", "Classic preprocessor controlnet (SD1.5)."),
+            _AxisToggle(
+                CapabilityKind.QR_CODE, "QR-code controlnet", "The QR-code workflow (the SDXL controlnet path)."
+            ),
         ),
     ),
     (
         "Alchemy",
         (
             _AxisToggle(
-                BenchAxis.ALCHEMY_CLIP, "Alchemy: CLIP lane", "Caption / interrogation / NSFW (safety process)."
+                CapabilityKind.ALCHEMY_CLIP, "Alchemy: CLIP lane", "Caption / interrogation / NSFW (safety process)."
             ),
-            _AxisToggle(BenchAxis.ALCHEMY_GRAPH, "Alchemy: graph lane", "Upscale / face-fix / strip-background."),
-            _AxisToggle(BenchAxis.ALCHEMY_CONCURRENT, "Alchemy: concurrent", "Alchemy forms alongside image jobs."),
+            _AxisToggle(CapabilityKind.ALCHEMY_GRAPH, "Alchemy: graph lane", "Upscale / face-fix / strip-background."),
+            _AxisToggle(
+                CapabilityKind.ALCHEMY_CONCURRENT, "Alchemy: concurrent", "Alchemy forms alongside image jobs."
+            ),
         ),
     ),
 )
@@ -164,7 +171,7 @@ Each axis is independently selectable: deselecting one drops only its levels (se
 `LadderOptions.excluded_axes`), so an operator can benchmark, say, post-processing without controlnet."""
 
 
-def _axis_switch_id(axis: BenchAxis) -> str:
+def _axis_switch_id(axis: CapabilityKind) -> str:
     """The widget id for an axis toggle (kept derivable so collection and layout cannot drift)."""
     return f"benchmark-axis-{axis.value}"
 
@@ -393,12 +400,6 @@ class BenchmarkView(VerticalScroll):
                             help_text=toggle.help_text,
                         )
                 yield self._switch_row(
-                    "Warm worker",
-                    "benchmark-warm",
-                    default=True,
-                    help_text="Reuse one warm worker across levels (faster). Off isolates each level.",
-                )
-                yield self._switch_row(
                     "Force",
                     "benchmark-force",
                     default=False,
@@ -612,7 +613,7 @@ class BenchmarkView(VerticalScroll):
             soak_minutes = float(self.query_one("#benchmark-soak", Input).value or "5")
         except ValueError:
             soak_minutes = 5.0
-        excluded_axes = [
+        excluded_capabilities = [
             toggle.axis.value
             for _group_name, toggles in _AXIS_GROUPS
             for toggle in toggles
@@ -624,8 +625,7 @@ class BenchmarkView(VerticalScroll):
             validate=self.query_one("#benchmark-validate", Switch).value,
             soak_minutes=soak_minutes,
             include_downloads=self.query_one("#benchmark-downloads", Switch).value,
-            excluded_axes=excluded_axes,
-            warm=self.query_one("#benchmark-warm", Switch).value,
+            excluded_capabilities=excluded_capabilities,
             force=self.query_one("#benchmark-force", Switch).value,
             verbose=self.query_one("#benchmark-verbose", Switch).value,
         )

@@ -143,7 +143,7 @@ def test_download_path_skips_the_gpu_probe(monkeypatch: pytest.MonkeyPatch) -> N
         captured["probe_devices"] = probe_devices
         return [], SimpleNamespace(total_vram_mb=None), SimpleNamespace()
 
-    monkeypatch.setattr(cli, "_prepare_ladder", fake_prepare)
+    monkeypatch.setattr(cli, "_prepare_catalog", fake_prepare)
     args = SimpleNamespace(
         tiers="sd15",
         dry_run=True,

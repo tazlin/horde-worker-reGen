@@ -30,6 +30,7 @@ from horde_worker_regen.benchmark.capabilities.catalog import (
     build_sustained_probe,
 )
 from horde_worker_regen.benchmark.capabilities.plan import build_plan
+from horde_worker_regen.benchmark.capabilities.plan_preview import build_capability_plan_rows
 from horde_worker_regen.benchmark.capabilities.probe_runner import run_capability_probe_async
 from horde_worker_regen.benchmark.capabilities.recommendation import synthesize_bridge_data, synthesize_capabilities
 from horde_worker_regen.benchmark.capabilities.report_render import describe_decision, render_markdown
@@ -51,6 +52,7 @@ from horde_worker_regen.benchmark.progress_channel import (
     NullProgressSink,
     ProgressSink,
     RampFinished,
+    RampPlanned,
     RampStarted,
     SuggestionDecisionRow,
 )
@@ -165,6 +167,7 @@ class ProbeExecutor:
         results: list[CapabilityProbeResult] = []
 
         self._emit_ramp_started(machine, num_probes=len(plan.probes))
+        self._emit_ramp_plan(plan.probes, machine)
 
         from horde_worker_regen.harness import WarmHarnessSession
 
@@ -353,6 +356,16 @@ class ProbeExecutor:
             )
 
         return _emit
+
+    def _emit_ramp_plan(self, probes: list[CapabilityProbe], machine: MachineInfo) -> None:
+        """Publish the per-probe resource plan and predicted verdicts before the first probe runs."""
+        rows = build_capability_plan_rows(
+            probes,
+            machine=machine,
+            process_mode=self._process_mode,
+            only_probe=self._only_probe,
+        )
+        self._progress.emit(RampPlanned(run_id=self._run_id, rows=rows))
 
     def _emit_ramp_started(self, machine: MachineInfo, *, num_probes: int) -> None:
         self._progress.emit(

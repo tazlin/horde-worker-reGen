@@ -229,22 +229,26 @@ def test_progress_line_shows_phase_and_restarts() -> None:
 
 
 @pytest.mark.e2e
-def test_fake_ramp_emits_lifecycle_events(tmp_path: Path) -> None:
-    """A fake-mode ramp writes the ramp/level lifecycle events to progress.jsonl."""
-    from horde_worker_regen.benchmark.controller import BenchmarkController
-    from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
+def test_fake_run_emits_lifecycle_events(tmp_path: Path) -> None:
+    """A fake-mode capability run writes the ramp/probe lifecycle events to progress.jsonl."""
+    from horde_worker_regen.benchmark.capabilities.catalog import CatalogOptions
+    from horde_worker_regen.benchmark.capabilities.executor import ProbeExecutor
+    from horde_worker_regen.benchmark.enums import BenchTier
 
-    ladder = build_default_ladder(
-        LadderOptions(
-            tiers=["sd15"],
+    sink = JsonlProgressSink(tmp_path / PROGRESS_FILENAME)
+    ProbeExecutor(
+        catalog_options=CatalogOptions(
+            tiers=[BenchTier.SD15],
             jobs_per_level=2,
             include_concurrency=False,
             include_features=False,
             include_alchemy=False,
         ),
-    )
-    sink = JsonlProgressSink(tmp_path / PROGRESS_FILENAME)
-    BenchmarkController(ladder, tmp_path, process_mode="fake", validate=False, progress_sink=sink).run()
+        process_mode="fake",
+        run_soak=False,
+        out_dir=tmp_path,
+        progress_sink=sink,
+    ).run()
 
     events = read_progress_events(tmp_path / PROGRESS_FILENAME)
     emitted_types = {type(event) for event in events}

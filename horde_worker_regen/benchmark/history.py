@@ -5,7 +5,7 @@ durable app state remembers only the most recent run. This module turns that dir
 a navigable history: :func:`list_runs` summarizes every run newest-first, and :func:`compare_reports`
 diffs two runs so an operator can answer "did this run regress against the last one?".
 
-It is deliberately import-light (only the report models, no controller/hordelib chain) so the TUI can
+It is deliberately import-light (only the result models, no executor/hordelib chain) so the TUI can
 load it lazily without paying the benchmark's heavy import cost.
 """
 
@@ -16,8 +16,8 @@ from pathlib import Path
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from horde_worker_regen.benchmark.enums import LevelOutcome
-from horde_worker_regen.benchmark.report import BenchmarkReport
+from horde_worker_regen.benchmark.capabilities.capability import CapabilityVerdict
+from horde_worker_regen.benchmark.capabilities.result import CapabilityReport
 
 DEFAULT_RESULTS_ROOT = Path("benchmark_results")
 """Where ramps write their timestamped output directories by default."""
@@ -38,33 +38,32 @@ class RunSummary(BaseModel):
     num_findings: int = 0
 
 
-def load_report(run_dir: Path) -> BenchmarkReport | None:
+def load_report(run_dir: Path) -> CapabilityReport | None:
     """Load one run's ``report.json``, returning None (never raising) when it is absent or unreadable.
 
-    Loads via the report model directly rather than the controller's ``load_existing_report`` to keep
-    this module off the heavy benchmark import chain.
+    Loads via the result model directly to keep this module off the heavy benchmark import chain.
     """
     report_path = run_dir / _REPORT_FILENAME
     if not report_path.exists():
         return None
     try:
-        return BenchmarkReport.model_validate_json(report_path.read_text(encoding="utf-8"))
+        return CapabilityReport.model_validate_json(report_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as load_error:
         logger.debug(f"Could not load benchmark report {report_path}: {load_error}")
         return None
 
 
-def summarize_report(run_dir: Path, report: BenchmarkReport) -> RunSummary:
+def summarize_report(run_dir: Path, report: CapabilityReport) -> RunSummary:
     """Project a loaded report into its history-list summary."""
-    levels_passed = sum(1 for level in report.levels if level.outcome == LevelOutcome.PASSED)
+    probes_proven = sum(1 for probe in report.probes if probe.verdict is CapabilityVerdict.PROVEN)
     return RunSummary(
         run_dir=str(run_dir),
         run_id=report.run_id or run_dir.name,
         created_at=report.created_at,
         gpu_name=report.machine.gpu_name,
         worker_version=report.worker_version,
-        levels_passed=levels_passed,
-        levels_total=len(report.levels),
+        levels_passed=probes_proven,
+        levels_total=len(report.probes),
         num_findings=len(report.findings),
     )
 
@@ -133,11 +132,11 @@ class ReportComparison(BaseModel):
         )
 
 
-def _outcomes_by_level(report: BenchmarkReport) -> dict[str, str]:
-    return {level.level.id: str(level.outcome) for level in report.levels}
+def _outcomes_by_level(report: CapabilityReport) -> dict[str, str]:
+    return {probe.capability.slug: str(probe.verdict) for probe in report.probes}
 
 
-def _capability_flags(report: BenchmarkReport) -> dict[str, bool]:
+def _capability_flags(report: CapabilityReport) -> dict[str, bool]:
     capabilities = report.capabilities
     return {
         "hires_fix": capabilities.supports_hires_fix,
@@ -151,7 +150,7 @@ def _capability_flags(report: BenchmarkReport) -> dict[str, bool]:
     }
 
 
-def _suggested_fields(report: BenchmarkReport) -> dict[str, str]:
+def _suggested_fields(report: CapabilityReport) -> dict[str, str]:
     suggested = report.suggested_bridge_data
     return {
         "max_threads": str(suggested.max_threads),
@@ -179,7 +178,7 @@ def _diff_string_maps(older: dict[str, str], newer: dict[str, str]) -> list[Fiel
     return changes
 
 
-def compare_reports(older: BenchmarkReport, newer: BenchmarkReport) -> ReportComparison:
+def compare_reports(older: CapabilityReport, newer: CapabilityReport) -> ReportComparison:
     """Diff two runs across level outcomes, capabilities, the recommendation, and baseline throughput.
 
     Throughput baselines are compared with one decimal of it/s so a trivial sampling jitter does not

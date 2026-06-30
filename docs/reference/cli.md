@@ -131,9 +131,8 @@ Progressive worker benchmarking. Subcommands:
 | Subcommand | Purpose |
 |------------|---------|
 | `run` | Run the capability-probe benchmark: prove what this machine can do, on one warm worker. |
-| `ramp` | The legacy ladder benchmark (cold-start per level). Superseded by `run`. |
 | `plan` | Show each probe's resource requirements and predicted run/skip verdict (no worker is started). |
-| `report OUT_DIR` | Re-render the markdown report from an existing output directory (capability or legacy). |
+| `report OUT_DIR` | Re-render the markdown report from an existing output directory. |
 | `monitor OUT_DIR` | Tail a run's `progress.jsonl` live (attach to or replay a run). |
 | `live` | Open-loop load generation against a live API (not yet implemented). |
 
@@ -172,7 +171,7 @@ Key `run` options:
 | `--no-validate` | off | Skip the post-run sustained-load soak (`--soak-minutes` sets its length). |
 | `--strict-duty` | off | Make the soak's 90% GPU-duty target a hard gate (advisory by default). |
 | `--exclude-capability KIND` | — | Drop a single capability kind (repeatable; choices are the `CapabilityKind` values, e.g. `post_processing`, `controlnet`, `alchemy_concurrent`). |
-| `--no-concurrency` / `--no-features` / `--no-alchemy` / `--include-downloads` | — | Coarse stage selection, as in `ramp`. |
+| `--no-concurrency` / `--no-features` / `--no-alchemy` / `--include-downloads` | — | Coarse stage selection (drop a whole group of probes; downloads are opt-in). |
 
 ```bash
 # Prove sd15 + sdxl on this GPU and write the report:
@@ -182,54 +181,28 @@ horde-benchmark run --tiers sd15,sdxl
 horde-benchmark run --only sd15-controlnet --no-validate
 ```
 
-The ramp walks an ordered ladder per tier: a conservative **baseline** (stage A), then **concurrency**
-(queue/threads/batch, B), **features** (C), **alchemy** (D), and optional **downloads** (E), followed by
-a sustained-load **validation soak** (V). Stage C is grounded in what hordelib actually supports:
-classic **controlnet** (canny/depth/openpose preprocessors) is exercised on SD1.5 only, while the
-**qr_code** workflow (the real SDXL controlnet capability, gated by `allow_sdxl_controlnet`) is
-exercised on SD1.5 and SDXL. Post-processing sweeps every known upscaler and face-fixer at 512²,
-1024², and a VRAM-derived maximum. Alchemy is tested on both lanes independently, the CLIP lane
-(caption/interrogation/NSFW, on the safety process) and the graph lane (upscalers/face-fixers/
-strip-background, on the inference processes), plus a concurrent-with-image rung.
-
-The report separates **Capabilities** (everything the worker proved it can do) from a **conservative
-recommended bridgeData** (only models that fit with VRAM headroom are loaded, the batch size is the
-largest that passed cleanly, and concurrent alchemy is enabled only if the soak held up).
+The catalog is grounded in what hordelib actually supports: classic **controlnet**
+(canny/depth/openpose preprocessors) is probed on SD1.5 only, while the **qr_code** workflow (the real
+SDXL controlnet capability, gated by `allow_sdxl_controlnet`) is probed on SD1.5 and SDXL.
+Post-processing sweeps every known upscaler and face-fixer at 512², 1024², and a VRAM-derived maximum.
+Alchemy is probed on both lanes independently, the CLIP lane (caption/interrogation/NSFW, on the safety
+process) and the graph lane (upscalers/face-fixers/strip-background, on the inference processes), plus a
+concurrent-with-image probe. Heavy tiers (`flux`/`qwen`/`zimage`) are opt-in and self-skip when the
+machine cannot hold them or the checkpoint is absent; `qwen`/`zimage` are beta models from the pending
+reference (need `HORDE_MODEL_REFERENCE_PRIMARY_API_URL`; the beta opt-in env is set automatically).
 
 Every suggested value carries a **provenance basis** so you can tell a setting that is off because it
-was *tested and failed* from one that is off only because its level was *skipped* (never tested),
+was *tested and failed* from one that is off only because its probe was *skipped* (never tested),
 *not in this run*, or *held back* for VRAM headroom or an unstable soak. The basis is printed under the
 completion line, written into the report's "Why each value" table, and shown beside each value in the
 dashboard. A built-in consistency check flags (and never silently ships) any recommendation that would
 enable a capability on anything weaker than a real pass.
 
-Key `ramp` options:
-
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--tiers` | `sd15,sdxl` | Comma-separated model tiers (`sd15`, `sdxl`, `flux`, `qwen`). `flux`/`qwen` are opt-in: they are very large (17-20 GB download, 13-16 GB VRAM), the run warns and auto-skips them when the machine cannot hold them or the checkpoint is absent, and `qwen` is a beta model sourced from the pending reference (needs `HORDE_MODEL_REFERENCE_PRIMARY_API_URL`; the beta opt-in env is set automatically). |
-| `--process-mode {fake,dry_run,real}` | `real` | `real` benchmarks the GPU; `fake`/`dry_run` exercise the ramp without inference. |
-| `--out PATH` | `benchmark_results/<timestamp>` | Output directory. |
-| `--jobs-per-level N` | `4` | Jobs run per ramp level. |
-| `--level-timeout SECONDS` | `900` | Per-level timeout. |
-| `--warm` / `--no-warm` | on | Reuse one warm worker across fixed-scenario levels instead of cold-starting a fresh worker (and respawning every inference process) per level. Feature and alchemy levels pre-warm their models (one throwaway job/form) before being measured, so the one-time cold load of a controlnet/QR checkpoint, upscaler, or BLIP model is not counted against the level; the measured pass reflects steady state. `--no-warm` runs each level in its own isolated subprocess. |
-| `--resume` | off | Reuse existing level results in `--out`. |
-| `--no-validate` | off | Skip the post-ramp sustained-load soak (`--soak-minutes` sets its length). |
-| `--force` | off | Attempt levels that would otherwise be skipped for not fitting this machine (insufficient VRAM/disk) or lacking a CivitAI token. An absent checkpoint is still skipped (there is nothing to run). |
-
-Other toggles narrow the run. The coarse stage flags drop a whole stage: `--no-concurrency`,
-`--no-features`, `--no-alchemy` (plus `--only-level`, `--skip-downloads`, `--include-downloads`).
-For finer control, `--exclude-axis AXIS` (repeatable) drops one individual capability while leaving its
-stage siblings in place, so you can benchmark, say, post-processing without controlnet. The axes are
-`queue_size`, `threads`, `batch` (concurrency); `hires_fix`, `post_processing`, `controlnet`,
-`qr_code` (features); and `alchemy_clip`, `alchemy_graph`, `alchemy_concurrent` (alchemy). A level is
-built only if its stage is included *and* its axis is not excluded.
-
 ### `plan`: preview requirements before you run
 
 The benchmark keeps every scenario identical across machines (apples-to-apples), so what changes from
-machine to machine is only *whether* a level runs. `plan` makes that decision visible up front, without
-starting a worker: it builds the same ladder `ramp` would, then prints one row per level with its
+machine to machine is only *whether* a probe runs. `plan` makes that decision visible up front, without
+starting a worker: it builds the same catalog `run` would, then prints one row per probe with its
 estimated VRAM, the disk it needs free, whether it needs network or a CivitAI token, and the predicted
 verdict (`RUN`, or `SKIP` with the reason) against the detected hardware.
 
@@ -241,12 +214,11 @@ horde-benchmark plan --tiers sd15,sdxl
 horde-benchmark plan --tiers flux --json
 ```
 
-`plan` accepts the same selection flags as `ramp` (`--tiers`, `--process-mode`, `--no-concurrency`,
-`--no-features`, `--no-alchemy`, `--exclude-axis`, `--include-downloads`, `--force`), so the preview
-matches exactly what the ramp would run. The same plan table is also printed
-at the top of every `ramp` (emitted on the progress channel as a `RampPlanned` event), so `monitor` and
-the dashboard show it too. Pass `--force` to see levels that do not fit (or lack a token) reported as
-`RUN` instead of `SKIP`.
+`plan` accepts the same selection flags as `run` (`--tiers`, `--process-mode`, `--no-concurrency`,
+`--no-features`, `--no-alchemy`, `--exclude-capability`, `--include-downloads`, `--force`), so the
+preview matches exactly what the run would do. The same plan table is also printed at the top of every
+`run` (emitted on the progress channel as a `RampPlanned` event), so `monitor` and the dashboard show it
+too. Pass `--force` to see probes that do not fit (or lack a token) reported as `RUN` instead of `SKIP`.
 
 ## `horde-log`
 

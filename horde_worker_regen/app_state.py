@@ -12,8 +12,9 @@ unparseable file yields a fresh state, so a corrupt file can never block worker 
 atomic (temp file in the same directory, then ``os.replace``).
 
 The module is deliberately dependency-light; it does not import the benchmark or hordelib chains, so
-it can be imported early in worker startup and by the TUI. The benchmark-report-to-record conversion
-([`build_benchmark_record`][horde_worker_regen.app_state.build_benchmark_record]) uses a local import.
+it can be imported early in worker startup and by the TUI. The report-to-record conversion
+([`build_capability_benchmark_record`][horde_worker_regen.app_state.build_capability_benchmark_record])
+uses a local import.
 """
 
 from __future__ import annotations
@@ -34,7 +35,6 @@ from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from horde_worker_regen.benchmark.capabilities.result import CapabilityReport
-    from horde_worker_regen.benchmark.report import BenchmarkReport
 
 APP_STATE_SCHEMA_VERSION = 1
 """Bumped when the persisted schema changes incompatibly; an older file is discarded on read."""
@@ -219,27 +219,6 @@ def should_prompt_onboarding(state: WorkerAppState, *, current_version: str) -> 
     return benchmark_status_summary(state, current_version=current_version) is not BenchmarkAvailability.CURRENT
 
 
-def build_benchmark_record(report: BenchmarkReport, *, results_dir: str | os.PathLike[str]) -> BenchmarkRecord:
-    """Convert a finished benchmark report into the lean, durable record stored in app state.
-
-    Uses the report's own version/run stamps so the CLI and TUI entry points record identical
-    metadata. The suggested bridge data is flattened to a plain dict to keep the persisted record
-    free of the benchmark model chain.
-    """
-    levels_passed = sum(1 for level in report.levels if level.outcome == "passed")
-    return BenchmarkRecord(
-        run_id=report.run_id,
-        results_dir=str(results_dir),
-        created_at=report.created_at,
-        worker_version=report.worker_version,
-        levels_passed=levels_passed,
-        levels_total=len(report.levels),
-        gpu_name=report.machine.gpu_name,
-        had_findings=bool(report.findings),
-        suggested_bridge_data=report.suggested_bridge_data.model_dump(),
-    )
-
-
 def build_capability_benchmark_record(
     report: CapabilityReport,
     *,
@@ -247,9 +226,9 @@ def build_capability_benchmark_record(
 ) -> BenchmarkRecord:
     """Convert a finished capability report into the durable record stored in app state.
 
-    The capability-engine counterpart of :func:`build_benchmark_record`: it counts proven probes instead
-    of passed levels, but produces the identical record so the run-to-run pointer is the same regardless
-    of which engine produced it.
+    Counts proven probes as passed and produces the lean, durable record stored in app state. Uses the
+    report's own version/run stamps so the CLI and TUI entry points record identical metadata; the
+    suggested bridge data is flattened to a plain dict to keep the record free of the benchmark chain.
     """
     probes_proven = sum(1 for probe in report.probes if probe.verdict == "proven")
     return BenchmarkRecord(
@@ -397,7 +376,7 @@ __all__ = [
     "WorkerAppState",
     "WorkerRunRecord",
     "benchmark_status_summary",
-    "build_benchmark_record",
+    "build_capability_benchmark_record",
     "compute_config_digest",
     "default_app_state_dir",
     "default_app_state_path",

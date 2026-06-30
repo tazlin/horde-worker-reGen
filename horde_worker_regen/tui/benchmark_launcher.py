@@ -45,7 +45,7 @@ from horde_worker_regen.process_management.lifecycle.owned_process_registry impo
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH, load_config, save_config
 
 if TYPE_CHECKING:
-    from horde_worker_regen.benchmark.report import BenchmarkReport, SuggestedBridgeData
+    from horde_worker_regen.benchmark.capabilities.result import CapabilityReport, SuggestedBridgeData
 
 _CANCEL_GRACE_SECONDS = 5.0
 
@@ -86,14 +86,13 @@ class BenchmarkOptions:
     include_concurrency: bool = True
     include_features: bool = True
     include_alchemy: bool = True
-    excluded_axes: list[str] = dataclasses.field(default_factory=list)
-    """Individual ramp axes to drop (BenchAxis values), independent of the coarse stage toggles."""
-    warm: bool = True
+    excluded_capabilities: list[str] = dataclasses.field(default_factory=list)
+    """Individual capability kinds to drop (CapabilityKind values), independent of the coarse stage toggles."""
     force: bool = False
     verbose: bool = False
 
     def _stage_selection_args(self) -> list[str]:
-        """The stage-inclusion + tier flags shared by the ``ramp`` and ``plan`` argv."""
+        """The stage-inclusion + tier flags shared by the ``run`` and ``plan`` argv."""
         args = ["--process-mode", self.process_mode, "--tiers", ",".join(self.tiers)]
         if self.include_downloads:
             args.append("--include-downloads")
@@ -103,14 +102,12 @@ class BenchmarkOptions:
             args.append("--no-features")
         if not self.include_alchemy:
             args.append("--no-alchemy")
-        for axis in self.excluded_axes:
-            args.extend(["--exclude-axis", axis])
-        if self.force:
-            args.append("--force")
+        for capability in self.excluded_capabilities:
+            args.extend(["--exclude-capability", capability])
         return args
 
     def build_command(self, out_dir: Path) -> list[str]:
-        """Return the ``horde-benchmark ramp`` argv that runs this configuration into ``out_dir``."""
+        """Return the ``horde-benchmark run`` argv that runs this configuration into ``out_dir``."""
         command = [
             sys.executable,
             # Unbuffered: the child's stdout/stderr is redirected to console.log (a regular file, not a
@@ -120,7 +117,7 @@ class BenchmarkOptions:
             "-u",
             "-m",
             "horde_worker_regen.benchmark.cli",
-            "ramp",
+            "run",
             *self._stage_selection_args(),
             "--out",
             str(out_dir),
@@ -129,15 +126,13 @@ class BenchmarkOptions:
         ]
         if not self.validate:
             command.append("--no-validate")
-        if not self.warm:
-            command.append("--no-warm")
         if self.verbose:
             command.append("--verbose")
         return command
 
     def build_plan_command(self) -> list[str]:
         """Return the ``horde-benchmark plan --json`` argv that previews this configuration (no worker)."""
-        return [
+        command = [
             sys.executable,
             "-m",
             "horde_worker_regen.benchmark.cli",
@@ -145,6 +140,9 @@ class BenchmarkOptions:
             *self._stage_selection_args(),
             "--json",
         ]
+        if self.force:
+            command.append("--force")
+        return command
 
     def build_download_command(self, *, dry_run: bool = False, control_stdin: bool = False) -> list[str]:
         """Return the ``horde-benchmark download`` argv that fetches this configuration's models.
@@ -174,8 +172,8 @@ class BenchmarkOptions:
             command.append("--no-features")
         if not self.include_alchemy:
             command.append("--no-alchemy")
-        for axis in self.excluded_axes:
-            command.extend(["--exclude-axis", axis])
+        for capability in self.excluded_capabilities:
+            command.extend(["--exclude-capability", capability])
         if dry_run:
             command.append("--dry-run")
         if control_stdin:
@@ -328,7 +326,7 @@ class BenchmarkSupervisor:
         self._status = BenchmarkSupervisorStatus.IDLE
         self._out_dir: Path | None = None
         self.run_state = BenchmarkRunState()
-        self.report: BenchmarkReport | None = None
+        self.report: CapabilityReport | None = None
 
     @property
     def status(self) -> BenchmarkSupervisorStatus:
@@ -432,13 +430,16 @@ class BenchmarkSupervisor:
         if self._out_dir is None:
             return
         try:
-            from horde_worker_regen.app_state import AppStateStore, build_benchmark_record
-            from horde_worker_regen.benchmark.controller import load_existing_report
+            from horde_worker_regen.app_state import AppStateStore, build_capability_benchmark_record
+            from horde_worker_regen.benchmark.capabilities.result import CapabilityReport
 
-            report = load_existing_report(self._out_dir)
-            if report is not None:
+            report_path = self._out_dir / "report.json"
+            if report_path.exists():
+                report = CapabilityReport.model_validate_json(report_path.read_text(encoding="utf-8"))
                 self.report = report
-                AppStateStore().record_benchmark(build_benchmark_record(report, results_dir=self._out_dir))
+                AppStateStore().record_benchmark(
+                    build_capability_benchmark_record(report, results_dir=self._out_dir),
+                )
         except Exception as record_error:  # noqa: BLE001 - recording must not break the TUI
             logger.debug(f"Could not load/record benchmark report: {record_error}")
 

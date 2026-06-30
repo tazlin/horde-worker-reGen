@@ -80,7 +80,7 @@ def test_plan_row_marks_a_fitting_but_incomplete_level_as_download_first() -> No
     Names each kind of missing artifact in the summary so the operator sees what to fetch; this is the
     derivation behind the reported bug where such a level wrongly read ``Ready``.
     """
-    from horde_worker_regen.benchmark.controller import _plan_row
+    from horde_worker_regen.benchmark.capabilities.plan_preview import _plan_row
     from horde_worker_regen.benchmark.requirements import LevelRequirements
 
     req = LevelRequirements(
@@ -105,7 +105,7 @@ def test_plan_row_marks_a_fitting_but_incomplete_level_as_download_first() -> No
 
 def test_plan_row_never_marks_a_hard_skip_as_download_first() -> None:
     """A skipped level (a verdict is present) is never ``download first``, even with missing artifacts."""
-    from horde_worker_regen.benchmark.controller import _plan_row
+    from horde_worker_regen.benchmark.capabilities.plan_preview import _plan_row
     from horde_worker_regen.benchmark.requirements import LevelRequirements
 
     req = LevelRequirements(
@@ -149,16 +149,16 @@ def test_plan_table_omits_annotator_prompt_when_already_downloaded() -> None:
     assert "controlnet annotators" not in table
 
 
-def test_plan_subcommand_honours_exclude_axis(
+def test_plan_subcommand_honours_exclude_capability(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`--exclude-axis` drops just that axis's levels while leaving the rest of the stage intact."""
+    """`--exclude-capability` drops just that axis's levels while leaving the rest of the stage intact."""
     # Avoid the reference-manager network fetch: skip the sized disk plan and report every model present.
     monkeypatch.setattr("horde_worker_regen.benchmark.requirements.models_disk_plan", lambda _names: None)
     monkeypatch.setattr("horde_worker_regen.benchmark.requirements.model_present_on_disk", lambda _name: True)
 
-    rc = main(["plan", "--tiers", "sd15", "--process-mode", "fake", "--exclude-axis", "controlnet", "--json"])
+    rc = main(["plan", "--tiers", "sd15", "--process-mode", "fake", "--exclude-capability", "controlnet", "--json"])
     assert rc == 0
 
     axes = {row.level_id for row in decode_plan_rows(capsys.readouterr().out)}

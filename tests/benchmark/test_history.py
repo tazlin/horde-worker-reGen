@@ -4,24 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from horde_worker_regen.benchmark.enums import BenchTier, LevelOutcome
-from horde_worker_regen.benchmark.history import compare_reports, list_runs, load_report
-from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
-from horde_worker_regen.benchmark.report import (
-    BenchmarkReport,
+from horde_worker_regen.benchmark.capabilities.capability import Capability, CapabilityKind, CapabilityVerdict
+from horde_worker_regen.benchmark.capabilities.result import (
+    CapabilityProbeResult,
+    CapabilityReport,
     Finding,
-    LevelReport,
     MachineInfo,
     SuggestedBridgeData,
 )
+from horde_worker_regen.benchmark.enums import BenchTier
+from horde_worker_regen.benchmark.history import compare_reports, list_runs, load_report
 
-
-def _baseline_level() -> object:
-    return next(
-        level
-        for level in build_default_ladder(LadderOptions(tiers=[BenchTier.SD15]))
-        if level.establishes_tier_baseline
-    )
+_BASELINE = Capability(tier=BenchTier.SD15, kind=CapabilityKind.BASELINE)
 
 
 def _write_report(
@@ -29,19 +23,18 @@ def _write_report(
     *,
     run_id: str,
     created_at: float,
-    outcome: LevelOutcome = LevelOutcome.PASSED,
+    verdict: CapabilityVerdict = CapabilityVerdict.PROVEN,
     suggested: SuggestedBridgeData | None = None,
     findings: int = 0,
 ) -> None:
     """Write a minimal but valid report.json into a run directory."""
     run_dir.mkdir(parents=True, exist_ok=True)
-    level = _baseline_level()
-    finding_list = [Finding(kind="oom", level_id=level.id, evidence="x") for _ in range(findings)]  # type: ignore[arg-type]
-    report = BenchmarkReport(
+    finding_list = [Finding(kind="oom", level_id=_BASELINE.slug, evidence="x") for _ in range(findings)]  # type: ignore[arg-type]
+    report = CapabilityReport(
         run_id=run_id,
         created_at=created_at,
         machine=MachineInfo(gpu_name="Test GPU", total_vram_mb=16000),
-        levels=[LevelReport(level=level, outcome=outcome, findings=finding_list)],
+        probes=[CapabilityProbeResult(capability=_BASELINE, verdict=verdict, findings=finding_list)],
         suggested_bridge_data=suggested or SuggestedBridgeData(),
         tier_baselines_its={"sd15": 5.0},
     )
@@ -69,17 +62,17 @@ def test_list_runs_on_missing_root_is_empty(tmp_path: Path) -> None:
 
 
 def test_compare_reports_surfaces_outcome_suggested_and_findings_changes(tmp_path: Path) -> None:
-    """A diff reports a level that regressed, a changed suggested field, and the findings delta."""
+    """A diff reports a probe that regressed, a changed suggested field, and the findings delta."""
     older_suggested = SuggestedBridgeData(max_threads=2)
     newer_suggested = SuggestedBridgeData(max_threads=1)
     _write_report(
-        tmp_path / "old", run_id="old", created_at=1.0, outcome=LevelOutcome.PASSED, suggested=older_suggested
+        tmp_path / "old", run_id="old", created_at=1.0, verdict=CapabilityVerdict.PROVEN, suggested=older_suggested
     )
     _write_report(
         tmp_path / "new",
         run_id="new",
         created_at=2.0,
-        outcome=LevelOutcome.FAILED,
+        verdict=CapabilityVerdict.DISPROVEN,
         suggested=newer_suggested,
         findings=1,
     )
@@ -91,7 +84,7 @@ def test_compare_reports_surfaces_outcome_suggested_and_findings_changes(tmp_pat
     comparison = compare_reports(older, newer)
 
     assert comparison.has_changes
-    assert any(change.new == "failed" for change in comparison.outcome_changes)
+    assert any(change.new == "disproven" for change in comparison.outcome_changes)
     assert any(
         change.field == "max_threads" and change.old == "2" and change.new == "1"
         for change in comparison.suggested_changes

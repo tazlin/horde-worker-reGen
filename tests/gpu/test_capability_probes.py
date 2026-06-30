@@ -31,9 +31,9 @@ from typing import TYPE_CHECKING
 import pytest
 
 from horde_worker_regen.benchmark.capabilities.capability import CapabilityVerdict
+from horde_worker_regen.benchmark.capabilities.executor import detect_machine_info
 from horde_worker_regen.benchmark.capabilities.probe import CapabilityProbe
 from horde_worker_regen.benchmark.capabilities.probe_runner import run_capability_probe_async
-from horde_worker_regen.benchmark.controller import detect_machine_info
 from horde_worker_regen.benchmark.requirements import (
     civitai_token_available,
     compute_probe_requirements,
