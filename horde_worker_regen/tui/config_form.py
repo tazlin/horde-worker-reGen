@@ -853,8 +853,9 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Leave blank to track Max threads. Set 1 to serialize (efficient on Windows WDDM, where concurrent "
         "loops only time-slice); higher values permit that many concurrent loops.",
         requires_restart=True,
-        minimum=1,
+        minimum=None,
         maximum=16,
+        explicit_default=None,
     ),
     # Other
     ConfigField(

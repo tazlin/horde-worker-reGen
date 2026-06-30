@@ -168,7 +168,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.post_process_job_overlap = False
     bd.unload_models_from_vram_often = False
     bd.gpu_sampling_lease_enabled = False
-    bd.gpu_sampling_lease_slots = 1
+    bd.gpu_sampling_lease_slots = None
     # Multi-GPU config: default to the single-GPU shape (no per-card overrides, auto-detect all). An empty
     # dict (not a Mock) is required so the effective-config resolver returns the base config unchanged.
     bd.gpu_overrides = {}
