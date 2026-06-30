@@ -551,6 +551,7 @@ class InferenceScheduler:
             self._diagnostic_mb_bucket(forecast.free_if_alone_mb),
             self._process_map.num_loaded_inference_processes(),
             self._diagnostic_mb_bucket(self._per_process_overhead_mb()),
+            self._diagnostic_mb_bucket(forecast.marginal_process_overhead_mb),
             forecast.fits_coresident,
             forecast.needs_exclusive_residency,
             forecast.requires_sibling_teardown,
@@ -560,12 +561,18 @@ class InferenceScheduler:
         if suppressed_count is None:
             return
 
+        marginal = self._overhead.marginal_breakdown(config_override_mb=self._config_overhead_override_mb())
+        marginal_chosen = f"{marginal.chosen_mb:.0f}" if marginal.chosen_mb is not None else "?"
+        marginal_probe = f"{marginal.probe_mb:.0f}" if marginal.probe_mb is not None else "?"
+        marginal_floor = f"{marginal.idle_floor_mb:.0f}" if marginal.idle_floor_mb is not None else "?"
         logger.debug(
             f"Stream forecast for {job.model}: {forecast.reason()} "
             f"[free_now={forecast.free_now_mb}, after_model_evict={forecast.free_after_model_evict_mb}, "
             f"alone={forecast.free_if_alone_mb}, live_procs="
             f"{self._process_map.num_loaded_inference_processes()}, "
-            f"overhead/proc={self._per_process_overhead_mb():.0f}MB] -> "
+            f"overhead/proc={self._per_process_overhead_mb():.0f}MB, "
+            f"marginal/ctx={marginal_chosen}MB(src={marginal.source},probe={marginal_probe},"
+            f"idle_floor={marginal_floor})] -> "
             f"coresident={forecast.fits_coresident}, "
             f"needs_exclusive={forecast.needs_exclusive_residency}, "
             f"needs_teardown={forecast.requires_sibling_teardown}, "
@@ -726,6 +733,36 @@ class InferenceScheduler:
         if used_mb <= 0:
             return
         self._overhead.observe_idle_residency(used_mb=used_mb, idle_inference_process_count=process_count)
+
+    def _maybe_invalidate_idle_context_floor(self) -> None:
+        """Lower a latched effective idle floor once the device proves it was not a sustained reading.
+
+        Complements :meth:`_maybe_capture_idle_context_residency`. The capture keeps the worst clean all-idle
+        reading; a transient spike (taken before the allocator returned a just-unloaded model's cache) would
+        otherwise pin the per-context marginal high for the whole session and route ordinary models into
+        teardown/exclusive admits. Unlike the capture this does not require the clean precondition: a reading
+        with resident models can only make the correction conservative, so any device-wide used reading below
+        the latched floor (with at least as many inference contexts live) is unambiguous proof it was too high.
+        Read-only beyond the cached figure, so it is safe every scheduling tick.
+        """
+        free_mb = self._process_map.get_free_vram_mb()
+        total_mb = self._process_map.get_reported_total_vram_mb()
+        if free_mb is None or total_mb is None:
+            return
+        used_mb = total_mb - free_mb
+        if used_mb <= 0:
+            return
+        live_inference_processes = sum(
+            1
+            for process_info in self._process_map.values()
+            if process_info.process_type == HordeProcessType.INFERENCE
+            and process_info.last_process_state
+            not in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED)
+        )
+        self._overhead.observe_device_residency(
+            used_mb=used_mb,
+            live_inference_process_count=live_inference_processes,
+        )
 
     def _marginal_process_overhead_mb(self) -> float | None:
         """Return the per-additional-context VRAM cost (MB), or None to fall back to the first-context overhead.
@@ -945,8 +982,10 @@ class InferenceScheduler:
         )
         num_safety_contexts = self._process_map.num_safety_processes(device_index=device_index) if safety_on_gpu else 0
         # Refresh the clean all-contexts idle baseline (a no-op once startup has passed) so the marginal
-        # per-context cost reflects measurement rather than the one-time-cost-times-N over-count.
+        # per-context cost reflects measurement rather than the one-time-cost-times-N over-count, then let a
+        # later lower reading invalidate a latched floor that was a transient spike rather than sustained.
         self._maybe_capture_idle_context_residency()
+        self._maybe_invalidate_idle_context_floor()
         # The EXTRA_LARGE tier (extra-large baselines plus the named VRAM-heavy checkpoints) is the single
         # source of truth for "wants the whole card and never shares". Feed it to the forecast so a baseline
         # whose conservative weight seed happens to fit co-resident still claims sole residency on intent,

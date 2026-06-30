@@ -438,16 +438,30 @@ once idle models are evicted.
 It derives them from two measurements, preferring hard data and erring conservative:
 
 - **The startup accelerator probe** measures the marginal per-additional-context cost directly (its
-  second-context delta). This is available from the first scheduling tick, so it also covers the startup
+  second-context delta, with the one-time runtime and the fixed device baseline already subtracted). This is
+  the structural per-context cost, available from the first scheduling tick, so it also covers the startup
   window where sibling processes have not yet reached idle. `vram_per_process_overhead_mb` (config) can
   override the first-context figure when an operator knows their card.
-- **The effective idle floor** is the *worst* (highest) device-wide used-VRAM reading observed when every
-  inference process is up, idle, and holding no model. That is ground truth for what reclaim can never
-  return: if a real inference context retains more allocator cache than the probe's minimal holder did,
-  the probe under-counts the marginal and the forecast would over-promise free VRAM. The scheduler takes
-  the **max** of the probe estimate and the effective-floor derivation, so it never believes in headroom
-  the device will not give back. The floor only rises above the probe once contexts genuinely over-commit
-  (the `threads > 1` regime), so a roomy card keeps the probe estimate unchanged.
+- **The idle floor** is derived from the device-wide used-VRAM observed when every inference process is up,
+  idle, and holding no model. A real inference context can retain more allocator/runtime VRAM than the
+  probe's minimal matmul holder did (emptying the cache does not return it), so the floor can legitimately
+  refine the probe upward. The scheduler takes the **max** of the probe and the idle-floor derivation, so it
+  never believes in headroom the device will not give back.
+
+The risk in that `max` is a *transient* spike: with `unload_models_from_vram_often` off the caching allocator
+holds a just-unloaded model's freed blocks for a while, so a clean all-idle reading taken in that window
+reads high and, kept as the worst-ever floor, would pin an inflated per-context cost for the whole session
+and route ordinary models into needless teardowns. The floor is therefore kept honest by **invalidation**:
+any later device-wide used reading below the latched floor (with at least as many inference contexts live)
+proves the device runs below that level, so the retained VRAM was reclaimable and the floor is lowered to the
+demonstrated reading. A *sustained* retention is never contradicted and stands; a transient spike is
+corrected down toward the minimum the device has actually shown. (A reading with resident models only makes
+the correction conservative, since residency adds VRAM, so the invalidation does not need the clean
+all-idle precondition the capture does.)
+
+The streaming-forecast log reports the chosen marginal alongside its inputs (`marginal/ctx=…MB(src=…,
+probe=…,idle_floor=…)`), so a bundle shows which signal won and the value the (corrected) idle floor settled
+on.
 
 These feed two decisions. The streaming forecast uses them to size `free_after_model_evict` (the VRAM
 achievable once idle resident models are gone) without multiplying the one-time cost by the process count.
