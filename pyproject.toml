@@ -26,7 +26,7 @@ dependencies = [
     "aiodns>=3.0.0,<4.0.0",
     "qrcode==7.4.2",
     "certifi",
-    "horde_sdk~=0.22.1",
+    "horde_sdk~=0.22.4",
     "horde_safety~=0.3.0",
     # Requires horde-engine (hordelib) 3.2.11+: in addition to the 3.2.5+ feature set (torchvision range,
     # no hard torchaudio dep, optional-feature extras + capability registry consumed by
@@ -34,7 +34,7 @@ dependencies = [
     # (hordelib.vram_planning.compute_inference_reserve_mb / compute_weight_budget_mb) and the runtime
     # weight-streaming telemetry (get_loaded_weights_offloaded_mb) the worker's streaming forecast and
     # whole-card exclusive residency depend on.
-    "horde_engine[layerdiffuse,upscale-extra]>=3.10.0,<4.0.0",
+    "horde_engine[layerdiffuse,upscale-extra]>=3.11.0,<4.0.0",
     "horde_model_reference>=7.0.2,<8.0.0",
     "python-dotenv",
     "ruamel.yaml",
@@ -49,6 +49,7 @@ dependencies = [
     "textual>=8.2.7",
     "textual-serve>=1.1.1",
     "logfire>=4.6.0",
+    "vtracer>=0.6.0", # For vectorize
     # Windows-only system-tray icon for the persistent worker host (tui/tray.py), so a detached worker
     # stays visible and stoppable. Import-guarded, so their absence on other platforms is harmless.
     "pystray; sys_platform == 'win32'",
@@ -93,10 +94,6 @@ cpu = ["torch", "torchvision"]
 # cannot be excluded per-job until the AI Horde API supports it), so its single extra covers it all.
 post-processing = ["horde-engine[rembg]"]
 controlnet = ["horde-engine[controlnet]"]
-# Image vectorizer alchemy form (raster -> SVG). vtracer is a pure-python/Rust wheel that ships for
-# every platform and needs no model download, so unlike the extras above it is not backend-gated; it
-# is optional only because vectorize is a niche alchemy op not every operator wants to offer.
-vectorize = ["vtracer>=0.6.0"]
 
 [project.urls]
 "Homepage" = "https://github.com/Haidra-Org/horde-worker-reGen"

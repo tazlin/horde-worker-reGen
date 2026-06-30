@@ -38,3 +38,40 @@ WORKER_KNOWN_EXTRA_ALCHEMY_FORMS = frozenset({VECTORIZE_FORM_NAME})
 def is_vectorize_form(form: str) -> bool:
     """Return whether *form* is the image vectorizer form name."""
     return form == VECTORIZE_FORM_NAME
+
+
+WORKER_KNOWN_BETA_UPSCALERS = frozenset(
+    {
+        "4xNomos8kSC",
+        "4xLSDIRplus",
+        "4xNomosWebPhoto_RealPLKSR",
+        "4xNomos2_realplksr_dysample",
+        "4xNomos2_hq_dat2",
+        "2xModernSpanimationV1",
+    },
+)
+"""Upscaler models this worker can run but whose acceptance depends on the AI-Horde server.
+
+These are distributed as beta via the model-reference pending queue and added to the AI-Horde server's
+``KNOWN_POST_PROCESSORS`` only at go-live. The server rejects an entire interrogation pop if it offers
+a post-processor the server does not list, so the worker must withhold these names until the server
+advertises them (checked via :func:`server_supports_interrogation_form`). The long-standing upscalers
+are in every server's enum and are never gated this way. Membership here gates only *offering*; the
+weights are resolved separately through hordelib's esrgan beta source.
+"""
+
+WORKER_KNOWN_BETA_FACEFIXERS = frozenset(
+    {
+        "GFPGANv1.3",
+        "RestoreFormer",
+    },
+)
+"""Face-restoration models this worker can run but whose acceptance depends on the AI-Horde server.
+
+The face-fixer analogue of :data:`WORKER_KNOWN_BETA_UPSCALERS`: distributed as beta via the
+model-reference pending queue (the ``gfpgan`` category) and added to the server's ``KNOWN_POST_PROCESSORS``
+only at go-live, so the worker withholds these names until the server advertises them (checked via
+:func:`server_supports_interrogation_form`). The long-standing ``GFPGAN``/``CodeFormers`` are in every
+server's enum and are never gated. ``RestoreFormer`` loads through hordelib's spandrel core; both weights
+are resolved through hordelib's gfpgan beta source.
+"""

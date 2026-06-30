@@ -45,7 +45,11 @@ from horde_sdk.generation_parameters.alchemy.consts import (
 from loguru import logger
 
 from horde_worker_regen.capabilities import strip_background_available, vectorize_available
-from horde_worker_regen.consts import VECTORIZE_FORM_NAME
+from horde_worker_regen.consts import (
+    VECTORIZE_FORM_NAME,
+    WORKER_KNOWN_BETA_FACEFIXERS,
+    WORKER_KNOWN_BETA_UPSCALERS,
+)
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
@@ -76,8 +80,10 @@ if TYPE_CHECKING:
 class _AlchemyPopRequest(AlchemyPopRequest):
     """AlchemyPopRequest with `forms` relaxed to plain strings.
 
-    The SDK's `KNOWN_ALCHEMY_TYPES` enum has `CodeFormers` aliased to the value "GFPGAN"
-    (an upstream copy-paste bug), so "CodeFormers" cannot round-trip through the enum.
+    The worker offers beta post-processors (upscalers, face-fixers) by name ahead of the SDK release
+    that lists them in `KNOWN_ALCHEMY_TYPES`, so `forms` must accept plain strings rather than round-trip
+    through the published enum. The server validates the names, and unknown ones are withheld until it
+    advertises them (see :func:`expand_offered_forms`).
     """
 
     forms: list[str]  # type: ignore[assignment]
@@ -156,8 +162,33 @@ def expand_offered_forms(bridge_data: reGenBridgeData) -> list[str]:
     ):
         offered.append(VECTORIZE_FORM_NAME)
     if "post-process" in configured:
-        offered.extend(m.value for m in KNOWN_UPSCALERS if m != KNOWN_UPSCALERS.BACKEND_DEFAULT)
-        offered.extend(m.value for m in KNOWN_FACEFIXERS if m != KNOWN_FACEFIXERS.BACKEND_DEFAULT)
+        # Newly-added (beta) upscalers are withheld until the server lists them: it rejects the whole
+        # pop if offered an unknown post-processor. The gate is fail-closed until probed, so the worker
+        # ships ahead of go-live and begins offering them within the probe TTL once the server catches
+        # up. The long-standing upscalers are in every server's enum and are never gated. The beta names
+        # are also offered straight from the worker-known set so the worker does not have to wait on an
+        # SDK release that lists them in KNOWN_UPSCALERS (the pop/submit wire models accept unknown
+        # upscaler names as plain strings; hordelib classifies them via its own SDK).
+        sdk_upscalers = [m.value for m in KNOWN_UPSCALERS if m != KNOWN_UPSCALERS.BACKEND_DEFAULT]
+        extra_beta_upscalers = [u for u in sorted(WORKER_KNOWN_BETA_UPSCALERS) if u not in sdk_upscalers]
+        for upscaler_value in (*sdk_upscalers, *extra_beta_upscalers):
+            if upscaler_value in WORKER_KNOWN_BETA_UPSCALERS and not server_supports_interrogation_form(
+                upscaler_value,
+            ):
+                continue
+            offered.append(upscaler_value)
+        # Face-fixers gate identically to the beta upscalers above: a newly-added face restorer is
+        # withheld until the server lists it, since one unknown post-processor rejects the whole pop.
+        # GFPGAN/CodeFormers are in every server's enum and are never gated. The beta names are also
+        # offered from the worker-known set so offering does not wait on an SDK release that lists them.
+        sdk_facefixers = [m.value for m in KNOWN_FACEFIXERS if m != KNOWN_FACEFIXERS.BACKEND_DEFAULT]
+        extra_beta_facefixers = [f for f in sorted(WORKER_KNOWN_BETA_FACEFIXERS) if f not in sdk_facefixers]
+        for facefixer_value in (*sdk_facefixers, *extra_beta_facefixers):
+            if facefixer_value in WORKER_KNOWN_BETA_FACEFIXERS and not server_supports_interrogation_form(
+                facefixer_value,
+            ):
+                continue
+            offered.append(facefixer_value)
         # strip_background needs rembg (no wheels on some backends); drop just it on a lean install.
         # Upscalers/face-fixers above are pure torch and stay on offer. Unlike image-generation
         # post-processing, alchemy forms are enumerated per-form, so this granular drop is possible.

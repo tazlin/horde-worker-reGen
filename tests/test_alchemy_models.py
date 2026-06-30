@@ -116,6 +116,51 @@ class TestExpandOfferedForms:
         bridge_data = self._bridge_data(forms=["vectorize"])
         assert expand_offered_forms(bridge_data) == []
 
+    def test_beta_upscalers_offered_when_server_supports(self, monkeypatch: object) -> None:
+        """Beta upscalers join the post-process offer once the server advertises them."""
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
+        offered = expand_offered_forms(self._bridge_data(forms=["post-process"]))
+        assert "4xNomos8kSC" in offered
+        assert "2xModernSpanimationV1" in offered
+        # The long-standing upscalers are always offered regardless of the gate.
+        assert "RealESRGAN_x4plus" in offered
+
+    def test_beta_upscalers_withheld_when_server_unsupported(self, monkeypatch: object) -> None:
+        """Beta upscalers are withheld pre-go-live, but the long-standing upscalers stay on offer.
+
+        Offering an upscaler the server's enum rejects would make it reject the whole pop, so the new
+        names are fail-closed until the server advertises them; the established names are never gated.
+        """
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: False)  # type: ignore[attr-defined]
+        offered = expand_offered_forms(self._bridge_data(forms=["post-process"]))
+        assert "4xNomos8kSC" not in offered
+        assert "2xModernSpanimationV1" not in offered
+        assert "RealESRGAN_x4plus" in offered
+        assert "GFPGAN" in offered
+
+    def test_beta_facefixers_offered_when_server_supports(self, monkeypatch: object) -> None:
+        """Beta face restorers join the post-process offer once the server advertises them."""
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
+        offered = expand_offered_forms(self._bridge_data(forms=["post-process"]))
+        assert "RestoreFormer" in offered
+        assert "GFPGANv1.3" in offered
+        # The long-standing face-fixers are always offered regardless of the gate.
+        assert "GFPGAN" in offered
+        assert "CodeFormers" in offered
+
+    def test_beta_facefixers_withheld_when_server_unsupported(self, monkeypatch: object) -> None:
+        """Beta face restorers are withheld pre-go-live; the established face-fixers stay on offer.
+
+        An unknown post-processor makes the server reject the whole pop, so the new names are fail-closed
+        until the server advertises them, while GFPGAN/CodeFormers (in every server's enum) are never gated.
+        """
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: False)  # type: ignore[attr-defined]
+        offered = expand_offered_forms(self._bridge_data(forms=["post-process"]))
+        assert "RestoreFormer" not in offered
+        assert "GFPGANv1.3" not in offered
+        assert "GFPGAN" in offered
+        assert "CodeFormers" in offered
+
     def test_config_accepts_vectorize_but_rejects_typos(self) -> None:
         """The worker's forms validator accepts the worker-known vectorize form yet still rejects typos.
 
@@ -165,18 +210,19 @@ class TestAlchemySubmitShapes:
         )
         assert request.result == {"nsfw": False}
 
-    def test_pop_request_accepts_codeformers(self) -> None:
-        """The pop request subclass can offer CodeFormers despite the SDK enum bug."""
-        # KNOWN_ALCHEMY_TYPES.CodeFormers is aliased to "GFPGAN" in the SDK (upstream bug),
-        # so the pop request must accept plain strings to offer CodeFormers at all.
+    def test_pop_request_accepts_plain_string_forms(self) -> None:
+        """The pop request subclass offers post-processors by name without round-tripping the SDK enum."""
+        # The worker offers beta post-processors (e.g. RestoreFormer) ahead of the SDK release that lists
+        # them, so the pop request must accept plain strings rather than enum members.
         request = _AlchemyPopRequest(
             apikey="0000000000",
             name="test alchemist",
             priority_usernames=[],
-            forms=["CodeFormers", "caption"],
+            forms=["CodeFormers", "RestoreFormer", "caption"],
             amount=1,
         )
         assert "CodeFormers" in request.forms
+        assert "RestoreFormer" in request.forms
 
 
 class TestVectorizeOp:

@@ -153,11 +153,15 @@ def load_env_vars_from_config() -> None:  # FIXME: there is a dynamic way to do 
 
 
 def apply_beta_model_env_defaults(api_key: str | None = None) -> None:
-    """Opt every worker (and the TUI host, which reuses this) into the image-generation beta by default.
+    """Opt every worker (and the TUI host, which reuses this) into the image-generation, esrgan and gfpgan beta.
 
-    Beta models (e.g. qwen) live in the model-reference PRIMARY's pending queue rather than the
-    canonical reference, so surfacing one requires both hordelib's beta opt-in env vars and a PRIMARY
-    URL to read the pending queue from (see ``hordelib.beta_models``). Reading the pending queue only
+    Beta models (e.g. qwen, the modern upscalers, and the modern face restorers) live in the
+    model-reference PRIMARY's pending queue rather than the canonical reference, so surfacing one requires
+    both hordelib's beta opt-in env vars and a PRIMARY URL to read the pending queue from (see
+    ``hordelib.beta_models``). The esrgan and gfpgan categories are opted in alongside image_generation so a
+    worker can serve the new upscalers and face restorers the moment the AI-Horde server advertises their
+    names (the worker withholds offering them until then). The gfpgan category also carries RestoreFormer,
+    which shares the face-restoration on-disk folder. Reading the pending queue only
     needs a reader-level key, which any AI-Horde key satisfies, including the anonymous ``"0000000000"``;
     callers pass the worker's own ``api_key`` when one is configured, otherwise the anonymous key is used.
 
@@ -173,7 +177,7 @@ def apply_beta_model_env_defaults(api_key: str | None = None) -> None:
         api_key: A reader-level AI-Horde key for the pending-queue reads. Falls back to the anonymous key.
     """
     # Mirrors hordelib.beta_models.BETA_CATEGORIES_ENV_VAR / BETA_API_KEY_ENV_VAR.
-    os.environ.setdefault("HORDELIB_BETA_MODEL_CATEGORIES", "image_generation")
+    os.environ.setdefault("HORDELIB_BETA_MODEL_CATEGORIES", "image_generation,esrgan,gfpgan")
     os.environ.setdefault("HORDELIB_BETA_MODELS_API_KEY", api_key or "0000000000")
     os.environ.setdefault("HORDE_MODEL_REFERENCE_PRIMARY_API_URL", "https://models.aihorde.net/api")
 
