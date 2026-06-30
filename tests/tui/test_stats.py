@@ -7,6 +7,7 @@ from rich.console import Console
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PopGovernorsSnapshot,
     PopGovernorStatus,
+    StatsRollupRow,
 )
 from horde_worker_regen.tui.widgets.stats import StatsView
 
@@ -53,3 +54,25 @@ def test_governor_table_shows_per_governor_aggregates() -> None:
     assert "Post-inference backpressure" in text
     assert "idle" in text
     assert "20.0%" in text
+
+
+def test_form_rollups_table_shows_form_count_and_average() -> None:
+    """The by-form table lists each alchemy form with its count and a derived average e2e."""
+    rows = [
+        StatsRollupRow(model="RealESRGAN_x4plus", jobs=4, e2e_seconds=8.0),
+        StatsRollupRow(model="caption", jobs=2, e2e_seconds=10.0),
+    ]
+
+    text = _render(StatsView._render_form_rollups(rows))
+
+    assert "By alchemy form totals" in text
+    assert "RealESRGAN_x4plus" in text
+    assert "caption" in text
+    # 4 forms over 8s totals a 2s average; the column derives it from the rollup.
+    assert "2s" in text
+
+
+def test_form_rollups_table_handles_no_forms() -> None:
+    """With no finalized forms the table shows a clear placeholder rather than an empty grid."""
+    text = _render(StatsView._render_form_rollups([]))
+    assert "no finalized alchemy forms yet" in text

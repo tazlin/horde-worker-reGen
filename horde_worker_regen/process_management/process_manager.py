@@ -86,7 +86,11 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     WorkLedgerEntry,
     WorkLedgerStage,
 )
-from horde_worker_regen.process_management.jobs.alchemy_popper import DEFAULT_ALCHEMY_FORMS, AlchemyCoordinator
+from horde_worker_regen.process_management.jobs.alchemy_popper import (
+    DEFAULT_ALCHEMY_FORMS,
+    AlchemyCoordinator,
+    AlchemyFormStatus,
+)
 from horde_worker_regen.process_management.jobs.image_coordinator import ImageGenerationCoordinator
 from horde_worker_regen.process_management.jobs.job_popper import JobPopper
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
@@ -1073,6 +1077,7 @@ class HordeWorkerProcessManager:
             api_sessions=self._api_sessions,
             reserve_ledger=self._reserve_ledger,
             canned_alchemy_source=canned_alchemy_source,
+            run_metrics=self._run_metrics,
         )
         self._message_dispatcher.set_alchemy_result_handler(self._alchemy_coordinator.on_alchemy_result)
 
@@ -1706,6 +1711,9 @@ class HordeWorkerProcessManager:
             await self.receive_and_handle_process_messages()
             self._download_coordinator.maybe_start_safety_processes()
             self._download_coordinator.maybe_start_inference_processes()
+            # A child may have just reported a CPU-only torch build (image generation disabled); collapse the
+            # fleet to one inference process per card so a sentinel-less CPU install matches the startup sizing.
+            self._enforce_alchemist_only_scale_down()
             self._apply_self_maintenance_throttle()
             self._apply_post_processing_fault_breaker()
             if self._state.server_maintenance_cleared_by_job_pop and self._worker_details_maintenance:
@@ -2606,10 +2614,37 @@ class HordeWorkerProcessManager:
             intent="recent fault" if job.faulted else "recent completion",
         )
 
+    _ALCHEMY_STAGE_TO_LEDGER: dict[str, WorkLedgerStage] = {
+        "pending": WorkLedgerStage.QUEUED,
+        "in_flight": WorkLedgerStage.INFERENCE,
+        "awaiting_submit": WorkLedgerStage.SUBMIT,
+    }
+    """Maps an alchemy form's pipeline stage onto the work-ledger's job stages so a form reads in the same
+    queued -> processing -> submit vocabulary as an image job."""
+
+    def _alchemy_status_to_ledger_entry(self, status: AlchemyFormStatus) -> WorkLedgerEntry:
+        """Project one active alchemy form into a work-ledger row (form as model, resolution as size)."""
+        return WorkLedgerEntry(
+            job_id=status.form_id,
+            stage=self._ALCHEMY_STAGE_TO_LEDGER.get(status.stage, WorkLedgerStage.INFERENCE),
+            model=f"⚗ {status.form}",
+            baseline=None,
+            process_id=status.process_id,
+            width=status.width,
+            height=status.height,
+        )
+
     def _build_work_ledger(self, recent_jobs: list[RecentJobRecord]) -> list[WorkLedgerEntry]:
-        """Build active rows first, then recent completed/faulted rows for the Overview work ledger."""
+        """Build active rows first, then recent completed/faulted rows for the Overview work ledger.
+
+        Active image jobs come first, then an alchemist worker's active forms (each shown with the form as
+        its model and the source-image resolution as its size), then recent finished work, all capped.
+        """
         now = time.time()
         rows = [self._tracked_job_to_ledger_entry(tracked, now=now) for tracked in self._job_tracker.tracked_jobs()]
+        rows.extend(
+            self._alchemy_status_to_ledger_entry(status) for status in self._alchemy_coordinator.active_form_statuses()
+        )
         active_ids = {row.job_id for row in rows}
         for job in reversed(recent_jobs):
             if len(rows) >= WORK_LEDGER_ENTRIES_IN_SNAPSHOT:
@@ -2864,7 +2899,12 @@ class HordeWorkerProcessManager:
         return OrchestrationIntentSnapshot(summary="Ready for work.", next_action="Pop the next matching job.")
 
     def _build_pending_jobs_list(self) -> list[JobQueueEntry]:
-        """Build a capped list of pending-inference jobs for the overview queue display."""
+        """Build a capped list of pending work for the overview queue display.
+
+        Image jobs awaiting inference come first; an alchemist worker's popped-but-not-yet-dispatched forms
+        follow, each shown with the form as its model and the source-image resolution as its size, so the
+        queue reads the same way for both workloads.
+        """
         entries: list[JobQueueEntry] = []
         for api_job in self._job_tracker.jobs_pending_inference[:PENDING_JOBS_IN_SNAPSHOT]:
             payload = api_job.payload
@@ -2881,6 +2921,22 @@ class HordeWorkerProcessManager:
                     height=payload.height,
                     features=features,
                 )
+            )
+        for status in self._alchemy_coordinator.active_form_statuses():
+            if len(entries) >= PENDING_JOBS_IN_SNAPSHOT:
+                break
+            if status.stage != "pending":
+                continue
+            entries.append(
+                JobQueueEntry(
+                    job_id=status.form_id,
+                    model=f"⚗ {status.form}",
+                    baseline=None,
+                    steps=None,
+                    width=status.width,
+                    height=status.height,
+                    features=None,
+                ),
             )
         return entries
 
@@ -3241,6 +3297,44 @@ class HordeWorkerProcessManager:
             )
         return cards
 
+    def _enforce_alchemist_only_scale_down(self) -> None:
+        """Collapse the inference fleet to one process per card once a runtime CPU-only build is detected.
+
+        A worker whose install sentinel was never set (a manual CPU torch install) comes up sized for image
+        generation. When an inference child reports a CPU-only torch build at runtime
+        (``torch_build_cpu_only``), image generation is disabled and a single inference process per card is
+        enough for the graph alchemy forms, so the extra contexts are reaped. This brings the runtime path
+        to parity with the startup ``serves_image_generation=False`` sizing the install sentinel would have
+        produced.
+
+        Each card's ``target_process_count`` is lowered to one (authoritative for recovery placement, the
+        VRAM/RAM budget, and any target-based scale-up), then idle contexts are reaped toward one. Run every
+        control tick while the flag is set: lowering the target happens once (idempotent thereafter), and the
+        reap retries cheaply until each card is at one, so a context that was briefly mid-alchemy at detection
+        is collapsed on a later tick. Busy processes are never killed.
+        """
+        if not self._state.torch_build_cpu_only:
+            return
+
+        from dataclasses import replace
+
+        target_lowered = False
+        for index, card in list(self._card_runtimes.items()):
+            if card.target_process_count != 1:
+                self._card_runtimes[index] = replace(card, target_process_count=1)
+                target_lowered = True
+        if target_lowered:
+            self.max_inference_processes = sum(card.target_process_count for card in self._card_runtimes.values())
+            self._process_lifecycle.refresh_max_inference_processes()
+            logger.info(
+                "CPU-only torch build detected at runtime; collapsing inference processes to one per card "
+                "(image generation disabled, alchemy continues).",
+            )
+
+        for index in sorted(self._card_runtimes):
+            if self._process_map.num_loaded_inference_processes(device_index=index) > 1:
+                self._process_lifecycle.scale_inference_processes(1, device_index=index)
+
     def _served_workloads(self, bridge_data: reGenBridgeData) -> list[str]:
         """The workloads actually served, as sorted ``WorkloadKind`` values, for the snapshot.
 
@@ -3426,6 +3520,7 @@ class HordeWorkerProcessManager:
             latest_stats_sample=latest_stats_sample,
             stats_model_rollups=self._run_metrics.model_rollups(),
             stats_baseline_rollups=self._run_metrics.baseline_rollups(),
+            stats_form_rollups=self._run_metrics.form_rollups(),
             stats_export=self._run_metrics.stats_export_state(),
             stats_history_backfill=self._run_metrics.stats_history_backfill(),
             downloads=self._model_availability.status,

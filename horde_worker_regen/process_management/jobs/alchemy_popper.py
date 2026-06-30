@@ -23,6 +23,7 @@ import statistics
 import time
 from asyncio import CancelledError
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, override
 
 import aiohttp
@@ -75,6 +76,7 @@ from horde_worker_regen.server_capabilities import (
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
     from horde_worker_regen.process_management.lifecycle.shutdown_manager import ShutdownManager
+    from horde_worker_regen.process_management.resources.run_metrics import WorkerRunMetrics
 
 
 class _AlchemyPopRequest(AlchemyPopRequest):
@@ -115,6 +117,26 @@ class _AlchemySubmitRequest(AlchemyJobSubmitRequest):
     """
 
     result: dict[str, object]  # type: ignore[assignment]
+
+
+@dataclass(frozen=True)
+class AlchemyFormStatus:
+    """One active alchemy form projected for the dashboard's work-ledger and queue tables.
+
+    Alchemy forms are the alchemist worker's unit of work, the analogue of an image job. This carries the
+    fields those tables render: the form name (shown where an image job shows its model), the source image
+    resolution (shown where an image job shows its W×H size), the lifecycle stage, and the process the form
+    was dispatched to (when in flight).
+    """
+
+    form_id: str
+    form: str
+    stage: str
+    """One of ``pending`` (popped, not yet dispatched), ``in_flight`` (dispatched, awaiting a result), or
+    ``awaiting_submit`` (result in hand, queued for API submission)."""
+    width: int | None
+    height: int | None
+    process_id: int | None
 
 
 def required_capability(form: str) -> WorkerCapability:
@@ -295,6 +317,7 @@ class AlchemyCoordinator:
         api_sessions: ApiSessions,
         reserve_ledger: CommittedReserveLedger | None = None,
         canned_alchemy_source: CannedAlchemySource | None = None,
+        run_metrics: WorkerRunMetrics | None = None,
     ) -> None:
         """Initialize with the shared main-process collaborators.
 
@@ -310,6 +333,9 @@ class AlchemyCoordinator:
                 ``None`` (unit tests driving the coordinator alone) a private ledger is created.
             canned_alchemy_source: When set, forms come from this source and submits are
                 recorded locally instead of touching the API (harness/benchmark mode).
+            run_metrics: The shared run-metrics aggregator. Each finished form is recorded here (its name,
+                pop->submit timing, and outcome) so alchemy gets the same recent-jobs and rollup
+                observability image generation has. ``None`` (unit tests) disables that recording.
         """
         self._state = state
         self._process_map = process_map
@@ -319,6 +345,7 @@ class AlchemyCoordinator:
         self._runtime_config = runtime_config
         self._api_sessions = api_sessions
         self._canned_alchemy_source = canned_alchemy_source
+        self._run_metrics = run_metrics
         self.num_canned_forms_completed = 0
         self.num_canned_forms_faulted = 0
         self.num_forms_submitted = 0
@@ -331,6 +358,10 @@ class AlchemyCoordinator:
         self._in_flight_owner = {}
         self._pending_submits = deque()
         self._form_time_popped = {}
+        self._form_resolution: dict[str, tuple[int, int] | None] = {}
+        """Source-image (width, height) per form_id, decoded once at pop, for the dashboard size column.
+
+        None for a form whose image could not be decoded. Pruned to the live forms each projection."""
 
         self._estimator = AlchemyHeadroomEstimator()
         self._free_vram_baseline_mb = None
@@ -365,6 +396,62 @@ class AlchemyCoordinator:
     def num_forms_awaiting_submit(self) -> int:
         """Forms with a result, waiting for API submission."""
         return len(self._pending_submits)
+
+    @staticmethod
+    def _decode_image_resolution(source_image_base64: str) -> tuple[int, int] | None:
+        """Return the (width, height) of a base64 source image, or None if it cannot be read.
+
+        Only the image header is parsed (Pillow defers pixel decode), so this is cheap. Any failure
+        (malformed data, unknown format) yields None so a form still shows in the tables without a size.
+        """
+        try:
+            import io
+
+            import PIL.Image
+
+            with PIL.Image.open(io.BytesIO(base64.b64decode(source_image_base64))) as image:
+                return (image.width, image.height)
+        except Exception:
+            return None
+
+    def active_form_statuses(self) -> list[AlchemyFormStatus]:
+        """Project the live alchemy forms for the dashboard work-ledger and queue tables.
+
+        Returns one :class:`AlchemyFormStatus` per form currently pending, in flight, or awaiting submit,
+        in pipeline order. Also prunes the resolution cache to the live forms so it cannot grow unbounded
+        across a long session.
+        """
+        statuses: list[AlchemyFormStatus] = []
+
+        for spec in self._pending_forms:
+            width, height = self._form_resolution.get(spec.form_id) or (None, None)
+            statuses.append(AlchemyFormStatus(spec.form_id, spec.form, "pending", width, height, None))
+
+        for form_id, spec in self._in_flight.items():
+            width, height = self._form_resolution.get(form_id) or (None, None)
+            owner = self._in_flight_owner.get(form_id)
+            statuses.append(
+                AlchemyFormStatus(form_id, spec.form, "in_flight", width, height, owner[0] if owner else None),
+            )
+
+        for submit in self._pending_submits:
+            width, height = self._form_resolution.get(submit.form_id) or (None, None)
+            statuses.append(
+                AlchemyFormStatus(
+                    submit.form_id,
+                    str(submit.result_message.form),
+                    "awaiting_submit",
+                    width,
+                    height,
+                    None,
+                ),
+            )
+
+        live_ids = {status.form_id for status in statuses}
+        for stale_id in [form_id for form_id in self._form_resolution if form_id not in live_ids]:
+            self._form_resolution.pop(stale_id, None)
+
+        return statuses
 
     def set_canned_alchemy_source(self, source: CannedAlchemySource | None) -> None:
         """Swap the canned alchemy source at runtime and reset its per-level counters."""
@@ -514,6 +601,7 @@ class AlchemyCoordinator:
             return
 
         self._form_time_popped[spec.form_id] = time.time()
+        self._form_resolution[spec.form_id] = self._decode_image_resolution(spec.source_image_base64)
         self._pending_forms.append(spec)
         logger.opt(ansi=True).info(
             f"<fg #34c0eb>Popped canned alchemy form {spec.form_id} ({spec.form})</>",
@@ -612,6 +700,7 @@ class AlchemyCoordinator:
                 r2_upload=form.r2_upload,
             )
             self._form_time_popped[spec.form_id] = time.time()
+            self._form_resolution[spec.form_id] = self._decode_image_resolution(source_image_base64)
             self._pending_forms.append(spec)
             logger.opt(ansi=True).info(
                 f"<fg #34c0eb>Popped alchemy form {spec.form_id} ({spec.form})</>",
@@ -771,6 +860,26 @@ class AlchemyCoordinator:
                 return False
         return True
 
+    def _record_form_metrics(self, submit: PendingAlchemySubmitJob, *, faulted: bool) -> None:
+        """Record a finished form's timing and outcome into run metrics (the alchemist analogue of finalize).
+
+        Called once per form at its terminal outcome (submitted or faulted). The pop->submit ``e2e`` and the
+        source-image resolution mirror what an image job records, so the form shows up in the recent-jobs
+        view and the by-form rollup with a real duration. A no-op when no run-metrics aggregator is wired
+        (unit tests).
+        """
+        if self._run_metrics is None:
+            return
+        width, height = self._form_resolution.get(submit.form_id) or (None, None)
+        self._run_metrics.record_alchemy_form(
+            form_id=submit.form_id,
+            form=str(submit.result_message.form),
+            e2e_seconds=max(0.0, time.time() - submit.time_popped),
+            faulted=faulted,
+            width=width,
+            height=height,
+        )
+
     async def _submit_single_form(self, submit: PendingAlchemySubmitJob) -> None:
         """Upload (if needed) and submit one form result; updates the submit state in place."""
         state = submit.result_message.state
@@ -812,6 +921,7 @@ class AlchemyCoordinator:
                 logger.warning(f"Alchemy form {submit.form_id} stale on submit: {response.message}")
                 submit.fault()
                 self.num_forms_faulted += 1
+                self._record_form_metrics(submit, faulted=True)
                 return
             logger.error(f"Failed to submit alchemy form (API Error) {submit.retry_attempts_string}: {response}")
             submit.retry()
@@ -826,6 +936,9 @@ class AlchemyCoordinator:
         self._state.kudos_events.append((time.time(), response.reward))
         submit.succeed(int(response.reward))
         self.num_forms_submitted += 1
+        # A successfully-delivered submit can still carry a faulted generation (e.g. a source-image
+        # download failure submitted as faulted), so the recorded outcome follows the form's own state.
+        self._record_form_metrics(submit, faulted=submit.result_message.state == GENERATION_STATE.faulted)
 
     def _canned_submit_alchemy(self) -> None:
         """Record a completed form locally instead of submitting to the API."""
@@ -839,11 +952,13 @@ class AlchemyCoordinator:
                 f"Completed canned alchemy form {submit.form_id[:8]} (<u>{submit.result_message.form}</u>) "
                 f"in {time_taken} seconds.",
             )
+            self._record_form_metrics(submit, faulted=False)
         else:
             self.num_canned_forms_faulted += 1
             self.num_forms_faulted += 1
             submit.fault()
             logger.error(f"Canned alchemy form {submit.form_id} faulted")
+            self._record_form_metrics(submit, faulted=True)
 
     @logger.catch(reraise=True)
     async def api_submit_alchemy(self) -> None:

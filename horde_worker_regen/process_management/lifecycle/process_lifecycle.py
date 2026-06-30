@@ -783,6 +783,15 @@ class ProcessLifecycleManager:
             pid += 1
         return pid
 
+    def refresh_max_inference_processes(self) -> None:
+        """Recompute the cached worker-wide inference-process ceiling from the current per-card targets.
+
+        The ceiling is summed once at construction; call this after the shared ``card_runtimes`` targets are
+        changed at runtime (an alchemist-only collapse lowers every card to one) so the worker-wide scale
+        bound and any reader of it agree with the new plan.
+        """
+        self._max_inference_processes = sum(card.target_process_count for card in self._card_runtimes.values())
+
     def scale_inference_processes(
         self,
         target_count: int,

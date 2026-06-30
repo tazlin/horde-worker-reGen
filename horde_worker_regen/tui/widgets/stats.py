@@ -62,6 +62,7 @@ class StatsView(Vertical):
             yield Static(id="stats-export")
             yield Static(id="stats-by-model")
             yield Static(id="stats-by-baseline")
+            yield Static(id="stats-by-form")
 
     def on_mount(self) -> None:
         """Hide the maintenance clock banner until maintenance is active."""
@@ -111,6 +112,12 @@ class StatsView(Vertical):
         self.query_one("#stats-by-baseline", Static).update(
             self._render_rollups("By baseline totals", snapshot.stats_baseline_rollups),
         )
+        # The by-form table is alchemy-specific; show it only for an alchemist worker (or once forms exist)
+        # so a dreamer worker's Stats tab is unchanged.
+        form_static = self.query_one("#stats-by-form", Static)
+        form_static.display = snapshot.config.alchemist or bool(snapshot.stats_form_rollups)
+        if form_static.display:
+            form_static.update(self._render_form_rollups(snapshot.stats_form_rollups))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Translate the export button into a typed request handled by the app."""
@@ -229,3 +236,29 @@ class StatsView(Vertical):
                 )
                 table.add_row(*cells)
         return Panel(table, title=title, title_align="left", border_style="grey37", padding=(0, 1))
+
+    @staticmethod
+    def _render_form_rollups(rows: list[StatsRollupRow]) -> Panel:
+        """Render finalized alchemy forms by form: count, average and total pop->submit time.
+
+        The alchemist analogue of the by-model table. The diffusion-specific columns (megapixelsteps,
+        sampling, batch) do not apply to alchemy forms and are omitted; the per-form average is the headline
+        an operator wants for sense of how long each form takes.
+        """
+        table = Table(expand=True, border_style="grey37", header_style="bold")
+        table.add_column("Form", no_wrap=True)
+        table.add_column("Forms", justify="right")
+        table.add_column("Avg E2E", justify="right")
+        table.add_column("Total E2E", justify="right")
+        if not rows:
+            table.add_row("no finalized alchemy forms yet", "", "", "")
+        else:
+            for row in rows:
+                average = row.e2e_seconds / row.jobs if row.jobs else 0.0
+                table.add_row(
+                    shorten(row.model, 32),
+                    f"{row.jobs:,}",
+                    human_duration(average),
+                    human_duration(row.e2e_seconds),
+                )
+        return Panel(table, title="By alchemy form totals", title_align="left", border_style="grey37", padding=(0, 1))

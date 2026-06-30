@@ -247,6 +247,7 @@ class WorkerRunMetrics:
         self._last_stats_sample_time = 0.0
         self._model_rollups: dict[tuple[str | None, str | None], StatsRollupRow] = {}
         self._baseline_rollups: dict[str | None, StatsRollupRow] = {}
+        self._form_rollups: dict[str, StatsRollupRow] = {}
         self._stats_exporter: _StatsJsonlExporter | None = None
         self._stats_export_enabled = False
         self._churn_event_times: dict[ChurnKind, list[float]] = {
@@ -268,6 +269,7 @@ class WorkerRunMetrics:
         self._last_stats_sample_time = 0.0
         self._model_rollups.clear()
         self._baseline_rollups.clear()
+        self._form_rollups.clear()
         for times in self._churn_event_times.values():
             times.clear()
 
@@ -295,19 +297,10 @@ class WorkerRunMetrics:
             current = self._ram_high_water_per_process.get(message.process_id, 0)
             self._ram_high_water_per_process[message.process_id] = max(current, metrics.ram_used_high_water_mb)
 
-        if message.is_alchemy:
-            # Alchemy forms never pass through the image job tracker, so their record
-            # is complete as soon as the child reports.
-            self._jobs.append(
-                JobMetricsRecord(
-                    job_id=message.job_id,
-                    is_alchemy=True,
-                    phase_metrics=metrics,
-                ),
-            )
-        else:
-            # Image jobs finalize later; hold the phase metrics for correlation.
-            self._phase_metrics_by_job[message.job_id] = metrics
+        # Both image jobs and alchemy forms finalize later (the alchemy coordinator records the form's
+        # full record at submit, with its name and pop->submit timing), so hold the child's phase metrics
+        # keyed by job/form id for correlation when that record is built.
+        self._phase_metrics_by_job[message.job_id] = metrics
 
     def on_download_metrics(self, message: HordeDownloadMetricsMessage) -> None:
         """Handle a download-events message from a child process."""
@@ -388,6 +381,45 @@ class WorkerRunMetrics:
         self._fold_rollup(record, baseline=baseline)
         self._write_job_event(record, baseline=baseline)
 
+    def record_alchemy_form(
+        self,
+        *,
+        form_id: str,
+        form: str,
+        e2e_seconds: float | None,
+        faulted: bool,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        """Record one finished alchemy form, the alchemist analogue of :meth:`on_job_finalized`.
+
+        Alchemy forms do not pass through the image job tracker, so the alchemy coordinator calls this at
+        submit/fault time with the pop->submit ``e2e_seconds`` and the form's name and source resolution.
+        Any phase metrics the child reported for this form (VRAM/RAM, correlated by id) are folded in. The
+        record feeds the recent-jobs view, the by-form rollup, and the JSONL export, giving alchemy the
+        same per-job observability image generation has.
+        """
+        phase_metrics = self._phase_metrics_by_job.pop(form_id, None)
+        sampling_seconds = (
+            phase_metrics.sampling.duration_seconds if phase_metrics is not None and phase_metrics.sampling else None
+        )
+        if e2e_seconds is not None:
+            job_e2e_histogram.record(e2e_seconds)
+        record = JobMetricsRecord(
+            job_id=form_id,
+            is_alchemy=True,
+            faulted=faulted,
+            e2e_seconds=e2e_seconds,
+            phase_metrics=phase_metrics,
+            model_name=form,
+            width=width,
+            height=height,
+            sampling_seconds=sampling_seconds,
+        )
+        self._jobs.append(record)
+        self._fold_form_rollup(record)
+        self._write_job_event(record, baseline=None)
+
     def record_process_crash(
         self,
         *,
@@ -445,6 +477,10 @@ class WorkerRunMetrics:
         """Return finalized image-job rollups by baseline."""
         return sorted(self._baseline_rollups.values(), key=lambda row: row.jobs, reverse=True)
 
+    def form_rollups(self) -> list[StatsRollupRow]:
+        """Return finalized alchemy-form rollups by form (``model`` carries the form name)."""
+        return sorted(self._form_rollups.values(), key=lambda row: row.jobs, reverse=True)
+
     def stats_export_state(self) -> StatsExportState:
         """Return current JSONL export state for the supervisor snapshot."""
         if self._stats_exporter is None:
@@ -471,6 +507,17 @@ class WorkerRunMetrics:
 
         baseline_row = self._baseline_rollups.setdefault(baseline, StatsRollupRow(baseline=baseline))
         self._add_to_rollup(baseline_row, record)
+
+    def _fold_form_rollup(self, record: JobMetricsRecord) -> None:
+        """Fold a finished alchemy form into the by-form rollup (keyed by form name).
+
+        Reuses :class:`StatsRollupRow`: ``model`` holds the form, ``jobs`` counts forms, and
+        ``e2e_seconds`` accumulates so the dashboard can show a per-form average. The sampling/megapixelstep
+        columns stay zero for alchemy (forms have no diffusion steps), which the by-form table omits.
+        """
+        form = record.model_name or "unknown"
+        row = self._form_rollups.setdefault(form, StatsRollupRow(model=form))
+        self._add_to_rollup(row, record)
 
     @staticmethod
     def _add_to_rollup(row: StatsRollupRow, record: JobMetricsRecord) -> None:

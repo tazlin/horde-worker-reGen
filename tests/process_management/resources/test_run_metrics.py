@@ -120,15 +120,50 @@ class TestJobCorrelation:
         _finalize_job(metrics, faulted=True)
         assert metrics.snapshot().jobs[0].faulted
 
-    def test_alchemy_metrics_recorded_immediately(self) -> None:
-        """Alchemy forms never finalize through the tracker, so they record on arrival."""
+    def test_alchemy_phase_metrics_held_until_form_recorded(self) -> None:
+        """A child's alchemy phase metrics are held (not recorded alone); the coordinator records the form."""
         metrics = WorkerRunMetrics()
         metrics.on_job_metrics(_job_metrics_message("form-1", is_alchemy=True))
 
-        snapshot = metrics.snapshot()
-        assert len(snapshot.jobs) == 1
-        assert snapshot.jobs[0].is_alchemy
-        assert snapshot.jobs[0].phase_metrics is not None
+        # No job record yet: the form's full record (name + pop->submit timing) is recorded at submit.
+        assert metrics.snapshot().jobs == []
+
+    def test_record_alchemy_form_builds_record_and_rollup(self) -> None:
+        """Recording a finished form yields a record (absorbing held phase metrics) and a by-form rollup."""
+        metrics = WorkerRunMetrics()
+        metrics.on_job_metrics(_job_metrics_message("form-1", is_alchemy=True))  # held phase metrics
+        metrics.record_alchemy_form(
+            form_id="form-1",
+            form="RealESRGAN_x4plus",
+            e2e_seconds=3.5,
+            faulted=False,
+            width=1024,
+            height=768,
+        )
+
+        record = metrics.snapshot().jobs[0]
+        assert record.is_alchemy
+        assert record.model_name == "RealESRGAN_x4plus"
+        assert record.e2e_seconds == 3.5
+        assert record.faulted is False
+        assert (record.width, record.height) == (1024, 768)
+        assert record.phase_metrics is not None  # absorbed the held child metrics
+
+        rollups = metrics.form_rollups()
+        assert len(rollups) == 1
+        assert rollups[0].model == "RealESRGAN_x4plus"
+        assert rollups[0].jobs == 1
+        assert rollups[0].e2e_seconds == 3.5
+
+    def test_form_rollups_accumulate_per_form(self) -> None:
+        """Multiple forms of the same name fold into one rollup row, so an average can be derived."""
+        metrics = WorkerRunMetrics()
+        metrics.record_alchemy_form(form_id="a", form="caption", e2e_seconds=2.0, faulted=False)
+        metrics.record_alchemy_form(form_id="b", form="caption", e2e_seconds=4.0, faulted=True)
+
+        rollups = {row.model: row for row in metrics.form_rollups()}
+        assert rollups["caption"].jobs == 2
+        assert rollups["caption"].e2e_seconds == 6.0
 
 
 class TestAggregates:
@@ -254,14 +289,15 @@ class TestStatsRollupsAndExport:
         assert row.sampling_seconds == 6.0
         assert row.e2e_seconds == 12.0
 
-    def test_alchemy_jobs_do_not_pollute_image_rollups(self) -> None:
-        """Alchemy child metrics are retained as jobs but excluded from image model/baseline tables."""
+    def test_alchemy_forms_roll_up_by_form_not_into_image_tables(self) -> None:
+        """A recorded alchemy form is retained as a job and rolls up by form, never into image tables."""
         metrics = WorkerRunMetrics()
-        metrics.on_job_metrics(_job_metrics_message("form-1", is_alchemy=True))
+        metrics.record_alchemy_form(form_id="form-1", form="caption", e2e_seconds=1.0, faulted=False)
 
         assert metrics.snapshot().jobs[0].is_alchemy
         assert metrics.model_rollups() == []
         assert metrics.baseline_rollups() == []
+        assert [row.model for row in metrics.form_rollups()] == ["caption"]
 
     def test_jsonl_export_writes_sample_and_job_events(self, tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
         """Export writes typed stats_sample and job_completed events under the session stats directory."""

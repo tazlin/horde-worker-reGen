@@ -922,6 +922,8 @@ class WorkerStateSnapshot(BaseModel):
     """Finalized image-job rollups by model."""
     stats_baseline_rollups: list[StatsRollupRow] = Field(default_factory=list)
     """Finalized image-job rollups by baseline."""
+    stats_form_rollups: list[StatsRollupRow] = Field(default_factory=list)
+    """Finalized alchemy-form rollups by form (``model`` carries the form name); empty for a dreamer worker."""
     stats_export: StatsExportState = Field(default_factory=StatsExportState)
     """Worker-side stats JSONL export state."""
     stats_history_backfill: StatsHistoryBackfill | None = None
