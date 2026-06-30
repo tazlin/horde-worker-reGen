@@ -227,15 +227,25 @@ the other self-protective throttles.
 `alchemist: true` opts the worker into **alchemy** jobs (`/v2/interrogate/pop`) in
 addition to image generation. Alchemy work reuses the existing child processes
 rather than spawning its own: graph forms (upscalers, face-fixers, background
-removal) run on the inference processes; CLIP/caption forms (interrogation, NSFW,
-caption) run on the safety process. The forms the worker offers come from the
-`forms` field; `forms` is left empty by default, which advertises the default set
-(caption, NSFW, interrogation, post-process).
+removal) run on the inference processes; CLIP/caption and other text-output forms
+(interrogation, NSFW, caption, `vectorize`, `palette`, `describe`, `aesthetic`) run
+on the safety process. The forms the worker offers come from the `forms` field;
+`forms` is left empty by default, which advertises the default set (caption, NSFW,
+interrogation, post-process, and the text-output forms `vectorize`/`palette`/
+`describe`/`aesthetic`). A newly-added text-output form is withheld until the
+server advertises it, so a worker can ship ahead of the server go-live without
+risking a rejected pop.
+
+The text-output forms return their result inline (no R2 upload): `palette` extracts
+a dominant-colour list, `describe` bundles a blurhash + perceptual hashes + geometry,
+and `aesthetic` returns a LAION 0-10 quality score (reusing the CLIP embedding the
+safety process already computes).
 
 | Field                       | Default | Effect                                                                                                     |
 | --------------------------- | ------- | ---------------------------------------------------------------------------------------------------------- |
 | `alchemist`                 | `false` | Enables alchemy popping/processing at all.                                                                  |
 | `alchemy_caption_enabled`   | `false` | Opts into caption forms. Off by default because captioning loads BLIP into the safety process (extra RAM/VRAM). |
+| `aesthetic_scoring_enabled` | `true`  | Attach a LAION aesthetic score to **every** image generation as `gen_metadata` (computed for free from the safety pass's CLIP embedding). Independent of offering the `aesthetic` alchemy form. Set `false` to skip it (and the one-time predictor-weight download). |
 | `alchemy_allow_concurrent`  | `true`  | Allow alchemy to run alongside image jobs. When `false`, alchemy is strict **backfill**: it pops only when the image queue is empty. |
 | `alchemy_max_concurrency`   | `1`     | Maximum alchemy forms in flight (dispatched, awaiting result) at once. Raise it on machines with spare compute/VRAM. |
 | `alchemy_vram_headroom_mb`  | `2000`  | Minimum free VRAM (MB) required before popping a graph form in concurrent mode; acts as the floor for the headroom estimator, which raises the bar toward the observed median cost of recent forms. |

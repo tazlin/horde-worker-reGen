@@ -30,7 +30,7 @@ from horde_sdk.generation_parameters.alchemy.consts import (
 from loguru import logger
 
 from horde_worker_regen import ASSETS_FOLDER_PATH
-from horde_worker_regen.consts import is_vectorize_form
+from horde_worker_regen.consts import is_aesthetic_form, is_describe_form, is_palette_form, is_vectorize_form
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
@@ -49,6 +49,8 @@ if TYPE_CHECKING:
     from horde_safety.deep_danbooru_model import DeepDanbooruModel
     from horde_safety.interrogate import Interrogator
     from horde_safety.nsfw_checker_class import NSFWChecker, NSFWResult
+
+    from horde_worker_regen.process_management.workers.aesthetic_predictor import AestheticScorer
 else:
 
     class Interrogator:
@@ -104,6 +106,13 @@ class HordeSafetyProcess(HordeProcess):
 
     _dry_run_skip_safety: bool
 
+    _safety_device: str = "cpu"
+    """The torch device the safety models (and the aesthetic head) run on."""
+    _aesthetic_scorer: "AestheticScorer | None" = None
+    """Lazily-loaded LAION aesthetic head; built on first use and shared by the form and gen-metadata paths."""
+    _aesthetic_unavailable: bool = False
+    """Latched once the aesthetic weight cannot be obtained, so the cheap per-image path stops retrying."""
+
     def __init__(
         self,
         process_id: int,
@@ -149,6 +158,7 @@ class HordeSafetyProcess(HordeProcess):
                 import torch
 
                 device = resolve_safety_device(cpu_only=cpu_only, cuda_available=torch.cuda.is_available())
+                self._safety_device = device
                 if device == "cpu" and not cpu_only:
                     logger.warning(
                         "Safety process was configured for GPU but torch reports no CUDA device available; "
@@ -305,6 +315,84 @@ class HordeSafetyProcess(HordeProcess):
         image.save(png_buffer, format="PNG")
         return vtracer.convert_raw_image_to_svg(png_buffer.getvalue(), img_format="png")
 
+    def _extract_palette(self, image: PIL.Image.Image, color_count: int = 6) -> dict[str, object]:
+        """Extract a dominant-colour palette from an image, ordered most-prominent first.
+
+        Pillow's median-cut quantizer does the clustering, so this needs no model and no optional
+        dependency. The image is thumbnailed first because palette fidelity does not benefit from full
+        resolution and the quantizer cost scales with pixel count. Each entry carries the colour as a
+        ``#rrggbb`` hex string and its ``proportion`` of sampled pixels (the quantizer's per-bucket
+        pixel counts), so a caller can weight by prominence.
+        """
+        sample = image.convert("RGB")
+        sample.thumbnail((256, 256))
+        quantized = sample.quantize(colors=color_count, method=PIL.Image.Quantize.MEDIANCUT)
+
+        flat_palette = quantized.getpalette() or []
+        bucket_counts = quantized.getcolors() or []  # list of (pixel_count, palette_index)
+        total_pixels = sum(count for count, _ in bucket_counts) or 1
+
+        colors: list[dict[str, object]] = []
+        for count, index in sorted(bucket_counts, reverse=True):
+            r, g, b = flat_palette[index * 3 : index * 3 + 3]
+            colors.append({"hex": f"#{r:02x}{g:02x}{b:02x}", "proportion": round(count / total_pixels, 4)})
+
+        return {"colors": colors}
+
+    def _describe_image(self, image: PIL.Image.Image) -> dict[str, object]:
+        """Produce a cheap technical-metadata bundle for an image.
+
+        Bundles a BlurHash placeholder string (for progressive-load UIs), perceptual hashes (for
+        dedup/similarity), and basic geometry/format facts. BlurHash and the perceptual hashes come
+        from the worker-only ``describe`` extra; the geometry facts use Pillow directly. The form is
+        only offered when those extras import (see ``capabilities.describe_available``), so a missing
+        install surfaces as a faulted form rather than a partial result.
+        """
+        import blurhash
+        import imagehash
+
+        rgb_image = image.convert("RGB")
+
+        png_buffer = BytesIO()
+        rgb_image.save(png_buffer, format="PNG")
+        png_buffer.seek(0)
+        blurhash_string = blurhash.encode(png_buffer, x_components=4, y_components=3)
+
+        width, height = image.size
+        return {
+            "blurhash": blurhash_string,
+            "phash": str(imagehash.phash(rgb_image)),
+            "dhash": str(imagehash.dhash(rgb_image)),
+            "width": width,
+            "height": height,
+            "aspect_ratio": round(width / height, 4) if height else None,
+            "has_alpha": image.mode in ("RGBA", "LA") or "transparency" in image.info,
+            "format": image.format,
+        }
+
+    def _score_aesthetic(self, image: PIL.Image.Image) -> float | None:
+        """Return the LAION 0-10 aesthetic score for an image, or ``None`` if the head is unavailable.
+
+        Reuses the interrogator's CLIP ViT-L/14 embedding (``image_to_features``) rather than embedding
+        the image again, then runs the small MLP head. The head is loaded lazily on first use; a failure
+        to obtain its weight is latched so the cheap per-generation path does not retry the download for
+        every image.
+        """
+        if self._aesthetic_unavailable:
+            return None
+        if self._aesthetic_scorer is None:
+            try:
+                from horde_worker_regen.process_management.workers.aesthetic_predictor import load_aesthetic_scorer
+
+                self._aesthetic_scorer = load_aesthetic_scorer(device=self._safety_device)
+            except Exception as e:
+                logger.warning(f"Aesthetic scoring unavailable (could not load predictor): {type(e).__name__} {e}")
+                self._aesthetic_unavailable = True
+                return None
+
+        image_features = self._interrogator.image_to_features(image)  # type: ignore[attr-defined]
+        return self._aesthetic_scorer.score(image_features)
+
     def _send_alchemy_job_metrics(self, form: AlchemyFormSpec) -> None:
         """Snapshot hordelib's metrics collector for this form and forward it (best effort)."""
         try:
@@ -326,7 +414,7 @@ class HordeSafetyProcess(HordeProcess):
             logger.warning(f"Failed to send alchemy job metrics: {type(e).__name__} {e}")
 
     def start_alchemy(self, form: AlchemyFormSpec) -> None:
-        """Run a non-graph alchemy form (caption/interrogation/nsfw/vectorize) and report the result.
+        """Run a non-graph alchemy form (caption/interrogation/nsfw/vectorize/palette/describe) and report it.
 
         These forms produce a text/JSON result rather than an image, so they run on the safety
         process (which already owns the CLIP stack) instead of an inference process, and their
@@ -357,6 +445,15 @@ class HordeSafetyProcess(HordeProcess):
                 result_payload = {"nsfw": nsfw_result.is_nsfw}
             elif is_vectorize_form(form.form):
                 result_payload = {"vectorize": self._vectorize_image(image)}
+            elif is_palette_form(form.form):
+                result_payload = {"palette": self._extract_palette(image)}
+            elif is_describe_form(form.form):
+                result_payload = {"describe": self._describe_image(image)}
+            elif is_aesthetic_form(form.form):
+                aesthetic_score = self._score_aesthetic(image)
+                if aesthetic_score is None:
+                    raise RuntimeError("Aesthetic predictor is unavailable")
+                result_payload = {"aesthetic": aesthetic_score}
             else:
                 raise ValueError(f"Unknown alchemy form for safety process: {form.form}")
 
@@ -484,11 +581,17 @@ class HordeSafetyProcess(HordeProcess):
                 replacement_image_base64 = self.censor_sfw_request_image_base64
                 logger.info(f"Censor list detected NSFW in image {message.job_id}.")
 
+            # The aesthetic score rides on the same CLIP embedding the NSFW check just used, so it is
+            # cheap to attach here. It is scored on the original image (not any censored replacement)
+            # so the metadata describes what was actually generated.
+            aesthetic_score = self._score_aesthetic(image_as_pil) if message.include_aesthetic_score else None
+
             safety_evaluations.append(
                 HordeSafetyEvaluation(
                     is_nsfw=nsfw_result.is_nsfw,
                     is_csam=nsfw_result.is_csam,
                     replacement_image_base64=replacement_image_base64,
+                    aesthetic_score=aesthetic_score,
                 ),
             )
 

@@ -11,6 +11,7 @@ from horde_sdk.ai_horde_api.apimodels import GenMetadataEntry
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from loguru import logger
 
+from horde_worker_regen.consts import AESTHETIC_METADATA_TYPE
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
@@ -816,6 +817,19 @@ class MessageDispatcher:
                 )
                 any_safety_failed = True
                 continue
+
+            # The aesthetic score (when the safety pass produced one) rides along as gen_metadata so a
+            # client can rank/curate generations. The float lives in `ref`; `value` is the categorical
+            # see_ref sentinel, matching how batch_index/information entries carry a non-enum payload.
+            aesthetic_score = message.safety_evaluations[i].aesthetic_score
+            if aesthetic_score is not None:
+                completed_job_info.job_image_results[i].generation_faults.append(
+                    GenMetadataEntry(
+                        type=AESTHETIC_METADATA_TYPE,
+                        value=METADATA_VALUE.see_ref,
+                        ref=str(aesthetic_score),
+                    ),
+                )
 
             if replacement_image is not None:
                 completed_job_info.job_image_results[i].image_base64 = replacement_image

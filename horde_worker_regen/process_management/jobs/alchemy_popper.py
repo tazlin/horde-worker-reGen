@@ -45,8 +45,11 @@ from horde_sdk.generation_parameters.alchemy.consts import (
 )
 from loguru import logger
 
-from horde_worker_regen.capabilities import strip_background_available, vectorize_available
+from horde_worker_regen.capabilities import describe_available, strip_background_available, vectorize_available
 from horde_worker_regen.consts import (
+    AESTHETIC_FORM_NAME,
+    DESCRIBE_FORM_NAME,
+    PALETTE_FORM_NAME,
     VECTORIZE_FORM_NAME,
     WORKER_KNOWN_BETA_FACEFIXERS,
     WORKER_KNOWN_BETA_UPSCALERS,
@@ -148,7 +151,16 @@ def required_capability(form: str) -> WorkerCapability:
     return capability_for_alchemy_form(form)
 
 
-DEFAULT_ALCHEMY_FORMS: tuple[str, ...] = ("caption", "nsfw", "interrogation", "post-process", VECTORIZE_FORM_NAME)
+DEFAULT_ALCHEMY_FORMS: tuple[str, ...] = (
+    "caption",
+    "nsfw",
+    "interrogation",
+    "post-process",
+    VECTORIZE_FORM_NAME,
+    PALETTE_FORM_NAME,
+    DESCRIBE_FORM_NAME,
+    AESTHETIC_FORM_NAME,
+)
 """Forms an alchemist offers when ``bridge_data.forms`` is left unset (an empty list means "all").
 
 The SDK's ``default_forms`` validator does not fire for the default empty list, so both the dispatch
@@ -183,6 +195,23 @@ def expand_offered_forms(bridge_data: reGenBridgeData) -> list[str]:
         and server_supports_interrogation_form(VECTORIZE_FORM_NAME)
     ):
         offered.append(VECTORIZE_FORM_NAME)
+    # palette is pure-Pillow (no optional dep), so it gates only on the server advertising the form;
+    # the gate is fail-closed until probed, so the worker ships ahead of the server's go-live.
+    if PALETTE_FORM_NAME in configured and server_supports_interrogation_form(PALETTE_FORM_NAME):
+        offered.append(PALETTE_FORM_NAME)
+    # describe needs the worker-only `describe` extra (blurhash/imagehash) AND a server that lists the
+    # form, mirroring vectorize: a lean install faults on it, an unaware server rejects the whole pop.
+    if (
+        DESCRIBE_FORM_NAME in configured
+        and describe_available()
+        and server_supports_interrogation_form(DESCRIBE_FORM_NAME)
+    ):
+        offered.append(DESCRIBE_FORM_NAME)
+    # aesthetic is a CLIP-stack form (safety process), always runnable when a safety process is up, so
+    # like palette it gates only on the server advertising the form (fail-closed until probed). Its
+    # one-time predictor-weight download happens lazily in the safety process on first use.
+    if AESTHETIC_FORM_NAME in configured and server_supports_interrogation_form(AESTHETIC_FORM_NAME):
+        offered.append(AESTHETIC_FORM_NAME)
     if "post-process" in configured:
         # Newly-added (beta) upscalers are withheld until the server lists them: it rejects the whole
         # pop if offered an unknown post-processor. The gate is fail-closed until probed, so the worker

@@ -119,6 +119,7 @@ class SafetyOrchestrator:
                     censor_nsfw=completed_job_info.sdk_api_job_info.payload.use_nsfw_censor,
                     sfw_worker=not bridge_data.nsfw,
                     horde_model_info=model_info,
+                    include_aesthetic_score=bridge_data.aesthetic_scoring_enabled,
                 ),
             )
 

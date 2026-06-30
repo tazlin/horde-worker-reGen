@@ -56,7 +56,7 @@ class TestRequiredCapability:
 
     def test_clip_forms_route_to_safety_process(self) -> None:
         """Text-output forms require ALCHEMY_CLIP (the safety process)."""
-        for form in ("caption", "interrogation", "nsfw", "vectorize"):
+        for form in ("caption", "interrogation", "nsfw", "vectorize", "palette", "describe"):
             assert required_capability(form) == WorkerCapability.ALCHEMY_CLIP, form
 
 
@@ -116,6 +116,51 @@ class TestExpandOfferedForms:
         bridge_data = self._bridge_data(forms=["vectorize"])
         assert expand_offered_forms(bridge_data) == []
 
+    def test_palette_offered_when_server_supports(self, monkeypatch: object) -> None:
+        """Palette (pure-Pillow, no optional dep) is offered once the server advertises the form."""
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["palette"])
+        assert expand_offered_forms(bridge_data) == ["palette"]
+
+    def test_palette_withheld_when_server_unsupported(self, monkeypatch: object) -> None:
+        """Palette is fail-closed until the server advertises it, so the worker can ship ahead of go-live."""
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: False)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["palette"])
+        assert expand_offered_forms(bridge_data) == []
+
+    def test_describe_offered_when_available_and_server_supports(self, monkeypatch: object) -> None:
+        """Describe is offered when its deps import and the server advertises the form."""
+        monkeypatch.setattr(alchemy_popper, "describe_available", lambda: True)  # type: ignore[attr-defined]
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["describe"])
+        assert expand_offered_forms(bridge_data) == ["describe"]
+
+    def test_describe_dropped_when_unavailable(self, monkeypatch: object) -> None:
+        """Describe is dropped on a lean install lacking its deps, so we never advertise a faulting form."""
+        monkeypatch.setattr(alchemy_popper, "describe_available", lambda: False)  # type: ignore[attr-defined]
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["describe"])
+        assert expand_offered_forms(bridge_data) == []
+
+    def test_describe_withheld_when_server_unsupported(self, monkeypatch: object) -> None:
+        """Describe is withheld until the server advertises it (fail-closed gate)."""
+        monkeypatch.setattr(alchemy_popper, "describe_available", lambda: True)  # type: ignore[attr-defined]
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: False)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["describe"])
+        assert expand_offered_forms(bridge_data) == []
+
+    def test_aesthetic_offered_when_server_supports(self, monkeypatch: object) -> None:
+        """Aesthetic (a CLIP-stack form, always runnable when the safety process is up) gates on the server."""
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["aesthetic"])
+        assert expand_offered_forms(bridge_data) == ["aesthetic"]
+
+    def test_aesthetic_withheld_when_server_unsupported(self, monkeypatch: object) -> None:
+        """Aesthetic is fail-closed until the server advertises it, so the worker can ship ahead of go-live."""
+        monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: False)  # type: ignore[attr-defined]
+        bridge_data = self._bridge_data(forms=["aesthetic"])
+        assert expand_offered_forms(bridge_data) == []
+
     def test_beta_upscalers_offered_when_server_supports(self, monkeypatch: object) -> None:
         """Beta upscalers join the post-process offer once the server advertises them."""
         monkeypatch.setattr(alchemy_popper, "server_supports_interrogation_form", lambda form: True)  # type: ignore[attr-defined]
@@ -170,6 +215,20 @@ class TestExpandOfferedForms:
         assert self._bridge_data(forms=["vectorize"]).forms == ["vectorize"]
         with pytest.raises(ValidationError):
             self._bridge_data(forms=["vectorrize"])
+
+    def test_config_accepts_palette_and_describe(self) -> None:
+        """The worker's forms validator accepts the worker-known palette/describe forms.
+
+        These are worker-known extras (see ``WORKER_KNOWN_EXTRA_ALCHEMY_FORMS``) so a config can list
+        them against a published SDK that predates the form, without weakening typo protection.
+        """
+        assert self._bridge_data(forms=["palette", "describe"]).forms == ["palette", "describe"]
+        with pytest.raises(ValidationError):
+            self._bridge_data(forms=["palettte"])
+
+    def test_config_accepts_aesthetic(self) -> None:
+        """The worker's forms validator accepts the worker-known aesthetic form."""
+        assert self._bridge_data(forms=["aesthetic"]).forms == ["aesthetic"]
 
 
 class TestAlchemySubmitShapes:
@@ -245,6 +304,94 @@ class TestVectorizeOp:
         assert isinstance(svg, str)
         assert "<svg" in svg
         assert len(svg) > 0
+
+
+def _checkerboard(size: int = 32) -> PIL.Image.Image:
+    image = PIL.Image.new("RGB", (size, size))
+    block = size // 4
+    for x in range(size):
+        for y in range(size):
+            image.putpixel((x, y), (255, 0, 0) if (x // block + y // block) % 2 == 0 else (0, 0, 255))
+    return image
+
+
+class TestPaletteOp:
+    """The palette op extracts an ordered dominant-colour list with no model or optional dep."""
+
+    def test_extract_palette_returns_ordered_hex_colors(self) -> None:
+        """_extract_palette returns hex colours with proportions, most-prominent first."""
+        from horde_worker_regen.process_management.workers.safety_process import HordeSafetyProcess
+
+        process = HordeSafetyProcess.__new__(HordeSafetyProcess)
+        result = process._extract_palette(_checkerboard(), color_count=4)
+
+        colors = result["colors"]
+        assert isinstance(colors, list)
+        assert len(colors) >= 1
+        for entry in colors:
+            assert entry["hex"].startswith("#") and len(entry["hex"]) == 7
+            assert 0.0 <= entry["proportion"] <= 1.0
+        # Proportions are sorted descending (most-prominent first).
+        proportions = [entry["proportion"] for entry in colors]
+        assert proportions == sorted(proportions, reverse=True)
+
+
+class TestDescribeOp:
+    """The describe op bundles blurhash, perceptual hashes, and geometry facts."""
+
+    def test_describe_image_returns_metadata_bundle(self) -> None:
+        """_describe_image returns a blurhash, perceptual hashes, and dimensions."""
+        from horde_worker_regen.process_management.workers.safety_process import HordeSafetyProcess
+
+        process = HordeSafetyProcess.__new__(HordeSafetyProcess)
+        result = process._describe_image(_checkerboard(size=64))
+
+        assert isinstance(result["blurhash"], str) and result["blurhash"]
+        assert isinstance(result["phash"], str) and len(result["phash"]) == 16
+        assert isinstance(result["dhash"], str)
+        assert result["width"] == 64
+        assert result["height"] == 64
+        assert result["aspect_ratio"] == 1.0
+        assert result["has_alpha"] is False
+
+
+class TestAestheticPredictor:
+    """The aesthetic head scores a CLIP ViT-L/14 embedding into a float (no network in this test)."""
+
+    def test_scorer_loads_state_dict_and_scores(self, tmp_path: object) -> None:
+        """AestheticScorer loads a predictor state_dict from disk and scores an embedding to a float."""
+        import torch
+
+        from horde_worker_regen.process_management.workers.aesthetic_predictor import (
+            AESTHETIC_EMBEDDING_DIM,
+            AestheticPredictor,
+            AestheticScorer,
+        )
+
+        # Build the predictor and persist its (randomly-initialised) weights, bypassing the network
+        # download so the scorer's load+score path is exercised hermetically.
+        weight_path = tmp_path / "predictor.pth"  # type: ignore[attr-defined]
+        torch.save(AestheticPredictor().state_dict(), weight_path)
+
+        scorer = AestheticScorer(weight_path, device="cpu")
+        embedding = torch.randn(1, AESTHETIC_EMBEDDING_DIM)
+        score = scorer.score(embedding)
+
+        assert isinstance(score, float)
+        # The scorer rounds to 4 decimals; an untrained head still yields a finite scalar.
+        assert score == round(score, 4)
+
+    def test_predictor_forward_shape(self) -> None:
+        """The predictor maps a batch of embeddings to one score each."""
+        import torch
+
+        from horde_worker_regen.process_management.workers.aesthetic_predictor import (
+            AESTHETIC_EMBEDDING_DIM,
+            AestheticPredictor,
+        )
+
+        out = AestheticPredictor()(torch.randn(3, AESTHETIC_EMBEDDING_DIM))
+        assert out.shape == (3, 1)
 
 
 class _StubProcessInfo:

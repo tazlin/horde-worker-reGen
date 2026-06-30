@@ -598,6 +598,7 @@ class TestHandleSafetyResult:
         safety_eval.replacement_image_base64 = None
         safety_eval.is_csam = False
         safety_eval.is_nsfw = False
+        safety_eval.aesthetic_score = None
 
         await message_dispatcher._handle_safety_result(
             Mock(
@@ -609,6 +610,72 @@ class TestHandleSafetyResult:
 
         assert job_info in job_tracker.jobs_pending_submit
         assert job_info not in job_tracker.jobs_being_safety_checked
+
+    async def test_safety_result_attaches_aesthetic_metadata(self) -> None:
+        """A safety evaluation that carries an aesthetic score attaches it as gen_metadata.
+
+        The score rides on the per-image generation_faults list (the worker's gen_metadata bucket) as a
+        float in the entry's ``ref``, so a client can rank/curate generations.
+        """
+        from horde_worker_regen.consts import AESTHETIC_METADATA_TYPE
+
+        job_tracker = JobTracker()
+
+        job = Mock()
+        job.id_ = "aesthetic-test-id"
+
+        image_result = Mock()
+        image_result.generation_faults = []
+
+        job_info = Mock()
+        job_info.sdk_api_job_info = job
+        job_info.job_image_results = [image_result]
+        await move_job_to_being_safety_checked_async(job_tracker, job_info)
+
+        message_dispatcher = _make_dispatcher(job_tracker=job_tracker)
+
+        safety_eval = Mock()
+        safety_eval.failed = False
+        safety_eval.replacement_image_base64 = None
+        safety_eval.is_csam = False
+        safety_eval.is_nsfw = False
+        safety_eval.aesthetic_score = 6.42
+
+        await message_dispatcher._handle_safety_result(
+            Mock(job_id=job.id_, safety_evaluations=[safety_eval], time_elapsed=1.0),
+        )
+
+        aesthetic_entries = [e for e in image_result.generation_faults if e.type_ == AESTHETIC_METADATA_TYPE]
+        assert len(aesthetic_entries) == 1
+        assert aesthetic_entries[0].ref == "6.42"
+
+    async def test_safety_result_without_aesthetic_score_attaches_nothing(self) -> None:
+        """When the evaluation carries no score (scoring disabled/unavailable), no entry is added."""
+        from horde_worker_regen.consts import AESTHETIC_METADATA_TYPE
+
+        job_tracker = JobTracker()
+        job = Mock()
+        job.id_ = "no-aesthetic-id"
+        image_result = Mock()
+        image_result.generation_faults = []
+        job_info = Mock()
+        job_info.sdk_api_job_info = job
+        job_info.job_image_results = [image_result]
+        await move_job_to_being_safety_checked_async(job_tracker, job_info)
+
+        message_dispatcher = _make_dispatcher(job_tracker=job_tracker)
+        safety_eval = Mock()
+        safety_eval.failed = False
+        safety_eval.replacement_image_base64 = None
+        safety_eval.is_csam = False
+        safety_eval.is_nsfw = False
+        safety_eval.aesthetic_score = None
+
+        await message_dispatcher._handle_safety_result(
+            Mock(job_id=job.id_, safety_evaluations=[safety_eval], time_elapsed=1.0),
+        )
+
+        assert not [e for e in image_result.generation_faults if e.type_ == AESTHETIC_METADATA_TYPE]
 
     async def test_safety_result_not_found_logs_error(self) -> None:
         """Test that if a safety result is received for a job ID that isn't being safety checked, it is handled."""

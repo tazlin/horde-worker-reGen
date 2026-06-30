@@ -112,6 +112,24 @@ def vectorize_available() -> bool:
     return True
 
 
+@functools.lru_cache(maxsize=1)
+def describe_available() -> bool:
+    """Return whether the technical-metadata ``describe`` form can run here.
+
+    Like :func:`vectorize_available`, this is a worker-only alchemy op that does not route through
+    hordelib; its blurhash/perceptual-hash pieces live in the worker's own ``describe`` extra, so a
+    plain import probe is the right check. The plain dimensions/dominant-colour parts use Pillow and
+    are always available, but the form is only offered when the full bundle can be produced.
+    """
+    try:
+        import blurhash  # noqa: F401
+        import imagehash  # noqa: F401
+    except Exception as exc:
+        logger.debug("Could not import describe deps (blurhash/imagehash); assuming unavailable: {}", exc)
+        return False
+    return True
+
+
 def controlnet_install_hint() -> str:
     """Build the actionable "install the controlnet extra" fragment naming the missing packages.
 

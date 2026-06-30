@@ -50,6 +50,8 @@ dependencies = [
     "textual-serve>=1.1.1",
     "logfire>=4.6.0",
     "vtracer>=0.6.0", # For vectorize
+    "blurhash-python>=1.2.1", # For the describe alchemy form (progressive-load placeholder string)
+    "imagehash>=4.3.1", # For the describe alchemy form (perceptual hashes; scipy/numpy already present)
     # Windows-only system-tray icon for the persistent worker host (tui/tray.py), so a detached worker
     # stays visible and stoppable. Import-guarded, so their absence on other platforms is harmless.
     "pystray; sys_platform == 'win32'",

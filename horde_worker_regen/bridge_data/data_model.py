@@ -549,6 +549,15 @@ class reGenBridgeData(CombinedHordeBridgeData):
     additional RAM/VRAM, so it is off by default.
     """
 
+    aesthetic_scoring_enabled: bool = Field(default=True)
+    """Attach a LAION aesthetic score to every image generation as ``gen_metadata``.
+
+    The safety pass already embeds each generated image with CLIP, which is exactly the input the
+    aesthetic head consumes, so the score is near-free to produce. On by default; set false to skip the
+    scoring (and the one-time predictor-weight download). This is independent of offering the
+    ``aesthetic`` alchemy form, which is controlled by ``forms``.
+    """
+
     alchemy_allow_concurrent: bool = Field(default=True)
     """Allow alchemy to run alongside image generation instead of only as backfill.
 
