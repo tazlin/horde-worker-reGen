@@ -64,6 +64,22 @@ else:
         """Dummy class to prevent type errors."""
 
 
+def resolve_safety_device(*, cpu_only: bool, cuda_available: bool) -> str:
+    """Resolve the device horde_safety models load onto, falling back to CPU when CUDA is truly absent.
+
+    The parent decides ``cpu_only`` from config plus the torch-free install sentinel, which can report
+    "GPU" while the actual torch build is CPU-only: a manually installed CPU torch whose ``bin/backend``
+    sentinel was never written is the motivating case. Loading a model on ``"cuda"`` then raises during
+    deserialization ("Attempting to deserialize object on a CUDA device but torch.cuda.is_available() is
+    False"). The safety child is torch-bearing, so it has the final say: when CUDA is not actually
+    available it uses CPU regardless of the flag. It never forces CPU when CUDA is present, so a normal
+    GPU worker is unaffected.
+    """
+    if cpu_only or not cuda_available:
+        return "cpu"
+    return "cuda"
+
+
 class CensorReason(enum.Enum):
     """The reason for censoring an image."""
 
@@ -130,9 +146,18 @@ class HordeSafetyProcess(HordeProcess):
                 raise
 
             try:
-                logger.debug(f"Initialising horde_safety with cpu_only={cpu_only}")
-                self._deep_danbooru_model = get_deep_danbooru_model(device="cpu" if cpu_only else "cuda")
-                self._interrogator = get_interrogator_no_blip(device="cpu" if cpu_only else "cuda")
+                import torch
+
+                device = resolve_safety_device(cpu_only=cpu_only, cuda_available=torch.cuda.is_available())
+                if device == "cpu" and not cpu_only:
+                    logger.warning(
+                        "Safety process was configured for GPU but torch reports no CUDA device available; "
+                        "loading safety models on CPU instead. This is expected with a CPU-only torch build "
+                        "whose install sentinel was not set (e.g. a manually installed CPU torch).",
+                    )
+                logger.debug(f"Initialising horde_safety on device={device} (cpu_only={cpu_only})")
+                self._deep_danbooru_model = get_deep_danbooru_model(device=device)
+                self._interrogator = get_interrogator_no_blip(device=device)
             except Exception as e:
                 logger.error(f"Failed to initialise horde_safety: {type(e).__name__} {e}")
                 raise
