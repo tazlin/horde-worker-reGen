@@ -276,6 +276,20 @@ class DownloadsView(VerticalScroll):
         control = self._control_line(downloads)
         if control is not None:
             lines.append(control)
+
+        # Add a heads up that controlnets annotators can take up to 60 minutes to download and verify,
+        # so the user doesn't think the worker is hung.
+        if downloads.phase == DownloadPhase.DOWNLOADING and any(
+            item.feature == _ANNOTATOR_DOWNLOAD_FEATURE for item in downloads.active
+        ):
+            lines.append(
+                Text(
+                    "ControlNet annotators are downloading and verifying (one-time setup). "
+                    "This can take up to 60 minutes.",
+                    style="yellow",
+                )
+            )
+
         return Panel(Group(*lines), title=title, title_align="left", border_style=colour, padding=(0, 1))
 
     @staticmethod
