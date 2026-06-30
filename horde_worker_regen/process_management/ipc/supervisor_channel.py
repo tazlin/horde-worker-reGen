@@ -834,6 +834,16 @@ class WorkerStateSnapshot(BaseModel):
     gpu_torch_incompatible_reason: str | None = None
     """Operator-facing detail for ``gpu_torch_incompatible`` (device + remedy); None when not tripped."""
 
+    torch_build_cpu_only: bool = False
+    """The installed PyTorch is a CPU-only build, so image generation is disabled (alchemy still runs).
+
+    Reported by a torch-bearing inference child at startup (the parent and TUI never import torch). The
+    runtime counterpart of a ``bin/backend`` 'cpu' sentinel: it makes a CPU torch build serve alchemy-only
+    even when the sentinel was never set (e.g. a manual CPU install). Sticky for the session; fixed by
+    installing a GPU build and restarting."""
+    torch_build_cpu_only_reason: str | None = None
+    """Operator-facing detail for ``torch_build_cpu_only`` (why image gen is off + remedy); None when not tripped."""
+
     # Connectivity / health signals the worker already tracks (surfaced for the status monitor).
     worker_registered: bool = False
     """Whether the AI Horde API has returned this worker's details at least once (it is known)."""

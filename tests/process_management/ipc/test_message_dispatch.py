@@ -235,6 +235,29 @@ class TestReceiveAndHandleProcessMessages:
         assert state.gpu_torch_incompatible is True
         assert "RTX 5070" in state.gpu_torch_incompatible_reason
 
+    async def test_torch_build_cpu_only_latches_worker_state_flag(self) -> None:
+        """A TORCH_BUILD_CPU_ONLY report latches the image-disable flag and stores its reason."""
+        process_info = make_mock_process_info(0)
+        process_info.process_launch_identifier = 0
+        process_info.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        state = WorkerState()
+
+        message_dispatcher = _make_dispatcher(process_map=ProcessMap({0: process_info}), state=state)
+
+        msg = Mock(spec=HordeProcessStateChangeMessage)
+        msg.process_id = 0
+        msg.process_launch_identifier = 0
+        msg.process_state = HordeProcessState.TORCH_BUILD_CPU_ONLY
+        msg.info = "Installed PyTorch is a CPU-only build; image generation is disabled. Alchemy continues."
+        msg.time_elapsed = None
+
+        assert state.torch_build_cpu_only is False
+        _enqueue(message_dispatcher, msg)
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert state.torch_build_cpu_only is True
+        assert "CPU-only build" in state.torch_build_cpu_only_reason
+
     async def test_mismatched_launch_identifier_is_ignored(self) -> None:
         """Ignore if a message is received with a launch identifier that doesn't match the process's current one."""
         process_info = make_mock_process_info(0)

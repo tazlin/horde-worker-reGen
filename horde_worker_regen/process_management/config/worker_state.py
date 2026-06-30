@@ -94,6 +94,21 @@ class WorkerState:
     """Operator-facing explanation for ``gpu_torch_incompatible`` (the child's ``info`` string), relayed
     verbatim to the TUI. Empty until the flag latches."""
 
+    torch_build_cpu_only: bool = False
+    """Session-latched: an inference child reported the installed PyTorch is a CPU-only build.
+
+    Set from the child's ``TORCH_BUILD_CPU_ONLY`` report. Unlike ``gpu_torch_incompatible`` nothing is
+    broken: the build simply has no GPU backend, so image generation is disabled (CPU inference is
+    impractically slow) while alchemy keeps running. While true the *image* job popper stops popping
+    (the alchemy popper is unaffected). This is the runtime counterpart of the ``bin/backend`` 'cpu'
+    sentinel: it makes a CPU torch build prevent image generation even when the sentinel was never set
+    (e.g. a manual CPU install). A build fact, so it never clears at runtime; fixed by installing a GPU
+    build (and restarting)."""
+
+    torch_build_cpu_only_reason: str = ""
+    """Operator-facing explanation for ``torch_build_cpu_only`` (the child's ``info`` string), relayed
+    verbatim to the TUI. Empty until the flag latches."""
+
     consecutive_failed_jobs: int = 0
     too_many_consecutive_failed_jobs: bool = False
     too_many_consecutive_failed_jobs_time: float = 0.0

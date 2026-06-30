@@ -149,6 +149,18 @@ class HordeProcessState(enum.Enum):
     prominently, all without importing torch (the invariant is that only the torch-bearing inference child
     ever touches torch; the parent and TUI learn of the problem through this torch-free signal)."""
 
+    TORCH_BUILD_CPU_ONLY = auto()
+    """The installed PyTorch is a CPU-only build, so image generation is disabled (reported by an inference child).
+
+    Distinct from ``TORCH_GPU_INCOMPATIBLE``: nothing is broken and the child does not exit. The torch wheel
+    simply has no GPU backend (no CUDA/HIP/XPU/MPS), so image generation would run ~100x slower and is
+    disabled, while the CPU-friendly alchemy forms keep running on this same process. The orchestrator
+    latches a worker-state flag from this and stops popping *image* jobs (alchemy is unaffected), all
+    without importing torch. This is build-based (it would not fire for a merely masked or broken GPU on a
+    GPU build), so it is the runtime counterpart to the ``bin/backend`` 'cpu' sentinel: it makes a CPU torch
+    build prevent image generation even when the install sentinel was never set (e.g. a manual CPU install).
+    A transient signal: the child reports it once at startup, then proceeds to its normal idle state."""
+
 
 class HordeProcessMessage(BaseModel):
     """Process messages are sent from the child processes to the main process."""

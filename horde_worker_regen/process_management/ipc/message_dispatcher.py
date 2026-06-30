@@ -437,6 +437,19 @@ class MessageDispatcher:
             self._state.gpu_torch_incompatible = True
             self._state.gpu_torch_incompatible_reason = message.info
 
+        if message.process_state == HordeProcessState.TORCH_BUILD_CPU_ONLY:
+            # A torch-bearing inference child found the installed PyTorch is a CPU-only build. Latch it here
+            # (the parent never imports torch) so the image popper stops popping while alchemy keeps running,
+            # and the TUI can surface the reason. Build fact, so sticky for the session. This is the runtime
+            # equivalent of a 'cpu' install sentinel, for a CPU torch build whose sentinel was never set.
+            if not self._state.torch_build_cpu_only:
+                logger.warning(
+                    f"Process {message.process_id} reports a CPU-only torch build; image generation is "
+                    f"disabled (alchemy continues). {message.info}",
+                )
+            self._state.torch_build_cpu_only = True
+            self._state.torch_build_cpu_only_reason = message.info
+
         if message.process_state == HordeProcessState.INFERENCE_STARTING:
             loaded_model_name = self._process_map[message.process_id].loaded_horde_model_name
             if loaded_model_name is None:

@@ -25,6 +25,30 @@ class _Recorder:
         return True
 
 
+def test_snapshot_reflects_runtime_cpu_only_torch_build() -> None:
+    """A child's CPU-only-build report drops image generation from the snapshot and flags the reason.
+
+    This is what makes the dashboard reshape to alchemist-only (and the popper stop) for a CPU torch build
+    whose install sentinel was never set.
+    """
+    manager = make_testable_process_manager()
+    manager._runtime_config.bridge_data.dreamer = True
+    manager._runtime_config.bridge_data.alchemist = True
+
+    before = manager._build_worker_state_snapshot()
+    assert "image_generation" in before.enabled_workloads
+    assert before.torch_build_cpu_only is False
+
+    manager._state.torch_build_cpu_only = True
+    manager._state.torch_build_cpu_only_reason = "Installed PyTorch is a CPU-only build; image generation disabled."
+
+    after = manager._build_worker_state_snapshot()
+    assert "image_generation" not in after.enabled_workloads
+    assert "alchemy" in after.enabled_workloads
+    assert after.torch_build_cpu_only is True
+    assert after.torch_build_cpu_only_reason
+
+
 def test_publish_is_dirty_gated_with_a_floor() -> None:
     """Snapshots publish on signature change and at the floor, and are suppressed when unchanged."""
     manager = make_testable_process_manager()

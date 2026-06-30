@@ -3241,6 +3241,20 @@ class HordeWorkerProcessManager:
             )
         return cards
 
+    def _served_workloads(self, bridge_data: reGenBridgeData) -> list[str]:
+        """The workloads actually served, as sorted ``WorkloadKind`` values, for the snapshot.
+
+        Starts from the declarative :func:`enabled_workloads` (config + install sentinel) and additionally
+        drops image generation when an inference child has reported a CPU-only torch build at runtime
+        (``torch_build_cpu_only``). That keeps the dashboard's mode identity truthful for a CPU torch build
+        whose ``bin/backend`` sentinel was never set: it reshapes to alchemist-only just as the install
+        sentinel would, matching the image popper which is already gated on the same flag.
+        """
+        workloads = enabled_workloads(bridge_data)
+        if self._state.torch_build_cpu_only:
+            workloads = workloads - {WorkloadKind.IMAGE_GENERATION}
+        return [workload.value for workload in workloads]
+
     def _build_worker_state_snapshot(self) -> WorkerStateSnapshot:
         """Assemble current worker state for the supervisor pipe (mirrors what StatusReporter prints)."""
         import horde_worker_regen
@@ -3374,6 +3388,8 @@ class HordeWorkerProcessManager:
             too_many_consecutive_failed_jobs=self._state.too_many_consecutive_failed_jobs,
             gpu_torch_incompatible=self._state.gpu_torch_incompatible,
             gpu_torch_incompatible_reason=(self._state.gpu_torch_incompatible_reason or None),
+            torch_build_cpu_only=self._state.torch_build_cpu_only,
+            torch_build_cpu_only_reason=(self._state.torch_build_cpu_only_reason or None),
             worker_registered=self.user_info is not None,
             user_info_failed=self._user_info_failed,
             user_info_failed_reason=self._user_info_failed_reason,
@@ -3424,7 +3440,7 @@ class HordeWorkerProcessManager:
             alchemy_forms_awaiting_submit=self._alchemy_coordinator.num_forms_awaiting_submit,
             alchemy_total_submitted=self._alchemy_coordinator.num_forms_submitted,
             alchemy_total_faulted=self._alchemy_coordinator.num_forms_faulted,
-            enabled_workloads=sorted(workload.value for workload in enabled_workloads(bridge_data)),
+            enabled_workloads=sorted(self._served_workloads(bridge_data)),
             pending_jobs=self._build_pending_jobs_list(),
             orchestration_intent=orchestration_intent,
             work_ledger=self._build_work_ledger(recent_jobs),

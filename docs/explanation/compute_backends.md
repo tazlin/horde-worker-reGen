@@ -156,6 +156,20 @@ and `HORDE_WORKER_BACKEND` overrides it for a one-off run. The runtime ground tr
 `accelerator_probe`; `compute_mode.reconcile_with_probe` warns when the two disagree (a GPU install with
 a broken driver, or a CPU install on a box that does have a GPU).
 
+#### Runtime backstop for a CPU torch build with no sentinel
+
+The sentinel is intent, set by the managed installer. A *manually* installed CPU torch (bypassing the
+installer) leaves no sentinel, so `is_cpu_only_install()` reports a GPU build and the startup-time
+behavior above (model coercion, one-process sizing) does not engage. To prevent the worker serving image
+jobs it cannot run there, a torch-bearing inference child reports the CPU-only torch *build* to the parent
+at startup (the `TORCH_BUILD_CPU_ONLY` signal, analogous to `TORCH_GPU_INCOMPATIBLE`). The parent latches
+`WorkerState.torch_build_cpu_only`, which stops the **image** popper (alchemy keeps running) and drops
+image generation from the snapshot's served workloads, so the dashboard still reshapes to alchemist-only.
+This is build-based (it would not fire for a merely masked or broken GPU on a GPU build), making it the
+runtime counterpart of the sentinel. Setting `HORDE_WORKER_BACKEND=cpu` (or running the installer's
+`--cpu`) is still preferred, since only the sentinel is known early enough to also right-size the process
+fleet and clear the model list at startup.
+
 ### What CPU mode changes
 
 - **Capability coercion** (`capabilities.coerce_bridge_data_to_capabilities`): whenever image generation

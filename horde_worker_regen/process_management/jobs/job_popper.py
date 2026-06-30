@@ -755,6 +755,13 @@ class JobPopper:
             self._state.last_pop_no_jobs_available = False
             return
 
+        if self._state.torch_build_cpu_only:
+            # CPU-only torch build: image generation is impractically slow and is disabled, so this (image)
+            # popper never pops. Alchemy runs on its own loop and is unaffected. This is the runtime
+            # equivalent of a 'cpu' install sentinel; sticky for the session (a build fact).
+            self._state.last_pop_no_jobs_available = False
+            return
+
         if self._state.downloads_only_hold:
             # Download-only posture: pre-fetch models without committing the GPU; pop nothing until GO_LIVE.
             self._state.last_pop_no_jobs_available = False

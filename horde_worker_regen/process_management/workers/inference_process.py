@@ -227,6 +227,7 @@ class HordeInferenceProcess(HordeProcess):
                 sys.exit(1)
 
             self._verify_torch_supports_gpu()
+            self._report_if_cpu_only_build()
 
             if gpu_sampling_lease is not None:
                 # Coordinate the GPU denoising loop across inference processes: this process
@@ -286,6 +287,48 @@ class HordeInferenceProcess(HordeProcess):
         self.send_process_state_change_message(
             process_state=HordeProcessState.WAITING_FOR_JOB,
             info="Waiting for job",
+        )
+
+    def _report_if_cpu_only_build(self) -> None:
+        """Tell the parent when the installed torch is a CPU-only build, so it stops popping image jobs.
+
+        Image generation on CPU is impractically slow, so a CPU-only torch build must not serve dreamer
+        work even when the torch-free orchestrator's install sentinel (``bin/backend``) was never set to
+        ``cpu`` (a manually installed CPU torch is the motivating case). The torch-bearing child is
+        authoritative about the build, so it reports the fact; the parent latches it and the image popper
+        stops, while alchemy (which runs acceptably on CPU) keeps serving on this same process. Unlike
+        :meth:`_verify_torch_supports_gpu` this never exits: the process is still useful for alchemy.
+
+        Build-based on purpose: it keys on the torch *build* having no GPU backend, so a merely masked or
+        broken GPU on a real GPU build is not mistaken for a CPU install (which would wrongly disable image
+        generation). Advisory and self-contained: any error determining the build type is logged and
+        ignored (the check must never crash the process).
+        """
+        try:
+            from hordelib.utils.torch_memory import torch_build_is_cpu_only
+
+            is_cpu_build = torch_build_is_cpu_only()
+        except Exception as e:
+            logger.debug(f"Could not determine whether torch is a CPU-only build: {type(e).__name__} {e}")
+            return
+
+        if not is_cpu_build:
+            return
+
+        logger.warning(
+            "The installed PyTorch is a CPU-only build, so image generation is disabled (it would run "
+            "~100x slower); this worker will serve alchemy only. Reinstall a GPU build to enable image "
+            "generation.",
+        )
+        # The info string is the operator-facing reason the parent relays verbatim to the TUI; keep it
+        # self-contained (no torch references the parent would have to interpret).
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.TORCH_BUILD_CPU_ONLY,
+            info=(
+                "Installed PyTorch is a CPU-only build; image generation is disabled (CPU inference is "
+                "impractically slow). Alchemy forms continue to run. Reinstall a GPU build to enable image "
+                "generation."
+            ),
         )
 
     def _verify_torch_supports_gpu(self) -> None:

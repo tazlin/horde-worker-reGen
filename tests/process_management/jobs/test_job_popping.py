@@ -138,6 +138,20 @@ class TestApiJobPopGuardClauses:
         assert state.last_pop_no_jobs_available is False
         assert state.gpu_torch_incompatible is True
 
+    async def test_cpu_only_torch_build_blocks_image_pop(self) -> None:
+        """A CPU-only torch build stops the image popper even with a fully available process pool.
+
+        This is the runtime equivalent of a 'cpu' install sentinel: image generation is disabled while
+        alchemy (a separate loop) keeps running.
+        """
+        state = WorkerState(torch_build_cpu_only=True, last_pop_no_jobs_available=True)
+        popper = _make_popper(state=state, process_map=_make_process_map_with_available_processes())
+
+        await popper.api_job_pop()
+
+        assert state.last_pop_no_jobs_available is False
+        assert state.torch_build_cpu_only is True
+
     async def test_too_many_consecutive_failures_blocks_pop(self) -> None:
         """Active failure pause prevents any pop attempt."""
         state = WorkerState(
