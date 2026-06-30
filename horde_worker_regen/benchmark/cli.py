@@ -20,11 +20,13 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from horde_worker_regen.benchmark.capabilities.capability import CapabilityKind
 from horde_worker_regen.benchmark.enums import SELECTABLE_AXES, BenchAxis, BenchTier
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from horde_worker_regen.benchmark.capabilities.result import CapabilityReport
     from horde_worker_regen.benchmark.download_progress import DownloadEvent, DownloadModelRow
     from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel
     from horde_worker_regen.benchmark.report import BenchmarkReport, MachineInfo
@@ -97,6 +99,55 @@ def _add_ramp_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Keep running after a level hangs/crashes instead of aborting the whole ramp "
         "(by default the first catastrophic failure stops the ramp, since the worker stack is shared).",
+    )
+
+
+def _add_run_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Add the ``run`` subcommand: the capability-engine benchmark (one warm worker, no per-probe rampup)."""
+    run = subparsers.add_parser(
+        "run",
+        help="Run the capability-probe benchmark: prove what this machine can do, on one warm worker.",
+    )
+    run.add_argument(
+        "--tiers",
+        default="sd15,sdxl",
+        help="Comma-separated model tiers to attempt (sd15, sdxl, flux, qwen, zimage). flux/qwen/zimage "
+        "are opt-in (very large) and auto-skip when the machine cannot host them.",
+    )
+    run.add_argument(
+        "--process-mode",
+        default="real",
+        choices=("fake", "dry_run", "real"),
+        help="real = GPU benchmark; fake/dry_run exercise the engine without inference.",
+    )
+    run.add_argument("--out", type=Path, default=None, help="Output directory (default: benchmark_results/<ts>).")
+    run.add_argument("--jobs-per-level", type=int, default=4)
+    run.add_argument("--probe-timeout", type=float, default=900.0, help="Per-probe timeout in seconds.")
+    run.add_argument("--only", default=None, help="Run a single probe by its capability slug (e.g. sd15-controlnet).")
+    run.add_argument("--include-downloads", action="store_true", help="Include the ad-hoc lora download probe.")
+    run.add_argument("--no-alchemy", action="store_true", help="Skip the alchemy probes.")
+    run.add_argument("--no-features", action="store_true", help="Skip the feature probes.")
+    run.add_argument("--no-concurrency", action="store_true", help="Skip the concurrency probes.")
+    run.add_argument(
+        "--exclude-capability",
+        action="append",
+        default=[],
+        choices=[kind.value for kind in CapabilityKind],
+        metavar="CAPABILITY",
+        help="Drop a single capability kind, independent of the coarse stage flags (repeatable).",
+    )
+    run.add_argument("--no-validate", action="store_true", help="Skip the post-run sustained-load soak.")
+    run.add_argument("--soak-minutes", type=float, default=5.0, help="Duration of each per-tier soak (minutes).")
+    run.add_argument(
+        "--strict-duty",
+        action="store_true",
+        help="Fail a soak whose GPU duty cycle misses the 90%% target (off by default: advisory).",
+    )
+    run.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show per-process state in the live view.",
     )
 
 
@@ -785,6 +836,96 @@ def _run_ramp(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_run(args: argparse.Namespace) -> int:
+    """Run the capability-probe benchmark on one warm worker and persist its report."""
+    from horde_worker_regen.benchmark.capabilities.catalog import CatalogOptions
+    from horde_worker_regen.benchmark.capabilities.executor import ProbeExecutor, detect_machine_info
+    from horde_worker_regen.benchmark.progress_channel import (
+        PROGRESS_FILENAME,
+        JsonlProgressSink,
+        MultiProgressSink,
+        RampStarting,
+    )
+    from horde_worker_regen.benchmark.progress_console import ConsoleProgressSink
+    from horde_worker_regen.benchmark.worker_env import ensure_worker_env
+
+    tiers = _parse_tiers(args.tiers)
+    if tiers is None:
+        return 2
+
+    out_dir: Path = args.out if args.out is not None else Path("benchmark_results") / time.strftime("%Y%m%d-%H%M%S")
+    _setup_controller_file_logging(out_dir)
+
+    progress_sink = MultiProgressSink(
+        [JsonlProgressSink(out_dir / PROGRESS_FILENAME), ConsoleProgressSink(verbose=args.verbose)],
+    )
+    progress_sink.emit(
+        RampStarting(
+            run_id=out_dir.name,
+            process_mode=args.process_mode,
+            phase="loading worker environment and detecting hardware",
+        ),
+    )
+
+    # The harness never reads bridgeData.yaml, so set AIWORKER_CACHE_HOME (and friends) before booting the
+    # worker, so the real inference children resolve the worker's model directory. Passing the tiers opts
+    # into the beta reference when a beta tier (qwen/zimage) is requested.
+    ensure_worker_env(args.process_mode, tiers)
+    machine = detect_machine_info(probe_devices=args.process_mode == "real")
+
+    options = CatalogOptions(
+        tiers=tiers,
+        jobs_per_level=args.jobs_per_level,
+        include_concurrency=not args.no_concurrency,
+        include_features=not args.no_features,
+        include_alchemy=not args.no_alchemy,
+        include_downloads=args.include_downloads,
+        excluded_kinds={CapabilityKind(value) for value in args.exclude_capability},
+        probe_timeout_seconds=args.probe_timeout,
+        total_vram_mb=machine.total_vram_mb,
+    )
+    executor = ProbeExecutor(
+        catalog_options=options,
+        process_mode=args.process_mode,
+        machine=machine,
+        out_dir=out_dir,
+        run_soak=not args.no_validate,
+        soak_seconds=args.soak_minutes * 60.0,
+        strict_duty_cycle=args.strict_duty,
+        only_probe=args.only,
+        progress_sink=progress_sink,
+    )
+    try:
+        report = executor.run()
+    except Exception:
+        logger.exception("The benchmark executor crashed.")
+        raise
+    finally:
+        progress_sink.close()
+    _record_capability_benchmark_in_app_state(report, out_dir)
+
+    proven = sum(1 for probe in report.probes if probe.verdict == "proven")
+    print(f"\nBenchmark complete: {proven}/{len(report.probes)} probes proven.")  # noqa: T201
+    print(f"Report: {out_dir / 'report.md'}")  # noqa: T201
+    if report.findings:
+        print(f"Robustness findings: {len(report.findings)} (see the remediation queue in the report)")  # noqa: T201
+    print("\nSuggested bridgeData:")  # noqa: T201
+    print(report.suggested_bridge_data.as_yaml_block())  # noqa: T201
+    return 0
+
+
+def _record_capability_benchmark_in_app_state(report: CapabilityReport, out_dir: Path) -> None:
+    """Record a finished capability run in app state, best-effort (bookkeeping must not fail the run)."""
+    try:
+        from horde_worker_regen.app_state import AppStateStore, build_capability_benchmark_record
+
+        record = build_capability_benchmark_record(report, results_dir=out_dir)
+        AppStateStore().record_benchmark(record)
+        logger.info(f"Recorded benchmark {record.run_id} in app state ({AppStateStore().path}).")
+    except Exception as app_state_error:  # noqa: BLE001 - app-state bookkeeping must not fail the run
+        logger.debug(f"Could not record benchmark in app state: {app_state_error}")
+
+
 def _record_benchmark_in_app_state(report: BenchmarkReport, out_dir: Path) -> None:
     """Record a finished CLI ramp as the canonical run-to-run benchmark, best-effort.
 
@@ -840,14 +981,37 @@ def _run_monitor(args: argparse.Namespace) -> int:
 
 
 def _run_report(args: argparse.Namespace) -> int:
-    from horde_worker_regen.benchmark.controller import load_existing_report
-    from horde_worker_regen.benchmark.report import render_markdown
+    """Re-render a run's markdown report, auto-detecting the capability (v5) or legacy report format."""
+    import json
 
-    report = load_existing_report(args.out_dir)
-    if report is None:
+    report_path = args.out_dir / "report.json"
+    if not report_path.exists():
         logger.error(f"No report.json found in {args.out_dir}")
         return 1
-    markdown = render_markdown(report)
+
+    # A capability report carries ``probes``; a legacy report carries ``levels``. Render with whichever
+    # engine produced it so ``report`` works for both ``run`` and the older ``ramp`` output.
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        logger.error(f"Could not read {report_path}: {error}")
+        return 1
+
+    if isinstance(data, dict) and "probes" in data:
+        from horde_worker_regen.benchmark.capabilities.report_render import render_markdown as render_capability
+        from horde_worker_regen.benchmark.capabilities.result import CapabilityReport
+
+        markdown = render_capability(CapabilityReport.model_validate(data))
+    else:
+        from horde_worker_regen.benchmark.controller import load_existing_report
+        from horde_worker_regen.benchmark.report import render_markdown
+
+        report = load_existing_report(args.out_dir)
+        if report is None:
+            logger.error(f"Could not parse a benchmark report from {report_path}")
+            return 1
+        markdown = render_markdown(report)
+
     (args.out_dir / "report.md").write_text(markdown, encoding="utf-8")
     print(markdown)  # noqa: T201
     return 0
@@ -858,6 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="horde-benchmark", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    _add_run_parser(subparsers)
     _add_ramp_parser(subparsers)
     _add_plan_parser(subparsers)
     _add_download_parser(subparsers)
@@ -878,6 +1043,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if args.command == "run":
+        return _run_run(args)
     if args.command == "ramp":
         return _run_ramp(args)
     if args.command == "plan":

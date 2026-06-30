@@ -15,6 +15,7 @@ package stays import-light and free of an import cycle.
 from __future__ import annotations
 
 import re
+import time
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,13 @@ if TYPE_CHECKING:
 
 CAPABILITY_REPORT_SCHEMA_VERSION = 5
 """Bumped from the legacy benchmark report's 4 on the clean break to the capability model."""
+
+
+def _current_worker_version() -> str:
+    """Return the running worker version (local import keeps this module import-light)."""
+    from horde_worker_regen import __version__
+
+    return __version__
 
 
 class Finding(BaseModel):
@@ -217,6 +225,9 @@ class CapabilityReport(BaseModel):
     """A whole catalog run: every probe's result, the capability surface, and the recommendation."""
 
     report_schema_version: int = CAPABILITY_REPORT_SCHEMA_VERSION
+    worker_version: str = Field(default_factory=_current_worker_version)
+    created_at: float = Field(default_factory=time.time)
+    run_id: str = ""
     machine: MachineInfo = Field(default_factory=MachineInfo)
     probes: list[CapabilityProbeResult] = Field(default_factory=list)
     capabilities: WorkerCapabilities = Field(default_factory=WorkerCapabilities)

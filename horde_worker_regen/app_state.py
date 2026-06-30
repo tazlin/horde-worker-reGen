@@ -33,6 +33,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
+    from horde_worker_regen.benchmark.capabilities.result import CapabilityReport
     from horde_worker_regen.benchmark.report import BenchmarkReport
 
 APP_STATE_SCHEMA_VERSION = 1
@@ -233,6 +234,31 @@ def build_benchmark_record(report: BenchmarkReport, *, results_dir: str | os.Pat
         worker_version=report.worker_version,
         levels_passed=levels_passed,
         levels_total=len(report.levels),
+        gpu_name=report.machine.gpu_name,
+        had_findings=bool(report.findings),
+        suggested_bridge_data=report.suggested_bridge_data.model_dump(),
+    )
+
+
+def build_capability_benchmark_record(
+    report: CapabilityReport,
+    *,
+    results_dir: str | os.PathLike[str],
+) -> BenchmarkRecord:
+    """Convert a finished capability report into the durable record stored in app state.
+
+    The capability-engine counterpart of :func:`build_benchmark_record`: it counts proven probes instead
+    of passed levels, but produces the identical record so the run-to-run pointer is the same regardless
+    of which engine produced it.
+    """
+    probes_proven = sum(1 for probe in report.probes if probe.verdict == "proven")
+    return BenchmarkRecord(
+        run_id=report.run_id,
+        results_dir=str(results_dir),
+        created_at=report.created_at,
+        worker_version=report.worker_version,
+        levels_passed=probes_proven,
+        levels_total=len(report.probes),
         gpu_name=report.machine.gpu_name,
         had_findings=bool(report.findings),
         suggested_bridge_data=report.suggested_bridge_data.model_dump(),

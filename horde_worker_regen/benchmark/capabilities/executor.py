@@ -8,8 +8,11 @@ machine, boot one warm worker so the rampup is paid once (not per probe, the way
 tests are), run each probe the supervisor admits, establish the per-tier it/s reference for the criteria
 comparison, then soak the synthesized recommendation and assemble the :class:`CapabilityReport`.
 
-Like :mod:`probe_runner`, this module is the heavy boundary: it imports the harness lazily inside the
-run so the type is importable (and ``detect_machine_info`` usable) without dragging torch.
+It emits the shared benchmark progress events as it goes (one ``LevelStarted``/``LevelFinished`` per
+probe, periodic ``LevelProgress``, and the surrounding ``RampStarted``/``RampFinished``), so the CLI
+console, ``monitor``, and the TUI render a live view by tailing the same ``progress.jsonl`` the old
+controller wrote. Like :mod:`probe_runner`, this is the heavy boundary: it imports the harness lazily
+inside the run so the type is importable (and ``detect_machine_info`` usable) without dragging torch.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from horde_worker_regen.benchmark.capabilities.catalog import (
 from horde_worker_regen.benchmark.capabilities.plan import build_plan
 from horde_worker_regen.benchmark.capabilities.probe_runner import run_capability_probe_async
 from horde_worker_regen.benchmark.capabilities.recommendation import synthesize_bridge_data, synthesize_capabilities
-from horde_worker_regen.benchmark.capabilities.report_render import render_markdown
+from horde_worker_regen.benchmark.capabilities.report_render import describe_decision, render_markdown
 from horde_worker_regen.benchmark.capabilities.result import (
     CapabilityProbeResult,
     CapabilityReport,
@@ -40,6 +43,17 @@ from horde_worker_regen.benchmark.capabilities.supervisor import CapabilitySuper
 from horde_worker_regen.benchmark.criteria import TierBaseline
 from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.ladder import BENCH_TIER_MODELS
+from horde_worker_regen.benchmark.progress_channel import (
+    LevelFinished,
+    LevelLiveSnapshot,
+    LevelProgress,
+    LevelStarted,
+    NullProgressSink,
+    ProgressSink,
+    RampFinished,
+    RampStarted,
+    SuggestionDecisionRow,
+)
 from horde_worker_regen.benchmark.requirements import (
     civitai_token_available,
     compute_probe_requirements,
@@ -47,8 +61,21 @@ from horde_worker_regen.benchmark.requirements import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from horde_worker_regen.benchmark.capabilities.probe import CapabilityProbe
     from horde_worker_regen.harness import HarnessProcessMode, WarmHarnessSession
+    from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot
+
+# A probe verdict maps onto the legacy level-outcome vocabulary the progress console and TUI render, so
+# the live view stays correct while the events keep their established names (the cosmetic Probe* rename
+# is a later, TUI-coupled change).
+_VERDICT_TO_OUTCOME: dict[CapabilityVerdict, str] = {
+    CapabilityVerdict.PROVEN: "passed",
+    CapabilityVerdict.DISPROVEN: "failed",
+    CapabilityVerdict.SKIPPED: "skipped",
+    CapabilityVerdict.CRASHED: "crashed",
+}
 
 
 def detect_machine_info(*, probe_devices: bool = True) -> MachineInfo:
@@ -104,20 +131,24 @@ class ProbeExecutor:
         process_mode: HarnessProcessMode = "fake",
         machine: MachineInfo | None = None,
         out_dir: Path | None = None,
+        run_id: str = "",
         run_soak: bool = True,
         soak_seconds: float = 120.0,
         strict_duty_cycle: bool = False,
         only_probe: str | None = None,
+        progress_sink: ProgressSink | None = None,
     ) -> None:
         """Configure a run; ``machine`` is detected at run time when None, ``only_probe`` narrows to one slug."""
         self._catalog_options = catalog_options if catalog_options is not None else CatalogOptions()
         self._process_mode = process_mode
         self._machine = machine
         self._out_dir = out_dir
+        self._run_id = run_id or (out_dir.name if out_dir is not None else "")
         self._run_soak = run_soak
         self._soak_seconds = soak_seconds
         self._strict_duty_cycle = strict_duty_cycle
         self._only_probe = only_probe
+        self._progress: ProgressSink = progress_sink if progress_sink is not None else NullProgressSink()
 
     async def run_async(self) -> CapabilityReport:
         """Run the catalog and return the assembled (and, if ``out_dir`` is set, persisted) report."""
@@ -133,6 +164,8 @@ class ProbeExecutor:
         tier_baselines: dict[BenchTier, TierBaseline] = {}
         results: list[CapabilityProbeResult] = []
 
+        self._emit_ramp_started(machine, num_probes=len(plan.probes))
+
         from horde_worker_regen.harness import WarmHarnessSession
 
         async with WarmHarnessSession(
@@ -140,7 +173,8 @@ class ProbeExecutor:
             model_names=self._warm_model_names(plan.probes),
             max_threads_ceiling=max((_probe_threads(probe) for probe in plan.probes), default=1),
         ) as session:
-            for probe in plan.probes:
+            for index, probe in enumerate(plan.probes):
+                self._emit_started(probe, index=index, num_probes=len(plan.probes))
                 result = await self._resolve_probe(
                     probe,
                     machine=machine,
@@ -151,6 +185,7 @@ class ProbeExecutor:
                 supervisor.record(probe, result)
                 results.append(result)
                 self._record_baseline(probe, result, tier_baselines)
+                self._emit_finished(result)
 
         suggested = synthesize_bridge_data(results, total_vram_mb=machine.total_vram_mb)
         if self._run_soak and self._only_probe is None and tier_baselines:
@@ -165,6 +200,7 @@ class ProbeExecutor:
             suggested = synthesize_bridge_data(results, total_vram_mb=machine.total_vram_mb)
 
         report = CapabilityReport(
+            run_id=self._run_id,
             machine=machine,
             probes=results,
             capabilities=synthesize_capabilities(results, total_vram_mb=machine.total_vram_mb),
@@ -177,6 +213,7 @@ class ProbeExecutor:
             (self._out_dir / "report.json").write_text(report.model_dump_json(indent=2), encoding="utf-8")
             (self._out_dir / "report.md").write_text(render_markdown(report), encoding="utf-8")
 
+        self._emit_ramp_finished(report)
         return report
 
     def run(self) -> CapabilityReport:
@@ -211,6 +248,7 @@ class ProbeExecutor:
             total_vram_mb=machine.total_vram_mb,
             baseline=baseline,
             warm_session=warm_session,
+            on_progress=self._progress_callback(probe.probe_id),
         )
 
     async def _run_soaks(
@@ -236,6 +274,7 @@ class ProbeExecutor:
                 requires=(Capability(tier=tier, kind=CapabilityKind.BASELINE),),
                 strict_duty_cycle=self._strict_duty_cycle,
             )
+            self._emit_started(sustained, index=0, num_probes=0)
             skip_reason = requirement_skip_reason(
                 compute_probe_requirements(sustained),
                 machine=machine,
@@ -253,8 +292,10 @@ class ProbeExecutor:
                     process_mode=self._process_mode,
                     total_vram_mb=machine.total_vram_mb,
                     baseline=tier_baselines[tier],
+                    on_progress=self._progress_callback(sustained.probe_id),
                 )
             supervisor.record(sustained, result)
+            self._emit_finished(result)
             soak_results.append(result)
         return soak_results
 
@@ -286,6 +327,101 @@ class ProbeExecutor:
             if tier in BENCH_TIER_MODELS:
                 names.add(BENCH_TIER_MODELS[tier])
         return sorted(names)
+
+    # region progress
+
+    def _progress_callback(self, probe_id: str) -> Callable[[RunMetricsSnapshot, float], None]:
+        """A live-metrics callback for one probe that republishes a :class:`LevelProgress` event."""
+
+        def _emit(metrics: RunMetricsSnapshot, elapsed: float) -> None:
+            snapshot = LevelLiveSnapshot.from_run_metrics(metrics, elapsed)
+            self._progress.emit(
+                LevelProgress(
+                    level_id=probe_id,
+                    jobs_completed=snapshot.jobs_completed,
+                    jobs_faulted=snapshot.jobs_faulted,
+                    iterations_per_second=snapshot.iterations_per_second,
+                    vram_used_mb=snapshot.vram_used_mb,
+                    gpu_busy_percent=snapshot.gpu_busy_percent,
+                    elapsed_seconds=snapshot.elapsed_seconds,
+                    phase=snapshot.phase,
+                    process_summary=snapshot.process_summary,
+                    num_process_recoveries=snapshot.num_process_recoveries,
+                    gpu_duty_gap_summary=snapshot.gpu_duty_gap_summary,
+                    no_jobs_available_seconds=snapshot.no_jobs_available_seconds,
+                ),
+            )
+
+        return _emit
+
+    def _emit_ramp_started(self, machine: MachineInfo, *, num_probes: int) -> None:
+        self._progress.emit(
+            RampStarted(
+                run_id=self._run_id,
+                num_levels=num_probes,
+                tiers=[str(tier) for tier in self._catalog_options.tiers],
+                process_mode=self._process_mode,
+                gpu_name=machine.gpu_name,
+                total_vram_mb=machine.total_vram_mb,
+            ),
+        )
+
+    def _emit_started(self, probe: CapabilityProbe, *, index: int, num_probes: int) -> None:
+        self._progress.emit(
+            LevelStarted(
+                level_id=probe.probe_id,
+                description=probe.capability.label,
+                tier=str(probe.capability.tier),
+                axis=str(probe.capability.kind),
+                level_index=index,
+                num_levels=num_probes,
+                timeout_seconds=probe.timeout_seconds,
+            ),
+        )
+
+    def _emit_finished(self, result: CapabilityProbeResult) -> None:
+        stats = result.stats
+        self._progress.emit(
+            LevelFinished(
+                level_id=result.capability.slug,
+                outcome=_VERDICT_TO_OUTCOME.get(result.verdict, str(result.verdict)),
+                reasons=list(result.reasons),
+                advisories=list(result.advisories),
+                its_p50=stats.its_p50 if stats is not None else None,
+                gpu_busy_percent=stats.gpu_utilization_mean_percent if stats is not None else None,
+                vram_used_high_water_mb=stats.vram_used_high_water_mb if stats is not None else None,
+                num_findings=len(result.findings),
+            ),
+        )
+
+    def _emit_ramp_finished(self, report: CapabilityReport) -> None:
+        from horde_worker_regen.benchmark.capabilities.recommendation import verify_suggestion_consistency
+
+        proven = sum(1 for probe in report.probes if probe.verdict is CapabilityVerdict.PROVEN)
+        decisions = [
+            SuggestionDecisionRow(
+                setting=decision.setting,
+                value_text=describe_decision(decision)[0],
+                basis=decision.basis.value,
+                basis_label=describe_decision(decision)[1],
+                detail=decision.detail,
+            )
+            for decision in report.suggested_bridge_data.decisions
+        ]
+        self._progress.emit(
+            RampFinished(
+                run_id=self._run_id,
+                levels_passed=proven,
+                levels_total=len(report.probes),
+                num_findings=len(report.findings),
+                report_path=str(self._out_dir / "report.md") if self._out_dir is not None else None,
+                suggested_bridge_data_yaml=report.suggested_bridge_data.as_yaml_block(),
+                suggestion_decisions=decisions,
+                consistency_warnings=verify_suggestion_consistency(report),
+            ),
+        )
+
+    # endregion
 
 
 def _skipped_result(probe: CapabilityProbe, reason: str) -> CapabilityProbeResult:

@@ -302,3 +302,41 @@ def test_build_benchmark_record_from_report() -> None:
     assert record.gpu_name == "Adapter GPU"
     assert record.levels_total == 0
     assert record.suggested_bridge_data["max_threads"] == 2
+
+
+def test_build_capability_benchmark_record_counts_proven_probes() -> None:
+    """The capability-report adapter counts proven probes as passed and carries the same stamps."""
+    from horde_worker_regen.app_state import build_capability_benchmark_record
+    from horde_worker_regen.benchmark.capabilities.capability import Capability, CapabilityKind, CapabilityVerdict
+    from horde_worker_regen.benchmark.capabilities.result import (
+        CapabilityProbeResult,
+        CapabilityReport,
+        MachineInfo,
+        SuggestedBridgeData,
+    )
+    from horde_worker_regen.benchmark.enums import BenchTier
+
+    report = CapabilityReport(
+        run_id="20260630-090000",
+        worker_version="9.9.9",
+        machine=MachineInfo(gpu_name="Adapter GPU"),
+        probes=[
+            CapabilityProbeResult(
+                capability=Capability(tier=BenchTier.SD15, kind=CapabilityKind.BASELINE),
+                verdict=CapabilityVerdict.PROVEN,
+            ),
+            CapabilityProbeResult(
+                capability=Capability(tier=BenchTier.SD15, kind=CapabilityKind.CONTROLNET),
+                verdict=CapabilityVerdict.DISPROVEN,
+            ),
+        ],
+        suggested_bridge_data=SuggestedBridgeData(max_threads=2),
+    )
+
+    record = build_capability_benchmark_record(report, results_dir="benchmark_results/20260630-090000")
+    assert record.run_id == "20260630-090000"
+    assert record.worker_version == "9.9.9"
+    assert record.gpu_name == "Adapter GPU"
+    assert record.levels_passed == 1
+    assert record.levels_total == 2
+    assert record.suggested_bridge_data["max_threads"] == 2
