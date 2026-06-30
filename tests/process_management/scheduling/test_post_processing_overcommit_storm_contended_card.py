@@ -1,4 +1,4 @@
-"""A large card can still over-commit post-processing under concurrency, and the breaker latches it off.
+"""Concurrent post-processing can over-commit even a large card; transient contention defers, the rest faults.
 
 The post-processing reclaim planner sizes a job's own upscaler/face-fixer peak against *effective* free
 VRAM: the measured free reading less the room concurrent sibling post-processing has already committed (and
@@ -6,15 +6,20 @@ any imminent peak still sampling). On a high-VRAM card running several inference
 or more siblings can be mid post-processing at once, each owing its multi-GB peak. Their combined committed
 reserve can exceed the measured free reading outright, so the effective free goes *negative* and a freshly
 dispatched job's own peak overflows a card that, by raw capacity, looks roomy. When no sibling is idle (every
-process is busy) there is nothing to evict and no bare context to shed, so the planner returns
-:attr:`PostProcessingReclaimAction.INSUFFICIENT` and the job is faulted rather than dispatched into a stall.
+process is busy) there is nothing to evict and no bare context to shed.
 
-This is distinct from the tiny-single-process-card INSUFFICIENT in the planner matrix: here the card is large
-(24 GB) yet still unhostable purely from concurrent-post-processing contention. These pin that signature, the
-terminal (non-retryable) fault that keeps the job from being re-dispatched into the same unchanged card (which
-would only fault again and feed the breaker a second over-commit count for one placement failure), and the
-end-to-end chain where repeated such faults trip the session-latched fault breaker and stop the worker
-advertising post-processing (so it is no longer handed jobs it cannot host).
+Whether that overflow faults or merely waits turns on one question: can the card host the peak *at all*? When
+the peak fits the card drained to this job's process alone, the contention is transient (a busy sibling's
+completion frees the room), so the planner returns :attr:`PostProcessingReclaimAction.DEFER` and the job
+keeps its head-of-queue position until the room appears, rather than faulting a job the card can host moments
+from now. Only when the peak overflows even the drained card (or no sibling is in flight to free room) is the
+verdict the terminal :attr:`PostProcessingReclaimAction.INSUFFICIENT`.
+
+These pin that split, the terminal (non-retryable) fault that keeps an unhostable job from being
+re-dispatched into the same unchanged card (which would only fault again and feed the breaker a second
+over-commit count for one placement failure), and the end-to-end chain where repeated such faults trip the
+session-latched fault breaker and stop the worker advertising post-processing (so it is no longer handed jobs
+it cannot host).
 """
 
 from __future__ import annotations
@@ -55,6 +60,12 @@ _MEASURED_FREE_MB = 10814.0
 _PP_SIBLING_PEAK_MB = 6495.5
 _DISPATCHED_PEAK_MB = 5230.0
 _DISPATCHED_WEIGHTS_MB = 4900.0
+# The large card's total VRAM: roomy enough that the ~5 GB dispatched peak fits it alone, so the contention
+# is purely transient (a sibling's completion will free room) rather than a peak the device cannot host.
+_LARGE_CARD_TOTAL_VRAM_MB = 24000.0
+# A peak no draining of this card can host (it overflows the device alone): the genuinely terminal case that
+# still faults and feeds the breaker, distinct from the transient contention that now defers.
+_UNHOSTABLE_DISPATCHED_PEAK_MB = 26000.0
 
 # effective free = measured free - committed reserve (both siblings) - imminent (the no-pp job adds 0).
 _EXPECTED_COMMITTED_RESERVE_MB = _PP_SIBLING_PEAK_MB * 2  # 12991
@@ -63,9 +74,9 @@ _EXPECTED_EFFECTIVE_FREE_MB = _MEASURED_FREE_MB - _EXPECTED_COMMITTED_RESERVE_MB
 _EXPECTED_SHORTFALL_MB = _DISPATCHED_PEAK_MB - _EXPECTED_EFFECTIVE_FREE_MB  # 7407
 
 
-def _peak_by_model(model: str | None) -> float:
+def _peak_by_model(model: str | None, *, dispatched_peak_mb: float) -> float:
     if model == _DISPATCHED_MODEL:
-        return _DISPATCHED_PEAK_MB
+        return dispatched_peak_mb
     if model in (_PP_SIBLING_MODEL_A, _PP_SIBLING_MODEL_B):
         return _PP_SIBLING_PEAK_MB
     return 0.0
@@ -76,8 +87,15 @@ def _contended_large_card_scheduler(
     process_map: ProcessMap,
     *,
     monkeypatch: pytest.MonkeyPatch,
+    dispatched_peak_mb: float = _DISPATCHED_PEAK_MB,
+    total_vram_mb: float = _LARGE_CARD_TOTAL_VRAM_MB,
 ) -> InferenceScheduler:
-    """A budget-active scheduler whose readings mirror a contended large card under post-processing overlap."""
+    """A budget-active scheduler whose readings mirror a contended large card under post-processing overlap.
+
+    ``dispatched_peak_mb`` is the dispatching job's own post-processing peak (the default fits the card alone,
+    so the contention is transient; an unhostable value overflows even the drained card). ``total_vram_mb`` is
+    the device total the planner sizes "fits the card alone" against.
+    """
     bridge_data = make_mock_bridge_data(enable_vram_budget=True, vram_reserve_mb=2048, ram_reserve_mb=4096)
     scheduler = _make_inference_scheduler(
         job_tracker=job_tracker,
@@ -86,9 +104,10 @@ def _contended_large_card_scheduler(
         max_inference=4,
     )
     scheduler._measured_free_vram_mb = Mock(return_value=_MEASURED_FREE_MB)  # type: ignore[method-assign]
+    scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=total_vram_mb)  # type: ignore[method-assign]
 
     def _fake_peak(job: object, baseline: str | None) -> float:
-        return _peak_by_model(getattr(job, "model", None))
+        return _peak_by_model(getattr(job, "model", None), dispatched_peak_mb=dispatched_peak_mb)
 
     def _fake_weight(job: object, baseline: str | None) -> float:
         return _DISPATCHED_WEIGHTS_MB if getattr(job, "model", None) == _DISPATCHED_MODEL else 0.0
@@ -149,8 +168,8 @@ def _contended_process_map() -> ProcessMap:
     )
 
 
-class TestContendedLargeCardInsufficient:
-    """The planner declines on a large card whose concurrent post-processing leaves negative effective free."""
+class TestContendedLargeCardDefersThenFaultsOnlyWhenUnhostable:
+    """Transient concurrent-post-processing contention now defers; only an unhostable peak still faults."""
 
     async def test_concurrent_post_processing_drives_effective_free_negative(
         self,
@@ -171,15 +190,16 @@ class TestContendedLargeCardInsufficient:
         assert effective_free == pytest.approx(_EXPECTED_EFFECTIVE_FREE_MB)
         assert effective_free < 0.0
 
-    async def test_large_card_is_insufficient_when_no_sibling_is_reclaimable(
+    async def test_large_card_defers_a_hostable_peak_until_a_sibling_frees_room(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Every process is busy, so there is nothing to evict or shed: the peak is unhostable -> INSUFFICIENT.
+        """The peak overflows the contended card now but fits it alone, with siblings in flight -> DEFER.
 
-        The card is 24 GB, far larger than the ~5 GB peak, yet the planner correctly declines: the room the
-        upscaler needs is spoken for by the siblings' in-flight post-processing, which the dispatching child's
-        own in-process free cannot reach, and no idle sibling holds evictable cross-process VRAM.
+        The card is 24 GB, far larger than the ~5 GB peak: the room is only spoken for transiently by the
+        siblings' in-flight post-processing, which will free it as they complete. Rather than faulting a job
+        the card can host moments from now, the planner holds the dispatch (the job keeps its head-of-queue
+        position) until that room appears.
         """
         job_tracker = JobTracker()
         scheduler = _contended_large_card_scheduler(job_tracker, _contended_process_map(), monkeypatch=monkeypatch)
@@ -187,8 +207,31 @@ class TestContendedLargeCardInsufficient:
 
         plan = scheduler._plan_post_processing_reclaim(dispatched, device_index=None, dispatching_process_id=4)
 
-        assert plan.action is PostProcessingReclaimAction.INSUFFICIENT
+        assert plan.action is PostProcessingReclaimAction.DEFER
         assert plan.shortfall_mb == pytest.approx(_EXPECTED_SHORTFALL_MB)
+
+    async def test_large_card_faults_when_the_peak_overflows_even_the_drained_card(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A peak no draining of the card can host faults terminally even with siblings in flight.
+
+        Waiting only helps when the peak fits the card alone; one that overflows the device outright is
+        unhostable no matter how the siblings drain, so the planner declines rather than parking the dispatch
+        forever. This is the genuinely terminal case that still feeds the post-processing breaker.
+        """
+        job_tracker = JobTracker()
+        scheduler = _contended_large_card_scheduler(
+            job_tracker,
+            _contended_process_map(),
+            monkeypatch=monkeypatch,
+            dispatched_peak_mb=_UNHOSTABLE_DISPATCHED_PEAK_MB,
+        )
+        dispatched = await _seed_contended_card(scheduler)
+
+        plan = scheduler._plan_post_processing_reclaim(dispatched, device_index=None, dispatching_process_id=4)
+
+        assert plan.action is PostProcessingReclaimAction.INSUFFICIENT
 
     async def test_freeing_the_dispatching_jobs_own_weights_cannot_close_the_gap(
         self,
@@ -212,12 +255,18 @@ class TestInsufficientFaultFeedsBreakerCounter:
     ) -> None:
         """Enacting INSUFFICIENT faults the job, declines dispatch, and bumps the breaker's window counter."""
         job_tracker = JobTracker()
-        scheduler = _contended_large_card_scheduler(job_tracker, _contended_process_map(), monkeypatch=monkeypatch)
+        scheduler = _contended_large_card_scheduler(
+            job_tracker,
+            _contended_process_map(),
+            monkeypatch=monkeypatch,
+            dispatched_peak_mb=_UNHOSTABLE_DISPATCHED_PEAK_MB,
+        )
         dispatched = await _seed_contended_card(scheduler)
         scheduler._job_tracker.handle_job_fault = AsyncMock()  # type: ignore[method-assign]
 
         assert job_tracker.count_recent_post_processing_faults(1800) == 0
         plan = scheduler._plan_post_processing_reclaim(dispatched, device_index=None, dispatching_process_id=4)
+        assert plan.action is PostProcessingReclaimAction.INSUFFICIENT
         should_dispatch = await scheduler._enact_post_processing_reclaim(
             plan,
             dispatched,
@@ -244,7 +293,12 @@ class TestInsufficientFaultFeedsBreakerCounter:
         job_tracker = JobTracker()
         # The worker's default retry policy; a plain (retryable) fault would grant this job a second attempt.
         job_tracker.set_retry_policy(2)
-        scheduler = _contended_large_card_scheduler(job_tracker, _contended_process_map(), monkeypatch=monkeypatch)
+        scheduler = _contended_large_card_scheduler(
+            job_tracker,
+            _contended_process_map(),
+            monkeypatch=monkeypatch,
+            dispatched_peak_mb=_UNHOSTABLE_DISPATCHED_PEAK_MB,
+        )
         dispatched = await _seed_contended_card(scheduler)
 
         plan = scheduler._plan_post_processing_reclaim(dispatched, device_index=None, dispatching_process_id=4)

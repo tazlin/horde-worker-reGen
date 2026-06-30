@@ -187,19 +187,29 @@ that first -- even when freeing the dispatching job's own weights would nominall
 cover the peak -- because on a contended card that sibling model is the room the
 upscaler needs and the child's in-process `free_memory` cannot reach it. Only when
 no reclaimable sibling holds room does it defer to that in-child own-weights free,
-then to stopping an idle context on the contended card. A peak nothing the
-orchestrator can reclaim will host faults gracefully so the horde reissues the job,
-rather than dispatching it into a guaranteed stall. This is not only the tiny
-single-process card: a large card running several processes with post-processing
-overlap can have two or more siblings mid-upscale at once, whose committed peaks
-pull the effective free below zero, so even a 24 GB card declines a fresh peak when
-nothing is idle to reclaim. That fault is terminal (non-retryable): a local retry
-would only re-dispatch into the same unchanged, still-overflowing card, so the job
-is left for the horde to reissue elsewhere. It is evidence-gated: with the peak
-unknown or free VRAM
-unmeasured it does nothing, and on a roomy card where the peak already fits it is a
-no-op. Each decision is logged at debug with the peak, the effective free, and the
-chosen action, so a stall the reclaim declined to prevent leaves a trace.
+then to stopping an idle context on the contended card. When none of those can free
+room *now*, it asks one more question before faulting: can the card host the peak at
+all? If the peak fits the card drained to this job's process alone and a sibling is
+mid-inference whose completion will free the room, the dispatch is *held* (the job
+keeps its head-of-queue position) until that room appears, rather than faulting a job
+the card can serve moments from now. This matters most on the large-card overlap
+case: a 24 GB card running several processes can have two or more siblings mid-upscale
+at once, whose committed peaks pull the effective free below zero, yet a fresh ~5 GB
+peak still fits the card the instant a sibling finishes, so waiting beats faulting.
+The hold is self-bounding and wedge-safe: it only ever spans a window the recovery
+supervisor already exempts as inference-in-progress, and the moment no sibling is left
+in flight to free room the plan re-evaluates and faults instead of parking forever.
+
+Only a peak that cannot fit even the drained card (or one with no in-flight sibling to
+wait on, such as the tiny single-process card) faults gracefully so the horde reissues
+the job, rather than dispatching it into a guaranteed stall. That fault is terminal
+(non-retryable): a local retry would only re-dispatch into the same unchanged,
+still-overflowing card, so the job is left for the horde to reissue elsewhere. The
+whole mechanism is evidence-gated: with the peak unknown or free VRAM unmeasured it
+does nothing, and on a roomy card where the peak already fits it is a no-op. Each
+decision is logged at debug with the peak, the effective free, and the chosen action,
+and a held dispatch logs its hold and surfaces in the dispatch-stall diagnostic, so a
+stall the reclaim declined to prevent (or chose to wait out) leaves a trace.
 
 `post_processing_fault_breaker_enabled` is the self-protective backstop. If
 post-processing peaks keep failing to host (more than

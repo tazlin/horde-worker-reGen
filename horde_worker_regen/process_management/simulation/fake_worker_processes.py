@@ -691,6 +691,7 @@ def start_fake_inference_process(
     dry_run_skip_inference: bool = False,
     dry_run_inference_delay: float = 1.0,
     gpu_sampling_lease: Semaphore | None = None,
+    expect_image_models: bool = True,
     fail_every_n: int = 0,
     fault_profile: FaultProfile | None = None,
     sim_vram_ledger: SimVramLedger | None = None,
@@ -700,8 +701,9 @@ def start_fake_inference_process(
     """Start a fake inference process.
 
     Signature-compatible with ``worker_entry_points.start_inference_process`` so it can
-    be injected as a drop-in multiprocessing target. Memory/GPU related arguments are
-    accepted and ignored; ``dry_run_inference_delay`` controls how long fake jobs take.
+    be injected as a drop-in multiprocessing target. Memory/GPU related arguments (and
+    ``expect_image_models``, which only gates the real worker's image-model presence check)
+    are accepted and ignored; ``dry_run_inference_delay`` controls how long fake jobs take.
     ``fail_every_n`` makes every nth job report a faulted result (0 = never), and
     ``fault_profile`` scripts richer misbehaviour (hang, crash, drop heartbeats, slow, OOM,
     corrupt message), letting harnesses exercise the recovery paths. ``sim_vram_ledger`` (with

@@ -22,8 +22,11 @@ it can actually reclaim:
    suffices on an otherwise-uncontended card, so no orchestrator action is needed.
 4. :attr:`PostProcessingReclaimAction.REDUCE_CONTEXT`: nothing idle holds an evictable model, so a sibling
    process is stopped to reclaim its (contended-card-scoped) context (the rare last rung).
-5. :attr:`PostProcessingReclaimAction.INSUFFICIENT`: no orchestrator-reclaimable room hosts the peak (a
-   single-process worker on a tiny card), so the job faults gracefully rather than thrashing the card.
+5. :attr:`PostProcessingReclaimAction.DEFER`: nothing idle is reclaimable now, but the peak fits the card
+   drained to this job's process alone and a sibling is mid-inference whose completion will free the room,
+   so the dispatch is held (the job keeps its head-of-queue position) until that room appears.
+6. :attr:`PostProcessingReclaimAction.INSUFFICIENT`: waiting cannot help either (no in-flight sibling will
+   free room, or the peak overflows even the card alone), so the job faults gracefully rather than thrashing.
 
 Each test fixes a card layout and asserts the planner returns the action that layout calls for.
 """
@@ -35,6 +38,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
+from horde_worker_regen.process_management.jobs.job_models import NextJobAndProcess
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
@@ -296,11 +300,12 @@ async def test_reduces_context_when_no_idle_sibling_model(monkeypatch: pytest.Mo
 
 
 async def test_insufficient_when_single_process_and_peak_overflows(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A single-process worker on a tiny card cannot reclaim cross-process room -> fault, never park.
+    """A single-process worker cannot reclaim cross-process room and has no sibling to wait on -> fault.
 
-    There is no idle sibling to evict and no context to reduce (the one process is running the job), so the
-    planner reports the peak as unhostable rather than demanding a teardown it cannot satisfy. The graceful
-    fault this drives feeds the post-processing circuit breaker.
+    There is no idle sibling to evict, no context to reduce, and no other process inferencing whose
+    completion would free room (the one process is running the job). Even though the peak fits the card
+    alone, waiting cannot help, so the planner reports it unhostable rather than parking the dispatch
+    forever. The graceful fault this drives feeds the post-processing circuit breaker.
     """
     job_tracker = JobTracker()
     dispatched = make_job_pop_response(model=_MODEL)
@@ -324,8 +329,89 @@ async def test_insufficient_when_single_process_and_peak_overflows(monkeypatch: 
         peak_for_model=_MODEL,
         process_map=process_map,
     )
+    # Roomy card (the peak fits it alone), so the fault is driven purely by the absence of a sibling whose
+    # completion would free room, not by the peak being too large for the device.
+    scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=24000.0)  # type: ignore[method-assign]
 
-    plan = scheduler._plan_post_processing_reclaim(dispatched, device_index=None)
+    plan = scheduler._plan_post_processing_reclaim(dispatched, device_index=None, dispatching_process_id=0)
+    assert plan.action is PostProcessingReclaimAction.INSUFFICIENT
+
+
+async def test_defers_when_peak_fits_alone_and_an_in_flight_sibling_will_free_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A peak that overflows the contended card now, but fits it alone, with a sibling mid-inference -> defer.
+
+    Nothing idle holds reclaimable room (the sibling is busy post-processing, not idle and evictable), but
+    the peak fits the card drained to this job's process alone and the busy sibling's completion will free
+    that room. Holding the dispatch and keeping the head's position beats faulting a job the card can host
+    moments from now.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+    await job_tracker.mark_inference_started(dispatched)
+    sibling_job = make_job_pop_response(model=_OTHER_MODEL)
+    await track_popped_job_async(job_tracker, sibling_job)
+    await job_tracker.mark_inference_started(sibling_job)
+
+    process_map = ProcessMap(
+        {
+            0: make_mock_process_info(process_id=0, model_name=_MODEL, state=HordeProcessState.INFERENCE_STARTING),
+            # A sibling actively post-processing: busy now (not idle/evictable), frees its room on completion.
+            1: make_mock_process_info(
+                process_id=1,
+                model_name=_OTHER_MODEL,
+                state=HordeProcessState.INFERENCE_POST_PROCESSING,
+            ),
+        },
+    )
+
+    scheduler = _scheduler_with_post_processing_peak(
+        job_tracker,
+        monkeypatch=monkeypatch,
+        free_vram_mb=_FREE_VRAM_NEEDS_SIBLING_MB,
+        peak_for_model=_MODEL,
+        process_map=process_map,
+    )
+    scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=24000.0)  # type: ignore[method-assign]
+
+    plan = scheduler._plan_post_processing_reclaim(dispatched, device_index=None, dispatching_process_id=0)
+    assert plan.action is PostProcessingReclaimAction.DEFER
+
+
+async def test_faults_when_peak_cannot_fit_even_the_drained_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A peak too large for even the card alone faults despite an in-flight sibling: waiting cannot host it."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+    await job_tracker.mark_inference_started(dispatched)
+    sibling_job = make_job_pop_response(model=_OTHER_MODEL)
+    await track_popped_job_async(job_tracker, sibling_job)
+    await job_tracker.mark_inference_started(sibling_job)
+
+    process_map = ProcessMap(
+        {
+            0: make_mock_process_info(process_id=0, model_name=_MODEL, state=HordeProcessState.INFERENCE_STARTING),
+            1: make_mock_process_info(
+                process_id=1,
+                model_name=_OTHER_MODEL,
+                state=HordeProcessState.INFERENCE_POST_PROCESSING,
+            ),
+        },
+    )
+
+    scheduler = _scheduler_with_post_processing_peak(
+        job_tracker,
+        monkeypatch=monkeypatch,
+        free_vram_mb=_FREE_VRAM_NEEDS_SIBLING_MB,
+        peak_for_model=_MODEL,
+        process_map=process_map,
+    )
+    # A card so small the ~8.5 GB peak overflows it even alone (peak > total - overhead - reserve).
+    scheduler._process_map.get_reported_total_vram_mb = Mock(return_value=7000.0)  # type: ignore[method-assign]
+
+    plan = scheduler._plan_post_processing_reclaim(dispatched, device_index=None, dispatching_process_id=0)
     assert plan.action is PostProcessingReclaimAction.INSUFFICIENT
 
 
@@ -523,6 +609,48 @@ class TestPostProcessingReclaimEnactment:
         scheduler.unload_models_from_vram.assert_not_called()
         scheduler._process_lifecycle.scale_inference_processes.assert_not_called()
         scheduler._job_tracker.handle_job_fault.assert_not_awaited()
+
+
+class TestPostProcessingDeferHoldsDispatch:
+    """A DEFER plan holds the dispatch (job keeps its position) without faulting it."""
+
+    async def test_defer_returns_false_and_does_not_fault(self) -> None:
+        """``start_inference`` declines to dispatch on a DEFER plan, leaving the job queued and unfaulted.
+
+        The hold keeps the job out of ``jobs_in_progress`` (it never starts), never invokes the reclaim
+        enactment (no eviction/teardown for a hold), never faults, and records the defer for the dispatch
+        stall diagnostic so the parked head reads as an explained wait.
+        """
+        job_tracker = JobTracker()
+        dispatched = make_job_pop_response(model=_MODEL)
+        await track_popped_job_async(job_tracker, dispatched)
+        process_map = ProcessMap(
+            {0: make_mock_process_info(process_id=0, model_name=_MODEL, state=HordeProcessState.WAITING_FOR_JOB)},
+        )
+        bridge_data = make_mock_bridge_data(enable_vram_budget=True, vram_reserve_mb=2048, ram_reserve_mb=4096)
+        scheduler = _make_inference_scheduler(
+            job_tracker=job_tracker,
+            bridge_data=bridge_data,
+            process_map=process_map,
+        )
+        scheduler.get_next_job_and_process = AsyncMock(  # type: ignore[method-assign]
+            return_value=NextJobAndProcess(next_job=dispatched, process_with_model=process_map[0]),
+        )
+        scheduler._should_keep_model_resident = Mock(return_value=False)  # type: ignore[method-assign]
+        scheduler._plan_post_processing_reclaim = Mock(  # type: ignore[method-assign]
+            return_value=PostProcessingReclaimPlan(action=PostProcessingReclaimAction.DEFER, shortfall_mb=1234.0),
+        )
+        scheduler._enact_post_processing_reclaim = AsyncMock()  # type: ignore[method-assign]
+        scheduler._job_tracker.handle_job_fault = AsyncMock()  # type: ignore[method-assign]
+
+        result = await scheduler.start_inference()
+
+        assert result is False
+        scheduler._enact_post_processing_reclaim.assert_not_awaited()
+        scheduler._job_tracker.handle_job_fault.assert_not_awaited()
+        assert dispatched not in job_tracker.jobs_in_progress
+        assert scheduler._post_processing_dispatch_defer is not None
+        assert scheduler._post_processing_dispatch_defer[0] == str(dispatched.id_)
 
 
 async def test_no_reclaim_when_job_has_no_post_processing(monkeypatch: pytest.MonkeyPatch) -> None:

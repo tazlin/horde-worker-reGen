@@ -79,10 +79,14 @@ class PostProcessingReclaimAction(enum.Enum):
        on an idle sibling process (the running model may still be demanded by the queue, so it is kept).
     3. :attr:`REDUCE_CONTEXT`: nothing idle holds an evictable model, so stop a sibling process to reclaim
        its context. Expected only on the smallest cards or one over-committed by out-of-worker allocation.
+    4. :attr:`DEFER`: nothing idle is reclaimable right now, but the peak fits the card drained to this
+       job's process alone and a sibling is mid-inference whose completion will free the room, so hold the
+       dispatch (the job keeps its head-of-queue position) until that room appears rather than faulting it.
 
     :attr:`NONE` means the peak fits as-is (or the job does no post-processing). :attr:`INSUFFICIENT` means
-    no reclaim the orchestrator can perform hosts the peak (e.g. a single-process worker on a tiny card), so
-    the job must fault gracefully rather than thrash; that fault feeds the post-processing circuit breaker.
+    no reclaim the orchestrator can perform and no in-flight sibling will free room hosts the peak (e.g. a
+    single-process worker on a tiny card, or a peak that overflows even the card alone), so the job must fault
+    gracefully rather than thrash; that fault feeds the post-processing circuit breaker.
     """
 
     NONE = enum.auto()
@@ -93,6 +97,8 @@ class PostProcessingReclaimAction(enum.Enum):
     """Evict a different model resident on an idle sibling process (cross-process room only the parent frees)."""
     REDUCE_CONTEXT = enum.auto()
     """Stop a sibling process to reclaim its context when nothing idle is evictable (the rare last rung)."""
+    DEFER = enum.auto()
+    """Hold the dispatch (keep the head's position) until an in-flight sibling frees room the peak fits into."""
     INSUFFICIENT = enum.auto()
     """No orchestrator-reclaimable room hosts the peak; fault gracefully and feed the circuit breaker."""
 
@@ -453,6 +459,12 @@ class InferenceScheduler:
         # than every sub-second control-loop tick.
         self._dispatch_stall_last_reason: str | None = None
         self._dispatch_stall_log_time: float = 0.0
+
+        # The head whose dispatch is currently held for post-processing-peak headroom (job id, shortfall MB),
+        # or None. Set when a dispatch defers (the peak overflows the contended card now but fits it alone and
+        # an in-flight sibling will free room); read by the dispatch-stall diagnostic so a held head reads as
+        # an explained wait. Cleared the moment any job dispatches.
+        self._post_processing_dispatch_defer: tuple[str | None, float] | None = None
 
     def set_churn_observer(self, observer: Callable[[ChurnKind], None]) -> None:
         """Register the sink for between-jobs reload/respawn events (see :data:`ChurnKind`)."""
@@ -1676,6 +1688,18 @@ class InferenceScheduler:
             return (
                 f"its model is resident and idle on process {process.process_id}, but its whole-card residency "
                 f"has not yet converged to sole residency (siblings still tearing down or the device draining)"
+            )
+
+        if (
+            self._post_processing_dispatch_defer is not None
+            and head.id_ is not None
+            and self._post_processing_dispatch_defer[0] == str(head.id_)
+        ):
+            shortfall_mb = self._post_processing_dispatch_defer[1]
+            return (
+                f"its model is resident and idle on process {process.process_id}, but dispatch is held for "
+                f"post-processing-peak headroom (~{shortfall_mb:.0f}MB short on the contended card); it keeps "
+                "its head-of-queue position and dispatches once an in-flight sibling frees room"
             )
 
         return (
@@ -3695,6 +3719,22 @@ class InferenceScheduler:
                 target_process_id=idle_siblings[0].process_id,
                 shortfall_mb=shortfall_mb,
             )
+        elif self._post_processing_peak_fits_solo(
+            post_processing_peak_mb,
+            device_index=device_index,
+        ) and self._post_processing_reclaim_can_wait(
+            dispatching_process_id=dispatching_process_id,
+            device_index=device_index,
+        ):
+            # Nothing idle is reclaimable right now, but the peak would fit once the card drains to this job's
+            # process alone, and a sibling is mid-inference whose completion frees that room. Hold the dispatch
+            # (the job keeps its head-of-queue position) rather than faulting a job the card can host moments
+            # from now. The wait is wedge-exempt while sibling inference is in progress, and self-bounds: once
+            # no sibling is left in flight to free room, this condition fails and the plan faults terminally.
+            plan = PostProcessingReclaimPlan(
+                action=PostProcessingReclaimAction.DEFER,
+                shortfall_mb=shortfall_mb,
+            )
         else:
             plan = PostProcessingReclaimPlan(
                 action=PostProcessingReclaimAction.INSUFFICIENT,
@@ -3710,6 +3750,83 @@ class InferenceScheduler:
             f"{evictable_sibling is not None}).",
         )
         return plan
+
+    def _post_processing_peak_fits_solo(self, post_processing_peak_mb: float, *, device_index: int | None) -> bool:
+        """Whether a post-processing peak fits the card drained to this job's process alone.
+
+        The achievable headroom under sole residency is the device total less one process context (the
+        per-process overhead the upscaler's own process keeps) and the configured VRAM reserve; the job's own
+        diffusion weights are freed in-child during the upscale, so they are not charged here (mirroring the
+        :attr:`PostProcessingReclaimAction.DELEGATE_IN_PROCESS` rung). A peak that exceeds even this can never
+        be hosted on the card no matter how it drains, so waiting cannot help and the caller faults instead of
+        deferring. Unknown total VRAM (cold start) reads False, the conservative direction (do not defer on a
+        guess).
+        """
+        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        if total_vram_mb is None:
+            return False
+        configured_reserve = config_number(self._runtime_config.bridge_data.vram_reserve_mb)
+        reserve_mb = configured_reserve if configured_reserve is not None and configured_reserve >= 0 else None
+        if reserve_mb is None:
+            reserve_mb = _DEFAULT_VRAM_RESERVE_MB
+        solo_free_mb = float(total_vram_mb) - self._per_process_overhead_mb() - reserve_mb
+        return post_processing_peak_mb <= solo_free_mb
+
+    def _post_processing_reclaim_can_wait(
+        self,
+        *,
+        dispatching_process_id: int | None,
+        device_index: int | None,
+    ) -> bool:
+        """Whether an in-flight sibling will free cross-process room as it completes.
+
+        A peak that overflows the contended card now but fits the card alone is hostable by waiting, not
+        faulting, only while a sibling is actively *inferencing* (sampling or post-processing): its completion
+        releases the activations/upscaler VRAM and leaves its model idle and evictable, which is the room the
+        upscaler needs. Siblings that are merely preloading or starting are excluded, since those grow the
+        card's commitment rather than freeing it. With no such sibling (a single-process worker, or every
+        sibling already idle and unevictable) waiting cannot help, so the caller faults. This is also what
+        keeps the deferral wedge-safe: it holds the dispatch only over a window the recovery supervisor
+        already exempts as inference-in-progress, and the moment that window closes the dispatch faults
+        rather than parking.
+        """
+        for process_info in self._process_map.values():
+            if process_info.process_type is not HordeProcessType.INFERENCE:
+                continue
+            if dispatching_process_id is not None and process_info.process_id == dispatching_process_id:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.last_process_state in (
+                HordeProcessState.INFERENCE_STARTING,
+                HordeProcessState.INFERENCE_POST_PROCESSING,
+            ):
+                return True
+        return False
+
+    def _note_post_processing_dispatch_defer(
+        self,
+        job: ImageGenerateJobPopResponse,
+        shortfall_mb: float,
+    ) -> None:
+        """Record, and throttled-log, that a job's dispatch is held for post-processing-peak headroom.
+
+        The job keeps its head-of-queue position; the recorded state lets the dispatch-stall diagnostic name
+        the hold rather than report a gate-less scheduler stall. The log is collapsed to one line per changed
+        (job, shortfall) so a multi-second hold does not flood the file each control-loop tick.
+        """
+        job_id = str(job.id_) if job.id_ is not None else None
+        self._post_processing_dispatch_defer = (job_id, shortfall_mb)
+        state_key = (job_id, self._diagnostic_mb_bucket(shortfall_mb))
+        suppressed_count = self._scheduler_diagnostic_suppressed_count("post_processing_dispatch_defer", state_key)
+        if suppressed_count is None:
+            return
+        logger.info(
+            f"Post-processing reclaim: holding dispatch of job {str(job_id)[:8]} ({job.model}); its "
+            f"post-processing peak overflows the contended card by ~{shortfall_mb:.0f}MB now but fits the card "
+            "alone, and an in-flight sibling will free the room. Keeping its head-of-queue position rather "
+            f"than faulting it{self._suppressed_suffix(suppressed_count)}.",
+        )
 
     async def _enact_post_processing_reclaim(
         self,
@@ -3985,19 +4102,8 @@ class InferenceScheduler:
             # fit, independent of the unload_models_from_vram_often setting.
             self.unload_models_from_vram(process_with_model)
 
-        color_format_string = "<fg #f0beff>{message}</>"
-
-        logger.opt(ansi=True).info(
-            color_format_string.format(
-                message=f"Starting inference for job {str(next_job.id_)[:8]} "
-                f"on process {process_with_model.process_id}",
-            ),
-        )
-
         if next_job.model is None:
             raise ValueError(f"next_job.model is None ({next_job})")
-
-        self._log_job_dispatch_details(next_job)
 
         process_with_model.batch_amount = next_job.payload.n_iter
         # Record the card this job runs on (None on a single-GPU host) so its over-budget fault streak is
@@ -4018,6 +4124,13 @@ class InferenceScheduler:
                 device_index=dispatched_device_index,
                 dispatching_process_id=process_with_model.process_id,
             )
+            if reclaim_plan.action is PostProcessingReclaimAction.DEFER:
+                # The peak overflows the contended card now but fits the card alone, and an in-flight sibling
+                # will free the room as it completes. Hold the dispatch and keep the head's position rather
+                # than faulting a job the card can host shortly; the next pass re-plans against the drained
+                # card and dispatches (or, once no sibling is left in flight, faults terminally).
+                self._note_post_processing_dispatch_defer(next_job, reclaim_plan.shortfall_mb)
+                return False
             should_dispatch = await self._enact_post_processing_reclaim(
                 reclaim_plan,
                 next_job,
@@ -4026,7 +4139,21 @@ class InferenceScheduler:
             )
             if not should_dispatch:
                 self._pending_line_skip = None
+                self._post_processing_dispatch_defer = None
                 return True
+
+        self._post_processing_dispatch_defer = None
+
+        # Past every hold/fault gate: this job is dispatching now, so emit the start logging here rather than
+        # before the reclaim decision (where a deferred or faulted job would mislead the log as "starting").
+        color_format_string = "<fg #f0beff>{message}</>"
+        logger.opt(ansi=True).info(
+            color_format_string.format(
+                message=f"Starting inference for job {str(next_job.id_)[:8]} "
+                f"on process {process_with_model.process_id}",
+            ),
+        )
+        self._log_job_dispatch_details(next_job)
 
         await self._dispatch_inference_message(
             next_job,

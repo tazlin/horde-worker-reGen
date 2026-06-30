@@ -168,10 +168,12 @@ those jobs and waiting for the next one only feeds the forced-maintenance spiral
 So the worker also withdraws the failing capability before that happens.
 
 The **post-processing fault breaker** is the instance of this for post-processing.
-A post-processing peak that cannot be hosted (see
+A post-processing peak that cannot be hosted *at all* (see
 [post-processing VRAM over-commit](bridge_config.md#post-processing-vram-over-commit))
-faults the job, and a watchdog-reaped post-processing stall does the same. The
-unhostable-peak fault is **terminal** (non-retryable): a local retry would only
+faults the job, and a watchdog-reaped post-processing stall does the same. A peak
+that only *transiently* overflows a contended card it would fit once drained is
+instead held until an in-flight sibling frees room, not faulted, so it never reaches
+the breaker. The unhostable-peak fault is **terminal** (non-retryable): a local retry would only
 re-dispatch the job into the same unchanged, still-overflowing card (a guaranteed
 second fault), so the job is reissued by the horde elsewhere instead, and one
 placement failure feeds the breaker exactly one count. Both sources feed a
