@@ -35,7 +35,7 @@ from horde_worker_regen.benchmark.report import SuggestedBridgeData
 from horde_worker_regen.benchmark.scenarios import (
     CannedAlchemyFormSpec,
     CannedImageJobSpec,
-    ScenarioSpec,
+    Scenario,
 )
 
 _SOAK_POST_PROCESSING = [KNOWN_UPSCALERS.RealESRGAN_x4plus.value, KNOWN_FACEFIXERS.GFPGAN.value]
@@ -63,7 +63,7 @@ def build_soak_scenario(
     *,
     soak_seconds: float,
     model_pool: list[str] | None = None,
-) -> ScenarioSpec:
+) -> Scenario:
     """Build a sustained, mixed workload weighted toward the jobs that max the chosen config.
 
     Each spec's ``count`` is used as a *relative weight* (the soak generates jobs continuously
@@ -123,7 +123,7 @@ def build_soak_scenario(
             CannedAlchemyFormSpec(form=KNOWN_FACEFIXERS.GFPGAN.value, count=1),
         ]
 
-    return ScenarioSpec(
+    return Scenario(
         name=f"{tier}-soak",
         image_jobs=image_jobs,
         alchemy_forms=alchemy_forms,

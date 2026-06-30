@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics, ModelLoadEvent, SamplingStats
 
+from horde_worker_regen.benchmark.capabilities.stats import _post_warmup_vram_reloads
 from horde_worker_regen.benchmark.criteria import LevelStats
 from horde_worker_regen.benchmark.ladder import LadderOptions, build_default_ladder
 from horde_worker_regen.benchmark.report import (
@@ -11,7 +12,6 @@ from horde_worker_regen.benchmark.report import (
     HarnessSummary,
     LevelReport,
     LevelRunResult,
-    _post_warmup_vram_reloads,
     compute_level_stats,
     render_markdown,
     synthesize_bridge_data,

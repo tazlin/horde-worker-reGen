@@ -16,7 +16,7 @@ from horde_worker_regen.benchmark.controller import (
 from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage
 from horde_worker_regen.benchmark.ladder import LadderOptions, RampLevel, build_default_ladder
 from horde_worker_regen.benchmark.report import MachineInfo
-from horde_worker_regen.benchmark.scenarios import CannedImageJobSpec, ScenarioSpec
+from horde_worker_regen.benchmark.scenarios import CannedImageJobSpec, Scenario
 
 
 def _mini_ladder(jobs: int = 2) -> list[RampLevel]:
@@ -247,7 +247,7 @@ def test_no_validate_skips_soak(tmp_path: Path) -> None:
 @pytest.mark.e2e
 def test_failed_axis_skips_higher_rungs(tmp_path: Path) -> None:
     """A failing level stops higher rungs on its axis; the ramp itself continues."""
-    scenario = ScenarioSpec(
+    scenario = Scenario(
         name="never-arrives",
         image_jobs=[CannedImageJobSpec(count=2)],
         # Steady arrival at 0.1 jobs/min: the first job is available immediately, but the

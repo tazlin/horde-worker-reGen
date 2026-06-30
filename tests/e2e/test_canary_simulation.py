@@ -15,21 +15,14 @@ from dataclasses import dataclass
 import pytest
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 
+from horde_worker_regen.benchmark.scenarios import CannedImageJobSpec, Scenario
 from horde_worker_regen.harness import HarnessConfig, HarnessResult, run_harness_async
 from horde_worker_regen.process_management.process_manager import SystemResources
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
     make_alchemy_scenario,
-    make_batch_scenario,
     make_canned_job,
-    make_controlnet_scenario,
-    make_hires_fix_scenario,
-    make_lora_scenario,
-    make_mixed_model_scenario,
-    make_post_processing_scenario,
-    make_ti_scenario,
-    make_varied_size_scenario,
 )
 from horde_worker_regen.process_management.simulation.fault_injection import FaultProfile
 
@@ -80,31 +73,52 @@ def _system_resources(
 
 def _feature_mix_scenario() -> list[ImageGenerateJobPopResponse]:
     """Queue with features that touch routing, safety, submit, and aux/preload metadata paths."""
-    return [
-        make_canned_job("Deliberate", width=512, height=512, ddim_steps=20),
-        make_controlnet_scenario(1, model_name="Deliberate", control_type="canny")[0],
-        make_hires_fix_scenario(1, model_name="Deliberate", width=768, height=768)[0],
-        make_post_processing_scenario(1, model_name="Deliberate", post_processors=["RealESRGAN_x4plus"])[0],
-        make_canned_job("Deliberate", width=640, height=832, ddim_steps=25),
-    ]
+    return Scenario(
+        name="canary-feature-mix",
+        image_jobs=[
+            CannedImageJobSpec(model="Deliberate", width=512, height=512, steps=20),
+            CannedImageJobSpec(model="Deliberate", control_type="canny"),
+            CannedImageJobSpec(model="Deliberate", width=768, height=768, hires_fix=True),
+            CannedImageJobSpec(model="Deliberate", post_processing=["RealESRGAN_x4plus"]),
+            CannedImageJobSpec(model="Deliberate", width=640, height=832, steps=25),
+        ],
+    ).expand_image_jobs()
 
 
 def _mainstream_mixed_queue() -> list[ImageGenerateJobPopResponse]:
-    """Mixed model and image-size pressure without making the run long."""
-    scenario = make_mixed_model_scenario(4, ["Deliberate", "Anything Diffusion"])
-    scenario.extend(make_varied_size_scenario(3, model_name="Deliberate"))
-    scenario.extend(make_batch_scenario(1, 2, model_name="Anything Diffusion"))
-    return scenario
+    """Mixed model and image-size pressure without making the run long.
+
+    The two models alternate (rather than grouping) to keep the scheduler preloading, swapping, and
+    unloading between jobs; the explicit per-job specs preserve that interleaving.
+    """
+    return Scenario(
+        name="canary-mainstream-mixed",
+        image_jobs=[
+            CannedImageJobSpec(model="Deliberate"),
+            CannedImageJobSpec(model="Anything Diffusion"),
+            CannedImageJobSpec(model="Deliberate"),
+            CannedImageJobSpec(model="Anything Diffusion"),
+            CannedImageJobSpec(model="Deliberate", width=512, height=512, steps=20),
+            CannedImageJobSpec(model="Deliberate", width=1024, height=1024, steps=50),
+            CannedImageJobSpec(model="Deliberate", width=768, height=768, steps=30),
+            CannedImageJobSpec(model="Anything Diffusion", n_iter=2),
+        ],
+    ).expand_image_jobs()
 
 
 def _aux_feature_churn_queue() -> list[ImageGenerateJobPopResponse]:
     """Aux/model-feature queue inspired by LoRA, TI, ControlNet, and post-processing repros."""
-    scenario = make_lora_scenario(2, ["canary-lora-a", "canary-lora-b"], model_name="Deliberate")
-    scenario.extend(make_ti_scenario(1, ["canary-ti"], model_name="Deliberate"))
-    scenario.extend(make_controlnet_scenario(1, model_name="Deliberate", control_type="canny"))
-    scenario.extend(make_post_processing_scenario(1, model_name="Deliberate", post_processors=["GFPGAN"]))
-    scenario.extend(make_batch_scenario(1, 2, model_name="Deliberate"))
-    return scenario
+    return Scenario(
+        name="canary-aux-feature-churn",
+        image_jobs=[
+            CannedImageJobSpec(model="Deliberate", lora_names=["canary-lora-a"]),
+            CannedImageJobSpec(model="Deliberate", lora_names=["canary-lora-b"]),
+            CannedImageJobSpec(model="Deliberate", ti_names=["canary-ti"]),
+            CannedImageJobSpec(model="Deliberate", control_type="canny"),
+            CannedImageJobSpec(model="Deliberate", post_processing=["GFPGAN"]),
+            CannedImageJobSpec(model="Deliberate", n_iter=2),
+        ],
+    ).expand_image_jobs()
 
 
 def _transient_resource_fault_queue() -> list[ImageGenerateJobPopResponse]:

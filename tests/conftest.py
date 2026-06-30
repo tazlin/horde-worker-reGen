@@ -1,6 +1,7 @@
 """Configures pytest and creates fixtures."""
 
 # import hordelib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,6 +12,34 @@ try:
     import tomllib
 except ModuleNotFoundError:
     import tomli as tomllib
+
+
+_PROBE_TIMINGS: list[tuple[str, str]] = []
+"""(capability slug, one-line timing summary) recorded by capability-probe tests for the end-of-run table.
+
+Each cold capability probe boots its own worker, so a probe's wall-clock is dominated by startup and the
+one-time model load, not inference. Collecting each probe's breakdown and printing it as a session-end
+table makes that warmup-versus-inference split visible across a whole run, where the per-probe loguru
+line is otherwise lost once the harness tears down the console sink."""
+
+
+@pytest.fixture
+def record_probe_timing() -> Callable[[str, str], None]:
+    """Return a callback a probe test calls with its capability slug and ``ProbeTiming.summary()``."""
+
+    def _record(slug: str, summary: str) -> None:
+        _PROBE_TIMINGS.append((slug, summary))
+
+    return _record
+
+
+def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    """Print the collected capability-probe timing breakdowns (warmup vs inference) after the run."""
+    if not _PROBE_TIMINGS:
+        return
+    terminalreporter.section("capability probe timing (warmup vs inference)")
+    for slug, summary in _PROBE_TIMINGS:
+        terminalreporter.write_line(f"{slug}: {summary}")
 
 
 def _cuda_device_present() -> bool:

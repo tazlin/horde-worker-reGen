@@ -1,4 +1,4 @@
-"""Tests for the canned scenario factories, arrival control, and ScenarioSpec (no GPU)."""
+"""Tests for the canned scenario factories, arrival control, and Scenario (no GPU)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import pytest
 from horde_worker_regen.benchmark.scenarios import (
     CannedAlchemyFormSpec,
     CannedImageJobSpec,
-    ScenarioSpec,
+    Scenario,
 )
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     ArrivalSchedule,
@@ -134,11 +134,11 @@ class TestTimedJobSource:
         assert source.next_pop_response().id_ is not None
 
 
-class TestScenarioSpec:
+class TestScenario:
     """The declarative spec expands consistently for the harness path."""
 
-    def _spec(self) -> ScenarioSpec:
-        return ScenarioSpec(
+    def _spec(self) -> Scenario:
+        return Scenario(
             name="mixed",
             image_jobs=[
                 CannedImageJobSpec(model="Deliberate", count=2, lora_names=["lora-a"]),

@@ -1,6 +1,6 @@
 """Declarative workload descriptions shared by the harness and live load-gen paths.
 
-A :class:`ScenarioSpec` describes *what* work a benchmark level offers (image jobs with
+A :class:`Scenario` describes *what* work a benchmark level offers (image jobs with
 features, alchemy forms, and an arrival schedule) independently of *how* it is driven:
 ``to_canned_sources()`` produces the pop-side sources consumed by the e2e harness
 (``skip_api=True``), and the live path translates the same spec into SDK submit requests.
@@ -56,8 +56,14 @@ class CannedAlchemyFormSpec(BaseModel):
     count: int = 1
 
 
-class ScenarioSpec(BaseModel):
-    """A complete benchmark workload: image jobs + alchemy forms + arrival structure."""
+class Scenario(BaseModel):
+    """A complete benchmark workload: image jobs + alchemy forms + arrival structure.
+
+    This is the single source of truth for a workload across every driver: the benchmark CLI,
+    the e2e harness (``pytest -m e2e``, fake mode), and the gpu catalog (``pytest -m gpu``).
+    It owns *what* work runs; *how* it is perturbed (faults, simulated VRAM, arrival overrides)
+    stays as harness kwargs on the low-level path.
+    """
 
     name: str
     image_jobs: list[CannedImageJobSpec] = Field(default_factory=list)

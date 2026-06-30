@@ -14,21 +14,26 @@ aggressive default that only just fit or only just held together.
 
 from __future__ import annotations
 
-import statistics
 import time
-from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from horde_worker_regen.benchmark.capabilities.result import (
+    Finding,
+    HarnessSummary,
+    MachineInfo,
+    SuggestedBridgeData,
+    SuggestionBasis,
+    SuggestionDecision,
+    TierCapability,
+    WorkerCapabilities,
+)
+from horde_worker_regen.benchmark.capabilities.stats import level_stats_from_metrics
 from horde_worker_regen.benchmark.criteria import LevelStats
 from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage, BenchTier, FindingKind, LevelOutcome
 from horde_worker_regen.benchmark.ladder import BENCH_TIER_MODELS, RampLevel
-from horde_worker_regen.process_management.resources.duty_cycle import (
-    PHASE_ORDER,
-    phase_breakdown,
-    span_derived_busy_ratio,
-)
-from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord, RunMetricsSnapshot
+from horde_worker_regen.process_management.resources.duty_cycle import PHASE_ORDER
+from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot
 
 BENCHMARK_REPORT_SCHEMA_VERSION = 4
 """Bumped when the report schema changes incompatibly; stamped into every report for later reads.
@@ -60,30 +65,6 @@ def _current_worker_version() -> str:
     return __version__
 
 
-class Finding(BaseModel):
-    """One robustness problem observed during a level, for the remediation queue."""
-
-    kind: FindingKind
-    level_id: str
-    evidence: str
-
-
-class HarnessSummary(BaseModel):
-    """The JSON-friendly subset of a HarnessResult."""
-
-    num_jobs_expected: int = 0
-    num_jobs_completed: int = 0
-    num_jobs_faulted: int = 0
-    num_alchemy_forms_expected: int = 0
-    num_alchemy_forms_completed: int = 0
-    num_alchemy_forms_faulted: int = 0
-    elapsed_seconds: float = 0.0
-    timed_out: bool = False
-    audit_failures: list[str] = Field(default_factory=list)
-    exit_reason: str = ""
-    diagnostics: list[str] = Field(default_factory=list)
-
-
 class LevelRunResult(BaseModel):
     """What the level runner writes to disk: raw outcomes, no policy applied."""
 
@@ -105,140 +86,6 @@ class LevelReport(BaseModel):
     harness: HarnessSummary | None = None
     findings: list[Finding] = Field(default_factory=list)
     log_tail: list[str] = Field(default_factory=list)
-
-
-class MachineInfo(BaseModel):
-    """The hardware the benchmark ran on."""
-
-    gpu_name: str | None = None
-    total_vram_mb: int | None = None
-    total_ram_bytes: int | None = None
-
-
-class SuggestionBasis(StrEnum):
-    """Why a suggested setting holds the value it does, so a reader can tell proof from absence.
-
-    The crucial distinction is between a setting that is off because it was *tested and did not work*
-    (:attr:`DISABLED_FAILED`) and one that is off merely because it was *never tested*
-    (:attr:`UNTESTED_SKIPPED` / :attr:`NOT_IN_LADDER`); the recommendation looks identical in both
-    cases but means very different things to an operator.
-    """
-
-    PROVEN = "proven"
-    """A level on the relevant axis passed; the value is grounded in a real result."""
-    DISABLED_FAILED = "disabled_failed"
-    """A level on the axis ran and failed/crashed, so the capability is left off."""
-    UNTESTED_SKIPPED = "untested_skipped"
-    """The axis's only levels were skipped (pre-flight gate or cascade); never proven either way."""
-    NOT_IN_LADDER = "not_in_ladder"
-    """The axis was not part of this ladder at all (e.g. excluded by --no-features)."""
-    CAPPED_VRAM = "capped_vram"
-    """Held back to keep VRAM headroom on this machine, not for lack of capability."""
-    CAPPED_SOAK = "capped_soak"
-    """Downgraded because the sustained-load soak did not hold up under combined load."""
-
-
-class SuggestionDecision(BaseModel):
-    """The provenance of one suggested setting: its value and why the synthesis chose it."""
-
-    setting: str
-    value: bool | int | list[str]
-    basis: SuggestionBasis
-    detail: str = ""
-
-
-class SuggestedBridgeData(BaseModel):
-    """A conservative bridgeData recommendation derived from the stable levels.
-
-    Unlike a raw "highest passing rung" readout, this keeps VRAM headroom (only models that fit with
-    headroom are loaded), prefers a batch size that passed without robustness findings, and has
-    concurrent alchemy disabled if the sustained-load soak did not hold up. ``decisions`` records the
-    basis behind every value (proven / failed / untested / capped) and ``notes`` the human-readable
-    downgrades, for the report.
-    """
-
-    max_threads: int = 1
-    queue_size: int = 1
-    max_batch: int = 1
-    allow_lora: bool = False
-    allow_controlnet: bool = False
-    allow_sdxl_controlnet: bool = False
-    allow_post_processing: bool = False
-    models_to_load: list[str] = Field(default_factory=list)
-    alchemist: bool = False
-    alchemy_allow_concurrent: bool = False
-    alchemy_max_concurrency: int = 1
-    decisions: list[SuggestionDecision] = Field(default_factory=list)
-    """Per-setting provenance: the basis behind each suggested value (not part of the bridgeData)."""
-    notes: list[str] = Field(default_factory=list)
-    """Human-readable rationale for the conservative choices (not part of the bridgeData itself)."""
-
-    def as_yaml_block(self) -> str:
-        """Render as a bridgeData.yaml-compatible snippet."""
-        lines = [
-            f"max_threads: {self.max_threads}",
-            f"queue_size: {self.queue_size}",
-            f"max_batch: {self.max_batch}",
-            f"allow_lora: {str(self.allow_lora).lower()}",
-            f"allow_controlnet: {str(self.allow_controlnet).lower()}",
-            f"allow_sdxl_controlnet: {str(self.allow_sdxl_controlnet).lower()}",
-            f"allow_post_processing: {str(self.allow_post_processing).lower()}",
-            "models_to_load:",
-            *[f'  - "{model}"' for model in self.models_to_load],
-            f"alchemist: {str(self.alchemist).lower()}",
-            f"alchemy_allow_concurrent: {str(self.alchemy_allow_concurrent).lower()}",
-            f"alchemy_max_concurrency: {self.alchemy_max_concurrency}",
-        ]
-        return "\n".join(lines)
-
-    def to_bridge_overrides(self) -> dict[str, object]:
-        """The worker bridge-data fields this recommendation sets (for the validation run).
-
-        ``max_batch`` is intentionally excluded: batch size is a per-job payload value, not a
-        worker config field, so the soak applies it through its job templates instead.
-        """
-        return {
-            "max_threads": self.max_threads,
-            "queue_size": self.queue_size,
-            "allow_lora": self.allow_lora,
-            "allow_controlnet": self.allow_controlnet,
-            "allow_sdxl_controlnet": self.allow_sdxl_controlnet,
-            "allow_post_processing": self.allow_post_processing,
-            "models_to_load": list(self.models_to_load),
-            "alchemist": self.alchemist,
-            "alchemy_allow_concurrent": self.alchemy_allow_concurrent,
-            "alchemy_max_concurrency": self.alchemy_max_concurrency,
-        }
-
-
-class TierCapability(BaseModel):
-    """What one model tier proved during the ramp."""
-
-    tier: BenchTier
-    model_name: str
-    baseline_passed: bool
-    observed_its_p50: float | None = None
-    max_stable_batch: int = 1
-    """The largest batch rung that passed with no robustness findings."""
-    peak_vram_mb: int | None = None
-    fits_with_headroom: bool = False
-    """Whether the tier's baseline peak VRAM left the headroom reserve free (drives models_to_load)."""
-
-
-class WorkerCapabilities(BaseModel):
-    """Everything the worker proved it can do, independent of the conservative recommendation."""
-
-    tiers: list[TierCapability] = Field(default_factory=list)
-    supports_hires_fix: bool = False
-    supports_post_processing: bool = False
-    supports_controlnet: bool = False
-    """Classic SD1.5 preprocessor controlnet (canny/depth/openpose)."""
-    supports_qr_code: bool = False
-    """The QR-code controlnet workflow (the SDXL controlnet capability)."""
-    supports_alchemy_clip: bool = False
-    supports_alchemy_graph: bool = False
-    supports_alchemy_concurrent: bool = False
-    supports_lora: bool = False
 
 
 class BenchmarkReport(BaseModel):
@@ -266,132 +113,15 @@ class BenchmarkReport(BaseModel):
         return [finding for level in self.levels for finding in level.findings]
 
 
-def _percentile(values: list[float], fraction: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
-    return ordered[index]
-
-
-def _its_retention(jobs: list[JobMetricsRecord]) -> float | None:
-    """Median sampling rate of the second half of completed image jobs ÷ that of the first half.
-
-    Ordered by completion time, this catches throughput decay over a sustained run (thermal
-    throttling, a VRAM/RAM leak, queue backpressure). Returns None without enough samples.
-    """
-    timed: list[tuple[float, float]] = []
-    for job in jobs:
-        if job.is_alchemy or job.phase_metrics is None or job.phase_metrics.sampling is None:
-            continue
-        its = job.phase_metrics.sampling.iterations_per_second
-        finalized = job.stage_timestamps.get("FINALIZED")
-        if its > 0 and finalized is not None:
-            timed.append((finalized, its))
-
-    if len(timed) < 4:
-        return None
-
-    timed.sort(key=lambda entry: entry[0])
-    midpoint = len(timed) // 2
-    first_half = statistics.median([its for _, its in timed[:midpoint]])
-    second_half = statistics.median([its for _, its in timed[midpoint:]])
-    if first_half <= 0:
-        return None
-    return second_half / first_half
-
-
-def _post_warmup_vram_reloads(jobs: list[JobMetricsRecord]) -> int | None:
-    """RAM->VRAM reloads across image jobs after the first completed one (warm-up excluded).
-
-    Orders jobs by completion and drops the first (the unavoidable cold load), then counts every
-    subsequent ``ram_to_vram`` model load. Under expected residency this is 0; a positive count
-    means a resident model was evicted and reloaded (residency defeated / stickiness thrash).
-    Returns None when no job carried phase metrics.
-    """
-    timed: list[tuple[float, int]] = []
-    for job in jobs:
-        if job.is_alchemy or job.phase_metrics is None:
-            continue
-        finalized = job.stage_timestamps.get("FINALIZED")
-        if finalized is None:
-            continue
-        reloads = sum(1 for load in job.phase_metrics.model_loads if load.phase == "ram_to_vram")
-        timed.append((finalized, reloads))
-
-    if not timed:
-        return None
-    timed.sort(key=lambda entry: entry[0])
-    return sum(reloads for _, reloads in timed[1:])
-
-
 def compute_level_stats(result: LevelRunResult, *, total_vram_mb: int | None = None) -> LevelStats:
-    """Distill a raw level run into the criteria-relevant statistics."""
-    harness = result.harness
-    metrics = result.metrics
+    """Distill a level runner's on-disk result into the criteria-relevant statistics.
 
-    its_values: list[float] = []
-    disk_loads: list[float] = []
-    vram_loads: list[float] = []
-    queue_waits: list[float] = []
-    e2es: list[float] = []
-    download_rates: list[float] = []
-    vram_high_water: int | None = None
-
-    if metrics is not None:
-        for job in metrics.jobs:
-            if job.phase_metrics is not None:
-                if job.phase_metrics.sampling is not None and job.phase_metrics.sampling.iterations_per_second > 0:
-                    its_values.append(job.phase_metrics.sampling.iterations_per_second)
-                for load in job.phase_metrics.model_loads:
-                    if load.phase == "disk_to_ram":
-                        disk_loads.append(load.duration_seconds)
-                    else:
-                        vram_loads.append(load.duration_seconds)
-            if job.queue_wait_seconds is not None:
-                queue_waits.append(job.queue_wait_seconds)
-            if job.e2e_seconds is not None:
-                e2es.append(job.e2e_seconds)
-        for download in metrics.downloads:
-            if download.success and download.megabytes_per_second > 0:
-                download_rates.append(download.megabytes_per_second)
-        if metrics.vram_used_high_water_mb_per_process:
-            vram_high_water = max(metrics.vram_used_high_water_mb_per_process.values())
-
-    disk_min_free = (
-        min(metrics.disk_min_free_bytes.values()) if metrics is not None and metrics.disk_min_free_bytes else None
-    )
-
-    level_phase_breakdown = phase_breakdown(metrics.jobs) if metrics is not None else {}
-
-    return LevelStats(
-        num_jobs_expected=harness.num_jobs_expected,
-        num_jobs_completed=harness.num_jobs_completed,
-        num_jobs_faulted=harness.num_jobs_faulted,
-        num_alchemy_forms_expected=harness.num_alchemy_forms_expected,
-        num_alchemy_forms_completed=harness.num_alchemy_forms_completed,
-        num_alchemy_forms_faulted=harness.num_alchemy_forms_faulted,
-        num_audit_failures=len(harness.audit_failures),
-        num_process_recoveries=metrics.num_process_recoveries if metrics is not None else 0,
-        timed_out=harness.timed_out,
-        its_p50=statistics.median(its_values) if its_values else None,
-        its_min=min(its_values) if its_values else None,
-        its_retention_fraction=_its_retention(metrics.jobs) if metrics is not None else None,
-        gpu_utilization_mean_percent=metrics.gpu_utilization_mean_percent if metrics is not None else None,
-        gpu_utilization_busy_fraction=metrics.gpu_utilization_busy_fraction if metrics is not None else None,
-        span_derived_busy_ratio=span_derived_busy_ratio(level_phase_breakdown),
-        post_warmup_vram_reloads=(_post_warmup_vram_reloads(metrics.jobs) if metrics is not None else None),
-        vram_used_high_water_mb=vram_high_water,
-        total_vram_mb=total_vram_mb,
-        disk_min_free_bytes=disk_min_free,
-        download_mbps_min=min(download_rates) if download_rates else None,
-        model_load_disk_seconds_median=statistics.median(disk_loads) if disk_loads else None,
-        model_load_vram_seconds_median=statistics.median(vram_loads) if vram_loads else None,
-        queue_wait_seconds_p95=_percentile(queue_waits, 0.95),
-        e2e_seconds_p95=_percentile(e2es, 0.95),
-        phase_breakdown_seconds=level_phase_breakdown,
-        time_spent_no_jobs_available=metrics.time_spent_no_jobs_available if metrics is not None else None,
-    )
+    Thin adapter over :func:`~horde_worker_regen.benchmark.capabilities.stats.level_stats_from_metrics`
+    for the subprocess path, whose :class:`LevelRunResult` carries its counts on ``harness`` and its
+    metrics alongside. The warm/in-process path skips this and calls ``level_stats_from_harness_result``
+    on the live :class:`~horde_worker_regen.harness.HarnessResult` directly.
+    """
+    return level_stats_from_metrics(result.harness, result.metrics, total_vram_mb=total_vram_mb)
 
 
 def _passed(report: LevelReport) -> bool:

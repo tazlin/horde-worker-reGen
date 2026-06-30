@@ -28,7 +28,7 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE, MODEL_REFERENCE_CATEGORY
 from horde_model_reference.model_reference_manager import ModelReferenceManager
@@ -68,6 +68,9 @@ from horde_worker_regen.process_management.simulation.fault_injection import Fau
 from horde_worker_regen.process_management.simulation.sim_vram import SimVramLedger
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
+
+if TYPE_CHECKING:
+    from horde_worker_regen.benchmark.scenarios import Scenario
 
 HarnessProcessMode = Literal["fake", "dry_run", "real"]
 
@@ -194,6 +197,57 @@ class HarnessConfig:
     progress_interval_seconds: float = 2.0
     """How often :attr:`on_progress` is sampled and invoked during a run."""
 
+    @classmethod
+    def from_scenario(
+        cls,
+        scenario: Scenario,
+        *,
+        process_mode: HarnessProcessMode,
+        timeout_seconds: float,
+        bridge_data_overrides: dict[str, object] | None = None,
+        audit: bool = True,
+        on_progress: Callable[[RunMetricsSnapshot, float], None] | None = None,
+        progress_interval_seconds: float = 2.0,
+    ) -> HarnessConfig:
+        """Build a canned (``skip_api``) harness config from a :class:`Scenario`.
+
+        The single seam every scenario-driven caller (benchmark CLI, e2e probes, the gpu catalog)
+        uses, so one workload runs identically regardless of which driver launched it. The
+        scenario's shape decides the mode: a soak streams generated jobs/forms for ``soak_seconds``,
+        while a fixed scenario expands into a concrete job list released on its arrival schedule.
+        Workload lives here; perturbation (faults, simulated VRAM, arrival overrides) stays on the
+        low-level constructor for the chaos/stress/sim-VRAM tests that need it.
+        """
+        overrides = dict(bridge_data_overrides) if bridge_data_overrides is not None else {}
+        if scenario.soak_seconds is not None:
+            image_templates, alchemy_templates = scenario.to_soak_templates()
+            return cls(
+                soak_seconds=scenario.soak_seconds,
+                soak_image_templates=image_templates,
+                soak_alchemy_templates=alchemy_templates,
+                process_mode=process_mode,
+                skip_api=True,
+                timeout_seconds=timeout_seconds,
+                bridge_data_overrides=overrides,
+                audit=audit,
+                on_progress=on_progress,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+        arrival = scenario.arrival_schedule()
+        return cls(
+            # An empty list is a real (alchemy-only) scenario; None would trigger the default image scenario.
+            scenario=scenario.expand_image_jobs(),
+            alchemy_forms=scenario.expand_alchemy_forms() or None,
+            arrival=arrival if arrival.kind != "all_at_once" else None,
+            process_mode=process_mode,
+            skip_api=True,
+            timeout_seconds=timeout_seconds,
+            bridge_data_overrides=overrides,
+            audit=audit,
+            on_progress=on_progress,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+
 
 @dataclass
 class HarnessResult:
@@ -204,6 +258,13 @@ class HarnessResult:
     num_jobs_faulted: int
     elapsed_seconds: float
     timed_out: bool
+    started_at_epoch: float = 0.0
+    """Wall-clock epoch the run's measured window began (set by the driver).
+
+    For a full harness run this is the moment the worker began booting, so the gap to the first job's
+    inference start measures process spawn plus engine/model cold-load; for a warm session it is the
+    measured pass's start (boot already amortized). 0.0 means a path that did not record it (e.g. the
+    on-disk subprocess reconstitution), in which case the startup/teardown split is reported as unknown."""
     audit_failures: list[str] = field(default_factory=list)
     """Invariant violations detected by the JobLifecycleAuditor (empty when auditing is off
     or the run timed out, since an aborted run purges the tracker)."""
@@ -828,6 +889,7 @@ async def run_harness_async(config: HarnessConfig) -> HarnessResult:
         num_jobs_completed=num_jobs_completed,
         num_jobs_faulted=manager._job_tracker.num_jobs_faulted,
         elapsed_seconds=time.time() - time_started,
+        started_at_epoch=time_started,
         timed_out=timed_out,
         audit_failures=audit_failures,
         num_jobs_submitted_faulted=num_jobs_submitted_faulted,
@@ -1342,6 +1404,7 @@ class WarmHarnessSession:
             num_jobs_completed=completed,
             num_jobs_faulted=faulted,
             elapsed_seconds=time.time() - time_started,
+            started_at_epoch=time_started,
             timed_out=timed_out,
             exit_reason="timed_out" if timed_out else "completed",
             diagnostics=diagnostics,

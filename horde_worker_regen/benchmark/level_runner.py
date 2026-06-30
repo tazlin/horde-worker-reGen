@@ -281,36 +281,15 @@ def run_level(level_json_path: Path, out_dir: Path, *, process_mode: str = "real
     exit_code = 0
     try:
         scenario = level.scenario
-        if scenario.soak_seconds is not None:
-            image_templates, alchemy_templates = scenario.to_soak_templates()
-            config = HarnessConfig(
-                soak_seconds=scenario.soak_seconds,
-                soak_image_templates=image_templates,
-                soak_alchemy_templates=alchemy_templates,
-                process_mode=process_mode,  # type: ignore[arg-type]
-                skip_api=True,
-                timeout_seconds=level.timeout_seconds,
-                bridge_data_overrides=dict(level.bridge_data_overrides),
-                audit=True,
-                on_progress=_on_progress,
-                progress_interval_seconds=_PROGRESS_INTERVAL_SECONDS,
-            )
-        else:
-            arrival = scenario.arrival_schedule()
-            config = HarnessConfig(
-                # An empty list is a real (alchemy-only) scenario; None would trigger
-                # the default image scenario.
-                scenario=scenario.expand_image_jobs(),
-                alchemy_forms=scenario.expand_alchemy_forms() or None,
-                arrival=arrival if arrival.kind != "all_at_once" else None,
-                process_mode=process_mode,  # type: ignore[arg-type]
-                skip_api=True,
-                timeout_seconds=level.timeout_seconds,
-                bridge_data_overrides=dict(level.bridge_data_overrides),
-                audit=True,
-                on_progress=_on_progress,
-                progress_interval_seconds=_PROGRESS_INTERVAL_SECONDS,
-            )
+        config = HarnessConfig.from_scenario(
+            scenario,
+            process_mode=process_mode,  # type: ignore[arg-type]
+            timeout_seconds=level.timeout_seconds,
+            bridge_data_overrides=dict(level.bridge_data_overrides),
+            audit=True,
+            on_progress=_on_progress,
+            progress_interval_seconds=_PROGRESS_INTERVAL_SECONDS,
+        )
         # The warm path pre-warms feature levels via WarmHarnessSession; this isolated subprocess path has no
         # such step, so a controlnet level here would cold-load its annotator inside the first job. Pre-fetch
         # the annotators now (in a throwaway process) so the timed children find them cached.

@@ -34,8 +34,10 @@ if TYPE_CHECKING:
 
     from horde_model_reference.model_reference_records import GenericModelRecord
 
+    from horde_worker_regen.benchmark.capabilities.probe import CapabilityProbe
     from horde_worker_regen.benchmark.enums import BenchTier
     from horde_worker_regen.benchmark.report import MachineInfo
+    from horde_worker_regen.benchmark.scenarios import Scenario
     from horde_worker_regen.model_download_plan import DownloadPlan
 
 _CIVITAI_TOKEN_ENV_VARS = ("CIVIT_API_TOKEN", "AIWORKER_CIVITAI_API_TOKEN")
@@ -357,20 +359,20 @@ def models_disk_plan(model_names: list[str]) -> DownloadPlan | None:
         return None
 
 
-def _estimate_vram_mb(level: RampLevel) -> int | None:
-    """Estimate the level's heaviest-job VRAM via the hordelib burden registry, or None on error."""
+def _estimate_vram_mb(scenario: Scenario, baseline: str, *, label: str) -> int | None:
+    """Estimate the scenario's heaviest-job VRAM via the hordelib burden registry, or None on error."""
     try:
         from hordelib.feature_impact import estimate_job_burden
 
         burden = estimate_job_burden(
-            baseline=level.baseline_hordelib,
-            width=max((job.width for job in level.scenario.image_jobs), default=512),
-            height=max((job.height for job in level.scenario.image_jobs), default=512),
-            batch=max((job.n_iter for job in level.scenario.image_jobs), default=1),
+            baseline=baseline,
+            width=max((job.width for job in scenario.image_jobs), default=512),
+            height=max((job.height for job in scenario.image_jobs), default=512),
+            batch=max((job.n_iter for job in scenario.image_jobs), default=1),
         )
         return burden.vram_mb
     except Exception as e:  # noqa: BLE001 - estimate is informational; never blocks
-        logger.debug(f"Burden estimate unavailable for {level.id}: {e}")
+        logger.debug(f"Burden estimate unavailable for {label}: {e}")
         return None
 
 
@@ -391,9 +393,9 @@ def _tier_download_bytes(tier: BenchTier) -> int | None:
         return None
 
 
-def _level_control_types(level: RampLevel) -> list[str]:
-    """Return the distinct controlnet ``control_type``s the level's image jobs exercise (may be empty)."""
-    return sorted({job.control_type for job in level.scenario.image_jobs if job.control_type})
+def _scenario_control_types(scenario: Scenario) -> list[str]:
+    """Return the distinct controlnet ``control_type``s the scenario's image jobs exercise (may be empty)."""
+    return sorted({job.control_type for job in scenario.image_jobs if job.control_type})
 
 
 def controlnet_installed() -> bool | None:
@@ -438,9 +440,9 @@ def _controlnet_annotator_bytes(control_types: list[str]) -> int:
         return 0
 
 
-def _level_features(level: RampLevel) -> list[str]:
-    """Human-readable feature tags the level exercises, derived from its image jobs."""
-    jobs = level.scenario.image_jobs
+def _scenario_features(scenario: Scenario) -> list[str]:
+    """Human-readable feature tags the scenario exercises, derived from its image jobs and forms."""
+    jobs = scenario.image_jobs
     features: list[str] = []
     if any(job.hires_fix for job in jobs):
         features.append("hires_fix")
@@ -456,7 +458,7 @@ def _level_features(level: RampLevel) -> list[str]:
         features.append("ti")
     if any(job.n_iter > 1 for job in jobs):
         features.append("batch")
-    if level.scenario.alchemy_forms:
+    if scenario.alchemy_forms:
         features.append("alchemy")
     return features
 
@@ -466,7 +468,57 @@ def compute_level_requirements(
     *,
     present_resolver: Callable[[str], bool | None] | None = None,
 ) -> LevelRequirements:
-    """Derive the read-only resource requirements of *level*.
+    """Derive the read-only resource requirements of *level* (the ladder adapter over the shared core)."""
+    return _compute_requirements(
+        identifier=level.id,
+        stage=str(level.stage),
+        tier=level.tier,
+        axis=str(level.axis),
+        baseline=level.baseline_hordelib,
+        scenario=level.scenario,
+        requires_network=level.requires_network,
+        min_disk_free_gb=level.criteria.min_disk_free_gb,
+        present_resolver=present_resolver,
+    )
+
+
+def compute_probe_requirements(
+    probe: CapabilityProbe,
+    *,
+    present_resolver: Callable[[str], bool | None] | None = None,
+) -> LevelRequirements:
+    """Derive the read-only resource requirements of a capability *probe* (the capability adapter).
+
+    The same machine-fit numbers as :func:`compute_level_requirements`, read from a
+    :class:`~horde_worker_regen.benchmark.capabilities.probe.CapabilityProbe`, so the gpu probe catalog
+    and the executor reuse the one :func:`requirement_skip_reason` gate.
+    """
+    return _compute_requirements(
+        identifier=probe.probe_id,
+        stage="",
+        tier=probe.capability.tier,
+        axis=str(probe.capability.kind),
+        baseline=probe.baseline_hordelib,
+        scenario=probe.scenario,
+        requires_network=probe.requires_network,
+        min_disk_free_gb=probe.criteria.min_disk_free_gb,
+        present_resolver=present_resolver,
+    )
+
+
+def _compute_requirements(
+    *,
+    identifier: str,
+    stage: str,
+    tier: BenchTier,
+    axis: str,
+    baseline: str,
+    scenario: Scenario,
+    requires_network: bool,
+    min_disk_free_gb: float,
+    present_resolver: Callable[[str], bool | None] | None,
+) -> LevelRequirements:
+    """Derive the read-only resource requirements of a scenario, shared by the level and probe adapters.
 
     By default this loads the real disk plan (presence, per-model size, download target, free space) via
     :func:`models_disk_plan`, so every surface can name *which* model is missing, *how big* it is, and
@@ -474,15 +526,22 @@ def compute_level_requirements(
     instead (no reference load), keeping the ``plan`` preview's offline mode and the unit tests fast.
 
     Args:
-        level: The ladder level to inspect (never mutated).
+        identifier: The level id or probe slug, used only for labelling.
+        stage: The level stage string, or empty for a probe (which has no stage).
+        tier: The model tier, for the huge/beta download gates.
+        axis: The axis string or the capability kind, for display only.
+        baseline: The ``KNOWN_IMAGE_GENERATION_BASELINE`` value, for the burden estimate.
+        scenario: The workload to inspect (never mutated).
+        requires_network: Whether the work needs network access.
+        min_disk_free_gb: The runtime disk-free floor from the criteria.
         present_resolver: When given, a presence-only resolver (True/False/None=unknown) used in place of
             the sized disk plan. Injectable so tests and offline previews avoid touching the reference
             manager; sizes are reported as unknown in that mode.
     """
-    models_required = level.scenario.models_referenced()
-    requires_civitai_key = any(job.lora_names or job.ti_names for job in level.scenario.image_jobs)
+    models_required = scenario.models_referenced()
+    requires_civitai_key = any(job.lora_names or job.ti_names for job in scenario.image_jobs)
 
-    control_types = _level_control_types(level)
+    control_types = _scenario_control_types(scenario)
     requires_controlnet = bool(control_types)
     cn_installed = controlnet_installed() if requires_controlnet else None
     # Only meaningful when the extra is present: without onnxruntime the annotators are never fetched, so
@@ -529,21 +588,21 @@ def compute_level_requirements(
     )
 
     return LevelRequirements(
-        level_id=level.id,
-        stage=str(level.stage),
-        tier=str(level.tier),
-        axis=str(level.axis),
-        baseline=level.baseline_hordelib,
-        estimated_vram_mb=_estimate_vram_mb(level),
-        min_disk_free_gb=level.criteria.min_disk_free_gb,
-        estimated_download_bytes=_tier_download_bytes(level.tier),
+        level_id=identifier,
+        stage=stage,
+        tier=str(tier),
+        axis=axis,
+        baseline=baseline,
+        estimated_vram_mb=_estimate_vram_mb(scenario, baseline, label=identifier),
+        min_disk_free_gb=min_disk_free_gb,
+        estimated_download_bytes=_tier_download_bytes(tier),
         models_required=models_required,
         models_missing=models_missing,
         missing_models=missing_models,
         download_bytes_needed=download_bytes_needed,
         present_bytes=present_bytes,
         free_disk_bytes=free_disk_bytes,
-        requires_network=level.requires_network,
+        requires_network=requires_network,
         requires_civitai_key=requires_civitai_key,
         requires_controlnet=requires_controlnet,
         controlnet_installed=cn_installed,
@@ -551,7 +610,7 @@ def compute_level_requirements(
         controlnet_annotator_bytes=_controlnet_annotator_bytes(control_types),
         controlnet_install_hint=cn_install_hint,
         controlnet_checkpoints_missing=controlnet_checkpoints_missing,
-        features=_level_features(level),
+        features=_scenario_features(scenario),
     )
 
 
@@ -637,6 +696,7 @@ __all__ = [
     "MissingModel",
     "civitai_token_available",
     "compute_level_requirements",
+    "compute_probe_requirements",
     "controlnet_annotators_present",
     "controlnet_installed",
     "model_present_on_disk",

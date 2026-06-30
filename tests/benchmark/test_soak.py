@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from horde_worker_regen.benchmark.enums import BenchTier
 from horde_worker_regen.benchmark.report import SuggestedBridgeData
-from horde_worker_regen.benchmark.scenarios import CannedAlchemyFormSpec, CannedImageJobSpec, ScenarioSpec
+from horde_worker_regen.benchmark.scenarios import CannedAlchemyFormSpec, CannedImageJobSpec, Scenario
 from horde_worker_regen.benchmark.soak import build_soak_scenario, build_validation_level
 from horde_worker_regen.process_management.simulation._canned_scenarios import (
     GeneratingAlchemySource,
@@ -14,11 +14,11 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
 
 
 class TestScenarioSoakTemplates:
-    """`ScenarioSpec.to_soak_templates` maps specs to weighted generation templates."""
+    """`Scenario.to_soak_templates` maps specs to weighted generation templates."""
 
     def test_count_becomes_weight(self) -> None:
         """Each spec's `count` becomes its generation weight; feature fields carry over."""
-        scenario = ScenarioSpec(
+        scenario = Scenario(
             name="mix",
             image_jobs=[
                 CannedImageJobSpec(model="Deliberate", count=1),

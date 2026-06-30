@@ -40,7 +40,7 @@ from horde_worker_regen.benchmark.enums import BenchAxis, BenchStage, BenchTier
 from horde_worker_regen.benchmark.scenarios import (
     CannedAlchemyFormSpec,
     CannedImageJobSpec,
-    ScenarioSpec,
+    Scenario,
 )
 from horde_worker_regen.benchmark.sizing import max_post_processing_resolution
 
@@ -165,7 +165,7 @@ class RampLevel(BaseModel):
     rung: int = 0
     """Position within the axis; higher rungs are skipped after a failure on the axis."""
     description: str
-    scenario: ScenarioSpec
+    scenario: Scenario
     bridge_data_overrides: dict[str, object] = Field(default_factory=dict)
     requires_network: bool = False
     timeout_seconds: float = 900.0
@@ -260,7 +260,7 @@ def build_default_ladder(options: LadderOptions | None = None) -> list[RampLevel
         rung: int,
         name: str,
         description: str,
-        scenario: ScenarioSpec,
+        scenario: Scenario,
         bridge_data_overrides: dict[str, object] | None = None,
         requires_network: bool = False,
         establishes_tier_baseline: bool = False,
@@ -323,7 +323,7 @@ class _LevelAdder(Protocol):
         rung: int,
         name: str,
         description: str,
-        scenario: ScenarioSpec,
+        scenario: Scenario,
         bridge_data_overrides: dict[str, object] | None = None,
         requires_network: bool = False,
         establishes_tier_baseline: bool = False,
@@ -342,7 +342,7 @@ def _add_baseline_level(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
         rung=0,
         name="baseline",
         description=f"{tier} baseline: threads=1 queue=1 batch=1 at native resolution",
-        scenario=ScenarioSpec(
+        scenario=Scenario(
             name=f"{tier}-baseline",
             image_jobs=[_tier_job(tier, count=opts.jobs_per_level)],
         ),
@@ -359,7 +359,7 @@ def _add_concurrency_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOp
         rung=1,
         name="queue2",
         description=f"{tier}: queue_size 2 (preload overlaps inference)",
-        scenario=ScenarioSpec(name=f"{tier}-q2", image_jobs=[_tier_job(tier, count=opts.jobs_per_level)]),
+        scenario=Scenario(name=f"{tier}-q2", image_jobs=[_tier_job(tier, count=opts.jobs_per_level)]),
         bridge_data_overrides={"queue_size": 2},
     )
     add(
@@ -369,7 +369,7 @@ def _add_concurrency_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOp
         rung=1,
         name="threads2",
         description=f"{tier}: max_threads 2 (two concurrent inference jobs)",
-        scenario=ScenarioSpec(name=f"{tier}-t2", image_jobs=[_tier_job(tier, count=opts.jobs_per_level)]),
+        scenario=Scenario(name=f"{tier}-t2", image_jobs=[_tier_job(tier, count=opts.jobs_per_level)]),
         bridge_data_overrides={"max_threads": 2, "queue_size": 2},
         criteria=_its_advisory_criteria(),
     )
@@ -381,7 +381,7 @@ def _add_concurrency_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOp
             rung=rung,
             name=f"batch{batch}",
             description=f"{tier}: n_iter {batch} (batched sampling)",
-            scenario=ScenarioSpec(
+            scenario=Scenario(
                 name=f"{tier}-b{batch}",
                 image_jobs=[_tier_job(tier, count=max(2, opts.jobs_per_level // 2), n_iter=batch)],
             ),
@@ -402,7 +402,7 @@ def _add_feature_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
             rung=1,
             name="hires_fix",
             description=f"{tier}: hires_fix (second upscaled sampling pass)",
-            scenario=ScenarioSpec(
+            scenario=Scenario(
                 name=f"{tier}-hires",
                 image_jobs=[
                     _tier_job(
@@ -427,7 +427,7 @@ def _add_feature_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
             rung=1,
             name="controlnet",
             description=f"{tier}: controlnet preprocessor sweep ({', '.join(_CONTROLNET_SWEEP_TYPES)})",
-            scenario=ScenarioSpec(
+            scenario=Scenario(
                 name=f"{tier}-controlnet",
                 image_jobs=[
                     _tier_job(tier, count=1, control_type=control_type) for control_type in _CONTROLNET_SWEEP_TYPES
@@ -449,7 +449,7 @@ def _add_feature_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
             rung=1,
             name="qr_code",
             description=f"{tier}: qr_code controlnet workflow (the real SDXL controlnet capability)",
-            scenario=ScenarioSpec(
+            scenario=Scenario(
                 name=f"{tier}-qr",
                 image_jobs=[_tier_job(tier, count=half_jobs, workflow=_QR_CODE_WORKFLOW)],
             ),
@@ -474,7 +474,7 @@ def _add_post_processing_levels(add: _LevelAdder, *, tier: BenchTier, opts: Ladd
         rung=1,
         name="pp-sweep",
         description=f"{tier}: post-processing sweep ({len(post_processors)} upscalers + face-fixers)",
-        scenario=ScenarioSpec(
+        scenario=Scenario(
             name=f"{tier}-pp-sweep",
             image_jobs=[
                 _tier_job(tier, count=1, post_processing=[post_processor]) for post_processor in post_processors
@@ -493,7 +493,7 @@ def _add_post_processing_levels(add: _LevelAdder, *, tier: BenchTier, opts: Ladd
         rung=2,
         name="pp-resolutions",
         description=f"{tier}: post-processing at resolutions {resolutions} (output-megapixel scaling)",
-        scenario=ScenarioSpec(
+        scenario=Scenario(
             name=f"{tier}-pp-res",
             image_jobs=[
                 _tier_job(tier, count=1, resolution=resolution, post_processing=default_pair)
@@ -524,7 +524,7 @@ def _add_alchemy_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
         rung=1,
         name="alchemy-clip",
         description=f"alchemy CLIP lane (safety process): {', '.join(clip_forms)}",
-        scenario=ScenarioSpec(
+        scenario=Scenario(
             name="alchemy-clip",
             alchemy_forms=[CannedAlchemyFormSpec(form=form, count=1) for form in clip_forms],
         ),
@@ -546,7 +546,7 @@ def _add_alchemy_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
         rung=1,
         name="alchemy-graph",
         description=f"alchemy graph lane (inference processes): {len(graph_forms)} post-processor forms",
-        scenario=ScenarioSpec(
+        scenario=Scenario(
             name="alchemy-graph",
             alchemy_forms=[CannedAlchemyFormSpec(form=form, count=1) for form in graph_forms],
         ),
@@ -561,7 +561,7 @@ def _add_alchemy_levels(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
         rung=1,
         name="alchemy-concurrent",
         description="image + alchemy concurrently on both lanes (headroom-gated)",
-        scenario=ScenarioSpec(
+        scenario=Scenario(
             name="alchemy-concurrent",
             image_jobs=[_tier_job(tier, count=max(2, opts.jobs_per_level // 2))],
             alchemy_forms=[
@@ -591,7 +591,7 @@ def _add_download_level(add: _LevelAdder, *, tier: BenchTier, opts: LadderOption
         rung=1,
         name="adhoc-lora",
         description="ad-hoc lora fetches from CivitAI (measures download bandwidth)",
-        scenario=ScenarioSpec(
+        scenario=Scenario(
             name="adhoc-lora",
             image_jobs=[
                 CannedImageJobSpec(

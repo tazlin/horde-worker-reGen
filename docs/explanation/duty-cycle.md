@@ -125,6 +125,36 @@ when the next queued job reuses the model and the VRAM budget confirms it fits (
 so a homogeneous or sticky workload stops paying `vram_transfer` on its hot model and the residual reload
 loss narrows to genuine model *switches*.
 
+## Per-probe timing: warmup versus inference
+
+Duty cycle as described above is a *steady-state* measure: it deliberately discounts cold-start so it
+reflects a running worker. A single benchmark **capability probe** measured in isolation tells the
+opposite story, and the difference is worth naming because it routinely surprises. A probe run on its
+own (for example `pytest -m gpu -k controlnet`, or any probe the supervisor cannot serve from a warm
+worker) boots its *own* worker: it spawns the process, imports torch, initialises the inference engine,
+and cold-loads a checkpoint before the first pixel is sampled. On a warm worker that cost is paid once
+and amortised across many jobs; on a per-probe cold boot it is paid every time, so an isolated probe
+can read as minutes of wall-clock at a low GPU-core duty cycle even though the actual generation was
+fast. The low duty there is an artifact of the measurement boundary, not a worker fault.
+
+[`probe_timing`][horde_worker_regen.benchmark.capabilities.timing.probe_timing] makes that split
+explicit from the timestamps the harness already records, with no extra instrumentation. It attributes
+a probe's whole wall-clock to three segments:
+
+- **startup**: run start to the first job's inference (process spawn plus engine init),
+- **active window**: the first job's inference start to the last job's completion (where work is
+  produced, including the one-time cold model load surfaced separately as `cold_model_load_seconds`),
+- **teardown**: the last completion to the end of the run (shutdown and drain),
+
+and reports `gpu_active_seconds` (summed sampling, VAE, encode, and VRAM load) with its
+`gpu_active_fraction` of the whole, which is the headline that explains a low isolated reading: a cold
+boot can leave only a small fraction of the run actually computing. The result rides on each
+[`CapabilityProbeResult`][horde_worker_regen.benchmark.capabilities.result.CapabilityProbeResult] and is
+logged per probe; the pytest probe suites also print a session-end table so a whole run's
+warmup-versus-inference cost is visible at a glance. The lesson the numbers teach is the same one the
+warm-session driver acts on: amortise the boot by reusing a worker across probes rather than paying
+startup once per capability.
+
 ## Where to read it
 
 The same [`DutyCycleSummary`][horde_worker_regen.process_management.resources.duty_cycle.DutyCycleSummary]
