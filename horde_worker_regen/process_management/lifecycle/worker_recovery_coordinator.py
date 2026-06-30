@@ -217,6 +217,14 @@ class WorkerRecoveryCoordinator:
         checking = self._job_tracker.jobs_being_safety_checked
         current_ids = {info.sdk_api_job_info.id_ for info in checking if info.sdk_api_job_info.id_ is not None}
 
+        # Jobs whose verdict was positively dropped (their safety launch was retired mid-check) skip the
+        # grace: the verdict is known lost, not merely late. Backdating first-seen routes them through the
+        # same requeue/escalation bookkeeping below, so a job is still bounded out if its re-checks keep
+        # failing rather than looping forever.
+        for job_id in self._message_dispatcher.take_safety_verdicts_known_lost():
+            if job_id in current_ids:
+                self.orphan_safety_since[job_id] = now - self.ORPHAN_SAFETY_GRACE_SECONDS
+
         for job_id in list(self.orphan_safety_since):
             if job_id not in current_ids:
                 del self.orphan_safety_since[job_id]

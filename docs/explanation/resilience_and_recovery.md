@@ -119,6 +119,36 @@ A *recurring* storm of orphan punts means something upstream keeps stranding job
 (a flaky GPU, say); that feeds the wedge assessment below so SOS can limp the
 worker by rather than punting forever.
 
+## Stranded safety-check jobs
+
+The safety stage has the same shape of loss. A job handed to the safety process
+sits in `SAFETY_CHECKING` until its verdict returns; if the safety process is
+**replaced** while the check is in flight, the verdict arrives from a now-retired
+launch and is dropped by the same launch-identifier guard. Safety-process
+replacement is routine, not exceptional: whole-card residency moves the safety
+process off the GPU while a card-filling model holds the device and restarts it
+when the residency lifts, so a model mix that alternates between a card-filler and
+co-resident models replaces the safety process repeatedly. Nothing else moves a
+job whose verdict was dropped, so each one would pin a pipeline slot until
+recovered; let enough pile up and the pipeline wedges into an SOS soft reset.
+
+`WorkerRecoveryCoordinator.reconcile_orphaned_safety_jobs` recovers them each
+control-loop tick, with the same two-signal split as the in-progress case:
+
+- **Prompt signal**: when the dispatcher drops a safety result because its launch
+  was retired, it flags that job's verdict as *known lost* (positive evidence, not
+  a timeout suspicion). The reconcile pass drains those flags and re-checks the job
+  on the next tick, skipping the grace it would otherwise wait out.
+- **Periodic watchdog**: any job that has sat in `SAFETY_CHECKING` past a grace
+  window with no verdict is requeued for a fresh check, covering losses with no
+  corresponding dropped message at all.
+
+Both routes share one bounded requeue/escalation counter, so a verdict that keeps
+being lost is requeued only a fixed number of times before the job is dropped with
+its images cleared (an image the safety check never cleared is **never** submitted)
+and popping is soft-paused until safety recovers. Re-checked images are always
+preserved, never submitted unchecked.
+
 ## Layer 3: save-our-ship (SOS) escalation
 
 Layers 1 and 2 handle *individual* failures. The SOS layer answers a different

@@ -26,7 +26,11 @@ from unittest.mock import Mock
 
 from horde_sdk.ai_horde_api import GENERATION_STATE
 
-from horde_worker_regen.process_management.ipc.messages import HordeImageResult, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import (
+    HordeImageResult,
+    HordeProcessState,
+    HordeSafetyResultMessage,
+)
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobStage
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
@@ -293,3 +297,99 @@ class TestSafetyResultInvariant:
         assert job_info.job_image_results is None
         assert job_info.state == GENERATION_STATE.faulted
         assert job_info in pm._job_tracker.jobs_pending_submit
+
+
+def _deliver_one_message(pm: object, message: object) -> None:
+    """Feed a single message through the dispatcher's real receive loop (mock queue: one item, then empty)."""
+    dispatcher = pm._message_dispatcher  # type: ignore[attr-defined]
+    dispatcher._process_message_queue.empty.side_effect = [False, True]
+    dispatcher._process_message_queue.get.return_value = message
+
+
+class TestRetiredSafetyLaunchStrandsInFlightJob:
+    """The trigger for the orphan wedge: replacing a safety process discards its in-flight verdict.
+
+    Whole-card residency moves the safety process off the GPU while a card-filling model holds the device,
+    then replaces it (retires the launch, starts a fresh one) when the residency lifts. A verdict produced
+    by the retired launch for a job that was mid-check is dropped at the launch-identifier guard. That guard
+    keeps a stale message from crashing the control loop, but on its own it leaves the job sitting in
+    SAFETY_CHECKING with a verdict that will never be re-delivered: only the orphan watchdog rescues it, and
+    only after its multi-second grace. When several such replacements land in quick succession the stranded
+    jobs accumulate faster than the watchdog clears them and the pipeline wedges into a soft reset.
+
+    The contract: dropping a result from a retired launch flags the job as having a verdict that is known
+    lost (positive evidence, not the watchdog's timeout suspicion), so the next reconcile tick re-checks it
+    at once rather than only after the orphan grace elapses. The bounded requeue/escalation bookkeeping is
+    unchanged, so a job whose re-checks keep failing is still faulted rather than looping forever.
+    """
+
+    async def _strand_then_drop_retired_verdict(self, pm: object) -> HordeJobInfo:
+        """Strand a job in SAFETY_CHECKING, retire its safety launch, and deliver+drop the late verdict."""
+        retired_launch_id = 12
+        safety_proc = make_mock_process_info(
+            10,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.SAFETY,
+        )
+        safety_proc.process_launch_identifier = retired_launch_id
+        pm._process_map[safety_proc.process_id] = safety_proc  # type: ignore[attr-defined]
+
+        job_info = _safety_job_info()
+        await _strand_in_safety_checking(pm, job_info)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+        assert pm._job_tracker.get_stage(job_id) == JobStage.SAFETY_CHECKING  # type: ignore[attr-defined]
+
+        # Whole-card residency lifts and the safety process is restored: its launch is retired.
+        pm._process_map.retire_process(  # type: ignore[attr-defined]
+            safety_proc,
+            "whole-card residency complete: restoring safety to GPU",
+        )
+
+        # The verdict the retired launch had in flight for this job now arrives and is dropped.
+        verdict = HordeSafetyResultMessage(
+            process_id=safety_proc.process_id,
+            process_launch_identifier=retired_launch_id,
+            info="late verdict from retired safety launch",
+            job_id=job_id,
+            safety_evaluations=[],
+        )
+        _deliver_one_message(pm, verdict)
+        await pm._message_dispatcher.receive_and_handle_process_messages()  # type: ignore[attr-defined]
+        return job_info
+
+    async def test_dropped_retired_safety_verdict_requeues_without_waiting_out_the_grace(self) -> None:
+        """A dropped retired-launch verdict re-checks its job on the next tick, not after the orphan grace."""
+        pm = make_testable_process_manager()
+        job_info = await self._strand_then_drop_retired_verdict(pm)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+
+        # No grace backdating by the test: one reconcile tick after the drop must already recover the job,
+        # because the dropped verdict is positive evidence the verdict is lost (not merely late).
+        await pm._recovery_coordinator.reconcile_orphaned_safety_jobs()
+
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SAFETY_CHECK
+        assert job_info not in pm._job_tracker.jobs_being_safety_checked
+        assert pm._recovery_coordinator.safety_requeue_count[job_id] == 1
+        # Its images are preserved so the fresh check has something to evaluate; never submitted unchecked.
+        assert job_info.job_image_results is not None
+        assert job_info.safety_evaluated is False
+
+    async def test_repeated_dropped_verdicts_still_bounded_to_a_no_image_fault(self) -> None:
+        """If re-checks keep losing the verdict, the job is faulted (no image), not requeued forever."""
+        pm = make_testable_process_manager()
+        job_info = await self._strand_then_drop_retired_verdict(pm)
+        job_id = job_info.sdk_api_job_info.id_
+        assert job_id is not None
+
+        # Pre-charge the requeue count to its ceiling: this drop is the one that must escalate, not loop.
+        pm._recovery_coordinator.safety_requeue_count[job_id] = pm._recovery_coordinator.SAFETY_REQUEUE_MAX
+
+        await pm._recovery_coordinator.reconcile_orphaned_safety_jobs()
+
+        assert pm._job_tracker.get_stage(job_id) == JobStage.PENDING_SUBMIT
+        assert job_info.job_image_results is None
+        assert job_info.state == GENERATION_STATE.faulted
+        assert pm._state.self_throttle_paused is True

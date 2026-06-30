@@ -9,6 +9,7 @@ from multiprocessing import Queue
 from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import GenMetadataEntry
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
+from horde_sdk.ai_horde_api.fields import GenerationID
 from loguru import logger
 
 from horde_worker_regen.consts import AESTHETIC_METADATA_TYPE
@@ -178,6 +179,20 @@ class MessageDispatcher:
         self._action_ledger = action_ledger
         self._on_unload_vram = on_unload_vram
         self._state = state
+        self._safety_verdicts_known_lost: set[GenerationID] = set()
+        """Jobs whose safety verdict was dropped because its producing launch was retired.
+
+        Positive evidence that a verdict will never arrive for these jobs (the message arrived and was
+        discarded), as opposed to the orphan watchdog's timeout-based suspicion. Drained by the recovery
+        coordinator so a job mid-check when its safety process is replaced is re-queued at once rather than
+        only after the watchdog's grace elapses.
+        """
+
+    def take_safety_verdicts_known_lost(self) -> set[GenerationID]:
+        """Return and clear the jobs whose safety verdict was dropped with their launch retired."""
+        lost = self._safety_verdicts_known_lost
+        self._safety_verdicts_known_lost = set()
+        return lost
 
     def set_alchemy_result_handler(self, handler: Callable[[HordeAlchemyResultMessage], None]) -> None:
         """Register the callback invoked when a child process reports an alchemy form result."""
@@ -328,6 +343,13 @@ class MessageDispatcher:
                 f"{message.process_id} launch {message.process_launch_identifier} "
                 f"({retired_launch.reason}): {type(message).__name__}",
             )
+            # A safety verdict dropped here is the only signal that the job it was checking will never get a
+            # verdict from that launch; flag it so the recovery coordinator re-checks it at once instead of
+            # leaving it stranded in SAFETY_CHECKING until the orphan watchdog's grace elapses. Replacing the
+            # safety process is routine (whole-card residency moves it off and back onto the GPU), so without
+            # this several such drops can pile up faster than the watchdog clears them and wedge the pipeline.
+            if isinstance(message, HordeSafetyResultMessage):
+                self._safety_verdicts_known_lost.add(message.job_id)
             return True
 
         if self._is_late_retired_liveness_message(message):
