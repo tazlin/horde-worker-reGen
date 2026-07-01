@@ -50,27 +50,30 @@ Want to know how it works under the hood, or contribute a change? The
 7. **[Performance and backpressure](explanation/performance_and_backpressure.md)**:
    pop throttling, model stickiness, megapixelstep backpressure, and the LRU
    eviction policy.
-8. **[Compute backends](explanation/compute_backends.md)**: the backend-agnostic
+8. **[Resource governance](explanation/resource_governance.md)**: the
+   decide/act separation behind the memory protections, the per-cycle governor
+   tick, and how to add a new resource protection.
+9. **[Compute backends](explanation/compute_backends.md)**: the backend-agnostic
    device/VRAM abstraction, optional feature extras, and what limits non-NVIDIA
    support.
-9. **[Shutdown and faults](explanation/shutdown_and_faults.md)**: graceful
-   versus abort shutdown, signal handling, and fault propagation.
-10. **[Resilience and recovery](explanation/resilience_and_recovery.md)**:
+10. **[Shutdown and faults](explanation/shutdown_and_faults.md)**: graceful
+    versus abort shutdown, signal handling, and fault propagation.
+11. **[Resilience and recovery](explanation/resilience_and_recovery.md)**:
     bounded/degraded job retry, crash-loop quarantine, the save-our-ship
     escalation, and orphan cleanup.
-11. **[Model downloads and availability](explanation/model_downloads.md)**: the
+12. **[Model downloads and availability](explanation/model_downloads.md)**: the
     background download process, on-disk availability tracking, and how popping
     stays aligned with it.
-12. **[Frontend and durable state](explanation/frontend_and_state.md)**: the
+13. **[Frontend and durable state](explanation/frontend_and_state.md)**: the
     dashboard/TUI, the supervisor channel, and the state that persists between
     runs.
-13. **[Telemetry](explanation/telemetry.md)**: the Logfire/OpenTelemetry layer
+14. **[Telemetry](explanation/telemetry.md)**: the Logfire/OpenTelemetry layer
     and in-process run metrics.
-14. **[GPU duty cycle](explanation/duty-cycle.md)**: how duty cycle is measured
+15. **[GPU duty cycle](explanation/duty-cycle.md)**: how duty cycle is measured
     and attributed (per-job phase gaps and reload churn), the
     `horde-duty-report` log analyzer, the tuning levers, and the structural
     ceiling on VRAM-constrained cards.
-15. **[Log diagnostics contract](explanation/log_diagnostics_contract.md)**: how
+16. **[Log diagnostics contract](explanation/log_diagnostics_contract.md)**: how
     the worker's log lines, the `horde-log` detectors that read them, and the
     dashboard's Diagnostics tab are kept in sync with one shared facade and a
     contract test, so a new detector needs the fewest manual touches.
