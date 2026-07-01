@@ -25,6 +25,12 @@ else
     export CUDA_HOME=/usr/local/cuda
     export LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
     export PATH=${CUDA_HOME}/bin:${PATH}
+
+    # Fail fast with an actionable rebuild instruction when the baked torch build has no kernels for the
+    # host GPU. An immutable image cannot switch CUDA builds at runtime, so otherwise the first GPU model
+    # load crashes with a cryptic deep traceback (e.g. open_clip's convert_weights_to_lp). set -e turns a
+    # non-zero exit here into a clean stop carrying the message, instead of a confusing mid-download crash.
+    uv run --no-sync python -m horde_worker_regen.torch_gpu_preflight
 fi
 
 # Configure from a mounted bridgeData.yaml if present, otherwise from AIWORKER_* environment variables.

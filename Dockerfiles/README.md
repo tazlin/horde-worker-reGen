@@ -22,6 +22,27 @@ docker pull ghcr.io/haidra-org/horde-worker-regen:latest   # newest main build
 # docker pull ghcr.io/haidra-org/horde-worker-regen:v12.7.4
 ```
 
+### Image variants (CUDA build per GPU architecture)
+
+One torch CUDA build cannot cover every GPU: `cu126` carries kernels for `sm_50`–`sm_90` (Maxwell
+through Hopper, incl. Ada/Ampere) but **not** Blackwell, while `cu130`/`cu132` cover `sm_75`–`sm_120`
+(Turing through Blackwell) but drop pre-Turing. A build with no kernel image for the host card crashes on
+the first GPU model load, so each build is published as its own tag:
+
+| Tag | Torch build | GPUs |
+| --- | --- | --- |
+| `:latest`, `:vX.Y.Z` (unsuffixed) | `cu130` | Turing → **Blackwell** (RTX 50-series, datacenter) |
+| `:latest-cu130`, `:vX.Y.Z-cu130` | `cu130` | same as the default, named explicitly |
+| `:latest-cu132`, `:vX.Y.Z-cu132` | `cu132` | Turing → Blackwell on a CUDA 13.2 driver |
+| `:latest-cu126`, `:vX.Y.Z-cu126` | `cu126` | Maxwell → Hopper (**pre-Turing / older cards**) |
+
+The unsuffixed tags default to `cu130` because the common container case is current datacenter / Blackwell
+hardware. If your card is **pre-Turing** (Maxwell/Pascal/Volta, e.g. GTX 10-series), pull the `-cu126`
+variant instead. `cu130`/`cu132` also require a **CUDA-13-capable NVIDIA driver** on the host; update the
+host driver if the container reports an incompatibility. The entrypoint runs a preflight that fails fast
+with the exact rebuild/pull instruction if the image's build has no kernels for the detected GPU, rather
+than crashing deep inside the first model load.
+
 Configure the worker entirely through `AIWORKER_*` environment variables (see
 [Configuration](#configuration)) and run it with the GPU passed through and a host directory mounted
 for the model cache:
@@ -102,9 +123,13 @@ image bakes in whatever source tree you build from.
 
 CUDA (`Dockerfile.cuda`):
 
-- `CUDA_VERSION` (default `12.8.1`) selects the `nvidia/cuda:<version>-runtime-ubuntu22.04` base.
-- `TORCH_BACKEND` (default `cu126`) selects the PyTorch build extra. `cu126` is the only CUDA-12 build
-  of the pinned torch and also runs on CUDA-13 drivers; use `cu130` for a CUDA-13 base image.
+- `CUDA_VERSION` (default `12.8.1`) selects the `nvidia/cuda:<version>-runtime-ubuntu22.04` base. Use a
+  CUDA-13 base (e.g. `13.0.1`) when building a `cu130`/`cu132` image.
+- `TORCH_BACKEND` (default `cu126`) selects the PyTorch build extra, which must match the host GPU's
+  architecture (see [Image variants](#image-variants-cuda-build-per-gpu-architecture)): `cu126` for
+  Maxwell–Hopper, `cu130`/`cu132` for Turing–Blackwell (RTX 50-series). The published `:latest` uses
+  `cu130`; the local build default stays `cu126` for the widest older-card compatibility, so pass
+  `--build-arg TORCH_BACKEND=cu130 --build-arg CUDA_VERSION=13.0.1` to build a Blackwell-capable image.
 
 ROCm (`Dockerfile.rocm`):
 

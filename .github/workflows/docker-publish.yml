@@ -1,9 +1,14 @@
 name: Build and publish Docker image
 
-# Builds the immutable CUDA worker image and publishes it to the GitHub Container Registry (GHCR) at
+# Builds the immutable CUDA worker images and publishes them to the GitHub Container Registry (GHCR) at
 #   ghcr.io/<owner>/horde-worker-regen
+# One image is built per locked CUDA build (cu126/cu130/cu132), each carrying a per-backend tag suffix
+# (e.g. :latest-cu130, :vX.Y.Z-cu126). The unsuffixed tags (:latest, :vX.Y.Z, :X.Y) point at the
+# DEFAULT_BACKEND below, chosen as the newest CUDA build so the common Docker case (datacenter / current
+# Blackwell cards) works from :latest without a rebuild. Older, pre-Turing cards pull an explicit
+# :...-cu126 tag instead.
 # Pull requests build only (no push) so a broken Dockerfile is caught before it can publish. Pushes to
-# main publish :latest, version tags (v*) publish the immutable :X.Y.Z / :X.Y tags, and the workflow
+# main publish :latest*, version tags (v*) publish the immutable :X.Y.Z* / :X.Y* tags, and the workflow
 # can be run on demand. The ROCm image is intentionally not published here (no AMD CI/GPU to validate
 # it); it stays buildable + linted via maintests.yml.
 on:
@@ -39,6 +44,22 @@ jobs:
     runs-on: ubuntu-latest
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/horde-worker-regen
+      # The build whose images also receive the unsuffixed :latest / :vX.Y.Z tags. Newest CUDA line so the
+      # default pull runs current Blackwell / datacenter cards; flip to cu132 here to move the default up.
+      DEFAULT_BACKEND: cu130
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # cuda_version selects the nvidia/cuda:<version>-runtime-ubuntu22.04 base. The torch wheel bundles
+          # its own CUDA runtime, so the base mainly sets the system CUDA libs and the driver floor; keep it
+          # on the same CUDA major as the torch build. Confirm the exact base tag exists before publishing.
+          - backend: cu126
+            cuda_version: "12.8.1"
+          - backend: cu130
+            cuda_version: "13.0.1"
+          - backend: cu132
+            cuda_version: "13.0.1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,8 +76,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive image tags and labels
-        id: meta
+      - name: Derive per-backend (suffixed) image tags and labels
+        id: meta_suffixed
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # Append -<backend> to every tag (including latest) so each build gets its own explicit tag.
+          flavor: |
+            latest=false
+            suffix=-${{ matrix.backend }},onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+
+      - name: Derive default (unsuffixed) image tags
+        id: meta_plain
+        # Only the DEFAULT_BACKEND build claims the unsuffixed :latest / :vX.Y.Z / :X.Y / :sha tags.
+        if: matrix.backend == env.DEFAULT_BACKEND
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
@@ -66,14 +104,22 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
 
-      - name: Build and push CUDA image
+      - name: Build and push CUDA image (${{ matrix.backend }})
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfiles/Dockerfile.cuda
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: |
+            TORCH_BACKEND=${{ matrix.backend }}
+            CUDA_VERSION=${{ matrix.cuda_version }}
+          # The suffixed tags always apply; the default backend additionally publishes the unsuffixed tags
+          # (an empty second block for the non-default backends is harmless).
+          tags: |
+            ${{ steps.meta_suffixed.outputs.tags }}
+            ${{ steps.meta_plain.outputs.tags }}
+          labels: ${{ steps.meta_suffixed.outputs.labels }}
+          # Scope the layer cache per backend so the three builds do not evict each other's cache.
+          cache-from: type=gha,scope=${{ matrix.backend }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.backend }}

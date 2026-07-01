@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from horde_worker_regen.process_management.workers.inference_process import _gpu_arch_supported
+from horde_worker_regen.torch_gpu_preflight import _gpu_arch_supported as _preflight_gpu_arch_supported
 from worker_bootstrap import detect
 
 # The compiled architecture set a stable cu126 wheel reports (matches the worker's real install logs):
@@ -61,11 +62,13 @@ def test_gpu_arch_supported_ignores_malformed_entries() -> None:
 def test_worker_and_bootstrap_arch_predicates_agree(
     arch_list: list[str], capability: tuple[int, int], expected: bool
 ) -> None:
-    """The worker's runtime predicate and worker_bootstrap.detect's copy must stay byte-for-byte in step.
+    """The three copies of the arch predicate (runtime, installer, container preflight) stay in step.
 
-    They are deliberate duplicates: ``worker_bootstrap`` is not importable from the packaged worker, so the
-    inference process cannot share the bootstrap's implementation. This guard fails if either drifts, since
-    a silent divergence would let the installer and the runtime disagree about which GPUs a build can run.
+    They are deliberate duplicates: ``worker_bootstrap`` is not importable from the packaged worker, and
+    the container preflight must stay dependency-light, so neither can share the others' implementation.
+    This guard fails if any drifts, since a silent divergence would let the installer, the runtime, and the
+    Docker entrypoint disagree about which GPUs a build can run.
     """
     assert _gpu_arch_supported(arch_list, capability) == expected
     assert detect.gpu_arch_supported(arch_list, capability) == expected
+    assert _preflight_gpu_arch_supported(arch_list, capability) == expected
