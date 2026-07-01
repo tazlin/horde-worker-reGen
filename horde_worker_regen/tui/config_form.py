@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,13 @@ class ConfigField:
     maximum: float | None = None
     unit: str = ""
     choices: tuple[str, ...] = ()
+    optional: bool = False
+    """Whether a blank value is meaningful (the field is nullable: blank/None means 'unset').
+
+    A numeric field with a model default of ``None`` (e.g. ``gpu_sampling_lease_slots``, where None means
+    "track max_threads") must be saveable while empty, so its coercion maps a blank or ``None`` entry to
+    ``None`` (removing the key) rather than rejecting it as a non-number. Only affects INT/FLOAT fields.
+    """
     explicit_default: Any = _UNSET
     """The worker's real default when the key is absent, when it differs from the kind-based fallback.
 
@@ -116,6 +124,7 @@ SECTIONS = (
     "Timeouts",
     "Retry & scheduling",
     "VRAM budget",
+    "Post-processing budget",
     "Exclusive residency",
     "Unservable model breaker",
     "Self-maintenance",
@@ -141,6 +150,7 @@ CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Budget",
         (
             "VRAM budget",
+            "Post-processing budget",
             "Exclusive residency",
             "Unservable model breaker",
             "Self-maintenance",
@@ -153,7 +163,16 @@ CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 SECTION_GUIDANCE: dict[str, str] = {
     "Throughput": "Bounds are enforced (max_threads 1–16, queue_size 0–4, max_batch 1–20, max_power 1–512). "
-    "See the suggested values per GPU tier in the README.",
+    "See the suggested values per GPU tier in the README. These fields together decide how many inference "
+    "processes the worker spawns (roughly queue_size + max_threads per card); the live estimate below "
+    "updates as you edit. Note the interlocks: queue_size is capped to 3 once max_threads >= 2, and "
+    "extra_slow_worker (on the Performance tab) forces max_threads to 1 and queue_size to 0.",
+    "Memory & performance": "high_performance_mode overrides moderate_performance_mode when both are on, and "
+    "each shortens the job timeout (high = 1/3, moderate = 1/2 of the default). extra_slow_worker overrides "
+    "both, disables them, and clamps concurrency (max_threads 1, queue_size 0, preload_timeout >= 120).",
+    "Features": "Some features depend on others: inpainting is forced off unless img2img is allowed, and "
+    "SDXL ControlNet requires ControlNet (which in turn wants img2img). Enabling a dependent feature without "
+    "its prerequisite has no effect.",
     "Models": "Edit the load/skip rules below; the panel previews exactly which models will load and "
     "their disk cost. Press Resolve to expand 'top N' / 'bottom N' commands (needs usage stats).",
     "Model downloads": "Controls background download behaviour. The Downloads tab provides a live pause/resume "
@@ -171,6 +190,9 @@ SECTION_GUIDANCE: dict[str, str] = {
     "out-of-memory crashes). Changing them incorrectly can cause OOM storms or permanently "
     "suppress jobs the card could actually run. Only adjust if you have diagnosed a specific "
     "budget-related problem in the logs.",
+    "Post-processing budget": "ADVANCED - leave these at their defaults unless you have diagnosed a "
+    "post-processing (upscale/face-fix) VRAM problem. They guard the VRAM peak that lands after sampling, "
+    "which a plain dispatch-time check cannot see. All are no-ops unless the VRAM budget is enabled.",
     "GPU sampling lease": "The lease serializes denoising loops so spare processes can stage their next pipeline "
     "in parallel. Counterproductive with unload_models_from_vram_often (no staged residency to overlap). "
     "Changes to these fields require a worker restart.",
@@ -395,6 +417,15 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Features",
         "Accept SDXL ControlNet/transparency jobs (heavy; requires allow_controlnet).",
     ),
+    ConfigField(
+        "aesthetic_scoring_enabled",
+        "Aesthetic scoring",
+        FieldKind.BOOL,
+        "Features",
+        "Attach a LAION aesthetic score to every image as metadata. Near-free (reuses the safety CLIP "
+        "embed). Independent of offering the 'aesthetic' alchemy form. One-time predictor download.",
+        explicit_default=True,
+    ),
     # LoRA
     ConfigField(
         "allow_lora",
@@ -501,6 +532,28 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=1,
         maximum=8,
         explicit_default=4,
+    ),
+    ConfigField(
+        "download_max_parallel_downloads",
+        "Max parallel downloads",
+        FieldKind.INT,
+        "Model downloads",
+        "How many model downloads may run at once across all hosts (1 = fully sequential). Parallelised "
+        "across distinct hosts, so a fresh install fetches from civitai/huggingface concurrently.",
+        minimum=1,
+        maximum=16,
+        explicit_default=4,
+    ),
+    ConfigField(
+        "download_per_host_concurrency",
+        "Per-host concurrency",
+        FieldKind.INT,
+        "Model downloads",
+        "How many downloads to the same host may run at once (1 = one connection per host). Raise above 1 "
+        "only if a single host can serve several files to you at full speed.",
+        minimum=1,
+        maximum=8,
+        explicit_default=1,
     ),
     ConfigField(
         "extra_model_directories",
@@ -662,6 +715,18 @@ CONFIG_FIELDS: list[ConfigField] = [
         explicit_default=120,
     ),
     ConfigField(
+        "inference_stuck_step_repeat_limit",
+        "Stuck-step repeat limit",
+        FieldKind.INT,
+        "Timeouts",
+        "How many times a slot may report the same sampling step without advancing before it is reaped. "
+        "Guards a wedge the time-based step timeout cannot see (the generation loops on one step). This "
+        "is a count of repeats, not seconds.",
+        minimum=3,
+        maximum=100,
+        explicit_default=20,
+    ),
+    ConfigField(
         "download_timeout",
         "Aux download timeout",
         FieldKind.INT,
@@ -685,14 +750,15 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         "minutes_allowed_without_jobs",
-        "Idle exit timeout",
+        "Idle warning after",
         FieldKind.INT,
         "Retry & scheduling",
-        "Minutes to stay alive with no jobs before exiting. 0 = run indefinitely.",
+        "Log a low-demand advisory once idle this many minutes in a session. The worker never exits when "
+        "idle; this only controls the reminder. 0 (default) disables the reminder.",
         minimum=0,
         maximum=3600,
         unit="min",
-        explicit_default=30,
+        explicit_default=0,
     ),
     ConfigField(
         "model_stickiness",
@@ -735,6 +801,96 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=131072,
         unit="MB",
         explicit_default=4096,
+    ),
+    ConfigField(
+        "ram_pressure_pause_percent",
+        "RAM pressure pause %",
+        FieldKind.FLOAT,
+        "VRAM budget",
+        "Absolute host-RAM danger floor: at or above this system-RAM usage %, the worker stops admitting "
+        "loads, sheds idle processes, and pauses pops to avoid an OS OOM kill. Distinct from RAM reserve "
+        "(a per-job margin). The effective floor is the more conservative of this and the min-free-MB below.",
+        minimum=0.0,
+        maximum=100.0,
+        unit="%",
+        explicit_default=90.0,
+    ),
+    ConfigField(
+        "ram_pressure_min_free_mb",
+        "RAM pressure min free",
+        FieldKind.INT,
+        "VRAM budget",
+        "Absolute companion to the pause %: the worker also degrades whenever free system RAM drops below "
+        "this many MB, protecting a small-RAM host where a percentage still leaves too few megabytes.",
+        minimum=0,
+        maximum=131072,
+        unit="MB",
+        explicit_default=1024,
+    ),
+    ConfigField(
+        "vram_per_process_overhead_mb",
+        "Per-process VRAM overhead",
+        FieldKind.INT,
+        "VRAM budget",
+        "VRAM (MB) one inference process uses for its CUDA context with no model loaded. 0 (default) "
+        "auto-detects via the startup probe; set a positive value only to override a bad measurement.",
+        minimum=0,
+        maximum=49152,
+        unit="MB",
+        explicit_default=0,
+    ),
+    # Post-processing budget
+    ConfigField(
+        "post_processing_budget_reserve_enabled",
+        "Reserve for post-processing peak",
+        FieldKind.BOOL,
+        "Post-processing budget",
+        "Hold back the imminent upscaler/face-fixer VRAM peak of in-flight jobs when admitting new ones, "
+        "so a freshly-released slot is not handed VRAM another job is about to claim. Only used when the "
+        "VRAM budget is enabled.",
+        explicit_default=True,
+    ),
+    ConfigField(
+        "post_processing_active_reclaim_enabled",
+        "Reclaim for own PP peak",
+        FieldKind.BOOL,
+        "Post-processing budget",
+        "Before a job's own post-processing peak lands, free cross-process VRAM (an idle sibling's model, "
+        "then a context) if it will not otherwise fit. Prevents an upscale tile-thrash on a full card. "
+        "Only used when the VRAM budget is enabled.",
+        explicit_default=True,
+    ),
+    ConfigField(
+        "post_processing_fault_breaker_enabled",
+        "Post-processing fault breaker",
+        FieldKind.BOOL,
+        "Post-processing budget",
+        "After repeated post-processing over-commit faults, stop popping post-processing jobs (session-"
+        "latched) so the worker does not trip the horde's forced maintenance. Only used when the VRAM "
+        "budget is enabled.",
+        explicit_default=True,
+    ),
+    ConfigField(
+        "post_processing_fault_threshold",
+        "PP fault threshold",
+        FieldKind.INT,
+        "Post-processing budget",
+        "The breaker trips when more than this many post-processing over-commit faults occur within the "
+        "window below (default tolerates 4, trips on the 5th).",
+        minimum=1,
+        maximum=100,
+        explicit_default=4,
+    ),
+    ConfigField(
+        "post_processing_fault_window_seconds",
+        "PP fault window",
+        FieldKind.INT,
+        "Post-processing budget",
+        "Rolling window (seconds) over which post-processing over-commit faults are counted for the breaker.",
+        minimum=60,
+        maximum=86400,
+        unit="s",
+        explicit_default=1800,
     ),
     # Exclusive residency
     ConfigField(
@@ -787,6 +943,31 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=600,
         unit="s",
         explicit_default=120,
+    ),
+    ConfigField(
+        "large_model_switch_min_seconds",
+        "Large-model switch throttle",
+        FieldKind.INT,
+        "Exclusive residency",
+        "Minimum seconds between offering different very-large models (Flux/Cascade/Qwen/Z-Image), so a "
+        "queue does not force a fresh whole-card teardown + multi-GB reload on every switch. 0 disables. "
+        "Jobs for the model already loaded are unaffected; an idle worker offers large models regardless.",
+        minimum=0,
+        maximum=600,
+        unit="s",
+        explicit_default=0,
+    ),
+    ConfigField(
+        "large_model_reentry_cooldown_seconds",
+        "Large-model re-entry cooldown",
+        FieldKind.INT,
+        "Exclusive residency",
+        "Seconds to avoid any very-large model after the last one drains, so the worker does ordinary work "
+        "for a beat instead of re-thrashing. -1 (default) inherits the whole-card cooldown; 0 disables.",
+        minimum=-1,
+        maximum=600,
+        unit="s",
+        explicit_default=-1,
     ),
     # Unservable model breaker
     ConfigField(
@@ -865,6 +1046,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         requires_restart=True,
         minimum=None,
         maximum=16,
+        optional=True,
         explicit_default=None,
     ),
     # Other
@@ -1267,6 +1449,8 @@ def coerce_value(field: ConfigField, raw: object) -> Any:  # noqa: ANN401 - kind
         return bool(raw)
     if field.kind in (FieldKind.INT, FieldKind.FLOAT):
         text = str(raw).strip()
+        if field.optional and (not text or text.lower() == "none"):
+            return None
         is_int = field.kind is FieldKind.INT
         try:
             value: float = int(text) if is_int else float(text)
@@ -1348,3 +1532,106 @@ def current_value(field: ConfigField, data: Any) -> Any:  # noqa: ANN401 - kind-
     ):
         return [str(value)]
     return value
+
+
+# ---------------------------------------------------------------------------------------------------
+# Process-count preview.
+#
+# How many inference processes a worker spawns is a non-obvious function of queue_size, max_threads and
+# the served model set, and it interacts with extra_slow_worker and the queue cap. The editor shows a
+# live estimate so an operator can see the consequence of a concurrency change before saving. The rules
+# below MIRROR the worker's authoritative computation (reGenBridgeData validators + resolve_card_concurrency
+# in process_manager.py); they are duplicated here only because this module is import-light and must not
+# pull in the SDK/torch chain. The estimate is intentionally an upper bound: the running worker further
+# reduces the count to fit shared system RAM and each card's VRAM (cap_card_process_counts), which cannot
+# be known at edit time.
+# ---------------------------------------------------------------------------------------------------
+
+_META_COMMAND_PREFIXES = ("top", "bottom", "all")
+
+
+def _entries_include_meta_command(load_entries: Sequence[str]) -> bool:
+    """Whether any models-to-load entry is a meta command (``top 5``, ``all sdxl``) rather than one model."""
+    for entry in load_entries:
+        lowered = str(entry).strip().lower()
+        if any(lowered == prefix or lowered.startswith(prefix + " ") for prefix in _META_COMMAND_PREFIXES):
+            return True
+    return False
+
+
+def estimate_inference_processes_per_card(
+    *,
+    max_threads: int,
+    queue_size: int,
+    load_entries: Sequence[str],
+    serves_image_generation: bool,
+    extra_slow_worker: bool,
+) -> int:
+    """Best-effort estimate of how many inference processes one card spawns for the given settings.
+
+    Mirrors the worker: extra-slow mode clamps concurrency (max_threads->1, queue_size->0) first, the
+    queue is then capped to 3 when max_threads >= 2, and a card runs ``queue_size + max_threads`` processes,
+    collapsing to 1 for a single concrete model at max_threads 1. An alchemist-only worker (no image
+    generation) always runs a single inference process. A meta command (``top 5``) counts as many models,
+    so it does not collapse.
+    """
+    if not serves_image_generation:
+        return 1
+    threads = 1 if extra_slow_worker else max(1, max_threads)
+    queue = 0 if extra_slow_worker else max(0, queue_size)
+    if threads >= 2 and queue > 3:
+        queue = 3
+    per_card = queue + threads
+    single_concrete_model = len(load_entries) == 1 and not _entries_include_meta_command(load_entries)
+    if single_concrete_model and threads == 1:
+        per_card = 1
+    return per_card
+
+
+def describe_process_plan(
+    *,
+    max_threads: int,
+    queue_size: int,
+    load_entries: Sequence[str],
+    serves_image_generation: bool,
+    extra_slow_worker: bool,
+    device_indices: Sequence[int],
+) -> str:
+    """A one-line, human-readable preview of the inference/safety processes the settings will spawn.
+
+    ``device_indices`` empty means auto-detect (drive every GPU), so the per-card figure is shown with the
+    caveat that the machine-wide total scales with the detected GPU count. When a specific set of cards is
+    pinned the total is shown explicitly. A trailing note flags the settings that changed the raw formula
+    (the extra-slow clamp, the queue cap) so the interaction is visible rather than surprising.
+    """
+    per_card = estimate_inference_processes_per_card(
+        max_threads=max_threads,
+        queue_size=queue_size,
+        load_entries=load_entries,
+        serves_image_generation=serves_image_generation,
+        extra_slow_worker=extra_slow_worker,
+    )
+    if not serves_image_generation:
+        return "Alchemist-only: 1 inference process + 1 safety process (image generation is off)."
+
+    notes: list[str] = []
+    if extra_slow_worker:
+        notes.append("extra-slow clamps concurrency to 1 thread / queue 0")
+    elif max_threads >= 2 and queue_size > 3:
+        notes.append("queue capped to 3 because max_threads >= 2")
+    note_text = f"  ({'; '.join(notes)})" if notes else ""
+
+    n_cards = len(device_indices)
+    if n_cards <= 1:
+        base = (
+            f"These settings spawn about {per_card} inference process(es) + 1 safety process on this card, "
+            "reduced at runtime to fit RAM/VRAM."
+        )
+        if n_cards == 0:
+            base += " On a multi-GPU box this is per card and scales with the number of GPUs detected."
+        return base + note_text
+    total = per_card * n_cards
+    return (
+        f"About {per_card} inference process(es) per card + 1 safety process; across {n_cards} cards up to "
+        f"{total} inference processes, reduced at runtime to fit shared RAM and each card's VRAM." + note_text
+    )

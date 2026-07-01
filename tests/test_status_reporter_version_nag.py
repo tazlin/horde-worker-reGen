@@ -45,6 +45,41 @@ def _call_print_warnings() -> list[str]:
     return captured
 
 
+def _call_print_warnings_idle(*, minutes_allowed: int, idle_seconds: float) -> list[str]:
+    """Invoke _print_warnings with a chosen idle threshold and idle duration, capturing the messages."""
+    captured: list[str] = []
+    sink_id = logger.add(lambda message: captured.append(message.record["message"]), level="DEBUG")
+    bridge = _stub_bridge_data()
+    bridge.minutes_allowed_without_jobs = minutes_allowed
+    try:
+        reporter = StatusReporter(0.0, 0.0)
+        reporter._print_warnings(
+            bridge,  # type: ignore[arg-type]
+            SimpleNamespace(root={}),  # type: ignore[arg-type]
+            too_many_consecutive_failed_jobs=False,
+            too_many_consecutive_failed_jobs_time=0.0,
+            too_many_consecutive_failed_jobs_wait_time=0.0,
+            time_spent_no_jobs_available=idle_seconds,
+            session_start_time=0.0,
+            total_ram_gigabytes=16,
+        )
+    finally:
+        logger.remove(sink_id)
+    return captured
+
+
+def test_idle_advisory_fires_past_a_positive_threshold() -> None:
+    """With a positive threshold, exceeding it logs the low-demand advisory."""
+    blob = "\n".join(_call_print_warnings_idle(minutes_allowed=10, idle_seconds=11 * 60))
+    assert "without jobs" in blob
+
+
+def test_idle_advisory_disabled_at_zero() -> None:
+    """A threshold of 0 disables the advisory even after a long idle stretch (it is not an exit timer)."""
+    blob = "\n".join(_call_print_warnings_idle(minutes_allowed=0, idle_seconds=10_000 * 60))
+    assert "without jobs" not in blob
+
+
 def test_newer_release_env_var_triggers_the_nag(monkeypatch: pytest.MonkeyPatch) -> None:
     """When a newer release was found at startup, the periodic report nags with the version and remedy."""
     monkeypatch.delenv("AIWORKER_NOT_REQUIRED_VERSION", raising=False)

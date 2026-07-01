@@ -72,6 +72,15 @@ remove_maintenance_on_init: false
 # We *do not* recommend this setting for most users.
 limited_console_messages: false
 
+# Automatic cleanup of the on-disk logs/ directory, run once at each worker start.
+# The worker's logs (rotated/zipped bridge*.log and trace*.log archives, plus per-run stdout/stderr,
+# startup-crash, console and faulthandler files) would otherwise accumulate without limit over time.
+# log_purge_max_age_days: delete any log file older than this many days (0 disables the age-out).
+# log_purge_max_total_gb: after the age-out, if the logs/ directory still exceeds this many gigabytes,
+#   delete the oldest files first until it fits (0 disables the size cap). Active logs are trimmed last.
+log_purge_max_age_days: 30
+log_purge_max_total_gb: 5
+
 #######################################
 ## Dreamer (Stable Diffusion Worker) ##
 #######################################
@@ -469,9 +478,9 @@ download_timeout: 121
 # A resource (out-of-memory) failure spends its retry in a degraded, isolated dispatch.
 max_inference_attempts: 2
 
-# Maximum minutes the worker will stay alive with no jobs before exiting.
-# Set to 0 to disable this safeguard (worker runs indefinitely).
-minutes_allowed_without_jobs: 30
+# After this many minutes of accumulated idle time, log a low-demand advisory. This never stops the
+# worker (it does not exit when idle); it is only a reminder that demand is low. 0 (default) disables it.
+minutes_allowed_without_jobs: 0
 
 # Percent chance (0.0 to 1.0) that the currently loaded models will be favored when popping a job.
 # Higher values keep the same model loaded longer, reducing model switches at the cost of throughput.

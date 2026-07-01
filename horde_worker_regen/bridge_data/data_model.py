@@ -436,7 +436,14 @@ class reGenBridgeData(CombinedHordeBridgeData):
     fresh attempt rather than faulted outright. A resource (out-of-memory) failure spends its retry in a
     degraded, isolated dispatch. Once attempts are exhausted the job is reported faulted with diagnostics."""
 
-    minutes_allowed_without_jobs: int = Field(default=30, ge=0, lt=60 * 60)
+    minutes_allowed_without_jobs: int = Field(default=0, ge=0, lt=60 * 60)
+    """After this many minutes of accumulated idle time in a session, log a low-demand advisory.
+
+    This is purely an advisory threshold: the worker never exits or shuts down when idle, it simply
+    notes that it has spent a while without jobs (usually low demand) and suggests offering more models
+    or raising max_power. 0 (the default) disables the advisory, which suits a worker deliberately left
+    running to wait for demand. Consumed only by the status reporter.
+    """
 
     horde_model_stickiness: float = Field(default=0.0, le=1.0, ge=0.0, alias="model_stickiness")
     """
@@ -515,6 +522,25 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     Set stats_output_frequency (in seconds) for control over the status message.
     """
+
+    log_purge_max_age_days: float = Field(default=30.0, ge=0.0)
+    """Delete on-disk worker logs older than this many days at startup (0 disables the age-out).
+
+    The worker's ``logs/`` directory accumulates rotated, zipped ``bridge*.log`` and ``trace*.log``
+    archives plus one-per-run ``stdout``/``stderr``, startup-crash, console-redirect and ``faulthandler``
+    files. The loguru sinks bound the *count* of each rotated family, but nothing ages files out or bounds
+    the directory as a whole, so a long-lived install grows it without limit. At startup the worker deletes
+    any log file last modified more than this many days ago. Generous by default so recent history stays
+    available for investigating an incident; set 0 to keep logs until only ``log_purge_max_total_gb`` trims
+    them."""
+
+    log_purge_max_total_gb: float = Field(default=5.0, ge=0.0)
+    """Cap the total size of the ``logs/`` directory in gigabytes (0 disables the size cap).
+
+    After the age-out (``log_purge_max_age_days``), if the directory still exceeds this many gigabytes the
+    worker deletes the oldest log files first until it fits, so a burst of churn cannot fill the disk
+    between age-outs. The currently active sinks are the newest files and are trimmed last. Set 0 to rely
+    only on the age-out."""
 
     dreamer: bool = Field(default=True)
     """If true, this worker pops and processes image-generation jobs (the dreamer role).

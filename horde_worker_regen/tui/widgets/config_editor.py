@@ -28,8 +28,10 @@ from horde_worker_regen.tui.config_form import (
     FieldKind,
     coerce_value,
     current_value,
+    describe_process_plan,
     format_number,
     load_config,
+    read_gpu_device_indices,
     save_config,
     validate_identity_names,
 )
@@ -42,6 +44,9 @@ if TYPE_CHECKING:
 
 _FIELD_BY_KEY = {field.key: field for field in CONFIG_FIELDS}
 _MODELS_SECTION = "Models"
+# The section whose fields drive the (non-obvious) inference-process count; a live preview is appended here.
+_THROUGHPUT_SECTION = "Throughput"
+_PROCESS_PREVIEW_ID = "config-process-preview"
 
 # The per-card multi-GPU editor is its own sub-tab, mounted after the catalog-driven tabs rather than
 # composed from flat ConfigFields (it edits the nested gpu_overrides block, not top-level keys).
@@ -192,6 +197,11 @@ class ConfigEditorView(Vertical):
         color: $text-muted;
         padding: 0 1;
     }
+    ConfigEditorView .config-process-preview {
+        color: $accent;
+        text-style: italic;
+        padding: 1 1 0 1;
+    }
     ConfigEditorView TextArea {
         height: 5;
     }
@@ -264,6 +274,10 @@ class ConfigEditorView(Vertical):
             yield Static(SECTION_GUIDANCE[section], classes="config-guidance")
         for field in section_fields:
             yield self._compose_field(field)
+        if section == _THROUGHPUT_SECTION:
+            # A live estimate of the resulting process count, which is a non-obvious function of these
+            # fields (see describe_process_plan). Filled in on mount and refreshed on every edit.
+            yield Static("", id=_PROCESS_PREVIEW_ID, classes="config-process-preview")
 
     def _label_text(self, field: ConfigField) -> str:
         """A field label annotated with bounds/unit and the restart marker."""
@@ -319,7 +333,7 @@ class ConfigEditorView(Vertical):
         else:
             input_type = {FieldKind.INT: "integer", FieldKind.FLOAT: "number"}.get(field.kind, "text")
             field_input = Input(
-                value=str(value),
+                value="" if value is None else str(value),
                 id=widget_id,
                 type=input_type,  # type: ignore[arg-type]
                 password=field.secret,
@@ -335,6 +349,59 @@ class ConfigEditorView(Vertical):
         """Capture the loaded values as the clean baseline for unsaved-change detection."""
         with contextlib.suppress(Exception):
             self._clean_state = self._widget_state()
+        self._update_process_preview()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Refresh the process-count preview when any numeric/text field changes."""
+        self._update_process_preview()
+
+    def on_switch_changed(self, event: Switch.Changed) -> None:
+        """Refresh the process-count preview when any toggle changes."""
+        self._update_process_preview()
+
+    def _update_process_preview(self) -> None:
+        """Recompute and display the live inference/safety process-count estimate (best-effort).
+
+        Reads the concurrency fields straight from their widgets so an unsaved edit is reflected, and
+        pins card count / model list from the loaded config (the multi-GPU block is restart-locked, so
+        its on-disk value is authoritative for a preview). Never raises: the preview is advisory.
+        """
+        try:
+            preview = self.query_one(f"#{_PROCESS_PREVIEW_ID}", Static)
+        except Exception:  # noqa: BLE001 - queried before mount / on tabs without the field
+            return
+        max_threads = self._int_widget_value("max_threads")
+        queue_size = self._int_widget_value("queue_size")
+        extra_slow = self._bool_widget_value("extra_slow_worker")
+        dreamer = self._bool_widget_value("dreamer")
+        load_entries = self._model_load_entries()
+        device_indices = read_gpu_device_indices(self._data)
+        with contextlib.suppress(Exception):
+            preview.update(
+                describe_process_plan(
+                    max_threads=max_threads,
+                    queue_size=queue_size,
+                    load_entries=load_entries,
+                    serves_image_generation=dreamer,
+                    extra_slow_worker=extra_slow,
+                    device_indices=device_indices,
+                ),
+            )
+
+    def _int_widget_value(self, key: str) -> int:
+        """The current integer value of a field's input, falling back to its configured default."""
+        default = int(current_value(_FIELD_BY_KEY[key], self._data))
+        try:
+            return int(str(self.query_one(f"#cfg-{key}", Input).value).strip())
+        except Exception:  # noqa: BLE001 - a blank/in-progress entry falls back to the last good value
+            return default
+
+    def _model_load_entries(self) -> list[str]:
+        """The current models-to-load entries from the live editor, falling back to the loaded config."""
+        try:
+            return [str(item) for item in self.query_one(f"#mle-root-{MODELS_TO_LOAD_KEY}", ModelListEditor).values()]
+        except Exception:  # noqa: BLE001 - the model panel may not be mounted yet
+            return [str(item) for item in current_value(_FIELD_BY_KEY[MODELS_TO_LOAD_KEY], self._data)]
 
     def is_dirty(self) -> bool:
         """Whether any field differs from the last loaded/saved state (best-effort; never raises).
@@ -450,12 +517,13 @@ class ConfigEditorView(Vertical):
                 elif isinstance(widget, TextArea):
                     widget.text = "\n".join(str(item) for item in value)
                 elif isinstance(widget, Input):
-                    widget.value = str(value)
+                    widget.value = "" if value is None else str(value)
         gpu_editor = self._gpu_editor()
         if gpu_editor is not None:
             gpu_editor.reload(self._data)
         with contextlib.suppress(Exception):
             self._clean_state = self._widget_state()
+        self._update_process_preview()
         self._set_status("Reloaded from disk.", "green")
 
     def _save(self) -> bool:

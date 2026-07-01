@@ -568,12 +568,14 @@ class StatusReporter:
                 f"{too_many_consecutive_failed_jobs_wait_time} seconds must pass before resuming.",
             )
 
-        # No jobs warning
+        # No jobs warning. This threshold only gates an advisory log; it never stops the worker. A value
+        # of 0 disables the warning entirely (a worker that is meant to sit idle waiting for demand should
+        # not nag), which is why the comparison is skipped rather than firing on the first idle second.
         minutes_allowed_without_jobs = bridge_data.minutes_allowed_without_jobs
         seconds_allowed_without_jobs = minutes_allowed_without_jobs * 60
         cur_time = time.time()
         cur_session_minutes = (cur_time - session_start_time) / 60
-        if time_spent_no_jobs_available > seconds_allowed_without_jobs:
+        if minutes_allowed_without_jobs > 0 and time_spent_no_jobs_available > seconds_allowed_without_jobs:
             if not bridge_data.suppress_speed_warnings:
                 logger.warning(
                     f"Your worker spent more than {minutes_allowed_without_jobs} minutes combined throughout this "

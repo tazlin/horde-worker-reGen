@@ -77,7 +77,11 @@ Minimise other VRAM-consuming apps while the worker runs.
 
 - **Use an SSD.** HDDs are too slow for multiple models; limit to one model with under 60 s load time.
 - **Configure 8 GB+ swap** (16 GB+ preferred), even on Linux.
-- **Keep `max_threads` at 2 or below** unless you have a 48 GB+ VRAM data-center GPU.
+- **Keep `max_threads` at 2 or below** unless you have a 48 GB+ VRAM data-center GPU. Remember that
+  `queue_size` and `max_threads` together set how many inference processes spawn (roughly
+  `queue_size + max_threads` per card); the Config tab shows a live estimate, and
+  [Process count](../explanation/bridge_config.md#process-count) explains the formula and its
+  interlocks.
 - **Disable sleep and power-saving** while the worker runs.
 - SDXL needs around 9 GB free RAM (32 GB+ total recommended). Flux and Cascade need around 20 GB free
   RAM (48 GB+ total recommended).

@@ -80,6 +80,38 @@ pop gate checks `queue_size + 1 + (max_threads - 1)` as the ceiling; the extra
 headroom accounts for the fact that jobs "in progress" briefly occupy two stages
 (pending_inference + in_progress).
 
+### Process count
+
+How many inference processes the worker spawns is not a single setting; it is
+derived from the concurrency fields, and the result is easy to under- or
+over-estimate. Per card the worker runs:
+
+```
+inference processes = queue_size + max_threads
+```
+
+with these adjustments:
+
+- **Single-model collapse:** a worker offering exactly one concrete model at
+  `max_threads: 1` collapses to a single inference process (a `top N`/`all` meta
+  command counts as many models, so it does not collapse).
+- **Queue cap:** `queue_size` is capped to `3` once `max_threads >= 2`.
+- **Extra-slow clamp:** `extra_slow_worker` forces `max_threads` to `1` and
+  `queue_size` to `0` first, so the count becomes `1`.
+- **Alchemist-only:** a worker with `dreamer: false` (or a CPU-only install)
+  runs a single inference process regardless of the above; image concurrency is
+  what the process pool exists for.
+
+There is always **one additional safety process**. On a multi-GPU host the count
+is computed **per card and summed**, then reduced so the worker-wide resident set
+fits shared system RAM and each card keeps enough free VRAM for the
+post-processing peak (`cap_card_process_counts`). That runtime reduction means
+the formula above is an **upper bound**.
+
+The **Config tab** shows a live estimate of this count under the Throughput
+fields, updating as you edit, so the consequence of a concurrency change is
+visible before you save.
+
 ### Performance modes
 
 Three boolean flags interact to determine timings and parallelism:
@@ -254,6 +286,31 @@ Image jobs always win contention for a process; in concurrent mode, alchemy only
 uses a process lane no waiting image job needs **and** only when the VRAM-headroom
 gate passes. See
 [Performance and Backpressure → Alchemy backpressure](performance_and_backpressure.md#alchemy-backpressure).
+
+### Log retention
+
+The worker's `logs/` directory holds several families of files: the rotated, zipped
+`bridge*.log` and `trace*.log` archives (written by the loguru sinks in hordelib),
+plus one-per-run `stdout`/`stderr` redirections, `bridge_*_startup.log` crash
+backstops, the supervised `bridge_main_console.log`, and `*.faulthandler` dumps. The
+loguru sinks keep a bounded *count* of each rotated family, but nothing ages files
+out over time or bounds the directory as a whole, so a long-lived install would grow
+it without limit.
+
+At each startup the orchestrator runs a single cleanup sweep of `logs/` before any
+child process is spawned: it first deletes files older than the age limit, then, if
+the directory still exceeds the size budget, deletes the oldest files first until it
+fits. The currently active logs are always the newest files, so the age-out never
+touches them and the size trim reaches them last. The sweep is best-effort: a file it
+cannot delete (an actively-held handle on Windows) is skipped rather than failing.
+
+| Field                    | Default | Effect                                                                                             |
+| ------------------------ | ------- | -------------------------------------------------------------------------------------------------- |
+| `log_purge_max_age_days` | `30`    | Delete any log file older than this many days at startup. `0` disables the age-out.                |
+| `log_purge_max_total_gb` | `5`     | After the age-out, if `logs/` still exceeds this many GB, delete oldest-first until it fits. `0` disables the size cap. |
+
+Both limits are independent; set both to `0` to keep all logs indefinitely (only the
+loguru per-sink rotation count then applies).
 
 ## Configuration flow at a glance
 
