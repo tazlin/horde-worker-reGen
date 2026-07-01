@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import faulthandler
 import re
+import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -65,6 +66,31 @@ def enable_child_faulthandler(role: str) -> None:
         _FAULTHANDLER_FILES.append(fault_file)
         faulthandler.enable(file=fault_file)  # type: ignore[arg-type]
     except Exception:  # noqa: BLE001 - crash capture must never block the worker from starting
+        return
+
+
+def neutralize_inherited_argv() -> None:
+    """Reduce a spawned child's ``sys.argv`` to just the program name.
+
+    A spawned worker inherits the launcher's full ``sys.argv`` (multiprocessing's ``spawn`` start
+    method restores the parent's argv in the child), but the child consumes none of it: its
+    configuration arrives through the target function's arguments and IPC, not the command line.
+
+    That inherited argv is not inert. Libraries loaded later can call ``argparse.parse_known_args()``
+    against ``sys.argv`` at runtime -- notably some ComfyUI controlnet-annotator preprocessors, whose
+    depth/normal path builds an argparse parser and parses the process argv when the annotator model is
+    loaded. ``parse_known_args`` still honours prefix abbreviation, so an inherited flag that ambiguously
+    (or wrongly) matches one of the parser's options makes argparse print an error and call
+    ``sys.exit(2)``. ``SystemExit`` is a ``BaseException``, so the worker's ``except Exception`` guards do
+    not catch it: the child exits with code 2 with no fault message and no fatal signal (faulthandler
+    stays silent), surfacing only as an unexplained mid-inference process recovery.
+
+    Clearing the argv the child never uses closes that whole class of collision. Call once, early in each
+    spawned entry point.
+    """
+    try:
+        sys.argv = sys.argv[:1]
+    except Exception:  # noqa: BLE001 - argv hygiene must never block the worker from starting
         return
 
 

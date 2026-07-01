@@ -39,6 +39,22 @@ Inference processes are started up to `max_inference_processes` (derived
 `queue_size + max_threads`). Safety processes are started up to
 `max_safety_processes` (typically 1).
 
+### Startup hygiene: inherited `sys.argv`
+
+The `spawn` start method restores the launcher's full `sys.argv` in each child,
+but a worker child consumes none of it (its configuration arrives through the
+entry point's arguments and IPC, not the command line). That inherited argv is
+not inert: libraries loaded later can call `argparse.parse_known_args()` against
+`sys.argv` at runtime, and abbreviation matching means an inherited flag can
+ambiguously match one of their options and trigger `sys.exit(2)`. Because
+`SystemExit` is a `BaseException`, the worker's `except Exception` guards miss
+it, so the child exits with no fault message and no fatal signal, surfacing only
+as an unexplained mid-inference process recovery. Each spawned entry point
+therefore calls `neutralize_inherited_argv()` immediately after enabling crash
+capture, reducing argv to the program name so no inherited flag can reach such a
+parser. (The ComfyUI controlnet depth/normal annotator preprocessors are one
+such runtime `sys.argv` reader.)
+
 ## Semaphores and locks
 
 Four shared synchronization primitives gate process concurrency:

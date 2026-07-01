@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import faulthandler
+import sys
 from pathlib import Path
 
 import pytest
 
 from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
     enable_child_faulthandler,
+    neutralize_inherited_argv,
     read_last_startup_crash,
     write_startup_crash,
 )
@@ -83,6 +86,56 @@ def test_write_startup_crash_swallows_failures(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setattr(Path, "open", _boom)
     # Must not raise.
     write_startup_crash("main", RuntimeError("original"))
+
+
+def _annotator_like_parser() -> argparse.ArgumentParser:
+    """A parser shaped like the ComfyUI leres/pix2pix annotator options that read ``sys.argv``.
+
+    It defines several ``--output_*`` options, so an inherited ``--out`` is an ambiguous abbreviation
+    (argparse's default ``allow_abbrev=True``), which is what makes ``parse_known_args`` call
+    ``sys.exit(2)`` when the child inherits the benchmark's ``--out`` flag.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output_nc", type=int, default=1)
+    parser.add_argument("--output_dir", type=str, required=False)
+    parser.add_argument("--output_resolution", type=int, required=False)
+    return parser
+
+
+def test_neutralize_inherited_argv_reduces_to_program_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The child's argv is cut down to just the program name; the inherited flags are dropped."""
+    monkeypatch.setattr(sys, "argv", ["run_worker", "run", "--tiers", "sd15,sdxl", "--out", "results/x"])
+    neutralize_inherited_argv()
+    assert sys.argv == ["run_worker"]
+
+
+def test_neutralize_inherited_argv_prevents_annotator_argparse_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An inherited ``--out`` crashes an annotator-like argparse; neutralizing argv first prevents it.
+
+    This pins the exact failure mode: a spawned child that inherits the benchmark's ``--out`` flag lets a
+    library ``parse_known_args`` call ``sys.exit(2)`` mid-inference (only depth/normal controlnet
+    preprocessors build such a parser), which surfaces only as an unexplained process recovery.
+    """
+    dirty = ["run_worker", "run", "--tiers", "sd15,sdxl", "--out", "results/x"]
+
+    # Without the fix, the inherited --out is an ambiguous prefix and argparse exits(2).
+    monkeypatch.setattr(sys, "argv", list(dirty))
+    with pytest.raises(SystemExit) as exit_info:
+        _annotator_like_parser().parse_known_args()
+    assert exit_info.value.code == 2
+
+    # With the fix applied first, the same parse sees no inherited flags and succeeds.
+    monkeypatch.setattr(sys, "argv", list(dirty))
+    neutralize_inherited_argv()
+    namespace, _extras = _annotator_like_parser().parse_known_args()
+    assert namespace.output_dir is None
+
+
+def test_neutralize_inherited_argv_handles_empty_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutralizing an already-empty argv is a harmless no-op (never raises)."""
+    monkeypatch.setattr(sys, "argv", [])
+    neutralize_inherited_argv()
+    assert sys.argv == []
 
 
 def test_enable_child_faulthandler_opens_file_and_enables(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

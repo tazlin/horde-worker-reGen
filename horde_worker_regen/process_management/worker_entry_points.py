@@ -15,6 +15,7 @@ from loguru import logger
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.lifecycle.child_crash_capture import (
     enable_child_faulthandler,
+    neutralize_inherited_argv,
     write_startup_crash,
 )
 from horde_worker_regen.process_management.lifecycle.debug_attach import maybe_wait_for_process_debugger
@@ -258,6 +259,7 @@ def start_inference_process(
         _apply_device_pin(process_id=process_id, device_index=device_index, accelerator_kind=accelerator_kind)
         _enable_expandable_segments(amd_gpu=amd_gpu, directml=directml)
     enable_child_faulthandler(f"inference_{process_id}")
+    neutralize_inherited_argv()
     with contextlib.nullcontext():  # contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
         logger.remove()
         maybe_wait_for_process_debugger(process_id, "inference")
@@ -423,6 +425,7 @@ def start_safety_process(
             role="safety",
         )
     enable_child_faulthandler(f"safety_{process_id}")
+    neutralize_inherited_argv()
     with contextlib.nullcontext():  # contextlib.redirect_stdout(), contextlib.redirect_stderr():
         logger.remove()
         maybe_wait_for_process_debugger(process_id, "safety")
@@ -539,6 +542,7 @@ def start_download_process(
         connections_per_file (int): Max concurrent connections used to fetch a single large file. Defaults to 4.
     """
     enable_child_faulthandler(f"download_{process_id}")
+    neutralize_inherited_argv()
     with contextlib.nullcontext():
         logger.remove()
         maybe_wait_for_process_debugger(process_id, "download")
