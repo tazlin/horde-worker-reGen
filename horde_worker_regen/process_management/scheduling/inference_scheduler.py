@@ -3341,7 +3341,7 @@ class InferenceScheduler:
             and bridge_data.cycle_process_on_model_change
             and not self._state.shutting_down
         ):
-            self._process_lifecycle._replace_inference_process(available_process)
+            self._process_lifecycle._replace_inference_process(available_process, intentional_reclaim=True)
             return self._preload_outcome(
                 AdmissionDecision.REPLACE_PROCESS,
                 job=job,

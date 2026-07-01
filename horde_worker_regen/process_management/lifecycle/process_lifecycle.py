@@ -1338,7 +1338,7 @@ class ProcessLifecycleManager:
 
         live = [p for p in self._process_map.values() if p.process_type == HordeProcessType.INFERENCE]
         for process_info in live:
-            self._replace_inference_process(process_info)
+            self._replace_inference_process(process_info, intentional_reason=f"soft reset: {reason}")
 
         for slot_id in revived:
             if slot_id not in self._process_map:
