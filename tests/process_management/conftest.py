@@ -25,6 +25,26 @@ from horde_worker_regen.process_management.process_manager import (
     SystemResources,
 )
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+
+
+async def run_scheduling_pass_with_dispatch_inert(scheduler: InferenceScheduler) -> None:
+    """Run one ``run_scheduling_cycle`` with the post-preload dispatch half stubbed inert.
+
+    Exercises the real per-cycle structure (governance tick, then preload) without starting inference or
+    probing for a next job, so a test can assert on the governance and preload side effects of one
+    scheduling pass in isolation.
+    """
+
+    async def _no_next_job(*args: object, **kwargs: object) -> None:
+        return None
+
+    async def _no_inference_started(*args: object, **kwargs: object) -> bool:
+        return False
+
+    scheduler.get_next_job_and_process = _no_next_job  # type: ignore[method-assign]
+    scheduler.start_inference = _no_inference_started  # type: ignore[method-assign]
+    await scheduler.run_scheduling_cycle({})
 
 
 async def track_popped_job_async(

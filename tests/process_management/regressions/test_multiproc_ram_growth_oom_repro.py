@@ -36,6 +36,7 @@ from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
+    run_scheduling_pass_with_dispatch_inert,
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -109,11 +110,12 @@ class TestDangerFloorGovernsEveryTick:
             },
         )
         scheduler = _ram_pressured_scheduler(process_map)
-        # Pending jobs for the *already-resident* models: this is the state that early-returns preload_models.
+        # Pending jobs for the *already-resident* models: this is the state that early-returns preload_models,
+        # so only the cycle-level governor tick can throttle here.
         for model in ("AlbedoBase XL (SDXL)", "Juggernaut XL"):
             await track_popped_job_async(scheduler._job_tracker, make_job_pop_response(model))
 
-        scheduler.preload_models()
+        await run_scheduling_pass_with_dispatch_inert(scheduler)
 
         assert scheduler._state.self_throttle_paused is True, (
             "a steady-state worker under the RAM floor must throttle even when nothing new needs preloading"

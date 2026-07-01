@@ -18,9 +18,11 @@ Pure and table-testable; no scheduler/process imports.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 
 def compute_protected_processes(
-    process_models: dict[int, str | None],
+    process_models: Mapping[int, str | None],
     models_to_load: set[str],
 ) -> set[int]:
     """Return the process ids that must not be displaced to preserve model affinity.

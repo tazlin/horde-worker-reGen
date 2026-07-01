@@ -36,6 +36,7 @@ from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
+    run_scheduling_pass_with_dispatch_inert,
     track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
@@ -251,7 +252,7 @@ class TestMemoryPressureThrottlesPops:
         head_job = make_job_pop_response(_HEAVY_MODEL)
         await track_popped_job_async(scheduler._job_tracker, head_job)
 
-        scheduler.preload_models()
+        await run_scheduling_pass_with_dispatch_inert(scheduler)
 
         assert scheduler._state.self_throttle_paused is True, (
             "critical RAM should slow/stop pops so intake stops adding memory pressure"
@@ -280,7 +281,7 @@ class TestMemoryPressureReducesResidentProcesses:
         head_job = make_job_pop_response(_HEAVY_MODEL)
         await track_popped_job_async(scheduler._job_tracker, head_job)
 
-        scheduler.preload_models()
+        await run_scheduling_pass_with_dispatch_inert(scheduler)
 
         assert scheduler._process_lifecycle.scale_inference_processes.called, (
             "critical RAM with reclaimable idle resident processes should reduce the process count"

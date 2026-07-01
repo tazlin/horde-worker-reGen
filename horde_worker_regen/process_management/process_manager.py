@@ -142,10 +142,10 @@ from horde_worker_regen.process_management.scheduling.workload_flow import FlowC
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.workers.safety_orchestrator import SafetyOrchestrator
-from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.reporting.status_reporter import StatusReporter
+from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
