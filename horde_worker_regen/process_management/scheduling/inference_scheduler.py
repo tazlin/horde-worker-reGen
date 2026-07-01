@@ -74,6 +74,8 @@ from horde_worker_regen.process_management.scheduling.governance import (
     StopTrackingShedCard,
     VramGateResult,
     VramReclaimOutcome,
+    WholeCardResidency,
+    WholeCardResidencyLedger,
     card_preload_order,
     compute_preload_disallowed_processes,
     decide_degrade_response,
@@ -81,6 +83,7 @@ from horde_worker_regen.process_management.scheduling.governance import (
     decide_ram_reclaim_outcome,
     decide_shed_card_restore,
     decide_vram_reclaim_outcome,
+    max_coresident_for_peak,
     preload_concurrency_blocked,
     select_head_room_process_id,
 )
@@ -293,34 +296,6 @@ class _WholeCardDemandOutcome(enum.Enum):
     residency; admit best-effort onto the cleared card under the over-budget step grace."""
 
 
-@dataclass
-class _WholeCardResidency:
-    """Mutable whole-card exclusive-residency state for one card (the worker, on a single-GPU host).
-
-    A heavy model can claim a whole card to itself by stopping that card's idle sibling inference contexts
-    (a context's VRAM is only reclaimed when its process exits) and, on the card the safety process sits
-    on, moving safety off-GPU. The scheduler keys one of these per device index so two heavy models on
-    different cards each hold their own residency independently. A single-GPU worker keeps exactly one
-    instance under the ``None`` key, so its behaviour is identical to the pre-multi-GPU scalar fields.
-    """
-
-    model: str | None = None
-    """The model holding (or being given) sole residency on this card; None when no residency is held."""
-    forecast: StreamForecast | None = None
-    """The streaming forecast that established this residency, cached for the status snapshot's hard numbers."""
-    established_at: float = 0.0
-    """When this residency was first established (stop siblings, cycle safety, load weights); 0.0 when none.
-
-    The establishment intentionally holds the queue, which the recovery supervisor must not mistake for a
-    structural wedge until the establish grace elapses."""
-    cooldown_until: float = 0.0
-    """Wall-clock time until which this residency is held even after its heavy job drains, so a burst of
-    heavy jobs reuses one residency instead of each churning a teardown/restore + safety cycle."""
-    restore_at: float = 0.0
-    """When this residency was last restored (siblings respawned, safety cycled back on-GPU); 0.0 when none.
-    The restore churn also briefly makes the queue unservable, so the wedge grace must cover it too."""
-
-
 class InferenceScheduler:
     """Owns model preloading, inference start, and model unloading logic."""
 
@@ -446,12 +421,12 @@ class InferenceScheduler:
         # it the probe measurements via set_measured_*; the scheduler feeds it clean idle-residency readings
         # captured each tick by _maybe_capture_idle_context_residency.
         self._overhead = ContextOverheadModel()
-        # Whole-card exclusive-residency state, keyed by the device index a residency is held on. A heavy
+        # Whole-card exclusive-residency records, keyed by the device index a residency is held on. A heavy
         # model claims a card by stopping that card's idle sibling contexts (and cycling safety off-GPU on the
         # safety card); keying per card lets two heavy models on different cards each hold their own residency.
         # A single-GPU worker uses exactly one entry under the None key, identical to the prior scalar fields.
-        # See _WholeCardResidency for the per-card fields and _residency_state for the accessor.
-        self._whole_card_residencies: dict[int | None, _WholeCardResidency] = {}
+        # All reads/writes go through the ledger (see WholeCardResidencyLedger; _residency_state delegates).
+        self._whole_card_ledger = WholeCardResidencyLedger()
         # The per-tick resource governor: run_scheduling_cycle ticks it unconditionally before any
         # preload/dispatch decision, so governance never depends on a particular scheduling path
         # executing. It owns the RAM governor's multi-tick bookkeeping (shed cards, draining
@@ -860,25 +835,21 @@ class InferenceScheduler:
             f"Serving it co-resident via model eviction instead of reserving the card.</>",
         )
 
-    def _residency_state(self, device_index: int | None) -> _WholeCardResidency:
+    def _residency_state(self, device_index: int | None) -> WholeCardResidency:
         """Return the (lazily-created) whole-card residency state for ``device_index``.
 
         ``None`` is the single-GPU / worker-wide key, so a single-GPU host keeps exactly one residency state
         and behaves as the pre-multi-GPU scalar fields did.
         """
-        state = self._whole_card_residencies.get(device_index)
-        if state is None:
-            state = _WholeCardResidency()
-            self._whole_card_residencies[device_index] = state
-        return state
+        return self._whole_card_ledger.state_for(device_index)
 
-    def _held_residencies(self) -> list[tuple[int | None, _WholeCardResidency]]:
+    def _held_residencies(self) -> list[tuple[int | None, WholeCardResidency]]:
         """Return ``(device_index, state)`` for every card currently holding a whole-card residency.
 
         A residency is "held" while its model is set. Used by the per-cycle convergence/restore passes and the
         supervisor-facing grace checks, which must consider every card's residency, not just one.
         """
-        return [(index, state) for index, state in self._whole_card_residencies.items() if state.model is not None]
+        return self._whole_card_ledger.held()
 
     # The worker-wide (single-GPU) whole-card residency is the entry under the ``None`` key. These properties
     # expose its fields under their historical scalar names so single-GPU callers and tests read/write the
@@ -953,17 +924,13 @@ class InferenceScheduler:
             device_index: When given, size against that one card's total VRAM (the per-card context-reduction
                 depth on a multi-GPU host); when None, the worker-wide total.
         """
-        total_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
-        per_process = self._per_process_overhead_mb()
-        if total_mb is None or per_process <= 0:
-            return None
-        marginal = self._marginal_process_overhead_mb() or per_process
-        if marginal <= 0:
-            return None
-        budget = total_mb - peak_mb - reserve_mb
-        if budget <= per_process:
-            return 1
-        return max(1, 1 + int((budget - per_process) // marginal))
+        return max_coresident_for_peak(
+            total_vram_mb=self._process_map.get_reported_total_vram_mb(device_index=device_index),
+            per_process_overhead_mb=self._per_process_overhead_mb(),
+            marginal_overhead_mb=self._marginal_process_overhead_mb(),
+            peak_mb=peak_mb,
+            reserve_mb=reserve_mb,
+        )
 
     def _forecast_streaming(
         self,
@@ -1088,14 +1055,14 @@ class InferenceScheduler:
         ``device_index`` scopes the residency to one card on a multi-GPU host (only that card's processes are
         reduced, and safety is paused only if it sits on that card); None is the single-GPU / worker-wide case.
         """
-        state = self._residency_state(device_index)
-        if announce or state.established_at == 0.0:
-            # Mark the establishment start (first admit of this heavy job, or a fresh residency) so the
-            # recovery supervisor's grace window is measured from when the intentional hold began.
-            state.established_at = time.time()
-        state.model = job.model
-        state.forecast = forecast
-        state.cooldown_until = time.time() + self._whole_card_cooldown_seconds()
+        self._whole_card_ledger.record_grant(
+            device_index,
+            model=job.model,
+            forecast=forecast,
+            cooldown_until=time.time() + self._whole_card_cooldown_seconds(),
+            now=time.time(),
+            refresh_established=announce,
+        )
 
         # ``target_override`` lets a caller size the depth from the admission verdict's rejected peak rather
         # than the forecast's lighter resident-weight estimate, for the activation-peak context over-commit the
@@ -1216,12 +1183,14 @@ class InferenceScheduler:
         ``device_index`` scopes the pre-staged residency to one card on a multi-GPU host; None is the
         single-GPU / worker-wide case.
         """
-        state = self._residency_state(device_index)
-        if announce or state.established_at == 0.0:
-            state.established_at = time.time()
-        state.model = job.model
-        state.forecast = forecast
-        state.cooldown_until = time.time() + self._whole_card_cooldown_seconds()
+        self._whole_card_ledger.record_grant(
+            device_index,
+            model=job.model,
+            forecast=forecast,
+            cooldown_until=time.time() + self._whole_card_cooldown_seconds(),
+            now=time.time(),
+            refresh_established=announce,
+        )
         if announce:
             logger.opt(ansi=True).info(
                 f"<fg #f0beff>Pre-staging whole-card head {job.model} into a spare process's RAM while the "
@@ -1310,12 +1279,7 @@ class InferenceScheduler:
         ``found`` distinguishes a genuine hit on the ``None`` (single-GPU / worker-wide) key from a miss, since
         ``None`` is itself a valid residency key.
         """
-        if model is None:
-            return (False, None)
-        for device_index, state in self._whole_card_residencies.items():
-            if state.model == model:
-                return (True, device_index)
-        return (False, None)
+        return self._whole_card_ledger.holder_for_model(model)
 
     def _whole_card_teardown_exhausted(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
         """Whether a whole-card residency has done all it can and the head can now load best-effort.
@@ -1374,10 +1338,11 @@ class InferenceScheduler:
         (the teardown completes shortly after establishment, and this is gated behind the structural-complete
         check at the call site), so a stuck or unavailable free-VRAM measurement can never wedge the head.
         """
-        state = self._whole_card_residencies.get(device_index)
-        if state is None or state.established_at == 0.0:
-            return False
-        return (time.time() - state.established_at) >= _WHOLE_CARD_DRAIN_SETTLE_SECONDS
+        return self._whole_card_ledger.drain_backstop_elapsed(
+            device_index,
+            now=time.time(),
+            settle_seconds=_WHOLE_CARD_DRAIN_SETTLE_SECONDS,
+        )
 
     def is_whole_card_residency_active(self) -> bool:
         """Whether any card currently holds a whole-card residency lease (its cooldown still running).
@@ -1386,7 +1351,7 @@ class InferenceScheduler:
         snapshot, so the job popper's large-model re-entry cooldown can cheaply ask "is the lease up?" every
         pop cycle: the lease is up exactly when this returns False (no card holds a residency model).
         """
-        return any(state.model is not None for state in self._whole_card_residencies.values())
+        return self._whole_card_ledger.any_held()
 
     def whole_card_residency_grace_active(self) -> bool:
         """Whether a whole-card residency is establishing, so the held queue is intentional (not a wedge).
@@ -1397,17 +1362,11 @@ class InferenceScheduler:
         ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS`` so a residency that genuinely never loads still trips the
         supervisor. Public: read by the process manager's wedge assessment.
         """
-        now = time.time()
-        for state in self._whole_card_residencies.values():
-            establishing = (
-                state.model is not None
-                and state.established_at != 0.0
-                and (now - state.established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
-            )
-            restoring = state.restore_at != 0.0 and (now - state.restore_at) < _WHOLE_CARD_RESTORE_GRACE_SECONDS
-            if establishing or restoring:
-                return True
-        return False
+        return self._whole_card_ledger.grace_active(
+            now=time.time(),
+            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+            restore_grace_seconds=_WHOLE_CARD_RESTORE_GRACE_SECONDS,
+        )
 
     def heavy_head_load_grace_active(self) -> bool:
         """Whether a heavy head admitted off the whole-card path is still inside its bounded load window.
@@ -1446,13 +1405,14 @@ class InferenceScheduler:
         ``None`` key, so a single-GPU caller reads it by passing ``device_index=None``. Reads without creating:
         a card with no residency is left absent from the map.
         """
-        state = self._whole_card_residencies.get(device_index)
-        if state is None or state.model is None:
-            return None, ""
-        establishing = (
-            state.established_at != 0.0 and (time.time() - state.established_at) < _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
+        model, phase = self._whole_card_ledger.phase(
+            device_index,
+            now=time.time(),
+            establish_grace_seconds=_WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
         )
-        return state.model, ("establishing" if establishing else "holding")
+        if model is None:
+            return None, ""
+        return model, str(phase)
 
     def whole_card_residency_state(self) -> WholeCardResidencyState:
         """Return a read-only view of the whole-card residency posture, for the status snapshot/TUI.

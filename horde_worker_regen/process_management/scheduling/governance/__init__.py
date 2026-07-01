@@ -57,6 +57,12 @@ from horde_worker_regen.process_management.scheduling.governance.snapshots impor
     HostMemorySnapshot,
     InferenceSlotSnapshot,
 )
+from horde_worker_regen.process_management.scheduling.governance.whole_card import (
+    WholeCardPhase,
+    WholeCardResidency,
+    WholeCardResidencyLedger,
+    max_coresident_for_peak,
+)
 
 __all__ = [
     "RAM_PRESSURE_PAUSE_SECONDS",
@@ -81,6 +87,9 @@ __all__ = [
     "StopTrackingShedCard",
     "VramGateResult",
     "VramReclaimOutcome",
+    "WholeCardPhase",
+    "WholeCardResidency",
+    "WholeCardResidencyLedger",
     "card_preload_order",
     "compute_preload_disallowed_processes",
     "decide_degrade_response",
@@ -91,6 +100,7 @@ __all__ = [
     "decide_ram_reclaim_outcome",
     "decide_shed_card_restore",
     "decide_vram_reclaim_outcome",
+    "max_coresident_for_peak",
     "preload_concurrency_blocked",
     "select_head_room_process_id",
 ]
