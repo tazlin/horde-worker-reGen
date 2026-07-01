@@ -94,6 +94,15 @@ def main(
 
     bridge_data.load_env_vars()
 
+    # Once per worker start, from the orchestrator before any child is spawned: age out and size-cap the
+    # shared logs/ directory so rotated archives and per-run files do not accumulate on disk indefinitely.
+    from horde_worker_regen.logging_purge import purge_worker_logs_safely
+
+    purge_worker_logs_safely(
+        max_age_days=bridge_data.log_purge_max_age_days,
+        max_total_gb=bridge_data.log_purge_max_total_gb,
+    )
+
     start_working(
         ctx=ctx,
         bridge_data=bridge_data,

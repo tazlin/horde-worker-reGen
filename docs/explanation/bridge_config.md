@@ -304,6 +304,19 @@ fits. The currently active logs are always the newest files, so the age-out neve
 touches them and the size trim reaches them last. The sweep is best-effort: a file it
 cannot delete (an actively-held handle on Windows) is skipped rather than failing.
 
+The sweep is deliberately incapable of removing the wrong file. It only ever considers
+a **direct child** of `logs/` (non-recursive, so a nested `logs/remote_support/` tree
+is never inspected), only a **regular file** (symlinks are skipped, never followed to a
+target elsewhere), and only a file that
+[`log_file_registry`][horde_worker_regen.log_file_registry] **positively recognizes** as
+a worker log. That registry is the single declared source of truth for the worker's
+log-file families (the hordelib `bridge*`/`trace*` sinks, the per-child `stdout`/`stderr`
+redirects, the supervisor sink, the startup-crash backstops, and the faulthandler dumps).
+It is **fail-closed**: a file the registry does not describe is left untouched, not
+guessed at. A CI check introspects the loguru sinks the worker and hordelib actually
+register at runtime and asserts every one is described by a registry entry, so the
+registry cannot silently drift out of step with the code that writes the logs.
+
 | Field                    | Default | Effect                                                                                             |
 | ------------------------ | ------- | -------------------------------------------------------------------------------------------------- |
 | `log_purge_max_age_days` | `30`    | Delete any log file older than this many days at startup. `0` disables the age-out.                |
