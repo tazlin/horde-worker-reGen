@@ -17,12 +17,17 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG DEBIAN_FRONTEND=noninteractive
 ENV APP_HOME=/horde-worker-reGen
 
-# libgl1 is needed by opencv/inference; ca-certificates lets uv reach the PyTorch wheel index.
-# git is needed by hordelib's git-based dependency resolution, and it's generally useful to have in the image for debugging.
+# opencv-python (pulled by horde-engine, imported at load time by bundled ComfyUI nodes such as
+# layer-diffusion's lib_layerdiffusion) needs BOTH libGL (libgl1) and libgthread/libglib (libglib2.0-0)
+# on this slim base. Without libglib2.0-0, `import cv2` raises ImportError, so those nodes fail to import
+# and ComfyUI silently drops their class mappings -- surfacing only later as e.g.
+# `KeyError: 'LayeredDiffusionApply'` at generation time. ca-certificates lets uv reach the PyTorch wheel
+# index. git is needed by hordelib's git-based dependency resolution, and is generally useful for debugging.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     git \
     libgl1 \
+    libglib2.0-0 \
     ca-certificates && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
