@@ -75,8 +75,11 @@ This buys three things:
 
 ## The admission pipeline
 
-The preload loop walks the pending queue and, per job, runs a sequence of named gates. The judgment
-calls are pure functions in
+The preload loop walks the pending queue and, per job, runs a sequence of named gates. The pass uses
+[`AdmissionDecision`][horde_worker_regen.process_management.scheduling.governance.preload_admission.AdmissionDecision]
+as its shared vocabulary (continue, stop, admit, defer by RAM pressure/concurrency/budget, pre-stage,
+terminal admit). The scheduler keeps a tiny private adapter from those decisions to pass control, while
+the judgment calls live as pure functions in
 [`preload_admission`][horde_worker_regen.process_management.scheduling.governance.preload_admission]:
 
 1. **Target exclusion**: which slots this preload may not displace (the queued-model guard, model to
@@ -97,19 +100,23 @@ calls are pure functions in
    the pure outcome deciders
    ([`decide_vram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_vram_reclaim_outcome],
    [`decide_ram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_ram_reclaim_outcome])
-   resolve what the exhausted pass means.
+   resolve what the exhausted pass means. Same-tick reclaim side effects stay behind the
+   [`ReclamationExecutor`][horde_worker_regen.process_management.scheduling.governance.preload_admission.ReclamationExecutor]
+   protocol, implemented by the scheduler because it owns live process state and logging.
 
 ## Whole-card residency state
 
 The whole-card exclusive-residency records (which model holds which card, when the hold was
 established, its cooldown and restore stamps) live in the
-[`WholeCardResidencyLedger`][horde_worker_regen.process_management.scheduling.governance.whole_card.WholeCardResidencyLedger],
-along with every question answerable from the records alone: the phase of a card's residency
-(establishing or holding), whether an establish/restore grace window marks a held queue as intentional,
-and whether the bounded drain backstop has elapsed. The transitions that touch live processes
-(establishing a residency, converging it to sole residency, restoring siblings afterward) remain
-scheduler methods, but they read and write state exclusively through the ledger. The pure sizing rule
-for how many live contexts a rejected peak can co-reside with is
+[`WholeCardResidencyMachine`][horde_worker_regen.process_management.scheduling.governance.whole_card.WholeCardResidencyMachine].
+It extends the ledger queries (phase, grace windows, model holder lookup, drain backstop) with the pure
+transition decisions the scheduler can ask without touching live process objects: whether a head demands
+residency, what process count the residency targets, and whether teardown is complete enough for dispatch.
+The transitions that touch live processes (establishing a residency, converging it to sole residency,
+restoring siblings afterward) remain scheduler methods, but they read and write state exclusively through
+the machine. A resident heavy head goes through the same machine-backed readiness gate as a newly-loaded
+head, so an already-resident whole-card model cannot co-sample while sibling models still occupy the card.
+The pure sizing rule for how many live contexts a rejected peak can co-reside with is
 [`max_coresident_for_peak`][horde_worker_regen.process_management.scheduling.governance.whole_card.max_coresident_for_peak].
 
 ## Extending governance
@@ -129,3 +136,4 @@ When adding a new resource protection, follow the same shape:
 
 The scheduler-integrated behavior stays covered by the regression suites under
 `tests/process_management/regressions/`, which drive real scheduling passes.
+

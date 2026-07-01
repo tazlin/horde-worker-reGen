@@ -25,6 +25,7 @@ __all__ = [
     "WholeCardPhase",
     "WholeCardResidency",
     "WholeCardResidencyLedger",
+    "WholeCardResidencyMachine",
     "max_coresident_for_peak",
 ]
 
@@ -190,6 +191,52 @@ class WholeCardResidencyLedger:
         if state is None or state.established_at == 0.0:
             return False
         return (now - state.established_at) >= settle_seconds
+
+
+class WholeCardResidencyMachine(WholeCardResidencyLedger):
+    """Whole-card residency state machine plus pure transition queries.
+
+    The scheduler still executes side effects (process scale-down, safety cycling, VRAM eviction), but this
+    class owns the multi-tick residency state and the policy questions that can be answered without touching
+    live process objects. It extends :class:`WholeCardResidencyLedger` so existing adapter properties can be
+    migrated incrementally without changing behavior.
+    """
+
+    def residency_demanded(
+        self,
+        forecast: StreamForecast,
+        *,
+        enabled: bool,
+        is_head_blocker: bool,
+    ) -> bool:
+        """Return whether a job should enter the whole-card residency pipeline."""
+        needs_teardown = forecast.needs_exclusive_residency or forecast.needs_process_count_reduction
+        return enabled and needs_teardown and is_head_blocker
+
+    def target_process_count(self, forecast: StreamForecast | None) -> int:
+        """Return the live inference-process target for a held residency."""
+        if forecast is None:
+            return 1
+        return forecast.max_resident_processes() or 1
+
+    def teardown_complete(
+        self,
+        forecast: StreamForecast,
+        *,
+        loaded_process_count: int,
+        safety_pause_required: bool,
+        safety_paused: bool,
+        weights_fit_live: bool,
+        drain_backstop_elapsed: bool,
+    ) -> bool:
+        """Return whether a held residency has cleared enough room for the head to sample."""
+        if loaded_process_count > self.target_process_count(forecast):
+            return False
+        if safety_pause_required and not safety_paused:
+            return False
+        if weights_fit_live:
+            return True
+        return forecast.fits_alone and drain_backstop_elapsed
 
 
 def max_coresident_for_peak(

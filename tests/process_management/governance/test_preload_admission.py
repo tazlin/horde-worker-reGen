@@ -7,6 +7,8 @@ covered by the budget/whole-card/regression suites.
 from __future__ import annotations
 
 from horde_worker_regen.process_management.scheduling.governance import (
+    AdmissionDecision,
+    AdmissionResult,
     PreloadSlotSnapshot,
     RamReclaimOutcome,
     VramReclaimOutcome,
@@ -280,3 +282,18 @@ class TestRamReclaimOutcome:
             no_live_resource_consumer=True,
         )
         assert outcome is RamReclaimOutcome.DEFER
+
+
+class TestAdmissionResult:
+    """The public preload decision vocabulary is stable and value-like."""
+
+    def test_result_carries_decision_reason_and_target(self) -> None:
+        """Admission stages can name a decision without mutating scheduler state."""
+        result = AdmissionResult(
+            decision=AdmissionDecision.DEFER_CONCURRENCY,
+            reason="device already loading",
+            process_id=4,
+        )
+        assert result.decision is AdmissionDecision.DEFER_CONCURRENCY
+        assert result.reason == "device already loading"
+        assert result.process_id == 4

@@ -31,8 +31,11 @@ from horde_worker_regen.process_management.scheduling.governance.governor import
     ResourceGovernor,
 )
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import (
+    AdmissionDecision,
+    AdmissionResult,
     PreloadSlotSnapshot,
     RamReclaimOutcome,
+    ReclamationExecutor,
     VramGateResult,
     VramReclaimOutcome,
     card_preload_order,
@@ -61,10 +64,13 @@ from horde_worker_regen.process_management.scheduling.governance.whole_card impo
     WholeCardPhase,
     WholeCardResidency,
     WholeCardResidencyLedger,
+    WholeCardResidencyMachine,
     max_coresident_for_peak,
 )
 
 __all__ = [
+    "AdmissionDecision",
+    "AdmissionResult",
     "RAM_PRESSURE_PAUSE_SECONDS",
     "CardProcessSnapshot",
     "ClearProcessDraining",
@@ -78,6 +84,7 @@ __all__ = [
     "PreloadSlotSnapshot",
     "RamGovernorState",
     "RamReclaimOutcome",
+    "ReclamationExecutor",
     "RecycleProcess",
     "ReduceCardProcesses",
     "ReduceWorkerProcesses",
@@ -90,6 +97,7 @@ __all__ = [
     "WholeCardPhase",
     "WholeCardResidency",
     "WholeCardResidencyLedger",
+    "WholeCardResidencyMachine",
     "card_preload_order",
     "compute_preload_disallowed_processes",
     "decide_degrade_response",

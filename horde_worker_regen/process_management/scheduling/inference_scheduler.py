@@ -54,6 +54,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 from horde_worker_regen.process_management.resources.run_metrics import ChurnKind
 from horde_worker_regen.process_management.scheduling.context_overhead_model import ContextOverheadModel
 from horde_worker_regen.process_management.scheduling.governance import (
+    AdmissionDecision,
     CardProcessSnapshot,
     ClearProcessDraining,
     EvictIdleModels,
@@ -75,7 +76,7 @@ from horde_worker_regen.process_management.scheduling.governance import (
     VramGateResult,
     VramReclaimOutcome,
     WholeCardResidency,
-    WholeCardResidencyLedger,
+    WholeCardResidencyMachine,
     card_preload_order,
     compute_preload_disallowed_processes,
     decide_degrade_response,
@@ -307,6 +308,17 @@ class _PreloadJobOutcome(enum.Enum):
     """A preload was issued for this job; the pass is done and reports success."""
 
 
+def _preload_outcome_from_admission(decision: AdmissionDecision) -> _PreloadJobOutcome:
+    """Map the public admission decision vocabulary onto the scheduler pass control enum."""
+    match decision:
+        case AdmissionDecision.ADMIT | AdmissionDecision.PRESTAGE | AdmissionDecision.TERMINAL_ADMIT:
+            return _PreloadJobOutcome.PRELOAD_SENT
+        case AdmissionDecision.NEXT_JOB | AdmissionDecision.QUARANTINED | AdmissionDecision.ALREADY_LOADED:
+            return _PreloadJobOutcome.NEXT_JOB
+        case _:
+            return _PreloadJobOutcome.STOP_PASS
+
+
 class InferenceScheduler:
     """Owns model preloading, inference start, and model unloading logic."""
 
@@ -437,7 +449,7 @@ class InferenceScheduler:
         # safety card); keying per card lets two heavy models on different cards each hold their own residency.
         # A single-GPU worker uses exactly one entry under the None key, identical to the prior scalar fields.
         # All reads/writes go through the ledger (see WholeCardResidencyLedger; _residency_state delegates).
-        self._whole_card_ledger = WholeCardResidencyLedger()
+        self._whole_card_ledger = WholeCardResidencyMachine()
         # The per-tick resource governor: run_scheduling_cycle ticks it unconditionally before any
         # preload/dispatch decision, so governance never depends on a particular scheduling path
         # executing. It owns the RAM governor's multi-tick bookkeeping (shed cards, draining
@@ -1232,7 +1244,7 @@ class InferenceScheduler:
             if model is None or not self._whole_card_residency_has_holder(model, device_index):
                 continue
             forecast = state.forecast
-            target = (forecast.max_resident_processes() or 1) if forecast is not None else 1
+            target = self._whole_card_ledger.target_process_count(forecast)
             if self._process_map.num_loaded_inference_processes(device_index=device_index) > target:
                 self._process_lifecycle.scale_inference_processes(
                     target,
@@ -1284,6 +1296,52 @@ class InferenceScheduler:
         forecast = self._forecast_streaming(job, baseline, device_index=device_index)
         return not self._whole_card_teardown_exhausted(forecast, device_index=device_index)
 
+    def _resident_whole_card_head_ready(
+        self,
+        job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+    ) -> bool:
+        """Ensure an already-resident whole-card head has sole residency before it samples.
+
+        The ordinary whole-card path runs during preload admission, so it used to miss a heavy head whose
+        model was already resident on an idle process while sibling processes still held their own models.
+        That job is entitled to the same residency as a to-be-loaded head: establish the residency, evict
+        sibling VRAM, and defer dispatch until the teardown is complete.
+        """
+        if job.model is None:
+            raise ValueError(f"job.model is None ({job})")
+        if not self._budget_active() or not self._whole_card_residency_enabled():
+            return True
+
+        target_device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
+        baseline = self._model_metadata.get_baseline(job.model)
+        forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
+        if not self._whole_card_ledger.residency_demanded(
+            forecast,
+            enabled=self._whole_card_residency_enabled(),
+            is_head_blocker=True,
+        ):
+            return True
+        if not self._whole_card_warranted(forecast):
+            self._log_whole_card_declined(job, forecast)
+            return True
+
+        first_time = not self._job_tracker.is_admitted_exclusive(job)
+        self._job_tracker.mark_admitted_exclusive(job)
+        self._establish_whole_card_residency(
+            job,
+            forecast,
+            announce=first_time,
+            device_index=target_device_index,
+        )
+        self.unload_models_from_vram(
+            process_with_model,
+            under_pressure=True,
+            for_head_of_queue=True,
+            device_index=target_device_index,
+        )
+        return self._whole_card_teardown_exhausted(forecast, device_index=target_device_index)
+
     def _residency_holder_for_model(self, model: str | None) -> tuple[bool, int | None]:
         """Return ``(found, device_index)`` for the card whose held whole-card residency is for ``model``.
 
@@ -1314,14 +1372,14 @@ class InferenceScheduler:
         ``device_index`` scopes the live-context count and the safety check to one card on a multi-GPU host;
         None is the single-GPU / worker-wide case.
         """
-        target = forecast.max_resident_processes() or 1
-        if self._process_map.num_loaded_inference_processes(device_index=device_index) > target:
-            return False
-        if self._residency_should_pause_safety(device_index) and not self._process_lifecycle.is_safety_gpu_paused:
-            return False
-        if self._whole_card_weights_fit_live(forecast, device_index=device_index):
-            return True
-        return forecast.fits_alone and self._whole_card_drain_backstop_elapsed(device_index)
+        return self._whole_card_ledger.teardown_complete(
+            forecast,
+            loaded_process_count=self._process_map.num_loaded_inference_processes(device_index=device_index),
+            safety_pause_required=self._residency_should_pause_safety(device_index),
+            safety_paused=self._process_lifecycle.is_safety_gpu_paused,
+            weights_fit_live=self._whole_card_weights_fit_live(forecast, device_index=device_index),
+            drain_backstop_elapsed=self._whole_card_drain_backstop_elapsed(device_index),
+        )
 
     def _whole_card_weights_fit_live(self, forecast: StreamForecast, *, device_index: int | None = None) -> bool:
         """Whether the residency model's weights fit the *live* measured free VRAM (read only at sole residency).
@@ -2606,8 +2664,11 @@ class InferenceScheduler:
         # because the live sibling process contexts have squeezed its bounded weights off the card though it
         # co-resides once the process count is reduced. Both are served by the same machinery: establish
         # residency, stop idle siblings down to max_resident_processes, and admit once the weights fit.
-        needs_teardown_path = forecast.needs_exclusive_residency or forecast.needs_process_count_reduction
-        whole_card_demanded = self._whole_card_residency_enabled() and needs_teardown_path and is_head_blocker
+        whole_card_demanded = self._whole_card_ledger.residency_demanded(
+            forecast,
+            enabled=self._whole_card_residency_enabled(),
+            is_head_blocker=is_head_blocker,
+        )
         if not whole_card_demanded:
             return _WholeCardDemandOutcome.FALL_THROUGH
         if not self._whole_card_warranted(forecast):
@@ -3078,10 +3139,10 @@ class InferenceScheduler:
                     f"Skipping preload of quarantined model {job.model}; faulting its job for reissue.",
                 )
                 self._job_tracker.handle_job_fault_now(job, retryable=False)
-            return _PreloadJobOutcome.NEXT_JOB
+            return _preload_outcome_from_admission(AdmissionDecision.QUARANTINED)
 
         if job.model in loaded_models:
-            return _PreloadJobOutcome.NEXT_JOB
+            return _preload_outcome_from_admission(AdmissionDecision.ALREADY_LOADED)
 
         # Absolute system-RAM floor (degrade, never crash): loading a new model routes its weights through
         # system RAM first, so admitting one while the host is already below its danger floor is the OS
@@ -3092,13 +3153,13 @@ class InferenceScheduler:
         # this only defers the load. Gated on the budget being active (the same switch the rest of the
         # memory machinery uses).
         if self._budget_active() and self._preload_blocked_by_ram_pressure(job):
-            return _PreloadJobOutcome.STOP_PASS
+            return _preload_outcome_from_admission(AdmissionDecision.DEFER_RAM_PRESSURE)
 
         # An exclusively-admitted over-budget job has the whole device; do not stage another model's
         # weights concurrently (a second resident load is exactly what spills the exclusive job's
         # weights to system RAM). The exclusive job's own preload is still allowed through.
         if self._job_tracker.has_exclusive_job_in_progress() and not self._job_tracker.is_admitted_exclusive(job):
-            return _PreloadJobOutcome.NEXT_JOB
+            return _preload_outcome_from_admission(AdmissionDecision.EXCLUSIVE_IN_PROGRESS)
 
         is_head_blocker = head_job is not None and job is head_job
 
@@ -3144,7 +3205,7 @@ class InferenceScheduler:
             available_process = self._select_head_room_process()
 
         if available_process is None:
-            return _PreloadJobOutcome.STOP_PASS
+            return _preload_outcome_from_admission(AdmissionDecision.NO_TARGET)
 
         if (
             available_process.last_process_state != HordeProcessState.WAITING_FOR_JOB
@@ -3153,7 +3214,7 @@ class InferenceScheduler:
             and not self._state.shutting_down
         ):
             self._process_lifecycle._replace_inference_process(available_process)
-            return _PreloadJobOutcome.STOP_PASS
+            return _preload_outcome_from_admission(AdmissionDecision.REPLACE_PROCESS)
 
         # Serialize preloads per card, not worker-wide: the gate exists so two checkpoints do not load
         # onto the same device at once (disk-read + VRAM-allocation spike). On a multi-GPU host a load
@@ -3179,7 +3240,7 @@ class InferenceScheduler:
                     "</>",
                 )
                 self._preload_delay_notified = True
-            return _PreloadJobOutcome.STOP_PASS
+            return _preload_outcome_from_admission(AdmissionDecision.DEFER_CONCURRENCY)
 
         # Resource budget gate: a fresh preload loads this model's weights into the shared device
         # (VRAM) and into system RAM, so admit it only when both measured free VRAM and available
@@ -3192,11 +3253,11 @@ class InferenceScheduler:
             available_process,
             is_head_blocker=is_head_blocker,
         ):
-            return _PreloadJobOutcome.STOP_PASS
+            return _preload_outcome_from_admission(AdmissionDecision.DEFER_BUDGET)
 
         if self._send_preload(job, available_process):
-            return _PreloadJobOutcome.PRELOAD_SENT
-        return _PreloadJobOutcome.STOP_PASS
+            return _preload_outcome_from_admission(AdmissionDecision.ADMIT)
+        return _preload_outcome_from_admission(AdmissionDecision.STOP_PASS)
 
     def _select_head_room_process(self) -> HordeProcessInfo | None:
         """Pick an idle inference process to free for a starved head-of-queue job, or None.
@@ -3682,6 +3743,14 @@ class InferenceScheduler:
                 process_with_model = diversity_process
 
         self._model_recently_missing = False
+
+        if (
+            not information_only
+            and line_skip is None
+            and not self._resident_whole_card_head_ready(next_job, process_with_model)
+        ):
+            self._pending_line_skip = None
+            return None
 
         # Hold a would-be concurrent job back until the in-flight job(s) have made size-appropriate
         # headway, so two heavy models (or a batch / extra-large model) do not stack their loads and

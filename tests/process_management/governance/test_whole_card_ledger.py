@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 from horde_worker_regen.process_management.scheduling.governance import (
     WholeCardPhase,
     WholeCardResidencyLedger,
+    WholeCardResidencyMachine,
     max_coresident_for_peak,
 )
 
@@ -191,4 +193,61 @@ class TestMaxCoresidentForPeak:
                 reserve_mb=1000.0,
             )
             == 5
+        )
+
+
+class TestWholeCardResidencyMachine:
+    """The machine owns pure whole-card transition decisions."""
+
+    def test_residency_demand_requires_enabled_head_and_teardown_need(self) -> None:
+        """Only a head with a teardown forecast enters the residency pipeline."""
+        machine = WholeCardResidencyMachine()
+        forecast = StreamForecast(
+            weights_mb=12_000.0,
+            reserve_mb=2_000.0,
+            free_now_mb=1_000.0,
+            free_if_alone_mb=14_000.0,
+            free_after_model_evict_mb=10_000.0,
+            total_vram_mb=16_000.0,
+            per_process_overhead_mb=1_000.0,
+        )
+        assert machine.residency_demanded(forecast, enabled=True, is_head_blocker=True)
+        assert not machine.residency_demanded(forecast, enabled=False, is_head_blocker=True)
+        assert not machine.residency_demanded(forecast, enabled=True, is_head_blocker=False)
+
+    def test_teardown_complete_requires_target_and_safety_then_live_fit_or_backstop(self) -> None:
+        """The readiness query mirrors the scheduler's structural teardown gate."""
+        machine = WholeCardResidencyMachine()
+        forecast = StreamForecast(
+            weights_mb=13_000.0,
+            reserve_mb=1_500.0,
+            free_now_mb=1_000.0,
+            free_if_alone_mb=14_500.0,
+            free_after_model_evict_mb=10_000.0,
+            total_vram_mb=16_000.0,
+            per_process_overhead_mb=1_000.0,
+        )
+        assert not machine.teardown_complete(
+            forecast,
+            loaded_process_count=2,
+            safety_pause_required=False,
+            safety_paused=False,
+            weights_fit_live=True,
+            drain_backstop_elapsed=False,
+        )
+        assert not machine.teardown_complete(
+            forecast,
+            loaded_process_count=1,
+            safety_pause_required=True,
+            safety_paused=False,
+            weights_fit_live=True,
+            drain_backstop_elapsed=False,
+        )
+        assert machine.teardown_complete(
+            forecast,
+            loaded_process_count=1,
+            safety_pause_required=True,
+            safety_paused=True,
+            weights_fit_live=False,
+            drain_backstop_elapsed=True,
         )
