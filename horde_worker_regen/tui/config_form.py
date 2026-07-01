@@ -808,12 +808,13 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.FLOAT,
         "VRAM budget",
         "Absolute host-RAM danger floor: at or above this system-RAM usage %, the worker stops admitting "
-        "loads, sheds idle processes, and pauses pops to avoid an OS OOM kill. Distinct from RAM reserve "
-        "(a per-job margin). The effective floor is the more conservative of this and the min-free-MB below.",
+        "loads, sheds idle processes, recycles an over-ceiling process, and pauses pops to avoid an OS OOM "
+        "kill. Distinct from RAM reserve (a per-job margin). The effective floor is the more conservative of "
+        "this and the min-free-MB below.",
         minimum=0.0,
         maximum=100.0,
         unit="%",
-        explicit_default=90.0,
+        explicit_default=85.0,
     ),
     ConfigField(
         "ram_pressure_min_free_mb",
@@ -826,6 +827,20 @@ CONFIG_FIELDS: list[ConfigField] = [
         maximum=131072,
         unit="MB",
         explicit_default=1024,
+    ),
+    ConfigField(
+        "ram_per_process_max_mb",
+        "Per-process RAM ceiling",
+        FieldKind.INT,
+        "VRAM budget",
+        "Resident RAM (MB) one inference process may hold before it is recycled while the host is under the "
+        "RAM danger floor (idle recycled at once; busy drained then recycled). Bounds a single process's "
+        "balloon so several processes plus co-tenants cannot drive an OS OOM kill. Consulted only under the "
+        "floor. 0 disables.",
+        minimum=0,
+        maximum=1048576,
+        unit="MB",
+        explicit_default=18432,
     ),
     ConfigField(
         "vram_per_process_overhead_mb",

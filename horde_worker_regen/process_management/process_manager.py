@@ -142,6 +142,7 @@ from horde_worker_regen.process_management.scheduling.workload_flow import FlowC
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.workers.safety_orchestrator import SafetyOrchestrator
+from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.reporting.status_reporter import StatusReporter
@@ -371,6 +372,33 @@ class _EstimatedContextFootprint:
     """System RAM a resident context retains (CPU-side weights plus allocator retention freed only by a respawn)."""
     POST_PROCESSING_PEAK_MB = 8500.0
     """Free VRAM a card must keep for the post-processing peak that lands after sampling (a 4x SDXL upscale)."""
+
+
+# Coarse system-RAM a co-hosted worker role consumes beside the image inference contexts, reserved up front so
+# the resident-context count is sized against what is actually left of the shared pool. An alchemist runs its
+# own CLIP/BLIP/aesthetic models in-worker; a scribe is a separate text-generation server whose weights still
+# sit in the same RAM. Both are deliberately conservative floors: under-reserving is what lets the summed
+# footprint (contexts + co-tenants) drive an OS OOM kill, the failure this guards.
+_ALCHEMIST_CO_TENANT_RAM_BYTES = 4 * 1024 * 1024 * 1024
+_SCRIBE_CO_TENANT_RAM_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def co_tenant_ram_reserve_bytes(bridge_data: reGenBridgeData) -> int:
+    """System RAM (bytes) to keep free for co-hosted worker roles (alchemist, scribe) beside image inference.
+
+    Raised into ``target_ram_overhead_bytes`` so the per-card process-count cap sizes resident contexts against
+    the RAM the co-tenants actually take, not the whole pool. Returns 0 for an image-only worker (byte-identical
+    to prior sizing). An alchemist reserve is the larger of its configured per-form RAM headroom and a floor; a
+    configured scribe adds a fixed floor (its text model's size is not known here, so a coarse guard is used).
+    Never raises on a bad config value.
+    """
+    reserve = 0
+    if WorkloadKind.ALCHEMY in enabled_workloads(bridge_data):
+        alchemy_headroom_mb = config_number(getattr(bridge_data, "alchemy_ram_headroom_mb", None)) or 0.0
+        reserve += max(_ALCHEMIST_CO_TENANT_RAM_BYTES, int(alchemy_headroom_mb * 1024 * 1024))
+    if getattr(bridge_data, "scribe_name", None):
+        reserve += _SCRIBE_CO_TENANT_RAM_BYTES
+    return reserve
 
 
 def cap_card_process_counts(
@@ -813,6 +841,23 @@ class HordeWorkerProcessManager:
                 )
 
             self.target_ram_overhead_bytes = min(self.target_ram_overhead_bytes, int(20 * 1024 * 1024 * 1024 / 2))
+
+        # Reserve additional RAM for co-hosted worker roles (an alchemist's in-worker CLIP/BLIP, a scribe's text
+        # model) so the per-card process-count cap does not size resident contexts as if the whole pool were
+        # theirs. Clamped so the reserve never claims more than 75% of RAM (always leaving room for at least one
+        # inference context): the summed image + co-tenant footprint over-committing the shared pool is what
+        # drove the observed OS OOM kill on a box running a dreamer, an alchemist, and a scribe together.
+        co_tenant_reserve = co_tenant_ram_reserve_bytes(self.bridge_data)
+        if co_tenant_reserve > 0:
+            self.target_ram_overhead_bytes = min(
+                self.target_ram_overhead_bytes + co_tenant_reserve,
+                int(self.total_ram_bytes * 0.75),
+            )
+            logger.debug(
+                f"Reserving an additional {co_tenant_reserve / 1024 / 1024 / 1024:.1f} GB RAM for co-hosted "
+                f"worker roles (alchemist/scribe); target RAM overhead now "
+                f"{self.target_ram_overhead_bytes / 1024 / 1024 / 1024:.1f} GB.",
+            )
 
         if self.target_ram_overhead_bytes > self.total_ram_bytes:
             raise ValueError(

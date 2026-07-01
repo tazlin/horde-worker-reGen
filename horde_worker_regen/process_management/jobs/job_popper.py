@@ -749,6 +749,17 @@ class JobPopper:
             self._state.last_pop_no_jobs_available = False
             return
 
+        if self._state.ram_pressure_pop_hold:
+            # Soft, pre-floor RAM hold: system RAM is approaching its danger floor (or an over-ceiling process
+            # is being drained). Do not start a new job's ttl clock on work the degraded worker cannot promptly
+            # serve, or it ages past its ttl in-queue and the horde aborts it as too slow. In-flight work is
+            # unaffected; the hold clears as soon as RAM recovers and no process is draining.
+            self._state.last_pop_no_jobs_available = False
+            self._state.last_pop_skipped_reasons["ram_pressure"] = (
+                self._state.last_pop_skipped_reasons.get("ram_pressure", 0) + 1
+            )
+            return
+
         if self._state.gpu_torch_incompatible:
             # The installed PyTorch has no kernels for this GPU: every job would fail at the first kernel
             # launch, so never pop. Sticky for the session (a build/hardware mismatch); fixed by reinstalling.

@@ -184,6 +184,9 @@ class TestPreloadBudgetGate:
         # Prevent the real psutil RAM reading from spuriously tripping the RAM danger floor gate
         # when system available memory is low (common in large combined test runs).
         monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
+        # Pin total RAM too so the absolute danger floor (a percentage of total) is host-independent: 8000 MB
+        # available clears 15% of 32000 MB, keeping these marginal-budget cases out of the danger-floor path.
+        monkeypatch.setattr(scheduler, "_measured_total_ram_mb", lambda: 32000.0)
 
         assert scheduler.preload_models() is False
         # The spare process was NOT told to preload...
@@ -225,6 +228,9 @@ class TestPreloadBudgetGate:
             max_inference=2,
         )
         monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
+        # Pin total RAM too so the absolute danger floor (a percentage of total) is host-independent: 8000 MB
+        # available clears 15% of 32000 MB, keeping these marginal-budget cases out of the danger-floor path.
+        monkeypatch.setattr(scheduler, "_measured_total_ram_mb", lambda: 32000.0)
         # Reclaim always "succeeds", so the RAM branch defers every tick and the existing best-effort
         # admit (which requires reclaim to be exhausted) never triggers: a perpetual wedge.
         monkeypatch.setattr(scheduler, "unload_models", lambda *a, **k: True)
@@ -275,6 +281,9 @@ class TestPreloadBudgetGate:
             max_inference=2,
         )
         monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
+        # Pin total RAM too so the absolute danger floor (a percentage of total) is host-independent: 8000 MB
+        # available clears 15% of 32000 MB, keeping these marginal-budget cases out of the danger-floor path.
+        monkeypatch.setattr(scheduler, "_measured_total_ram_mb", lambda: 32000.0)
 
         scheduler._update_head_starvation_timer(head)
         # A live job holds the device, so the head's clock must not be running.
@@ -305,6 +314,9 @@ class TestPreloadBudgetGate:
         # Prevent the real psutil RAM reading from spuriously tripping the RAM danger floor gate
         # when system available memory is low (common in large combined test runs).
         monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
+        # Pin total RAM too so the absolute danger floor (a percentage of total) is host-independent: 8000 MB
+        # available clears 15% of 32000 MB, keeping these marginal-budget cases out of the danger-floor path.
+        monkeypatch.setattr(scheduler, "_measured_total_ram_mb", lambda: 32000.0)
 
         assert scheduler.preload_models() is True
         assert spare.last_control_flag == HordeControlFlag.PRELOAD_MODEL
@@ -342,6 +354,9 @@ class TestPreloadBudgetGate:
         )
         # Force a low available-RAM reading so the RAM budget defers deterministically.
         monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 8000.0)
+        # Pin total RAM too so the absolute danger floor (a percentage of total) is host-independent: 8000 MB
+        # available clears 15% of 32000 MB, keeping these marginal-budget cases out of the danger-floor path.
+        monkeypatch.setattr(scheduler, "_measured_total_ram_mb", lambda: 32000.0)
 
         assert scheduler.preload_models() is False
         assert spare.last_control_flag != HordeControlFlag.PRELOAD_MODEL

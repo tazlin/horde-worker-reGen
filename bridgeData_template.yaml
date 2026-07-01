@@ -533,15 +533,26 @@ ram_reserve_mb: 4096
 # new model loads, sheds idle resident inference processes, and pauses job pops until RAM recovers, instead
 # of loading a model's weights through an out-of-RAM host and being killed by the kernel OOM-killer. The
 # effective floor is the more conservative of this percentage and ram_pressure_min_free_mb, so a large-RAM
-# host is protected by the percentage and a small-RAM host by the absolute floor. Only used with
-# enable_vram_budget.
-ram_pressure_pause_percent: 90.0
+# host is protected by the percentage and a small-RAM host by the absolute floor. A resident inference
+# process can allocate several GB in a single step (a batch decode, or a fresh checkpoint routed through RAM),
+# so the default leaves ~15% of RAM free for that step. Only used with enable_vram_budget.
+ram_pressure_pause_percent: 85.0
 
 # Minimum free system RAM (MB) below which the worker degrades, regardless of ram_pressure_pause_percent.
 # On a small-RAM host the percentage can resolve to too few MB to load safely, so the worker also degrades
 # whenever free RAM drops below this. Effective floor = max((100 - ram_pressure_pause_percent)% of total
 # RAM, this). Only used with enable_vram_budget.
 ram_pressure_min_free_mb: 1024
+
+# Resident system RAM (MB) one inference process may hold before it becomes a reclaim candidate *while the
+# host is under its RAM danger floor*. A worker that keeps model weights resident accumulates them per process,
+# and the allocator does not return those pages to the OS without a respawn; on a multi-process / multi-GPU
+# host a single process can balloon past what the shared pool holds beside its siblings and any co-tenants
+# (an alchemist, a scribe), the shape that drives an OS OOM kill. When over this ceiling under pressure, an
+# idle process is recycled immediately and a busy one is drained (fed no new work) then recycled once its job
+# finishes. Only consulted under the danger floor, so a roomy host never recycles needlessly. 0 disables.
+# Only used with enable_vram_budget.
+ram_per_process_max_mb: 18432
 
 # Hold back the imminent post-processing VRAM peak of in-flight jobs when admitting new ones. A job releases
 # its inference slot for overlap *before* its upscaler/face-fixer allocates, so measured free VRAM

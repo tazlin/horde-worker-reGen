@@ -135,6 +135,27 @@ def test_bridge_data_yaml() -> None:
     assert len(parsed_bridge_data.meta_load_instructions) == 1
 
 
+def test_ram_safety_defaults() -> None:
+    """The RAM-safety knobs default to the conservative values that hedge against an OS OOM kill.
+
+    A resident inference process can allocate several GB in one step, so the danger floor keeps ~15% of RAM
+    free (not 10%), and a per-process ceiling bounds a single process's resident balloon so the summed
+    footprint across processes and co-tenants cannot drive the host into a kernel OOM kill.
+    """
+    assert reGenBridgeData.model_fields["ram_pressure_pause_percent"].default == 85.0
+    assert reGenBridgeData.model_fields["ram_per_process_max_mb"].default == 18432
+
+
+def test_template_matches_ram_safety_defaults() -> None:
+    """The shipped template must carry the same RAM-safety defaults as the model (no silent drift)."""
+    yaml = YAML(typ="safe")
+    with open("bridgeData_template.yaml", encoding="utf-8") as f:
+        raw = yaml.load(f)
+    parsed = reGenBridgeData.model_validate(raw)
+    assert parsed.ram_pressure_pause_percent == 85.0
+    assert parsed.ram_per_process_max_mb == 18432
+
+
 def test_bridge_data_loader_yaml_template() -> None:
     """Test that the bridge data template file can be loaded and parsed by a BridgeDataLoader.
 

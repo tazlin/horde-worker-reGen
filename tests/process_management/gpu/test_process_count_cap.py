@@ -143,3 +143,83 @@ class TestOnlyReduces:
             vram_by_card={0: _VRAM_24GB_MB, 1: _VRAM_24GB_MB},
         )
         assert capped == {0: 1, 1: 1}
+
+
+class TestCoTenantReserveShrinksTheContextBudget:
+    """A worker co-hosting an alchemist and/or scribe must reserve their RAM before sizing image contexts.
+
+    The field OOM ran a dreamer, an alchemist, and a scribe on one 64GB host: sizing the resident-context count
+    as if the whole pool were the image worker's over-committed the shared RAM. The co-tenant reserve raises the
+    RAM overhead so the worker-wide cap trims contexts to what is actually left.
+    """
+
+    def test_image_only_worker_reserves_nothing(self) -> None:
+        """An image-only worker keeps the prior overhead (byte-identical sizing)."""
+        from unittest.mock import Mock
+
+        from horde_worker_regen.process_management.process_manager import co_tenant_ram_reserve_bytes
+        from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+
+        bridge_data = Mock()
+        bridge_data.scribe_name = None
+        bridge_data.alchemy_ram_headroom_mb = 2048
+        # No alchemy workload enabled.
+        import horde_worker_regen.process_management.process_manager as pm
+
+        original = pm.enabled_workloads
+        pm.enabled_workloads = lambda _bd: frozenset({WorkloadKind.IMAGE_GENERATION})
+        try:
+            assert co_tenant_ram_reserve_bytes(bridge_data) == 0
+        finally:
+            pm.enabled_workloads = original
+
+    def test_alchemist_and_scribe_each_add_a_reserve(self) -> None:
+        """An alchemist reserves at least its floor and a configured scribe adds its own floor on top."""
+        from unittest.mock import Mock
+
+        import horde_worker_regen.process_management.process_manager as pm
+        from horde_worker_regen.process_management.process_manager import (
+            _ALCHEMIST_CO_TENANT_RAM_BYTES,
+            _SCRIBE_CO_TENANT_RAM_BYTES,
+            co_tenant_ram_reserve_bytes,
+        )
+        from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind
+
+        bridge_data = Mock()
+        bridge_data.scribe_name = "my-scribe"
+        bridge_data.alchemy_ram_headroom_mb = 2048  # below the alchemist floor, so the floor governs
+
+        original = pm.enabled_workloads
+        pm.enabled_workloads = lambda _bd: frozenset({WorkloadKind.IMAGE_GENERATION, WorkloadKind.ALCHEMY})
+        try:
+            reserve = co_tenant_ram_reserve_bytes(bridge_data)
+        finally:
+            pm.enabled_workloads = original
+
+        assert reserve == _ALCHEMIST_CO_TENANT_RAM_BYTES + _SCRIBE_CO_TENANT_RAM_BYTES
+
+    def test_raised_overhead_trims_a_context(self) -> None:
+        """On a host where the RAM pool binds, reserving co-tenant RAM trims the worker-wide context budget.
+
+        The coarse RAM cap barely binds on a very large host (where the per-process ceiling is the live guard),
+        so this uses a 40GB host to exercise the sizing effect: the same two 24GB cards that hold three contexts
+        between them at the base overhead lose one once the alchemist/scribe RAM is reserved.
+        """
+        # Baseline: 9GB overhead on 40GB leaves room for three contexts.
+        baseline = _cap(
+            {0: 2, 1: 2},
+            total_ram_bytes=40 * _GIB,
+            overhead_bytes=_OVERHEAD_9GB,
+            vram_by_card={0: _VRAM_24GB_MB, 1: _VRAM_24GB_MB},
+        )
+        assert sum(baseline.values()) == 3
+        # With ~17GB reserved (9GB base + 8GB alchemist+scribe), usable RAM holds fewer contexts.
+        capped = _cap(
+            {0: 2, 1: 2},
+            total_ram_bytes=40 * _GIB,
+            overhead_bytes=_OVERHEAD_9GB + 8 * _GIB,
+            vram_by_card={0: _VRAM_24GB_MB, 1: _VRAM_24GB_MB},
+        )
+        assert sum(capped.values()) < sum(baseline.values()), (
+            "reserving co-tenant RAM must trim the worker-wide context budget where the RAM pool binds"
+        )

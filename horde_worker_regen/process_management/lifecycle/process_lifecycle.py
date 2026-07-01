@@ -1343,9 +1343,9 @@ class ProcessLifecycleManager:
             return False
         try:
             bridge_data = self._runtime_config.bridge_data
-            pause = getattr(bridge_data, "ram_pressure_pause_percent", 90.0)
+            pause = getattr(bridge_data, "ram_pressure_pause_percent", 85.0)
             min_free = getattr(bridge_data, "ram_pressure_min_free_mb", 1024.0)
-            pause_pct = float(pause) if isinstance(pause, (int, float)) and not isinstance(pause, bool) else 90.0
+            pause_pct = float(pause) if isinstance(pause, (int, float)) and not isinstance(pause, bool) else 85.0
             min_free_mb = (
                 float(min_free) if isinstance(min_free, (int, float)) and not isinstance(min_free, bool) else 1024.0
             )

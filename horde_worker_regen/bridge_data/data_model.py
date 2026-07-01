@@ -640,7 +640,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     """Available system RAM (MB) the budget keeps in reserve so resident-in-RAM models do not force
     the OS to page to disk. Only used when `enable_vram_budget` is true."""
 
-    ram_pressure_pause_percent: float = Field(default=90.0, ge=0, le=100)
+    ram_pressure_pause_percent: float = Field(default=85.0, ge=0, le=100)
     """System-RAM usage percentage at or above which the worker degrades to protect against an OS OOM kill.
 
     Distinct from `ram_reserve_mb` (a marginal, per-job admission reserve): this is an *absolute* danger
@@ -649,8 +649,10 @@ class reGenBridgeData(CombinedHordeBridgeData):
     resident inference processes, and pauses job pops until RAM recovers, rather than loading a model's
     weights through an out-of-RAM host and being killed by the kernel OOM-killer. The effective floor is
     the *more conservative* of this percentage and `ram_pressure_min_free_mb`, so a large-RAM host is
-    protected by the percentage and a small-RAM host by the absolute floor. Only used when
-    `enable_vram_budget` is true."""
+    protected by the percentage and a small-RAM host by the absolute floor. A resident inference process
+    can allocate several GB in a single step (a batch decode, or a fresh checkpoint routed through RAM),
+    so the headroom this leaves must exceed one such step; the default keeps ~15% of RAM free for that
+    reason. Only used when `enable_vram_budget` is true."""
 
     ram_pressure_min_free_mb: int = Field(default=1024, ge=0)
     """Minimum free system RAM (MB) below which the worker degrades, regardless of `ram_pressure_pause_percent`.
@@ -659,6 +661,21 @@ class reGenBridgeData(CombinedHordeBridgeData):
     percent of total can still be too few megabytes to load safely, so the worker also degrades whenever
     free RAM drops below this many MB. The effective danger floor is `max((100 -
     ram_pressure_pause_percent)% of total RAM, this)`. Only used when `enable_vram_budget` is true."""
+
+    ram_per_process_max_mb: int = Field(default=18432, ge=0)
+    """Resident system RAM (MB) one inference process may hold before it is a reclaim candidate under pressure.
+
+    A worker that keeps model weights resident for fast reload accumulates them in each process's address
+    space, and the allocator does not return those pages to the OS without a respawn. On a multi-process /
+    multi-GPU host a single process's footprint can balloon past what the shared RAM pool can hold beside its
+    siblings and any co-tenants (an alchemist, a scribe), which is the shape that drives an OS OOM kill.
+
+    When the host is below its RAM danger floor, a process whose resident RAM is at or above this ceiling is
+    reclaimed: if idle it is recycled immediately (returning its retained pages), and if busy it is drained
+    (fed no new work) and recycled once its in-flight job finishes. This bounds the per-process balloon so the
+    summed resident set stays within RAM, rather than relying only on shedding idle siblings (which cannot help
+    when every process is busy). The ceiling is only consulted while the host is under the danger floor, so a
+    roomy host never recycles needlessly. Set to 0 to disable. Only used when `enable_vram_budget` is true."""
 
     post_processing_budget_reserve_enabled: bool = Field(default=True)
     """Hold back the imminent post-processing VRAM peak of in-flight jobs when admitting new ones.

@@ -51,6 +51,14 @@ class WorkerState:
     self_throttle_paused_until: float = 0.0
     """Wall-clock time the self-throttle pop-pause auto-resumes; 0 when not throttling."""
 
+    ram_pressure_pop_hold: bool = False
+    """Soft, pre-floor pop hold set while system RAM is *approaching* its danger floor (within the marginal
+    RAM reserve of it) or while an over-ceiling process is being drained for reclaim. Distinct from the hard
+    ``self_throttle_paused`` (which fires at/below the floor): this stops the popper starting a new job's ttl
+    clock on work the degraded worker cannot promptly serve, so the job does not age past its ttl in-queue and
+    get aborted by the horde as too slow. In-flight work is unaffected; cleared as soon as RAM recovers and no
+    process is draining."""
+
     post_processing_disabled_by_breaker: bool = False
     """Session-latched: the post-processing fault breaker tripped on repeated unhostable post-processing peaks.
 

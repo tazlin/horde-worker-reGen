@@ -436,6 +436,12 @@ class InferenceScheduler:
         # records each card it shrank here so the recovery path can grow it back once the host clears the
         # danger floor. Multi-GPU only; the worker-wide (single-GPU) reduction does not populate it.
         self._ram_pressure_shed_cards: set[int] = set()
+        # Inference process ids marked to DRAIN because their resident RAM crossed the per-process ceiling while
+        # the host was under its danger floor. A draining process is fed no new dispatch/preload so its in-flight
+        # job can finish, after which the governor recycles it to return its allocator-retained pages. Cleared
+        # when a process falls back under the ceiling (or is recycled). Distinct from _ram_pressure_shed_cards,
+        # which tracks *idle* contexts shed by count; this tracks a *specific busy* process being wound down.
+        self._processes_draining_for_ram: set[int] = set()
         # When a heavy head was last admitted best-effort off the whole-card path (the over-budget exclusive
         # branch, for a model that streams even alone). Its load equally holds the queue, so this bounds a
         # wedge grace that the whole-card establishment grace does not cover. 0.0 when none is loading.
@@ -1823,7 +1829,9 @@ class InferenceScheduler:
         bridge_data = self._runtime_config.bridge_data
         pause = config_number(bridge_data.ram_pressure_pause_percent)
         min_free = config_number(bridge_data.ram_pressure_min_free_mb)
-        pause_pct = pause if pause is not None else 90.0
+        # Fallbacks match reGenBridgeData's defaults for these fields (85% used / 1 GB) so a partially-mocked
+        # config sees the same danger floor a real worker does.
+        pause_pct = pause if pause is not None else 85.0
         min_free_mb = min_free if min_free is not None else 1024.0
         return pause_pct, min_free_mb
 
@@ -1860,6 +1868,105 @@ class InferenceScheduler:
         # resident process count: each idle context pins GB of resident weights the allocator only frees on exit.
         self.unload_models(under_pressure=True)
         self._reduce_processes_under_ram_pressure()
+        # Idle-shed keeps at least one context per card and cannot help when every process is busy, so a single
+        # process whose retained RAM has ballooned past the ceiling is never reclaimed by count alone. Bound it
+        # directly: recycle the largest over-ceiling process (draining it first if it is busy).
+        self._reclaim_over_ceiling_processes()
+
+    def _govern_ram_pressure_if_pressured(self) -> bool:
+        """Evaluate the absolute RAM danger floor and degrade the worker if it is breached.
+
+        The per-tick entry point (distinct from the per-job :meth:`_preload_blocked_by_ram_pressure`): it runs
+        the whole-host degrade response (pause pops, evict idle models, shed idle contexts, reclaim an
+        over-ceiling process) whenever the host is under its floor, so a worker that never attempts a new
+        preload still throttles and reclaims instead of growing into an OS OOM kill. Returns whether the host
+        was under pressure. Clears the one-shot notice when the host is healthy.
+        """
+        verdict = self._ram_pressure_verdict()
+        self._update_ram_pop_hold(verdict)
+        if not verdict.under_pressure:
+            self._ram_pressure_notified = False
+            return False
+        self._govern_ram_pressure(verdict)
+        return True
+
+    def _update_ram_pop_hold(self, verdict: RamPressureVerdict) -> None:
+        """Set the soft, pre-floor pop hold when RAM is approaching the danger floor or a drain is in flight.
+
+        The hard floor engages :attr:`self_throttle_paused`; this softer band stops the popper starting a new
+        job's ttl clock *before* the host is critical, so a job does not age past its ttl waiting on a degraded
+        worker and get aborted by the horde as too slow. The approach margin reuses the marginal RAM reserve
+        (no separate knob): the hold engages once measured available RAM is within ``ram_reserve_mb`` of the
+        floor, and also while any process is being drained for reclaim. Cleared when RAM recovers and no
+        process is draining. Never raises on a bad config value.
+        """
+        margin_mb = config_number(self._runtime_config.bridge_data.ram_reserve_mb)
+        if margin_mb is None:
+            margin_mb = 4096.0
+        approaching = verdict.available_mb is not None and (verdict.available_mb - verdict.floor_mb) < margin_mb
+        self._state.ram_pressure_pop_hold = bool(verdict.under_pressure or approaching) or bool(
+            self._processes_draining_for_ram,
+        )
+
+    def _ram_per_process_ceiling_mb(self) -> float | None:
+        """The configured per-process resident-RAM ceiling (MB), or None when disabled/unset.
+
+        Read defensively (a partially-mocked config yields None) so the pressure path never crashes on a bad
+        attribute; a non-positive value disables the ceiling.
+        """
+        ceiling = config_number(self._runtime_config.bridge_data.ram_per_process_max_mb)
+        if ceiling is None or ceiling <= 0:
+            return None
+        return ceiling
+
+    def _reclaim_over_ceiling_processes(self) -> None:
+        """Reclaim the largest inference process whose resident RAM is at/above the per-process ceiling.
+
+        Only ever called while the host is under its RAM danger floor, so a roomy host never recycles. Acts on
+        one process per invocation (the largest over-ceiling one) to avoid emptying every card at once: if it is
+        idle it is recycled now (its allocator-retained pages return to the OS on respawn); if it is busy it is
+        marked draining (fed no new work by the dispatch/preload target selection) so its in-flight job finishes,
+        and a later invocation recycles it once it is idle. A process that has fallen back under the ceiling is
+        cleared from the drain set.
+        """
+        ceiling_mb = self._ram_per_process_ceiling_mb()
+        if ceiling_mb is None:
+            self._processes_draining_for_ram.clear()
+            return
+
+        over_ceiling: list[HordeProcessInfo] = []
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.ram_usage_bytes / (1024 * 1024) >= ceiling_mb:
+                over_ceiling.append(process_info)
+            else:
+                self._processes_draining_for_ram.discard(process_info.process_id)
+
+        if not over_ceiling:
+            return
+
+        target = max(over_ceiling, key=lambda p: p.ram_usage_bytes)
+        used_mb = target.ram_usage_bytes / (1024 * 1024)
+        if target.is_process_busy():
+            if target.process_id not in self._processes_draining_for_ram:
+                self._processes_draining_for_ram.add(target.process_id)
+                logger.opt(ansi=True).warning(
+                    f"<fg #ff8c69>Inference process {target.process_id} holds {used_mb:.0f} MB RAM (>= the "
+                    f"{ceiling_mb:.0f} MB per-process ceiling) while the host is under its RAM floor; draining it "
+                    "(no new work) so it can be recycled once its in-flight job finishes.</>",
+                )
+            return
+
+        logger.opt(ansi=True).warning(
+            f"<fg #ff8c69>Inference process {target.process_id} holds {used_mb:.0f} MB RAM (>= the "
+            f"{ceiling_mb:.0f} MB per-process ceiling) while the host is under its RAM floor; recycling it to "
+            "return the retained RAM to the OS.</>",
+        )
+        self._processes_draining_for_ram.discard(target.process_id)
+        self._process_lifecycle._replace_inference_process(target, intentional_reclaim=True)
+        self._ram_reclaim_cycle_at = time.time()
+        self._record_churn("process_cycle")
 
     def _reduce_processes_under_ram_pressure(self) -> None:
         """Shed idle resident inference processes to return their resident-weight RAM to the OS.
@@ -2390,7 +2497,10 @@ class InferenceScheduler:
         if not ram_pressure.under_pressure:
             self._ram_pressure_notified = False
             return False
-        self._govern_ram_pressure(ram_pressure)
+        # The per-tick governor (_govern_ram_pressure_if_pressured, run at the top of preload_models) has
+        # already driven the whole-host degrade response this cycle; here we only defer *this* preload and
+        # surface the per-model notice once so the loop does not route a new model's weights through a host
+        # already on the edge.
         if not self._ram_pressure_notified:
             logger.opt(ansi=True).warning(
                 f"<fg #ff8c69>RAM danger floor reached: deferring preload of {job.model} "
@@ -2825,6 +2935,16 @@ class InferenceScheduler:
         self._restore_siblings_after_whole_card()
         self._converge_whole_card_residency()
         self._expire_stale_model_map_entries()
+
+        # Absolute system-RAM floor, evaluated every tick rather than only when a new model needs preloading.
+        # A steady-state worker whose pending jobs all target already-resident models reaches the
+        # ``loaded_models == pending_models`` early-return below without ever checking the floor, so its
+        # resident set can grow into an OS OOM kill with the governor asleep. Governing here (before that
+        # return) drives the shed/throttle/per-process-reclaim response regardless of whether anything preloads.
+        # Gated on the budget being active, the same switch the rest of the memory machinery uses.
+        if self._budget_active():
+            self._govern_ram_pressure_if_pressured()
+
         loaded_models = {process.loaded_horde_model_name for process in self._process_map.values()}
         loaded_models = loaded_models.union(
             model.horde_model_name
@@ -2929,10 +3049,20 @@ class InferenceScheduler:
                         set(processes_with_model_for_queued_job) | protected,
                     )
 
+            # A process marked draining for RAM (its resident footprint crossed the per-process ceiling under
+            # pressure) must be fed no new work so it can go idle and be recycled; exclude it as a preload target.
+            # It is only ever excluded here as a target, never wedging the queue: the head-starvation fallback
+            # below can still reach it, and the governor recycles it before dispatch once it is idle.
+            preload_disallowed = processes_with_model_for_queued_job
+            if self._processes_draining_for_ram:
+                preload_disallowed = list(
+                    set(processes_with_model_for_queued_job) | self._processes_draining_for_ram,
+                )
+
             # On a multi-GPU host this also chooses *which* card to load onto: an eligible card already
             # holding the model first, then the least-loaded eligible card. Single-GPU returns the first
             # available slot exactly as before.
-            available_process = self._select_preload_process(job, processes_with_model_for_queued_job)
+            available_process = self._select_preload_process(job, preload_disallowed)
 
             if available_process is None and is_head_blocker:
                 # The head of the queue could not get a slot because affinity (or the queued-model

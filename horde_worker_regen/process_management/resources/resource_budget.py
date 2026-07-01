@@ -1152,7 +1152,9 @@ class RamBudget:
 
 # The defaults a partially-mocked or older config falls back to, so the pressure check never crashes the
 # scheduling cycle on a non-numeric attribute (mirrors how the unservable breaker tolerates a bad threshold).
-_DEFAULT_RAM_PRESSURE_PAUSE_PERCENT = 90.0
+# Kept in step with reGenBridgeData.ram_pressure_pause_percent's default: a resident inference process can
+# allocate several GB in a single step, so the floor leaves ~15% of RAM free rather than only 10%.
+_DEFAULT_RAM_PRESSURE_PAUSE_PERCENT = 85.0
 _DEFAULT_RAM_PRESSURE_MIN_FREE_MB = 1024.0
 
 

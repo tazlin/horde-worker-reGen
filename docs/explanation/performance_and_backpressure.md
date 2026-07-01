@@ -349,16 +349,39 @@ so the budget never wedges a worker that has not yet reported memory. Set
 recommended on a shared or consumer GPU).
 
 Separately from the *marginal* fit check above, an **absolute system-RAM danger
-floor** guards against the kernel OOM-killer. When measured available RAM falls
-below the floor the worker pauses job pops (the self-throttle, auto-resumed on
-recovery), evicts idle resident models, and **reduces the resident
-inference-process count** so each idle context's pinned weights return to the OS.
-On a multi-GPU host that reduction is applied **per card**, leaving at least one
-context on every driven card: a worker-wide collapse would let the victim search
-empty a whole card of contexts and idle that GPU until something restored it. Each
-card the reduction shrank is then grown back to its planned per-card process count
-once RAM clears the floor and the pop-pause has lapsed (a card a whole-card
-residency is deliberately holding down is left to that residency's own restore).
+floor** guards against the kernel OOM-killer. It is evaluated **every scheduling
+tick**, not only when a new model needs preloading: a steady-state worker whose
+queued jobs all target already-resident models would otherwise never reach the
+check (the preload routine returns early when nothing needs loading) and could
+grow its resident set into an OOM with the governor asleep. When measured available
+RAM falls below the floor (default: 15% free, `ram_pressure_pause_percent`) the
+worker pauses job pops (the self-throttle, auto-resumed on recovery), evicts idle
+resident models, and **reduces the resident inference-process count** so each idle
+context's pinned weights return to the OS. On a multi-GPU host that reduction is
+applied **per card**, leaving at least one context on every driven card: a
+worker-wide collapse would let the victim search empty a whole card of contexts and
+idle that GPU until something restored it. Each card the reduction shrank is then
+grown back to its planned per-card process count once RAM clears the floor and the
+pop-pause has lapsed (a card a whole-card residency is deliberately holding down is
+left to that residency's own restore).
+
+Idle-shedding cannot help when *every* process is busy, so a single process whose
+resident RAM has ballooned past a **per-process ceiling** (`ram_per_process_max_mb`,
+default 18 GB) is reclaimed directly while the host is under the floor: an idle
+over-ceiling process is recycled immediately (its allocator-retained pages return to
+the OS on respawn), and a busy one is **drained** (fed no new work by the preload
+target selection) so its in-flight job finishes before it is recycled. The largest
+over-ceiling process is acted on first, one per cycle, so a multi-GPU host never
+empties every card at once. The ceiling is consulted only under the danger floor, so
+a roomy host never recycles needlessly. This bounds the per-process balloon that a
+generous residency policy accumulates (weights the allocator will not return without
+a respawn), which is what a shed-idle-only response cannot reach.
+
+A softer, **pre-floor pop hold** sits above the hard floor: once available RAM is
+within the marginal RAM reserve of the danger floor (or a process is mid-drain) the
+popper stops accepting new jobs, so a job does not start its time-to-live clock on a
+worker too degraded to serve it promptly and then get aborted by the horde as too
+slow. In-flight work is unaffected; the hold clears as soon as RAM recovers.
 
 The reductions above are the runtime backstop; the **plan-time process count** is
 sized to the hardware up front so the worker rarely has to reach for them. The
