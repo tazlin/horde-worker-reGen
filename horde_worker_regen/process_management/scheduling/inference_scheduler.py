@@ -71,12 +71,15 @@ from horde_worker_regen.process_management.scheduling.governance import (
     ReduceWorkerProcesses,
     ResourceGovernor,
     RestoreCardProcess,
+    RestoreWorkerProcess,
     SetPopHold,
     StopTrackingShedCard,
+    StopTrackingWorkerShed,
     VramGateResult,
     VramReclaimOutcome,
     WholeCardResidency,
     WholeCardResidencyMachine,
+    WorkerProcessShedState,
     card_preload_order,
     compute_preload_disallowed_processes,
     decide_degrade_response,
@@ -1985,12 +1988,23 @@ class InferenceScheduler:
             multi_gpu_routing_active=self._multi_gpu_routing_active,
             in_flight_job_count=len(self._job_tracker.jobs_in_progress),
             loaded_worker_process_count=self._process_map.num_loaded_inference_processes(),
+            planned_worker_process_count=self._max_inference_processes,
             inference_slots=inference_slots,
             cards=cards,
             draining_process_ids=frozenset(self._ram_governor_state.draining_process_ids),
             shed_card_indices=frozenset(self._ram_governor_state.shed_cards),
             restore_headroom_mb=self._ram_headroom_for_additional_context_mb(),
             per_context_ram_estimate_mb=self._estimated_resident_context_ram_mb(),
+            worker_shed_planned_process_count=(
+                self._ram_governor_state.worker_shed.planned_process_count
+                if self._ram_governor_state.worker_shed is not None
+                else None
+            ),
+            worker_shed_process_count=(
+                self._ram_governor_state.worker_shed.shed_process_count
+                if self._ram_governor_state.worker_shed is not None
+                else 0
+            ),
         )
 
     def _execute_governance_actions(self, actions: list[GovernanceAction]) -> None:
@@ -2015,14 +2029,42 @@ class InferenceScheduler:
                     )
                 case EvictIdleModels():
                     self.unload_models(under_pressure=True)
-                case ReduceWorkerProcesses(target_count=target_count):
-                    self._process_lifecycle.scale_inference_processes(target_count, device_index=None)
+                case ReduceWorkerProcesses(
+                    target_count=target_count,
+                    planned_count=planned_count,
+                    pressure_shortfall_mb=pressure_shortfall_mb,
+                ):
+                    current = self._process_map.num_loaded_inference_processes()
+                    planned = planned_count if planned_count > 0 else self._max_inference_processes
+                    after = self._process_lifecycle.scale_inference_processes(
+                        target_count,
+                        device_index=None,
+                        pressure_shortfall_mb=pressure_shortfall_mb,
+                    )
+                    if not isinstance(after, int):
+                        after = current
+                    if after < current:
+                        existing = governor_state.worker_shed.shed_process_count if governor_state.worker_shed else 0
+                        governor_state.worker_shed = WorkerProcessShedState(
+                            planned_process_count=planned,
+                            shed_process_count=existing + (current - after),
+                        )
+                        shortfall_note = (
+                            f", shortfall ~{pressure_shortfall_mb:.0f} MB" if pressure_shortfall_mb is not None else ""
+                        )
+                        logger.opt(ansi=True).info(
+                            f"<fg #ff8c69>RAM pressure reduced worker inference contexts "
+                            f"({current} -> {after} of {planned}{shortfall_note}); the pool will be "
+                            "restored incrementally once RAM has headroom.</>",
+                        )
                 case ReduceCardProcesses(device_index=device_index, target_count=target_count):
                     current = self._process_map.num_loaded_inference_processes(device_index=device_index)
                     after = self._process_lifecycle.scale_inference_processes(
                         target_count,
                         device_index=device_index,
                     )
+                    if not isinstance(after, int):
+                        after = current
                     if after < current:
                         governor_state.shed_cards.add(device_index)
                 case MarkProcessDraining(
@@ -2059,14 +2101,34 @@ class InferenceScheduler:
                         target_count,
                         device_index=device_index,
                     )
+                    if not isinstance(after, int):
+                        after = current
                     logger.opt(ansi=True).info(
                         f"<fg #7b7d7d>System RAM has headroom; restoring an inference context on device "
                         f"{device_index} ({current} -> {after} of {planned}) so the card resumes serving.</>",
                     )
                     if after >= planned:
                         governor_state.shed_cards.discard(device_index)
+                case RestoreWorkerProcess(target_count=target_count, planned_count=planned):
+                    current = self._process_map.num_loaded_inference_processes()
+                    after = self._process_lifecycle.scale_inference_processes(target_count, device_index=None)
+                    if not isinstance(after, int):
+                        after = current
+                    logger.opt(ansi=True).info(
+                        f"<fg #7b7d7d>System RAM has headroom; restoring a worker inference context "
+                        f"({current} -> {after} of {planned}).</>",
+                    )
+                    if after >= planned:
+                        governor_state.worker_shed = None
+                    elif governor_state.worker_shed is not None and after > current:
+                        governor_state.worker_shed.shed_process_count = max(
+                            0,
+                            governor_state.worker_shed.shed_process_count - (after - current),
+                        )
                 case StopTrackingShedCard(device_index=device_index):
                     governor_state.shed_cards.discard(device_index)
+                case StopTrackingWorkerShed():
+                    governor_state.worker_shed = None
 
     def _govern_ram_pressure(self, verdict: RamPressureVerdict) -> None:
         """Degrade the worker's footprint and intake while system RAM is below the danger floor.
@@ -2144,15 +2206,15 @@ class InferenceScheduler:
         return available_ram_mb - committed_ram_mb - self._ram_budget.reserve_mb
 
     def _restore_processes_after_ram_pressure(self) -> None:
-        """Grow cards shed by the RAM-pressure reduction back toward plan as system RAM proves it can hold them.
+        """Grow RAM-pressure-shed inference contexts back toward plan as system RAM proves headroom.
 
         The reduction sheds idle contexts to walk the host back above its absolute RAM floor; nothing else
-        re-establishes them, so without this a card that lost its contexts to a RAM spike sits idle for the
-        rest of the run while the surviving card serializes the work. The restore grants (incremental,
-        RAM-gated, residency-aware) are decided by
+        re-establishes them, so without this a card or single-GPU worker-wide pool that lost contexts to a
+        RAM spike stays reduced for the rest of the run. The restore grants (incremental, RAM-gated,
+        residency-aware) are decided by
         [`decide_shed_card_restore`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_shed_card_restore].
         """
-        if not self._ram_governor_state.shed_cards:
+        if not self._ram_governor_state.shed_cards and self._ram_governor_state.worker_shed is None:
             return
         snapshot = self._build_host_memory_snapshot(self._ram_pressure_verdict())
         self._execute_governance_actions(decide_shed_card_restore(snapshot))

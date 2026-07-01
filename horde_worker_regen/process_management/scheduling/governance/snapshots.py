@@ -87,6 +87,8 @@ class HostMemorySnapshot:
     """How many jobs are currently in progress across the worker."""
     loaded_worker_process_count: int
     """How many inference processes are resident worker-wide (the single-GPU reduction input)."""
+    planned_worker_process_count: int
+    """The normal worker-wide process target before RAM-pressure shedding."""
     inference_slots: tuple[InferenceSlotSnapshot, ...]
     """Every live inference process's memory-relevant state."""
     cards: tuple[CardProcessSnapshot, ...]
@@ -99,6 +101,10 @@ class HostMemorySnapshot:
     """Measured RAM headroom (MB) above the reserve and committed reserves, for restore gating."""
     per_context_ram_estimate_mb: float
     """Conservative resident-RAM cost (MB) of one more inference context, for restore gating."""
+    worker_shed_planned_process_count: int | None = None
+    """The worker-wide process target captured when single-GPU RAM pressure shed contexts."""
+    worker_shed_process_count: int = 0
+    """How many worker-wide contexts were shed during the current RAM-pressure episode."""
 
     def card(self, device_index: int) -> CardProcessSnapshot | None:
         """Return the snapshot for ``device_index``, or None when the card is not driven."""

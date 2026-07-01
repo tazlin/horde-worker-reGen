@@ -21,8 +21,10 @@ from horde_worker_regen.process_management.scheduling.governance import (
     ReduceCardProcesses,
     ReduceWorkerProcesses,
     RestoreCardProcess,
+    RestoreWorkerProcess,
     SetPopHold,
     StopTrackingShedCard,
+    StopTrackingWorkerShed,
     decide_degrade_response,
     decide_over_ceiling_reclaim,
     decide_pop_hold,
@@ -48,12 +50,15 @@ def _snapshot(
     multi_gpu_routing_active: bool = False,
     in_flight_job_count: int = 0,
     loaded_worker_process_count: int = 0,
+    planned_worker_process_count: int = 0,
     inference_slots: tuple[InferenceSlotSnapshot, ...] = (),
     cards: tuple[CardProcessSnapshot, ...] = (),
     draining_process_ids: frozenset[int] = frozenset(),
     shed_card_indices: frozenset[int] = frozenset(),
     restore_headroom_mb: float = 30000.0,
     per_context_ram_estimate_mb: float = 4096.0,
+    worker_shed_planned_process_count: int | None = None,
+    worker_shed_process_count: int = 0,
 ) -> HostMemorySnapshot:
     """Build a snapshot with healthy defaults so each test states only what it varies."""
     return HostMemorySnapshot(
@@ -66,12 +71,15 @@ def _snapshot(
         multi_gpu_routing_active=multi_gpu_routing_active,
         in_flight_job_count=in_flight_job_count,
         loaded_worker_process_count=loaded_worker_process_count,
+        planned_worker_process_count=planned_worker_process_count,
         inference_slots=inference_slots,
         cards=cards,
         draining_process_ids=draining_process_ids,
         shed_card_indices=shed_card_indices,
         restore_headroom_mb=restore_headroom_mb,
         per_context_ram_estimate_mb=per_context_ram_estimate_mb,
+        worker_shed_planned_process_count=worker_shed_planned_process_count,
+        worker_shed_process_count=worker_shed_process_count,
     )
 
 
@@ -134,7 +142,9 @@ class TestDegradeResponse:
         assert isinstance(pauses[0], PausePops)
         assert pauses[0].until_time > _NOW
         assert _only(actions, EvictIdleModels) == [EvictIdleModels()]
-        assert _only(actions, ReduceWorkerProcesses) == [ReduceWorkerProcesses(target_count=1)]
+        assert _only(actions, ReduceWorkerProcesses) == [
+            ReduceWorkerProcesses(target_count=2, planned_count=3, pressure_shortfall_mb=9100.0),
+        ]
 
     def test_existing_longer_pause_is_not_rearmed(self) -> None:
         """An already-armed pause that outlasts the new window is left alone (no duplicate announcements)."""
@@ -157,10 +167,12 @@ class TestDegradeResponse:
 class TestProcessReduction:
     """The reduction sheds toward in-flight need: per card on multi-GPU, worker-wide otherwise."""
 
-    def test_single_gpu_reduces_worker_wide_toward_in_flight_need(self) -> None:
-        """The worker-wide pool reduces toward the in-flight job count, at least one below current."""
-        snapshot = _snapshot(loaded_worker_process_count=3, in_flight_job_count=2)
-        assert decide_process_reduction(snapshot) == [ReduceWorkerProcesses(target_count=2)]
+    def test_single_gpu_reduces_worker_wide_by_one_context(self) -> None:
+        """The worker-wide pool sheds one idle context per tick, then remeasures."""
+        snapshot = _snapshot(loaded_worker_process_count=3, planned_worker_process_count=4, in_flight_job_count=1)
+        assert decide_process_reduction(snapshot) == [
+            ReduceWorkerProcesses(target_count=2, planned_count=4, pressure_shortfall_mb=0.0),
+        ]
 
     def test_single_context_pool_is_never_reduced(self) -> None:
         """A pool already at one context has nothing to shed."""
@@ -273,6 +285,47 @@ class TestShedCardRestore:
         assert decide_shed_card_restore(snapshot) == [
             RestoreCardProcess(device_index=0, target_count=2, planned_count=2),
         ]
+
+    def test_worker_wide_restore_grows_one_context_toward_plan(self) -> None:
+        """A recovered single-GPU host grows one shed worker-wide context back toward plan."""
+        snapshot = _snapshot(
+            loaded_worker_process_count=2,
+            worker_shed_planned_process_count=4,
+            worker_shed_process_count=2,
+        )
+        assert decide_shed_card_restore(snapshot) == [RestoreWorkerProcess(target_count=3, planned_count=4)]
+
+    def test_worker_wide_restore_stops_tracking_when_back_at_plan(self) -> None:
+        """Once the worker-wide pool reaches plan, the RAM episode is cleared."""
+        snapshot = _snapshot(
+            loaded_worker_process_count=4,
+            worker_shed_planned_process_count=4,
+            worker_shed_process_count=1,
+        )
+        assert decide_shed_card_restore(snapshot) == [StopTrackingWorkerShed()]
+
+    def test_worker_wide_restore_defers_without_headroom(self) -> None:
+        """The worker-wide pool stays reduced while RAM cannot hold another context."""
+        snapshot = _snapshot(
+            loaded_worker_process_count=2,
+            worker_shed_planned_process_count=4,
+            worker_shed_process_count=2,
+            restore_headroom_mb=1000.0,
+            per_context_ram_estimate_mb=4096.0,
+        )
+        assert decide_shed_card_restore(snapshot) == []
+
+    def test_no_restore_while_a_process_is_draining(self) -> None:
+        """Any over-ceiling drain in flight blocks both card and worker-wide restore."""
+        snapshot = _snapshot(
+            shed_card_indices=frozenset({0}),
+            cards=(self._card(0),),
+            loaded_worker_process_count=1,
+            worker_shed_planned_process_count=2,
+            worker_shed_process_count=1,
+            draining_process_ids=frozenset({9}),
+        )
+        assert decide_shed_card_restore(snapshot) == []
 
     def test_residency_held_card_is_left_to_its_own_restore(self) -> None:
         """A card a whole-card residency holds down is untracked here, not regrown."""

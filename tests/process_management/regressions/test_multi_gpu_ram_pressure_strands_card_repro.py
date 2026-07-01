@@ -31,6 +31,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.scheduling.governance import WorkerProcessShedState
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_mock_bridge_data,
@@ -232,11 +233,11 @@ class TestRamPressureReExpansion:
         )
 
 
-class TestSingleGpuReductionUnchanged:
-    """The worker-wide (single-GPU) reduction keeps its original collapse-to-one behaviour."""
+class TestSingleGpuRamPressureRecovery:
+    """The worker-wide (single-GPU) reduction is incremental and restorable."""
 
-    def test_single_card_collapses_worker_wide_without_recording_cards(self) -> None:
-        """A single-GPU pool still reduces toward one worker-wide context and records no per-card shed state."""
+    def test_single_card_reduces_by_one_and_records_worker_shed(self) -> None:
+        """A single-GPU pressure tick sheds one context, not the whole idle pool, and records restore state."""
         process_map = ProcessMap(
             {
                 0: make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB, device_index=0),
@@ -245,9 +246,103 @@ class TestSingleGpuReductionUnchanged:
             },
         )
         scheduler = _make_inference_scheduler(process_map=process_map, max_inference=3)
-        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=1)
+        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=2)
 
         scheduler._reduce_processes_under_ram_pressure()
 
-        scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(1, device_index=None)
+        scheduler._process_lifecycle.scale_inference_processes.assert_called_once()
+        _, kwargs = scheduler._process_lifecycle.scale_inference_processes.call_args
+        assert scheduler._process_lifecycle.scale_inference_processes.call_args.args[0] == 2
+        assert kwargs["device_index"] is None
+        assert kwargs["pressure_shortfall_mb"] is not None
         assert scheduler._ram_pressure_shed_cards == set()
+        assert scheduler._ram_governor_state.worker_shed is not None
+        assert scheduler._ram_governor_state.worker_shed.planned_process_count == 3
+        assert scheduler._ram_governor_state.worker_shed.shed_process_count == 1
+
+    def test_recovered_single_card_restores_one_worker_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A recovered single-GPU worker grows one shed process back toward plan when RAM has headroom."""
+        process_map = ProcessMap(
+            {
+                0: make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB, device_index=0),
+                1: make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB, device_index=0),
+            },
+        )
+        scheduler = _make_inference_scheduler(process_map=process_map, max_inference=4)
+        scheduler._ram_governor_state.worker_shed = WorkerProcessShedState(
+            planned_process_count=4, shed_process_count=2
+        )
+        _set_available_ram(scheduler, monkeypatch, _HEALTHY_AVAILABLE_RAM_MB)
+
+        def _scale(target_count: int, *, device_index: int | None = None, **_kwargs: object) -> int:
+            assert device_index is None
+            process_map[target_count] = make_mock_process_info(
+                target_count,
+                model_name=None,
+                state=HordeProcessState.WAITING_FOR_JOB,
+                device_index=0,
+            )
+            return process_map.num_loaded_inference_processes()
+
+        scheduler._process_lifecycle.scale_inference_processes = Mock(side_effect=_scale)
+
+        scheduler._restore_processes_after_ram_pressure()
+
+        assert process_map.num_loaded_inference_processes() == 3
+        assert scheduler._ram_governor_state.worker_shed is not None
+        assert scheduler._ram_governor_state.worker_shed.shed_process_count == 1
+
+    def test_single_card_restore_defers_without_headroom(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A single-GPU shed episode stays pending while RAM cannot hold another context."""
+        resident = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB, device_index=0)
+        resident.ram_usage_bytes = 22_000 * 1024 * 1024
+        process_map = ProcessMap({0: resident})
+        scheduler = _make_inference_scheduler(process_map=process_map, max_inference=2)
+        scheduler._ram_governor_state.worker_shed = WorkerProcessShedState(
+            planned_process_count=2, shed_process_count=1
+        )
+        scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=2)
+        _set_available_ram(scheduler, monkeypatch, 6000.0)
+
+        scheduler._restore_processes_after_ram_pressure()
+
+        scheduler._process_lifecycle.scale_inference_processes.assert_not_called()
+        assert scheduler._ram_governor_state.worker_shed is not None
+
+
+class TestRamPressureScaleDownVictimSelection:
+    """RAM pressure scale-down should use the smallest idle process that clears the shortfall."""
+
+    def test_small_shortfall_chooses_small_sufficient_idle_process(self) -> None:
+        """A ~591 MB RAM shortfall should stop a ~1 GB idle slot before a ~9 GB model holder."""
+        large = make_mock_process_info(1, model_name="large", state=HordeProcessState.WAITING_FOR_JOB, device_index=0)
+        small = make_mock_process_info(2, model_name=None, state=HordeProcessState.WAITING_FOR_JOB, device_index=0)
+        large.ram_usage_bytes = 9_000 * 1024 * 1024
+        small.ram_usage_bytes = 1_000 * 1024 * 1024
+        process_map = ProcessMap({1: large, 2: small})
+        lifecycle = _two_card_lifecycle(process_map)
+
+        victim = lifecycle._select_inference_process_to_scale_down(
+            disallowed_processes=[],
+            pressure_shortfall_mb=591.0,
+        )
+
+        assert victim is small
+
+    def test_falls_back_when_no_idle_process_clears_shortfall(self) -> None:
+        """If no reported idle RSS can clear the shortfall, scale-down keeps the old first-eligible fallback."""
+        first = make_mock_process_info(1, model_name="first", state=HordeProcessState.WAITING_FOR_JOB, device_index=0)
+        second = make_mock_process_info(
+            2, model_name="second", state=HordeProcessState.WAITING_FOR_JOB, device_index=0
+        )
+        first.ram_usage_bytes = 1_000 * 1024 * 1024
+        second.ram_usage_bytes = 2_000 * 1024 * 1024
+        process_map = ProcessMap({1: first, 2: second})
+        lifecycle = _two_card_lifecycle(process_map)
+
+        victim = lifecycle._select_inference_process_to_scale_down(
+            disallowed_processes=[],
+            pressure_shortfall_mb=20_000.0,
+        )
+
+        assert victim is first

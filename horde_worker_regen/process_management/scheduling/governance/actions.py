@@ -25,8 +25,10 @@ __all__ = [
     "ReduceCardProcesses",
     "ReduceWorkerProcesses",
     "RestoreCardProcess",
+    "RestoreWorkerProcess",
     "SetPopHold",
     "StopTrackingShedCard",
+    "StopTrackingWorkerShed",
 ]
 
 
@@ -61,6 +63,10 @@ class ReduceWorkerProcesses:
 
     target_count: int
     """The worker-wide process count to reduce toward (never below one)."""
+    planned_count: int = 0
+    """The planned worker-wide process count, for later restoration."""
+    pressure_shortfall_mb: float | None = None
+    """How far below the RAM floor the host is, used to choose the smallest sufficient idle victim."""
 
 
 @dataclass(frozen=True)
@@ -125,11 +131,26 @@ class RestoreCardProcess:
 
 
 @dataclass(frozen=True)
+class RestoreWorkerProcess:
+    """Grow the worker-wide pool by one inference context after RAM pressure recovers."""
+
+    target_count: int
+    """The worker-wide process count to grow to (one more than currently resident)."""
+    planned_count: int
+    """The planned worker-wide process count, for the announcement and tracking cutoff."""
+
+
+@dataclass(frozen=True)
 class StopTrackingShedCard:
     """Stop tracking a shed card whose restoration belongs to another path (or is already complete)."""
 
     device_index: int
     """The card to stop tracking."""
+
+
+@dataclass(frozen=True)
+class StopTrackingWorkerShed:
+    """Stop tracking worker-wide RAM-pressure shedding once it is restored or stale."""
 
 
 type GovernanceAction = (
@@ -142,6 +163,8 @@ type GovernanceAction = (
     | ClearProcessDraining
     | RecycleProcess
     | RestoreCardProcess
+    | RestoreWorkerProcess
     | StopTrackingShedCard
+    | StopTrackingWorkerShed
 )
 """The tagged union of every remedy a governance decision can return."""

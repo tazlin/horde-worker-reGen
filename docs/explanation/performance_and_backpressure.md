@@ -359,13 +359,18 @@ grow its resident set into an OOM with the governor asleep. When measured availa
 RAM falls below the floor (default: 15% free, `ram_pressure_pause_percent`) the
 worker pauses job pops (the self-throttle, auto-resumed on recovery), evicts idle
 resident models, and **reduces the resident inference-process count** so each idle
-context's pinned weights return to the OS. On a multi-GPU host that reduction is
-applied **per card**, leaving at least one context on every driven card: a
-worker-wide collapse would let the victim search empty a whole card of contexts and
-idle that GPU until something restored it. Each card the reduction shrank is then
-grown back to its planned per-card process count once RAM clears the floor and the
-pop-pause has lapsed (a card a whole-card residency is deliberately holding down is
-left to that residency's own restore).
+context's pinned weights return to the OS. On a single-GPU host this reduction is
+incremental: one idle context is stopped per governance tick, the host is measured
+again, and the smallest idle context that can plausibly clear the current RAM
+shortfall is preferred before a larger model-holding process. The worker records the
+pre-pressure process target and grows the pool back one context at a time once RAM
+has headroom, the pop-pause has lapsed, and no over-ceiling process is draining. On
+a multi-GPU host the reduction is applied **per card**, leaving at least one context
+on every driven card: a worker-wide collapse would let the victim search empty a
+whole card of contexts and idle that GPU until something restored it. Each card the
+reduction shrank is then grown back to its planned per-card process count once RAM
+clears the floor and the pop-pause has lapsed (a card a whole-card residency is
+deliberately holding down is left to that residency's own restore).
 
 Idle-shedding cannot help when *every* process is busy, so a single process whose
 resident RAM has ballooned past a **per-process ceiling** (`ram_per_process_max_mb`,

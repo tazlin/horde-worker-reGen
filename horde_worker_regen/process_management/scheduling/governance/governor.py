@@ -21,7 +21,7 @@ from horde_worker_regen.process_management.scheduling.governance.actions import 
 from horde_worker_regen.process_management.scheduling.governance.ram_governor import (
     RamGovernorState,
     decide_pressure_governance,
-    decide_shed_card_restore,
+    decide_shed_restore,
 )
 from horde_worker_regen.process_management.scheduling.governance.snapshots import HostMemorySnapshot
 
@@ -93,6 +93,6 @@ class ResourceGovernor:
         self.last_ram_verdict = verdict
         snapshot = self._host._build_host_memory_snapshot(verdict)
         actions = decide_pressure_governance(snapshot)
-        actions.extend(decide_shed_card_restore(snapshot))
+        actions.extend(decide_shed_restore(snapshot))
         self._host._execute_governance_actions(actions)
         return verdict.under_pressure

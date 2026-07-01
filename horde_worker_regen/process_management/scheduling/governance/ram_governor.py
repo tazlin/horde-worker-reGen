@@ -25,6 +25,8 @@ Critical public members:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from horde_worker_regen.process_management.scheduling.governance.actions import (
     ClearProcessDraining,
     EvictIdleModels,
@@ -35,20 +37,24 @@ from horde_worker_regen.process_management.scheduling.governance.actions import 
     ReduceCardProcesses,
     ReduceWorkerProcesses,
     RestoreCardProcess,
+    RestoreWorkerProcess,
     SetPopHold,
     StopTrackingShedCard,
+    StopTrackingWorkerShed,
 )
 from horde_worker_regen.process_management.scheduling.governance.snapshots import HostMemorySnapshot
 
 __all__ = [
     "RAM_PRESSURE_PAUSE_SECONDS",
     "RamGovernorState",
+    "WorkerProcessShedState",
     "decide_degrade_response",
     "decide_over_ceiling_reclaim",
     "decide_pop_hold",
     "decide_pressure_governance",
     "decide_process_reduction",
     "decide_shed_card_restore",
+    "decide_shed_restore",
 ]
 
 RAM_PRESSURE_PAUSE_SECONDS = 30.0
@@ -57,6 +63,16 @@ RAM_PRESSURE_PAUSE_SECONDS = 30.0
 A short, self-expiring pop-pause (it auto-resumes via the manager's self-throttle cooldown) so intake
 stops adding memory pressure while idle footprint is shed and the host recovers, without wedging a worker
 whose RAM frees up moments later. Re-armed each scheduling pass that still reads under the floor."""
+
+
+@dataclass(slots=True)
+class WorkerProcessShedState:
+    """Worker-wide RAM-pressure shedding to restore after a single-GPU pressure episode."""
+
+    planned_process_count: int
+    """The normal worker-wide process target before pressure shedding."""
+    shed_process_count: int = 0
+    """How many contexts this pressure episode actually shed."""
 
 
 class RamGovernorState:
@@ -78,6 +94,12 @@ class RamGovernorState:
         The reduction keeps one context per driven card so no GPU is stranded, and records each card it
         shrank here so the restore path can grow it back once the host clears the danger floor.
         Multi-GPU only; the worker-wide (single-GPU) reduction does not populate it.
+        """
+        self.worker_shed: WorkerProcessShedState | None = None
+        """Worker-wide single-GPU process shedding that should be restored after RAM recovers.
+
+        Multi-GPU pressure uses :attr:`shed_cards`; single-GPU pressure has no per-card identity to track,
+        so it records the planned worker-wide count and how many idle contexts actually stopped.
         """
         self.draining_process_ids: set[int] = set()
         """Inference process ids marked to drain because their resident RAM crossed the per-process ceiling.
@@ -129,9 +151,12 @@ def decide_process_reduction(snapshot: HostMemorySnapshot) -> list[GovernanceAct
     current = snapshot.loaded_worker_process_count
     if current <= 1:
         return []
-    needed = max(1, snapshot.in_flight_job_count)
-    target = max(1, min(current - 1, needed))
-    return [ReduceWorkerProcesses(target_count=target)]
+    target = max(1, current - 1)
+    planned = max(snapshot.planned_worker_process_count, current)
+    shortfall = None
+    if snapshot.verdict.available_mb is not None:
+        shortfall = max(0.0, snapshot.verdict.floor_mb - snapshot.verdict.available_mb)
+    return [ReduceWorkerProcesses(target_count=target, planned_count=planned, pressure_shortfall_mb=shortfall)]
 
 
 def decide_over_ceiling_reclaim(snapshot: HostMemorySnapshot) -> list[GovernanceAction]:
@@ -220,31 +245,39 @@ def decide_pressure_governance(snapshot: HostMemorySnapshot) -> list[GovernanceA
     return actions
 
 
-def decide_shed_card_restore(snapshot: HostMemorySnapshot) -> list[GovernanceAction]:
-    """Return the incremental restore of cards the RAM-pressure reduction shed, as RAM proves headroom.
+def decide_shed_restore(snapshot: HostMemorySnapshot) -> list[GovernanceAction]:
+    """Return incremental RAM-pressure restore actions for card-scoped and worker-wide shedding.
 
-    The reduction sheds idle contexts to walk the host back above its absolute RAM floor; nothing else
-    re-establishes them, so without this a card that lost its contexts to a RAM spike sits idle for the
-    rest of the run while the surviving cards serialize the work. Scoped to the pressure episode: only
-    cards the reduction recorded are grown back, only once RAM is no longer under pressure and the
-    self-throttle pop-pause has lapsed, and never a card a whole-card residency is deliberately holding
-    down (that path runs its own restore).
-
-    Growth is RAM-gated and incremental: one context per card per tick, and only while the snapshot's
-    measured headroom can hold another resident working set. Because the snapshot is taken once, each
-    grant charges the per-context estimate against the remaining headroom, so two cards cannot both be
-    granted room that only exists once. A card stays pending until it reaches its plan or RAM proves it
-    cannot sustain more.
+    The reduction sheds idle contexts to walk the host back above its absolute RAM floor. Restore is
+    conservative and RAM-gated: the host must be healthy, the self-throttle pause must have lapsed, no
+    over-ceiling process may be draining, and each grant charges the per-context estimate against the
+    measured restore headroom so one reading is not double-spent.
     """
-    if not snapshot.shed_card_indices:
+    if not snapshot.shed_card_indices and snapshot.worker_shed_planned_process_count is None:
         return []
     if snapshot.verdict.under_pressure:
         return []
     if snapshot.pop_pause_active and snapshot.now < snapshot.pop_pause_until:
         return []
+    if snapshot.draining_process_ids:
+        return []
 
     actions: list[GovernanceAction] = []
     remaining_headroom_mb = snapshot.restore_headroom_mb
+
+    worker_planned = snapshot.worker_shed_planned_process_count
+    if worker_planned is not None:
+        if snapshot.loaded_worker_process_count >= worker_planned or snapshot.worker_shed_process_count <= 0:
+            actions.append(StopTrackingWorkerShed())
+        elif remaining_headroom_mb >= snapshot.per_context_ram_estimate_mb:
+            remaining_headroom_mb -= snapshot.per_context_ram_estimate_mb
+            actions.append(
+                RestoreWorkerProcess(
+                    target_count=snapshot.loaded_worker_process_count + 1,
+                    planned_count=worker_planned,
+                ),
+            )
+
     for device_index in sorted(snapshot.shed_card_indices):
         card = snapshot.card(device_index)
         if card is None or card.held_by_whole_card_residency:
@@ -266,3 +299,12 @@ def decide_shed_card_restore(snapshot: HostMemorySnapshot) -> list[GovernanceAct
             ),
         )
     return actions
+
+
+def decide_shed_card_restore(snapshot: HostMemorySnapshot) -> list[GovernanceAction]:
+    """Return the incremental restore of RAM-pressure shedding as RAM proves headroom.
+
+    Backward-compatible public name retained for callers/tests; it now handles both the original multi-GPU
+    card restore and the worker-wide single-GPU restore.
+    """
+    return decide_shed_restore(snapshot)

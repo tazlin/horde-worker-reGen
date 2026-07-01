@@ -17,6 +17,7 @@ from horde_worker_regen.process_management.scheduling.governance import (
     HostMemorySnapshot,
     ResourceGovernor,
     RestoreCardProcess,
+    RestoreWorkerProcess,
     SetPopHold,
 )
 from tests.process_management.governance.test_ram_governor import _snapshot
@@ -87,6 +88,20 @@ class TestResourceGovernorTick:
         governor.tick()
 
         assert RestoreCardProcess(device_index=0, target_count=2, planned_count=2) in host.executed
+
+    def test_recovered_tick_restores_worker_wide_shed_in_the_same_pass(self) -> None:
+        """A recovered single-GPU host's tick grows back worker-wide RAM-pressure shedding."""
+        snapshot = _snapshot(
+            loaded_worker_process_count=2,
+            worker_shed_planned_process_count=4,
+            worker_shed_process_count=2,
+        )
+        host = _FakeHost(snapshot)
+        governor = ResourceGovernor(host=host)
+
+        governor.tick()
+
+        assert RestoreWorkerProcess(target_count=3, planned_count=4) in host.executed
 
     def test_verdict_is_cached_for_within_cycle_readers(self) -> None:
         """The tick's verdict is retained so per-job gates in the same cycle act on one reading."""

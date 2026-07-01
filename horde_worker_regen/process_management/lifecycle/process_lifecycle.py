@@ -798,6 +798,7 @@ class ProcessLifecycleManager:
         *,
         device_index: int | None = None,
         whole_card_model: str | None = None,
+        pressure_shortfall_mb: float | None = None,
     ) -> int:
         """Grow or shrink the running inference processes toward ``target_count``.
 
@@ -823,6 +824,9 @@ class ProcessLifecycleManager:
                 *behind* the head pins the count above the target and the residency can never converge, wedging
                 the queue. Busy processes are still never killed (the victim selection skips them), so live work
                 is unaffected. Leave None for the ordinary benchmark / pressure shrink.
+            pressure_shortfall_mb: When set, choose the smallest idle victim that can plausibly clear this
+                RAM shortfall before falling back to the usual first eligible victim. This keeps a small RAM
+                dip from tearing down a much larger model-holding process when a smaller idle context suffices.
 
         Returns:
             The number of inference processes after scaling (scoped to ``device_index`` when given).
@@ -852,7 +856,10 @@ class ProcessLifecycleManager:
                     # only an idle process on the target card can be the victim.
                     disallowed = disallowed + self._other_card_inference_processes(device_index)
             for _ in range(current - target):
-                victim = self._process_map._get_first_inference_process_to_kill(disallowed_processes=disallowed)
+                victim = self._select_inference_process_to_scale_down(
+                    disallowed_processes=disallowed,
+                    pressure_shortfall_mb=pressure_shortfall_mb,
+                )
                 if victim is None:
                     logger.debug("Scale down: no idle inference process available to stop right now")
                     break
@@ -861,6 +868,39 @@ class ProcessLifecycleManager:
                 logger.info(f"Scaled down: stopped inference process {victim.process_id}")
 
         return self._process_map.num_loaded_inference_processes(device_index=device_index)
+
+    def _select_inference_process_to_scale_down(
+        self,
+        *,
+        disallowed_processes: list[int],
+        pressure_shortfall_mb: float | None,
+    ) -> HordeProcessInfo | None:
+        """Choose an idle inference process to stop for scale-down.
+
+        Under RAM pressure, prefer the smallest eligible resident context whose reported RSS can clear the
+        shortfall. If no eligible process has a sufficient report, fall back to the existing first-eligible
+        behavior so ordinary scale-down semantics stay unchanged.
+        """
+        if pressure_shortfall_mb is None or pressure_shortfall_mb <= 0:
+            return self._process_map._get_first_inference_process_to_kill(disallowed_processes=disallowed_processes)
+
+        shortfall_bytes = pressure_shortfall_mb * 1024 * 1024
+        candidates: list[HordeProcessInfo] = []
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.process_id in disallowed_processes:
+                continue
+            if process_info.is_process_busy():
+                continue
+            if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
+                continue
+            if process_info.ram_usage_bytes >= shortfall_bytes:
+                candidates.append(process_info)
+
+        if candidates:
+            return min(candidates, key=lambda process_info: process_info.ram_usage_bytes)
+        return self._process_map._get_first_inference_process_to_kill(disallowed_processes=disallowed_processes)
 
     def _other_card_inference_processes(self, device_index: int) -> list[int]:
         """Return inference processes pinned to a card other than ``device_index`` (off-limits for a scoped shrink)."""
