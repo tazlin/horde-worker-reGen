@@ -53,6 +53,27 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 )
 from horde_worker_regen.process_management.resources.run_metrics import ChurnKind
 from horde_worker_regen.process_management.scheduling.context_overhead_model import ContextOverheadModel
+from horde_worker_regen.process_management.scheduling.governance import (
+    CardProcessSnapshot,
+    ClearProcessDraining,
+    EvictIdleModels,
+    GovernanceAction,
+    HostMemorySnapshot,
+    InferenceSlotSnapshot,
+    MarkProcessDraining,
+    PausePops,
+    RamGovernorState,
+    RecycleProcess,
+    ReduceCardProcesses,
+    ReduceWorkerProcesses,
+    RestoreCardProcess,
+    SetPopHold,
+    StopTrackingShedCard,
+    decide_degrade_response,
+    decide_pressure_governance,
+    decide_process_reduction,
+    decide_shed_card_restore,
+)
 from horde_worker_regen.process_management.scheduling.model_affinity import (
     affinity_active,
     compute_protected_processes,
@@ -158,13 +179,6 @@ force-admitted best-effort. Deliberately under the recovery supervisor's
 admitting one head onto an idle card, rather than tripping a save-our-ship soft reset that respawns
 every pool and faults the whole backlog. Only runs while no live job holds the device, so it never
 re-introduces the multi-process over-commit the budget guards against."""
-
-_RAM_PRESSURE_PAUSE_SECONDS = 30.0
-"""How long the worker pauses job pops once system RAM crosses its danger floor.
-
-A short, self-expiring pop-pause (it auto-resumes via the manager's self-throttle cooldown) so intake
-stops adding memory pressure while idle footprint is shed and the host recovers, without wedging a worker
-whose RAM frees up moments later. Re-armed each scheduling pass that still reads under the floor."""
 
 _DISPATCH_STALL_MIN_SECONDS = 10.0
 """How long the head must be continuously undispatched before the dispatch-stall diagnostic speaks.
@@ -431,17 +445,11 @@ class InferenceScheduler:
         # A single-GPU worker uses exactly one entry under the None key, identical to the prior scalar fields.
         # See _WholeCardResidency for the per-card fields and _residency_state for the accessor.
         self._whole_card_residencies: dict[int | None, _WholeCardResidency] = {}
-        # Device indices whose idle inference contexts the RAM-pressure footprint reduction shed below their
-        # planned per-card count. The reduction keeps one context per driven card so no GPU is stranded, and
-        # records each card it shrank here so the recovery path can grow it back once the host clears the
-        # danger floor. Multi-GPU only; the worker-wide (single-GPU) reduction does not populate it.
-        self._ram_pressure_shed_cards: set[int] = set()
-        # Inference process ids marked to DRAIN because their resident RAM crossed the per-process ceiling while
-        # the host was under its danger floor. A draining process is fed no new dispatch/preload so its in-flight
-        # job can finish, after which the governor recycles it to return its allocator-retained pages. Cleared
-        # when a process falls back under the ceiling (or is recycled). Distinct from _ram_pressure_shed_cards,
-        # which tracks *idle* contexts shed by count; this tracks a *specific busy* process being wound down.
-        self._processes_draining_for_ram: set[int] = set()
+        # The RAM governor's multi-tick bookkeeping (shed cards, draining processes). Decisions in
+        # governance.ram_governor read frozen copies of it via HostMemorySnapshot; only the action
+        # dispatcher (_execute_governance_actions) mutates it. Exposed under the historical attribute
+        # names through the _ram_pressure_shed_cards / _processes_draining_for_ram properties.
+        self._ram_governor_state = RamGovernorState()
         # When a heavy head was last admitted best-effort off the whole-card path (the over-budget exclusive
         # branch, for a model that streams even alone). Its load equally holds the queue, so this bounds a
         # wedge grace that the whole-card establishment grace does not cover. 0.0 when none is loading.
@@ -1845,68 +1853,178 @@ class InferenceScheduler:
             min_free_mb=min_free_mb,
         )
 
-    def _govern_ram_pressure(self, verdict: RamPressureVerdict) -> None:
-        """Degrade the worker's footprint and intake while system RAM is below the danger floor.
+    @property
+    def _ram_pressure_shed_cards(self) -> set[int]:
+        """Device indices the RAM-pressure reduction shed below plan (see ``RamGovernorState.shed_cards``)."""
+        return self._ram_governor_state.shed_cards
 
-        The proactive counterpart to the marginal RAM budget: rather than admit a load that the absolute
-        reading says will trip the kernel OOM-killer, the worker (1) pauses job pops so intake stops adding
-        pressure (self-throttle, auto-resumed on cooldown), (2) evicts idle resident models, and (3) reduces
-        the resident inference-process count so the multi-GB of resident weights each idle context pins is
-        returned to the OS. Together these walk the host back above the floor instead of crash-looping.
-        """
-        now = time.time()
-        until = now + _RAM_PRESSURE_PAUSE_SECONDS
-        if not (self._state.self_throttle_paused and self._state.self_throttle_paused_until >= until):
-            self._state.self_throttle_paused = True
-            self._state.self_throttle_paused_until = until
-            logger.opt(ansi=True).warning(
-                f"<fg #ff8c69>System RAM below the danger floor ({verdict.reason()}); pausing job pops for "
-                f"{_RAM_PRESSURE_PAUSE_SECONDS:.0f}s and shedding idle footprint so the host is not driven into "
-                "an OS OOM kill. In-flight jobs finish; pops resume once RAM recovers.</>",
-            )
-        # Evict idle resident models (their RAM is returned to the OS once the slot respawns), then reduce the
-        # resident process count: each idle context pins GB of resident weights the allocator only frees on exit.
-        self.unload_models(under_pressure=True)
-        self._reduce_processes_under_ram_pressure()
-        # Idle-shed keeps at least one context per card and cannot help when every process is busy, so a single
-        # process whose retained RAM has ballooned past the ceiling is never reclaimed by count alone. Bound it
-        # directly: recycle the largest over-ceiling process (draining it first if it is busy).
-        self._reclaim_over_ceiling_processes()
+    @_ram_pressure_shed_cards.setter
+    def _ram_pressure_shed_cards(self, value: set[int]) -> None:
+        self._ram_governor_state.shed_cards = set(value)
 
-    def _govern_ram_pressure_if_pressured(self) -> bool:
-        """Evaluate the absolute RAM danger floor and degrade the worker if it is breached.
+    @property
+    def _processes_draining_for_ram(self) -> set[int]:
+        """Inference process ids draining for RAM reclaim (see ``RamGovernorState.draining_process_ids``)."""
+        return self._ram_governor_state.draining_process_ids
 
-        The per-tick entry point (distinct from the per-job :meth:`_preload_blocked_by_ram_pressure`): it runs
-        the whole-host degrade response (pause pops, evict idle models, shed idle contexts, reclaim an
-        over-ceiling process) whenever the host is under its floor, so a worker that never attempts a new
-        preload still throttles and reclaims instead of growing into an OS OOM kill. Returns whether the host
-        was under pressure. Clears the one-shot notice when the host is healthy.
-        """
-        verdict = self._ram_pressure_verdict()
-        self._update_ram_pop_hold(verdict)
-        if not verdict.under_pressure:
-            self._ram_pressure_notified = False
-            return False
-        self._govern_ram_pressure(verdict)
-        return True
+    @_processes_draining_for_ram.setter
+    def _processes_draining_for_ram(self, value: set[int]) -> None:
+        self._ram_governor_state.draining_process_ids = set(value)
 
-    def _update_ram_pop_hold(self, verdict: RamPressureVerdict) -> None:
-        """Set the soft, pre-floor pop hold when RAM is approaching the danger floor or a drain is in flight.
+    def _build_host_memory_snapshot(self, verdict: RamPressureVerdict) -> HostMemorySnapshot:
+        """Capture the host-RAM state and governor bookkeeping one governance decision runs over.
 
-        The hard floor engages :attr:`self_throttle_paused`; this softer band stops the popper starting a new
-        job's ttl clock *before* the host is critical, so a job does not age past its ttl waiting on a degraded
-        worker and get aborted by the horde as too slow. The approach margin reuses the marginal RAM reserve
-        (no separate knob): the hold engages once measured available RAM is within ``ram_reserve_mb`` of the
-        floor, and also while any process is being drained for reclaim. Cleared when RAM recovers and no
-        process is draining. Never raises on a bad config value.
+        The single measurement site for RAM governance: every reading the pure decision functions in
+        [`ram_governor`][horde_worker_regen.process_management.scheduling.governance.ram_governor] consume
+        is taken here, once, so a decision never re-measures mid-flight. Config values are read
+        defensively (a partially-mocked config falls back to the field default) so snapshotting never
+        crashes the scheduling cycle.
         """
         margin_mb = config_number(self._runtime_config.bridge_data.ram_reserve_mb)
         if margin_mb is None:
             margin_mb = 4096.0
-        approaching = verdict.available_mb is not None and (verdict.available_mb - verdict.floor_mb) < margin_mb
-        self._state.ram_pressure_pop_hold = bool(verdict.under_pressure or approaching) or bool(
-            self._processes_draining_for_ram,
+        inference_slots = tuple(
+            InferenceSlotSnapshot(
+                process_id=process_info.process_id,
+                device_index=process_info.device_index,
+                resident_ram_mb=process_info.ram_usage_bytes / (1024 * 1024),
+                is_busy=process_info.is_process_busy(),
+            )
+            for process_info in self._process_map.values()
+            if process_info.process_type == HordeProcessType.INFERENCE
         )
+        residency_held_cards = {index for index, _residency in self._held_residencies()}
+        cards = tuple(
+            CardProcessSnapshot(
+                device_index=device_index,
+                loaded_process_count=self._process_map.num_loaded_inference_processes(device_index=device_index),
+                busy_process_count=self._card_inference_load(device_index),
+                planned_process_count=card_runtime.target_process_count,
+                held_by_whole_card_residency=device_index in residency_held_cards,
+            )
+            for device_index, card_runtime in sorted(self._card_runtimes.items())
+        )
+        return HostMemorySnapshot(
+            verdict=verdict,
+            now=time.time(),
+            pop_pause_active=self._state.self_throttle_paused,
+            pop_pause_until=self._state.self_throttle_paused_until,
+            pop_hold_margin_mb=margin_mb,
+            per_process_ceiling_mb=self._ram_per_process_ceiling_mb(),
+            multi_gpu_routing_active=self._multi_gpu_routing_active,
+            in_flight_job_count=len(self._job_tracker.jobs_in_progress),
+            loaded_worker_process_count=self._process_map.num_loaded_inference_processes(),
+            inference_slots=inference_slots,
+            cards=cards,
+            draining_process_ids=frozenset(self._ram_governor_state.draining_process_ids),
+            shed_card_indices=frozenset(self._ram_governor_state.shed_cards),
+            restore_headroom_mb=self._ram_headroom_for_additional_context_mb(),
+            per_context_ram_estimate_mb=self._estimated_resident_context_ram_mb(),
+        )
+
+    def _execute_governance_actions(self, actions: list[GovernanceAction]) -> None:
+        """Execute governance decisions against the live worker: the single act site for RAM remedies.
+
+        The governor's multi-tick bookkeeping (draining marks, shed-card tracking) is mutated here, at
+        execution time and with the measured result of each remedy (a card is only recorded as shed when
+        its count actually fell), so the decision layer stays a pure function of its snapshot.
+        """
+        governor_state = self._ram_governor_state
+        for action in actions:
+            match action:
+                case SetPopHold(active=hold_active):
+                    self._state.ram_pressure_pop_hold = hold_active
+                case PausePops(until_time=until_time, pause_seconds=pause_seconds, reason=reason):
+                    self._state.self_throttle_paused = True
+                    self._state.self_throttle_paused_until = until_time
+                    logger.opt(ansi=True).warning(
+                        f"<fg #ff8c69>System RAM below the danger floor ({reason}); pausing job pops for "
+                        f"{pause_seconds:.0f}s and shedding idle footprint so the host is not driven into "
+                        "an OS OOM kill. In-flight jobs finish; pops resume once RAM recovers.</>",
+                    )
+                case EvictIdleModels():
+                    self.unload_models(under_pressure=True)
+                case ReduceWorkerProcesses(target_count=target_count):
+                    self._process_lifecycle.scale_inference_processes(target_count, device_index=None)
+                case ReduceCardProcesses(device_index=device_index, target_count=target_count):
+                    current = self._process_map.num_loaded_inference_processes(device_index=device_index)
+                    after = self._process_lifecycle.scale_inference_processes(
+                        target_count,
+                        device_index=device_index,
+                    )
+                    if after < current:
+                        governor_state.shed_cards.add(device_index)
+                case MarkProcessDraining(
+                    process_id=process_id,
+                    resident_ram_mb=resident_ram_mb,
+                    ceiling_mb=ceiling_mb,
+                ):
+                    governor_state.draining_process_ids.add(process_id)
+                    logger.opt(ansi=True).warning(
+                        f"<fg #ff8c69>Inference process {process_id} holds {resident_ram_mb:.0f} MB RAM (>= the "
+                        f"{ceiling_mb:.0f} MB per-process ceiling) while the host is under its RAM floor; "
+                        "draining it (no new work) so it can be recycled once its in-flight job finishes.</>",
+                    )
+                case ClearProcessDraining(process_id=process_id):
+                    governor_state.draining_process_ids.discard(process_id)
+                case RecycleProcess(process_id=process_id, resident_ram_mb=resident_ram_mb, ceiling_mb=ceiling_mb):
+                    process_info = self._process_map.get(process_id)
+                    if process_info is None:
+                        # The process exited between snapshot and execution; nothing to reclaim.
+                        governor_state.draining_process_ids.discard(process_id)
+                        continue
+                    logger.opt(ansi=True).warning(
+                        f"<fg #ff8c69>Inference process {process_id} holds {resident_ram_mb:.0f} MB RAM (>= the "
+                        f"{ceiling_mb:.0f} MB per-process ceiling) while the host is under its RAM floor; "
+                        "recycling it to return the retained RAM to the OS.</>",
+                    )
+                    governor_state.draining_process_ids.discard(process_id)
+                    self._process_lifecycle._replace_inference_process(process_info, intentional_reclaim=True)
+                    self._ram_reclaim_cycle_at = time.time()
+                    self._record_churn("process_cycle")
+                case RestoreCardProcess(device_index=device_index, target_count=target_count, planned_count=planned):
+                    current = self._process_map.num_loaded_inference_processes(device_index=device_index)
+                    after = self._process_lifecycle.scale_inference_processes(
+                        target_count,
+                        device_index=device_index,
+                    )
+                    logger.opt(ansi=True).info(
+                        f"<fg #7b7d7d>System RAM has headroom; restoring an inference context on device "
+                        f"{device_index} ({current} -> {after} of {planned}) so the card resumes serving.</>",
+                    )
+                    if after >= planned:
+                        governor_state.shed_cards.discard(device_index)
+                case StopTrackingShedCard(device_index=device_index):
+                    governor_state.shed_cards.discard(device_index)
+
+    def _govern_ram_pressure(self, verdict: RamPressureVerdict) -> None:
+        """Degrade the worker's footprint and intake while system RAM is below the danger floor.
+
+        The proactive counterpart to the marginal RAM budget: rather than admit a load that the absolute
+        reading says will trip the kernel OOM-killer, the worker pauses job pops, evicts idle resident
+        models, reduces the resident inference-process count, and reclaims a process whose resident RAM
+        crossed the per-process ceiling. The decision logic lives in
+        [`decide_degrade_response`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_degrade_response].
+        """
+        snapshot = self._build_host_memory_snapshot(verdict)
+        self._execute_governance_actions(decide_degrade_response(snapshot))
+
+    def _govern_ram_pressure_if_pressured(self) -> bool:
+        """Evaluate the absolute RAM danger floor and degrade the worker if it is breached.
+
+        The per-tick entry point (distinct from the per-job :meth:`_preload_blocked_by_ram_pressure`): it
+        updates the soft pop hold and runs the whole-host degrade response whenever the host is under its
+        floor, so a worker that never attempts a new preload still throttles and reclaims instead of
+        growing into an OS OOM kill. Returns whether the host was under pressure. Clears the one-shot
+        notice when the host is healthy.
+        """
+        verdict = self._ram_pressure_verdict()
+        snapshot = self._build_host_memory_snapshot(verdict)
+        self._execute_governance_actions(decide_pressure_governance(snapshot))
+        if not verdict.under_pressure:
+            self._ram_pressure_notified = False
+            return False
+        return True
 
     def _ram_per_process_ceiling_mb(self) -> float | None:
         """The configured per-process resident-RAM ceiling (MB), or None when disabled/unset.
@@ -1919,95 +2037,18 @@ class InferenceScheduler:
             return None
         return ceiling
 
-    def _reclaim_over_ceiling_processes(self) -> None:
-        """Reclaim the largest inference process whose resident RAM is at/above the per-process ceiling.
-
-        Only ever called while the host is under its RAM danger floor, so a roomy host never recycles. Acts on
-        one process per invocation (the largest over-ceiling one) to avoid emptying every card at once: if it is
-        idle it is recycled now (its allocator-retained pages return to the OS on respawn); if it is busy it is
-        marked draining (fed no new work by the dispatch/preload target selection) so its in-flight job finishes,
-        and a later invocation recycles it once it is idle. A process that has fallen back under the ceiling is
-        cleared from the drain set.
-        """
-        ceiling_mb = self._ram_per_process_ceiling_mb()
-        if ceiling_mb is None:
-            self._processes_draining_for_ram.clear()
-            return
-
-        over_ceiling: list[HordeProcessInfo] = []
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if process_info.ram_usage_bytes / (1024 * 1024) >= ceiling_mb:
-                over_ceiling.append(process_info)
-            else:
-                self._processes_draining_for_ram.discard(process_info.process_id)
-
-        if not over_ceiling:
-            return
-
-        target = max(over_ceiling, key=lambda p: p.ram_usage_bytes)
-        used_mb = target.ram_usage_bytes / (1024 * 1024)
-        if target.is_process_busy():
-            if target.process_id not in self._processes_draining_for_ram:
-                self._processes_draining_for_ram.add(target.process_id)
-                logger.opt(ansi=True).warning(
-                    f"<fg #ff8c69>Inference process {target.process_id} holds {used_mb:.0f} MB RAM (>= the "
-                    f"{ceiling_mb:.0f} MB per-process ceiling) while the host is under its RAM floor; draining it "
-                    "(no new work) so it can be recycled once its in-flight job finishes.</>",
-                )
-            return
-
-        logger.opt(ansi=True).warning(
-            f"<fg #ff8c69>Inference process {target.process_id} holds {used_mb:.0f} MB RAM (>= the "
-            f"{ceiling_mb:.0f} MB per-process ceiling) while the host is under its RAM floor; recycling it to "
-            "return the retained RAM to the OS.</>",
-        )
-        self._processes_draining_for_ram.discard(target.process_id)
-        self._process_lifecycle._replace_inference_process(target, intentional_reclaim=True)
-        self._ram_reclaim_cycle_at = time.time()
-        self._record_churn("process_cycle")
-
     def _reduce_processes_under_ram_pressure(self) -> None:
         """Shed idle resident inference processes to return their resident-weight RAM to the OS.
 
         The RAM analogue of :attr:`StreamForecast.needs_process_count_reduction`: with the host over the
-        danger floor, the structural remedy is fewer resident contexts, not another load on top. Targets the
-        count needed for in-flight work (at least one), shedding at least one idle sibling; only idle
-        processes are stopped (``scale_inference_processes`` never kills a busy slot), so live work is spared.
-
-        On a multi-GPU host the reduction is applied per card so it never empties a card of every context: a
-        worker-wide shrink would let the worldwide victim search stop every idle process regardless of card,
-        leaving a card with zero contexts (and so an idle GPU) until restored. The single-GPU / worker-wide
-        path is unchanged.
+        danger floor, the structural remedy is fewer resident contexts, not another load on top. Only idle
+        processes are stopped (``scale_inference_processes`` never kills a busy slot), so live work is
+        spared. The reduction targets are decided by
+        [`decide_process_reduction`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_process_reduction]
+        (per card on a multi-GPU host, worker-wide otherwise).
         """
-        if self._multi_gpu_routing_active:
-            self._reduce_processes_per_card_under_ram_pressure()
-            return
-        current = self._process_map.num_loaded_inference_processes()
-        if current <= 1:
-            return
-        needed = max(1, len(self._job_tracker.jobs_in_progress))
-        target = max(1, min(current - 1, needed))
-        self._process_lifecycle.scale_inference_processes(target, device_index=None)
-
-    def _reduce_processes_per_card_under_ram_pressure(self) -> None:
-        """Shed idle contexts on each driven card while leaving every card at least one resident context.
-
-        Each card is reduced toward the count its own in-flight work needs (at least one), so no GPU is
-        stranded by the worker-wide victim search. Every card actually shrunk is recorded in
-        :attr:`_ram_pressure_shed_cards` so :meth:`_restore_processes_after_ram_pressure` grows it back once
-        the host clears the danger floor.
-        """
-        for device_index in sorted(self._card_runtimes):
-            current = self._process_map.num_loaded_inference_processes(device_index=device_index)
-            if current <= 1:
-                continue
-            needed = max(1, self._card_inference_load(device_index))
-            target = max(1, min(current - 1, needed))
-            after = self._process_lifecycle.scale_inference_processes(target, device_index=device_index)
-            if after < current:
-                self._ram_pressure_shed_cards.add(device_index)
+        snapshot = self._build_host_memory_snapshot(self._ram_pressure_verdict())
+        self._execute_governance_actions(decide_process_reduction(snapshot))
 
     def _estimated_resident_context_ram_mb(self) -> float:
         """Conservative system-RAM cost (MB) of one more resident inference context.
@@ -2038,49 +2079,14 @@ class InferenceScheduler:
 
         The reduction sheds idle contexts to walk the host back above its absolute RAM floor; nothing else
         re-establishes them, so without this a card that lost its contexts to a RAM spike sits idle for the
-        rest of the run while the surviving card serializes the work. Mirrors the whole-card residency restore
-        and is scoped to the pressure episode: only cards the reduction recorded are grown back, only once RAM
-        is no longer under pressure and the self-throttle pop-pause has lapsed, and never a card a whole-card
-        residency is deliberately holding down (that path runs its own restore).
-
-        Growth is RAM-gated and incremental: one context per card per cycle, and only while measured RAM
-        headroom can hold another resident working set (estimated from the largest live context). This keeps
-        the restore from fighting the budget on a host whose full process plan over-commits the shared RAM
-        pool, where growing straight back to plan would re-trip the reduction and oscillate. A card stays
-        pending until it reaches its plan or RAM proves it cannot sustain more.
+        rest of the run while the surviving card serializes the work. The restore grants (incremental,
+        RAM-gated, residency-aware) are decided by
+        [`decide_shed_card_restore`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_shed_card_restore].
         """
-        if not self._ram_pressure_shed_cards:
+        if not self._ram_governor_state.shed_cards:
             return
-        if self._ram_pressure_verdict().under_pressure:
-            return
-        if self._state.self_throttle_paused and time.time() < self._state.self_throttle_paused_until:
-            return
-
-        cards_held_by_residency = {index for index, _residency in self._held_residencies()}
-        per_context_ram_mb = self._estimated_resident_context_ram_mb()
-        cards_to_stop_tracking: set[int] = set()
-        for device_index in sorted(self._ram_pressure_shed_cards):
-            card = self._card_runtimes.get(device_index)
-            if card is None or device_index in cards_held_by_residency:
-                # A residency-held (or unknown) card is restored by its own path; stop tracking it here.
-                cards_to_stop_tracking.add(device_index)
-                continue
-            current = self._process_map.num_loaded_inference_processes(device_index=device_index)
-            if current >= card.target_process_count:
-                cards_to_stop_tracking.add(device_index)
-                continue
-            if self._ram_headroom_for_additional_context_mb() < per_context_ram_mb:
-                # No RAM to sustain another resident context yet; keep the card pending and retry next cycle.
-                continue
-            after = self._process_lifecycle.scale_inference_processes(current + 1, device_index=device_index)
-            logger.opt(ansi=True).info(
-                f"<fg #7b7d7d>System RAM has headroom; restoring an inference context on device {device_index} "
-                f"({current} -> {after} of {card.target_process_count}) so the card resumes serving.</>",
-            )
-            if after >= card.target_process_count:
-                cards_to_stop_tracking.add(device_index)
-
-        self._ram_pressure_shed_cards -= cards_to_stop_tracking
+        snapshot = self._build_host_memory_snapshot(self._ram_pressure_verdict())
+        self._execute_governance_actions(decide_shed_card_restore(snapshot))
 
     def _committed_post_processing_reserve_mb(self, *, device_index: int | None = None) -> float:
         """Sum the imminent post-processing-phase VRAM peaks of jobs currently in post-processing (MB).
