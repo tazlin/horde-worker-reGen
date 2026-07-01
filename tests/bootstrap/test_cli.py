@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from worker_bootstrap import backend, cli
+from worker_bootstrap import backend, cli, detect
+
+
+def _decision(token: str) -> detect.BackendDecision:
+    """A minimal detect-stage BackendDecision resolving to *token* (the hardware-probe seam in tests)."""
+    return detect.BackendDecision(stage="detect", final_token=token, reason="test")
 
 
 @pytest.fixture
@@ -18,7 +23,9 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, list[tup
         encoding="utf-8",
     )
     monkeypatch.delenv("HORDE_WORKER_BACKEND", raising=False)
-    monkeypatch.setattr(cli.detect, "detect_backend", lambda: "cu126")
+    # The hardware-probe seam: the CLI resolves the detected token (and records its decision) through
+    # describe_backend_selection. Stub it to cu126 so tests never touch real nvidia-smi.
+    monkeypatch.setattr(cli.detect, "describe_backend_selection", lambda: _decision("cu126"))
     # The sync path reconciles the resolved token against the live GPU's compute capability. Stub it to
     # "unreadable" so the default is a no-op; tests that exercise the arch self-heal override this.
     monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (0, 0))
@@ -100,7 +107,7 @@ def test_sync_self_heals_stale_cu126_on_blackwell(env: tuple[Path, list], monkey
 def test_sync_detects_backend_when_no_file(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
     """With no persisted bin/backend, sync uses live detection rather than blindly defaulting to cu126."""
     _, calls = env
-    monkeypatch.setattr(cli.detect, "detect_backend", lambda: "cu130")
+    monkeypatch.setattr(cli.detect, "describe_backend_selection", lambda: _decision("cu130"))
     assert cli.main(["sync"]) == 0
     assert calls == [("sync", "cu130")]
 
@@ -218,6 +225,110 @@ def test_launch_skips_sync_when_stamp_matches_lock(env: tuple[Path, list]) -> No
     (root / ".venv" / ".horde-sync-stamp").write_text(cli._lock_fingerprint(root), encoding="utf-8")
     assert cli.main(["launch", "terminal"]) == 0
     assert calls == [("run", ["horde-worker"])]
+
+
+def _in_sync_venv(root: Path) -> None:
+    """A venv whose recorded sync stamp matches the current lock, so a launch would otherwise skip syncing."""
+    _make_venv(root)
+    (root / "uv.lock").write_text("lock-current", encoding="utf-8")
+    (root / ".venv" / ".horde-sync-stamp").write_text(cli._lock_fingerprint(root), encoding="utf-8")
+
+
+def test_launch_forces_resync_when_installed_torch_cannot_run_gpu(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A lock-matching venv whose torch has no kernels for the live GPU is re-synced before starting.
+
+    This is the launch-path backstop for a persisted build that cannot run the card actually present (a
+    cu126 install on a Blackwell GPU): the runtime guard alone would refuse every job on every relaunch
+    forever, because nothing on the pure-launch path re-runs the installer.
+    """
+    root, calls = env
+    _in_sync_venv(root)
+    backend.write_backend_file(root / "bin" / "backend", "cu126")
+    # Live Blackwell card; the installed cu126 wheel carries no sm_120 kernel image.
+    monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (12, 0))
+    monkeypatch.setattr(cli.runner, "query_torch_arch_list", lambda uv, **kw: ["sm_80", "sm_90"])
+    assert cli.main(["launch", "terminal"]) == 0
+    # The forced sync reconciles cu126 -> cu130 (the runnable build) before the worker starts.
+    assert calls == [("sync", "cu130"), ("run", ["horde-worker"])]
+    assert backend.read_backend_file(root / "bin" / "backend") == "cu130"
+    assert "no CUDA kernels for this GPU" in capsys.readouterr().err
+
+
+def test_launch_stamps_healthy_torch_and_skips_reprobe(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wheel that runs the live GPU is verified once, stamped, and not re-probed on the next launch."""
+    root, calls = env
+    _in_sync_venv(root)
+    monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (12, 0))
+    monkeypatch.setattr(cli.runner, "query_torch_arch_list", lambda uv, **kw: ["sm_90", "sm_100", "sm_120"])
+    assert cli.main(["launch", "terminal"]) == 0
+    assert calls == [("run", ["horde-worker"])]
+    assert cli.paths.gpu_check_stamp_file(root).is_file()
+
+    # A second launch must not re-run the torch-arch probe now that the check is stamped current.
+    def _boom(uv: str, **kw: object) -> list[str]:
+        raise AssertionError("re-probed torch arch despite a current GPU-check stamp")
+
+    monkeypatch.setattr(cli.runner, "query_torch_arch_list", _boom)
+    calls.clear()
+    assert cli.main(["launch", "terminal"]) == 0
+    assert calls == [("run", ["horde-worker"])]
+
+
+def test_launch_warns_but_starts_when_no_corrective_build_exists(
+    env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When the installed build is already the best for the card yet still cannot run it, do not loop-resync.
+
+    This is the stale-selection-table case (a worker bug): reinstalling the same build cannot help, so the
+    launch starts and lets the worker's runtime guard surface the report-worthy specifics.
+    """
+    root, calls = env
+    _in_sync_venv(root)
+    backend.write_backend_file(root / "bin" / "backend", "cu130")
+    monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (12, 0))
+    # The installed wheel still cannot run sm_120 even though cu130 is the correct token for the card.
+    monkeypatch.setattr(cli.runner, "query_torch_arch_list", lambda uv, **kw: ["sm_80", "sm_90"])
+    assert cli.main(["launch", "terminal"]) == 0
+    assert calls == [("run", ["horde-worker"])]  # started, never re-synced
+    assert "no alternative locked build is known" in capsys.readouterr().err
+
+
+def test_detect_records_decision_breadcrumb(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """`detect` writes the full selection decision to bin/backend-decision.json for a support bundle."""
+    root, _ = env
+    monkeypatch.setattr(
+        cli.detect,
+        "describe_backend_selection",
+        lambda: detect.BackendDecision(
+            stage="detect",
+            final_token="cu130",
+            reason="floored for Blackwell",
+            driver_cuda_version=(12, 8),
+            compute_capability=(12, 0),
+            clamp_action=detect.CLAMP_FLOORED,
+        ),
+    )
+    assert cli.main(["detect"]) == 0
+    recorded = cli.json.loads(cli.paths.backend_decision_file(root).read_text(encoding="utf-8"))
+    assert recorded["detect"]["final_token"] == "cu130"
+    assert recorded["detect"]["clamp_action"] == detect.CLAMP_FLOORED
+    assert recorded["detect"]["compute_capability"] == "12.0"
+
+
+def test_sync_reconcile_records_decision_breadcrumb(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reconcile step records its own decision stage (why a stale token was clamped) in the breadcrumb."""
+    root, _ = env
+    backend.write_backend_file(root / "bin" / "backend", "cu126")
+    monkeypatch.setattr(cli.detect, "_nvidia_compute_cap", lambda: (12, 0))
+    assert cli.main(["sync"]) == 0
+    recorded = cli.json.loads(cli.paths.backend_decision_file(root).read_text(encoding="utf-8"))
+    assert recorded["reconcile"]["final_token"] == "cu130"
+    assert recorded["reconcile"]["input_token"] == "cu126"
+    assert recorded["reconcile"]["clamp_action"] == detect.CLAMP_FLOORED
 
 
 def _available_info() -> object:
@@ -428,14 +539,14 @@ def test_bare_command_falls_back_to_run(env: tuple[Path, list]) -> None:
 
 def test_amd_unsupported_aborts(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
     """An AMD-on-Windows detection makes `detect` exit non-zero rather than silently choosing CPU."""
-    monkeypatch.setattr(cli.detect, "detect_backend", lambda: "amd-unsupported")
+    monkeypatch.setattr(cli.detect, "describe_backend_selection", lambda: _decision("amd-unsupported"))
     assert cli.main(["detect"]) == 2
 
 
 def test_env_override_beats_detection(env: tuple[Path, list], monkeypatch: pytest.MonkeyPatch) -> None:
     """HORDE_WORKER_BACKEND=cpu lets an AMD user opt into the CPU build."""
     root, _ = env
-    monkeypatch.setattr(cli.detect, "detect_backend", lambda: "amd-unsupported")
+    monkeypatch.setattr(cli.detect, "describe_backend_selection", lambda: _decision("amd-unsupported"))
     monkeypatch.setenv("HORDE_WORKER_BACKEND", "cpu")
     assert cli.main(["detect", "--write"]) == 0
     assert backend.read_backend_file(root / "bin" / "backend") == "cpu"

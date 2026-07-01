@@ -120,6 +120,68 @@ def test_reconcile_backend_for_gpu(
     assert detect.reconcile_backend_for_gpu(token) == expected
 
 
+def test_describe_backend_selection_records_the_arch_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Blackwell card on an old driver yields a decision that names the ceiling, the clamp, and the reason."""
+    monkeypatch.setattr(detect, "_nvidia_present", lambda: True)
+    monkeypatch.setattr(detect, "_nvidia_smi_path", lambda: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(detect, "_nvidia_cuda_version", lambda: (12, 8))
+    monkeypatch.setattr(detect, "_nvidia_compute_cap", lambda: (12, 0))
+    decision = detect.describe_backend_selection()
+    assert decision.stage == "detect"
+    assert decision.final_token == detect.CU130
+    assert decision.driver_ceiling_build == detect.CU126  # driver ceiling before the arch clamp
+    assert decision.clamp_action == detect.CLAMP_FLOORED
+    assert decision.to_dict()["driver_cuda_version"] == "12.8"
+    assert decision.to_dict()["compute_capability"] == "12.0"
+
+
+def test_describe_backend_selection_reports_unreadable_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreadable compute capability keeps the driver-only pick and records the skipped clamp."""
+    monkeypatch.setattr(detect, "_nvidia_present", lambda: True)
+    monkeypatch.setattr(detect, "_nvidia_smi_path", lambda: None)
+    monkeypatch.setattr(detect, "_nvidia_cuda_version", lambda: (13, 2))
+    monkeypatch.setattr(detect, "_nvidia_compute_cap", lambda: (0, 0))
+    decision = detect.describe_backend_selection()
+    assert decision.final_token == detect.CU132
+    assert decision.clamp_action == detect.CLAMP_SKIPPED
+
+
+def test_describe_backend_selection_non_nvidia(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no GPU the decision resolves to cpu and records the absence."""
+    monkeypatch.setattr(detect, "_nvidia_present", lambda: False)
+    monkeypatch.setattr(detect, "_amd_present", lambda: False)
+    decision = detect.describe_backend_selection()
+    assert decision.final_token == detect.CPU
+    assert decision.nvidia_present is False
+    assert decision.amd_present is False
+
+
+@pytest.mark.parametrize(
+    ("token", "compute_cap", "expected_token", "expected_action"),
+    [
+        (detect.CU126, (12, 0), detect.CU130, detect.CLAMP_FLOORED),
+        (detect.CU132, (6, 1), detect.CU126, detect.CLAMP_CEILED),
+        (detect.CU130, (8, 6), detect.CU130, detect.CLAMP_NONE),
+        (detect.CU126, (0, 0), detect.CU126, detect.CLAMP_SKIPPED),
+        (detect.CPU, (12, 0), detect.CPU, detect.CLAMP_NOT_CUDA),
+    ],
+)
+def test_describe_reconcile_records_clamp_action(
+    monkeypatch: pytest.MonkeyPatch,
+    token: str,
+    compute_cap: tuple[int, int],
+    expected_token: str,
+    expected_action: str,
+) -> None:
+    """A reconcile decision records the input token, the resolved token, and what the clamp did."""
+    monkeypatch.setattr(detect, "_nvidia_compute_cap", lambda: compute_cap)
+    decision = detect.describe_reconcile(token)
+    assert decision.stage == "reconcile"
+    assert decision.input_token == token
+    assert decision.final_token == expected_token
+    assert decision.clamp_action == expected_action
+
+
 @pytest.mark.parametrize("token", [detect.CPU, detect.ROCM, detect.ROCM_WINDOWS, detect.AMD_UNSUPPORTED])
 def test_reconcile_backend_leaves_non_cuda_tokens_untouched(
     monkeypatch: pytest.MonkeyPatch,

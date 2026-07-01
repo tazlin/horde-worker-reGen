@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 CU126 = "cu126"
@@ -279,28 +280,139 @@ def live_compute_capability() -> tuple[int, int]:
     return _nvidia_compute_cap()
 
 
+# clamp_action values recorded on a BackendDecision, naming what the architecture clamp did to the
+# driver-ceiling (or persisted) build. These are stable strings a support bundle / test can key on.
+CLAMP_NONE = "in_window"  # the build already carries kernels for the card; unchanged
+CLAMP_FLOORED = "floored_to_cu130"  # a Blackwell+ card lifted off cu126 (which has no kernel image for it)
+CLAMP_CEILED = "ceiled_to_cu126"  # a pre-Turing card held on cu126 (the CUDA 13 wheels dropped it)
+CLAMP_SKIPPED = "skipped_unreadable_cap"  # compute capability could not be read, so no clamp was applied
+CLAMP_NOT_CUDA = "not_cuda"  # a cpu/rocm token, never clamped
+
+
+@dataclass(frozen=True)
+class BackendDecision:
+    """The full audit trail behind a torch-build choice: the chosen token plus every input and step.
+
+    A build token on its own ("cu126") cannot explain *why* it was picked, which is exactly what a support
+    bundle needs when the installed wheel turns out to have no kernels for the card. This records the
+    hardware signals read (driver CUDA ceiling, GPU compute capability), the intermediate driver-only pick,
+    what the architecture clamp did to it, and a human-readable reason, so a maintainer can tell a stale
+    persisted token apart from an unreadable ``nvidia-smi`` apart from an out-of-date selection table.
+
+    ``stage`` is ``"detect"`` (a fresh hardware probe) or ``"reconcile"`` (re-clamping an already-resolved
+    token against the live GPU). Fields that do not apply to a stage (a reconcile never reads the driver
+    ceiling; a non-NVIDIA detect never reads a compute capability) stay ``None``.
+    """
+
+    stage: str
+    final_token: str
+    reason: str
+    nvidia_present: bool | None = None
+    amd_present: bool | None = None
+    nvidia_smi_path: str | None = None
+    driver_cuda_version: tuple[int, int] | None = None
+    compute_capability: tuple[int, int] | None = None
+    driver_ceiling_build: str | None = None
+    input_token: str | None = None
+    clamp_action: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable view, rendering version tuples as ``"major.minor"`` strings."""
+
+        def _cap(value: tuple[int, int] | None) -> str | None:
+            return None if value is None else f"{value[0]}.{value[1]}"
+
+        return {
+            "stage": self.stage,
+            "final_token": self.final_token,
+            "reason": self.reason,
+            "nvidia_present": self.nvidia_present,
+            "amd_present": self.amd_present,
+            "nvidia_smi_path": self.nvidia_smi_path,
+            "driver_cuda_version": _cap(self.driver_cuda_version),
+            "compute_capability": _cap(self.compute_capability),
+            "driver_ceiling_build": self.driver_ceiling_build,
+            "input_token": self.input_token,
+            "clamp_action": self.clamp_action,
+        }
+
+
+def _explain_clamp(pre_clamp: str, post_clamp: str, compute_cap: tuple[int, int]) -> tuple[str, str]:
+    """Return the ``(clamp_action, reason)`` describing what :func:`_clamp_build_to_arch` did and why."""
+    if pre_clamp not in (CU126, CU130, CU132):
+        return CLAMP_NOT_CUDA, f"{pre_clamp} is not a CUDA build; no architecture clamp applies"
+    if compute_cap == (0, 0):
+        return (
+            CLAMP_SKIPPED,
+            f"kept the driver-ceiling build {pre_clamp}; the GPU compute capability could not be read, so "
+            "no architecture clamp was applied",
+        )
+    cap_tag = f"{compute_cap[0]}.{compute_cap[1]}"
+    if post_clamp == pre_clamp:
+        return CLAMP_NONE, f"{pre_clamp} carries kernels for compute capability {cap_tag}"
+    if post_clamp == CU130 and pre_clamp == CU126:
+        return (
+            CLAMP_FLOORED,
+            f"cu126 has no kernel image for compute capability {cap_tag} (Blackwell or newer); floored to "
+            "cu130 (a driver update may be required before it can load)",
+        )
+    return (
+        CLAMP_CEILED,
+        f"the CUDA 13 wheels dropped compute capability {cap_tag} (pre-Turing); held at cu126",
+    )
+
+
+def _driver_ceiling_build(version: tuple[int, int]) -> str:
+    """Return the newest locked CUDA build the driver's max CUDA version can load (before any arch clamp).
+
+    A torch wheel built against CUDA toolkit T needs a driver whose max CUDA version is >= T. The newest
+    build the driver covers wins: 13.2+ -> cu132, 13.0/13.1 -> cu130, anything older or an unreadable
+    (0, 0) version -> cu126. Tuple ordering keeps this version-aware (so e.g. (13, 1) < (13, 2)).
+    """
+    if version >= (13, 2):
+        return CU132
+    if version >= (13, 0):
+        return CU130
+    return CU126
+
+
 def _cuda_build(version: tuple[int, int], compute_cap: tuple[int, int] = (0, 0)) -> str:
     """Pick the newest locked CUDA build the driver allows, clamped to the GPU's valid arch window.
 
     Two independent constraints decide the build, and the highest *valid* build is the newest one that
     satisfies both:
 
-    * Driver ceiling: a torch wheel built against CUDA toolkit T needs a driver whose max CUDA version
-      is >= T. The newest build the driver covers wins: 13.2+ -> cu132, 13.0/13.1 -> cu130, anything
-      older or an unreadable (0, 0) version -> cu126. Tuple ordering keeps this version-aware
-      (so e.g. (13, 1) < (13, 2)).
+    * Driver ceiling: see :func:`_driver_ceiling_build`.
     * Architecture window: the driver version is only a ceiling, not proof the wheel has kernels for the
       card, so the driver-based pick is clamped into the card's valid window (see
       :func:`_clamp_build_to_arch`). ``compute_cap`` (0, 0) skips the clamp and keeps the driver-only
       pick, preserving the prior behaviour.
     """
-    if version >= (13, 2):
-        build = CU132
-    elif version >= (13, 0):
-        build = CU130
-    else:
-        build = CU126
-    return _clamp_build_to_arch(build, compute_cap)
+    return _clamp_build_to_arch(_driver_ceiling_build(version), compute_cap)
+
+
+def describe_reconcile(token: str) -> BackendDecision:
+    """Re-clamp an already-resolved token to the live GPU's arch window, recording the full decision.
+
+    See :func:`reconcile_backend_for_gpu` for the behaviour; this variant returns a :class:`BackendDecision`
+    so an install path can persist *why* the token was (or was not) changed, not just the resulting token.
+    """
+    if token not in (CU126, CU130, CU132):
+        action, reason = _explain_clamp(token, token, (0, 0))
+        return BackendDecision(
+            stage="reconcile", final_token=token, input_token=token, clamp_action=action, reason=reason
+        )
+    compute_cap = _nvidia_compute_cap()
+    final = _clamp_build_to_arch(token, compute_cap)
+    action, reason = _explain_clamp(token, final, compute_cap)
+    return BackendDecision(
+        stage="reconcile",
+        final_token=final,
+        input_token=token,
+        compute_capability=compute_cap,
+        clamp_action=action,
+        reason=reason,
+    )
 
 
 def reconcile_backend_for_gpu(token: str) -> str:
@@ -315,9 +427,66 @@ def reconcile_backend_for_gpu(token: str) -> str:
     A non-CUDA token (cpu/rocm) is returned untouched and never triggers an nvidia-smi probe; an
     unreadable capability likewise returns the token unchanged.
     """
-    if token not in (CU126, CU130, CU132):
-        return token
-    return _clamp_build_to_arch(token, _nvidia_compute_cap())
+    return describe_reconcile(token).final_token
+
+
+def describe_backend_selection() -> BackendDecision:
+    """Return the torch build token for this machine together with the full decision trail.
+
+    See :func:`detect_backend` for the resolution rules; this variant returns a :class:`BackendDecision`
+    so the install path can persist the hardware signals and the reasoning behind the pick (the breadcrumb
+    a support bundle reads to diagnose a wrong-build install).
+    """
+    if _nvidia_present():
+        smi = _nvidia_smi_path()
+        driver = _nvidia_cuda_version()
+        compute_cap = _nvidia_compute_cap()
+        ceiling = _driver_ceiling_build(driver)
+        final = _clamp_build_to_arch(ceiling, compute_cap)
+        action, clamp_reason = _explain_clamp(ceiling, final, compute_cap)
+        driver_tag = f"{driver[0]}.{driver[1]}" if driver != (0, 0) else "unreadable"
+        return BackendDecision(
+            stage="detect",
+            final_token=final,
+            nvidia_present=True,
+            nvidia_smi_path=smi,
+            driver_cuda_version=driver,
+            compute_capability=compute_cap,
+            driver_ceiling_build=ceiling,
+            clamp_action=action,
+            reason=f"NVIDIA GPU; driver CUDA {driver_tag} -> {ceiling}; {clamp_reason}",
+        )
+    if _amd_present():
+        if windows_backend := _windows_amd_rocm_backend():
+            return BackendDecision(
+                stage="detect",
+                final_token=windows_backend,
+                nvidia_present=False,
+                amd_present=True,
+                reason="AMD GPU matched a supported ROCm Windows profile",
+            )
+        if _rocm_runtime_present():
+            return BackendDecision(
+                stage="detect",
+                final_token=ROCM,
+                nvidia_present=False,
+                amd_present=True,
+                reason="AMD GPU with a ROCm runtime present",
+            )
+        return BackendDecision(
+            stage="detect",
+            final_token=AMD_UNSUPPORTED,
+            nvidia_present=False,
+            amd_present=True,
+            reason="AMD GPU with no known installable backend",
+        )
+    return BackendDecision(
+        stage="detect",
+        final_token=CPU,
+        nvidia_present=False,
+        amd_present=False,
+        reason="no NVIDIA or AMD GPU detected",
+    )
 
 
 def detect_backend() -> str:
@@ -330,10 +499,4 @@ def detect_backend() -> str:
         supported AMD Windows Radeon/Ryzen AI devices, ``amd-unsupported`` for an AMD card with no known
         installable backend, or ``cpu``.
     """
-    if _nvidia_present():
-        return _cuda_build(_nvidia_cuda_version(), _nvidia_compute_cap())
-    if _amd_present():
-        if windows_backend := _windows_amd_rocm_backend():
-            return windows_backend
-        return ROCM if _rocm_runtime_present() else AMD_UNSUPPORTED
-    return CPU
+    return describe_backend_selection().final_token

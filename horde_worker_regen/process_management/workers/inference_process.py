@@ -363,27 +363,32 @@ class HordeInferenceProcess(HordeProcess):
             if _gpu_arch_supported(arch_list, capability):
                 return
             device_name = torch.cuda.get_device_name(self.device_index)
+            # The wheel's build tag (e.g. "12.6" -> a cu126 build) names *which* build was installed, so a
+            # support log ties the mismatch straight back to the installer's choice without guesswork.
+            torch_build = getattr(torch.version, "cuda", None)
+            torch_version = getattr(torch, "__version__", "?")
         except Exception as e:
             logger.debug(f"Could not verify torch GPU architecture support: {type(e).__name__} {e}")
             return
 
         cap_tag = f"sm_{capability[0]}{capability[1]}"
+        build_tag = f"CUDA {torch_build}" if torch_build else "an unknown CUDA"
         logger.critical(
-            f"The installed PyTorch has no CUDA kernels for this GPU. {device_name} is compute "
-            f"capability {capability[0]}.{capability[1]} ({cap_tag}), but this torch build only supports "
-            f"{' '.join(arch_list)}. Every job would fail at the first kernel launch with "
-            f"'no kernel image is available for execution on the device'. Reinstall the worker so the "
-            f"installer picks the matching CUDA backend for your GPU and driver (update.cmd, or re-run "
-            f"the installer), and update your NVIDIA driver if the installer asks for a newer one.",
+            f"The installed PyTorch ({torch_version}, {build_tag} build) has no CUDA kernels for this GPU. "
+            f"{device_name} is compute capability {capability[0]}.{capability[1]} ({cap_tag}), but this "
+            f"torch build only supports {' '.join(arch_list)}. Every job would fail at the first kernel "
+            f"launch with 'no kernel image is available for execution on the device'. Reinstall the worker "
+            f"so the installer picks the matching CUDA backend for your GPU and driver (update.cmd, or "
+            f"re-run the installer), and update your NVIDIA driver if the installer asks for a newer one.",
         )
         # The info string is the operator-facing reason the parent relays verbatim to the TUI; keep it
         # self-contained (no torch references the parent would have to interpret).
         self.send_process_state_change_message(
             process_state=HordeProcessState.TORCH_GPU_INCOMPATIBLE,
             info=(
-                f"PyTorch has no CUDA kernels for {device_name} (compute capability {cap_tag}). "
-                f"Reinstall the worker to get the matching CUDA backend, and update your NVIDIA driver "
-                f"if asked. The worker will not pop jobs until this is fixed."
+                f"The installed PyTorch ({build_tag} build) has no CUDA kernels for {device_name} "
+                f"(compute capability {cap_tag}). Reinstall the worker to get the matching CUDA backend, "
+                f"and update your NVIDIA driver if asked. The worker will not pop jobs until this is fixed."
             ),
         )
         sys.exit(1)

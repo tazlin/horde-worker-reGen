@@ -232,6 +232,18 @@ def build_support_bundle(
         # Config (redacted) and the structured ledger.
         if config_path.is_file():
             _write(zf, "config/bridgeData.redacted.yaml", config_path.read_text(encoding="utf-8", errors="replace"))
+
+        # Backend-selection breadcrumbs: the persisted torch build and the audit trail of why it was chosen
+        # (driver CUDA ceiling, GPU compute capability, what the arch clamp did). These pin down a
+        # wrong-CUDA-build install, which the logs otherwise surface only as a downstream runtime fault.
+        install_root = config_path.resolve().parent
+        for source, member in (
+            (install_root / "bin" / "backend", "config/backend"),
+            (install_root / "bin" / "backend-decision.json", "config/backend-decision.json"),
+        ):
+            if source.is_file():
+                _write(zf, member, source.read_text(encoding="utf-8", errors="replace"))
+
         ledger_paths = ledger_ingest.find_ledger_paths(log_bundle.root)
         if ledger_paths:
             ledger_text = "\n".join(p.read_text(encoding="utf-8", errors="replace").rstrip("\n") for p in ledger_paths)

@@ -74,6 +74,15 @@ existed) therefore self-heals to `cu130` on its next update, and even a hand-for
 `HORDE_WORKER_BACKEND=cu126` on a Blackwell card is corrected upward (an unrunnable build helps nobody)
 with a note explaining the swap. The corrected build is re-recorded so the fix sticks.
 
+Launch is a backstop for the same problem. A matching lockfile proves the right package *versions* are
+installed, not that the installed torch has kernels for the card actually present (a GPU swap, or a build
+carried over from a different machine, leaves an up-to-date venv whose torch still cannot launch a
+kernel). So a launch verifies the installed wheel's architecture list against the live GPU once per
+lock + card (stamped, so a healthy start stays instant) and, when the wheel cannot run the card and a
+different locked build can, re-syncs to install the runnable one before the worker starts. Every backend
+selection (detect and the clamp) is recorded to `bin/backend-decision.json` so a support bundle can show
+why a given build was chosen.
+
 Build selection is still a *prediction* (the installer must choose a wheel before torch exists, so it
 maps your GPU's compute capability onto a build from a table). As a backstop, the sync re-checks that
 prediction against reality once torch is on disk: it reads the installed wheel's actual kernel list and,

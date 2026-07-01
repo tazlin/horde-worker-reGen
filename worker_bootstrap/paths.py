@@ -79,6 +79,18 @@ def backend_file(root: Path | None = None) -> Path:
     return bin_dir(root) / "backend"
 
 
+def backend_decision_file(root: Path | None = None) -> Path:
+    """Return the path of the backend-selection audit breadcrumb (``bin/backend-decision.json``).
+
+    Records *why* the persisted backend token was chosen (the driver CUDA ceiling, the GPU compute
+    capability, and what the architecture clamp did), keyed by stage (``detect`` / ``reconcile``). Lives
+    beside ``bin/backend`` so an update overlay preserves it and the support bundle can collect it: the
+    logs otherwise show a wrong-build install only as a downstream runtime fault, never the selection
+    inputs behind it.
+    """
+    return bin_dir(root) / "backend-decision.json"
+
+
 def consent_marker(root: Path | None = None) -> Path:
     """Return the marker that records install consent was captured (``bin/install-consent``).
 
@@ -151,6 +163,19 @@ def sync_stamp_file(root: Path | None = None) -> Path:
     launch the dependencies changed and a re-sync is due.
     """
     return venv_dir(root) / ".horde-sync-stamp"
+
+
+def gpu_check_stamp_file(root: Path | None = None) -> Path:
+    """Return the stamp recording the installed torch was verified to run the live GPU (``.venv/.horde-gpu-check``).
+
+    Holds ``<lock-fingerprint>:<compute-capability>``. A matching lock does not prove the installed torch
+    has kernels for the card actually present (a GPU swap, or a build persisted from a different machine,
+    leaves torch unable to launch a kernel while the lock is untouched), so a launch verifies the wheel's
+    architecture list against the live card once and stamps the result here. It lives inside the venv so it
+    is discarded whenever the venv is recreated, and re-verifies whenever the lock or the card changes,
+    keeping a healthy launch from paying the torch-arch probe every time.
+    """
+    return venv_dir(root) / ".horde-gpu-check"
 
 
 def template_config(root: Path | None = None) -> Path:

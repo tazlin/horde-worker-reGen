@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -74,6 +76,54 @@ def _disk_free(path: Path) -> dict[str, int] | None:
         return None
 
 
+_SMI_CUDA_RE = re.compile(r"CUDA Version:\s*(\d+\.\d+)")
+
+
+def nvidia_smi_summary() -> dict[str, Any] | None:
+    """Return the NVIDIA driver's version, its CUDA ceiling, and per-GPU name + compute capability.
+
+    Torch-free and cheap: it shells ``nvidia-smi`` (never imports torch), so a bundle captures the two
+    numbers a wrong-CUDA-build incident turns on -- the driver's max CUDA version (the build *ceiling*) and
+    each card's compute capability (which decides whether a wheel has kernels for it) -- even on an install
+    whose backend-decision breadcrumb predates that feature. Returns None when nvidia-smi is absent or
+    unreadable (no NVIDIA GPU, or the driver has not added it to PATH), so a non-NVIDIA host simply omits
+    the block.
+    """
+    exe = shutil.which("nvidia-smi")
+    if not exe and os.name == "nt":
+        candidate = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "nvidia-smi.exe"
+        exe = str(candidate) if candidate.exists() else None
+    if not exe:
+        return None
+
+    summary: dict[str, Any] = {}
+    try:
+        header = subprocess.run([exe], capture_output=True, text=True, timeout=20, check=False).stdout
+        match = _SMI_CUDA_RE.search(header or "")
+        summary["driver_max_cuda_version"] = match.group(1) if match else None
+        gpus = subprocess.run(
+            [exe, "--query-gpu=name,compute_cap,driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return summary or None
+
+    cards: list[dict[str, str]] = []
+    for line in (gpus or "").splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) >= 2 and fields[0]:
+            card = {"name": fields[0], "compute_cap": fields[1]}
+            if len(fields) >= 3:
+                card["driver_version"] = fields[2]
+            cards.append(card)
+    if cards:
+        summary["gpus"] = cards
+    return summary or None
+
+
 def collect_system_info(*, cache_home: str | None = None, probe_gpu: bool = False) -> dict[str, Any]:
     """Gather worker version, OS/python, CPU/RAM, disk, and (optionally) a GPU inventory.
 
@@ -102,6 +152,9 @@ def collect_system_info(*, cache_home: str | None = None, probe_gpu: bool = Fals
         },
         "cache_home": cache_home,
     }
+    driver = nvidia_smi_summary()
+    if driver is not None:
+        info["nvidia_smi"] = driver
     if probe_gpu:
         info["accelerators"] = _probe_gpus()
     return info
