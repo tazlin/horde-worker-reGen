@@ -12,7 +12,11 @@ from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
-from horde_worker_regen.process_management.ipc.supervisor_channel import ProcessSnapshot, WorkerStateSnapshot
+from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    ProcessSnapshot,
+    SchedulingGovernanceSnapshot,
+    WorkerStateSnapshot,
+)
 from horde_worker_regen.process_management.lifecycle.process_temperature import (
     ProcessTemperature,
     classify_process_temperature,
@@ -21,6 +25,7 @@ from horde_worker_regen.process_management.lifecycle.process_temperature import 
 from horde_worker_regen.tui.formatters import (
     STATE_LABELS,
     format_its,
+    human_duration,
     human_mb,
     is_low_fidelity,
     job_id_text,
@@ -96,8 +101,11 @@ class LiveView(VerticalScroll):
         technical rows (raw job ID, heartbeat age/type) that the F6 toggle gates.
         """
         body = self.query_one("#live-body", Static)
+        governance = self._render_governance_strip(snapshot.scheduling_governance, detailed=detailed)
         if not snapshot.processes:
-            body.update(Text("Waiting for the first worker snapshot…", style="italic grey62"))
+            body.update(
+                Group(governance, Text(""), Text("Waiting for the first worker snapshot…", style="italic grey62"))
+            )
             return
 
         stale = snapshot_age is not None and snapshot_age > _STALE_AFTER_SECONDS
@@ -106,14 +114,85 @@ class LiveView(VerticalScroll):
             self._render_process_panel(process, stale=stale, detailed=detailed, pending_models=pending_models)
             for process in snapshot.processes
         ]
+        content: list[RenderableType] = [governance, Text(""), *panels]
         if stale:
             banner = Text(
                 f"⚠ Live data is {snapshot_age:.0f}s old; the worker may be busy, hung, or restarting.",
                 style="bold yellow",
             )
-            body.update(Group(banner, Text(""), *panels))
+            body.update(Group(banner, Text(""), *content))
         else:
-            body.update(Group(*panels))
+            body.update(Group(*content))
+
+    @staticmethod
+    def _preload_decision_label(decision: str) -> str:
+        """Humanize a preload-admission decision key for compact live-view text."""
+        if not decision:
+            return "no decision yet"
+        return decision.replace("_", " ").title()
+
+    @staticmethod
+    def _preload_decision_style(decision: str) -> str:
+        """Style preload decisions by whether they admitted, skipped, or deferred work."""
+        if not decision:
+            return "grey50"
+        if decision in {"admit", "prestage", "terminal_admit", "already_loaded"}:
+            return "green"
+        if decision in {"next_job", "quarantined"}:
+            return "grey62"
+        return "yellow"
+
+    @staticmethod
+    def _render_governance_strip(governance: SchedulingGovernanceSnapshot, *, detailed: bool = False) -> Panel:
+        """Render a compact scheduler-governance strip above the process cards."""
+        ram = governance.ram
+        preload = governance.preload
+        table = Table.grid(padding=(0, 2))
+        table.add_column(justify="right", style="bold cyan", no_wrap=True)
+        table.add_column(ratio=1)
+        table.add_column(justify="right", style="bold cyan", no_wrap=True)
+        table.add_column(ratio=1)
+
+        if not ram.measured:
+            ram_label = Text("pending", style="grey50")
+            ram_detail = "waiting for governor tick"
+        elif ram.under_pressure:
+            ram_label = Text("pressure", style="red")
+            ram_detail = ram.reason
+        elif ram.pop_hold_active:
+            ram_label = Text("holding", style="yellow")
+            ram_detail = ram.reason or "pop hold active"
+        else:
+            ram_label = Text("ok", style="green")
+            ram_detail = ram.reason or "above RAM floor"
+
+        decision_style = LiveView._preload_decision_style(preload.decision)
+        decision = LiveView._preload_decision_label(preload.decision)
+        target = f"p{preload.process_id}" if preload.process_id is not None else "no target"
+        age = f" · {human_duration(time.time() - preload.timestamp)} ago" if preload.timestamp else ""
+        preload_detail = f"{shorten(preload.model, 30) if preload.model else '-'} · {target}{age}"
+        table.add_row(
+            "RAM",
+            Text.assemble(ram_label, (f"  {ram_detail}", "grey70")),
+            "Preload",
+            Text.assemble((decision, decision_style), (f"  {preload_detail}", "grey70")),
+        )
+
+        if detailed:
+            reclaim: list[str] = []
+            if ram.draining_process_ids:
+                reclaim.append("draining p" + ", p".join(str(pid) for pid in ram.draining_process_ids))
+            if ram.shed_card_indices:
+                reclaim.append("shed GPU " + ", ".join(str(index) for index in ram.shed_card_indices))
+            intake = "pop hold on" if ram.pop_hold_active else "pop hold off"
+            if ram.pop_pause_active:
+                intake += f"; hard pause {human_duration(ram.pop_pause_remaining_seconds)}"
+            gate = preload.reason or "-"
+            table.add_row("Intake", Text(intake, style="grey62"), "Gate", Text(gate, style="grey62"))
+            table.add_row("Reclaim", Text("; ".join(reclaim) if reclaim else "none active", style="grey62"), "", "")
+
+        border = "yellow" if ram.under_pressure or ram.pop_hold_active or decision_style == "yellow" else "grey37"
+        return Panel(table, title="Scheduling", title_align="left", border_style=border, padding=(0, 1))
 
     def _render_process_panel(
         self,

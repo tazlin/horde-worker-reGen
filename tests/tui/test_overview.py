@@ -12,10 +12,13 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     FeatureReadinessSummary,
     JobQueueEntry,
     OrchestrationIntentSnapshot,
+    PreloadAdmissionSnapshot,
     PopGovernorsSnapshot,
     PopGovernorStatus,
     ProcessSnapshot,
+    RamGovernanceSnapshot,
     RecentJobRecord,
+    SchedulingGovernanceSnapshot,
     SystemMemorySnapshot,
     WholeCardResidencyStatus,
     WorkerConfigSummary,
@@ -815,3 +818,39 @@ def test_governors_panel_details_lists_released_history() -> None:
     assert "Whole-card residency" in text
     assert "3x" in text
     assert "30% of session" in text
+
+
+def test_governance_panel_surfaces_ram_and_preload_decision() -> None:
+    """The details-mode governance panel names RAM remedies and the latest preload gate."""
+    governance = SchedulingGovernanceSnapshot(
+        ram=RamGovernanceSnapshot(
+            measured=True,
+            under_pressure=True,
+            reason="available 2048 MB below danger floor 4096 MB",
+            available_mb=2048,
+            floor_mb=4096,
+            pop_hold_active=True,
+            draining_process_ids=[2],
+            shed_card_indices=[1],
+            restore_headroom_mb=512,
+            per_context_ram_estimate_mb=1024,
+            per_process_ceiling_mb=8192,
+        ),
+        preload=PreloadAdmissionSnapshot(
+            decision="defer_budget",
+            model="Flux.1-dev",
+            process_id=2,
+            reason="VRAM/RAM budget gate",
+        ),
+    )
+
+    text = _render(OverviewView._render_governance_panel(governance))
+
+    assert "Scheduling governance" in text
+    assert "available 2048 MB below danger floor 4096 MB" in text
+    assert "draining p2" in text
+    assert "shed GPU 1" in text
+    assert "Defer Budget" in text
+    assert "Flux.1-dev" in text
+    assert "p2" in text
+    assert "VRAM/RAM budget gate" in text

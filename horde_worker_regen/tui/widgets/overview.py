@@ -23,6 +23,7 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PopGovernorsSnapshot,
     ProcessSnapshot,
     RecentJobRecord,
+    SchedulingGovernanceSnapshot,
     WholeCardResidencyStatus,
     WorkerStateSnapshot,
     WorkLedgerEntry,
@@ -81,6 +82,28 @@ _SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "INFERENCE_POST_PROCESSING",
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _SERVING_PULSE = ("dark_green", "green", "green3", "bright_green", "green3", "green")
+
+
+def _join_styled(parts: list[tuple[str, str]], separator: str) -> list[tuple[str, str] | str]:
+    """Return Rich Text.assemble fragments with a plain separator between styled parts."""
+    fragments: list[tuple[str, str] | str] = []
+    for index, part in enumerate(parts):
+        if index:
+            fragments.append(separator)
+        fragments.append(part)
+    return fragments
+
+
+def _preload_decision_style(decision: str) -> str:
+    """Style preload-admission decisions by whether they admitted, skipped, or deferred work."""
+    if not decision:
+        return "grey50"
+    if decision in {"admit", "prestage", "terminal_admit", "already_loaded"}:
+        return "green"
+    if decision in {"next_job", "quarantined"}:
+        return "grey62"
+    return "yellow"
+
 
 _STATIC_GLYPHS: dict[WorkerPhase, str] = {
     WorkerPhase.STOPPED: "■",
@@ -243,6 +266,7 @@ class OverviewView(Vertical):
                 yield Static(id="overview-queue")
                 yield Static(id="overview-intent")
                 yield Static(id="overview-governors")
+                yield Static(id="overview-governance")
             yield Static(id="overview-work")
             yield Static(id="overview-processes")
             with Container(id="overview-ops-row", classes="overview-row"):
@@ -303,6 +327,7 @@ class OverviewView(Vertical):
         # The intent-row children are managed individually (queue is details-only, governors conditional).
         self.query_one("#overview-intent", Static).display = not thin
         self.query_one("#overview-queue", Static).display = detailed
+        self.query_one("#overview-governance", Static).display = detailed and snapshot is not None
 
         nag = self.query_one("#overview-update-nag", Static)
         if self._update_info is not None:
@@ -355,6 +380,9 @@ class OverviewView(Vertical):
                     self._render_governors_panel(governors, detailed=detailed),
                 )
             if detailed:
+                self.query_one("#overview-governance", Static).update(
+                    self._render_governance_panel(snapshot.scheduling_governance),
+                )
                 self.query_one("#overview-queue", Static).update(
                     self._render_queue_table(snapshot, available_width=width),
                 )
@@ -757,6 +785,64 @@ class OverviewView(Vertical):
             padding=(0, 1),
             expand=False,
         )
+
+    @staticmethod
+    def _preload_decision_label(decision: str) -> str:
+        """Humanize a preload-admission decision key for compact dashboard text."""
+        if not decision:
+            return "no decision yet"
+        return decision.replace("_", " ").title()
+
+    @staticmethod
+    def _render_governance_panel(governance: SchedulingGovernanceSnapshot) -> Panel:
+        """Render the details-mode scheduler governance diagnostics."""
+        ram = governance.ram
+        preload = governance.preload
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(justify="right", style="bold cyan", no_wrap=True)
+        grid.add_column(ratio=1)
+
+        if not ram.measured:
+            ram_text = Text("waiting for first governor tick", style="grey50")
+        else:
+            ram_style = "red" if ram.under_pressure else "yellow" if ram.pop_hold_active else "green"
+            ram_text = Text(ram.reason or "RAM governor measured", style=ram_style)
+        grid.add_row("RAM", ram_text)
+
+        intake_parts: list[tuple[str, str]] = []
+        intake_parts.append(
+            ("pop hold on" if ram.pop_hold_active else "pop hold off", "yellow" if ram.pop_hold_active else "grey62")
+        )
+        if ram.pop_pause_active:
+            pause = human_duration(ram.pop_pause_remaining_seconds)
+            intake_parts.append((f"hard pause {pause}", "yellow"))
+        grid.add_row("Intake", Text.assemble(*_join_styled(intake_parts, " · ")))
+
+        reclaim_bits: list[str] = []
+        if ram.draining_process_ids:
+            reclaim_bits.append("draining p" + ", p".join(str(pid) for pid in ram.draining_process_ids))
+        if ram.shed_card_indices:
+            reclaim_bits.append("shed GPU " + ", ".join(str(index) for index in ram.shed_card_indices))
+        grid.add_row("Reclaim", Text("; ".join(reclaim_bits) if reclaim_bits else "none active", style="grey62"))
+
+        if ram.measured:
+            restore = f"{human_mb(ram.restore_headroom_mb)} headroom; {human_mb(ram.per_context_ram_estimate_mb)} per context"
+            if ram.per_process_ceiling_mb is not None:
+                restore += f"; {human_mb(ram.per_process_ceiling_mb)} process ceiling"
+            grid.add_row("Restore", Text(restore, style="grey62"))
+
+        decision = OverviewView._preload_decision_label(preload.decision)
+        target = f"p{preload.process_id}" if preload.process_id is not None else "no target"
+        model = shorten(preload.model, 34) if preload.model else "-"
+        age = f" · {human_duration(time.time() - preload.timestamp)} ago" if preload.timestamp else ""
+        preload_style = _preload_decision_style(preload.decision)
+        grid.add_row("Preload", Text.assemble((decision, preload_style), (f" · {model} · {target}{age}", "grey70")))
+        if preload.reason:
+            grid.add_row("Gate", Text(preload.reason, style="grey62"))
+
+        active = ram.under_pressure or ram.pop_hold_active or preload_style == "yellow"
+        border = "yellow" if active else "grey37"
+        return Panel(grid, title="Scheduling governance", title_align="left", border_style=border, padding=(0, 1))
 
     @staticmethod
     def _render_governors_panel(governors: PopGovernorsSnapshot, *, detailed: bool) -> Panel:

@@ -9,9 +9,12 @@ from types import SimpleNamespace
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     SUPERVISOR_PROTOCOL_VERSION,
+    PreloadAdmissionSnapshot,
     ProcessSnapshot,
+    RamGovernanceSnapshot,
     RecentJobRecord,
     StatsRollupRow,
+    SchedulingGovernanceSnapshot,
     StatsSample,
     SupervisorChannel,
     SupervisorCommand,
@@ -39,9 +42,9 @@ def _make_snapshot() -> WorkerStateSnapshot:
     return WorkerStateSnapshot(config=config, processes=[process], num_jobs_submitted=7)
 
 
-def test_protocol_version_is_v14() -> None:
-    """The fatal worker-config-error frame (taken worker name, etc.) rides supervisor protocol v14."""
-    assert SUPERVISOR_PROTOCOL_VERSION == 14
+def test_protocol_version_is_v15() -> None:
+    """Scheduler-governance diagnostics ride supervisor protocol v15."""
+    assert SUPERVISOR_PROTOCOL_VERSION == 15
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:
@@ -314,3 +317,34 @@ def test_closed_channel_emits_no_liveness_frame() -> None:
     assert channel.closed is True
     channel.close()
     child.close()
+
+
+def test_scheduling_governance_survives_json_roundtrip() -> None:
+    """The RAM-governor posture and latest preload admission are part of the typed snapshot."""
+    snapshot = _make_snapshot()
+    snapshot.scheduling_governance = SchedulingGovernanceSnapshot(
+        ram=RamGovernanceSnapshot(
+            measured=True,
+            under_pressure=True,
+            reason="available 2048 MB below danger floor 4096 MB",
+            available_mb=2048,
+            floor_mb=4096,
+            pop_hold_active=True,
+            draining_process_ids=[2],
+            shed_card_indices=[0],
+        ),
+        preload=PreloadAdmissionSnapshot(
+            decision="defer_budget",
+            model="Flux.1-dev",
+            process_id=2,
+            reason="VRAM/RAM budget gate",
+            timestamp=123.0,
+        ),
+    )
+
+    restored = WorkerStateSnapshot.model_validate_json(snapshot.model_dump_json())
+
+    assert restored.scheduling_governance.ram.under_pressure is True
+    assert restored.scheduling_governance.ram.draining_process_ids == [2]
+    assert restored.scheduling_governance.preload.decision == "defer_budget"
+    assert restored.scheduling_governance.preload.model == "Flux.1-dev"

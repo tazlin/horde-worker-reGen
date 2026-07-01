@@ -43,11 +43,11 @@ defines the structured protocol over it:
   (one per driven GPU: VRAM headroom, inference contexts, whole-card residency, and
   per-card fault/unservable-model health) that the GPUs tab and the Overview per-card
   strip render. Each `ProcessSnapshot` also carries the `device_index` of the card its
-  slot is pinned to. A single-GPU host reports exactly one `CardSnapshot`. Protocol v11 also carries
+  slot is pinned to. A single-GPU host reports exactly one `CardSnapshot`. The snapshot also carries
   worker-owned stats data: the latest one-second `StatsSample`, bounded stats-history backfill for
   reconnecting frontends, model/baseline `StatsRollupRow` tables, and `StatsExportState` for the JSONL
   export toggle and disk-size warning. The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 11) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 15) so a frontend can detect a mismatch with a worker built from different code.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate

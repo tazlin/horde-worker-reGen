@@ -136,6 +136,22 @@ class PostProcessingReclaimAction(enum.Enum):
 
 
 @dataclass(frozen=True)
+class LatestPreloadAdmission:
+    """Operator-facing record of the most recent preload-admission decision."""
+
+    decision: AdmissionDecision
+    """The admission gate's decision."""
+    model: str | None
+    """Model whose queued job was judged, when available."""
+    process_id: int | None
+    """Target inference process selected by the decision, when one was selected."""
+    reason: str
+    """Short human-readable explanation for the decision."""
+    timestamp: float
+    """Worker wall-clock time when the decision was recorded."""
+
+
+@dataclass(frozen=True)
 class PostProcessingReclaimPlan:
     """Represents the scheduler's decision for hosting a job's imminent post-processing VRAM peak.
 
@@ -347,6 +363,7 @@ class InferenceScheduler:
     _ram_budget_defer_notified: bool
     _ram_pressure_notified: bool
     _scheduler_diagnostic_log_state: dict[str, tuple[tuple[object, ...], float, int]]
+    _last_preload_admission: LatestPreloadAdmission | None
 
     def __init__(
         self,
@@ -431,6 +448,7 @@ class InferenceScheduler:
         self._ram_budget_defer_notified = False
         self._ram_pressure_notified = False
         self._scheduler_diagnostic_log_state = {}
+        self._last_preload_admission = None
         # One-shot log throttle, keyed by model, for the "held back as locally unservable" notice.
         self._unservable_admit_notified: dict[str, bool] = {}
         # One-shot log throttle, keyed by model, for the "declined a whole-card residency" notice (a teardown
@@ -489,6 +507,17 @@ class InferenceScheduler:
     def set_churn_observer(self, observer: Callable[[ChurnKind], None]) -> None:
         """Register the sink for between-jobs reload/respawn events (see :data:`ChurnKind`)."""
         self._churn_observer = observer
+
+    def latest_preload_admission(self) -> LatestPreloadAdmission | None:
+        """Return the most recent preload-admission decision, for the supervisor snapshot."""
+        return self._last_preload_admission
+
+    def latest_host_memory_governance_snapshot(self) -> HostMemorySnapshot | None:
+        """Return the latest host-memory governance input snapshot, or None before the first tick."""
+        verdict = self._governor.last_ram_verdict
+        if verdict is None:
+            return None
+        return self._build_host_memory_snapshot(verdict)
 
     def _record_churn(self, kind: ChurnKind) -> None:
         """Report one churn event to the observer if one is registered (no-op otherwise)."""
@@ -3111,6 +3140,35 @@ class InferenceScheduler:
 
         return False
 
+    def _record_preload_admission(
+        self,
+        decision: AdmissionDecision,
+        *,
+        job: ImageGenerateJobPopResponse | None = None,
+        process: HordeProcessInfo | None = None,
+        reason: str = "",
+    ) -> None:
+        """Remember one preload-admission decision for operator diagnostics."""
+        self._last_preload_admission = LatestPreloadAdmission(
+            decision=decision,
+            model=job.model if job is not None else None,
+            process_id=process.process_id if process is not None else None,
+            reason=reason,
+            timestamp=time.time(),
+        )
+
+    def _preload_outcome(
+        self,
+        decision: AdmissionDecision,
+        *,
+        job: ImageGenerateJobPopResponse | None = None,
+        process: HordeProcessInfo | None = None,
+        reason: str = "",
+    ) -> _PreloadJobOutcome:
+        """Record a public admission decision and map it onto the preload pass control enum."""
+        self._record_preload_admission(decision, job=job, process=process, reason=reason)
+        return _preload_outcome_from_admission(decision)
+
     def _attempt_preload_for_job(
         self,
         job: ImageGenerateJobPopResponse,
@@ -3139,10 +3197,12 @@ class InferenceScheduler:
                     f"Skipping preload of quarantined model {job.model}; faulting its job for reissue.",
                 )
                 self._job_tracker.handle_job_fault_now(job, retryable=False)
-            return _preload_outcome_from_admission(AdmissionDecision.QUARANTINED)
+            return self._preload_outcome(AdmissionDecision.QUARANTINED, job=job, reason="model load quarantined")
 
         if job.model in loaded_models:
-            return _preload_outcome_from_admission(AdmissionDecision.ALREADY_LOADED)
+            return self._preload_outcome(
+                AdmissionDecision.ALREADY_LOADED, job=job, reason="model already resident or loading"
+            )
 
         # Absolute system-RAM floor (degrade, never crash): loading a new model routes its weights through
         # system RAM first, so admitting one while the host is already below its danger floor is the OS
@@ -3153,13 +3213,17 @@ class InferenceScheduler:
         # this only defers the load. Gated on the budget being active (the same switch the rest of the
         # memory machinery uses).
         if self._budget_active() and self._preload_blocked_by_ram_pressure(job):
-            return _preload_outcome_from_admission(AdmissionDecision.DEFER_RAM_PRESSURE)
+            return self._preload_outcome(
+                AdmissionDecision.DEFER_RAM_PRESSURE, job=job, reason="system RAM danger floor"
+            )
 
         # An exclusively-admitted over-budget job has the whole device; do not stage another model's
         # weights concurrently (a second resident load is exactly what spills the exclusive job's
         # weights to system RAM). The exclusive job's own preload is still allowed through.
         if self._job_tracker.has_exclusive_job_in_progress() and not self._job_tracker.is_admitted_exclusive(job):
-            return _preload_outcome_from_admission(AdmissionDecision.EXCLUSIVE_IN_PROGRESS)
+            return self._preload_outcome(
+                AdmissionDecision.EXCLUSIVE_IN_PROGRESS, job=job, reason="exclusive over-budget job in progress"
+            )
 
         is_head_blocker = head_job is not None and job is head_job
 
@@ -3205,7 +3269,9 @@ class InferenceScheduler:
             available_process = self._select_head_room_process()
 
         if available_process is None:
-            return _preload_outcome_from_admission(AdmissionDecision.NO_TARGET)
+            return self._preload_outcome(
+                AdmissionDecision.NO_TARGET, job=job, reason="no idle inference slot available"
+            )
 
         if (
             available_process.last_process_state != HordeProcessState.WAITING_FOR_JOB
@@ -3214,7 +3280,12 @@ class InferenceScheduler:
             and not self._state.shutting_down
         ):
             self._process_lifecycle._replace_inference_process(available_process)
-            return _preload_outcome_from_admission(AdmissionDecision.REPLACE_PROCESS)
+            return self._preload_outcome(
+                AdmissionDecision.REPLACE_PROCESS,
+                job=job,
+                process=available_process,
+                reason="cycling process for model change",
+            )
 
         # Serialize preloads per card, not worker-wide: the gate exists so two checkpoints do not load
         # onto the same device at once (disk-read + VRAM-allocation spike). On a multi-GPU host a load
@@ -3240,7 +3311,12 @@ class InferenceScheduler:
                     "</>",
                 )
                 self._preload_delay_notified = True
-            return _preload_outcome_from_admission(AdmissionDecision.DEFER_CONCURRENCY)
+            return self._preload_outcome(
+                AdmissionDecision.DEFER_CONCURRENCY,
+                job=job,
+                process=available_process,
+                reason="preload concurrency gate",
+            )
 
         # Resource budget gate: a fresh preload loads this model's weights into the shared device
         # (VRAM) and into system RAM, so admit it only when both measured free VRAM and available
@@ -3253,11 +3329,17 @@ class InferenceScheduler:
             available_process,
             is_head_blocker=is_head_blocker,
         ):
-            return _preload_outcome_from_admission(AdmissionDecision.DEFER_BUDGET)
+            return self._preload_outcome(
+                AdmissionDecision.DEFER_BUDGET, job=job, process=available_process, reason="VRAM/RAM budget gate"
+            )
 
         if self._send_preload(job, available_process):
-            return _preload_outcome_from_admission(AdmissionDecision.ADMIT)
-        return _preload_outcome_from_admission(AdmissionDecision.STOP_PASS)
+            return self._preload_outcome(
+                AdmissionDecision.ADMIT, job=job, process=available_process, reason="preload sent"
+            )
+        return self._preload_outcome(
+            AdmissionDecision.STOP_PASS, job=job, process=available_process, reason="preload send failed"
+        )
 
     def _select_head_room_process(self) -> HordeProcessInfo | None:
         """Pick an idle inference process to free for a starved head-of-queue job, or None.

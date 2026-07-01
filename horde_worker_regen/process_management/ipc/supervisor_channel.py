@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 14
+SUPERVISOR_PROTOCOL_VERSION = 15
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -697,6 +697,69 @@ class PopGovernorsSnapshot(BaseModel):
     """Whether any governor is currently engaged (a quick "is the worker being held back" flag)."""
 
 
+class RamGovernanceSnapshot(BaseModel):
+    """The RAM governor's current posture as operator-visible state.
+
+    This is the projection of the scheduler's per-cycle host-memory snapshot after the pure governor
+    policy has run: measured RAM vs the danger floor, whether intake is held, and which reclaim remedies
+    are currently active. It is intentionally compact so the dashboard can explain why pops or preloads
+    are being held without exposing the whole internal process map.
+    """
+
+    measured: bool = False
+    """Whether the governor has produced at least one RAM verdict this session."""
+    under_pressure: bool = False
+    """Available RAM is below the absolute danger floor."""
+    reason: str = ""
+    """Short human explanation, usually the verdict's ``reason()`` string."""
+    available_mb: int | None = None
+    """Measured available system RAM (MB), or None when telemetry is unavailable."""
+    floor_mb: int = 0
+    """The active available-RAM danger floor (MB)."""
+    total_mb: int | None = None
+    """Total system RAM (MB), or None when unknown."""
+    pop_hold_active: bool = False
+    """The soft intake hold is active because RAM is pressured, near the floor, or reclaim is draining."""
+    pop_pause_active: bool = False
+    """The hard self-throttle pop pause is active."""
+    pop_pause_remaining_seconds: float | None = None
+    """Seconds until the hard pop pause lapses, when active."""
+    draining_process_ids: list[int] = Field(default_factory=list)
+    """Inference process ids currently draining so a RAM-heavy slot can be recycled."""
+    shed_card_indices: list[int] = Field(default_factory=list)
+    """GPU device indices whose inference context count was reduced for host-RAM pressure."""
+    restore_headroom_mb: int = 0
+    """Measured RAM headroom above reserves available for restoring a shed context."""
+    per_context_ram_estimate_mb: int = 0
+    """Estimated resident-RAM cost of restoring one inference context."""
+    per_process_ceiling_mb: int | None = None
+    """Configured resident-RAM ceiling for a single inference process, when enabled."""
+
+
+class PreloadAdmissionSnapshot(BaseModel):
+    """The most recent preload-admission decision the scheduler made for a queued image job."""
+
+    decision: str = ""
+    """Stable decision key from ``AdmissionDecision`` (e.g. ``admit``, ``defer_budget``)."""
+    model: str | None = None
+    """Model whose queued job was judged, if known."""
+    process_id: int | None = None
+    """Target process selected by the decision, when one was selected."""
+    reason: str = ""
+    """Short human explanation for the decision."""
+    timestamp: float = 0.0
+    """Worker wall-clock time when the decision was recorded; 0 means no decision yet."""
+
+
+class SchedulingGovernanceSnapshot(BaseModel):
+    """Operator-visible scheduler governance state for the Overview and Live views."""
+
+    ram: RamGovernanceSnapshot = Field(default_factory=RamGovernanceSnapshot)
+    """The RAM governor's latest measured posture and active remedies."""
+    preload: PreloadAdmissionSnapshot = Field(default_factory=PreloadAdmissionSnapshot)
+    """The latest preload-admission decision made while scanning the pending queue."""
+
+
 _CARD_VRAM_PRESSURE_FLOOR_MB = 1024.0
 """Free VRAM below this (or below ~8% of the card) reads as VRAM pressure (a near-OOM heads-up)."""
 
@@ -967,6 +1030,9 @@ class WorkerStateSnapshot(BaseModel):
 
     pop_governors: PopGovernorsSnapshot = Field(default_factory=PopGovernorsSnapshot)
     """The pop/scheduling governors holding back or reshaping job pops, with live + session-aggregate state."""
+
+    scheduling_governance: SchedulingGovernanceSnapshot = Field(default_factory=SchedulingGovernanceSnapshot)
+    """RAM-governor posture plus the latest preload-admission decision for operator diagnostics."""
 
     per_card: list[CardSnapshot] = Field(default_factory=list)
     """Per-card multi-GPU view, one entry per driven card (exactly one on a single-GPU host)."""

@@ -5,7 +5,10 @@ from __future__ import annotations
 from rich.console import Console
 
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
+    PreloadAdmissionSnapshot,
     ProcessSnapshot,
+    RamGovernanceSnapshot,
+    SchedulingGovernanceSnapshot,
     WorkerConfigSummary,
     WorkerStateSnapshot,
 )
@@ -122,3 +125,31 @@ def test_sampling_stale_heartbeat_still_warns() -> None:
     text = LiveView._heartbeat_text(16.0, True, "INFERENCE_STARTING")
     assert text.plain == "16.0s ago"
     assert text.style == "red"
+
+
+def test_governance_strip_surfaces_scheduler_decisions() -> None:
+    """The Live view starts with a compact RAM/preload decision strip."""
+    governance = SchedulingGovernanceSnapshot(
+        ram=RamGovernanceSnapshot(
+            measured=True,
+            reason="available 8192 MB above danger floor 4096 MB",
+            pop_hold_active=True,
+            draining_process_ids=[2],
+        ),
+        preload=PreloadAdmissionSnapshot(
+            decision="defer_concurrency",
+            model="AlbedoBase XL",
+            process_id=2,
+            reason="preload concurrency gate",
+        ),
+    )
+
+    text = _render(LiveView._render_governance_strip(governance, detailed=True))
+
+    assert "Scheduling" in text
+    assert "holding" in text
+    assert "Defer Concurrency" in text
+    assert "AlbedoBase XL" in text
+    assert "p2" in text
+    assert "preload concurrency gate" in text
+    assert "draining p2" in text

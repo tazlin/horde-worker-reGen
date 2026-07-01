@@ -73,8 +73,11 @@ from horde_worker_regen.process_management.ipc.supervisor_channel import (
     OrchestrationIntentSnapshot,
     PopGovernorsSnapshot,
     PopGovernorStatus,
+    PreloadAdmissionSnapshot,
     ProcessSnapshot,
+    RamGovernanceSnapshot,
     RecentJobRecord,
+    SchedulingGovernanceSnapshot,
     StatsSample,
     SupervisorChannel,
     SupervisorCommand,
@@ -3286,6 +3289,51 @@ class HordeWorkerProcessManager:
 
         return readings
 
+    @staticmethod
+    def _round_optional_mb(value: float | None) -> int | None:
+        """Round an optional MB reading for the supervisor snapshot."""
+        return int(round(value)) if value is not None else None
+
+    def _scheduling_governance_status(self) -> SchedulingGovernanceSnapshot:
+        """Project scheduler governance decisions onto the wire snapshot the TUI renders."""
+        ram_snapshot = self._inference_scheduler.latest_host_memory_governance_snapshot()
+        if ram_snapshot is None:
+            ram = RamGovernanceSnapshot()
+        else:
+            pause_remaining = (
+                max(0.0, ram_snapshot.pop_pause_until - time.time()) if ram_snapshot.pop_pause_active else None
+            )
+            ram = RamGovernanceSnapshot(
+                measured=True,
+                under_pressure=ram_snapshot.verdict.under_pressure,
+                reason=ram_snapshot.verdict.reason(),
+                available_mb=self._round_optional_mb(ram_snapshot.verdict.available_mb),
+                floor_mb=int(round(ram_snapshot.verdict.floor_mb)),
+                total_mb=self._round_optional_mb(ram_snapshot.verdict.total_mb),
+                pop_hold_active=self._state.ram_pressure_pop_hold,
+                pop_pause_active=ram_snapshot.pop_pause_active,
+                pop_pause_remaining_seconds=pause_remaining,
+                draining_process_ids=sorted(ram_snapshot.draining_process_ids),
+                shed_card_indices=sorted(ram_snapshot.shed_card_indices),
+                restore_headroom_mb=int(round(ram_snapshot.restore_headroom_mb)),
+                per_context_ram_estimate_mb=int(round(ram_snapshot.per_context_ram_estimate_mb)),
+                per_process_ceiling_mb=self._round_optional_mb(ram_snapshot.per_process_ceiling_mb),
+            )
+
+        preload_status = self._inference_scheduler.latest_preload_admission()
+        if preload_status is None:
+            preload = PreloadAdmissionSnapshot()
+        else:
+            preload = PreloadAdmissionSnapshot(
+                decision=str(preload_status.decision),
+                model=preload_status.model,
+                process_id=preload_status.process_id,
+                reason=preload_status.reason,
+                timestamp=preload_status.timestamp,
+            )
+
+        return SchedulingGovernanceSnapshot(ram=ram, preload=preload)
+
     def _pop_governors_status(self) -> PopGovernorsSnapshot:
         """Project the governor registry onto the wire snapshot the TUI renders."""
         elapsed = max(0.0, time.time() - self.session_start_time)
@@ -3617,6 +3665,7 @@ class HordeWorkerProcessManager:
             work_ledger=self._build_work_ledger(recent_jobs),
             whole_card_residency=self._whole_card_residency_status(),
             pop_governors=self._pop_governors_status(),
+            scheduling_governance=self._scheduling_governance_status(),
             per_card=self._build_card_snapshots(),
             system_memory=SystemMemorySnapshot.from_summary(self._sample_system_memory()),
         )
