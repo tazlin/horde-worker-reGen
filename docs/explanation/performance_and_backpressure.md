@@ -318,7 +318,9 @@ producing an out-of-memory crash (and, for system RAM, paging to disk that
 collapses throughput). The eviction rules above are *count*-based. They assume
 that if the working set fits the process count it fits the device, which only
 holds for SD1.5-class weights. The budget makes the worker decide on **measured**
-resources instead.
+resources instead. (The *structure* those decisions run in, one snapshot per
+decision, pure policy functions, a single per-cycle governor tick, is described
+in [Resource governance](resource_governance.md).)
 
 [`VramBudget` and `RamBudget`][horde_worker_regen.process_management.resources.resource_budget]
 predict a job's peak VRAM and RAM cost from hordelib's per-job burden estimate
@@ -709,6 +711,8 @@ and the streak is worker-wide - identical to before.
 
 ## See also
 
+- [Resource governance](resource_governance.md): the decide/act structure the
+  memory protections on this page run in
 - [Bridge Configuration](bridge_config.md): the config fields that drive
   throttling behavior
 - [GPU duty cycle](duty-cycle.md): how the reload churn and hand-off gaps from

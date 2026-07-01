@@ -1,0 +1,131 @@
+# Resource governance
+
+How the worker decides, every scheduling cycle, whether the host can afford what it is about to do:
+load another model, keep another process resident, start another job. This page explains the structure
+of those decisions; the individual policies (the VRAM/RAM budget, the RAM danger floor, whole-card
+residency) are described in [Performance and backpressure](performance_and_backpressure.md).
+
+## Why governance is separated from scheduling
+
+Resource incidents share a repeating shape: a protective check existed, but it was fused into one
+scheduling path (a preload attempt, a dispatch), and the incident arrived through a different path
+where the check never ran. A steady-state worker that never loads a new model can still grow its
+resident RAM into an OS OOM kill; a model already resident on a card can still be dispatched into VRAM
+another decision reserved. Protections tied to *how the work happens to flow* go dormant exactly when
+the flow changes.
+
+The worker therefore separates three roles that used to live in single methods:
+
+- **Measurement**: reading live state (free VRAM per card, available host RAM, per-process resident
+  RAM, process counts) happens in one place per decision and produces an immutable *snapshot*. A
+  decision never re-measures midway, so one decision acts on one consistent picture of the host.
+- **Decision**: pure functions over a snapshot return typed values (remedy *actions*, outcome enums).
+  They touch no live state, so every policy is unit-testable by constructing a snapshot and asserting
+  on the returned decision, with no process pool, no monkeypatching.
+- **Execution**: a single dispatcher applies the returned actions to the live worker (pause pops, evict
+  a model, shrink or grow a process pool, recycle a process). Multi-tick bookkeeping is mutated only
+  here, with the measured result of each remedy, so what the governor believes always reflects what
+  actually happened.
+
+The decision layer lives in the
+[`governance`][horde_worker_regen.process_management.scheduling.governance] package; the
+[`InferenceScheduler`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler]
+provides the measurement and execution surfaces.
+
+## The governor tick
+
+[`ResourceGovernor.tick`][horde_worker_regen.process_management.scheduling.governance.governor.ResourceGovernor.tick]
+runs at the top of every scheduling cycle, before any preload or dispatch decision, unconditionally.
+That placement is the structural fix for the dormant-check shape above: governance does not depend on
+any particular scheduling path executing, so a worker that never attempts a preload is governed exactly
+as often as one that does.
+
+One tick measures the RAM danger-floor verdict and one
+[`HostMemorySnapshot`][horde_worker_regen.process_management.scheduling.governance.snapshots.HostMemorySnapshot],
+then decides and executes both regimes:
+
+- **Pressured host** (below the danger floor): the degrade response. Arm the self-throttle pop pause,
+  set the soft pop hold, evict idle resident models, shed idle inference contexts (per card on a
+  multi-GPU host, never emptying a card), and reclaim a process whose resident RAM crossed the
+  per-process ceiling (recycled if idle, drained first if busy).
+- **Recovered host**: the restore response. Cards the reduction shed grow back toward their planned
+  process count, one context per card per tick, gated on measured RAM headroom actually fitting another
+  resident working set.
+
+The two regimes are mutually exclusive by construction, so one combined execution never both sheds and
+restores. The tick's verdict is retained for the rest of the cycle: per-job gates (such as the preload
+RAM-floor defer) read it instead of re-measuring, so a whole cycle acts on one reading.
+
+## Decisions are values
+
+Remedies are expressed as inert command objects
+([`GovernanceAction`][horde_worker_regen.process_management.scheduling.governance.actions]) and policy
+outcomes as enums (for example
+[`VramReclaimOutcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.VramReclaimOutcome]).
+This buys three things:
+
+- **Testability**: the escalation policy that decides between deferring a preload, holding a
+  breaker-tripped model, reducing the live context count, and best-effort-admitting a starved head is a
+  pure function of six booleans, and is tested as one.
+- **One execution site per side effect**: every RAM remedy executes through the scheduler's single
+  action dispatcher, so there is exactly one place a remedy's log line, bookkeeping, and measured
+  result live.
+- **Reviewability**: a change to *policy* is a change to a pure function and its table of cases, not to
+  a method interleaving measurement, judgment, and process manipulation.
+
+## The admission pipeline
+
+The preload loop walks the pending queue and, per job, runs a sequence of named gates. The judgment
+calls are pure functions in
+[`preload_admission`][horde_worker_regen.process_management.scheduling.governance.preload_admission]:
+
+1. **Target exclusion**: which slots this preload may not displace (the queued-model guard, model to
+   process affinity, slots draining for RAM reclaim), composed by
+   [`compute_preload_disallowed_processes`][horde_worker_regen.process_management.scheduling.governance.preload_admission.compute_preload_disallowed_processes].
+   The guards are exclusions only, never a wedge: the starved-head fallback
+   ([`select_head_room_process_id`][horde_worker_regen.process_management.scheduling.governance.preload_admission.select_head_room_process_id])
+   deliberately overrides them while still never displacing live work.
+2. **Placement**: on a multi-GPU host, which card receives a fresh load
+   ([`card_preload_order`][horde_worker_regen.process_management.scheduling.governance.preload_admission.card_preload_order]:
+   a card already serving the model first, then the least-loaded card).
+3. **Load serialization**: whether another checkpoint may load on this device right now
+   ([`preload_concurrency_blocked`][horde_worker_regen.process_management.scheduling.governance.preload_admission.preload_concurrency_blocked]).
+4. **Budget verdicts**: the VRAM gate answers with an explicit
+   [`VramGateResult`][horde_worker_regen.process_management.scheduling.governance.preload_admission.VramGateResult]
+   (fits / defer / admitted over budget), so an over-budget admit visibly bypasses the RAM gate whose
+   reclaim it already performed. When a verdict rejects, the scheduler runs the reclaim attempts and
+   the pure outcome deciders
+   ([`decide_vram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_vram_reclaim_outcome],
+   [`decide_ram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_ram_reclaim_outcome])
+   resolve what the exhausted pass means.
+
+## Whole-card residency state
+
+The whole-card exclusive-residency records (which model holds which card, when the hold was
+established, its cooldown and restore stamps) live in the
+[`WholeCardResidencyLedger`][horde_worker_regen.process_management.scheduling.governance.whole_card.WholeCardResidencyLedger],
+along with every question answerable from the records alone: the phase of a card's residency
+(establishing or holding), whether an establish/restore grace window marks a held queue as intentional,
+and whether the bounded drain backstop has elapsed. The transitions that touch live processes
+(establishing a residency, converging it to sole residency, restoring siblings afterward) remain
+scheduler methods, but they read and write state exclusively through the ledger. The pure sizing rule
+for how many live contexts a rejected peak can co-reside with is
+[`max_coresident_for_peak`][horde_worker_regen.process_management.scheduling.governance.whole_card.max_coresident_for_peak].
+
+## Extending governance
+
+When adding a new resource protection, follow the same shape:
+
+1. Put the readings it needs into the snapshot (or a new snapshot type) in
+   [`snapshots`][horde_worker_regen.process_management.scheduling.governance.snapshots]: measurement
+   stays in the scheduler, captured once per decision.
+2. Express the remedy as a new action in
+   [`actions`][horde_worker_regen.process_management.scheduling.governance.actions] and its execution
+   as a new dispatcher case, so the side effect has one home.
+3. Write the policy as a pure decide function with unit tests under
+   `tests/process_management/governance/`.
+4. Wire it into the governor tick, not into a scheduling path, unless it is genuinely scoped to one
+   job's admission.
+
+The scheduler-integrated behavior stays covered by the regression suites under
+`tests/process_management/regressions/`, which drive real scheduling passes.
