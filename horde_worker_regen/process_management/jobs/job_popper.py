@@ -760,6 +760,8 @@ class JobPopper:
             )
             return
 
+        self._state.last_pop_skipped_reasons.pop("ram_pressure", None)
+
         if self._state.gpu_torch_incompatible:
             # The installed PyTorch has no kernels for this GPU: every job would fail at the first kernel
             # launch, so never pop. Sticky for the session (a build/hardware mismatch); fixed by reinstalling.
@@ -817,6 +819,8 @@ class JobPopper:
                     "stage is slower than inference; if this persists, enable safety_on_gpu or speed safety up.",
                 )
             return
+
+        self._state.last_pop_skipped_reasons.pop("safety_backlog", None)
 
         # Warm-up rule: until the first job of the session has completed, don't queue
         # ahead (if we're doomed to fail with 1 job, we're doomed to fail with 2).
