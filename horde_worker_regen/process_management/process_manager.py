@@ -1685,6 +1685,37 @@ class HordeWorkerProcessManager:
                     "'update.cmd'/'update.sh', or by re-running the installer.",
                 )
 
+    _SERVER_CAPABILITIES_POLL_SECONDS = 5.0
+    """How often the server-capability loop wakes. The probe self-throttles on its own TTL, so this only
+    bounds how promptly a shutdown is noticed and how soon the first probe runs after startup; the actual
+    swagger fetch cadence is governed by :mod:`horde_worker_regen.server_capabilities`."""
+
+    async def _periodic_server_capabilities_loop(self) -> None:
+        """Keep the server-capability probe fresh, off any job hot path.
+
+        Some worker features (a newly-added interrogation form, the aesthetic-score ``gen_metadata``
+        attachment) must be withheld until the server advertises support, or the server rejects the
+        whole pop/submit. The probe reads the server's Swagger document and gates those features
+        fail-closed. It is refreshed here, on its own task, rather than inside the pop loops: a slow or
+        hung swagger fetch must never delay job popping, and the single owner keeps one fetch serving
+        both the image and alchemy flows. The probe self-throttles on its TTL, so calling it each tick
+        is cheap once primed.
+        """
+        from horde_worker_regen.server_capabilities import refresh_server_capabilities
+
+        while True:
+            with logger.catch():
+                try:
+                    await refresh_server_capabilities()
+                except CancelledError as e:
+                    self._shutdown()
+                    logger.debug(f"CancelledError: {e}")
+
+            if self.is_time_for_shutdown() or self._state.shut_down:
+                break
+
+            await asyncio.sleep(self._SERVER_CAPABILITIES_POLL_SECONDS)
+
     _status_message_frequency = 20.0
     """The rate in seconds at which to print status messages with details about the current state of the worker."""
     _last_status_message_time = 0.0
@@ -3736,6 +3767,7 @@ class HordeWorkerProcessManager:
                 self._process_control_loop(),
                 self._api_get_user_info_loop(),
                 self._periodic_update_check_loop(),
+                self._periodic_server_capabilities_loop(),
                 *(flow.run() for flow in self._flows.values()),
             ]
             if not self.bridge_data._loaded_from_env_vars:

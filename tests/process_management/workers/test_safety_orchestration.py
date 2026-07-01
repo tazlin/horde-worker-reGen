@@ -5,6 +5,9 @@ from __future__ import annotations
 import uuid
 from unittest.mock import Mock
 
+import pytest
+
+from horde_worker_regen.consts import AESTHETIC_METADATA_TYPE
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from tests.process_management.conftest import (
@@ -13,6 +16,11 @@ from tests.process_management.conftest import (
     make_testable_process_manager,
     queue_job_for_safety_async,
 )
+
+
+def _sent_safety_message(safety_proc: object) -> object:
+    """Return the control message the orchestrator handed to the safety process's pipe."""
+    return safety_proc.pipe_connection.send.call_args.args[0]  # type: ignore[attr-defined]
 
 
 class TestStartEvaluateSafety:
@@ -70,6 +78,67 @@ class TestStartEvaluateSafety:
 
         assert job_info not in process_manager._job_tracker.jobs_pending_safety_check
         assert job_info in process_manager._job_tracker.jobs_being_safety_checked
+
+    @pytest.mark.parametrize(
+        ("scoring_enabled", "server_supports", "expected_include"),
+        [
+            (True, True, True),
+            (True, False, False),
+            (False, True, False),
+        ],
+    )
+    async def test_aesthetic_score_gated_on_scoring_flag_and_server_support(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        scoring_enabled: bool,
+        server_supports: bool,
+        expected_include: bool,
+    ) -> None:
+        """Aesthetic scoring is requested only when opted in AND the server advertises the metadata type.
+
+        The server rejects a submit carrying a gen_metadata type it does not recognise, so the safety
+        control message must not ask for a score until both the operator flag and the server-capability
+        probe agree.
+        """
+        from horde_worker_regen.process_management.workers import safety_orchestrator
+
+        process_manager = make_testable_process_manager()
+        process_manager.bridge_data.aesthetic_scoring_enabled = scoring_enabled
+        monkeypatch.setattr(
+            safety_orchestrator,
+            "server_supports_generation_metadata_type",
+            lambda metadata_type: server_supports and metadata_type == AESTHETIC_METADATA_TYPE,
+        )
+
+        safety_proc = make_mock_process_info(
+            10,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.SAFETY,
+        )
+        process_manager._process_map.clear()
+        process_manager._process_map.update({10: safety_proc})
+
+        model_record = make_mock_model_reference_record("stable_diffusion")
+        process_manager.stable_diffusion_reference = {"stable_diffusion": model_record}
+
+        job = Mock()
+        job.id_ = uuid.uuid4()
+        job.model = "stable_diffusion"
+        job.payload = Mock()
+        job.payload.prompt = "test prompt"
+        job.payload.use_nsfw_censor = False
+
+        job_info = Mock()
+        job_info.sdk_api_job_info = job
+        job_info.job_image_results = [Mock()]
+        job_info.images_base64 = ["base64data"]
+
+        await queue_job_for_safety_async(process_manager._job_tracker, job_info)
+
+        await process_manager.start_evaluate_safety()
+
+        assert _sent_safety_message(safety_proc).include_aesthetic_score is expected_include
 
     async def test_critical_fault_missing_image_results(self) -> None:
         """If job_image_results is None, it should be cleaned up and not cause a crash.

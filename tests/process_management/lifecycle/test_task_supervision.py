@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import horde_worker_regen.server_capabilities as server_capabilities_module
 import horde_worker_regen.update_check as update_check_module
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from tests.process_management.conftest import make_testable_process_manager
@@ -91,5 +92,31 @@ async def test_disabled_update_check_loop_stays_alive_until_shutdown(monkeypatch
     assert not task.done(), "the disabled update-check loop must keep running, not return while the worker is live"
 
     pm._state.shut_down = True  # the loop's only legitimate exit: a shutdown signal
+    await asyncio.wait_for(task, timeout=1.0)
+    assert task.exception() is None
+
+
+async def test_server_capabilities_loop_refreshes_off_hot_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The capability probe runs on its own supervised loop, not inside a job pop loop.
+
+    Moving the probe here is what keeps a slow or hung swagger fetch from stalling job popping. The loop
+    must call the refresh and, like the other main-loop tasks, keep running until shutdown.
+    """
+    calls = 0
+
+    async def _fake_refresh(*, force: bool = False) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(server_capabilities_module, "refresh_server_capabilities", _fake_refresh)
+    pm = _pm_with_spied_backstop()
+    monkeypatch.setattr(pm, "_SERVER_CAPABILITIES_POLL_SECONDS", 0.01, raising=False)
+
+    task = asyncio.create_task(pm._periodic_server_capabilities_loop())
+    await asyncio.sleep(0.05)  # several poll intervals
+    assert not task.done(), "the capability loop must keep running while the worker is live"
+    assert calls >= 1, "the loop must drive the server-capability refresh"
+
+    pm._state.shut_down = True
     await asyncio.wait_for(task, timeout=1.0)
     assert task.exception() is None

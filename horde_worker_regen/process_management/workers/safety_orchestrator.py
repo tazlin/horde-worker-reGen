@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from loguru import logger
 
+from horde_worker_regen.consts import AESTHETIC_METADATA_TYPE
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import (
@@ -13,6 +14,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.server_capabilities import server_supports_generation_metadata_type
 from horde_worker_regen.telemetry_spans import span_safety_check
 
 
@@ -119,7 +121,13 @@ class SafetyOrchestrator:
                     censor_nsfw=completed_job_info.sdk_api_job_info.payload.use_nsfw_censor,
                     sfw_worker=not bridge_data.nsfw,
                     horde_model_info=model_info,
-                    include_aesthetic_score=bridge_data.aesthetic_scoring_enabled,
+                    # Only score when the operator opted in AND the server advertises the metadata
+                    # type: a gen_metadata entry the server does not recognise makes it reject the
+                    # whole submit, so the feature stays dark until the server's go-live is probed.
+                    include_aesthetic_score=(
+                        bridge_data.aesthetic_scoring_enabled
+                        and server_supports_generation_metadata_type(AESTHETIC_METADATA_TYPE)
+                    ),
                 ),
             )
 

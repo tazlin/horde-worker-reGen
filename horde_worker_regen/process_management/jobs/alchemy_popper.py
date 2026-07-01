@@ -71,10 +71,7 @@ from horde_worker_regen.process_management.resources.resource_budget import Comm
 from horde_worker_regen.process_management.scheduling.workload_flow import WorkloadKind, capability_for_alchemy_form
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource
 from horde_worker_regen.runtime_version import runtime_version
-from horde_worker_regen.server_capabilities import (
-    refresh_server_capabilities,
-    server_supports_interrogation_form,
-)
+from horde_worker_regen.server_capabilities import server_supports_interrogation_form
 
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -1013,7 +1010,6 @@ class AlchemyCoordinator:
         while True:
             with logger.catch():
                 try:
-                    await refresh_server_capabilities()
                     self._sample_vram()
                     await self.api_alchemy_pop()
                     self.dispatch_pending_forms()
