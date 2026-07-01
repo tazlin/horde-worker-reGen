@@ -311,6 +311,43 @@ async def test_setup_collapses_and_plan_folds_once_a_run_is_live(
         assert app.query_one("#benchmark-plan-detail", Collapsible).collapsed is True
 
 
+async def test_plan_computing_summary_animates_while_in_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While a plan preview is computing, the summary shows an animated spinner (not a frozen sentence)."""
+    import time
+
+    from horde_worker_regen.tui.widgets.benchmark import _SPINNER
+
+    monkeypatch.chdir(tmp_path)
+    app = _BenchmarkHarness()
+    async with app.run_test() as pilot:
+        view = app.query_one(BenchmarkView)
+
+        # Simulate an in-flight preview: no plan rows yet, but the computing marker is set.
+        view._plan_computing_since = time.monotonic()
+
+        view.update_view(BenchmarkRunState(), BenchmarkSupervisorStatus.IDLE, frame=1)
+        await pilot.pause()
+        summary = app.query_one("#benchmark-plan-summary")
+        assert summary.display is True
+        first = _render_to_text(summary.render())
+        assert "Computing the plan" in first
+        assert _SPINNER[1 % len(_SPINNER)] in first
+
+        # A later frame advances the spinner glyph, proving the line is not frozen.
+        view.update_view(BenchmarkRunState(), BenchmarkSupervisorStatus.IDLE, frame=2)
+        await pilot.pause()
+        second = _render_to_text(app.query_one("#benchmark-plan-summary").render())
+        assert _SPINNER[2 % len(_SPINNER)] in second
+
+        # Once results land, the computing marker clears and the animated line gives way to the plan.
+        view._render_plan_preview(_plan_rows())
+        await pilot.pause()
+        assert view._plan_computing_since is None
+
+
 async def test_plan_table_states_readiness_in_plain_language(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The plan reads as readiness, not a command: ``Ready``/``Skip`` with a reason, never a bare ``RUN``."""
     monkeypatch.chdir(tmp_path)

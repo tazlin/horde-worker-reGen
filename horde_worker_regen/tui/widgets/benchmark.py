@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import enum
 import subprocess
+import time
 import typing
 from dataclasses import dataclass
 
@@ -101,9 +102,7 @@ _TIER_TOGGLES: tuple[_TierToggle, ...] = (
     _TierToggle(
         BenchTier.FLUX, "Flux", "Very large (17-20 GB download, 13-16 GB VRAM); auto-skips if it does not fit.", False
     ),
-    _TierToggle(
-        BenchTier.QWEN, "Qwen", "Very large beta model; needs the pending reference, auto-skips if absent.", False
-    ),
+    _TierToggle(BenchTier.QWEN, "Qwen", "Very large beta model; auto-skips if absent.", False),
     _TierToggle(
         BenchTier.ZIMAGE,
         "Z-Image",
@@ -325,6 +324,9 @@ class BenchmarkView(VerticalScroll):
         operator stays free to expand or collapse a section by hand within a phase."""
         self._waiting: BenchmarkWaitingState | None = None
         """Set while the benchmark's models download in the background; drives the waiting banner and gates Run."""
+        self._plan_computing_since: float | None = None
+        """Wall-clock start of an in-flight plan preview, or None when idle. Drives the animated "thinking"
+        summary so the (cold, GPU-probing) plan subprocess reads as working rather than hung."""
 
     def compose(self) -> ComposeResult:
         """Lay out the guided steps, the primary controls, the collapsed advanced options, and the body.
@@ -529,6 +531,14 @@ class BenchmarkView(VerticalScroll):
         if run_state.plan_rows:
             self._plan_rows = run_state.plan_rows
         self._refresh_plan_panes(phase, phase_changed=phase_changed)
+        # While a plan preview is in flight the subprocess is cold and GPU-probing (up to ~180s); animate a
+        # "thinking" summary each tick so it reads as working rather than hung. This takes precedence over
+        # (and stays visible even without) any prior plan the panes just rendered.
+        if self._plan_computing_since is not None:
+            with contextlib.suppress(NoMatches):
+                summary = self.query_one("#benchmark-plan-summary", Static)
+                summary.display = True
+                summary.update(self._plan_computing_summary(frame=frame))
         self.query_one("#benchmark-body", Static).update(self._render_body(run_state, status, frame))
 
     def _current_phase(self, status: BenchmarkSupervisorStatus, run_state: BenchmarkRunState) -> _Phase:
@@ -660,9 +670,10 @@ class BenchmarkView(VerticalScroll):
         The plan starts no worker and never touches the GPU, so it is safe to run while idle without the
         worker/benchmark GPU hand-off the Run path needs.
         """
+        self._plan_computing_since = time.monotonic()
         summary = self.query_one("#benchmark-plan-summary", Static)
         summary.display = True
-        summary.update(Text("Computing the plan (detecting your hardware; no worker is started)…", style="yellow"))
+        summary.update(self._plan_computing_summary(frame=0))
         options = self._collect_options()
         self.run_worker(
             lambda: self._compute_plan_preview(options),
@@ -697,12 +708,27 @@ class BenchmarkView(VerticalScroll):
 
     def _render_plan_preview(self, rows: list[LevelPlanRow]) -> None:
         """(UI thread) store and render the previewed plan rows, expanding the per-level table."""
+        self._plan_computing_since = None
         self._plan_rows = rows
         self._phase = _Phase.PREVIEW
         self._refresh_plan_panes(_Phase.PREVIEW, phase_changed=True)
 
+    def _plan_computing_summary(self, *, frame: int) -> Text:
+        """The animated "thinking" line shown while the plan preview subprocess runs.
+
+        Pairs the ticking spinner with an elapsed-seconds counter so a long hardware probe visibly makes
+        progress instead of freezing on a static sentence.
+        """
+        spinner = _SPINNER[frame % len(_SPINNER)]
+        elapsed = 0.0 if self._plan_computing_since is None else time.monotonic() - self._plan_computing_since
+        return Text(
+            f"{spinner} Computing the plan (detecting your hardware; no worker is started)… {elapsed:.0f}s",
+            style="yellow",
+        )
+
     def _render_plan_error(self, message: str) -> None:
         """(UI thread) show why the plan preview could not be produced (any prior table stays in place)."""
+        self._plan_computing_since = None
         summary = self.query_one("#benchmark-plan-summary", Static)
         summary.display = True
         summary.update(Text(f"Could not compute the plan: {message}", style="red"))
