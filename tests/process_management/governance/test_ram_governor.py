@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.scheduling.governance import (
     StopTrackingShedCard,
     StopTrackingWorkerShed,
     decide_degrade_response,
+    decide_draining_followthrough,
     decide_over_ceiling_reclaim,
     decide_pop_hold,
     decide_pressure_governance,
@@ -111,10 +112,20 @@ class TestPopHold:
         """A host with ample available RAM keeps the pop hold clear."""
         assert decide_pop_hold(_snapshot()) == SetPopHold(active=False)
 
-    def test_hold_engages_within_the_margin_of_the_floor(self) -> None:
-        """Available RAM inside the margin above the floor engages the hold before the floor trips."""
+    def test_hold_engages_within_the_margin_of_the_floor_with_work_in_flight(self) -> None:
+        """Available RAM inside the margin above the floor engages the hold while jobs are in flight."""
         floor_mb = assess_ram_pressure(None, _TOTAL_RAM_MB).floor_mb
-        assert decide_pop_hold(_snapshot(available_mb=floor_mb + 100.0)) == SetPopHold(active=True)
+        snapshot = _snapshot(available_mb=floor_mb + 100.0, in_flight_job_count=1)
+        assert decide_pop_hold(snapshot) == SetPopHold(active=True)
+
+    def test_hold_stays_clear_within_the_margin_on_an_idle_worker(self) -> None:
+        """An idle worker whose steady-state footprint sits inside the margin is not held.
+
+        Nothing on an idle host frees RAM on its own, so engaging the hold there can never clear it: the
+        worker would starve permanently on a stable, above-floor reading.
+        """
+        floor_mb = assess_ram_pressure(None, _TOTAL_RAM_MB).floor_mb
+        assert decide_pop_hold(_snapshot(available_mb=floor_mb + 100.0)) == SetPopHold(active=False)
 
     def test_hold_engages_under_the_floor(self) -> None:
         """A host under the danger floor always holds pops."""
@@ -239,6 +250,80 @@ class TestOverCeilingReclaim:
         slots = (_slot(1, resident_ram_mb=5000.0),)
         snapshot = _snapshot(inference_slots=slots, draining_process_ids=frozenset({1}))
         assert decide_over_ceiling_reclaim(snapshot) == [ClearProcessDraining(process_id=1)]
+
+    def test_vanished_process_is_cleared_from_draining(self) -> None:
+        """A draining mark whose process no longer exists is cleared rather than gating pops forever."""
+        slots = (_slot(1, resident_ram_mb=5000.0),)
+        snapshot = _snapshot(inference_slots=slots, draining_process_ids=frozenset({9}))
+        assert decide_over_ceiling_reclaim(snapshot) == [ClearProcessDraining(process_id=9)]
+
+
+class TestDrainingFollowthrough:
+    """A drain initiated under pressure resolves even after the host clears its floor.
+
+    The mark gates job pops and shed restore until it resolves, and the degrade response that placed it
+    routinely lifts the pressure before the drained process finishes its job; without follow-through the
+    worker's intake stays closed indefinitely on a healthy host.
+    """
+
+    def test_no_marks_means_no_actions(self) -> None:
+        """A healthy host with no draining bookkeeping needs no follow-through."""
+        assert decide_draining_followthrough(_snapshot()) == []
+
+    def test_idle_drained_process_is_recycled_after_pressure_clears(self) -> None:
+        """A marked process that finished its job and idles over the ceiling is recycled on a healthy host."""
+        slots = (_slot(4, resident_ram_mb=19000.0),)
+        snapshot = _snapshot(inference_slots=slots, draining_process_ids=frozenset({4}))
+        assert decide_draining_followthrough(snapshot) == [
+            RecycleProcess(process_id=4, resident_ram_mb=19000.0, ceiling_mb=_CEILING_MB),
+        ]
+
+    def test_busy_drained_process_keeps_draining(self) -> None:
+        """A marked process still busy over the ceiling is left to finish its in-flight job."""
+        slots = (_slot(4, resident_ram_mb=19000.0, is_busy=True),)
+        snapshot = _snapshot(inference_slots=slots, draining_process_ids=frozenset({4}))
+        assert decide_draining_followthrough(snapshot) == []
+
+    def test_fallen_under_ceiling_mark_is_cleared(self) -> None:
+        """A marked process that shrank back under the ceiling is unmarked."""
+        slots = (_slot(4, resident_ram_mb=5000.0),)
+        snapshot = _snapshot(inference_slots=slots, draining_process_ids=frozenset({4}))
+        assert decide_draining_followthrough(snapshot) == [ClearProcessDraining(process_id=4)]
+
+    def test_vanished_process_mark_is_cleared(self) -> None:
+        """A marked process that exited or was replaced is unmarked."""
+        snapshot = _snapshot(draining_process_ids=frozenset({4}))
+        assert decide_draining_followthrough(snapshot) == [ClearProcessDraining(process_id=4)]
+
+    def test_disabled_ceiling_clears_every_mark(self) -> None:
+        """Disabling the ceiling clears all draining bookkeeping."""
+        snapshot = _snapshot(per_process_ceiling_mb=None, draining_process_ids=frozenset({2, 5}))
+        assert decide_draining_followthrough(snapshot) == [
+            ClearProcessDraining(process_id=2),
+            ClearProcessDraining(process_id=5),
+        ]
+
+    def test_only_one_idle_drainer_is_recycled_per_tick(self) -> None:
+        """With several idle drainers, only the largest is recycled this tick."""
+        slots = (_slot(1, resident_ram_mb=19000.0), _slot(2, resident_ram_mb=21000.0))
+        snapshot = _snapshot(inference_slots=slots, draining_process_ids=frozenset({1, 2}))
+        assert decide_draining_followthrough(snapshot) == [
+            RecycleProcess(process_id=2, resident_ram_mb=21000.0, ceiling_mb=_CEILING_MB),
+        ]
+
+    def test_pressure_governance_carries_the_followthrough_on_a_healthy_host(self) -> None:
+        """The per-tick entry point resolves an outlived drain, then the released hold reopens intake."""
+        slots = (_slot(4, resident_ram_mb=19000.0),)
+        snapshot = _snapshot(inference_slots=slots, draining_process_ids=frozenset({4}))
+        actions = decide_pressure_governance(snapshot)
+        assert actions[0] == SetPopHold(active=True)
+        assert RecycleProcess(process_id=4, resident_ram_mb=19000.0, ceiling_mb=_CEILING_MB) in actions
+
+    def test_pressure_governance_never_initiates_a_drain_on_a_healthy_host(self) -> None:
+        """A roomy host never marks or recycles an unmarked over-ceiling process."""
+        slots = (_slot(1, resident_ram_mb=30000.0, is_busy=True), _slot(2, resident_ram_mb=30000.0))
+        actions = decide_pressure_governance(_snapshot(inference_slots=slots))
+        assert actions == [SetPopHold(active=False)]
 
 
 class TestShedCardRestore:

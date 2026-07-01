@@ -2088,7 +2088,7 @@ class InferenceScheduler:
                         continue
                     logger.opt(ansi=True).warning(
                         f"<fg #ff8c69>Inference process {process_id} holds {resident_ram_mb:.0f} MB RAM (>= the "
-                        f"{ceiling_mb:.0f} MB per-process ceiling) while the host is under its RAM floor; "
+                        f"{ceiling_mb:.0f} MB per-process ceiling); "
                         "recycling it to return the retained RAM to the OS.</>",
                     )
                     governor_state.draining_process_ids.discard(process_id)
@@ -3793,7 +3793,16 @@ class InferenceScheduler:
         else:
             jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
         max_jobs_allowed = self._max_jobs_in_progress_allowed(processes_post_processing, card=target_card)
-        if jobs_in_progress_count >= max_jobs_allowed:
+        if self._state.wants_line_skip_candidate and (
+            bridge_data.aux_model_download_line_skip_threshold_seconds is None
+            or not self._process_map.any_model_downloading_aux_more_than_threshold(
+                threshold_seconds=bridge_data.aux_model_download_line_skip_threshold_seconds,
+            )
+        ):
+            # The aux download that justified bypassing the in-progress cap is no longer blocking (or the
+            # breaker was disabled); without this reset the cap would stay bypassed for the whole session.
+            self._state.wants_line_skip_candidate = False
+        if jobs_in_progress_count >= max_jobs_allowed and not self._state.wants_line_skip_candidate:
             if self._job_tracker.has_exclusive_job_in_progress():
                 logger.debug(
                     "Line-skip blocked: exclusive in-progress job requires isolation "
@@ -3820,6 +3829,18 @@ class InferenceScheduler:
                 if bypass is not None:
                     self._pending_line_skip = bypass
                     return bypass
+
+                # So no already popped job was suitable, let's set the state accordingly so we can attempt
+                # to pop a smaller job next tick
+                if (
+                    bridge_data.aux_model_download_line_skip_threshold_seconds is not None
+                    and self._process_map.any_model_downloading_aux_more_than_threshold(
+                        device_index=process_with_model.device_index,
+                        threshold_seconds=bridge_data.aux_model_download_line_skip_threshold_seconds,
+                    )
+                ):
+                    self._state.wants_line_skip_candidate = True
+
             return None
 
         if process_with_model is None:

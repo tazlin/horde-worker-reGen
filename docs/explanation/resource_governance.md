@@ -48,9 +48,14 @@ then decides and executes both regimes:
   set the soft pop hold, evict idle resident models, shed idle inference contexts (per card on a
   multi-GPU host, never emptying a card), and reclaim a process whose resident RAM crossed the
   per-process ceiling (recycled if idle, drained first if busy).
-- **Recovered host**: the restore response. Cards the reduction shed grow back toward their planned
-  process count, one context per card per tick, gated on measured RAM headroom actually fitting another
-  resident working set.
+- **Recovered host**: the restore response, and the drain follow-through. Cards the reduction shed grow
+  back toward their planned process count, one context per card per tick, gated on measured RAM headroom
+  actually fitting another resident working set. A drain the pressure episode initiated but did not
+  finish still resolves here
+  ([`decide_draining_followthrough`][horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_draining_followthrough]):
+  the marked process is recycled once idle (or unmarked if it shrank under the ceiling or exited), because
+  the mark holds job pops and shed restore closed until it resolves. New drains are never initiated on a
+  recovered host.
 
 The two regimes are mutually exclusive by construction, so one combined execution never both sheds and
 restores. The tick's verdict is retained for the rest of the cycle: per-job gates (such as the preload

@@ -513,6 +513,49 @@ class TestAuxDownloadLineSkip:
 
         assert await scheduler.get_next_job_and_process() is None
 
+    async def test_stalled_aux_download_without_bypass_arms_the_pop_candidate_flag(self) -> None:
+        """With no suitable bypass job and the aux download past its threshold, the pop-candidate flag arms."""
+        lora_candidate = make_job_pop_response(
+            "small_model",
+            loras=[LorasPayloadEntry(name="line-skip-test-lora")],
+        )
+        scheduler, _, _, _ = await self._make_scheduler(candidate_job=lora_candidate)
+        # The blocked slot has been downloading aux models for longer than the configured threshold.
+        scheduler._process_map[0].last_received_timestamp = time.time() - 10.0
+
+        assert await scheduler.get_next_job_and_process() is None
+        assert scheduler._state.wants_line_skip_candidate is True
+
+    async def test_fresh_aux_download_does_not_arm_the_pop_candidate_flag(self) -> None:
+        """An aux download still inside the threshold does not arm the flag."""
+        lora_candidate = make_job_pop_response(
+            "small_model",
+            loras=[LorasPayloadEntry(name="line-skip-test-lora")],
+        )
+        scheduler, _, _, _ = await self._make_scheduler(candidate_job=lora_candidate)
+
+        assert await scheduler.get_next_job_and_process() is None
+        assert scheduler._state.wants_line_skip_candidate is False
+
+    async def test_pop_candidate_flag_clears_once_no_aux_download_exceeds_the_threshold(self) -> None:
+        """The armed flag (which bypasses the in-progress cap) resets when the blocking download ends.
+
+        Left armed, the flag would exempt every future scheduling pass from the in-progress cap for the
+        rest of the session.
+        """
+        lora_candidate = make_job_pop_response(
+            "small_model",
+            loras=[LorasPayloadEntry(name="line-skip-test-lora")],
+        )
+        scheduler, _, _, _ = await self._make_scheduler(candidate_job=lora_candidate)
+        scheduler._state.wants_line_skip_candidate = True
+        # The blocked slot's aux download completed; it is preloading/serving again.
+        scheduler._process_map[0].last_process_state = HordeProcessState.PRELOADED_MODEL
+
+        await scheduler.get_next_job_and_process()
+
+        assert scheduler._state.wants_line_skip_candidate is False
+
 
 class TestStartInference:
     """Tests for start_inference."""

@@ -163,26 +163,94 @@ class TestLoneOverCeilingProcessIsReclaimed:
         )
 
 
+class TestDrainOutlivesThePressureEpisode:
+    """A drain marked under the floor must resolve after RAM recovers, or it wedges intake forever.
+
+    The mark itself holds the soft pop hold engaged and blocks shed restore, and the degrade response that
+    placed it (pop pause, idle-model eviction, context shedding) routinely lifts the pressure before the
+    drained process finishes its in-flight job. If reclaim only ever runs under the floor, the mark can
+    never resolve on the recovered host: the drained process idles over the ceiling untouched, its retained
+    RAM is never returned, and the worker refuses every pop for the rest of the session.
+    """
+
+    def test_drained_process_is_recycled_once_idle_after_ram_recovers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A busy drain marked under the floor is recycled on a later healthy tick once its job finishes."""
+        proc = _resident_idle_proc(1, "AlbedoBase XL (SDXL)", ram_bytes=_OVER_CEILING_RAM_BYTES)
+        proc.last_process_state = HordeProcessState.INFERENCE_STARTING  # busy when the floor trips
+        process_map = ProcessMap({1: proc})
+        scheduler = _ram_pressured_scheduler(process_map)
+        recycle = Mock()
+        scheduler._process_lifecycle._replace_inference_process = recycle  # type: ignore[method-assign]
+
+        scheduler._govern_ram_pressure_if_pressured()
+
+        assert 1 in scheduler._processes_draining_for_ram, "the busy over-ceiling process is marked under the floor"
+        assert not recycle.called
+
+        # The degrade response worked: RAM recovered above the floor, and the drained job then finished.
+        scheduler._measured_available_ram_mb = lambda: _TOTAL_RAM_MB * 0.7  # type: ignore[method-assign]
+        proc.last_process_state = HordeProcessState.WAITING_FOR_JOB
+
+        scheduler._govern_ram_pressure_if_pressured()
+
+        assert recycle.called, "an idle drained process must still be recycled after the floor clears"
+        assert 1 not in scheduler._processes_draining_for_ram, "the resolved drain must release its mark"
+
+        scheduler._govern_ram_pressure_if_pressured()
+
+        assert scheduler._state.ram_pressure_pop_hold is False, (
+            "with the drain resolved and RAM recovered, the pop hold must release so intake reopens"
+        )
+
+
 class TestPopHeldBeforeTheFloorToAvoidStaleJobs:
     """Popping must pause as RAM *approaches* the floor, not only once it is breached.
 
     A job popped onto a worker already near its RAM ceiling can sit in-queue past its ttl while the worker
     degrades, and the horde then aborts it as too slow (a forced-maintenance driver). A soft pre-floor hold
-    stops new jobs starting their ttl clock while RAM is within the marginal reserve of the danger floor.
+    stops new jobs starting their ttl clock while RAM is within the marginal reserve of the danger floor
+    and work is in flight; an idle worker whose stable footprint sits in the band is not held (nothing on an
+    idle host frees RAM on its own, so a hold there would starve the worker permanently).
     """
 
-    def test_pop_hold_engages_in_the_approaching_band(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """With available RAM just above the floor (within the reserve margin), the soft pop hold engages."""
+    async def test_pop_hold_engages_in_the_approaching_band_with_work_in_flight(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With available RAM just above the floor and a job in flight, the soft pop hold engages."""
         process_map = ProcessMap({1: _resident_idle_proc(1, "AlbedoBase XL (SDXL)")})
         # Floor on 64 GB at 85% is ~9.6 GB; with a 4 GB reserve margin the band is [9.6, 13.6) GB. 11 GB sits
         # in it: above the hard floor (no self-throttle) but approaching it (soft hold).
         scheduler = _ram_pressured_scheduler(process_map, available_ram_mb=11000.0)
+        job = make_job_pop_response("AlbedoBase XL (SDXL)")
+        await track_popped_job_async(scheduler._job_tracker, job)
+        await scheduler._job_tracker.mark_inference_started(job)
 
         scheduler._govern_ram_pressure_if_pressured()
 
         assert scheduler._state.self_throttle_paused is False, "the approaching band is above the hard floor"
         assert scheduler._state.ram_pressure_pop_hold is True, (
             "approaching the RAM floor must hold pops so a new job's ttl clock does not start on a degraded worker"
+        )
+
+    def test_pop_hold_stays_clear_in_the_approaching_band_on_an_idle_worker(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An idle worker whose resident footprint merely sits in the band keeps popping.
+
+        With no in-flight work nothing on the host frees RAM by itself, so a hold engaged here can never
+        clear: the worker would sit above the floor, fully idle, refusing every pop for the rest of the
+        session while the skipped-reason counter grows.
+        """
+        process_map = ProcessMap({1: _resident_idle_proc(1, "AlbedoBase XL (SDXL)")})
+        scheduler = _ram_pressured_scheduler(process_map, available_ram_mb=11000.0)
+
+        scheduler._govern_ram_pressure_if_pressured()
+
+        assert scheduler._state.self_throttle_paused is False, "the approaching band is above the hard floor"
+        assert scheduler._state.ram_pressure_pop_hold is False, (
+            "an idle worker in the approaching band must not latch a hold nothing can ever release"
         )
 
     def test_pop_hold_clears_when_ram_is_ample(self, monkeypatch: pytest.MonkeyPatch) -> None:

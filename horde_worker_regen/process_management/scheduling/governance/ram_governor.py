@@ -18,6 +18,10 @@ Critical public members:
 * [`decide_shed_card_restore`]
   [horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_shed_card_restore]:
   the recovery counterpart that grows shed cards back toward plan.
+* [`decide_draining_followthrough`]
+  [horde_worker_regen.process_management.scheduling.governance.ram_governor.decide_draining_followthrough]:
+  resolves pressure-initiated draining marks after the floor clears, so a drain never outlives its episode
+  as a permanent hold on intake.
 * [`RAM_PRESSURE_PAUSE_SECONDS`]
   [horde_worker_regen.process_management.scheduling.governance.ram_governor.RAM_PRESSURE_PAUSE_SECONDS]:
   how long one pressure reading pauses job pops.
@@ -49,6 +53,7 @@ __all__ = [
     "RamGovernorState",
     "WorkerProcessShedState",
     "decide_degrade_response",
+    "decide_draining_followthrough",
     "decide_over_ceiling_reclaim",
     "decide_pop_hold",
     "decide_pressure_governance",
@@ -116,12 +121,18 @@ def decide_pop_hold(snapshot: HostMemorySnapshot) -> SetPopHold:
 
     The hard floor pauses pops outright; this softer band stops the popper starting a new job's ttl clock
     *before* the host is critical, so a job does not age past its ttl waiting on a degraded worker and get
-    aborted by the horde as too slow. The hold engages while the host is under the floor, while measured
-    available RAM is within the margin of the floor, or while any process is being drained for reclaim.
+    aborted by the horde as too slow. The hold engages while the host is under the floor, while any process
+    is being drained for reclaim, or while measured available RAM is within the margin of the floor *and*
+    work is in flight whose completion will change the reading. An idle worker whose steady-state resident
+    footprint simply sits inside the margin is not held: nothing on an idle host frees RAM on its own, so
+    holding there starves the worker permanently, and a popped job is served immediately (no ttl-aging
+    risk) with the hard floor still guarding actual overgrowth.
     """
     verdict = snapshot.verdict
     approaching = (
-        verdict.available_mb is not None and (verdict.available_mb - verdict.floor_mb) < snapshot.pop_hold_margin_mb
+        verdict.available_mb is not None
+        and (verdict.available_mb - verdict.floor_mb) < snapshot.pop_hold_margin_mb
+        and snapshot.in_flight_job_count > 0
     )
     active = bool(verdict.under_pressure or approaching) or bool(snapshot.draining_process_ids)
     return SetPopHold(active=active)
@@ -166,14 +177,21 @@ def decide_over_ceiling_reclaim(snapshot: HostMemorySnapshot) -> list[Governance
     caller gates on pressure. Acts on one process per tick (the largest over-ceiling one) to avoid
     emptying every card at once: an idle offender is recycled now (its allocator-retained pages return to
     the OS on respawn), a busy one is marked draining so its in-flight job finishes and a later tick
-    recycles it. Processes that have fallen back under the ceiling have their draining marks cleared; a
-    disabled ceiling clears every mark.
+    recycles it. Processes that have fallen back under the ceiling (or no longer exist) have their
+    draining marks cleared; a disabled ceiling clears every mark. Marks that outlive the pressure episode
+    are resolved by :func:`decide_draining_followthrough`.
     """
     ceiling_mb = snapshot.per_process_ceiling_mb
     if ceiling_mb is None:
         return [ClearProcessDraining(process_id=process_id) for process_id in sorted(snapshot.draining_process_ids)]
 
     actions: list[GovernanceAction] = []
+    live_process_ids = {slot.process_id for slot in snapshot.inference_slots}
+    for process_id in sorted(snapshot.draining_process_ids):
+        # A mark whose process no longer exists (exited or replaced) can never resolve through the slot
+        # scan below; left in place it would gate pops and restore forever.
+        if process_id not in live_process_ids:
+            actions.append(ClearProcessDraining(process_id=process_id))
     over_ceiling = []
     for slot in snapshot.inference_slots:
         if slot.resident_ram_mb >= ceiling_mb:
@@ -233,15 +251,57 @@ def decide_degrade_response(snapshot: HostMemorySnapshot) -> list[GovernanceActi
     return actions
 
 
+def decide_draining_followthrough(snapshot: HostMemorySnapshot) -> list[GovernanceAction]:
+    """Return the resolution of existing draining marks on a host that is no longer under its RAM floor.
+
+    Draining marks are *initiated* only under the danger floor (see :func:`decide_over_ceiling_reclaim`),
+    but a mark gates job pops and shed restore until it resolves, and the pressure that placed it often
+    clears before the drained process finishes its in-flight job (pausing pops and shedding footprint is
+    the point of the degrade response). The mark must therefore resolve on a healthy host too: a marked
+    process that fell back under the ceiling (or exited) is unmarked, a marked process that went idle is
+    recycled (one per tick, largest first) so its allocator-retained RAM actually returns to the OS, and a
+    marked process still busy over the ceiling keeps draining. New marks are never placed here.
+    """
+    if not snapshot.draining_process_ids:
+        return []
+    ceiling_mb = snapshot.per_process_ceiling_mb
+    if ceiling_mb is None:
+        return [ClearProcessDraining(process_id=process_id) for process_id in sorted(snapshot.draining_process_ids)]
+
+    actions: list[GovernanceAction] = []
+    slots_by_id = {slot.process_id: slot for slot in snapshot.inference_slots}
+    recyclable = []
+    for process_id in sorted(snapshot.draining_process_ids):
+        slot = slots_by_id.get(process_id)
+        if slot is None or slot.resident_ram_mb < ceiling_mb:
+            actions.append(ClearProcessDraining(process_id=process_id))
+        elif not slot.is_busy:
+            recyclable.append(slot)
+    if recyclable:
+        target = max(recyclable, key=lambda slot: slot.resident_ram_mb)
+        actions.append(
+            RecycleProcess(
+                process_id=target.process_id,
+                resident_ram_mb=target.resident_ram_mb,
+                ceiling_mb=ceiling_mb,
+            ),
+        )
+    return actions
+
+
 def decide_pressure_governance(snapshot: HostMemorySnapshot) -> list[GovernanceAction]:
     """Return the complete per-tick RAM governance for this snapshot.
 
     Always yields the soft pop-hold setting (engaged or cleared), then the full degrade response when the
-    host is under its danger floor. The restore of shed cards is decided separately by
-    :func:`decide_shed_card_restore`, because it applies on a *healthy* host.
+    host is under its danger floor, or the draining follow-through when it is not (so a drain initiated
+    under pressure still resolves after the floor clears). The restore of shed cards is decided separately
+    by :func:`decide_shed_card_restore`, because it applies on a *healthy* host.
     """
     actions: list[GovernanceAction] = [decide_pop_hold(snapshot)]
-    actions.extend(decide_degrade_response(snapshot))
+    if snapshot.verdict.under_pressure:
+        actions.extend(decide_degrade_response(snapshot))
+    else:
+        actions.extend(decide_draining_followthrough(snapshot))
     return actions
 
 

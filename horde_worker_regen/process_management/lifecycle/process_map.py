@@ -982,3 +982,20 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             p.last_process_state in [HordeProcessState.WAITING_FOR_JOB, HordeProcessState.PRELOADED_MODEL]
             for p in self.values()
         )
+
+    def any_model_downloading_aux_more_than_threshold(
+        self,
+        threshold_seconds: float,
+        device_index: int | None = None,
+    ) -> bool:
+        """Return True if any process is downloading an auxiliary model for longer than the threshold."""
+        now = time.time()
+        for process in self.values():
+            if device_index is not None and process.device_index != device_index:
+                continue
+            if (
+                process.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL
+                and (now - process.last_received_timestamp) > threshold_seconds
+            ):
+                return True
+        return False

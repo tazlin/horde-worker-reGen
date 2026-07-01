@@ -12,15 +12,18 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 )
 from horde_worker_regen.process_management.scheduling.governance import (
     CardProcessSnapshot,
+    ClearProcessDraining,
     EvictIdleModels,
     GovernanceAction,
     HostMemorySnapshot,
+    MarkProcessDraining,
+    RecycleProcess,
     ResourceGovernor,
     RestoreCardProcess,
     RestoreWorkerProcess,
     SetPopHold,
 )
-from tests.process_management.governance.test_ram_governor import _snapshot
+from tests.process_management.governance.test_ram_governor import _CEILING_MB, _slot, _snapshot
 
 _TOTAL_RAM_MB = 64000.0
 
@@ -102,6 +105,55 @@ class TestResourceGovernorTick:
         governor.tick()
 
         assert RestoreWorkerProcess(target_count=3, planned_count=4) in host.executed
+
+    def test_drain_marked_under_pressure_resolves_after_recovery(self) -> None:
+        """A drain that outlives its pressure episode is recycled, unmarked, and the pop hold released.
+
+        Sequence: the floor trips while a ballooned process is busy, so it is marked draining rather than
+        recycled. The degrade response then lifts the pressure before that job finishes. On the recovered
+        host the drained process (now idle, still over the ceiling) must still be recycled and unmarked;
+        otherwise the mark keeps the pop hold engaged and blocks shed restore for the rest of the session.
+        """
+
+        class _StatefulHost(_FakeHost):
+            """A fake host whose executed Mark/Clear/Recycle actions mutate the governor's drain set."""
+
+            governor: ResourceGovernor
+
+            def _execute_governance_actions(self, actions: list[GovernanceAction]) -> None:
+                super()._execute_governance_actions(actions)
+                draining = self.governor.ram_state.draining_process_ids
+                for action in actions:
+                    if isinstance(action, MarkProcessDraining):
+                        draining.add(action.process_id)
+                    elif isinstance(action, (ClearProcessDraining, RecycleProcess)):
+                        draining.discard(action.process_id)
+
+        busy_balloon = _slot(4, resident_ram_mb=19000.0, is_busy=True)
+        host = _StatefulHost(_snapshot(available_mb=500.0, inference_slots=(busy_balloon,), in_flight_job_count=1))
+        governor = ResourceGovernor(host=host)
+        host.governor = governor
+
+        assert governor.tick() is True
+        assert governor.ram_state.draining_process_ids == {4}
+
+        # RAM recovered above the floor and the drained process finished its job, idling over the ceiling.
+        idle_balloon = _slot(4, resident_ram_mb=19000.0)
+        host.snapshot = _snapshot(
+            inference_slots=(idle_balloon,),
+            draining_process_ids=frozenset(governor.ram_state.draining_process_ids),
+        )
+        host.executed.clear()
+        assert governor.tick() is False
+        assert host.executed[0] == SetPopHold(active=True), "the hold protects the drain until it resolves"
+        assert RecycleProcess(process_id=4, resident_ram_mb=19000.0, ceiling_mb=_CEILING_MB) in host.executed
+        assert governor.ram_state.draining_process_ids == set()
+
+        # With the drain resolved, the next healthy tick releases the pop hold and intake reopens.
+        host.snapshot = _snapshot(inference_slots=(_slot(4, resident_ram_mb=2000.0),))
+        host.executed.clear()
+        governor.tick()
+        assert host.executed == [SetPopHold(active=False)]
 
     def test_verdict_is_cached_for_within_cycle_readers(self) -> None:
         """The tick's verdict is retained so per-job gates in the same cycle act on one reading."""

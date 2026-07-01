@@ -88,6 +88,11 @@ class WorkerState:
     support (see ``_lora_disk_permits``) so the worker stops feeding jobs into a failing download
     path. Windows double per consecutive strike and reset after a healthy stretch."""
 
+    wants_line_skip_candidate: bool = False
+    """An aux-model download has been blocking dispatch past the configured threshold with no suitable
+    already-popped bypass job, so the line-skip in-progress cap may be bypassed to keep the GPU busy.
+    Cleared by the line-skip cap gate as soon as no aux download exceeds the threshold."""
+
     gpu_torch_incompatible: bool = False
     """Session-latched: an inference child reported the installed PyTorch has no CUDA kernels for this GPU.
 

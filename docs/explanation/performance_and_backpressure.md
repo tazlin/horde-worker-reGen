@@ -379,16 +379,27 @@ over-ceiling process is recycled immediately (its allocator-retained pages retur
 the OS on respawn), and a busy one is **drained** (fed no new work by the preload
 target selection) so its in-flight job finishes before it is recycled. The largest
 over-ceiling process is acted on first, one per cycle, so a multi-GPU host never
-empties every card at once. The ceiling is consulted only under the danger floor, so
-a roomy host never recycles needlessly. This bounds the per-process balloon that a
-generous residency policy accumulates (weights the allocator will not return without
-a respawn), which is what a shed-idle-only response cannot reach.
+empties every card at once. New drains are *initiated* only under the danger floor, so
+a roomy host never recycles needlessly, but an already-placed mark **follows through**
+even after the floor clears: the degrade response itself (pausing pops, shedding
+footprint) routinely lifts the pressure before the drained process finishes its job,
+and the mark holds the popper closed and blocks shed restore until it resolves.
+Once the drained process goes idle it is recycled on the recovered host too; a mark
+whose process shrank back under the ceiling or exited is simply cleared. This bounds
+the per-process balloon that a generous residency policy accumulates (weights the
+allocator will not return without a respawn), which is what a shed-idle-only response
+cannot reach.
 
 A softer, **pre-floor pop hold** sits above the hard floor: once available RAM is
-within the marginal RAM reserve of the danger floor (or a process is mid-drain) the
-popper stops accepting new jobs, so a job does not start its time-to-live clock on a
-worker too degraded to serve it promptly and then get aborted by the horde as too
-slow. In-flight work is unaffected; the hold clears as soon as RAM recovers.
+within the marginal RAM reserve of the danger floor while work is in flight (or a
+process is mid-drain) the popper stops accepting new jobs, so a job does not start
+its time-to-live clock on a worker too degraded to serve it promptly and then get
+aborted by the horde as too slow. In-flight work is unaffected; the hold clears as
+soon as RAM recovers, the in-flight work finishes, or the drain resolves. An idle
+worker whose steady-state resident footprint merely sits inside the margin is not
+held: nothing on an idle host frees RAM on its own, so a hold there could never
+clear, and a popped job is served immediately (no time-to-live risk) with the hard
+floor still guarding actual overgrowth.
 
 The reductions above are the runtime backstop; the **plan-time process count** is
 sized to the hardware up front so the worker rarely has to reach for them. The

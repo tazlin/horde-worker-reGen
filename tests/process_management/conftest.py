@@ -210,6 +210,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.large_model_reentry_cooldown_seconds = -1
     bd.unservable_model_fault_threshold = 3
     bd.unservable_model_cooldown_seconds = 900
+    bd.aux_model_download_line_skip_threshold_seconds = 3
     bd.self_maintenance_fault_threshold = 6
     bd.self_maintenance_window_seconds = 600
     bd.self_maintenance_cooldown_seconds = 300

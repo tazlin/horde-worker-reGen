@@ -827,6 +827,11 @@ class reGenBridgeData(CombinedHordeBridgeData):
     unservable_model_cooldown_seconds: int = Field(default=900, ge=0)
     """How long a model flagged locally unservable is held back before the worker tries it again."""
 
+    aux_model_download_line_skip_threshold_seconds: int | None = Field(default=3, ge=0)
+    """The number of seconds for a process to be downloading an auxiliary model, and with no non-lora
+    models available to skip the line, before the worker will attempt to pop a non-lora small job
+    to keep the GPU busy. Keep unset to disable the breaker."""
+
     self_maintenance_fault_threshold: int = Field(default=6, ge=0)
     """Terminal resource/OOM faults within `self_maintenance_window_seconds` before the worker
     self-throttles.
