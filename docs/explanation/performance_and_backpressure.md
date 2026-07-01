@@ -219,6 +219,33 @@ download, the skip decision is cached in `_pending_line_skip` so the second call
 agrees with the first. Without this cache, the launch call could pick a
 different job, causing the block decision to be wasted.
 
+#### Sourcing a skip job when none is queued
+
+A line-skip needs a small, non-LoRA job that is already resident on an idle
+sibling process. Often one is: the queue holds a mix and the scheduler simply
+picks it. But when the blocked head sits behind an auxiliary-model download and
+*nothing queued qualifies* (every other queued job shares the head's model, is
+itself LoRA-bearing, or is too large), the GPU would idle for the whole
+download. `aux_model_download_line_skip_threshold_seconds` bounds how long the
+scheduler tolerates that before acting: once a slot has been in
+`DOWNLOADING_AUX_MODEL` past the threshold with no usable candidate, it arms
+`WorkerState.wants_line_skip_candidate`. Two things then happen:
+
+- The in-flight **count** cap is bypassed for that cycle, so a skip job that
+  materialises can dispatch even though the cap is nominally reached.
+- The job popper reads the flag and **biases its next pop** toward a small,
+  non-LoRA job: it stops advertising LoRA support (a LoRA candidate would only
+  block on its own download) and caps `max_power` down to the line-skip
+  resolution ceiling (`line_skip_pop_max_power`, derived from the same
+  per-performance-mode eMPS limit the scheduler uses to accept a skip candidate).
+
+The freshly popped small job is preloaded onto the idle sibling on the next
+cycle, becomes a valid skip candidate, and keeps the GPU sampling while the
+download finishes. The scheduler clears the flag as soon as no aux download
+still exceeds the threshold, so the cap bypass and the pop bias last only as long
+as the stall does. Set `aux_model_download_line_skip_threshold_seconds` to unset
+to disable the breaker entirely.
+
 ### Concurrent-overlap gating
 
 `max_threads` caps how many jobs may be *in flight* at once, but it only counts jobs; it does not look at

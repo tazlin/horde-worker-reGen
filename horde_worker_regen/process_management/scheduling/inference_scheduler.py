@@ -98,6 +98,7 @@ from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.job_utils import (
     get_single_job_magnitude as _get_single_job_effective_megapixelsteps,
 )
+from horde_worker_regen.utils.job_utils import line_skip_candidate_emps_limit
 
 
 class PostProcessingReclaimAction(enum.Enum):
@@ -3763,12 +3764,10 @@ class InferenceScheduler:
         process_with_model = self._resident_process_for_job(next_job)
         line_skip: LineSkip | None = None
 
-        candidate_job_size = 25
-
-        if bridge_data.high_performance_mode:
-            candidate_job_size = 100
-        elif bridge_data.moderate_performance_mode:
-            candidate_job_size = 50
+        candidate_job_size = line_skip_candidate_emps_limit(
+            high_performance_mode=bool(bridge_data.high_performance_mode),
+            moderate_performance_mode=bool(bridge_data.moderate_performance_mode),
+        )
 
         # On a multi-GPU host the head's resident process names the card this dispatch would land on, so the
         # concurrency cap is scoped to that card: its own in-progress count vs its own ceilings. The scope is
@@ -4792,6 +4791,11 @@ class InferenceScheduler:
                         )
                         and not self._state.shutting_down
                     ):
+                        logger.warning(
+                            f"Failed to send UNLOAD_MODELS_FROM_VRAM to process {process_info.process_id}. ",
+                            "This may indicate the process is unresponsive or has already exited. "
+                            "Attempting to replace the process with a new one.",
+                        )
                         self._process_lifecycle._replace_inference_process(process_info)
                     process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
                     unloaded_any = True

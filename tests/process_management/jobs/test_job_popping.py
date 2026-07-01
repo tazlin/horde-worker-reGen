@@ -28,6 +28,7 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
+from horde_worker_regen.utils.job_utils import line_skip_pop_max_power
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -1377,3 +1378,71 @@ class TestJobPopFrequency:
         """Error pop frequency should be 5.0 seconds."""
         popper = _make_popper()
         assert popper._pop_throttler._error_pop_frequency == 5.0
+
+
+class TestAuxDownloadLineSkipPopBias:
+    """When the scheduler arms ``wants_line_skip_candidate`` the pop biases toward a small non-LoRA job.
+
+    The scheduler sets the flag when a slot is blocked downloading auxiliary models past
+    ``aux_model_download_line_skip_threshold_seconds`` and nothing already queued can slip past the blocked
+    head. Biasing the next pop small and non-LoRA lets an idle sibling process pick up skippable work so
+    the GPU keeps sampling while the download finishes.
+    """
+
+    @staticmethod
+    async def _pop_and_capture_request(*, state: WorkerState, **bridge_overrides: object) -> object:
+        """Drive one full pop with the given state and bridge overrides, returning the built pop request."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()  # clear the session warm-up gate so a pop happens
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            state=state,
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(**bridge_overrides),
+        )
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
+        return session.submit_request.call_args.args[0]
+
+    async def test_armed_flag_withholds_lora(self) -> None:
+        """An armed flag stops the pop advertising LoRA support even when the config allows it."""
+        state = WorkerState()
+        state.wants_line_skip_candidate = True
+
+        request = await self._pop_and_capture_request(state=state, allow_lora=True)
+
+        assert request.allow_lora is False
+
+    async def test_armed_flag_caps_oversized_max_power(self) -> None:
+        """An armed flag caps a large configured max_power down to the line-skip resolution ceiling."""
+        state = WorkerState()
+        state.wants_line_skip_candidate = True
+
+        request = await self._pop_and_capture_request(state=state, max_power=64)
+
+        ceiling = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
+        assert request.max_pixels == ceiling * 8 * 64 * 64
+
+    async def test_armed_flag_does_not_enlarge_a_small_max_power(self) -> None:
+        """A worker already configured for small jobs keeps its own (smaller) max_power under the bias."""
+        state = WorkerState()
+        state.wants_line_skip_candidate = True
+
+        request = await self._pop_and_capture_request(state=state, max_power=8)
+
+        assert request.max_pixels == 8 * 8 * 64 * 64
+
+    async def test_unarmed_flag_leaves_pop_unbiased(self) -> None:
+        """With the flag clear (the default), LoRA support and max_power are advertised unchanged."""
+        state = WorkerState()  # wants_line_skip_candidate defaults False
+
+        request = await self._pop_and_capture_request(state=state, allow_lora=True, max_power=64)
+
+        assert request.allow_lora is True
+        assert request.max_pixels == 64 * 8 * 64 * 64

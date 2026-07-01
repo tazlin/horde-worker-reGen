@@ -59,7 +59,7 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
 from horde_worker_regen.runtime_version import runtime_version
 from horde_worker_regen.telemetry_spans import queue_depth_counter, span_job_pop
-from horde_worker_regen.utils.job_utils import get_single_job_magnitude
+from horde_worker_regen.utils.job_utils import get_single_job_magnitude, line_skip_pop_max_power
 
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -910,6 +910,23 @@ class JobPopper:
         # jobs, so a non-LoRA job can still be popped and line-skip past a blocked LoRA head.
         if pop_allow_lora and self._lora_queue_cap_reached():
             pop_allow_lora = False
+
+        # Aux-download line-skip bias: the scheduler has flagged that a slot is blocked downloading
+        # auxiliary models past the threshold and no already-queued non-LoRA job is small enough to slip
+        # past it (see aux_model_download_line_skip_threshold_seconds). Bias this pop toward a small,
+        # non-LoRA job so an idle sibling process gets skippable work and the GPU keeps sampling while the
+        # download finishes. A LoRA candidate would itself block on a download, so it can never skip; a
+        # smaller max_power keeps the returned job under the scheduler's line-skip eMPS ceiling. The
+        # scheduler clears the flag once the blocking download ends.
+        if self._state.wants_line_skip_candidate:
+            pop_allow_lora = False
+            pop_max_power = min(
+                pop_max_power,
+                line_skip_pop_max_power(
+                    high_performance_mode=bool(bridge_data.high_performance_mode),
+                    moderate_performance_mode=bool(bridge_data.moderate_performance_mode),
+                ),
+            )
 
         # First-class feature readiness: withhold a gated feature (ControlNet, SDXL-ControlNet,
         # post-processing) until its models/annotators are actually on disk, so the worker never

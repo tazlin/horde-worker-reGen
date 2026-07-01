@@ -66,3 +66,51 @@ def get_single_job_magnitude(job: ImageGenerateJobPopResponse) -> int:
     if controlnet_multiplier and not slow_multiplier:
         job_effective_pixel_steps *= controlnet_multiplier
     return int(job_effective_pixel_steps / 1_000_000)
+
+
+def line_skip_candidate_emps_limit(
+    *,
+    high_performance_mode: bool,
+    moderate_performance_mode: bool,
+) -> int:
+    """Return the eMPS ceiling a job must fall under to line-skip a slot blocked on aux downloads.
+
+    A line-skip job fills an idle sibling process while another slot waits on an auxiliary-model
+    download, so it must be quick enough that it does not become a long-running tenant of its own. The
+    ceiling widens with the worker's performance mode, matching the job sizes those modes are provisioned
+    to absorb.
+    """
+    if high_performance_mode:
+        return 100
+    if moderate_performance_mode:
+        return 50
+    return 25
+
+
+_LINE_SKIP_POP_NOMINAL_STEPS = 30
+"""Sampling-step count assumed when translating the line-skip eMPS ceiling into a pop ``max_power``.
+
+Real jobs vary in step count, so this only biases the horde toward returning a skippable job; it is not a
+guarantee. The scheduler re-checks each popped job's true eMPS against
+:func:`line_skip_candidate_emps_limit` before allowing it to skip, so a returned job that is larger than
+expected simply waits its turn in the queue instead of skipping."""
+
+
+def line_skip_pop_max_power(
+    *,
+    high_performance_mode: bool,
+    moderate_performance_mode: bool,
+) -> int:
+    """Return a ``max_power`` that biases a pop toward a job able to line-skip an aux-download-blocked slot.
+
+    The horde honours ``max_pixels`` (``max_power * 8 * 64 * 64``) as a hard cap on the resolution of
+    returned jobs. Translating the perf-mode eMPS ceiling into an approximate resolution ceiling (assuming
+    a nominal step count) keeps the returned job small enough to slip past the blocked head and onto an
+    idle sibling process.
+    """
+    emps_limit = line_skip_candidate_emps_limit(
+        high_performance_mode=high_performance_mode,
+        moderate_performance_mode=moderate_performance_mode,
+    )
+    max_pixels = emps_limit * 1_000_000 // _LINE_SKIP_POP_NOMINAL_STEPS
+    return max(1, max_pixels // (8 * 64 * 64))
