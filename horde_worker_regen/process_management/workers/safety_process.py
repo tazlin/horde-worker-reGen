@@ -344,19 +344,19 @@ class HordeSafetyProcess(HordeProcess):
 
         Bundles a BlurHash placeholder string (for progressive-load UIs), perceptual hashes (for
         dedup/similarity), and basic geometry/format facts. BlurHash and the perceptual hashes come
-        from the worker-only ``describe`` extra; the geometry facts use Pillow directly. The form is
-        only offered when those extras import (see ``capabilities.describe_available``), so a missing
-        install surfaces as a faulted form rather than a partial result.
+        from the worker-only ``describe`` dependencies; the geometry facts use Pillow directly. The form
+        is only offered when those dependencies import (see ``capabilities.describe_available``), so a
+        missing install surfaces as a faulted form rather than a partial result.
         """
         import blurhash
         import imagehash
+        import numpy as np
 
         rgb_image = image.convert("RGB")
 
-        png_buffer = BytesIO()
-        rgb_image.save(png_buffer, format="PNG")
-        png_buffer.seek(0)
-        blurhash_string = blurhash.encode(png_buffer, x_components=4, y_components=3)
+        # halcy's pure-python blurhash takes an (H, W, 3) pixel array rather than a file buffer, which
+        # also lets us skip a PNG re-encode of an image we already hold decoded.
+        blurhash_string = blurhash.encode(np.array(rgb_image), components_x=4, components_y=3)
 
         width, height = image.size
         return {

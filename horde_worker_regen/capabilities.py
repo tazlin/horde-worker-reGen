@@ -117,7 +117,7 @@ def describe_available() -> bool:
     """Return whether the technical-metadata ``describe`` form can run here.
 
     Like :func:`vectorize_available`, this is a worker-only alchemy op that does not route through
-    hordelib; its blurhash/perceptual-hash pieces live in the worker's own ``describe`` extra, so a
+    hordelib; its blurhash/perceptual-hash pieces come from the worker's own dependencies, so a
     plain import probe is the right check. The plain dimensions/dominant-colour parts use Pillow and
     are always available, but the form is only offered when the full bundle can be produced.
     """

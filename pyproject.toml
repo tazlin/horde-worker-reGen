@@ -50,7 +50,10 @@ dependencies = [
     "textual-serve>=1.1.1",
     "logfire>=4.6.0",
     "vtracer>=0.6.0", # For vectorize
-    "blurhash-python>=1.2.1", # For the describe alchemy form (progressive-load placeholder string)
+    # Pure-python blurhash (halcy) for the describe alchemy form's progressive-load placeholder string.
+    # Deliberately NOT the woltapp "blurhash-python" cffi package: that ships only manylinux wheels, so a
+    # Windows/macOS worker without a C toolchain fails to build it. This one has no native code.
+    "blurhash>=1.1.5",
     "imagehash>=4.3.1", # For the describe alchemy form (perceptual hashes; scipy/numpy already present)
     # Windows-only system-tray icon for the persistent worker host (tui/tray.py), so a detached worker
     # stays visible and stoppable. Import-guarded, so their absence on other platforms is harmless.
