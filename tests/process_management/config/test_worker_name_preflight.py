@@ -138,6 +138,20 @@ class TestOwnershipCheck:
         with pytest.raises(WorkerNameConfigError, match="another account"):
             verify_worker_identity(_bridge_data(dreamer="Unique Dreamer"))
 
+    def test_registered_worker_with_hidden_owner_proceeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A registered worker whose owner the horde withholds is indeterminate, not foreign: proceed.
+
+        Reproduces the alchemist "already taken but owner unknown" boot block: a private account (no
+        public workers) never sees a worker's owner, and the alchemist's id is structurally absent from
+        the account's worker_ids, so neither same-account signal can fire. That is not proof of a foreign
+        name, so it must warn and proceed rather than hard-block boot on every start.
+        """
+        worker = Mock(id_="alch-77", name="My Alchemist", owner=None)
+        monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: ({"dreamer-1"}, "Me#1"))
+        monkeypatch.setattr(worker_identity, "_lookup_registered_worker", lambda name, api_key: worker)
+
+        verify_worker_identity(_bridge_data(dreamer="My Alchemist"))
+
     def test_unregistered_worker_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A name not yet registered is the normal first-run case and passes."""
         monkeypatch.setattr(worker_identity, "_fetch_account_identity", lambda api_key: (set(), "Me#1"))
@@ -182,6 +196,40 @@ class TestOwnershipCheck:
 
         verify_worker_identity(_bridge_data(dreamer="Unique Dreamer", dry_run_skip_api=True))
         assert calls["count"] == 0
+
+
+class TestOwnershipVerdict:
+    """``_classify_worker_ownership`` only calls a name foreign on positive proof."""
+
+    def test_id_in_worker_ids_is_owned(self) -> None:
+        """An id present in the account's worker_ids is a same-account signal."""
+        worker = Mock(id_="w-1", owner=None)
+        verdict = worker_identity._classify_worker_ownership(worker, {"w-1"}, None)
+        assert verdict is worker_identity._OwnershipVerdict.OWNED
+
+    def test_owner_matches_username_is_owned(self) -> None:
+        """A visible owner equal to the authenticated username is a same-account signal."""
+        worker = Mock(id_="w-1", owner="Me#1")
+        verdict = worker_identity._classify_worker_ownership(worker, set(), "me#1")
+        assert verdict is worker_identity._OwnershipVerdict.OWNED
+
+    def test_visible_mismatched_owner_is_foreign(self) -> None:
+        """A visible owner different from this account is the only positive-proof foreign case."""
+        worker = Mock(id_="w-1", owner="Someone#999")
+        verdict = worker_identity._classify_worker_ownership(worker, set(), "me#1")
+        assert verdict is worker_identity._OwnershipVerdict.FOREIGN
+
+    def test_hidden_owner_is_indeterminate(self) -> None:
+        """A withheld owner with no id match cannot be proven foreign, so it is indeterminate."""
+        worker = Mock(id_="w-1", owner=None)
+        verdict = worker_identity._classify_worker_ownership(worker, {"other"}, "me#1")
+        assert verdict is worker_identity._OwnershipVerdict.INDETERMINATE
+
+    def test_owner_visible_but_no_account_username_is_indeterminate(self) -> None:
+        """If the account username could not be resolved, a visible owner cannot be compared: indeterminate."""
+        worker = Mock(id_="w-1", owner="Someone#999")
+        verdict = worker_identity._classify_worker_ownership(worker, set(), None)
+        assert verdict is worker_identity._OwnershipVerdict.INDETERMINATE
 
 
 class _FakeSession:

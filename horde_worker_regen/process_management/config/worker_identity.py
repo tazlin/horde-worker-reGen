@@ -10,21 +10,38 @@ This module verifies the configuration *before* any processes spawn:
 1. A local check (no network): names must not be the reserved defaults, and the alchemist name must
    differ from the dreamer name when alchemy is enabled.
 2. A network check: each enabled name must be either unregistered (a brand-new worker, the normal
-   first-run case) or already owned by the configured API key. The name is resolved through the
+   first-run case) or not *provably* owned by another account. The name is resolved through the
    single-worker-by-name endpoint, *not* the all-workers list: the list only returns workers that are
    currently active, so an idle (offline) worker registered under the name is invisible there and a
    collision would slip past this check, only to fail later at pop time. The by-name endpoint finds
    the worker regardless of activity, and its ``WorkerNotFound`` response is the genuine "name is free"
-   signal. Ownership is then accepted on *either* the worker id appearing in the account's worker_ids
-   OR the worker's owner matching the authenticated username, because the user-details worker_ids list
-   can lag or omit a worker the account genuinely owns (right after a fresh registration, or once an
-   idle worker is pruned from the list while still findable by name). Per the project's chosen policy
-   this hard-fails on *any* failure, including the API being unreachable (after a small bounded retry),
-   so the worker never silently runs under a name the horde will reject.
+   signal.
+
+A registered worker is classified into one of three ownership verdicts (see ``_classify_worker_ownership``):
+
+- **Owned** (silent pass): the worker id appears in the account's ``worker_ids``, or the worker's owner
+  matches the authenticated username. Two signals are needed because ``worker_ids`` can lag or omit a
+  worker the account genuinely owns (right after a fresh registration, or once an idle worker is pruned
+  from the list while still findable by name).
+- **Foreign** (hard fail): the worker's owner *is visible* and differs from the authenticated username.
+  This is the only case with positive proof that the name belongs to someone else.
+- **Indeterminate** (warn and proceed): the worker is registered but ownership cannot be confirmed *or*
+  disproven, because the horde did not reveal the owner. The horde only exposes a worker's ``owner`` to
+  moderators or when the owner enabled public workers, so a private account never sees it. Worse, the
+  *alchemist* (an ``interrogation_worker``) is a sibling of the image ``Worker`` in the horde's data
+  model and is structurally absent from the account's ``worker_ids``, so for a private account *neither*
+  ownership signal can ever fire for it. Treating that as "another account" hard-blocked boot on every
+  start. This is not proof of a collision, so it must not block boot: if the name really is foreign the
+  horde rejects pops with a (non-terminal) "wrong credentials" warning, which is the authoritative guard.
+
+Only an outright failure to reach a verdict (the API being unreachable, after a small bounded retry) or a
+proven-foreign name hard-fails; the worker never silently runs under a name the horde will *provably*
+reject, but neither does an unverifiable name become a strange boot-blocking error.
 """
 
 from __future__ import annotations
 
+import enum
 import time
 
 from horde_sdk.ai_horde_api.ai_horde_clients import AIHordeAPIClientSession, AIHordeAPISimpleClient
@@ -49,7 +66,20 @@ _OWNERSHIP_CHECK_RETRY_DELAY_SECONDS = 2.0
 
 
 class WorkerNameConfigError(Exception):
-    """Raised when a worker name is a reserved default, duplicated, or owned by another account."""
+    """Raised when a worker name is a reserved default, duplicated, or provably owned by another account."""
+
+
+class _OwnershipVerdict(enum.Enum):
+    """The outcome of comparing a registered worker against the authenticated account."""
+
+    OWNED = "owned"
+    """A same-account signal fired: pass silently."""
+
+    FOREIGN = "foreign"
+    """The worker's owner is visible and differs from this account: positive proof, hard fail."""
+
+    INDETERMINATE = "indeterminate"
+    """The worker is registered but ownership could be neither confirmed nor disproven: warn, proceed."""
 
 
 def verify_worker_identity(bridge_data: reGenBridgeData) -> None:
@@ -119,12 +149,27 @@ def _verify_worker_names_owned(bridge_data: reGenBridgeData) -> None:
                 if worker is None:
                     logger.info(f"Worker name {name!r} is not yet registered; it will be created on first pop.")
                     continue
-                if not _worker_is_owned_by_account(worker, owned_worker_ids, account_username):
+                verdict = _classify_worker_ownership(worker, owned_worker_ids, account_username)
+                if verdict is _OwnershipVerdict.FOREIGN:
                     raise WorkerNameConfigError(
                         f"Worker name {name!r} is already registered to another account "
-                        f"(owner: {worker.owner or 'unknown'}). Worker names are unique horde-wide; "
+                        f"(owner: {worker.owner}). Worker names are unique horde-wide; "
                         "choose a different name in bridgeData.yaml.",
                     )
+                if verdict is _OwnershipVerdict.INDETERMINATE:
+                    # The horde would not reveal the worker's owner (it does so only for moderators or
+                    # accounts with public workers enabled), and the alchemist is structurally absent from
+                    # worker_ids, so neither same-account signal could fire. This is not proof of a
+                    # collision; blocking boot on it turns an unverifiable name into a hard start failure.
+                    # A genuinely foreign name still fails, non-fatally, with "wrong credentials" at pop.
+                    logger.warning(
+                        f"Worker name {name!r} is registered on the horde but its ownership could not be "
+                        "confirmed for this account (the horde reveals a worker's owner only to moderators or "
+                        "when the owner enabled public workers, and alchemist workers are not listed in your "
+                        "account's worker ids). Proceeding; if this name belongs to another account the horde "
+                        "will reject pops with 'wrong credentials'.",
+                    )
+                    continue
                 logger.debug(f"Worker name {name!r} is owned by this account ({worker.id_}).")
             return
         except WorkerNameConfigError:
@@ -183,26 +228,36 @@ def _lookup_registered_worker(name: str, api_key: str) -> WorkerDetailItem | Non
     return response
 
 
-def _worker_is_owned_by_account(
+def _classify_worker_ownership(
     worker: WorkerDetailItem,
     owned_worker_ids: set[str],
     account_username: str | None,
-) -> bool:
-    """Whether a registered ``worker`` belongs to the authenticated account.
+) -> _OwnershipVerdict:
+    """Classify a registered ``worker`` against the authenticated account into an ownership verdict.
 
-    Ownership is accepted on *either* signal: the worker id appears in the account's ``worker_ids``,
-    or the worker's ``owner`` matches the authenticated ``username``. The owner-name match is the
-    robust fallback: ``worker_ids`` can lag or omit a worker the account genuinely owns (a freshly
-    registered worker, or an idle one pruned from the list while still findable by name), and relying
-    on it alone falsely rejected an owned worker as "another account", refusing to start. Usernames
-    are unique horde-wide (they carry a discriminator), so an owner/username match is a safe
-    same-account signal.
+    Ownership is accepted on *either* same-account signal: the worker id appears in the account's
+    ``worker_ids``, or the worker's ``owner`` matches the authenticated ``username``. The owner-name
+    match is a robust fallback because ``worker_ids`` can lag or omit a worker the account genuinely
+    owns (a freshly registered worker, or an idle one pruned from the list while still findable by
+    name). Usernames are unique horde-wide (they carry a discriminator), so an owner/username match is
+    a safe same-account signal.
+
+    A ``FOREIGN`` verdict requires *positive* proof: the owner is visible and differs from this
+    account. When the horde does not reveal the owner (the common case for a private account, and
+    always the case for the alchemist, whose id is structurally absent from ``worker_ids``), ownership
+    is ``INDETERMINATE`` rather than foreign. Only positive proof may block boot; an unverifiable name
+    must not, or a legitimately owned worker is refused a start.
     """
     if str(worker.id_) in owned_worker_ids:
-        return True
+        return _OwnershipVerdict.OWNED
     owner = (worker.owner or "").strip().lower()
     username = (account_username or "").strip().lower()
-    return bool(owner) and owner == username
+    if not owner or not username:
+        # Missing either side of the comparison: cannot confirm *or* disprove ownership.
+        return _OwnershipVerdict.INDETERMINATE
+    if owner == username:
+        return _OwnershipVerdict.OWNED
+    return _OwnershipVerdict.FOREIGN
 
 
 def lookup_worker_by_name(
