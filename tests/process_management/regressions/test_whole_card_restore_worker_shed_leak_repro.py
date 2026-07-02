@@ -120,7 +120,7 @@ class TestWholeCardRestoreReconcilesWorkerShed:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Repeated reduce/whole-card-restore cycles under pressure do not grow the recorded shed count without bound."""
+        """Repeat reduce/whole-card-restore cycles under pressure do not grow the recorded shed count without bound."""
         scheduler, process_map = _single_gpu_scheduler_with_scaling(monkeypatch)
         _pin_available_ram(scheduler, monkeypatch, _CRITICAL_AVAILABLE_RAM_MB)
 
