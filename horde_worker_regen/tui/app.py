@@ -52,7 +52,7 @@ from horde_worker_regen.tui.benchmark_launcher import (
 from horde_worker_regen.tui.beta_models import apply_beta_model_env
 from horde_worker_regen.tui.cache_home import apply_cache_home_env
 from horde_worker_regen.tui.config_form import DEFAULT_CONFIG_PATH
-from horde_worker_regen.tui.formatters import configure_fidelity
+from horde_worker_regen.tui.formatters import configure_fidelity, format_percent
 from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, build_offline_checks, derive
 from horde_worker_regen.tui.logging_setup import setup_supervisor_file_logging
 from horde_worker_regen.tui.update_check import UpdateInfo, check_for_update
@@ -77,6 +77,7 @@ from horde_worker_regen.tui.widgets.onboarding import (
     WorkerStartModal,
 )
 from horde_worker_regen.tui.widgets.overview import OverviewView
+from horde_worker_regen.tui.widgets.overview_layout import OverviewLayoutModal, valid_hidden_keys
 from horde_worker_regen.tui.widgets.stats import StatsView
 from horde_worker_regen.tui.wizard import SetupWizardModal, WizardOutcome, is_setup_incomplete
 from horde_worker_regen.tui.worker_launcher import SupervisorStatus, WorkerProcessMode, WorkerSupervisor
@@ -335,6 +336,8 @@ class HordeWorkerTUI(App[None]):
     BINDINGS = [
         ("f3", "start_stop_worker", "Start/Stop"),
         ("f6", "cycle_view_mode", "View mode"),
+        ("c", "customize_overview", "Customize"),
+        ("h", "toggle_hidden_reveal", "Reveal hidden"),
         ("f7", "toggle_download_pause", "Pause downloads"),
         ("t", "cycle_trend_window", "Trend window"),
         ("r", "reset_trends", "Reset trends"),
@@ -386,6 +389,12 @@ class HordeWorkerTUI(App[None]):
         persisted_state = self._app_state_store.load()
         self._view_mode = persisted_state.overview_view_mode
         self._trend_window = persisted_state.overview_trend_window
+        # Operator-hidden Overview elements (registry keys), restored from durable state. Unknown/renamed
+        # keys are dropped on load so a stale preference never blocks rendering.
+        self._overview_hidden: set[str] = valid_hidden_keys(persisted_state.overview_hidden_elements)
+        # Session-only: the 'h' quick-reveal toggle temporarily un-suppresses hidden elements. Not persisted,
+        # so a restart returns to the operator's curated layout.
+        self._reveal_hidden_elements = False
         self._show_recent_work_ledger_jobs = True
         self._last_trend_config_fingerprint: tuple[object, ...] | None = None
         self._last_main_tab = "tab-overview"
@@ -719,6 +728,8 @@ class HordeWorkerTUI(App[None]):
                 mode=self._view_mode,
                 trend_window=self._trend_window,
                 show_recent_work_ledger_jobs=self._show_recent_work_ledger_jobs,
+                hidden_keys=frozenset(self._overview_hidden),
+                reveal_hidden=self._reveal_hidden_elements,
             )
             self.query_one(GpusView).update_view(snapshot, mode=self._view_mode)
             self.query_one(DownloadsView).update_view(snapshot, mode=self._view_mode)
@@ -1037,8 +1048,16 @@ class HordeWorkerTUI(App[None]):
             self._last_trend_config_fingerprint = fingerprint
             overview.note_config_changed()
 
+    # Status-bar segments are laid out most-important-first and shed from the end on a narrow terminal.
+    _STATUS_BAR_SEPARATOR = "   "
+
     def _update_status_bar(self, report: HealthReport, snapshot: WorkerStateSnapshot | None) -> None:
-        """Render the top status bar, led by the worker's current lifecycle phase."""
+        """Render the always-visible top status bar: phase, a health summary, and at-a-glance vitals.
+
+        The bar is the single cross-tab summary. Health, RAM, GPU and pipeline are inlined here (rather than
+        only on the Overview) so they are legible from any tab, and the segments shed from the end when the
+        terminal is too narrow to hold them all, so nothing is ever truncated mid-word at 80 columns.
+        """
         phase_text = report.phase.value.upper()
         if report.phase is WorkerPhase.MAINTENANCE:
             source = self._paused_source(snapshot) or "server"
@@ -1047,17 +1066,88 @@ class HordeWorkerTUI(App[None]):
             source = self._paused_source(snapshot)
             if source:
                 phase_text = f"PAUSED·{source}"
-        badge = f"[black on {self._badge_colour(report.severity)}] {phase_text} [/]"
-        parts = [badge, f"[grey62]mode[/] {self._supervisor.mode.value}"]
+
+        # Priority order: the phase badge and any instability signal lead, then the health summary and live
+        # vitals, then the slower-moving identity/session counters that shed first.
+        parts = [f"[black on {self._badge_colour(report.severity)}] {phase_text} [/]"]
         if self._supervisor.restart_attempts:
             parts.append(f"[yellow]restarts {self._supervisor.restart_attempts}[/]")
+        parts.append(self._health_summary_markup(report))
         if snapshot is not None:
+            parts.append(self._pipeline_markup(snapshot))
+            if snapshot.gpu_utilization_mean_percent is not None:
+                parts.append(f"[grey62]gpu[/] {format_percent(snapshot.gpu_utilization_mean_percent)}")
+            ram = self._ram_percent_markup(snapshot)
+            if ram is not None:
+                parts.append(ram)
             kudos = "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"
-            parts.append(f"[grey62]worker[/] {snapshot.config.dreamer_name}")
-            parts.append(f"[grey62]submitted[/] {snapshot.num_jobs_submitted}")
-            parts.append(f"[grey62]faulted[/] {snapshot.num_jobs_faulted}")
             parts.append(f"[grey62]kudos/hr[/] {kudos}")
-        self.query_one("#status-bar", Static).update(Text.from_markup("   ".join(parts)))
+            parts.append(f"[grey62]done[/] {snapshot.num_jobs_submitted}")
+            parts.append(f"[yellow]faulted[/] {snapshot.num_jobs_faulted}" if snapshot.num_jobs_faulted else "")
+            parts.append(f"[grey62]worker[/] {snapshot.config.dreamer_name}")
+        parts.append(f"[grey62]mode[/] {self._supervisor.mode.value}")
+
+        parts = [part for part in parts if part]
+        self.query_one("#status-bar", Static).update(Text.from_markup(self._fit_status_parts(parts)))
+
+    def _fit_status_parts(self, parts: list[str]) -> str:
+        """Join ``parts`` (priority-ordered markup) with separators, dropping the tail that will not fit.
+
+        The first segment (the phase badge) is always kept even if it alone exceeds the width, so the bar is
+        never blank; every later segment is admitted only while the running visible width still fits.
+        """
+        width = self.size.width
+        if not width or width <= 0:
+            return self._STATUS_BAR_SEPARATOR.join(parts)
+        budget = width - 2  # the status bar carries one column of horizontal padding on each side
+        kept: list[str] = []
+        used = 0
+        for part in parts:
+            visible = Text.from_markup(part).cell_len
+            extra = visible + (len(self._STATUS_BAR_SEPARATOR) if kept else 0)
+            if kept and used + extra > budget:
+                break
+            kept.append(part)
+            used += extra
+        return self._STATUS_BAR_SEPARATOR.join(kept or parts[:1])
+
+    @staticmethod
+    def _health_summary_markup(report: HealthReport) -> str:
+        """One compact health segment: the worst check when something needs attention, else an OK tally.
+
+        Relies on :class:`HealthStatus` being an ``IntEnum`` ordered so a worse outcome compares greater.
+        """
+        checks = report.checks
+        if not checks:
+            return "[grey62]health[/] [grey50]-[/]"
+        worst = max(checks, key=lambda check: check.status)
+        if worst.status <= HealthStatus.INFO:
+            ok_count = sum(1 for check in checks if check.status is HealthStatus.OK)
+            return f"[grey62]health[/] [green]{ok_count}/{len(checks)} ok[/]"
+        colour = worst.status.colour
+        return f"[grey62]health[/] [{colour}]{worst.status.glyph} {worst.name}[/]"
+
+    @staticmethod
+    def _pipeline_markup(snapshot: WorkerStateSnapshot) -> str:
+        """The compact ``q▸inf▸saf▸sub`` pipeline segment for the status bar."""
+        safety = snapshot.jobs_pending_safety_check + snapshot.jobs_being_safety_checked
+        return (
+            f"[grey62]q[/][cyan]{snapshot.jobs_pending_inference}[/]"
+            f"[grey62]▸inf[/][green]{snapshot.jobs_in_progress}[/]"
+            f"[grey62]▸saf[/][grey70]{safety}[/]"
+            f"[grey62]▸sub[/][cyan]{snapshot.jobs_pending_submit}[/]"
+        )
+
+    @staticmethod
+    def _ram_percent_markup(snapshot: WorkerStateSnapshot) -> str | None:
+        """The system-RAM percentage segment, or None when no memory sample has arrived yet."""
+        wire = snapshot.system_memory
+        if wire is None or wire.total_bytes <= 0:
+            return None
+        used_fraction = wire.to_summary().used_fraction
+        if used_fraction is None:
+            return None
+        return f"[grey62]ram[/] {format_percent(used_fraction * 100)}"
 
     @staticmethod
     def _badge_colour(severity: HealthStatus) -> str:
@@ -1133,6 +1223,37 @@ class HordeWorkerTUI(App[None]):
         self._show_recent_work_ledger_jobs = not self._show_recent_work_ledger_jobs
         state = "shown" if self._show_recent_work_ledger_jobs else "summarized"
         self.notify(f"Work ledger recent jobs: {state}.")
+        self._tick()
+
+    def action_customize_overview(self) -> None:
+        """Open the customize-layout modal; persist the chosen hidden set when it closes."""
+        self.push_screen(OverviewLayoutModal(frozenset(self._overview_hidden)), self._on_overview_layout_chosen)
+
+    def _on_overview_layout_chosen(self, hidden: frozenset[str] | None) -> None:
+        """Store the operator's hidden-element choice and refresh the Overview immediately."""
+        if hidden is None:
+            return
+        self._overview_hidden = set(hidden)
+        # A fresh customize pass is an explicit re-curation, so drop any temporary quick-reveal state: what
+        # the operator just chose is what they should see.
+        self._reveal_hidden_elements = False
+        with contextlib.suppress(Exception):
+            self._app_state_store.set_overview_hidden_elements(self._overview_hidden)
+        self.notify(f"Overview layout saved ({len(self._overview_hidden)} hidden).")
+        self._tick()
+
+    def action_toggle_hidden_reveal(self) -> None:
+        """Temporarily reveal (or re-hide) every element the operator has marked hidden.
+
+        This is a session-only convenience: it never changes the persisted hidden set, so it is a quick way
+        to glance at a demoted panel without re-editing the layout.
+        """
+        if not self._overview_hidden:
+            self.notify("No overview elements are hidden.")
+            return
+        self._reveal_hidden_elements = not self._reveal_hidden_elements
+        state = "revealed" if self._reveal_hidden_elements else "re-hidden"
+        self.notify(f"Hidden overview elements {state}.")
         self._tick()
 
     def action_toggle_pause(self) -> None:

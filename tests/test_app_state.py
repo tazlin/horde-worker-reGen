@@ -180,6 +180,37 @@ def test_legacy_detailed_info_migrates_to_details_view(tmp_path: Path) -> None:
     assert store.load().overview_view_mode is OverviewViewMode.DETAILS
 
 
+def test_overview_hidden_elements_default_empty(tmp_path: Path) -> None:
+    """A fresh state hides nothing on the Overview."""
+    assert _store(tmp_path).load().overview_hidden_elements == []
+
+
+def test_set_overview_hidden_elements_round_trips_sorted_and_preserves_fields(tmp_path: Path) -> None:
+    """Hidden elements persist (de-duplicated and sorted) without clobbering other recorded state."""
+    store = _store(tmp_path)
+    store.set_auto_start_worker(True)
+
+    store.set_overview_hidden_elements(["trends", "health", "trends"])
+
+    state = store.load()
+    assert state.overview_hidden_elements == ["health", "trends"]
+    assert state.auto_start_worker is True
+
+    store.set_overview_hidden_elements([])
+    assert store.load().overview_hidden_elements == []
+
+
+def test_old_state_file_without_hidden_elements_loads_with_default(tmp_path: Path) -> None:
+    """A state file predating the field loads with an empty hidden set rather than failing."""
+    store = _store(tmp_path)
+    store.path.parent.mkdir(parents=True, exist_ok=True)
+    store.path.write_text('{"auto_start_worker": true}', encoding="utf-8")
+
+    state = store.load()
+    assert state.overview_hidden_elements == []
+    assert state.auto_start_worker is True
+
+
 def test_setup_complete_defaults_off(tmp_path: Path) -> None:
     """A fresh state has setup-complete off, so a new install runs the wizard."""
     assert _store(tmp_path).load().setup_complete is False

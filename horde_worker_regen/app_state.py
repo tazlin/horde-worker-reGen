@@ -26,7 +26,7 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -163,6 +163,10 @@ class WorkerAppState(BaseModel):
     redesigned lean overview is the default, with the older verbose dashboard behind ``details``."""
     overview_trend_window: OverviewTrendWindow = OverviewTrendWindow.FIFTEEN_MINUTES
     """Time span used by the Overview trend sparklines; samples remain session-local."""
+    overview_hidden_elements: list[str] = Field(default_factory=list)
+    """Stable keys of Overview elements the operator has hidden (see the overview layout registry).
+    Persisted so a curated dashboard survives restarts; an unknown key is ignored rather than rejected,
+    so the list stays forward-compatible when elements are renamed or removed."""
     worker_version_last_ran: str | None = None
     onboarding: OnboardingState = Field(default_factory=OnboardingState)
     last_worker_run: WorkerRunRecord | None = None
@@ -357,6 +361,16 @@ class AppStateStore:
         """Persist the Overview tab's trend window."""
         state = self.load()
         state.overview_trend_window = window
+        self.save(state)
+
+    def set_overview_hidden_elements(self, keys: Iterable[str]) -> None:
+        """Persist the set of Overview element keys the operator has chosen to hide.
+
+        Stored sorted and de-duplicated so the on-disk file is stable regardless of the modal's
+        iteration order, which keeps diffs and round-trip tests deterministic.
+        """
+        state = self.load()
+        state.overview_hidden_elements = sorted(set(keys))
         self.save(state)
 
     # endregion

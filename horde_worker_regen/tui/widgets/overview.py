@@ -6,7 +6,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from rich.console import Group
+from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -63,6 +63,7 @@ from horde_worker_regen.tui.responsive import (
 )
 from horde_worker_regen.tui.trends import fixed_counter_deltas, fixed_float_buckets, trend_bounds
 from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
+from horde_worker_regen.tui.widgets.overview_layout import OVERVIEW_ELEMENTS
 from horde_worker_regen.update_check import UpdateInfo, current_version
 
 _TREND_HISTORY = 21600
@@ -74,8 +75,11 @@ _TREND_SAMPLE_INTERVAL = 1.0
 _TREND_SPARK_WIDTH = 48
 """Maximum number of samples drawn in a Trends sparkline, keeping the line terminal-friendly."""
 
-_DETAIL_SIDE_BY_SIDE_MIN_WIDTH = 110
-"""Minimum Overview content width where detailed mode uses side-by-side row groups."""
+_TWO_COLUMN_MIN_WIDTH = 100
+"""Minimum Overview width (columns) at which panels lay out two-up instead of a single stack."""
+
+_THREE_COLUMN_MIN_WIDTH = 165
+"""Minimum Overview width (columns) at which the widest panel regions spread across three columns."""
 
 _SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "INFERENCE_POST_PROCESSING", "ALCHEMY_STARTING"})
 """States with a live sampling step/it-s; outside these the snapshot's step numbers are last-job residue."""
@@ -140,42 +144,6 @@ class OverviewView(Vertical):
         width: 100%;
         layout: vertical;
     }
-    OverviewView.-details-wide #overview-core-grid {
-        layout: grid;
-        grid-size: 2;
-        grid-columns: 2fr 1fr;
-        grid-rows: auto;
-        grid-gutter: 0 1;
-    }
-    OverviewView.-details-wide #overview-core-grid Static,
-    OverviewView.-details-wide #overview-workload-column {
-        width: 100%;
-        height: auto;
-    }
-    OverviewView.-details-wide .overview-row {
-        layout: horizontal;
-        grid-gutter: 0 1;
-    }
-    OverviewView.-details-wide .overview-row Static {
-        width: 1fr;
-        height: auto;
-        margin: 0 1 0 0;
-    }
-    OverviewView.-details-wide #overview-ops-row {
-        layout: grid;
-        grid-size: 2;
-        grid-columns: 1fr 1fr;
-        grid-rows: auto;
-        grid-gutter: 1 1;
-    }
-    OverviewView.-details-wide #overview-ops-row Static {
-        width: 100%;
-        height: auto;
-        margin: 0;
-    }
-    OverviewView.-details-wide #overview-worker {
-        row-span: 2;
-    }
     OverviewView #overview-residency {
         width: auto;
     }
@@ -196,19 +164,74 @@ class OverviewView(Vertical):
         height: auto;
         margin: 0;
     }
-    OverviewView.-details-wide #overview-intent-row {
+
+    /* Two-column layout, applied whenever the width can host it (any density mode). */
+    OverviewView.-cols-2 #overview-core-grid {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 2fr 1fr;
+        grid-rows: auto;
+        grid-gutter: 0 1;
+    }
+    OverviewView.-cols-2 #overview-core-grid Static,
+    OverviewView.-cols-2 #overview-workload-column {
+        width: 100%;
+        height: auto;
+    }
+    /* Trends carries a wide sparkline, so it takes the full grid width on its own row rather than being
+       squeezed into a fractional column (which would scrunch the label/value/spark/peak layout). */
+    OverviewView.-cols-2 #overview-trends {
+        column-span: 2;
+    }
+    OverviewView.-cols-2 .overview-row {
+        layout: horizontal;
+        grid-gutter: 0 1;
+    }
+    OverviewView.-cols-2 .overview-row Static {
+        width: 1fr;
+        height: auto;
+        margin: 0 1 0 0;
+    }
+    OverviewView.-cols-2 #overview-ops-row {
         layout: grid;
         grid-size: 2;
         grid-columns: 1fr 1fr;
         grid-rows: auto;
         grid-gutter: 1 1;
     }
-    OverviewView.-details-wide #overview-queue {
+    OverviewView.-cols-2 #overview-ops-row Static {
+        width: 100%;
+        height: auto;
+        margin: 0;
+    }
+    OverviewView.-cols-2 #overview-worker {
+        row-span: 2;
+    }
+    OverviewView.-cols-2 #overview-intent-row {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 1fr 1fr;
+        grid-rows: auto;
+        grid-gutter: 1 1;
+    }
+    OverviewView.-cols-2 #overview-queue {
         column-span: 2;
     }
+
+    /* Three-column layout, layered on top of -cols-2 on a roomy terminal: spread the compact ops-row
+       panels (worker/alchemy/residency) three-up. The core grid stays two-up on purpose: Health wants a
+       wide detail column and Trends spans full width, so a third core column would only cramp them. */
+    OverviewView.-cols-3 #overview-ops-row {
+        grid-size: 3;
+        grid-columns: 1fr 1fr 1fr;
+    }
+    OverviewView.-cols-3 #overview-worker {
+        row-span: 1;
+    }
     """
-    """Row containers stay vertical by default, then detailed mode opts into horizontal adjacency when the
-    current content width can support it."""
+    """Row containers stay vertical (single column) by default; ``-cols-2``/``-cols-3`` opt into horizontal
+    adjacency once the terminal is wide enough (see ``_apply_overview_columns``). ``-cols-3`` is layered on
+    top of ``-cols-2`` and widens only the compact ops-row; Health/Trends keep their two-column band."""
 
     def __init__(self) -> None:
         """Set up the view, including the client-side trend history for the Trends sparklines."""
@@ -265,7 +288,6 @@ class OverviewView(Vertical):
             with Container(id="overview-intent-row"):
                 yield Static(id="overview-queue")
                 yield Static(id="overview-intent")
-                yield Static(id="overview-governors")
                 yield Static(id="overview-governance")
             yield Static(id="overview-work")
             yield Static(id="overview-processes")
@@ -295,6 +317,25 @@ class OverviewView(Vertical):
     _DETAIL_ROW_IDS = ("#overview-history-row",)
     """Row containers shown only in details mode."""
 
+    def on_mount(self) -> None:
+        """Pick the column count for the initial size so the first paint is not misaligned."""
+        self._apply_overview_columns()
+
+    def on_resize(self) -> None:
+        """Re-pick the two/three-column layout when the terminal is resized."""
+        self._apply_overview_columns()
+
+    def _apply_overview_columns(self) -> None:
+        """Stamp ``-cols-2``/``-cols-3`` from the current width so panels lay out two- or three-up.
+
+        The classes are additive: ``-cols-3`` layers on top of ``-cols-2`` (the base horizontal rules live
+        under ``-cols-2``), so a three-column screen carries both. Below the two-column threshold neither is
+        set and every region falls back to the single stacked column defined by the base CSS.
+        """
+        width = self.size.width
+        self.set_class(width >= _TWO_COLUMN_MIN_WIDTH, "-cols-2")
+        self.set_class(width >= _THREE_COLUMN_MIN_WIDTH, "-cols-3")
+
     def update_view(
         self,
         report: HealthReport,
@@ -304,30 +345,78 @@ class OverviewView(Vertical):
         mode: OverviewViewMode = OverviewViewMode.NORMAL,
         trend_window: OverviewTrendWindow | None = None,
         show_recent_work_ledger_jobs: bool = True,
+        hidden_keys: frozenset[str] = frozenset(),
+        reveal_hidden: bool = False,
     ) -> None:
-        """Refresh the visible regions for the active view ``mode`` from the report and snapshot."""
+        """Refresh the visible regions for the active view ``mode`` from the report and snapshot.
+
+        ``hidden_keys`` are the operator's hidden-element choices (registry keys); ``reveal_hidden``
+        temporarily un-suppresses them for the quick reveal toggle. Hiding is layered on top of the mode
+        and per-panel guards: it can only remove an element that would otherwise show, never force one on.
+        """
         if trend_window is not None:
             self.set_trend_window(trend_window)
         thin = mode is OverviewViewMode.THIN
         detailed = mode is OverviewViewMode.DETAILS
-        # The laid-out content width drives both row adjacency and column shedding. It is 0 before the
-        # first layout pass, where None disables shedding so the first frame renders fully.
+        self._apply_overview_columns()
+        # The laid-out content width drives column shedding. It is 0 before the first layout pass, where
+        # None disables shedding so the first frame renders fully.
         width = self.content_size.width or None
-        self.set_class(detailed and width is not None and width >= _DETAIL_SIDE_BY_SIDE_MIN_WIDTH, "-details-wide")
+
+        effective_hidden = frozenset() if reveal_hidden else hidden_keys
+        hidden_nodes = {element.node_id for element in OVERVIEW_ELEMENTS if element.key in effective_hidden}
+
+        def visible(node_id: str, base: bool) -> bool:
+            """Final display for a registry node: its mode/guard base minus any operator hide."""
+            return base and node_id not in hidden_nodes
 
         self.query_one("#overview-thin", Static).display = thin
         for row_id in self._NORMAL_ROW_IDS:
             self.query_one(row_id).display = not thin
         for row_id in self._DETAIL_ROW_IDS:
             self.query_one(row_id).display = detailed
-        for node_id in self._NORMAL_NODE_IDS:
-            self.query_one(node_id, Static).display = not thin
-        for node_id in self._DETAIL_NODE_IDS:
-            self.query_one(node_id, Static).display = detailed
-        # The intent-row children are managed individually (queue is details-only, governors conditional).
-        self.query_one("#overview-intent", Static).display = not thin
-        self.query_one("#overview-queue", Static).display = detailed
-        self.query_one("#overview-governance", Static).display = detailed and snapshot is not None
+
+        # Governance folds the pop governors and the scheduler-governance diagnostics into one grouping:
+        # the pop half surfaces whenever a governor is engaged (so a teardown/cooldown/backpressure is never
+        # a silent mystery, and in details mode also once one has a session history), while the scheduling
+        # half is a details-mode diagnostic.
+        residency = snapshot.whole_card_residency if snapshot is not None else None
+        governors = snapshot.pop_governors if snapshot is not None else None
+        scheduling = snapshot.scheduling_governance if snapshot is not None else None
+        governors_have_history = detailed and governors is not None and bool(governors.governors)
+        show_pop = governors is not None and (governors.any_active or governors_have_history)
+        show_sched = detailed and scheduling is not None
+
+        show = {
+            "#overview-hero": visible("#overview-hero", not thin),
+            "#overview-health": visible("#overview-health", not thin),
+            "#overview-trends": visible("#overview-trends", not thin),
+            "#overview-pipeline": visible("#overview-pipeline", not thin),
+            "#overview-work": visible("#overview-work", not thin),
+            "#overview-processes": visible("#overview-processes", not thin),
+            "#overview-intent": visible("#overview-intent", not thin and snapshot is not None),
+            "#overview-queue": visible("#overview-queue", detailed and snapshot is not None),
+            "#overview-governance": visible("#overview-governance", not thin and (show_pop or show_sched)),
+            "#overview-gpus": visible("#overview-gpus", not thin and snapshot is not None and bool(snapshot.per_card)),
+            "#overview-worker": visible("#overview-worker", not thin and snapshot is not None),
+            "#overview-alchemy": visible(
+                "#overview-alchemy",
+                not thin and snapshot is not None and self._show_alchemy_panel(snapshot),
+            ),
+            # Residency detail is details-only AND only when the feature applies, so it never clutters the
+            # detailed view on hardware/configs that never engage whole-card residency.
+            "#overview-residency": visible(
+                "#overview-residency",
+                detailed and residency is not None and (residency.active or residency.possible),
+            ),
+            "#overview-recent": visible("#overview-recent", detailed and snapshot is not None),
+        }
+        for node_id, is_shown in show.items():
+            self.query_one(node_id, Static).display = is_shown
+        # The ops-row container carries the worker/alchemy/residency panels; show it while any of them do.
+        self.query_one("#overview-ops-row").display = (
+            show["#overview-worker"] or show["#overview-alchemy"] or show["#overview-residency"]
+        )
 
         nag = self.query_one("#overview-update-nag", Static)
         if self._update_info is not None:
@@ -336,32 +425,6 @@ class OverviewView(Vertical):
         else:
             nag.display = False
 
-        show_worker = not thin and snapshot is not None
-        show_alchemy = show_worker and self._show_alchemy_panel(snapshot)
-        self.query_one("#overview-ops-row").display = show_worker
-        self.query_one("#overview-worker", Static).display = show_worker
-        self.query_one("#overview-alchemy", Static).display = show_alchemy
-
-        # The residency detail is details-only AND only when the feature applies, so the panel never
-        # clutters the detailed view on hardware/configs that never engage whole-card residency.
-        residency = snapshot.whole_card_residency if snapshot is not None else None
-        show_residency = detailed and residency is not None and (residency.active or residency.possible)
-        self.query_one("#overview-residency", Static).display = show_residency
-
-        # The per-card strip rides the normal/details modes (hidden in thin, where the compact bar stands in)
-        # and only appears once the worker reports per-card data, so an older worker's overview is unchanged.
-        show_gpus = not thin and snapshot is not None and bool(snapshot.per_card)
-        self.query_one("#overview-gpus", Static).display = show_gpus
-
-        # The pop-governor strip surfaces whatever is currently holding back or reshaping pops. It appears when
-        # a governor is engaged (so a teardown/cooldown/backpressure is never a silent mystery), and in details
-        # mode also when any governor has a session history worth reviewing.
-        governors = snapshot.pop_governors if snapshot is not None else None
-        show_governors = (
-            not thin and governors is not None and (governors.any_active or (detailed and bool(governors.governors)))
-        )
-        self.query_one("#overview-governors", Static).display = show_governors
-
         if snapshot is not None:
             self._maybe_record_trends(snapshot)
 
@@ -369,27 +432,34 @@ class OverviewView(Vertical):
             self.query_one("#overview-thin", Static).update(self._render_compact_bar(report, snapshot, frame))
             return
 
-        self.query_one("#overview-hero", Static).update(self._render_hero(report, snapshot, frame))
-        self.query_one("#overview-health", Static).update(
-            self._render_health(report, snapshot.feature_readiness if snapshot is not None else None),
-        )
-        if snapshot is not None:
+        if show["#overview-hero"]:
+            self.query_one("#overview-hero", Static).update(self._render_hero(report, snapshot, frame))
+        if show["#overview-health"]:
+            self.query_one("#overview-health", Static).update(
+                self._render_health(report, snapshot.feature_readiness if snapshot is not None else None),
+            )
+        if snapshot is None:
+            return
+
+        if show["#overview-intent"]:
             self.query_one("#overview-intent", Static).update(self._render_intent(snapshot, detailed=detailed))
-            if show_governors and governors is not None:
-                self.query_one("#overview-governors", Static).update(
-                    self._render_governors_panel(governors, detailed=detailed),
-                )
-            if detailed:
-                self.query_one("#overview-governance", Static).update(
-                    self._render_governance_panel(snapshot.scheduling_governance),
-                )
-                self.query_one("#overview-queue", Static).update(
-                    self._render_queue_table(snapshot, available_width=width),
-                )
-            if show_gpus:
-                self.query_one("#overview-gpus", Static).update(self._render_gpus_strip(snapshot, detailed=detailed))
+        if show["#overview-governance"]:
+            self.query_one("#overview-governance", Static).update(
+                self._render_governance_combined(
+                    governors if show_pop else None,
+                    scheduling if show_sched else None,
+                    detailed=detailed,
+                ),
+            )
+        if show["#overview-queue"]:
+            self.query_one("#overview-queue", Static).update(self._render_queue_table(snapshot, available_width=width))
+        if show["#overview-gpus"]:
+            self.query_one("#overview-gpus", Static).update(self._render_gpus_strip(snapshot, detailed=detailed))
+        if show["#overview-trends"]:
             self.query_one("#overview-trends", Static).update(self._render_trends(snapshot))
+        if show["#overview-pipeline"]:
             self.query_one("#overview-pipeline", Static).update(self._render_pipeline_strip(snapshot))
+        if show["#overview-work"]:
             self.query_one("#overview-work", Static).update(
                 self._render_work_ledger(
                     snapshot,
@@ -398,21 +468,20 @@ class OverviewView(Vertical):
                     show_recent_jobs=show_recent_work_ledger_jobs,
                 ),
             )
+        if show["#overview-processes"]:
             self.query_one("#overview-processes", Static).update(
                 self._render_process_table(snapshot, detailed=detailed, available_width=width),
             )
-            if show_worker:
-                self.query_one("#overview-worker", Static).update(self._render_worker_table(snapshot))
-            if show_alchemy:
-                self.query_one("#overview-alchemy", Static).update(self._render_alchemy_panel(snapshot))
-            if detailed:
-                self.query_one("#overview-recent", Static).update(
-                    self._render_recent_jobs(snapshot, available_width=width),
-                )
-                if show_residency:
-                    self.query_one("#overview-residency", Static).update(
-                        self._render_residency_panel(snapshot.whole_card_residency),
-                    )
+        if show["#overview-worker"]:
+            self.query_one("#overview-worker", Static).update(self._render_worker_table(snapshot))
+        if show["#overview-alchemy"]:
+            self.query_one("#overview-alchemy", Static).update(self._render_alchemy_panel(snapshot))
+        if show["#overview-recent"]:
+            self.query_one("#overview-recent", Static).update(
+                self._render_recent_jobs(snapshot, available_width=width)
+            )
+        if show["#overview-residency"] and residency is not None:
+            self.query_one("#overview-residency", Static).update(self._render_residency_panel(residency))
 
     def _maybe_record_trends(self, snapshot: WorkerStateSnapshot) -> None:
         """Record a trend sample at most once per :data:`_TREND_SAMPLE_INTERVAL` of wall-clock time."""
@@ -610,32 +679,27 @@ class OverviewView(Vertical):
 
     @staticmethod
     def _memory_line(snapshot: WorkerStateSnapshot) -> Text | None:
-        """A system-RAM line: whole-machine in-use/total and the worker's per-role share.
+        """A system-RAM line: whole-machine in-use/total and the worker's total share.
 
-        Returns None when no memory sample has arrived yet (older worker, or before the first report), so
-        the hero simply omits the line rather than showing zeroes.
+        The per-role worker breakdown lives on the Live tab, which already carries per-process RAM; the
+        hero keeps only the overall figures so the status view stays scannable. Returns None when no memory
+        sample has arrived yet (older worker, or before the first report), so the hero simply omits the line.
         """
         wire = snapshot.system_memory
         if wire is None or wire.total_bytes <= 0:
             return None
-        from horde_worker_regen.process_management.resources.system_memory import ROLE_LABELS
 
         summary = wire.to_summary()
         used_fraction = summary.used_fraction
         used_pct = f" ({used_fraction * 100:.0f}%)" if used_fraction is not None else ""
 
-        line = Text.assemble(
+        return Text.assemble(
             ("RAM ", "grey50"),
             (f"{human_bytes(summary.used_bytes)} / {human_bytes(summary.total_bytes)}", "grey70"),
             (used_pct, "grey50"),
             ("  ·  worker ", "grey50"),
             (human_bytes(summary.worker_total_bytes), "bold cyan"),
         )
-        role_items = summary.nonzero_role_items()
-        if role_items:
-            parts = ", ".join(f"{ROLE_LABELS.get(role, role)} {human_bytes(value)}" for role, value in role_items)
-            line.append(f" ({parts})", style="grey50")
-        return line
 
     @staticmethod
     def _download_line(snapshot: WorkerStateSnapshot) -> Text | None:
@@ -794,8 +858,12 @@ class OverviewView(Vertical):
         return decision.replace("_", " ").title()
 
     @staticmethod
-    def _render_governance_panel(governance: SchedulingGovernanceSnapshot) -> Panel:
-        """Render the details-mode scheduler governance diagnostics."""
+    def _scheduling_grid(governance: SchedulingGovernanceSnapshot) -> tuple[Table, bool]:
+        """Build the scheduler-governance diagnostics grid, plus whether anything is actively holding.
+
+        Returns the grid and an ``active`` flag (RAM pressure, a pop hold, or a non-admitting preload
+        decision) so a caller can colour the surrounding panel border.
+        """
         ram = governance.ram
         preload = governance.preload
         grid = Table.grid(padding=(0, 2))
@@ -826,7 +894,10 @@ class OverviewView(Vertical):
         grid.add_row("Reclaim", Text("; ".join(reclaim_bits) if reclaim_bits else "none active", style="grey62"))
 
         if ram.measured:
-            restore = f"{human_mb(ram.restore_headroom_mb)} headroom; {human_mb(ram.per_context_ram_estimate_mb)} per context"
+            restore = (
+                f"{human_mb(ram.restore_headroom_mb)} headroom; "
+                f"{human_mb(ram.per_context_ram_estimate_mb)} per context"
+            )
             if ram.per_process_ceiling_mb is not None:
                 restore += f"; {human_mb(ram.per_process_ceiling_mb)} process ceiling"
             grid.add_row("Restore", Text(restore, style="grey62"))
@@ -841,12 +912,18 @@ class OverviewView(Vertical):
             grid.add_row("Gate", Text(preload.reason, style="grey62"))
 
         active = ram.under_pressure or ram.pop_hold_active or preload_style == "yellow"
+        return grid, active
+
+    @staticmethod
+    def _render_governance_panel(governance: SchedulingGovernanceSnapshot) -> Panel:
+        """Render the scheduler governance diagnostics as a standalone panel."""
+        grid, active = OverviewView._scheduling_grid(governance)
         border = "yellow" if active else "grey37"
         return Panel(grid, title="Scheduling governance", title_align="left", border_style=border, padding=(0, 1))
 
     @staticmethod
-    def _render_governors_panel(governors: PopGovernorsSnapshot, *, detailed: bool) -> Panel:
-        """Render the pop/scheduling governors currently holding back or reshaping job pops.
+    def _governors_grid(governors: PopGovernorsSnapshot, *, detailed: bool) -> Table:
+        """Build the pop-governor grid: active governors first, then a dim session history in details mode.
 
         Active governors lead, each with its reason and either a live countdown (timed windows: a residency
         cooldown, the switch/re-entry windows, the consecutive-failure or self-throttle pause, the
@@ -885,15 +962,56 @@ class OverviewView(Vertical):
                     Text(summary + pct, style="grey50"),
                 )
 
+        return grid
+
+    @staticmethod
+    def _render_governors_panel(governors: PopGovernorsSnapshot, *, detailed: bool) -> Panel:
+        """Render the pop governors currently holding back or reshaping job pops as a standalone panel."""
         border = "yellow" if governors.any_active else "grey37"
         return Panel(
-            grid,
+            OverviewView._governors_grid(governors, detailed=detailed),
             title="Pop governors",
             title_align="left",
             border_style=border,
             padding=(0, 1),
             expand=False,
         )
+
+    @staticmethod
+    def _render_governance_combined(
+        governors: PopGovernorsSnapshot | None,
+        scheduling: SchedulingGovernanceSnapshot | None,
+        *,
+        detailed: bool,
+    ) -> Panel:
+        """Fold the pop governors and scheduler governance into one panel with labelled sub-sections.
+
+        Either sub-section is omitted when its caller passes None, so the panel shows only what is relevant:
+        an active-governor summary in normal mode, both sub-sections in details mode. The active-governor
+        count rides the title so an operator sees at a glance how many holds are engaged without expanding.
+        """
+        parts: list[RenderableType] = []
+        active_governors = 0
+        border = "grey37"
+
+        if governors is not None:
+            active_governors = sum(1 for governor in governors.governors if governor.active)
+            if governors.any_active:
+                border = "yellow"
+            parts.append(Text("Pop governors", style="bold grey70"))
+            parts.append(OverviewView._governors_grid(governors, detailed=detailed))
+
+        if scheduling is not None:
+            grid, sched_active = OverviewView._scheduling_grid(scheduling)
+            if sched_active:
+                border = "yellow"
+            if parts:
+                parts.append(Text(""))
+            parts.append(Text("Scheduling", style="bold grey70"))
+            parts.append(grid)
+
+        title = "Governance" if not active_governors else f"Governance · {active_governors} active"
+        return Panel(Group(*parts), title=title, title_align="left", border_style=border, padding=(0, 1))
 
     def _render_health(self, report: HealthReport, feature_readiness: FeatureReadinessSummary | None = None) -> Panel:
         """Render the health checklist, with a compact feature-readiness line when any feature is engaged."""
@@ -1225,16 +1343,21 @@ class OverviewView(Vertical):
                 table.add_row(*[spec.render(entry) for spec in layout.columns])
         subtitle = shed_hint(layout)
         body = table
+        completed = sum(1 for entry in recent_entries if not entry.faulted)
+        faulted = len(recent_entries) - completed
         if not show_recent_jobs and recent_entries:
-            completed = sum(1 for entry in recent_entries if not entry.faulted)
-            faulted = len(recent_entries) - completed
             summary = f"{completed} job{'s' if completed != 1 else ''} completed recently"
             if faulted:
                 summary += f"; {faulted} faulted"
             body = Group(table, Text(f"({summary})", style="grey62"))
+        # Surface the active/finished tally in the title so the ledger's scale reads without scanning rows.
+        active_count = sum(1 for entry in snapshot.work_ledger if entry.stage not in recent_stages)
+        title = "Work ledger"
+        if active_count or recent_entries:
+            title = f"Work ledger · {active_count} active · {completed + faulted} done"
         return Panel(
             body,
-            title="Work ledger",
+            title=title,
             title_align="left",
             subtitle=Text(subtitle, style="grey50") if subtitle else None,
             subtitle_align="right",
@@ -1413,7 +1536,13 @@ class OverviewView(Vertical):
                 f"{card.loaded_contexts}/{card.target_process_count} ctx",
                 tail,
             )
-        return Panel(grid, title="GPUs", title_align="left", border_style="grey37", padding=(0, 1))
+        # Card count and mean duty ride the title so utilization reads at a glance, and a multi-GPU host is
+        # obvious even before the rows are scanned.
+        card_count = len(snapshot.per_card)
+        title = f"GPUs · {card_count} card{'s' if card_count != 1 else ''}"
+        if snapshot.gpu_utilization_mean_percent is not None:
+            title += f" · {format_percent(snapshot.gpu_utilization_mean_percent)} duty"
+        return Panel(grid, title=title, title_align="left", border_style="grey37", padding=(0, 1))
 
     def _render_trends(self, snapshot: WorkerStateSnapshot) -> Panel:
         """Render recent kudos/hr, jobs/hr, and GPU-duty trends: a value, direction, and sparkline.
@@ -1605,8 +1734,17 @@ class OverviewView(Vertical):
             ceiling=intent_ceiling(detailed),
             available_width=available_width,
         )
+        # Fold the alive/hot tally into the title so process health reads at a glance without counting rows.
+        total_procs = len(snapshot.processes)
+        alive = sum(1 for process in snapshot.processes if process.is_alive)
+        hot = sum(1 for process in snapshot.processes if process.is_busy)
+        title = "Processes"
+        if total_procs:
+            title = f"Processes · {alive}/{total_procs} alive"
+            if hot:
+                title += f" · {hot} hot"
         table = Table(
-            title="Processes",
+            title=title,
             title_style="bold",
             expand=True,
             border_style="grey37",
@@ -1751,9 +1889,17 @@ class OverviewView(Vertical):
         lane = OverviewView._render_queue_lane(snapshot)
         body = Group(lane, Text(""), table) if lane is not None else table
         subtitle = shed_hint(layout)
+        # The pending count and its total megapixelstep cost ride the title, so queue depth and weight read
+        # at a glance without expanding every row.
+        pending = len(snapshot.pending_jobs)
+        title = "Queue"
+        if pending:
+            title = f"Queue · {pending} pending"
+            if snapshot.pending_megapixelsteps:
+                title += f" · {snapshot.pending_megapixelsteps:,.0f} MP"
         return Panel(
             body,
-            title="Queue",
+            title=title,
             title_align="left",
             subtitle=Text(subtitle, style="grey50") if subtitle else None,
             subtitle_align="right",

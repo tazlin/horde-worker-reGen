@@ -156,7 +156,11 @@ def test_overview_compact_bar_includes_download_progress() -> None:
 
 
 def test_overview_hero_shows_system_memory_line() -> None:
-    """The hero renders a RAM line with the in-use/total figure and the worker's per-role breakdown."""
+    """The hero renders a RAM line with the in-use/total figure and the worker's total share only.
+
+    The per-role breakdown was relocated to the Live tab; the hero keeps just the overall figures so the
+    status view stays scannable.
+    """
     _GB = 1024**3
     snapshot = WorkerStateSnapshot(
         config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
@@ -173,7 +177,8 @@ def test_overview_hero_shows_system_memory_line() -> None:
 
     assert "RAM 44.0 GB / 64.0 GB" in hero
     assert "worker 21.0 GB" in hero
-    assert "inference 18.0 GB" in hero
+    # The per-role split now lives on the Live tab, not the hero.
+    assert "inference 18.0 GB" not in hero
 
 
 def test_overview_hero_omits_memory_line_without_sample() -> None:
@@ -854,3 +859,123 @@ def test_governance_panel_surfaces_ram_and_preload_decision() -> None:
     assert "Flux.1-dev" in text
     assert "p2" in text
     assert "VRAM/RAM budget gate" in text
+
+
+def _one_active_governor() -> PopGovernorsSnapshot:
+    return PopGovernorsSnapshot(
+        governors=[
+            PopGovernorStatus(
+                name="large_model_reentry",
+                label="Large-model re-entry cooldown",
+                active=True,
+                reason="cooling down before serving any very-large model",
+                current_spell_seconds=12.0,
+                expected_remaining_seconds=33.0,
+                triggers=1,
+                total_active_seconds=12.0,
+                fraction_of_session=0.1,
+            ),
+        ],
+        any_active=True,
+    )
+
+
+def _scheduling_under_pressure() -> SchedulingGovernanceSnapshot:
+    return SchedulingGovernanceSnapshot(
+        ram=RamGovernanceSnapshot(
+            measured=True,
+            under_pressure=True,
+            reason="available 2048 MB below danger floor 4096 MB",
+            available_mb=2048,
+            floor_mb=4096,
+            pop_hold_active=True,
+        ),
+        preload=PreloadAdmissionSnapshot(decision="defer_budget", model="Flux.1-dev", process_id=2),
+    )
+
+
+def test_governance_combined_shows_both_sections_in_details() -> None:
+    """The merged governance panel carries both the pop-governor and scheduling sub-sections in details."""
+    text = _render(
+        OverviewView._render_governance_combined(
+            _one_active_governor(),
+            _scheduling_under_pressure(),
+            detailed=True,
+        ),
+    )
+
+    assert "Governance" in text
+    assert "1 active" in text  # the at-a-glance active-governor count in the title
+    assert "Pop governors" in text
+    assert "Large-model re-entry cooldown" in text
+    assert "Scheduling" in text
+    assert "available 2048 MB below danger floor 4096 MB" in text
+
+
+def test_governance_combined_normal_mode_is_pop_only() -> None:
+    """With no scheduling sub-section passed (normal mode), only the pop-governor section renders."""
+    text = _render(OverviewView._render_governance_combined(_one_active_governor(), None, detailed=False))
+
+    assert "Pop governors" in text
+    assert "Scheduling" not in text
+
+
+def test_process_table_title_shows_alive_and_hot_tally() -> None:
+    """The Processes table folds the alive/hot counts into its title for at-a-glance health."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process()],
+    )
+    text = _render(OverviewView()._render_process_table(snapshot), width=200)
+
+    assert "Processes · 1/1 alive · 1 hot" in text
+
+
+def test_queue_title_shows_pending_and_megapixelsteps() -> None:
+    """The Queue panel title surfaces the pending count and total megapixelstep cost."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        pending_jobs=[
+            JobQueueEntry(
+                job_id="7f3a1c9e-4b2c-4d6e-8a1f-0c2b07d49abc",
+                model="AlbedoBase XL",
+                width=1024,
+                height=1024,
+                steps=30,
+            ),
+        ],
+        pending_megapixelsteps=1234.0,
+    )
+    text = _render(OverviewView._render_queue_table(snapshot), width=200)
+
+    assert "Queue · 1 pending" in text
+    assert "1,234 MP" in text
+
+
+def test_process_table_keeps_essentials_at_80_columns() -> None:
+    """At an 80-column terminal the process table still shows its essential columns without overflow."""
+    snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Tester", worker_version="12.0.0"),
+        processes=[_busy_process()],
+    )
+    text = _render(OverviewView()._render_process_table(snapshot, available_width=80), width=80)
+
+    # Essential columns survive the shed, and nothing spills past the 80-column budget.
+    assert "State" in text
+    assert "ID" in text
+    assert all(len(line) <= 80 for line in text.splitlines())
+
+
+def test_overview_layout_registry_covers_mode_managed_nodes() -> None:
+    """Every mode-managed Overview node has a layout-registry entry, so hide/show can never miss one."""
+    from horde_worker_regen.tui.widgets.overview_layout import OVERVIEW_ELEMENTS, element_for_node
+
+    registry_nodes = {element.node_id for element in OVERVIEW_ELEMENTS}
+    for node_id in (*OverviewView._NORMAL_NODE_IDS, *OverviewView._DETAIL_NODE_IDS):
+        assert node_id in registry_nodes, f"{node_id} is mode-managed but missing from OVERVIEW_ELEMENTS"
+
+    keys = [element.key for element in OVERVIEW_ELEMENTS]
+    assert len(keys) == len(set(keys)), "duplicate element keys in the registry"
+    for element in OVERVIEW_ELEMENTS:
+        assert element.node_id.startswith("#overview-")
+        assert element_for_node(element.node_id) is element

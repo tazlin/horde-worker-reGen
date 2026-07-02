@@ -25,6 +25,7 @@ from horde_worker_regen.process_management.lifecycle.process_temperature import 
 from horde_worker_regen.tui.formatters import (
     STATE_LABELS,
     format_its,
+    human_bytes,
     human_duration,
     human_mb,
     is_low_fidelity,
@@ -114,7 +115,13 @@ class LiveView(VerticalScroll):
             self._render_process_panel(process, stale=stale, detailed=detailed, pending_models=pending_models)
             for process in snapshot.processes
         ]
-        content: list[RenderableType] = [governance, Text(""), *panels]
+        content: list[RenderableType] = [governance, Text("")]
+        # The per-role worker RAM breakdown lives here (the Overview keeps only the overall figure): this tab
+        # already carries per-process RAM, so the role split is its natural, deeper home.
+        ram_panel = self._render_ram_by_role(snapshot)
+        if ram_panel is not None:
+            content.extend((ram_panel, Text("")))
+        content.extend(panels)
         if stale:
             banner = Text(
                 f"⚠ Live data is {snapshot_age:.0f}s old; the worker may be busy, hung, or restarting.",
@@ -123,6 +130,38 @@ class LiveView(VerticalScroll):
             body.update(Group(banner, Text(""), *content))
         else:
             body.update(Group(*content))
+
+    @staticmethod
+    def _render_ram_by_role(snapshot: WorkerStateSnapshot) -> RenderableType | None:
+        """Render the worker's resident-RAM split by role, or None when no memory sample has arrived yet.
+
+        The overall system figure headlines the title; the rows break the worker's own footprint down by
+        role (inference, safety, and so on) so a memory balloon can be traced to the responsible role rather
+        than read as one opaque total.
+        """
+        wire = snapshot.system_memory
+        if wire is None or wire.total_bytes <= 0:
+            return None
+        from horde_worker_regen.process_management.resources.system_memory import ROLE_LABELS
+
+        summary = wire.to_summary()
+        role_items = summary.nonzero_role_items()
+        if not role_items:
+            return None
+
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column(style="bold cyan", no_wrap=True)
+        grid.add_column(justify="right", no_wrap=True)
+        for role, value in role_items:
+            grid.add_row(ROLE_LABELS.get(role, role), human_bytes(value))
+
+        used_fraction = summary.used_fraction
+        used_pct = f" ({used_fraction * 100:.0f}%)" if used_fraction is not None else ""
+        title = (
+            f"Worker RAM by role · {human_bytes(summary.worker_total_bytes)} of "
+            f"{human_bytes(summary.used_bytes)} used{used_pct}"
+        )
+        return Panel(grid, title=title, title_align="left", border_style="grey37", padding=(0, 1))
 
     @staticmethod
     def _preload_decision_label(decision: str) -> str:

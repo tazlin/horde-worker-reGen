@@ -214,8 +214,11 @@ fails fast *before* any process spawns:
 counterpart to the in-memory [`WorkerState`](architecture.md#the-shared-state-pattern):
 it records what the application needs to remember *between* invocations: the last
 benchmark and where its results live, the last worker run, the last-known-good
-settings, and which worker version last ran (so a version bump can mark a stale
-benchmark for re-running).
+settings, which worker version last ran (so a version bump can mark a stale
+benchmark for re-running), and the operator's durable UI preferences (the Overview
+density mode, the trend window, and which Overview panels are hidden). A hidden-panel
+key that no longer names a live element is dropped on load, so a stale preference can
+never block the Overview from rendering.
 
 The store lives in a grouped working-directory folder
 (`.horde_worker_regen/state.json`), alongside `bridgeData.yaml`, `logs/`,

@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
-from textual.widgets import TabbedContent
+from textual.widgets import Static, TabbedContent
 
 from horde_worker_regen.app_state import AppStateStore, OnboardingChoice, OverviewTrendWindow, OverviewViewMode
 from horde_worker_regen.process_management.ipc.supervisor_channel import WorkerConfigSummary, WorkerStateSnapshot
@@ -73,7 +73,8 @@ async def test_app_boots_renders_and_cycles_tabs(tmp_path: Path) -> None:
             app.action_cycle_view_mode()
             await pilot.pause()
             assert app._view_mode is OverviewViewMode.DETAILS
-            assert app.query_one(OverviewView).has_class("-details-wide")
+            # At 120 cols the overview lays out two-up (columns are width-driven now, in every density mode).
+            assert app.query_one(OverviewView).has_class("-cols-2")
             assert store.load().overview_view_mode is OverviewViewMode.DETAILS
             app.action_cycle_view_mode()
             await pilot.pause()
@@ -334,3 +335,94 @@ async def test_tick_clears_optimistic_maintenance_after_successful_pop(
     assert app._intended_server_maintenance is None
     assert app._server_maintenance_intent_pop_count is None
     assert captured[-1] is False
+
+
+def _overview_app(tmp_path: Path) -> tuple[HordeWorkerTUI, AppStateStore, FakeSupervisor]:
+    """Build a TUI over a fake, already-running worker with a minimal snapshot for overview tests."""
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    store.set_auto_start_worker(True)
+    store.record_onboarding_choice(OnboardingChoice.DECLINED)
+    supervisor = FakeSupervisor(alive=True)
+    supervisor.latest_snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Layout", worker_version="0.0.0"),
+    )
+    app = HordeWorkerTUI(supervisor, config_path=Path("bridgeData.yaml"), app_state_store=store)
+    return app, store, supervisor
+
+
+async def test_overview_hide_persists_masks_and_reveal_toggles(tmp_path: Path) -> None:
+    """Hiding an element persists and masks its node; the reveal toggle un-suppresses it, then re-hides."""
+    app, store, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._tick()
+        await pilot.pause()
+        trends = app.query_one(OverviewView).query_one("#overview-trends", Static)
+        assert trends.display is True
+
+        app._on_overview_layout_chosen(frozenset({"trends"}))
+        await pilot.pause()
+        assert store.load().overview_hidden_elements == ["trends"]
+        assert trends.display is False
+
+        app.action_toggle_hidden_reveal()  # 'h': reveal
+        await pilot.pause()
+        assert trends.display is True
+
+        app.action_toggle_hidden_reveal()  # 'h' again: re-hide
+        await pilot.pause()
+        assert trends.display is False
+
+
+async def test_customize_modal_saves_selection(tmp_path: Path) -> None:
+    """The 'c' modal opens, a toggled element is persisted on escape (save), and the node is masked."""
+    from textual.widgets import Checkbox
+
+    from horde_worker_regen.tui.widgets.overview_layout import OverviewLayoutModal
+
+    app, store, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._tick()
+        await pilot.pause()
+
+        app.action_customize_overview()
+        await pilot.pause()
+        assert isinstance(app.screen, OverviewLayoutModal)
+        app.screen.query_one("#layout-cb-health", Checkbox).value = True
+        await pilot.pause()
+        await pilot.press("escape")  # save & close
+        await pilot.pause()
+
+        assert store.load().overview_hidden_elements == ["health"]
+        assert app.query_one(OverviewView).query_one("#overview-health", Static).display is False
+
+
+@pytest.mark.parametrize(
+    ("width", "expect_cols2", "expect_cols3"),
+    [(80, False, False), (120, True, False), (200, True, True)],
+)
+async def test_overview_column_classes_track_width(
+    tmp_path: Path, width: int, expect_cols2: bool, expect_cols3: bool
+) -> None:
+    """The overview stamps -cols-2/-cols-3 from its width, so narrow stays single-column and wide spreads."""
+    app, _, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(width, 40)) as pilot:
+        app._tick()
+        await pilot.pause()
+        overview = app.query_one(OverviewView)
+        assert overview.has_class("-cols-2") is expect_cols2
+        assert overview.has_class("-cols-3") is expect_cols3
+
+
+async def test_trends_panel_gets_a_wide_band_when_multicolumn(tmp_path: Path) -> None:
+    """Regression: Trends spans the full grid width (not a squeezed fractional column) on a wide terminal."""
+    app, _, _ = _overview_app(tmp_path)
+    async with app.run_test(size=(200, 45)) as pilot:
+        app._tick()
+        await pilot.pause()
+        overview = app.query_one(OverviewView)
+        assert overview.has_class("-cols-3")
+        trends = overview.query_one("#overview-trends", Static)
+        health = overview.query_one("#overview-health", Static)
+        # Trends must be far wider than the fractional core column Health sits in: it carries a ~48-char
+        # sparkline and would scrunch if squeezed into a 1/3 slot.
+        assert trends.size.width > health.size.width
