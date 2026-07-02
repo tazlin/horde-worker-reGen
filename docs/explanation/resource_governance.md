@@ -47,7 +47,11 @@ then decides and executes both regimes:
 - **Pressured host** (below the danger floor): the degrade response. Arm the self-throttle pop pause,
   set the soft pop hold, evict idle resident models, shed idle inference contexts (per card on a
   multi-GPU host, never emptying a card), and reclaim a process whose resident RAM crossed the
-  per-process ceiling (recycled if idle, drained first if busy).
+  per-process ceiling (recycled if idle, drained first if busy). The idle-model eviction is *not* gated on
+  there being queued work: the pop hold drains the queue, so the footprint left to reclaim is exactly the
+  idle resident set on an empty queue, and eviction must still reach it. When no idle model remains to
+  unload, an idle slot that kept the freed model's allocator pages is cycled to return that RAM to the OS.
+  Without this the host would stay pinned under its floor with the pop hold latched on indefinitely.
 - **Recovered host**: the restore response, and the drain follow-through. Cards the reduction shed grow
   back toward their planned process count, one context per card per tick, gated on measured RAM headroom
   actually fitting another resident working set. A drain the pressure episode initiated but did not

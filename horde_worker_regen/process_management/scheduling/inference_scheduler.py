@@ -2050,7 +2050,12 @@ class InferenceScheduler:
                         "an OS OOM kill. In-flight jobs finish; pops resume once RAM recovers.</>",
                     )
                 case EvictIdleModels():
-                    self.unload_models(under_pressure=True)
+                    # Unload an idle resident model; when none remains to unload, the footprint left on the
+                    # host is a slot whose allocator kept the freed model's pages, which only a process cycle
+                    # returns to the OS. Mirrors the preload reclaim path so sustained pressure with a drained
+                    # queue still reclaims RAM instead of pinning it and holding pops forever.
+                    if not self.unload_models(under_pressure=True):
+                        self._replace_stale_ram_unload_process()
                 case ReduceWorkerProcesses(
                     target_count=target_count,
                     planned_count=planned_count,
@@ -4915,7 +4920,11 @@ class InferenceScheduler:
         """
         bridge_data = self._runtime_config.bridge_data
 
-        if len(self._job_tracker.jobs_pending_inference) == 0:
+        # An empty queue short-circuits the *normal* path (nothing to make room for), but not the pressure
+        # path: under the RAM danger floor the held pops drain the queue, and the idle resident footprint
+        # left behind is precisely what must be reclaimed to get the host back off its floor. Gating the
+        # reclaim on queued work would leave that footprint pinned forever, so the pop hold never lifts.
+        if len(self._job_tracker.jobs_pending_inference) == 0 and not under_pressure:
             return False
 
         if (
