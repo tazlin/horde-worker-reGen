@@ -529,11 +529,20 @@ class JobPopper:
 
         return False
 
-    def _is_queue_full(self, bridge_data: reGenBridgeData) -> bool:
-        """Return True if the job queue already has enough jobs."""
+    def _is_queue_full(self, bridge_data: reGenBridgeData, *, extra_allowance: int = 0) -> bool:
+        """Return True if the job queue already has enough jobs.
+
+        Args:
+            bridge_data: The active bridge configuration (supplies queue_size / max_threads).
+            extra_allowance: Additional queue slots to tolerate beyond the configured depth. Used by the
+                aux-download line-skip breaker to admit one skip job that is expected to dispatch onto an
+                idle sibling immediately rather than buffer, so the normal depth cap would otherwise
+                strand the GPU for the whole download.
+        """
         max_jobs_in_queue = bridge_data.queue_size + 1
         if bridge_data.max_threads > 1:
             max_jobs_in_queue += bridge_data.max_threads - 1
+        max_jobs_in_queue += extra_allowance
         return len(self._job_tracker.jobs_pending_inference) >= max_jobs_in_queue
 
     _SAFETY_BACKLOG_LOG_INTERVAL_SECONDS = 30.0
@@ -783,10 +792,24 @@ class JobPopper:
         cur_time = time.time()
         bridge_data = self._runtime_config.bridge_data
 
+        # Aux-download line-skip: the scheduler has flagged that a slot is stalled downloading auxiliary
+        # models past the threshold with nothing already queued able to slip past it. A job popped now is
+        # expected to dispatch immediately onto the idle sibling process (a line-skip), not to buffer, so
+        # the steady-state pacing governors that assume this pop adds durable queue depth do not apply while
+        # the stall lasts. Treat the pop as urgent and let it relax the queue-depth and pop-cadence gates so
+        # the bias applied further down (small, non-LoRA) can actually be exercised. Genuinely protective
+        # gates (shutdown, RAM/safety backpressure, failure pause, no free process) still apply.
+        line_skip_wanted = self._state.wants_line_skip_candidate
+        if line_skip_wanted:
+            urgent = True
+
         if self._handle_consecutive_failures(bridge_data, cur_time):
             return
 
-        if self._is_queue_full(bridge_data):
+        # Admit one extra job past the configured depth when a line-skip is wanted: the skip job is expected
+        # to leave the queue immediately for the idle sibling, so bounding the relaxation to a single slot
+        # keeps intake from running away if it cannot be placed this cycle.
+        if self._is_queue_full(bridge_data, extra_allowance=1 if line_skip_wanted else 0):
             return
 
         # Post-inference backpressure: if the safety stage is backed up enough that a job admitted now
@@ -838,7 +861,10 @@ class JobPopper:
             await asyncio.sleep(3)
             return
 
-        if self._pop_throttler.should_wait_for_megapixelsteps(bridge_data):
+        # The megapixelstep governor holds pops so large in-flight jobs can drain; a line-skip job is small
+        # by construction and fills a GPU the blocked head has left idle, so it must not be held behind the
+        # very backlog it is meant to relieve.
+        if not line_skip_wanted and self._pop_throttler.should_wait_for_megapixelsteps(bridge_data):
             return
 
         if not urgent and self._pop_throttler.is_pop_too_soon(self._state.last_job_pop_time):
