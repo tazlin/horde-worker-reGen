@@ -101,20 +101,20 @@ class TestMultiCardPools:
 class TestProcessCountCapIntegration:
     """The plan-time RAM/VRAM cap is applied when the worker drives more than one card, but never to one card."""
 
-    def test_two_16gb_cards_are_capped_to_one_context_each(self) -> None:
-        """A 2x16GB host that would otherwise run two contexts per card is right-sized to one each.
+    def test_two_16gb_cards_keep_two_contexts_each(self) -> None:
+        """A 2x16GB host keeps its resolved two-process-per-card plan (four total).
 
-        With more than one model offered the resolved plan is two processes per card; on 16GB cards offering
-        post-processing the cap lowers each to one so the upscale peak has VRAM headroom and the shared RAM
-        pool is not over-committed.
+        Two SDXL resident contexts fit a 16GB card; the post-processing upscale peak is charged at dispatch by
+        the runtime reclaim machinery, not pre-reserved in the spawn plan, so offering post-processing no longer
+        halves the per-card process count. This is the ``queue_size:2`` -> four-total invariant on this hardware.
         """
         manager = make_testable_process_manager(
             system_resources=_system_resources((0, 16, "cuda"), (1, 16, "cuda")),
             mp_primitives=make_test_mp_primitives(device_indices=(0, 1)),
             image_models_to_load=["model_a", "model_b"],
         )
-        assert all(card.target_process_count == 1 for card in manager._card_runtimes.values())
-        assert manager.max_inference_processes == 2
+        assert all(card.target_process_count == 2 for card in manager._card_runtimes.values())
+        assert manager.max_inference_processes == 4
 
     def test_single_16gb_card_is_not_capped(self) -> None:
         """A single 16GB card keeps its resolved two-process plan: the cap is multi-GPU only (byte-identical)."""

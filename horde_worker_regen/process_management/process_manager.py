@@ -364,7 +364,7 @@ class _EstimatedContextFootprint:
     Used only to right-size the per-card process count before any model reference or runtime measurement
     exists (see :func:`cap_card_process_counts`). Deliberately coarse and conservative: the measured runtime
     budget refines the *live* count downward under real pressure, so a slightly-low plan self-corrects,
-    whereas an over-provisioned plan is what produces the system-RAM and post-processing-VRAM reaps. Tunable.
+    whereas an over-provisioned plan is what drives the shared system RAM pool into an OS kill. Tunable.
     """
 
     SDXL_CONTEXT_VRAM_MB = 7000.0
@@ -373,8 +373,6 @@ class _EstimatedContextFootprint:
     """Resident VRAM working set when a VRAM-heavy family (Flux/Cascade) is offered."""
     CONTEXT_RAM_MB = 9000.0
     """System RAM a resident context retains (CPU-side weights plus allocator retention freed only by a respawn)."""
-    POST_PROCESSING_PEAK_MB = 8500.0
-    """Free VRAM a card must keep for the post-processing peak that lands after sampling (a 4x SDXL upscale)."""
 
 
 # Coarse system-RAM a co-hosted worker role consumes beside the image inference contexts, reserved up front so
@@ -410,18 +408,24 @@ def cap_card_process_counts(
     total_ram_bytes: int,
     target_ram_overhead_bytes: int,
     total_vram_mb_by_card: Mapping[int, float | None],
-    allow_post_processing: bool,
     has_vram_heavy_models: bool,
 ) -> dict[int, int]:
-    """Right-size each card's inference-process count to the shared RAM pool and the card's VRAM headroom.
+    """Right-size each card's inference-process count to the shared RAM pool and the card's VRAM capacity.
 
     The resolved per-card plan (``queue_size + ceiling``) is sound per card but, summed across cards,
-    double-counts the single shared system-RAM pool (a second card doubles VRAM, not RAM) and ignores the
-    post-processing VRAM peak that lands after sampling. This lowers the per-card target so each card keeps
-    enough free VRAM for that peak and the worker-wide resident-context count fits system RAM. It only ever
-    reduces a card below its resolved plan, and never below one context per card (a card must keep at least
-    one to serve at all). The measured runtime budget remains the authority that gates actual loads; this is
-    a coarse front-end that keeps the spawn plan from over-committing in the first place.
+    double-counts the single shared system-RAM pool (a second card doubles VRAM, not RAM). This lowers the
+    per-card target so the worker-wide resident-context count fits system RAM and no card is asked to hold
+    more resident contexts than its VRAM physically fits. It only ever reduces a card below its resolved
+    plan, and never below one context per card (a card must keep at least one to serve at all).
+
+    Only the *resident* footprint is reserved here: a context's weights and persistent CUDA overhead (VRAM),
+    and the RAM those weights retain. The transient post-processing peak that lands after sampling is
+    deliberately not pre-reserved. Unlike a resident context it is short-lived and reclaimable, so it is
+    charged as an entry cost when the post-processing job is dispatched, where the scheduler evicts a sibling
+    model, stops a sibling process, or defers the dispatch to host it (see ``PostProcessingReclaimAction``).
+    Reserving that peak up front instead permanently halves a card's process count for a spike that only
+    exists while a job post-processes. System RAM is treated differently because an over-commit there is a
+    fatal OS kill the runtime cannot reclaim, whereas VRAM pressure is recoverable.
 
     Args:
         per_card_target_processes: The resolved ``target_process_count`` per device index.
@@ -429,7 +433,6 @@ def cap_card_process_counts(
         target_ram_overhead_bytes: RAM the worker keeps free (subtracted before sizing the context count).
         total_vram_mb_by_card: Each card's total VRAM in MB, or None where capacity is unknown (then the
             per-card VRAM cap abstains for that card and only the worker-wide RAM cap applies).
-        allow_post_processing: Whether the worker offers post-processing (reserves the upscale peak per card).
         has_vram_heavy_models: Whether any offered model is VRAM-heavy (Flux/Cascade), raising the per-context
             VRAM estimate.
 
@@ -442,15 +445,13 @@ def cap_card_process_counts(
         if has_vram_heavy_models
         else _EstimatedContextFootprint.SDXL_CONTEXT_VRAM_MB
     )
-    post_processing_reserve_mb = _EstimatedContextFootprint.POST_PROCESSING_PEAK_MB if allow_post_processing else 0.0
 
-    # Per-card VRAM / post-processing cap: a card must keep the post-processing peak free on top of its
-    # resident contexts. Abstain when the card's capacity is unknown (the runtime budget still gates loads).
+    # Per-card VRAM cap: never plan more resident contexts than the card's VRAM physically holds. Abstain
+    # when the card's capacity is unknown (the runtime budget still gates loads).
     for device_index, total_vram_mb in total_vram_mb_by_card.items():
         if total_vram_mb is None or device_index not in capped:
             continue
-        vram_for_contexts_mb = total_vram_mb - post_processing_reserve_mb
-        max_contexts_for_vram = max(1, int(vram_for_contexts_mb // per_context_vram_mb))
+        max_contexts_for_vram = max(1, int(total_vram_mb // per_context_vram_mb))
         capped[device_index] = min(capped[device_index], max_contexts_for_vram)
 
     # Worker-wide RAM cap: every resident context retains RAM that no other card's VRAM offsets. Trim the
@@ -1219,7 +1220,6 @@ class HordeWorkerProcessManager:
                 total_ram_bytes=self.total_ram_bytes,
                 target_ram_overhead_bytes=self.target_ram_overhead_bytes,
                 total_vram_mb_by_card=total_vram_mb_by_card,
-                allow_post_processing=bridge_data.allow_post_processing,
                 has_vram_heavy_models=any(m in VRAM_HEAVY_MODELS for m in bridge_data.image_models_to_load),
             )
             for index in device_indices:
@@ -1227,9 +1227,10 @@ class HordeWorkerProcessManager:
                 if target_process_counts[index] < resolved:
                     logger.warning(
                         f"Right-sizing device {index} to {target_process_counts[index]} inference process(es) "
-                        f"(resolved plan was {resolved}): the shared system RAM and this card's "
-                        f"post-processing VRAM headroom cannot sustain the full plan across "
-                        f"{len(device_indices)} cards. Lower max_threads/queue_size to raise it intentionally.",
+                        f"(resolved plan was {resolved}): the shared system RAM pool or this card's VRAM "
+                        f"cannot hold the full plan's resident contexts across {len(device_indices)} cards. "
+                        f"The post-processing peak is handled at dispatch, not reserved here. "
+                        f"Lower max_threads/queue_size to raise it intentionally.",
                     )
 
         should_mask = len(device_indices) > 1 or bridge_data.gpu_device_indices is not None

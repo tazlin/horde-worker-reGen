@@ -50,6 +50,15 @@ from horde_worker_regen.process_management.scheduling.performance_model import (
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
 
+SAFETY_PROCESS_ID: int = 0
+"""The reserved process-map slot for the safety process, by convention always PID 0.
+
+Inference and safety processes share one integer slot space in the process map. The (currently single)
+safety process owns slot 0; inference processes are allocated from 1 upward (:meth:`_allocate_inference_pid`)
+so they can never collide with it, regardless of which on-disk gate (image models vs safety models) opens
+first and starts its pool. The download process lives outside the map at its own reserved id.
+"""
+
 CRASH_LOOP_WINDOW_SECONDS: float = 300.0
 """Sliding window over which an inference slot's replacements are counted for crash-loop detection."""
 
@@ -432,7 +441,13 @@ class ProcessLifecycleManager:
             raise ValueError("num_processes_to_start cannot be less than 0")
 
         for _ in range(num_processes_to_start):
-            pid = self._process_map.num_safety_processes()
+            # By convention the safety process owns the reserved slot ``SAFETY_PROCESS_ID`` (0); inference
+            # processes are allocated from 1 upward, so the two never collide no matter which pool starts
+            # first. A hypothetical second safety process (not used today) falls back to the lowest free
+            # inference-range slot rather than re-taking 0.
+            pid = (
+                SAFETY_PROCESS_ID if self._process_map.num_safety_processes() == 0 else self._allocate_inference_pid()
+            )
             pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
 
             # A CPU-only torch build has no CUDA device to pin to, so the safety process must come up
@@ -697,7 +712,10 @@ class ProcessLifecycleManager:
             raise ValueError("num_processes_to_start cannot be less than 0")
 
         for i in range(num_processes_to_start):
-            pid = len(self._process_map)
+            # Allocate through the shared helper (lowest free slot from 1 upward) so the reserved safety slot
+            # 0 is never taken and ids stay stable across scale cycles. A ``len(map)``-based id would grab 0
+            # when the inference pool starts before the safety pool, colliding with the safety process.
+            pid = self._allocate_inference_pid()
             self._start_inference_process(pid, device_index=self._device_for_new_process())
 
             logger.info(f"Started inference process (id: {pid})")
@@ -771,14 +789,16 @@ class ProcessLifecycleManager:
         return process_info
 
     def _allocate_inference_pid(self) -> int:
-        """Return the lowest process id not currently in use.
+        """Return the lowest inference process id not currently in use.
 
-        Slot ids are reused once freed, so this stays stable across scale-down/scale-up cycles
-        (a ``len(map)``-based scheme would collide after removing a non-last slot). The download
-        process lives outside the map at its own reserved id, so it never participates here.
+        Allocation starts at 1: slot ``SAFETY_PROCESS_ID`` (0) is reserved for the safety process by
+        convention, so an inference process never occupies it even when the inference pool starts before the
+        safety pool. Slot ids are reused once freed, so this stays stable across scale-down/scale-up cycles
+        (a ``len(map)``-based scheme would collide after removing a non-last slot). The download process lives
+        outside the map at its own reserved id, so it never participates here.
         """
         used = set(self._process_map.keys())
-        pid = 0
+        pid = SAFETY_PROCESS_ID + 1
         while pid in used:
             pid += 1
         return pid

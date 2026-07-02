@@ -81,6 +81,54 @@ def test_inference_child_is_created_from_the_injected_context() -> None:
     fake_ctx.Process.assert_called_once()
 
 
+def test_inference_pids_never_take_the_reserved_safety_slot() -> None:
+    """Inference process ids are allocated from 1 upward; slot 0 is reserved for the safety process.
+
+    Allocation must skip 0 even when the map is empty (the inference pool can start before the safety pool),
+    and must keep returning the lowest free slot at or above 1 as processes come and go.
+    """
+    plm = _make_plm(process_map=ProcessMap({}))
+    assert plm._allocate_inference_pid() == 1, "the first inference process must not take the reserved safety slot 0"
+
+    plm._process_map[1] = make_mock_process_info(1, process_type=HordeProcessType.INFERENCE)
+    assert plm._allocate_inference_pid() == 2
+
+    # Even with the safety process resident at slot 0, allocation stays in the inference range.
+    plm._process_map[0] = make_mock_process_info(0, process_type=HordeProcessType.SAFETY)
+    assert plm._allocate_inference_pid() == 2
+
+
+def test_safety_process_takes_slot_zero_without_clobbering_inference() -> None:
+    """The safety process claims the reserved slot 0, never an existing inference process's id.
+
+    Inference and safety start on independent on-disk gates, so on a multi-GPU host the inference processes
+    can register first (in the inference range 1..N). The safety process must still land on the reserved slot
+    0 rather than overwriting an inference slot, so no card is stranded.
+    """
+    fake_ctx = Mock()
+    fake_ctx.get_start_method.return_value = "spawn"
+    fake_ctx.Pipe.return_value = (Mock(), Mock())
+    fake_ctx.Process.return_value.pid = 12345
+
+    # Two inference processes already occupy slots 1 and 2 (the multi-GPU inference-first ordering).
+    process_map = ProcessMap(
+        {
+            1: make_mock_process_info(1, process_type=HordeProcessType.INFERENCE, device_index=0),
+            2: make_mock_process_info(2, process_type=HordeProcessType.INFERENCE, device_index=1),
+        },
+    )
+    plm = _make_plm(process_map=process_map, ctx=fake_ctx)
+
+    plm.start_safety_processes()
+
+    assert process_map.num_inference_processes() == 2, "an inference slot was clobbered by the safety process"
+    assert process_map.num_safety_processes() == 1
+    assert process_map[1].process_type is HordeProcessType.INFERENCE
+    assert process_map[2].process_type is HordeProcessType.INFERENCE
+    safety_ids = [pid for pid, info in process_map.items() if info.process_type is HordeProcessType.SAFETY]
+    assert safety_ids == [0], "the safety process must occupy the reserved slot 0"
+
+
 def test_non_spawn_context_is_rejected_on_posix(monkeypatch: pytest.MonkeyPatch) -> None:
     """A fork (or forkserver) context must fail loudly outside tests rather than crash-loop every child."""
     monkeypatch.setattr(sys, "platform", "linux")
@@ -685,7 +733,8 @@ def test_scale_up_starts_processes_up_to_ceiling() -> None:
 
     assert plm.scale_inference_processes(2) == 2
     assert plm._process_map.num_inference_processes() == 2
-    assert sorted(plm._process_map.keys()) == [0, 1]
+    # Inference processes occupy the range from 1 upward; slot 0 is reserved for the safety process.
+    assert sorted(plm._process_map.keys()) == [1, 2]
 
     # Requests beyond the launched ceiling are capped.
     assert plm.scale_inference_processes(5) == 2
@@ -696,10 +745,12 @@ def test_scale_down_stops_idle_processes() -> None:
     plm = _make_plm()
     _patch_spawn_with_stub(plm)
     plm.scale_inference_processes(2)
-    retired_process = plm._process_map[0]
+    before = dict(plm._process_map)
 
     assert plm.scale_inference_processes(1) == 1
     assert plm._process_map.num_inference_processes() == 1
+    retired_pid = (set(before) - set(plm._process_map)).pop()
+    retired_process = before[retired_pid]
     assert plm._process_map.is_retired_launch(
         retired_process.process_id,
         retired_process.process_launch_identifier,
@@ -722,11 +773,11 @@ def test_pid_reused_after_scale_down_then_up() -> None:
     """A slot freed by scaling down is reused on the next scale up (no collision)."""
     plm = _make_plm()
     _patch_spawn_with_stub(plm)
-    plm.scale_inference_processes(2)  # pids 0, 1
-    plm.scale_inference_processes(1)  # removes the first idle slot (pid 0)
-    plm.scale_inference_processes(2)  # should re-allocate pid 0
+    plm.scale_inference_processes(2)  # pids 1, 2 (slot 0 reserved for safety)
+    plm.scale_inference_processes(1)  # removes an idle slot
+    plm.scale_inference_processes(2)  # re-allocates the freed slot
 
-    assert sorted(plm._process_map.keys()) == [0, 1]
+    assert sorted(plm._process_map.keys()) == [1, 2]
 
 
 def test_stuck_starting_safety_arms_replacement() -> None:

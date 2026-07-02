@@ -1,9 +1,11 @@
 """Tests for the plan-time per-card inference-process cap (:func:`cap_card_process_counts`).
 
 The resolved per-card plan (``queue_size + ceiling``) is sound per card but, summed across cards,
-double-counts the single shared system-RAM pool and ignores the post-processing VRAM peak. The cap lowers
-the per-card target so each card keeps post-processing headroom and the worker-wide resident-context count
-fits system RAM, never below one context per card and only ever reducing the resolved plan.
+double-counts the single shared system-RAM pool. The cap lowers the per-card target so the worker-wide
+resident-context count fits system RAM and no card is asked to hold more resident contexts than its VRAM
+fits, never below one context per card and only ever reducing the resolved plan. The transient
+post-processing peak is not reserved here; it is charged as a dispatch-time entry cost by the runtime
+post-processing reclaim machinery, so it must not shrink the spawn plan.
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ def _cap(
     total_ram_bytes: int,
     overhead_bytes: int,
     vram_by_card: dict[int, float | None],
-    allow_post_processing: bool = True,
     has_vram_heavy_models: bool = False,
 ) -> dict[int, int]:
     """Invoke the cap with explicit hardware so the expected counts are deterministic on any host."""
@@ -35,37 +36,54 @@ def _cap(
         total_ram_bytes=total_ram_bytes,
         target_ram_overhead_bytes=overhead_bytes,
         total_vram_mb_by_card=vram_by_card,
-        allow_post_processing=allow_post_processing,
         has_vram_heavy_models=has_vram_heavy_models,
     )
 
 
 class TestPerCardVramCap:
-    """Each card must keep the post-processing peak free on top of its resident contexts."""
+    """No card may be planned to hold more resident contexts than its VRAM physically fits."""
 
-    def test_two_16gb_cards_with_post_processing_cap_to_one_each(self) -> None:
-        """A 16GB card cannot hold two SDXL contexts plus the ~8.5GB upscale peak, so it caps to one."""
+    def test_two_16gb_cards_keep_two_contexts_each(self) -> None:
+        """Two SDXL resident contexts fit a 16GB card, so two 16GB cards keep four inference processes.
+
+        The upscale peak is a dispatch-time concern reclaimed by the runtime, not a spawn-plan reserve, so
+        offering post-processing no longer halves the count.
+        """
         capped = _cap(
             {0: 2, 1: 2},
             total_ram_bytes=64 * _GIB,
             overhead_bytes=_OVERHEAD_9GB,
             vram_by_card={0: _VRAM_16GB_MB, 1: _VRAM_16GB_MB},
         )
-        assert capped == {0: 1, 1: 1}
+        assert capped == {0: 2, 1: 2}
+        assert sum(capped.values()) == 4
 
-    def test_post_processing_disabled_frees_the_reserved_headroom(self) -> None:
-        """Without post-processing there is no upscale peak to reserve, so a 16GB card keeps two contexts."""
+    def test_post_processing_does_not_shrink_the_plan(self) -> None:
+        """Offering post-processing must not reduce the spawn plan.
+
+        The peak is reclaimed at dispatch, so a 16GB card keeps two contexts whether or not post-processing is
+        offered (the cap no longer reads it).
+        """
         capped = _cap(
             {0: 2, 1: 2},
             total_ram_bytes=64 * _GIB,
             overhead_bytes=_OVERHEAD_9GB,
             vram_by_card={0: _VRAM_16GB_MB, 1: _VRAM_16GB_MB},
-            allow_post_processing=False,
+        )
+        assert capped == {0: 2, 1: 2}
+
+    def test_caps_when_contexts_exceed_vram(self) -> None:
+        """A 16GB card cannot hold three SDXL resident contexts (~7GB each), so a plan of three caps to two."""
+        capped = _cap(
+            {0: 3, 1: 3},
+            total_ram_bytes=64 * _GIB,
+            overhead_bytes=_OVERHEAD_9GB,
+            vram_by_card={0: _VRAM_16GB_MB, 1: _VRAM_16GB_MB},
         )
         assert capped == {0: 2, 1: 2}
 
     def test_24gb_cards_keep_two_contexts(self) -> None:
-        """A 24GB card has room for two SDXL contexts plus the post-processing peak."""
+        """A 24GB card has room for two SDXL resident contexts."""
         capped = _cap(
             {0: 2, 1: 2},
             total_ram_bytes=64 * _GIB,
