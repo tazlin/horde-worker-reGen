@@ -116,7 +116,7 @@ class SafetyOrchestrator:
                 HordeSafetyControlMessage(
                     control_flag=HordeControlFlag.EVALUATE_SAFETY,
                     job_id=completed_job_info.sdk_api_job_info.id_,
-                    images_base64=completed_job_info.images_base64,
+                    images_bytes=completed_job_info.images_bytes,
                     prompt=completed_job_info.sdk_api_job_info.payload.prompt,
                     censor_nsfw=completed_job_info.sdk_api_job_info.payload.use_nsfw_censor,
                     sfw_worker=not bridge_data.nsfw,

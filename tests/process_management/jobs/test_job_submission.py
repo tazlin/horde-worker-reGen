@@ -192,7 +192,7 @@ class TestApiSubmitJob:
             sdk_api_job_info=job,
             state=GENERATION_STATE.ok,
             time_popped=0.0,
-            job_image_results=[HordeImageResult(image_base64="data")],
+            job_image_results=[HordeImageResult(image_bytes=b"data")],
             censored=None,
         )
         await track_popped_job_async(job_tracker, job, time_popped=0.0)
@@ -223,7 +223,7 @@ class TestApiSubmitJob:
             state=GENERATION_STATE.ok,
             censored=False,
             time_popped=0.0,
-            job_image_results=[HordeImageResult(image_base64="data")],
+            job_image_results=[HordeImageResult(image_bytes=b"data")],
         )
         await track_popped_job_async(job_tracker, job, time_popped=0.0)
         await queue_job_for_submit_async(job_tracker, job_info)

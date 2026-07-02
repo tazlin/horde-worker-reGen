@@ -5,7 +5,6 @@ it already owns the CLIP interrogator and NSFW checker, so those forms run here 
 in the (comfy-loaded) inference processes.
 """
 
-import base64
 import enum
 import time
 from enum import auto
@@ -99,10 +98,10 @@ class HordeSafetyProcess(HordeProcess):
 
     _nsfw_checker: NSFWChecker
 
-    censor_csam_image_base64: str
-    censor_censorlist_image_base64: str
-    censor_sfw_request_image_base64: str
-    censor_sfw_worker_image_base64: str
+    censor_csam_image_bytes: bytes
+    censor_censorlist_image_bytes: bytes
+    censor_sfw_request_image_bytes: bytes
+    censor_sfw_worker_image_bytes: bytes
 
     _dry_run_skip_safety: bool
 
@@ -204,15 +203,15 @@ class HordeSafetyProcess(HordeProcess):
                 "The first job will always take several seconds longer when on CPU. Subsequent jobs will be faster.",
             )
 
-    def _set_censor_image(self, reason: CensorReason, image_base64: str) -> None:
+    def _set_censor_image(self, reason: CensorReason, image_bytes: bytes) -> None:
         if reason == CensorReason.CSAM:
-            self.censor_csam_image_base64 = image_base64
+            self.censor_csam_image_bytes = image_bytes
         elif reason == CensorReason.CENSORLIST:
-            self.censor_censorlist_image_base64 = image_base64
+            self.censor_censorlist_image_bytes = image_bytes
         elif reason == CensorReason.SFW_REQUEST:
-            self.censor_sfw_request_image_base64 = image_base64
+            self.censor_sfw_request_image_bytes = image_bytes
         elif reason == CensorReason.SFW_WORKER:
-            self.censor_sfw_worker_image_base64 = image_base64
+            self.censor_sfw_worker_image_bytes = image_bytes
         else:
             raise ValueError(f"Unknown censor reason: {reason}")
 
@@ -227,7 +226,7 @@ class HordeSafetyProcess(HordeProcess):
 
         for reason in CensorReason:
             with open(ASSETS_FOLDER_PATH / file_lookup[reason], "rb") as f:
-                self._set_censor_image(reason, base64.b64encode(f.read()).decode("utf-8"))
+                self._set_censor_image(reason, f.read())
 
     _caption_model_loaded: bool = False
     """Whether BLIP has been (lazily) loaded for caption forms."""
@@ -430,7 +429,7 @@ class HordeSafetyProcess(HordeProcess):
         result_payload: dict | None = None
 
         try:
-            image = PIL.Image.open(BytesIO(base64.b64decode(form.source_image_base64)))
+            image = PIL.Image.open(BytesIO(form.source_image_bytes))
 
             if is_caption_form(form.form):
                 self._ensure_caption_model()
@@ -524,8 +523,8 @@ class HordeSafetyProcess(HordeProcess):
                     time_elapsed=0.0,
                     job_id=message.job_id,
                     safety_evaluations=[
-                        HordeSafetyEvaluation(is_nsfw=False, is_csam=False, replacement_image_base64=None)
-                        for _ in message.images_base64
+                        HordeSafetyEvaluation(is_nsfw=False, is_csam=False, replacement_image_bytes=None)
+                        for _ in message.images_bytes
                     ],
                 ),
             )
@@ -537,23 +536,21 @@ class HordeSafetyProcess(HordeProcess):
         time_start = time.time()
 
         logger.info(
-            f"Horde safety process received job {message.job_id}. Number of images: {len(message.images_base64)}",
+            f"Horde safety process received job {message.job_id}. Number of images: {len(message.images_bytes)}",
         )
 
         safety_evaluations: list[HordeSafetyEvaluation] = []
 
-        for image_base64 in message.images_base64:
-            # Decode the image from base64
-            image_bytes = BytesIO(base64.b64decode(image_base64))
+        for image_bytes in message.images_bytes:
             try:
-                image_as_pil = PIL.Image.open(image_bytes)
+                image_as_pil = PIL.Image.open(BytesIO(image_bytes))
             except Exception as e:
                 logger.error(f"Failed to open image: {type(e).__name__} {e}")
                 safety_evaluations.append(
                     HordeSafetyEvaluation(
                         is_nsfw=True,
                         is_csam=True,
-                        replacement_image_base64=None,
+                        replacement_image_bytes=None,
                         failed=True,
                     ),
                 )
@@ -569,16 +566,16 @@ class HordeSafetyProcess(HordeProcess):
             if nsfw_result is None:
                 raise RuntimeError("NSFW result is None")
 
-            replacement_image_base64: str | None = None
+            replacement_image_bytes: bytes | None = None
 
             if nsfw_result.is_csam:
-                replacement_image_base64 = self.censor_csam_image_base64
+                replacement_image_bytes = self.censor_csam_image_bytes
                 logger.debug(f"CSAM detected in image {message.job_id}. Image is deleted.")
             elif message.sfw_worker and nsfw_result.is_nsfw:
-                replacement_image_base64 = self.censor_sfw_worker_image_base64
+                replacement_image_bytes = self.censor_sfw_worker_image_bytes
                 logger.info(f"SFW worker detected NSFW in image {message.job_id}.")
             elif message.censor_nsfw and nsfw_result.is_nsfw:
-                replacement_image_base64 = self.censor_sfw_request_image_base64
+                replacement_image_bytes = self.censor_sfw_request_image_bytes
                 logger.info(f"Censor list detected NSFW in image {message.job_id}.")
 
             # The aesthetic score rides on the same CLIP embedding the NSFW check just used, so it is
@@ -590,7 +587,7 @@ class HordeSafetyProcess(HordeProcess):
                 HordeSafetyEvaluation(
                     is_nsfw=nsfw_result.is_nsfw,
                     is_csam=nsfw_result.is_csam,
-                    replacement_image_base64=replacement_image_base64,
+                    replacement_image_bytes=replacement_image_bytes,
                     aesthetic_score=aesthetic_score,
                 ),
             )

@@ -148,7 +148,7 @@ class TestControlLoopTick:
         job_info = Mock()
         job_info.sdk_api_job_info = job
         job_info.job_image_results = [Mock()]
-        job_info.images_base64 = ["base64data"]
+        job_info.images_bytes = [b"imgdata"]
 
         await process_manager._job_tracker.queue_for_safety(job_info)
 

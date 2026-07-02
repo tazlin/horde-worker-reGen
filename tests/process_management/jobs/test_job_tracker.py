@@ -328,7 +328,7 @@ class TestJobStages:
             state=GENERATION_STATE.ok,
             censored=False,
             time_popped=0.0,
-            job_image_results=[HordeImageResult(image_base64="data")],
+            job_image_results=[HordeImageResult(image_bytes=b"data")],
         )
         await job_tracker.queue_for_submit(safety_checked)
         assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
@@ -339,7 +339,7 @@ class TestJobStages:
             state=None,
             censored=None,
             time_popped=0.0,
-            job_image_results=[HordeImageResult(image_base64="data")],
+            job_image_results=[HordeImageResult(image_bytes=b"data")],
         )
         await job_tracker.queue_for_safety(stale_pre_safety)
 

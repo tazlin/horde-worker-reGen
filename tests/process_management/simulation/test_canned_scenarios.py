@@ -78,7 +78,7 @@ class TestAlchemyScenario:
         forms = make_alchemy_scenario(["caption", "RealESRGAN_x4plus"], 3)
         assert [form.form for form in forms] == ["caption", "RealESRGAN_x4plus", "caption"]
         assert len({form.form_id for form in forms}) == 3
-        assert all(form.source_image_base64 for form in forms)
+        assert all(form.source_image_bytes for form in forms)
 
     def test_canned_source_exhausts(self) -> None:
         """The source hands out each form once and then reports exhaustion."""

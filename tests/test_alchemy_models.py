@@ -32,7 +32,7 @@ def _result_message(
     form: str,
     *,
     result_payload: dict | None = None,
-    image_base64: str | None = None,
+    image_bytes: bytes | None = None,
 ) -> HordeAlchemyResultMessage:
     return HordeAlchemyResultMessage(
         process_id=0,
@@ -42,7 +42,7 @@ def _result_message(
         form=form,
         state=GENERATION_STATE.ok,
         result_payload=result_payload,
-        image_base64=image_base64,
+        image_bytes=image_bytes,
     )
 
 
@@ -253,7 +253,7 @@ class TestAlchemySubmitShapes:
     def test_image_form_submits_r2_sentinel(self) -> None:
         """Image forms submit the R2 sentinel after upload."""
         submit = PendingAlchemySubmitJob(
-            result_message=_result_message("RealESRGAN_x4plus", image_base64="aGk="),
+            result_message=_result_message("RealESRGAN_x4plus", image_bytes=b"hi"),
             r2_upload="https://example.com/upload",
             time_popped=0.0,
         )
@@ -450,8 +450,8 @@ class TestAlchemyDispatch:
         )
         coordinator = _make_coordinator(process_map)
 
-        upscale_form = AlchemyFormSpec(form_id="form-1", form="RealESRGAN_x4plus", source_image_base64="aGk=")
-        caption_form = AlchemyFormSpec(form_id="form-2", form="caption", source_image_base64="aGk=")
+        upscale_form = AlchemyFormSpec(form_id="form-1", form="RealESRGAN_x4plus", source_image_bytes=b"hi")
+        caption_form = AlchemyFormSpec(form_id="form-2", form="caption", source_image_bytes=b"hi")
         coordinator._pending_forms.extend([upscale_form, caption_form])
 
         coordinator.dispatch_pending_forms()
@@ -466,7 +466,7 @@ class TestAlchemyDispatch:
         """A form stays queued until a capable process is available."""
         process_map = _StubProcessMap({})
         coordinator = _make_coordinator(process_map)
-        form = AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_base64="aGk=")
+        form = AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_bytes=b"hi")
         coordinator._pending_forms.append(form)
 
         coordinator.dispatch_pending_forms()
@@ -478,7 +478,7 @@ class TestAlchemyDispatch:
         """A result message moves the form from in-flight to pending submit."""
         process_map = _StubProcessMap({WorkerCapability.ALCHEMY_CLIP: _StubProcessInfo(process_id=2)})
         coordinator = _make_coordinator(process_map)
-        form = AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_base64="aGk=", r2_upload=None)
+        form = AlchemyFormSpec(form_id="form-1", form="nsfw", source_image_bytes=b"hi", r2_upload=None)
         coordinator._pending_forms.append(form)
         coordinator._form_time_popped["form-1"] = 123.0
         coordinator.dispatch_pending_forms()

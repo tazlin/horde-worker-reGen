@@ -57,11 +57,11 @@ class HordeJobInfo(BaseModel):
         return self.safety_evaluated
 
     @property
-    def images_base64(self) -> list[str]:
-        """Return a list containing all base64 images."""
+    def images_bytes(self) -> list[bytes]:
+        """Return a list containing all encoded image bytes."""
         if self.job_image_results is None:
             return []
-        return [r.image_base64 for r in self.job_image_results]
+        return [r.image_bytes for r in self.job_image_results]
 
     def fault_job(self) -> None:
         """Mark the job as faulted."""

@@ -47,7 +47,7 @@ def _safety_job_info(*, model: str = "stable_diffusion") -> HordeJobInfo:
     pop = make_job_pop_response(model=model, r2_upload="https://r2.example/upload")
     return HordeJobInfo(
         sdk_api_job_info=pop,
-        job_image_results=[HordeImageResult(image_base64="imgdata")],
+        job_image_results=[HordeImageResult(image_bytes=b"imgdata")],
         state=None,
         time_popped=time.time(),
     )
@@ -255,7 +255,7 @@ def _safety_eval(*, failed: bool = False, is_nsfw: bool = False, is_csam: bool =
     evaluation.failed = failed
     evaluation.is_nsfw = is_nsfw
     evaluation.is_csam = is_csam
-    evaluation.replacement_image_base64 = None
+    evaluation.replacement_image_bytes = None
     return evaluation
 
 

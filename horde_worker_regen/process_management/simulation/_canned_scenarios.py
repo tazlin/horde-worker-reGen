@@ -104,8 +104,8 @@ def make_simple_scenario(
 
 
 @functools.cache
-def make_source_image_base64(width: int = 512, height: int = 512) -> str:
-    """Return a synthetic source image (PNG base64) suitable for img2img/controlnet/alchemy.
+def make_source_image_bytes(width: int = 512, height: int = 512) -> bytes:
+    """Return a synthetic source image (PNG bytes) suitable for img2img/controlnet/alchemy.
 
     Uses PIL when available (a gradient with enough structure for annotators to find
     edges); falls back to a 1x1 dummy PNG in environments without PIL.
@@ -115,9 +115,9 @@ def make_source_image_base64(width: int = 512, height: int = 512) -> str:
 
         import PIL.Image
     except ImportError:
-        from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_base64
+        from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
 
-        return make_dummy_png_base64()
+        return make_dummy_png_bytes()
 
     image = PIL.Image.new("RGB", (width, height))
     pixels = image.load()
@@ -130,7 +130,7 @@ def make_source_image_base64(width: int = 512, height: int = 512) -> str:
 
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return buffer.getvalue()
 
 
 def make_canned_job(
@@ -182,11 +182,11 @@ def make_canned_job(
     if control_type is not None:
         data["payload"]["control_type"] = control_type
         if source_image_base64 is None:
-            source_image_base64 = make_source_image_base64()
+            source_image_base64 = base64.b64encode(make_source_image_bytes()).decode("utf-8")
     if workflow is not None:
         data["payload"]["workflow"] = workflow
         if source_image_base64 is None:
-            source_image_base64 = make_source_image_base64()
+            source_image_base64 = base64.b64encode(make_source_image_bytes()).decode("utf-8")
     if source_image_base64 is not None:
         data["source_image"] = source_image_base64
         data["source_processing"] = source_processing if source_processing is not None else "img2img"
@@ -346,17 +346,17 @@ def make_alchemy_scenario(
     forms: list[str],
     num_forms: int,
     *,
-    source_image_base64: str | None = None,
+    source_image_bytes: bytes | None = None,
 ) -> list[AlchemyFormSpec]:
     """Create alchemy form specs cycling over the given form names (e.g. caption, RealESRGAN_x4plus)."""
     if not forms:
         raise ValueError("forms must not be empty")
-    image = source_image_base64 if source_image_base64 is not None else make_source_image_base64()
+    image = source_image_bytes if source_image_bytes is not None else make_source_image_bytes()
     return [
         AlchemyFormSpec(
             form_id=str(uuid.uuid4()),
             form=forms[i % len(forms)],
-            source_image_base64=image,
+            source_image_bytes=image,
             r2_upload=DUMMY_R2_UPLOAD_URL,
         )
         for i in range(num_forms)
@@ -457,7 +457,7 @@ class GeneratingAlchemySource(CannedAlchemySource):
         if sum(self._form_weights) <= 0:
             self._form_weights = [1.0] * len(self._form_names)
         self._rng = random.Random(seed)
-        self._source_image = make_source_image_base64()
+        self._source_image = make_source_image_bytes()
         self._stopped = False
 
     def stop(self) -> None:
@@ -482,7 +482,7 @@ class GeneratingAlchemySource(CannedAlchemySource):
         return AlchemyFormSpec(
             form_id=str(uuid.uuid4()),
             form=form,
-            source_image_base64=self._source_image,
+            source_image_bytes=self._source_image,
             r2_upload=DUMMY_R2_UPLOAD_URL,
         )
 

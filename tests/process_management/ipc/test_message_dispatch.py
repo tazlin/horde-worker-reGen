@@ -595,7 +595,7 @@ class TestHandleSafetyResult:
 
         safety_eval = Mock()
         safety_eval.failed = False
-        safety_eval.replacement_image_base64 = None
+        safety_eval.replacement_image_bytes = None
         safety_eval.is_csam = False
         safety_eval.is_nsfw = False
         safety_eval.aesthetic_score = None
@@ -636,7 +636,7 @@ class TestHandleSafetyResult:
 
         safety_eval = Mock()
         safety_eval.failed = False
-        safety_eval.replacement_image_base64 = None
+        safety_eval.replacement_image_bytes = None
         safety_eval.is_csam = False
         safety_eval.is_nsfw = False
         safety_eval.aesthetic_score = 6.42
@@ -666,7 +666,7 @@ class TestHandleSafetyResult:
         message_dispatcher = _make_dispatcher(job_tracker=job_tracker)
         safety_eval = Mock()
         safety_eval.failed = False
-        safety_eval.replacement_image_base64 = None
+        safety_eval.replacement_image_bytes = None
         safety_eval.is_csam = False
         safety_eval.is_nsfw = False
         safety_eval.aesthetic_score = None

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import gc
 import io
@@ -1146,14 +1145,14 @@ class HordeInferenceProcess(HordeProcess):
 
         time_start = time.time()
         state = GENERATION_STATE.faulted
-        image_base64: str | None = None
+        image_bytes: bytes | None = None
 
         try:
             kind = classify_post_processor(form.form)
             if kind is None:
                 raise ValueError(f"Unknown alchemy form for inference process: {form.form}")
 
-            source_image = PIL.Image.open(io.BytesIO(base64.b64decode(form.source_image_base64)))
+            source_image = PIL.Image.open(io.BytesIO(form.source_image_bytes))
 
             result = self._horde.post_process(
                 {
@@ -1167,7 +1166,7 @@ class HordeInferenceProcess(HordeProcess):
             buffer = io.BytesIO()
             # WebP keeps submit bandwidth low; quality/method match the legacy alchemist.
             result.image.save(buffer, format="WebP", quality=95, method=6)
-            image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            image_bytes = buffer.getvalue()
             state = GENERATION_STATE.ok
         except Exception as e:
             logger.error(f"Alchemy form {form.form} ({form.form_id}) failed: {type(e).__name__} {e}")
@@ -1181,7 +1180,7 @@ class HordeInferenceProcess(HordeProcess):
                 form_id=form.form_id,
                 form=form.form,
                 state=state,
-                image_base64=image_base64,
+                image_bytes=image_bytes,
             ),
         )
 
@@ -1339,10 +1338,9 @@ class HordeInferenceProcess(HordeProcess):
                     logger.critical("Result or result image is None")
                     continue
 
-                image_base64 = base64.b64encode(result.rawpng.getvalue()).decode("utf-8")
                 all_image_results.append(
                     HordeImageResult(
-                        image_base64=image_base64,
+                        image_bytes=result.rawpng.getvalue(),
                         generation_faults=result.faults,
                     ),
                 )

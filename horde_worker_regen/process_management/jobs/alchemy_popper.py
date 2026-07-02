@@ -424,8 +424,8 @@ class AlchemyCoordinator:
         return len(self._pending_submits)
 
     @staticmethod
-    def _decode_image_resolution(source_image_base64: str) -> tuple[int, int] | None:
-        """Return the (width, height) of a base64 source image, or None if it cannot be read.
+    def _decode_image_resolution(source_image_bytes: bytes) -> tuple[int, int] | None:
+        """Return the (width, height) of an encoded source image, or None if it cannot be read.
 
         Only the image header is parsed (Pillow defers pixel decode), so this is cheap. Any failure
         (malformed data, unknown format) yields None so a form still shows in the tables without a size.
@@ -435,7 +435,7 @@ class AlchemyCoordinator:
 
             import PIL.Image
 
-            with PIL.Image.open(io.BytesIO(base64.b64decode(source_image_base64))) as image:
+            with PIL.Image.open(io.BytesIO(source_image_bytes)) as image:
                 return (image.width, image.height)
         except Exception:
             return None
@@ -603,17 +603,21 @@ class AlchemyCoordinator:
             self._free_vram_baseline_mb = free_vram_mb
             self._min_free_vram_mb = None
 
-    async def _download_source_image(self, source_image: str) -> str:
-        """Return the form's source image as base64, downloading it if it is a URL."""
+    async def _download_source_image(self, source_image: str) -> bytes:
+        """Return the form's source image as raw bytes, downloading it if it is a URL.
+
+        The horde API delivers a non-URL source image as a base64 string, so that case is decoded to
+        bytes here; a URL yields its bytes directly.
+        """
         if not source_image.startswith(("http://", "https://")):
-            return source_image
+            return base64.b64decode(source_image)
 
         async with self._api_sessions.require_aiohttp_session().get(
             yarl.URL(source_image, encoded=True),
             timeout=aiohttp.ClientTimeout(total=15),
         ) as response:
             response.raise_for_status()
-            return base64.b64encode(await response.read()).decode("utf-8")
+            return await response.read()
 
     def _canned_alchemy_pop(self) -> None:
         """Take the next form from the canned source, honoring the same pop policy as the API path."""
@@ -627,7 +631,7 @@ class AlchemyCoordinator:
             return
 
         self._form_time_popped[spec.form_id] = time.time()
-        self._form_resolution[spec.form_id] = self._decode_image_resolution(spec.source_image_base64)
+        self._form_resolution[spec.form_id] = self._decode_image_resolution(spec.source_image_bytes)
         self._pending_forms.append(spec)
         logger.opt(ansi=True).info(
             f"<fg #34c0eb>Popped canned alchemy form {spec.form_id} ({spec.form})</>",
@@ -700,7 +704,7 @@ class AlchemyCoordinator:
                 logger.error(f"Popped alchemy form has no source image: {form}")
                 continue
             try:
-                source_image_base64 = await self._download_source_image(form.source_image)
+                source_image_bytes = await self._download_source_image(form.source_image)
             except Exception as e:
                 logger.error(f"Failed to download alchemy source image for {form.id_}: {e}")
                 self._pending_submits.append(
@@ -722,11 +726,11 @@ class AlchemyCoordinator:
             spec = AlchemyFormSpec(
                 form_id=str(form.id_),
                 form=str(form.form),
-                source_image_base64=source_image_base64,
+                source_image_bytes=source_image_bytes,
                 r2_upload=form.r2_upload,
             )
             self._form_time_popped[spec.form_id] = time.time()
-            self._form_resolution[spec.form_id] = self._decode_image_resolution(source_image_base64)
+            self._form_resolution[spec.form_id] = self._decode_image_resolution(source_image_bytes)
             self._pending_forms.append(spec)
             logger.opt(ansi=True).info(
                 f"<fg #34c0eb>Popped alchemy form {spec.form_id} ({spec.form})</>",
@@ -867,14 +871,14 @@ class AlchemyCoordinator:
 
     async def _upload_form_image(self, submit: PendingAlchemySubmitJob) -> bool:
         """Upload an image-form result (WebP bytes) to the pop-provided R2 URL."""
-        if submit.result_message.image_base64 is None:
+        if submit.result_message.image_bytes is None:
             logger.error(f"Alchemy form {submit.form_id} has no image to upload")
             return False
         if not submit.r2_upload:
             logger.error(f"Alchemy form {submit.form_id} has no R2 upload URL")
             return False
 
-        image_bytes = base64.b64decode(submit.result_message.image_base64)
+        image_bytes = submit.result_message.image_bytes
         async with self._api_sessions.require_aiohttp_session().put(
             yarl.URL(submit.r2_upload, encoded=True),
             data=image_bytes,

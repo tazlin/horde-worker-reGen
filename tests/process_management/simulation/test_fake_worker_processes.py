@@ -7,7 +7,6 @@ inference and safety processes.
 
 from __future__ import annotations
 
-import base64
 import uuid
 from unittest.mock import Mock
 
@@ -152,8 +151,7 @@ class TestFakeInferenceProcess:
         assert result.job_image_results is not None
         assert len(result.job_image_results) == 2
         for image_result in result.job_image_results:
-            png_bytes = base64.b64decode(image_result.image_base64)
-            assert png_bytes.startswith(b"\x89PNG")
+            assert image_result.image_bytes.startswith(b"\x89PNG")
 
         states = queue.state_changes()
         assert HordeProcessState.INFERENCE_STARTING in states
@@ -218,7 +216,7 @@ class TestFakeSafetyProcess:
                 prompt="a test prompt",
                 censor_nsfw=True,
                 sfw_worker=True,
-                images_base64=["aaa", "bbb", "ccc"],
+                images_bytes=[b"aaa", b"bbb", b"ccc"],
                 horde_model_info=None,
             ),
         )
@@ -233,7 +231,7 @@ class TestFakeSafetyProcess:
             assert not evaluation.is_nsfw
             assert not evaluation.is_csam
             assert not evaluation.failed
-            assert evaluation.replacement_image_base64 is None
+            assert evaluation.replacement_image_bytes is None
 
         states = queue.state_changes()
         assert HordeProcessState.EVALUATING_SAFETY in states

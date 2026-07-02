@@ -6,7 +6,6 @@ job does: the form shown where a model name goes, and the source-image resolutio
 
 from __future__ import annotations
 
-import base64
 import io
 import time
 from collections import deque
@@ -63,11 +62,11 @@ def test_record_form_metrics_is_noop_without_run_metrics() -> None:
     coordinator._record_form_metrics(_submit_job("x", "nsfw"), faulted=True)  # must not raise
 
 
-def _png_b64(width: int, height: int) -> str:
-    """A base64-encoded PNG of the given size, for the resolution-decode path."""
+def _png_bytes(width: int, height: int) -> bytes:
+    """Encoded PNG bytes of the given size, for the resolution-decode path."""
     buffer = io.BytesIO()
     PIL.Image.new("RGB", (width, height), (10, 20, 30)).save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return buffer.getvalue()
 
 
 def _bare_coordinator() -> AlchemyCoordinator:
@@ -83,18 +82,18 @@ def _bare_coordinator() -> AlchemyCoordinator:
 
 def test_decode_image_resolution_reads_dimensions() -> None:
     """A valid image yields its (width, height); junk yields None rather than raising."""
-    assert AlchemyCoordinator._decode_image_resolution(_png_b64(640, 480)) == (640, 480)
-    assert AlchemyCoordinator._decode_image_resolution("not-an-image") is None
+    assert AlchemyCoordinator._decode_image_resolution(_png_bytes(640, 480)) == (640, 480)
+    assert AlchemyCoordinator._decode_image_resolution(b"not-an-image") is None
 
 
 def test_active_form_statuses_projects_each_stage_with_resolution() -> None:
     """Pending, in-flight, and awaiting-submit forms each project with their form, stage, size, and owner."""
     coordinator = _bare_coordinator()
 
-    coordinator._pending_forms.append(AlchemyFormSpec(form_id="p1", form="caption", source_image_base64="x"))
+    coordinator._pending_forms.append(AlchemyFormSpec(form_id="p1", form="caption", source_image_bytes=b"x"))
     coordinator._form_resolution["p1"] = (640, 480)
 
-    coordinator._in_flight["f1"] = AlchemyFormSpec(form_id="f1", form="RealESRGAN_x4plus", source_image_base64="x")
+    coordinator._in_flight["f1"] = AlchemyFormSpec(form_id="f1", form="RealESRGAN_x4plus", source_image_bytes=b"x")
     coordinator._in_flight_owner["f1"] = (3, 0)
     coordinator._form_resolution["f1"] = (1024, 768)
 
@@ -138,9 +137,9 @@ def test_work_ledger_and_queue_include_alchemy_forms() -> None:
     """The process manager surfaces alchemy forms into the work ledger and queue with form-as-model + size."""
     manager = make_testable_process_manager()
     coordinator = manager._alchemy_coordinator
-    coordinator._pending_forms.append(AlchemyFormSpec(form_id="p1", form="caption", source_image_base64="x"))
+    coordinator._pending_forms.append(AlchemyFormSpec(form_id="p1", form="caption", source_image_bytes=b"x"))
     coordinator._form_resolution["p1"] = (640, 480)
-    coordinator._in_flight["f1"] = AlchemyFormSpec(form_id="f1", form="RealESRGAN_x4plus", source_image_base64="x")
+    coordinator._in_flight["f1"] = AlchemyFormSpec(form_id="f1", form="RealESRGAN_x4plus", source_image_bytes=b"x")
     coordinator._in_flight_owner["f1"] = (2, 0)
     coordinator._form_resolution["f1"] = (1024, 768)
 

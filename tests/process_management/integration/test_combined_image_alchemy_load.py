@@ -265,8 +265,8 @@ class TestSyncReserveLedger:
         )
         # Graph forms (which allocate real VRAM); CLIP-form reserving is covered by TestFormCostClassification.
         coordinator._in_flight = {
-            "form-a": AlchemyFormSpec(form_id="form-a", form="RealESRGAN_x4plus", source_image_base64="aGk="),
-            "form-b": AlchemyFormSpec(form_id="form-b", form="RealESRGAN_x2plus", source_image_base64="aGk="),
+            "form-a": AlchemyFormSpec(form_id="form-a", form="RealESRGAN_x4plus", source_image_bytes=b"hi"),
+            "form-b": AlchemyFormSpec(form_id="form-b", form="RealESRGAN_x2plus", source_image_bytes=b"hi"),
         }
         coordinator._sync_reserve_ledger()
         # Cold-start prediction is the floor (1500) per form.
@@ -279,7 +279,7 @@ class TestSyncReserveLedger:
 
 
 def _spec(form_id: str, form: str) -> AlchemyFormSpec:
-    return AlchemyFormSpec(form_id=form_id, form=form, source_image_base64="aGk=")
+    return AlchemyFormSpec(form_id=form_id, form=form, source_image_bytes=b"hi")
 
 
 class TestFormCostClassification:
@@ -448,7 +448,7 @@ class TestLostFormReaping:
             reserve_ledger=ledger,
         )
         coordinator._pending_forms.append(
-            AlchemyFormSpec(form_id=form_id, form=form, source_image_base64="aGk="),
+            AlchemyFormSpec(form_id=form_id, form=form, source_image_bytes=b"hi"),
         )
         coordinator.dispatch_pending_forms()
         return coordinator, process_map

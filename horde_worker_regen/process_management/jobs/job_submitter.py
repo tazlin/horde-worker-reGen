@@ -31,7 +31,7 @@ from horde_worker_regen.process_management.jobs.job_models import (
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.reporting.kudos_training_recorder import KudosTrainingRecorder
-from horde_worker_regen.utils.image_utils import base64_image_to_stream_buffer
+from horde_worker_regen.utils.image_utils import image_bytes_to_stream_buffer
 
 if TYPE_CHECKING:
     from horde_model_reference.model_reference_records import ImageGenerationModelRecord
@@ -156,8 +156,8 @@ class JobSubmitter:
             return new_submit
 
         if new_submit.image_result is not None:
-            image_in_buffer = base64_image_to_stream_buffer(
-                new_submit.image_result.image_base64,
+            image_in_buffer = image_bytes_to_stream_buffer(
+                new_submit.image_result.image_bytes,
             )
             if image_in_buffer is None:
                 logger.critical(

@@ -65,7 +65,7 @@ from horde_worker_regen.process_management.lifecycle.child_crash_capture import 
 )
 from horde_worker_regen.process_management.lifecycle.debug_attach import maybe_wait_for_process_debugger
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
-from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_base64
+from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
 from horde_worker_regen.process_management.simulation.fault_injection import (
     FAULT_INFO_PREFIX,
     FaultKind,
@@ -270,7 +270,7 @@ class FakeInferenceProcess(HordeProcess):
                 info=f"{FAULT_INFO_PREFIX}{FaultKind.CORRUPT_MESSAGE}",
                 state=GENERATION_STATE.ok,
                 time_elapsed=0.0,
-                job_image_results=[HordeImageResult(image_base64=make_dummy_png_base64())],
+                job_image_results=[HordeImageResult(image_bytes=make_dummy_png_bytes())],
                 sdk_api_job_info=job_info,
             ),
         )
@@ -315,7 +315,7 @@ class FakeInferenceProcess(HordeProcess):
         n_iter = job_info.payload.n_iter if job_info.payload.n_iter else 1
         job_image_results = None
         if not should_fail:
-            job_image_results = [HordeImageResult(image_base64=make_dummy_png_base64()) for _ in range(n_iter)]
+            job_image_results = [HordeImageResult(image_bytes=make_dummy_png_bytes()) for _ in range(n_iter)]
 
         if should_oom:
             result_info = f"{FAULT_INFO_PREFIX}{FaultKind.OOM}"
@@ -428,7 +428,7 @@ class FakeInferenceProcess(HordeProcess):
                 form_id=form.form_id,
                 form=form.form,
                 state=GENERATION_STATE.ok,
-                image_base64=make_dummy_png_base64(),
+                image_bytes=make_dummy_png_bytes(),
             ),
         )
         self.process_message_queue.put(
@@ -651,9 +651,9 @@ class FakeSafetyProcess(HordeProcess):
                     HordeSafetyEvaluation(
                         is_nsfw=False,
                         is_csam=False,
-                        replacement_image_base64=None,
+                        replacement_image_bytes=None,
                     )
-                    for _ in message.images_base64
+                    for _ in message.images_bytes
                 ],
             ),
         )

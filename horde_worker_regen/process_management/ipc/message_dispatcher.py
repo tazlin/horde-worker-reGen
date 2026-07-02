@@ -830,7 +830,7 @@ class MessageDispatcher:
             if completed_job_info.sdk_api_job_info.id_ is None:
                 continue
             completed_job_info.job_image_results[i].generation_faults += job_fault_entries
-            replacement_image = message.safety_evaluations[i].replacement_image_base64
+            replacement_image = message.safety_evaluations[i].replacement_image_bytes
 
             if message.safety_evaluations[i].failed:
                 logger.error(
@@ -854,7 +854,7 @@ class MessageDispatcher:
                 )
 
             if replacement_image is not None:
-                completed_job_info.job_image_results[i].image_base64 = replacement_image
+                completed_job_info.job_image_results[i].image_bytes = replacement_image
                 num_images_censored += 1
                 if message.safety_evaluations[i].is_csam:
                     num_images_csam += 1
@@ -893,7 +893,7 @@ class MessageDispatcher:
                 completed_job_info.state = GENERATION_STATE.csam
                 completed_job_info.censored = True
             elif message.safety_evaluations[i].is_nsfw:
-                if message.safety_evaluations[i].replacement_image_base64 is None:
+                if message.safety_evaluations[i].replacement_image_bytes is None:
                     new_meta_entry = GenMetadataEntry(
                         type=METADATA_TYPE.information,
                         value=METADATA_VALUE.nsfw,

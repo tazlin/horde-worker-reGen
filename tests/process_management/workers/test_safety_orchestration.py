@@ -65,12 +65,12 @@ class TestStartEvaluateSafety:
         job.payload.use_nsfw_censor = False
 
         image_result = Mock()
-        image_result.image_base64 = "base64data"
+        image_result.image_bytes = b"imgdata"
 
         job_info = Mock()
         job_info.sdk_api_job_info = job
         job_info.job_image_results = [image_result]
-        job_info.images_base64 = ["base64data"]
+        job_info.images_bytes = [b"imgdata"]
 
         await queue_job_for_safety_async(process_manager._job_tracker, job_info)
 
@@ -132,7 +132,7 @@ class TestStartEvaluateSafety:
         job_info = Mock()
         job_info.sdk_api_job_info = job
         job_info.job_image_results = [Mock()]
-        job_info.images_base64 = ["base64data"]
+        job_info.images_bytes = [b"imgdata"]
 
         await queue_job_for_safety_async(process_manager._job_tracker, job_info)
 
@@ -262,7 +262,7 @@ class TestStartEvaluateSafety:
         job_info = Mock()
         job_info.sdk_api_job_info = job
         job_info.job_image_results = [Mock()]
-        job_info.images_base64 = ["base64data"]
+        job_info.images_bytes = [b"imgdata"]
 
         await queue_job_for_safety_async(process_manager._job_tracker, job_info)
 
