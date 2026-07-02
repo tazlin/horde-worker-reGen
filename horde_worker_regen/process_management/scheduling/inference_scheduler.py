@@ -1638,11 +1638,32 @@ class InferenceScheduler:
             if current >= ceiling and not safety_restored:
                 continue
             after = self._process_lifecycle.scale_inference_processes(ceiling, device_index=device_index)
+            self._reconcile_worker_shed_to_pool()
             safety_note = " and restoring safety to the GPU" if safety_restored else ""
             logger.opt(ansi=True).info(
                 f"<fg #7b7d7d>Whole-card residency for {model} complete; restoring inference processes "
                 f"({current} -> {after} of {ceiling}){safety_note}.</>",
             )
+
+    def _reconcile_worker_shed_to_pool(self) -> None:
+        """Realign the RAM governor's worker-wide shed record with the live inference-process count.
+
+        The RAM governor records a worker-wide shed so its own restore can grow the pool back once RAM
+        proves headroom. When a different mechanism grows the pool instead (the whole-card residency
+        restore), that record would otherwise persist as a stale claim that the pool is still short of
+        plan, and while the host stays under its RAM floor the governor re-sheds the pool the residency
+        just regrew. Recompute the record from the live count against the recorded plan: drop it once the
+        pool is back at (or above) plan, otherwise set the shortfall to the true remaining gap. A no-op on a
+        multi-GPU host, whose reduction tracks per-card shedding rather than a worker-wide record.
+        """
+        worker_shed = self._ram_governor_state.worker_shed
+        if worker_shed is None:
+            return
+        loaded = self._process_map.num_loaded_inference_processes()
+        if loaded >= worker_shed.planned_process_count:
+            self._ram_governor_state.worker_shed = None
+        else:
+            worker_shed.shed_process_count = worker_shed.planned_process_count - loaded
 
     def _residency_restore_ceiling(self, device_index: int | None) -> int:
         """The process count to grow back to when a card's whole-card residency is restored.
@@ -2045,10 +2066,12 @@ class InferenceScheduler:
                     if not isinstance(after, int):
                         after = current
                     if after < current:
-                        existing = governor_state.worker_shed.shed_process_count if governor_state.worker_shed else 0
+                        # The record is the live shortfall below plan, not an accumulation of reductions: a
+                        # whole-card residency restore can regrow the pool between reductions, and a running
+                        # total would over-count every cycle without bound while the pool is back at plan.
                         governor_state.worker_shed = WorkerProcessShedState(
                             planned_process_count=planned,
-                            shed_process_count=existing + (current - after),
+                            shed_process_count=max(0, planned - after),
                         )
                         shortfall_note = (
                             f", shortfall ~{pressure_shortfall_mb:.0f} MB" if pressure_shortfall_mb is not None else ""

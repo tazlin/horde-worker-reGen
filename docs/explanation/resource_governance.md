@@ -61,6 +61,14 @@ The two regimes are mutually exclusive by construction, so one combined executio
 restores. The tick's verdict is retained for the rest of the cycle: per-job gates (such as the preload
 RAM-floor defer) read it instead of re-measuring, so a whole cycle acts on one reading.
 
+The single-GPU shed record tracks the *live* shortfall below plan (planned minus loaded), not a running
+total of reductions. This matters because the inference-process count is also moved by a second, unrelated
+mechanism: whole-card residency collapses the pool to the residency holder and grows it back when the
+residency drains. When that restore regrows the pool, it reconciles the RAM shed record against the live
+count, dropping it once the pool is back at plan. Without that reconciliation the record would linger as a
+stale claim that the pool is still short, and while the host stayed under its floor the governor would
+re-shed the pool the residency just regrew, cycle after cycle, without ever returning to steady state.
+
 ## Decisions are values
 
 Remedies are expressed as inert command objects

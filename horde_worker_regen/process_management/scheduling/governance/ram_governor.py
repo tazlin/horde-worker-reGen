@@ -77,7 +77,12 @@ class WorkerProcessShedState:
     planned_process_count: int
     """The normal worker-wide process target before pressure shedding."""
     shed_process_count: int = 0
-    """How many contexts this pressure episode actually shed."""
+    """The live shortfall below plan (planned minus currently-loaded), not a running total of reductions.
+
+    Every mutation recomputes this from the measured process count against ``planned_process_count`` so it
+    stays the true outstanding gap. It must not accumulate across reductions: another mechanism (a
+    whole-card residency restore) can regrow the pool between reductions, and a running total would then
+    over-count each cycle without bound while the pool is actually back at plan."""
 
 
 class RamGovernorState:
