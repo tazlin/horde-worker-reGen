@@ -64,8 +64,9 @@ There are two termination paths:
 2. [`ProcessLifecycleManager`][horde_worker_regen.process_management.lifecycle.process_lifecycle.ProcessLifecycleManager]'s
    `_hard_kill_processes()` kills all children immediately, joins them briefly,
    and clears the in-memory process/model maps and owned-PID registry.
-3. `start_timed_shutdown()` launches a background thread that `sys.exit(1)`
-   after a grace period; a last-resort measure if the main loop is stuck.
+3. `start_timed_shutdown()` launches a background backstop. After a grace period,
+   it kills any remaining children and force-exits the worker process with a non-zero
+   status so an external supervisor can observe the death and restart it.
 
 ## Signal handling
 
@@ -131,7 +132,9 @@ escalation layer handles the case where the worker **as a whole** has stopped
 making progress: a "save-our-ship" supervisor first soft-resets the process pools
 in place (rebuild every child, reduce concurrency a notch for "limp-by"), and
 only if that clearly is not helping does it give up cleanly on jobs it cannot
-serve (faulting them so the horde reissues them) while continuing to run. Two
+serve (faulting them so the horde reissues them). If the process pools are
+structurally broken, that give-up escalates through abort so the supervised
+worker exits non-zero and is relaunched instead of staying half-alive. Two
 durable records (the action ledger and the owned-PID registry) support diagnosis
 and orphan cleanup across crashes. These are covered in full in
 [Resilience and Recovery](resilience_and_recovery.md).

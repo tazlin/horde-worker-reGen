@@ -184,7 +184,11 @@ The escalation, in order:
 2. **Give up cleanly** (`give_up_on_wedged_jobs`): once resets clearly are not
    helping (e.g. a deterministic crash-on-start), stop fighting: fault the jobs
    that cannot be served so the horde reissues them, rather than wedging forever.
-   The worker keeps running and keeps popping.
+   If the pool is still structurally usable (for example, a queue-deadlock give-up
+   with live capacity), the worker keeps running. If inference or safety capacity
+   cannot be restored, SOS escalates through abort so the worker process exits
+   non-zero after killing its children; the TUI supervisor then relaunches it via
+   the normal unexpected-exit path.
 
 With `exit_on_unhandled_faults` set, the worker exits instead of limping; SOS is
 the default-on alternative that prioritises continued operation.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -35,6 +36,11 @@ API before the last-resort kill."""
 
 _SHUTDOWN_POLL_INTERVAL_SECONDS = 0.25
 """Granularity of the backstop's wait loops, so a clean exit is detected promptly."""
+
+
+def _force_exit_process(exit_code: int) -> None:
+    """Terminate the worker process from any thread after last-resort cleanup."""
+    os._exit(exit_code)
 
 
 class ShutdownManager:
@@ -190,7 +196,7 @@ class ShutdownManager:
             # Only force-exit if the graceful shutdown hasn't completed; a clean exit
             # should be left to the main thread (and embedders like the test harness).
             if not self._state.shut_down:
-                sys.exit(1)
+                _force_exit_process(1)
 
         threading.Thread(target=hard_shutdown).start()
 

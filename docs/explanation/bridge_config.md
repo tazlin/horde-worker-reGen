@@ -120,7 +120,7 @@ Three boolean flags interact to determine timings and parallelism:
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `high_performance_mode`     | Cuts `process_timeout` to 1/3 of default; allows post-processing overlap                                                                                                                                                           |
 | `moderate_performance_mode` | Cuts `process_timeout` to 1/2 of default; allows post-processing overlap                                                                                                                                                           |
-| `extra_slow_worker`         | Disables both performance modes (`high_performance_mode`, `moderate_performance_mode`); forces `queue_size=0`, `max_threads=1`, and `preload_timeout` to at least `120`                                                             |
+| `extra_slow_worker`         | Disables both performance modes (`high_performance_mode`, `moderate_performance_mode`); forces `queue_size=0`, `max_threads=1`, and `preload_timeout` to at least `150`                                                             |
 
 These flags also affect safety-check timeouts and how aggressively the scheduler
 preloads models.

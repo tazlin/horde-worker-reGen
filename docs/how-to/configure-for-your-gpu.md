@@ -65,7 +65,7 @@ Minimise other VRAM-consuming apps while the worker runs.
 - `extra_slow_worker: true` gives more time per job, but requesters must opt in. Only use it if you
   are consistently under 0.3 MPS/s or 3000 kudos/hr with an otherwise-correct config.
 - `limit_max_steps: true` caps total steps per job based on model type.
-- `preload_timeout: 120` allows longer model load times.
+- `preload_timeout: 150` allows longer model load times.
 
 ### Systems with less than 32 GB RAM
 

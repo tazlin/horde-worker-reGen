@@ -77,13 +77,12 @@ being stuck. Processes continuously report progress via heartbeats
 as `min(now − last_received, now − last_heartbeat)` exceeding a **per-state**
 timeout:
 
-| Stuck in…                        | Timeout                                |
-| -------------------------------- | -------------------------------------- |
-| Mid-inference                    | `inference_step_timeout`               |
-| Preloading a model / starting up | `preload_timeout`                      |
-| Downloading an auxiliary model   | `download_timeout`                     |
-| Post-processing                  | `post_process_timeout + 3 × max_batch` |
-
+| Stuck in…                        | Timeout                                | Default window                         |
+| -------------------------------- | -------------------------------------- | -------------------------------------- |
+| Mid-inference                    | `inference_step_timeout`               | `20s` base, widened as described below |
+| Preloading a model / starting up | `preload_timeout`                      | `150s`                                 |
+| Downloading an auxiliary model   | `download_timeout`                     | LoRA download budget + 1s              |
+| Post-processing                  | `post_process_timeout + 3 × max_batch` | `120s + 3 × max_batch`                 |
 (`process_timeout` and these timeouts are affected by performance modes.)
 
 The mid-inference timeout is not a single flat value. Before a job's first
@@ -127,16 +126,18 @@ the wedged call itself: hordelib swallows exceptions raised inside the progress
 callback, so reaping is the parent's job.) The `detect_stuck_inference_step`
 [log detector](../reference/logs.md) recognizes the reap line after the fact.
 
-A reap in the **post-processing** state has a specific cause worth naming: a VRAM
-over-commit. The upscaler/face-fixer peak lands after sampling and is never
-charged against the job's placement, so on a contended card it allocates into
-near-zero free VRAM and tile-thrashes silently until the
-`post_process_timeout + 3 × max_batch` silence reaps the slot. Each such reap
-feeds the post-processing fault breaker (see
+A reap in the **post-processing** state most often means the post-processing peak
+or result handoff went silent for too long. A common cause is VRAM over-commit:
+the upscaler/face-fixer peak lands after sampling and is never charged against
+the job's placement, so on a contended card it allocates into near-zero free VRAM
+and tile-thrashes silently until the `post_process_timeout + 3 × max_batch`
+silence reaps the slot. The same watchdog also covers a child that completed the
+post-processing pipeline but then stalls while packaging or sending the final
+result to the parent. Each such reap feeds the post-processing fault breaker (see
 [Resilience and recovery](resilience_and_recovery.md)); the
 `detect_post_processing_vram_stall` detector attributes the reap line to the
-over-commit. The preventative fix is the scheduler's active post-processing
-reclaim (`post_processing_active_reclaim_enabled`, see
+post-processing stall. The preventative fix for the VRAM-over-commit case is the
+scheduler's active post-processing reclaim (`post_processing_active_reclaim_enabled`, see
 [bridge config](bridge_config.md#post-processing-vram-over-commit)), which frees
 cross-process VRAM before the peak lands so the reap never happens.
 

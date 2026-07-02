@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -13,6 +14,7 @@ from horde_worker_regen.process_management.ipc.messages import HordeImageResult,
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_submitter import JobSubmitter
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle import shutdown_manager as shutdown_manager_module
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.shutdown_manager import (
@@ -194,12 +196,14 @@ class TestAbort:
         shutdown_manager = _make_shutdown_manager()
         shutdown_manager._job_tracker._purge_jobs = Mock()
         shutdown_manager._process_lifecycle._hard_kill_processes = Mock()
+        shutdown_manager.start_timed_shutdown = Mock()
 
         shutdown_manager.abort()
 
         assert shutdown_manager._state.shutting_down is True
         shutdown_manager._job_tracker._purge_jobs.assert_called_once()
         shutdown_manager._process_lifecycle._hard_kill_processes.assert_called_once()
+        shutdown_manager.start_timed_shutdown.assert_called_once()
 
 
 class TestSignalHandler:
@@ -330,6 +334,32 @@ class TestShutdownDrainsUnsubmittableJob:
         assert len(job_tracker.jobs_pending_submit) == 0
         # With the queue drained and no live processes, shutdown can finally complete.
         assert shutdown_manager.is_time_for_shutdown() is True
+
+
+class TestTimedShutdownBackstop:
+    """The background shutdown backstop must terminate the worker process, not only its own thread."""
+
+    def test_backstop_force_exits_after_killing_children(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A timed-out shutdown uses the process-exit lever so the supervisor can observe and restart it."""
+        shutdown_manager = _make_shutdown_manager()
+        shutdown_manager._process_lifecycle._hard_kill_processes = Mock()
+        exit_codes: list[int] = []
+
+        class _InlineThread:
+            def __init__(self, target: Callable[[], None], *args: object, **kwargs: object) -> None:
+                self._target = target
+
+            def start(self) -> None:
+                self._target()
+
+        monkeypatch.setattr(shutdown_manager_module, "_EMPTY_SHUTDOWN_GRACE_SECONDS", 0.0)
+        monkeypatch.setattr(shutdown_manager_module, "_force_exit_process", exit_codes.append)
+        monkeypatch.setattr(shutdown_manager_module.threading, "Thread", _InlineThread)
+
+        shutdown_manager.start_timed_shutdown()
+
+        shutdown_manager._process_lifecycle._hard_kill_processes.assert_called_once()
+        assert exit_codes == [1]
 
 
 class TestStartTimedShutdownIdempotent:

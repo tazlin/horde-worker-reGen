@@ -77,11 +77,11 @@ def compute_extra_slow_clamps(
                 "Extra slow worker is enabled, so max_threads has been set to 1. "
                 "This behavior may change in the future.",
             )
-    if preload_timeout < 120:
-        preload_clamp = 120
+    if preload_timeout < 150:
+        preload_clamp = 150
         if log:
             logger.warning(
-                "Extra slow worker is enabled, so preload_timeout has been set to 120. "
+                "Extra slow worker is enabled, so preload_timeout has been set to 150. "
                 "This behavior may change in the future.",
             )
 
@@ -338,7 +338,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     process_timeout: int = Field(default=300)
     """The maximum amount of time to allow a job to run before it is killed"""
 
-    post_process_timeout: int = Field(default=60, ge=15)
+    post_process_timeout: int = Field(default=120, ge=15)
 
     download_timeout: int = Field(default=TOTAL_LORA_DOWNLOAD_TIMEOUT + 1)
     """The maximum amount of time to allow an aux model to download before it is killed"""
@@ -387,7 +387,7 @@ class reGenBridgeData(CombinedHordeBridgeData):
     disks. New downloads always target the primary root. Also settable via the
     ``AIWORKER_EXTRA_MODEL_DIRECTORIES`` environment variable (``os.pathsep``-separated)."""
 
-    preload_timeout: int = Field(default=80, ge=15)
+    preload_timeout: int = Field(default=150, ge=15)
     """The maximum amount of time to allow a model to load before it is killed"""
     inference_step_timeout: int = Field(default=20, ge=15, le=60)
     """The maximum wall-clock time a single sampling step may make no progress before the slot is killed

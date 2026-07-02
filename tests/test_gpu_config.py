@@ -74,6 +74,16 @@ class TestResolveInheritance:
         assert base.max_threads == 4  # global object is not mutated by resolving a card
 
 
+class TestBridgeDataTimeoutDefaults:
+    """Default watchdog windows should suit average machines without needless reaping."""
+
+    def test_preload_and_post_process_defaults_are_conservative(self) -> None:
+        """Startup and post-processing get enough silence budget for normal host churn."""
+        base = _make_base()
+        assert base.preload_timeout == 150
+        assert base.post_process_timeout == 120
+
+
 class TestResolveCrossFieldRules:
     """The per-card combination is normalised by the same passes the global config runs."""
 
@@ -105,7 +115,7 @@ class TestResolveCrossFieldRules:
         resolved = resolve_effective_gpu_config(base, GpuOverride(extra_slow_worker=True, max_threads=4, queue_size=4))
         assert resolved.max_threads == 1
         assert resolved.queue_size == 0
-        assert resolved.preload_timeout >= 120
+        assert resolved.preload_timeout >= 150
 
     def test_high_performance_scales_timeout_per_card(self) -> None:
         """A high-performance card gets the 1/3 process_timeout; a default card keeps the full value."""

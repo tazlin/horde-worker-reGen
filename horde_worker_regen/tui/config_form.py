@@ -169,7 +169,7 @@ SECTION_GUIDANCE: dict[str, str] = {
     "extra_slow_worker (on the Performance tab) forces max_threads to 1 and queue_size to 0.",
     "Memory & performance": "high_performance_mode overrides moderate_performance_mode when both are on, and "
     "each shortens the job timeout (high = 1/3, moderate = 1/2 of the default). extra_slow_worker overrides "
-    "both, disables them, and clamps concurrency (max_threads 1, queue_size 0, preload_timeout >= 120).",
+    "both, disables them, and clamps concurrency (max_threads 1, queue_size 0, preload_timeout >= 150).",
     "Features": "Some features depend on others: inpainting is forced off unless img2img is allowed, and "
     "SDXL ControlNet requires ControlNet (which in turn wants img2img). Enabling a dependent feature without "
     "its prerequisite has no effect.",
