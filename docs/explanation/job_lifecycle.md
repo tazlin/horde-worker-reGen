@@ -143,7 +143,10 @@ identical.
 
 `_process_control_loop` invokes
 [`InferenceScheduler`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler]'s
-`run_scheduling_cycle` when there are pending jobs and a free process or preloaded model. One cycle:
+`run_scheduling_cycle` when there are pending jobs and a free process or preloaded model. (Resource
+governance is driven separately, every control-loop iteration via `run_governance_tick`, so it does not
+depend on this queue-gated cycle running; see
+[Resource governance](resource_governance.md#the-governor-tick).) One cycle:
 
 1. **`preload_models()`**: for the first pending job whose model isn't loaded anywhere, pick an
    available process (`ProcessMap.get_first_available_inference_process`), send `PRELOAD_MODEL`, mark

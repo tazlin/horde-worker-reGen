@@ -472,11 +472,11 @@ class InferenceScheduler:
         # A single-GPU worker uses exactly one entry under the None key, identical to the prior scalar fields.
         # All reads/writes go through the ledger (see WholeCardResidencyLedger; _residency_state delegates).
         self._whole_card_ledger = WholeCardResidencyMachine()
-        # The per-tick resource governor: run_scheduling_cycle ticks it unconditionally before any
-        # preload/dispatch decision, so governance never depends on a particular scheduling path
-        # executing. It owns the RAM governor's multi-tick bookkeeping (shed cards, draining
-        # processes), exposed under the historical attribute names through the
-        # _ram_pressure_shed_cards / _processes_draining_for_ram properties.
+        # The per-tick resource governor: the process manager ticks it once per control-loop iteration via
+        # run_governance_tick(), independent of queue depth, so governance never depends on a particular
+        # scheduling path executing (or on the inference queue being non-empty). It owns the RAM governor's
+        # multi-tick bookkeeping (shed cards, draining processes), exposed under the historical attribute
+        # names through the _ram_pressure_shed_cards / _processes_draining_for_ram properties.
         self._governor = ResourceGovernor(host=self)
         # When a heavy head was last admitted best-effort off the whole-card path (the over-budget exclusive
         # branch, for a model that streams even alone). Its load equally holds the queue, so this bounds a
@@ -2186,6 +2186,57 @@ class InferenceScheduler:
             self._ram_pressure_notified = False
         return under_pressure
 
+    def run_governance_tick(self) -> None:
+        """Drive one resource-governance tick per control-loop iteration, independent of queue depth.
+
+        The process manager calls this every iteration so the governor's degrade/restore response and the
+        soft pop hold are re-evaluated even when the inference queue is empty. Gated on the same budget
+        switch as the rest of the memory machinery, which also no-ops against partial/mocked or
+        early-startup config.
+        """
+        if self._budget_active():
+            self._govern_ram_pressure_if_pressured()
+
+    def reset_governance_to_baseline(self, reason: str) -> None:
+        """Return RAM-governance state to a clean baseline, re-derived from live measurement next tick.
+
+        Clears the soft pop hold and the governor's shed/draining episode bookkeeping, and drops the
+        RAM-pressure entry from the pop-skip reasons so a stale count stops surfacing (other reasons are
+        left intact). Deliberately leaves alone flags owned by other subsystems or latched for the session:
+        the shared self-throttle pause (safety/self-maintenance, which self-expires), the operator
+        supervisor pause, the downloads-only hold, and the post-processing / torch-compat breakers. Safe to
+        call under genuine pressure: the next governance tick re-arms whatever the live host warrants.
+        """
+        logger.warning(f"Resetting RAM governance to baseline: {reason}")
+        self._state.ram_pressure_pop_hold = False
+        self._state.last_pop_skipped_reasons.pop("ram_pressure", None)
+        self._ram_reclaim_cycle_at = 0.0
+        self._ram_pressure_notified = False
+        self._governor.reset_bookkeeping()
+
+    def governance_healthy_but_held(self) -> bool:
+        """Whether the soft RAM pop hold is engaged while the host is measurably healthy.
+
+        The signature of a governance latch: pops are held for RAM pressure, yet the most recent
+        danger-floor verdict is healthy and nothing is draining, so the hold should already have cleared.
+        Distinct from a merely idle worker (which never sets the hold) and from the deliberate held-queue
+        windows (whole-card establishment, heavy-head load, RAM-reclaim cycle), which own their own
+        resolution. Returns False before the first tick has measured a verdict (treated as not-yet-healthy).
+        Read by the recovery coordinator's healthy-hold watchdog.
+        """
+        if not self._state.ram_pressure_pop_hold:
+            return False
+        verdict = self._governor.last_ram_verdict
+        if verdict is None or verdict.under_pressure:
+            return False
+        if self._ram_governor_state.draining_process_ids:
+            return False
+        return not (
+            self.whole_card_residency_grace_active()
+            or self.heavy_head_load_grace_active()
+            or self.ram_reclaim_cycle_grace_active()
+        )
+
     def _ram_per_process_ceiling_mb(self) -> float | None:
         """The configured per-process resident-RAM ceiling (MB), or None when disabled/unset.
 
@@ -2668,9 +2719,10 @@ class InferenceScheduler:
         if not ram_pressure.under_pressure:
             self._ram_pressure_notified = False
             return False
-        # The governor's tick (run at the top of run_scheduling_cycle) has already driven the whole-host
-        # degrade response this cycle; here we only defer *this* preload and surface the per-model notice
-        # once so the loop does not route a new model's weights through a host already on the edge.
+        # The governor's tick (run once per control-loop iteration via run_governance_tick) has already
+        # driven the whole-host degrade response this cycle; here we only defer *this* preload and surface
+        # the per-model notice once so the loop does not route a new model's weights through a host already
+        # on the edge.
         if not self._ram_pressure_notified:
             logger.opt(ansi=True).warning(
                 f"<fg #ff8c69>RAM danger floor reached: deferring preload of {job.model} "
@@ -5015,15 +5067,9 @@ class InferenceScheduler:
 
         self._refresh_model_demand()
 
-        # Govern host resources before any preload/dispatch decision, unconditionally: a steady-state
-        # worker whose pending jobs all target already-resident models makes no preload attempt, so
-        # governance tied to a scheduling path would sleep while the resident set grows into an OS OOM
-        # kill. One tick covers the degrade response (pressured host) and the shed-card restore
-        # (recovered host). Gated on the budget being active, the same switch the rest of the memory
-        # machinery uses.
-        if self._budget_active():
-            self._govern_ram_pressure_if_pressured()
-
+        # Resource governance is not driven here: the process manager runs run_governance_tick() every
+        # control-loop iteration, so the danger-floor verdict and shed/restore response are already fresh
+        # for this cycle regardless of whether any preload or dispatch happens.
         if not self.preload_models():
             next_job_and_process = await self.get_next_job_and_process(information_only=True)
 

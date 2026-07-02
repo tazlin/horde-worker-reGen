@@ -33,6 +33,13 @@ class WorkerRecoveryCoordinator:
     SAFETY_SOFT_PAUSE_SECONDS = 60.0
     RUNAWAY_RECOVERY_WINDOW_SECONDS = 300.0
     RUNAWAY_RECOVERY_CEILING = 20
+    HEALTHY_HOLD_WATCHDOG_GRACE_SECONDS = 120.0
+    """How long the soft RAM pop hold may stay engaged on a healthy, idle worker before the watchdog resets
+    governance. Comfortably above the pressure-pause window and the deliberate held-queue graces so a normal
+    pressure episode clears itself first."""
+    HEALTHY_HOLD_ESCALATION_GRACE_SECONDS = 60.0
+    """How long the hold may remain re-latched after a governance-baseline reset before the watchdog escalates
+    to rebuilding the (idle) inference pool."""
 
     def __init__(
         self,
@@ -91,6 +98,11 @@ class WorkerRecoveryCoordinator:
         self.orphan_punt_history: list[float] = []
         self.orphan_safety_since: dict[GenerationID, float] = {}
         self.safety_requeue_count: dict[GenerationID, int] = {}
+        # Healthy-hold watchdog episode timestamps: when the healthy-but-held condition was first observed,
+        # and when a governance-baseline reset was applied for it (to time the escalation). Both None when
+        # no episode is open.
+        self.healthy_hold_since: float | None = None
+        self.governance_reset_at: float | None = None
 
     @property
     def bridge_data(self) -> reGenBridgeData:
@@ -351,6 +363,7 @@ class WorkerRecoveryCoordinator:
             return
         if self.maybe_abort_on_runaway_recoveries():
             return
+        self.maybe_reset_stuck_governance_hold()
         is_wedged = self.assess_wedge()
         if self.is_inference_pool_unrecoverable() or self.is_safety_pool_unrecoverable():
             self.episode_saw_unrecoverable_pool = True
@@ -391,6 +404,78 @@ class WorkerRecoveryCoordinator:
         )
         self._process_lifecycle.rebuild_inference_pool(reason=f"soft reset #{level}")
         self._process_lifecycle.rebuild_safety_pool(reason=f"soft reset #{level}")
+        # A soft reset rebuilds the pools, but the RAM pop hold and shed/draining bookkeeping live in worker
+        # state, not the pool, so a rebuild alone leaves them latched. Return them to baseline too so the
+        # reset actually clears a governance hold; the next governance tick re-arms anything still warranted.
+        self._inference_scheduler.reset_governance_to_baseline(f"soft reset #{level}")
+
+    def maybe_reset_stuck_governance_hold(self) -> None:
+        """Recover a RAM pop hold that stayed engaged after the host became healthy (a governance latch).
+
+        Belt-and-suspenders for the case the per-iteration governance tick fails to clear the soft pop hold
+        once RAM recovers: the hold blocks image pops, so the inference queue drains and stays empty. This
+        watchdog observes the healthy-but-held condition on an idle worker and, after a grace, resets
+        governance to baseline; if that does not stick, it escalates to rebuilding the (all-idle) inference
+        pool.
+
+        Deliberately standalone rather than an ``assess_wedge`` trigger: the pool here is healthy and idle, so
+        the save-our-ship soft reset's limp-by concurrency notch and unconditional pool churn would be wrong.
+        The cheap governance reset is tried first; the pool rebuild is a rare second resort that only fires if
+        the hold re-latches despite a healthy host.
+        """
+        if self._state.shutting_down or self._state.downloads_only_hold:
+            self.healthy_hold_since = None
+            self.governance_reset_at = None
+            return
+
+        held = (
+            self._inference_scheduler.governance_healthy_but_held()
+            and not self._process_map.has_inference_in_progress()
+            and len(self._job_tracker.jobs_pending_inference) == 0
+        )
+        if not held:
+            self.healthy_hold_since = None
+            self.governance_reset_at = None
+            return
+
+        now = self._clock()
+        if self.healthy_hold_since is None:
+            self.healthy_hold_since = now
+            return
+        if (now - self.healthy_hold_since) < self.HEALTHY_HOLD_WATCHDOG_GRACE_SECONDS:
+            return
+
+        if self.governance_reset_at is None:
+            held_seconds = now - self.healthy_hold_since
+            logger.warning(
+                f"Healthy-hold watchdog: the RAM pop hold has stayed engaged for {held_seconds:.0f}s on a "
+                "healthy, idle worker; resetting governance to baseline.",
+            )
+            self._action_ledger.record(
+                LedgerEventType.GOVERNANCE_RESET,
+                reason="healthy-hold watchdog: pop hold latched while host healthy",
+                detail={"held_seconds": round(held_seconds, 1)},
+            )
+            self._inference_scheduler.reset_governance_to_baseline("healthy-hold watchdog")
+            self.governance_reset_at = now
+            return
+
+        if (now - self.governance_reset_at) < self.HEALTHY_HOLD_ESCALATION_GRACE_SECONDS:
+            return
+
+        logger.error(
+            "Healthy-hold watchdog: the RAM pop hold re-latched after a governance reset; escalating to an "
+            "inference-pool rebuild (all slots idle).",
+        )
+        self._action_ledger.record(
+            LedgerEventType.GOVERNANCE_RESET,
+            reason="healthy-hold watchdog escalation: pop hold re-latched after baseline reset",
+            detail={"escalated": True},
+        )
+        self._process_lifecycle.rebuild_inference_pool(reason="healthy-hold watchdog escalation")
+        self._inference_scheduler.reset_governance_to_baseline("healthy-hold watchdog escalation")
+        self.healthy_hold_since = None
+        self.governance_reset_at = None
 
     def give_up_on_wedged_jobs(self) -> None:
         """Fault unservable jobs and abort when no pool can recover."""

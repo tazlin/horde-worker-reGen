@@ -35,10 +35,13 @@ provides the measurement and execution surfaces.
 ## The governor tick
 
 [`ResourceGovernor.tick`][horde_worker_regen.process_management.scheduling.governance.governor.ResourceGovernor.tick]
-runs at the top of every scheduling cycle, before any preload or dispatch decision, unconditionally.
-That placement is the structural fix for the dormant-check shape above: governance does not depend on
-any particular scheduling path executing, so a worker that never attempts a preload is governed exactly
-as often as one that does.
+runs once per control-loop iteration, unconditionally, driven by the process manager (via the scheduler's
+`run_governance_tick`) rather than as a step inside a scheduling cycle. That placement is the structural
+fix for the dormant-check shape above: governance does not depend on any particular scheduling path
+executing, nor on the inference queue being non-empty, so a worker that never attempts a preload, or one
+whose queue a pop hold has drained to empty, is governed exactly as often as one actively serving work.
+Gating the tick on a non-empty queue would let the soft pop hold self-latch: the hold blocks pops, the
+queue drains, and the only thing that clears the hold (the tick) would never run again.
 
 One tick measures the RAM danger-floor verdict and one
 [`HostMemorySnapshot`][horde_worker_regen.process_management.scheduling.governance.snapshots.HostMemorySnapshot],
@@ -72,6 +75,27 @@ residency drains. When that restore regrows the pool, it reconciles the RAM shed
 count, dropping it once the pool is back at plan. Without that reconciliation the record would linger as a
 stale claim that the pool is still short, and while the host stayed under its floor the governor would
 re-shed the pool the residency just regrew, cycle after cycle, without ever returning to steady state.
+
+## Governance baseline and the healthy-hold watchdog
+
+Because the soft pop hold and the governor's shed/draining bookkeeping live in worker state rather than in
+the process pool, rebuilding the pool does not clear them. The scheduler exposes a single
+`reset_governance_to_baseline` that drops the RAM pop hold, clears the shed-card / draining / single-GPU
+shed records, and forgets the RAM-pressure pop-skip reason, leaving flags owned by other subsystems (the
+shared self-throttle pause, the operator supervisor pause, the downloads-only hold, the post-processing
+and torch-compat breakers) untouched. It is safe to call at any time: the next governance tick re-derives
+whatever the live host warrants. The save-our-ship soft reset calls it so a pool rebuild also returns
+governance to a clean slate.
+
+A standalone watchdog in the recovery coordinator (`maybe_reset_stuck_governance_hold`) is the last-resort
+guard against a pop hold that stays engaged after the host is healthy. It fires only when the pop hold is
+set, the most recent danger-floor verdict is healthy, nothing is draining, none of the deliberate
+held-queue graces (whole-card establishment, heavy-head load, RAM-reclaim cycle) are active, no inference
+is in progress, and the queue is empty, sustained past a grace window. The pop-hold-set term is what
+distinguishes a genuine latch from a merely idle worker with no matching jobs. It escalates in tiers: first
+a governance-baseline reset, and only if the hold re-latches despite a healthy host does it rebuild the
+(all-idle) inference pool. It is deliberately not an `assess_wedge` trigger, because that would apply the
+soft reset's limp-by concurrency notch and unconditional pool churn to a pool that is actually healthy.
 
 ## Decisions are values
 

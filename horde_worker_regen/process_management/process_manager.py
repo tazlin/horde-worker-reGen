@@ -1824,6 +1824,14 @@ class HordeWorkerProcessManager:
                     self._job_popper._replaced_due_to_maintenance = True
                 MaintenanceModeMessenger.print_maintenance_mode_messages()
 
+            # Drive resource governance every iteration, independent of queue depth. The governor tick is the
+            # only thing that clears the soft RAM pop hold and restores shed contexts once RAM recovers;
+            # gating it on a non-empty inference queue would let a pop hold that drained the queue latch
+            # forever (the hold keeps the queue empty, and an empty queue would keep the tick from ever
+            # running). Placed after the housekeeping above so the governor snapshots the same process-map
+            # and pause state a scheduling cycle would.
+            self._inference_scheduler.run_governance_tick()
+
             if free_process_or_model_loaded and len(self._job_tracker.jobs_pending_inference) > 0:
                 await self._inference_scheduler.run_scheduling_cycle(self.stable_diffusion_reference)
 

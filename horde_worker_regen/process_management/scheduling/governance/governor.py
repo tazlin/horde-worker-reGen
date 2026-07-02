@@ -2,11 +2,13 @@
 
 [`ResourceGovernor`][horde_worker_regen.process_management.scheduling.governance.governor.ResourceGovernor]
 owns the measure/decide/execute cycle for host resources and the multi-tick governor bookkeeping. The
-scheduling loop calls
+process manager drives
 [`tick`][horde_worker_regen.process_management.scheduling.governance.governor.ResourceGovernor.tick]
-unconditionally at the top of every cycle, so governance never depends on any particular scheduling path
-(a preload attempt, a dispatch) happening to execute: a steady-state worker that never loads a new model
-is governed exactly as often as one that does.
+once per control-loop iteration (via the scheduler's ``run_governance_tick``), independent of whether a
+scheduling cycle dispatches, so governance never depends on any particular scheduling path (a preload
+attempt, a dispatch) or a non-empty queue happening to execute it: a steady-state worker that never loads
+a new model, or one whose queue a pop hold has drained to empty, is governed exactly as often as one
+actively serving work.
 
 The governor does not measure or act itself: its host (the scheduler) provides the snapshot and executes
 the returned actions, keeping this module free of process-map and lifecycle dependencies.
@@ -96,3 +98,15 @@ class ResourceGovernor:
         actions.extend(decide_shed_restore(snapshot))
         self._host._execute_governance_actions(actions)
         return verdict.under_pressure
+
+    def reset_bookkeeping(self) -> None:
+        """Drop the RAM governor's multi-tick episode state back to the healthy-host baseline.
+
+        Clears the shed-card and draining-process records and the single-GPU shed record. The next tick
+        re-derives whatever is warranted from a fresh measurement, so this is safe to call even mid-episode:
+        genuine pressure simply re-arms the response. Used by the scheduler's governance-baseline reset when
+        a soft reset or the healthy-hold watchdog returns the worker to a clean slate.
+        """
+        self.ram_state.shed_cards.clear()
+        self.ram_state.worker_shed = None
+        self.ram_state.draining_process_ids.clear()

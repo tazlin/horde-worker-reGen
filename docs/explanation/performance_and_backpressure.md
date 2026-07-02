@@ -164,7 +164,11 @@ the queue would appear full when it still has capacity.
 ## Inference scheduling priorities
 
 [`InferenceScheduler`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler]'s
-`run_scheduling_cycle` runs every 200 ms and makes decisions in this order:
+`run_scheduling_cycle` runs (when there are pending jobs and capacity) and makes decisions in this order.
+Resource governance is *not* part of this cycle: the process manager drives `run_governance_tick` every
+control-loop iteration regardless of queue depth (see
+[Resource governance](resource_governance.md#the-governor-tick)), so the RAM pop hold and shed/restore
+response stay live even when the queue is empty.
 
 1. **Preload models**: for the first pending job whose model isn't loaded, pick
    a free process and send `PRELOAD_MODEL`, subject to the

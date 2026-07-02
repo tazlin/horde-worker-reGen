@@ -41,6 +41,7 @@ class LedgerEventType(enum.StrEnum):
     SOFT_RESET = "soft_reset"
     RECOVERY_ABANDONED = "recovery_abandoned"
     ORPHAN_REAPED = "orphan_reaped"
+    GOVERNANCE_RESET = "governance_reset"
 
 
 class LedgerEvent(BaseModel):
