@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 from unittest.mock import Mock
 
 import pytest
@@ -16,6 +17,7 @@ from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle import owned_process_registry
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
@@ -28,12 +30,28 @@ from horde_worker_regen.process_management.resources.device_info import TorchDev
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 
 
-async def run_scheduling_pass_with_dispatch_inert(scheduler: InferenceScheduler) -> None:
-    """Run one ``run_scheduling_cycle`` with the post-preload dispatch half stubbed inert.
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_owned_process_registry(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """Point the durable owned-process registry at a throwaway dir for the whole session.
 
-    Exercises the real per-cycle structure (governance tick, then preload) without starting inference or
-    probing for a next job, so a test can assert on the governance and preload side effects of one
-    scheduling pass in isolation.
+    Belt-and-suspenders behind the ``AI_HORDE_TESTING`` guard (which normally stops a test manager from
+    building the registry at all): a real ``HordeWorkerProcessManager`` reaps orphaned child pids from
+    ``.horde_worker_regen/owned_pids.json`` on startup and kills any still-alive match. Redirecting the
+    registry's state dir to a temp path keeps it empty, so even a test that unsets the guard can never
+    terminate a real process (for example a live worker's children sharing this working directory).
+    """
+    isolated_state_dir = tmp_path_factory.mktemp("owned_process_registry_state")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(owned_process_registry, "default_app_state_dir", lambda: isolated_state_dir)
+        yield
+
+
+async def run_scheduling_pass_with_dispatch_inert(scheduler: InferenceScheduler) -> None:
+    """Run one governance tick then one ``run_scheduling_cycle`` with the dispatch half stubbed inert.
+
+    Mirrors the control loop's ordering (the process manager drives ``run_governance_tick`` before the
+    scheduling cycle) without starting inference or probing for a next job, so a test can assert on the
+    governance and preload side effects of one pass in isolation.
     """
 
     async def _no_next_job(*args: object, **kwargs: object) -> None:
@@ -44,6 +62,7 @@ async def run_scheduling_pass_with_dispatch_inert(scheduler: InferenceScheduler)
 
     scheduler.get_next_job_and_process = _no_next_job  # type: ignore[method-assign]
     scheduler.start_inference = _no_inference_started  # type: ignore[method-assign]
+    scheduler.run_governance_tick()
     await scheduler.run_scheduling_cycle({})
 
 

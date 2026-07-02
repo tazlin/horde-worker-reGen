@@ -1,12 +1,21 @@
 """Configures pytest and creates fixtures."""
 
 # import hordelib
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 from loguru import logger
+
+# Mark the process as running under test before any HordeWorkerProcessManager can be constructed. Its
+# startup otherwise reaps orphaned child pids recorded in the shared .horde_worker_regen/owned_pids.json
+# (killing any still-alive match) and writes an action-ledger file into the working directory; both are
+# gated on AI_HORDE_TESTING (see process_manager.py). CI sets it, but a bare local `pytest` would not, so a
+# test that builds a real manager could reach across and terminate a live worker's inference/safety
+# children sharing this directory. setdefault so an explicitly-provided value still wins.
+os.environ.setdefault("AI_HORDE_TESTING", "True")
 
 try:
     import tomllib
