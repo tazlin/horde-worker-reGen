@@ -177,4 +177,3 @@ When adding a new resource protection, follow the same shape:
 
 The scheduler-integrated behavior stays covered by the regression suites under
 `tests/process_management/regressions/`, which drive real scheduling passes.
-

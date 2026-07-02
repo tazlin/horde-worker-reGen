@@ -788,4 +788,3 @@ and the streak is worker-wide - identical to before.
 - [`InferenceScheduler`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler]
 - [`LRUCache`][horde_worker_regen.process_management.models.lru_cache.LRUCache]
 - [`VramBudget` / `RamBudget`][horde_worker_regen.process_management.resources.resource_budget]
-
