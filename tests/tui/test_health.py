@@ -94,7 +94,7 @@ def test_disconnected_on_user_info_failure() -> None:
     )
     assert report.phase is WorkerPhase.DISCONNECTED
     assert report.severity is HealthStatus.ERROR
-    connectivity = next(check for check in report.checks if check.name == "API connectivity")
+    connectivity = next(check for check in report.checks if check.name == "API")
     assert connectivity.status is HealthStatus.ERROR
 
 
@@ -275,7 +275,7 @@ def test_maintenance_mode_beats_api_backoff_and_labels_connectivity() -> None:
     )
 
     assert report.phase is WorkerPhase.MAINTENANCE
-    connectivity = next(check for check in report.checks if check.name == "API connectivity")
+    connectivity = next(check for check in report.checks if check.name == "API")
     assert connectivity.status is HealthStatus.INFO
     assert "maintenance" in connectivity.detail.lower()
 
@@ -291,7 +291,7 @@ def test_optimistic_server_maintenance_is_shown_before_poll_confirmation() -> No
 
     assert report.phase is WorkerPhase.MAINTENANCE
     assert "requested" in report.detail.lower()
-    connectivity = next(check for check in report.checks if check.name == "API connectivity")
+    connectivity = next(check for check in report.checks if check.name == "API")
     assert "maintenance" in connectivity.detail.lower()
 
 
@@ -300,25 +300,13 @@ def _residency_check(report: object) -> object | None:
     return next((check for check in report.checks if check.name == "Residency"), None)  # type: ignore[attr-defined]
 
 
-def test_residency_check_heads_up_when_possible() -> None:
-    """When whole-card residency can engage, an INFO heads-up appears so a later teardown is no surprise."""
-    report = derive(
-        _snapshot(
-            processes=[_process("WAITING_FOR_JOB")],
-            whole_card_residency=WholeCardResidencyStatus(possible=True),
-        ),
-        SupervisorStatus.RUNNING,
-        0.5,
-    )
-    residency = _residency_check(report)
-    assert residency is not None
-    assert residency.status is HealthStatus.INFO  # type: ignore[attr-defined]
-    assert "sole use of the GPU" in residency.detail  # type: ignore[attr-defined]
+def test_residency_is_not_a_health_row() -> None:
+    """Whole-card residency is communicated in the hero/process/panel, not as a health checklist row.
 
-
-def test_residency_check_names_model_when_active() -> None:
-    """An active residency names the model holding the card, still as a low-key INFO note."""
-    report = derive(
+    Even with residency active or armed, no "Residency" row is added: it is not a pass/warn/fail health
+    dimension, so it stays out of the checklist to avoid duplicating what the residency banner already says.
+    """
+    active = derive(
         _snapshot(
             processes=[_process("INFERENCE_STARTING")],
             whole_card_residency=WholeCardResidencyStatus(active=True, model="Flux.1-dev"),
@@ -326,16 +314,16 @@ def test_residency_check_names_model_when_active() -> None:
         SupervisorStatus.RUNNING,
         0.5,
     )
-    residency = _residency_check(report)
-    assert residency is not None
-    assert residency.status is HealthStatus.INFO  # type: ignore[attr-defined]
-    assert "Flux.1-dev" in residency.detail  # type: ignore[attr-defined]
-
-
-def test_no_residency_check_when_not_applicable() -> None:
-    """Workers the feature never applies to keep the checklist quiet (no Residency row)."""
-    report = derive(_snapshot(processes=[_process("WAITING_FOR_JOB")]), SupervisorStatus.RUNNING, 0.5)
-    assert _residency_check(report) is None
+    possible = derive(
+        _snapshot(
+            processes=[_process("WAITING_FOR_JOB")],
+            whole_card_residency=WholeCardResidencyStatus(possible=True),
+        ),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    assert _residency_check(active) is None
+    assert _residency_check(possible) is None
 
 
 def test_short_term_no_jobs_is_ready_with_skip_reasons() -> None:
@@ -412,4 +400,54 @@ def test_checks_cover_core_dimensions() -> None:
         _snapshot(processes=[_process("WAITING_FOR_JOB")], active_models=["Deliberate"]), SupervisorStatus.RUNNING, 0.5
     )
     names = {check.name for check in report.checks}
-    assert {"API connectivity", "Registration", "Processes", "Models", "GPU", "Disk", "Job health"} <= names
+    assert {"API", "Disk", "Job health"} <= names
+
+
+def test_api_check_folds_reachability_and_registration() -> None:
+    """A reachable, registered worker reports one 'API' row naming the registered dreamer name."""
+    report = derive(
+        _snapshot(processes=[_process("WAITING_FOR_JOB")], worker_registered=True),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    api = next(check for check in report.checks if check.name == "API")
+    assert api.status is HealthStatus.OK
+    assert "registered as Test" in api.detail
+
+
+def test_api_check_notes_pending_registration_when_reachable() -> None:
+    """A reachable but not-yet-acknowledged worker reports an INFO 'API' row, not a separate row."""
+    report = derive(
+        _snapshot(processes=[_process("WAITING_FOR_JOB")], worker_registered=False),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    api = next(check for check in report.checks if check.name == "API")
+    assert api.status is HealthStatus.INFO
+    assert "not yet acknowledged" in api.detail
+
+
+def test_processes_models_and_gpu_duty_are_not_health_rows() -> None:
+    """Process count, model count, and GPU duty moved out of the checklist to titles/Trends."""
+    report = derive(
+        _snapshot(processes=[_process("WAITING_FOR_JOB")], active_models=["Deliberate"]),
+        SupervisorStatus.RUNNING,
+        0.5,
+    )
+    names = {check.name for check in report.checks}
+    assert {"Processes", "Models", "GPU", "Registration", "API connectivity"}.isdisjoint(names)
+
+
+def test_is_gpu_duty_low_flags_idle_gpu_during_a_job() -> None:
+    """The Trends low-duty predicate is True only when a job is running against a near-idle GPU."""
+    from horde_worker_regen.tui.health import is_gpu_duty_low
+
+    running_idle = _snapshot(processes=[_process("INFERENCE_STARTING")], gpu_utilization_mean_percent=1.0)
+    running_busy = _snapshot(processes=[_process("INFERENCE_STARTING")], gpu_utilization_mean_percent=80.0)
+    waiting_idle = _snapshot(processes=[_process("WAITING_FOR_JOB")], gpu_utilization_mean_percent=1.0)
+    unsampled = _snapshot(processes=[_process("INFERENCE_STARTING")])
+
+    assert is_gpu_duty_low(running_idle) is True
+    assert is_gpu_duty_low(running_busy) is False
+    assert is_gpu_duty_low(waiting_idle) is False
+    assert is_gpu_duty_low(unsampled) is False

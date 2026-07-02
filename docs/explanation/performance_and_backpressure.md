@@ -243,6 +243,21 @@ scheduler tolerates that before acting: once a slot has been in
   resolution ceiling (`line_skip_pop_max_power`, derived from the same
   per-performance-mode eMPS limit the scheduler uses to accept a skip candidate).
 
+Biasing the pop is not enough on its own: the situation that arms the flag is a
+*full* local queue whose head is stuck, so the popper's steady-state gates would
+otherwise refuse the pop before the bias could take effect. Because a skip job is
+expected to dispatch onto the idle sibling immediately rather than buffer, an
+armed flag also relaxes those throughput/pacing governors for that one pop: it is
+treated as **urgent** (skipping the inter-pop cadence gate), the megapixelstep
+wait is bypassed (the small skip job must not be held behind the very backlog it
+relieves), and the queue-depth cap is loosened by exactly one slot so a single
+skip job can be admitted past a full queue. Genuinely protective gates
+(shutdown, RAM-pressure and safety-backlog holds, the consecutive-failure pause,
+and requiring a free process) still apply. The per-model "one running plus one
+queued" cap is untouched by design: the queue is full of the head's model, so
+that cap simply steers the pop toward the *other* configured models a skip job
+would use.
+
 The freshly popped small job is preloaded onto the idle sibling on the next
 cycle, becomes a valid skip candidate, and keeps the GPU sampling while the
 download finishes. The scheduler clears the flag as soon as no aux download

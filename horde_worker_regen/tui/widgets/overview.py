@@ -51,7 +51,13 @@ from horde_worker_regen.tui.formatters import (
     sparkline,
     temperature_colour,
 )
-from horde_worker_regen.tui.health import HealthReport, HealthStatus, WorkerPhase, summarize_skips
+from horde_worker_regen.tui.health import (
+    HealthReport,
+    HealthStatus,
+    WorkerPhase,
+    is_gpu_duty_low,
+    summarize_skips,
+)
 from horde_worker_regen.tui.responsive import (
     ColumnSpec,
     DensityTier,
@@ -436,7 +442,11 @@ class OverviewView(Vertical):
             self.query_one("#overview-hero", Static).update(self._render_hero(report, snapshot, frame))
         if show["#overview-health"]:
             self.query_one("#overview-health", Static).update(
-                self._render_health(report, snapshot.feature_readiness if snapshot is not None else None),
+                self._render_health(
+                    report,
+                    snapshot.feature_readiness if snapshot is not None else None,
+                    models_loaded=len(snapshot.active_models) if snapshot is not None else None,
+                ),
             )
         if snapshot is None:
             return
@@ -1013,8 +1023,18 @@ class OverviewView(Vertical):
         title = "Governance" if not active_governors else f"Governance · {active_governors} active"
         return Panel(Group(*parts), title=title, title_align="left", border_style=border, padding=(0, 1))
 
-    def _render_health(self, report: HealthReport, feature_readiness: FeatureReadinessSummary | None = None) -> Panel:
-        """Render the health checklist, with a compact feature-readiness line when any feature is engaged."""
+    def _render_health(
+        self,
+        report: HealthReport,
+        feature_readiness: FeatureReadinessSummary | None = None,
+        *,
+        models_loaded: int | None = None,
+    ) -> Panel:
+        """Render the health checklist, with a compact feature-readiness line when any feature is engaged.
+
+        The loaded-model count rides the panel title as an at-a-glance figure rather than a checklist row,
+        since it is a plain count with no pass/warn/fail character of its own.
+        """
         table = Table.grid(padding=(0, 2))
         table.add_column(width=2)
         table.add_column(style="bold", no_wrap=True)
@@ -1030,7 +1050,10 @@ class OverviewView(Vertical):
         features_line = self._feature_readiness_line(feature_readiness)
         if features_line is not None:
             table.add_row(Text("⊟", style="grey62"), Text("Features", style="bold"), features_line)
-        return Panel(table, title="Health", title_align="left", border_style="grey37", padding=(0, 1))
+        title = "Health"
+        if models_loaded is not None:
+            title += f" · {models_loaded} models" if models_loaded else " · no models"
+        return Panel(table, title=title, title_align="left", border_style="grey37", padding=(0, 1))
 
     _COMPACT_READINESS_STYLE: dict[FeatureReadinessState, str] = {
         FeatureReadinessState.OFFERED: "green",
@@ -1599,9 +1622,20 @@ class OverviewView(Vertical):
         if busy_fraction is None and snapshot.gpu_utilization_mean_percent is not None:
             busy_fraction = snapshot.gpu_utilization_mean_percent / 100.0
         duty_bar = Text(mini_bar(busy_fraction, 12), style="green") if busy_fraction is not None else Text("…")
+        # A near-idle GPU while a job is in flight is the one duty-cycle condition worth an alert. Rather
+        # than a separate health row, it is flagged here where the duty figure already lives: the row and
+        # the panel border turn orange and a "(!)" rides the value.
+        duty_low = is_gpu_duty_low(snapshot)
+        duty_style = "dark_orange" if duty_low else "bold cyan"
+        duty_value: RenderableType = format_percent(snapshot.gpu_utilization_mean_percent)
+        if duty_low:
+            duty_value = Text.assemble(
+                (format_percent(snapshot.gpu_utilization_mean_percent), "dark_orange"),
+                (" (!)", "bold dark_orange"),
+            )
         grid.add_row(
-            "GPU duty",
-            format_percent(snapshot.gpu_utilization_mean_percent),
+            Text("GPU duty", style=duty_style),
+            duty_value,
             duty_bar,
             Text(sparkline(gpu_series) or "…", style="green"),
             "busy" if busy_fraction and busy_fraction > 0.5 else "idle",
@@ -1619,8 +1653,14 @@ class OverviewView(Vertical):
             else:
                 notice = Text(self._trend_notice, style="italic yellow")
 
-        body: Group
-        body = Group(notice, grid) if notice is not None else Group(grid)
+        duty_warning = (
+            Text("GPU near-idle while a job is running: check the loaded model and the logs.", style="dark_orange")
+            if duty_low
+            else None
+        )
+
+        parts: list[RenderableType] = [part for part in (notice, duty_warning, grid) if part is not None]
+        body = Group(*parts)
 
         return Panel(
             body,
@@ -1628,7 +1668,7 @@ class OverviewView(Vertical):
             title_align="left",
             subtitle=Text(window, style="grey50"),
             subtitle_align="right",
-            border_style="grey37",
+            border_style="dark_orange" if duty_low else "grey37",
             padding=(0, 1),
         )
 

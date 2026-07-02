@@ -402,36 +402,7 @@ def _build_checks(
     """Build the supporting health checklist from a snapshot."""
     checks: list[HealthCheck] = []
 
-    if _server_maintenance_active(snapshot, optimistic_server_maintenance=optimistic_server_maintenance):
-        checks.append(HealthCheck("API connectivity", HealthStatus.INFO, "Worker is in horde maintenance mode"))
-    elif snapshot.user_info_failed:
-        reason = snapshot.user_info_failed_reason or "request failed"
-        checks.append(HealthCheck("API connectivity", HealthStatus.ERROR, f"AI Horde API unreachable ({reason})"))
-    elif snapshot.in_error_backoff:
-        checks.append(HealthCheck("API connectivity", HealthStatus.WARN, "Backing off after pop failures"))
-    else:
-        checks.append(HealthCheck("API connectivity", HealthStatus.OK, "AI Horde API reachable"))
-
-    if snapshot.worker_registered:
-        checks.append(
-            HealthCheck("Registration", HealthStatus.OK, f"Known to the horde as {snapshot.config.dreamer_name}")
-        )
-    else:
-        checks.append(HealthCheck("Registration", HealthStatus.INFO, "Not yet acknowledged by the horde"))
-
-    alive = sum(1 for process in snapshot.processes if process.is_alive)
-    total = len(snapshot.processes)
-    if total and alive == total:
-        checks.append(HealthCheck("Processes", HealthStatus.OK, f"{alive}/{total} processes alive"))
-    elif total:
-        checks.append(HealthCheck("Processes", HealthStatus.WARN, f"{alive}/{total} processes alive"))
-    else:
-        checks.append(HealthCheck("Processes", HealthStatus.INFO, "No processes reported yet"))
-
-    if snapshot.active_models:
-        checks.append(HealthCheck("Models", HealthStatus.OK, f"{len(snapshot.active_models)} model(s) loaded"))
-    else:
-        checks.append(HealthCheck("Models", HealthStatus.INFO, "No model loaded yet"))
+    checks.append(_api_check(snapshot, optimistic_server_maintenance=optimistic_server_maintenance))
 
     if snapshot.gpu_torch_incompatible:
         checks.append(
@@ -441,10 +412,6 @@ def _build_checks(
                 snapshot.gpu_torch_incompatible_reason or "Installed PyTorch has no kernels for this GPU.",
             )
         )
-    checks.append(_gpu_check(snapshot))
-    residency_check = _residency_check(snapshot)
-    if residency_check is not None:
-        checks.append(residency_check)
     checks.extend(_per_card_checks(snapshot))
     checks.append(_disk_check(snapshot))
     if snapshot.lora_pops_blocked_by_disk:
@@ -483,25 +450,27 @@ def _build_checks(
     return checks
 
 
-def _residency_check(snapshot: WorkerStateSnapshot) -> HealthCheck | None:
-    """An informational note that whole-card single residency can engage, or is engaged right now.
+def _api_check(
+    snapshot: WorkerStateSnapshot,
+    *,
+    optimistic_server_maintenance: bool = False,
+) -> HealthCheck:
+    """A single check folding API reachability and horde registration into one row.
 
-    Surfaced so an operator who later sees inference-process rows disappear (the residency teardown)
-    is not led to think the worker has broken: it is a deliberate, configured behaviour for very heavy
-    models. Returns None when the feature cannot engage under the current config, so the checklist stays
-    quiet on workers it never applies to.
+    Connectivity dominates: an unreachable or backing-off API is reported first, since registration is
+    meaningless while the worker cannot talk to the horde. Once reachable, the detail names whether the
+    horde has acknowledged this worker so both facts read from one line.
     """
-    residency = snapshot.whole_card_residency
-    if residency.active:
-        model = residency.model or "a heavy model"
-        return HealthCheck("Residency", HealthStatus.INFO, f"{model} has sole use of the GPU (intentional)")
-    if residency.possible:
-        return HealthCheck(
-            "Residency",
-            HealthStatus.INFO,
-            "Heavy models may briefly get sole use of the GPU",
-        )
-    return None
+    if _server_maintenance_active(snapshot, optimistic_server_maintenance=optimistic_server_maintenance):
+        return HealthCheck("API", HealthStatus.INFO, "Worker is in horde maintenance mode")
+    if snapshot.user_info_failed:
+        reason = snapshot.user_info_failed_reason or "request failed"
+        return HealthCheck("API", HealthStatus.ERROR, f"AI Horde API unreachable ({reason})")
+    if snapshot.in_error_backoff:
+        return HealthCheck("API", HealthStatus.WARN, "Backing off after pop failures")
+    if snapshot.worker_registered:
+        return HealthCheck("API", HealthStatus.OK, f"Reachable; registered as {snapshot.config.dreamer_name}")
+    return HealthCheck("API", HealthStatus.INFO, "Reachable; not yet acknowledged by the horde")
 
 
 def _per_card_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
@@ -530,15 +499,18 @@ def _per_card_checks(snapshot: WorkerStateSnapshot) -> list[HealthCheck]:
     return [HealthCheck("GPUs", HealthStatus.OK, f"{len(cards)} cards healthy")]
 
 
-def _gpu_check(snapshot: WorkerStateSnapshot) -> HealthCheck:
-    """A GPU-activity check from the sampled duty cycle (when available)."""
+def is_gpu_duty_low(snapshot: WorkerStateSnapshot) -> bool:
+    """True when the GPU is near-idle while a job is in flight (the low-duty attention condition).
+
+    The duty cycle itself is surfaced in the Trends region rather than as a health row, so this predicate
+    lets that region flag the concerning case (a job running against an idle GPU) without duplicating a
+    check. Returns False when the duty cycle has not been sampled or no job is running.
+    """
     duty = snapshot.gpu_utilization_mean_percent
     if duty is None:
-        return HealthCheck("GPU", HealthStatus.INFO, "Utilisation not sampled")
+        return False
     busy = any(process.last_process_state in _INFERENCE_STATES for process in snapshot.processes)
-    if busy and duty < 5:
-        return HealthCheck("GPU", HealthStatus.WARN, f"Idle ({duty:.0f}%) while a job is running")
-    return HealthCheck("GPU", HealthStatus.OK, f"{duty:.0f}% duty cycle")
+    return busy and duty < 5
 
 
 def _disk_check(snapshot: WorkerStateSnapshot) -> HealthCheck:

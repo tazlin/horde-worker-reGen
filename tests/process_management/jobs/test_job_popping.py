@@ -1446,3 +1446,80 @@ class TestAuxDownloadLineSkipPopBias:
 
         assert request.allow_lora is True
         assert request.max_pixels == 64 * 8 * 64 * 64
+
+    @staticmethod
+    def _make_full_queue_popper(*, state: WorkerState) -> tuple[JobPopper, Mock]:
+        """Build a popper offering two models with an idle sibling process, for line-skip pop scenarios.
+
+        A second configured model (``sibling_model``) stands in for the resident-on-an-idle-sibling model a
+        real line-skip job would target: with the head's model over-queued, ``_select_models_for_pop`` drops
+        it but keeps the sibling model, so a pop can still proceed.
+        """
+        job_tracker = JobTracker()
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            state=state,
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            image_models_to_load=["stable_diffusion", "sibling_model"],
+        )
+        return popper, session
+
+    async def _fill_queue_to_cap(self, popper: JobPopper) -> None:
+        """Seed the queue with the two head-model jobs that fill the default depth cap and clear warm-up."""
+        await track_popped_job_async(popper._job_tracker, make_mock_job(model="stable_diffusion"))
+        await track_popped_job_async(popper._job_tracker, make_mock_job(model="stable_diffusion"))
+        await popper._job_tracker.increment_jobs_completed()
+
+    async def test_armed_flag_pops_through_full_queue(self) -> None:
+        """A full local queue does not block the skip pop; without the flag the same queue blocks it.
+
+        This is the scenario that arms the flag: the queue is full of jobs that cannot slip past the
+        aux-download-blocked head. The skip job is expected to dispatch immediately onto the idle sibling,
+        so one extra slot past the depth cap is admitted rather than stranding the GPU for the download.
+        """
+        state = WorkerState()
+        state.wants_line_skip_candidate = True
+        popper, session = self._make_full_queue_popper(state=state)
+        await self._fill_queue_to_cap(popper)
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
+
+    async def test_full_queue_blocks_pop_when_unarmed(self) -> None:
+        """The same full queue blocks the pop when the flag is clear (the depth cap is otherwise honoured)."""
+        state = WorkerState()  # wants_line_skip_candidate defaults False
+        popper, session = self._make_full_queue_popper(state=state)
+        await self._fill_queue_to_cap(popper)
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_not_awaited()
+
+    async def test_armed_flag_pops_through_megapixelstep_wait(self) -> None:
+        """An armed flag bypasses the megapixelstep governor so the small skip job is not held behind it."""
+        state = WorkerState()
+        state.wants_line_skip_candidate = True
+        popper, session = self._make_full_queue_popper(state=state)
+        await track_popped_job_async(popper._job_tracker, make_mock_job(model="stable_diffusion"))
+        await popper._job_tracker.increment_jobs_completed()
+        popper._pop_throttler.should_wait_for_megapixelsteps = Mock(return_value=True)  # type: ignore[method-assign]
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_awaited_once()
+
+    async def test_megapixelstep_wait_blocks_pop_when_unarmed(self) -> None:
+        """With the flag clear, the megapixelstep governor still holds the pop."""
+        state = WorkerState()  # wants_line_skip_candidate defaults False
+        popper, session = self._make_full_queue_popper(state=state)
+        await track_popped_job_async(popper._job_tracker, make_mock_job(model="stable_diffusion"))
+        await popper._job_tracker.increment_jobs_completed()
+        popper._pop_throttler.should_wait_for_megapixelsteps = Mock(return_value=True)  # type: ignore[method-assign]
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_not_awaited()
