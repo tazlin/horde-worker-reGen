@@ -458,6 +458,23 @@ class StreamForecast:
         return (self.weights_mb + self._effective_base_reserve) >= self.total_vram_mb * _WHOLE_CARD_WARRANT_FRACTION
 
     @property
+    def admit_requires_isolation(self) -> bool:
+        """Whether a best-effort over-budget admit of this model must run with the device to itself.
+
+        Isolation protects a heavy checkpoint from a concurrent sibling load pushing its weights into
+        host-RAM streaming; that hazard needs both a footprint that dominates the card
+        (:attr:`is_card_demanding`) *and* a card too small to host a sibling model beside it. A
+        card-dominating model on a genuinely roomy card (:attr:`_has_room_for_coresident_model`, e.g. a
+        Flux fp8 on 24 GB) co-resides safely: its no-co-*sampling* contract is upheld by the concurrency
+        overlap gate, so reserving the device for its admit only freezes the sibling lane through the
+        model's multi-GB load. Unsized forecasts read as isolating (room reads False, dominance reads
+        True), keeping the conservative direction wherever the card cannot be measured.
+        """
+        if self._has_room_for_coresident_model:
+            return False
+        return self.is_card_demanding
+
+    @property
     def streams_unavoidably(self) -> bool:
         """Streams even with the whole device to itself (e.g. fp16 weights on a too-small card).
 

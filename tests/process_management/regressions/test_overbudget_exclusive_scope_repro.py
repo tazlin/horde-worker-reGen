@@ -9,12 +9,14 @@ on a device whose free VRAM is depressed by retained sibling contexts, and it sa
 a sibling. Marking such an admit exclusive suppresses every other preload and caps dispatch at one job
 from admit through completion, serializing a multi-thread card for the full duration of an ordinary job.
 
-The contract pinned here: exclusivity attaches to an over-budget admit only when the forecast shows the
-model's persistent footprint dominates the device (the same ``is_card_demanding`` trust test the
-whole-card residency machinery uses). Card-light over-budget admits keep the ``admitted_over_budget``
-classification (the widened step grace and the resource-fault retry accounting) but share the device.
-An unsized forecast stays exclusive: without a footprint measurement the conservative direction is
-isolation.
+The contract pinned here (``StreamForecast.admit_requires_isolation``): exclusivity attaches to an
+over-budget admit only when the model's persistent footprint dominates the device *and* the card lacks
+room for a sibling model beside it. Card-light admits share; so does a card-dominating model on a
+genuinely roomy card, where co-residence is safe and the no-co-sampling contract is upheld by the
+concurrency overlap gate instead of by freezing the sibling lane through the admit. Both keep the
+``admitted_over_budget`` classification (the widened step grace and the resource-fault retry
+accounting). An unsized forecast stays exclusive: without a footprint measurement the conservative
+direction is isolation.
 """
 
 from __future__ import annotations
@@ -39,14 +41,15 @@ def _make_forecast(
     *,
     weights_mb: float | None,
     total_vram_mb: float | None = _CARD_TOTAL_MB,
+    free_if_alone_mb: float | None = 20801.0,
     wants_whole_card: bool = False,
 ) -> StreamForecast:
-    """Build a forecast whose footprint fields drive ``is_card_demanding`` deterministically."""
+    """Build a forecast whose footprint and room fields drive the isolation verdict deterministically."""
     return StreamForecast(
         weights_mb=weights_mb,
         reserve_mb=2048.0,
         free_now_mb=10162.0,
-        free_if_alone_mb=20801.0,
+        free_if_alone_mb=free_if_alone_mb,
         free_after_model_evict_mb=13819.0,
         total_vram_mb=total_vram_mb,
         per_process_overhead_mb=3273.0,
@@ -58,14 +61,27 @@ def _make_forecast(
 def _card_light_forecast() -> StreamForecast:
     """A moderate SDXL on a 24GB card: weights + reserve well under the card-demanding fraction."""
     forecast = _make_forecast(weights_mb=4900.0)
-    assert forecast.is_card_demanding is False
+    assert forecast.admit_requires_isolation is False
     return forecast
 
 
-def _card_demanding_forecast() -> StreamForecast:
-    """A combined checkpoint whose footprint dominates the card."""
+def _roomy_card_demanding_forecast() -> StreamForecast:
+    """A combined checkpoint that dominates the card, on a card with room for a sibling model."""
     forecast = _make_forecast(weights_mb=11900.0, wants_whole_card=True)
     assert forecast.is_card_demanding is True
+    assert forecast.admit_requires_isolation is False
+    return forecast
+
+
+def _tight_card_demanding_forecast() -> StreamForecast:
+    """The same checkpoint on a card too small to host a sibling model beside it."""
+    forecast = _make_forecast(
+        weights_mb=11900.0,
+        wants_whole_card=True,
+        total_vram_mb=16375.0,
+        free_if_alone_mb=13500.0,
+    )
+    assert forecast.admit_requires_isolation is True
     return forecast
 
 
@@ -115,8 +131,26 @@ class TestOverbudgetExclusiveScope:
         assert job_tracker.is_admitted_over_budget(job) is True
         assert scheduler.heavy_head_load_grace_active() is True
 
-    async def test_card_demanding_admit_stays_exclusive(self, job_tracker: JobTracker) -> None:
-        """CONTROL: a card-dominating model keeps the device to itself.
+    async def test_roomy_card_demanding_admit_is_shared(self, job_tracker: JobTracker) -> None:
+        """A card-dominating model on a card with room for a sibling model shares the device.
+
+        Co-residence is safe on a card this roomy, and the model's no-co-sampling contract is enforced
+        by the overlap gate; isolating its admit would only freeze the sibling lane through the
+        checkpoint's multi-GB load and queue drain.
+        """
+        scheduler = _make_scheduler(job_tracker)
+        job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        await job_tracker.record_popped_job(job)
+        await job_tracker.mark_inference_started(job)
+
+        scheduler._mark_overbudget_admit(job, _roomy_card_demanding_forecast())
+
+        assert job_tracker.is_admitted_over_budget(job) is True
+        assert job_tracker.is_admitted_exclusive(job) is False
+        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+
+    async def test_tight_card_demanding_admit_stays_exclusive(self, job_tracker: JobTracker) -> None:
+        """CONTROL: the same model on a card too small for a sibling keeps the device to itself.
 
         This is the case the exclusive mode exists for: a concurrent sibling load would push the heavy
         model's weights into host-RAM streaming and collapse its step rate.
@@ -126,7 +160,7 @@ class TestOverbudgetExclusiveScope:
         await job_tracker.record_popped_job(job)
         await job_tracker.mark_inference_started(job)
 
-        scheduler._mark_overbudget_admit(job, _card_demanding_forecast())
+        scheduler._mark_overbudget_admit(job, _tight_card_demanding_forecast())
 
         assert job_tracker.is_admitted_exclusive(job) is True
         assert scheduler._max_jobs_in_progress_allowed(0) == 1
@@ -154,12 +188,12 @@ class TestOverbudgetExclusiveScope:
         assert job_tracker.is_admitted_exclusive(job) is True
 
     async def test_exclusive_mode_off_marks_nothing_exclusive(self, job_tracker: JobTracker) -> None:
-        """CONTROL: with the mode disabled even a card-dominating admit shares (operator override)."""
+        """CONTROL: with the mode disabled even an isolation-warranting admit shares (operator override)."""
         scheduler = _make_scheduler(job_tracker, overbudget_exclusive_mode=False)
         job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
         await job_tracker.record_popped_job(job)
         await job_tracker.mark_inference_started(job)
 
-        scheduler._mark_overbudget_admit(job, _card_demanding_forecast())
+        scheduler._mark_overbudget_admit(job, _tight_card_demanding_forecast())
 
         assert job_tracker.is_admitted_exclusive(job) is False

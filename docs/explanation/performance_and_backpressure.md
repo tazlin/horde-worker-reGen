@@ -279,12 +279,23 @@ is already sampling only when the in-flight work can tolerate it. Models are cla
 missing reference does not starve dispatch. The rules, scaled by tier:
 
 - The first job (nothing in flight) always starts.
-- An extra-large or batched candidate never joins a busy card, and an extra-large or batched job already
-  in flight never lets anything share the card: these want the device to themselves.
+- An extra-large candidate never joins a busy card, and an extra-large job already in flight never lets
+  anything share the card: the whole-card tier's contract holds whatever the headroom.
+- A batched candidate or a batched in-flight job blocks overlap on a tight card; with ample measured
+  headroom (below) the batch instead imposes the strictest (both-heavy) headway.
 - Otherwise the running job must have made size-appropriate **headway** before a candidate joins: none for
   light + light (they thread freely), modest when one side is heavy, and considerable for two heavy jobs.
   Progress is read live from the running slot's step counters (a freshly dispatched job that has not yet
   reported a step reads as `0.0`, which is exactly when a heavy overlap is most dangerous).
+
+The heavy fractions are sized for a tight card and would otherwise price a high-VRAM card identically: on
+a heavy-only queue (an all-SDXL worker) a 75% both-heavy headway converges two configured threads to
+roughly one effective thread. So the gate conditions its strictness on measurement
+(`_overlap_headroom_ample`): when the device's live free VRAM absorbs the candidate's full predicted
+sampling peak plus the configured reserve (the same verdict the VRAM admission budget uses, and doubly
+conservative here because a dispatchable candidate's weights are already resident), the heavy headway
+drops to a small constant that still gives the running job its memory-hungry startup beat. No measurement
+(cold start) or a disabled VRAM budget keeps the strict fractions.
 
 A blocked candidate is never dropped; it keeps its queue position and dispatches the moment the in-flight
 jobs progress past the headway threshold or finish.

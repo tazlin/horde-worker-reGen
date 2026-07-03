@@ -150,13 +150,14 @@ the judgment calls live as pure functions in
 
 Two scoping rules keep these last-resort remedies from taxing a healthy host:
 
-- **Exclusivity follows the footprint.** An over-budget admit runs with the device to itself
-  (`overbudget_exclusive_mode`) only when the streaming forecast shows the model's persistent footprint
-  dominates the card, the same trust test the whole-card machinery applies. Isolation protects a heavy
-  checkpoint from a concurrent sibling load spilling its weights to host RAM; a card-light model that
-  reaches the admit through reserve arithmetic alone (free VRAM depressed by retained sibling contexts)
-  shares the device, since isolating it would cap a multi-thread card at one job and block every other
-  preload for the admit's whole lifetime.
+- **Exclusivity follows the footprint and the room.** An over-budget admit runs with the device to
+  itself (`overbudget_exclusive_mode`) only when the streaming forecast's `admit_requires_isolation`
+  holds: the model's persistent footprint dominates the card *and* the card lacks room for a sibling
+  model beside it. Isolation protects a heavy checkpoint from a concurrent sibling load spilling its
+  weights to host RAM; a card-light model that reaches the admit through reserve arithmetic alone (free
+  VRAM depressed by retained sibling contexts) shares the device, and so does a card-dominating model on
+  a genuinely roomy card, whose no-co-sampling contract the overlap gate enforces without freezing the
+  sibling lane through the admit.
 - **RAM eviction sacrifices the cheapest cache.** When an idle RAM resident must be reclaimed, the
   victim is the smallest size-tier candidate (map order breaking ties), never a card-dominating
   checkpoint whose disk reload costs several times an ordinary model's, unless it is the only candidate.

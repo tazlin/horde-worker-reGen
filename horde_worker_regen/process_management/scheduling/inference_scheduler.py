@@ -295,6 +295,16 @@ _OVERLAP_HEADWAY_BOTH_HEAVY = 0.75
 Two SDXL jobs stacking their weight loads and activation peaks is the over-subscription that thrashes
 a sampler into a watchdog teardown, so the running job must be most of the way done first."""
 
+_OVERLAP_HEADWAY_AMPLE_VRAM = 0.15
+"""Headway applied instead of the mixed/both-heavy fractions when the device's measured free VRAM
+absorbs the candidate's full predicted sampling peak plus the configured reserve.
+
+The strict fractions price every card as tight; on a high-VRAM card serving a heavy-only queue that
+prices a second configured thread out of existence (a both-heavy candidate waits for 75% progress, so
+two threads converge to ~one effective thread). When the measurement says the newcomer's whole peak
+fits *now*, the over-subscription the strict headway guards against cannot occur; a small headway is
+kept so the running job clears its memory-hungry startup before a sibling adds pressure."""
+
 
 class _WholeCardDemandOutcome(enum.Enum):
     """How the whole-card residency decision resolves a budget-gated head's preload.
@@ -729,18 +739,18 @@ class InferenceScheduler:
         duration, leaving the device un-contended while it completes.
 
         Exclusivity guards a heavy model against a concurrent sibling load pushing its weights into
-        host-RAM streaming; that risk needs a footprint that actually dominates the device. A card-light
+        host-RAM streaming; that risk needs a footprint that dominates the device *on a card too small
+        to host a sibling beside it* (see :attr:`StreamForecast.admit_requires_isolation`). A card-light
         model can reach this path purely through reserve arithmetic (free VRAM depressed by retained
-        sibling contexts), and isolating it caps a multi-thread card at one job for the admit's whole
-        lifetime while blocking every other preload. So the exclusive tag follows the same
-        ``is_card_demanding`` trust test the whole-card machinery uses; an unsized or missing forecast
-        keeps the conservative isolation.
+        sibling contexts), and a card-dominating model on a roomy card co-resides safely; isolating
+        either caps a multi-thread card at one job for the admit's whole lifetime while blocking every
+        other preload. An unsized or missing forecast keeps the conservative isolation.
         """
         if not self._job_tracker.is_admitted_over_budget(job):
             self._heavy_head_admitted_at = time.time()
         self._job_tracker.mark_admitted_over_budget(job)
         if self._runtime_config.bridge_data.overbudget_exclusive_mode and (
-            forecast is None or forecast.is_card_demanding
+            forecast is None or forecast.admit_requires_isolation
         ):
             self._job_tracker.mark_admitted_exclusive(job)
 
@@ -2606,12 +2616,17 @@ class InferenceScheduler:
         into a step-timeout teardown. This gate adds the missing dimension: a new overlap is admitted
         only when the in-flight work can tolerate it.
 
-        Rules, scaled by model size:
+        Rules, scaled by model size and measured headroom:
             * The first job (nothing in flight) always starts.
-            * An extra-large or batched candidate never joins a busy card; it wants the card to itself.
-            * An extra-large or batched job already in flight never shares the card.
+            * An extra-large candidate never joins a busy card, and an extra-large job in flight never
+              shares it: the whole-card tier's contract is independent of how roomy the card is.
+            * A batched candidate or a batched job in flight blocks overlap on a tight card; when the
+              device's measured free VRAM absorbs the candidate's full predicted peak plus reserve
+              (:meth:`_overlap_headroom_ample`), the batch instead imposes the strictest headway.
             * Otherwise the running job must have made size-appropriate headway: none for light+light,
-              modest when one side is heavy, considerable for two heavy jobs.
+              modest when one side is heavy, considerable for two heavy jobs. With ample measured
+              headroom the heavy fractions relax to a small constant, since the over-subscription they
+              guard against cannot occur when the newcomer's whole peak fits free VRAM now.
 
         A blocked job is not dropped; it keeps its queue position and dispatches once the in-flight
         job(s) progress or finish.
@@ -2633,21 +2648,77 @@ class InferenceScheduler:
             return True
 
         candidate_tier = self._model_size_tier(candidate_job.model)
-        if candidate_tier >= _ModelSizeTier.EXTRA_LARGE or self._job_batch_amount(candidate_job) > 1:
+        if candidate_tier >= _ModelSizeTier.EXTRA_LARGE:
+            return False
+
+        # Resolved once per call (it reads the live VRAM measurement) and only when a rule needs it.
+        headroom_ample: bool | None = None
+
+        def ample() -> bool:
+            nonlocal headroom_ample
+            if headroom_ample is None:
+                headroom_ample = self._overlap_headroom_ample(candidate_job, device_index=target_device_index)
+            return headroom_ample
+
+        candidate_batched = self._job_batch_amount(candidate_job) > 1
+        if candidate_batched and not ample():
             return False
 
         for job in in_progress_jobs:
             running_tier = self._model_size_tier(job.model)
-            if running_tier >= _ModelSizeTier.EXTRA_LARGE or self._job_batch_amount(job) > 1:
+            if running_tier >= _ModelSizeTier.EXTRA_LARGE:
                 return False
 
-            required_headway = self._required_overlap_headway(running_tier, candidate_tier)
+            if candidate_batched or self._job_batch_amount(job) > 1:
+                # A batch multiplies the activation peak, so on a tight card it keeps the hard block;
+                # with measured room for the newcomer's whole peak the batch is bounded instead by the
+                # strictest headway (never the ample relaxation, which is sized for single jobs).
+                if not ample():
+                    return False
+                required_headway = _OVERLAP_HEADWAY_BOTH_HEAVY
+            else:
+                required_headway = self._required_overlap_headway(running_tier, candidate_tier)
+                if required_headway > 0.0 and ample():
+                    required_headway = _OVERLAP_HEADWAY_AMPLE_VRAM
+
             if required_headway <= 0.0:
                 continue
             if self._in_flight_progress_fraction(job) < required_headway:
                 return False
 
         return True
+
+    def _overlap_headroom_ample(
+        self,
+        candidate_job: ImageGenerateJobPopResponse,
+        *,
+        device_index: int | None = None,
+    ) -> bool:
+        """Whether the device's live free VRAM absorbs ``candidate_job``'s full predicted sampling peak.
+
+        The overlap gate's strict headway fractions guard against a newcomer's weight load and
+        activation peak over-subscribing a card that cannot host both samplers; this predicate is the
+        measurement that decides whether that hazard exists at all. It reuses the VRAM budget's own
+        verdict (predicted sampling peak + configured reserve against measured free, net of committed
+        reserves), so the overlap gate and the admission gate price a job identically. The check is
+        deliberately conservative in the candidate's favor: dispatch requires the candidate's model to
+        be resident already, so its weights are on the card and the prediction double-counts them as
+        margin. No measurement (cold start) or an inactive budget reads as tight, keeping the strict
+        gate wherever the relaxation cannot be justified by data.
+        """
+        if candidate_job.model is None or not self._budget_active():
+            return False
+        free_vram_mb = self._measured_free_vram_mb(device_index=device_index)
+        if free_vram_mb is None:
+            return False
+        baseline = self._model_metadata.get_baseline(candidate_job.model)
+        verdict = self._vram_budget.check_job(
+            candidate_job,
+            baseline,
+            free_vram_mb,
+            committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
+        )
+        return verdict.fits
 
     def _expire_stale_model_map_entries(self) -> list[str]:
         """Expire model-map entries whose owning process can no longer be loading that model."""
