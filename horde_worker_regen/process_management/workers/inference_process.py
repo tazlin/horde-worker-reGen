@@ -30,6 +30,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
     ImageGenerateJobPopResponse,
 )
+from horde_sdk.generation_parameters.alchemy import SingleAlchemyParameters
 from loguru import logger
 
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
@@ -1075,10 +1076,9 @@ class HordeInferenceProcess(HordeProcess):
                         width=job_info.payload.width,
                         height=job_info.payload.height,
                     ):
-                        results = self._horde.basic_inference(
+                        results = self._run_typed_inference(
                             job_info,
-                            progress_callback=self.progress_callback,
-                            defer_vram_unload=keep_model_resident,
+                            keep_model_resident=keep_model_resident,
                         )
         except Exception as e:
             # Keep a reason for the faulted result: the main process logs it and classifies a
@@ -1107,6 +1107,156 @@ class HordeInferenceProcess(HordeProcess):
                     self._vae_decode_semaphore.release()
             self._vae_lock_was_acquired = False
         return results
+
+    def _run_typed_inference(
+        self,
+        job_info: ImageGenerateJobPopResponse,
+        *,
+        keep_model_resident: bool,
+    ) -> list[ResultingImageReturn]:
+        """Run a job through hordelib's typed generation path, then its embedded post-processing.
+
+        The AI-Horde job is translated to backend-agnostic generation parameters by the SDK
+        (hordelib itself has no knowledge of the AI-Horde API models), inference runs via
+        `HordeLib.generate` with automatic pipeline selection, and any post-processing the job
+        requested is driven here per image via the typed `HordeLib.post_process`.
+        """
+        from horde_sdk.worker.dispatch.ai_horde.image.convert import (
+            convert_image_job_pop_response_to_parameters,
+        )
+
+        from horde_worker_regen.reference_helper import ensure_offline_reference_manager
+
+        conversion_result = convert_image_job_pop_response_to_parameters(
+            api_response=job_info,
+            model_reference_manager=ensure_offline_reference_manager(),
+        )
+
+        from hordelib.api import AUTO_PIPELINE
+
+        results = self._horde.generate(
+            conversion_result.generation_parameters,
+            pipeline=AUTO_PIPELINE,
+            progress_callback=self.progress_callback,
+            defer_vram_unload=keep_model_resident,
+        )
+
+        alchemy_params = conversion_result.generation_parameters.alchemy_params
+        if alchemy_params is None:
+            for single_result in results:
+                single_result.faults = conversion_result.faults + single_result.faults
+            return results
+
+        return self._run_embedded_post_processing(
+            results,
+            alchemy_params.all_alchemy_operations,
+            conversion_result.faults,
+        )
+
+    def _run_embedded_post_processing(
+        self,
+        results: list[ResultingImageReturn],
+        operations: list[SingleAlchemyParameters],
+        conversion_faults: list[GenMetadataEntry],
+    ) -> list[ResultingImageReturn]:
+        """Apply a job's embedded post-processing chain to each generated image.
+
+        Each image accumulates the conversion, inference, and post-processing faults. An image
+        whose chain ends without an output is dropped from the results (an empty result list
+        faults the whole job upstream). Facefixers run last regardless of the requested order;
+        otherwise the requested order is preserved.
+        """
+        from horde_sdk.generation_parameters.alchemy import (
+            FacefixAlchemyParameters,
+            UpscaleAlchemyParameters,
+        )
+        from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
+        from hordelib.api import (
+            FacefixPayload,
+            ResultingImageReturn,
+            StripBackgroundPayload,
+            UpscalePayload,
+        )
+
+        # Post-processing runs after the sampling slot is no longer needed: mirror the state
+        # transition hordelib's embedded loop used to trigger via ProgressState.post_processing,
+        # so the next job can start sampling while this one post-processes.
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.INFERENCE_POST_PROCESSING,
+            info="Post Processing",
+            time_elapsed=time.time() - self._start_inference_time,
+        )
+        self._in_post_processing = True
+        self._release_inference_slot()
+        if not self._post_processing_memory_report_sent:
+            self._post_processing_memory_report_sent = True
+            self._send_inference_memory_report()
+
+        ordered_operations = self._facefixers_last(operations)
+
+        post_processed_results: list[ResultingImageReturn] = []
+        for single_result in results:
+            single_image_faults = conversion_faults + single_result.faults
+            final_image = single_result.image
+            final_rawpng = single_result.rawpng
+
+            for operation in ordered_operations:
+                if final_image is None:
+                    logger.error("No image available to post-process; aborting remaining operations")
+                    break
+
+                if isinstance(operation, UpscaleAlchemyParameters):
+                    upscale_result = self._horde.post_process(
+                        UpscalePayload(model=str(operation.upscaler), source_image=final_image),
+                    )
+                    single_image_faults += upscale_result.faults
+                    final_rawpng = upscale_result.rawpng
+                    final_image = upscale_result.image
+                elif isinstance(operation, FacefixAlchemyParameters):
+                    # The carried codeformer_fidelity is deliberately not forwarded: the legacy
+                    # mapping never wired facefixer_strength to the fixer, so honoring it would
+                    # change existing job output.
+                    facefix_result = self._horde.post_process(
+                        FacefixPayload(model=str(operation.facefixer), source_image=final_image),
+                    )
+                    single_image_faults += facefix_result.faults
+                    final_rawpng = facefix_result.rawpng
+                    final_image = facefix_result.image
+                elif is_strip_background_form(operation.form):
+                    # The pre-strip rawpng is intentionally kept (legacy parity)
+                    final_image = self._horde.post_process(
+                        StripBackgroundPayload(source_image=final_image),
+                    ).image
+                else:
+                    logger.warning(f"Unknown post-processor requested; skipping: {operation.form}")
+
+            if final_image is None:
+                logger.error("Post processing failed and there is no output image!")
+            else:
+                post_processed_results.append(
+                    ResultingImageReturn(
+                        image=final_image,
+                        rawpng=final_rawpng,
+                        faults=single_image_faults,
+                    ),
+                )
+
+        return post_processed_results
+
+    @staticmethod
+    def _facefixers_last(operations: list[SingleAlchemyParameters]) -> list[SingleAlchemyParameters]:
+        """Return the operations reordered so facefixers run last, preserving order otherwise.
+
+        Execution policy inherited from the legacy embedded loop: upscaling before facefixing
+        keeps the facefixer working on the final resolution (and the pinned reference images
+        encode this order).
+        """
+        from horde_sdk.generation_parameters.alchemy import FacefixAlchemyParameters
+
+        return sorted(
+            operations,
+            key=lambda operation: 1 if isinstance(operation, FacefixAlchemyParameters) else 0,
+        )
 
     @staticmethod
     def _make_dummy_inference_result(
@@ -1449,7 +1599,7 @@ class HordeInferenceProcess(HordeProcess):
                     # The model is already resident, so the scheduler dispatched inference without a
                     # fresh preload. The aux-model (LoRA/TI) download lives inside preload_model, so
                     # without this call those per-job downloads fall through to a lazy fetch inside
-                    # basic_inference while the slot reads INFERENCE_STARTING. A slow CivitAI download
+                    # inference while the slot reads INFERENCE_STARTING. A slow CivitAI download
                     # there emits no step heartbeat, so the parent's inference_step_timeout watchdog
                     # mistakes it for a hang and kills the process. download_aux_models runs under the
                     # heartbeat-protected DOWNLOADING_AUX_MODEL path and is idempotent (a no-op when

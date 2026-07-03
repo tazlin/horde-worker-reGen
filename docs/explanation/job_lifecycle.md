@@ -174,8 +174,15 @@ priorities](performance_and_backpressure.md#inference-scheduling-priorities).
 ### 3. Inference (child process, `inference_process.py`)
 
 [`HordeInferenceProcess`][horde_worker_regen.process_management.workers.inference_process.HordeInferenceProcess]
-receives the control message, runs hordelib, and streams back heartbeats, memory reports, and state
-changes, ending with `HordeInferenceResultMessage` (state `ok`/`censored`/`faulted` + base64 images).
+receives the control message and runs the job in three explicit stages: it translates the AI-Horde
+`ImageGenerateJobPopResponse` into backend-agnostic generation parameters via horde_sdk's
+`convert_image_job_pop_response_to_parameters` (hordelib has no knowledge of AI-Horde API models),
+runs inference through hordelib's typed `HordeLib.generate` (with registry-based automatic pipeline
+selection), then drives the job's requested post-processing itself, per image, through the typed
+`HordeLib.post_process` (facefixers last; an image whose chain produces no output is dropped, and an
+empty result list faults the job). Throughout, it streams back heartbeats, memory reports, and state
+changes (including `INFERENCE_POST_PROCESSING`, which frees the sampling slot for the next job),
+ending with `HordeInferenceResultMessage` (state `ok`/`censored`/`faulted` + base64 images).
 A job that stops reporting progress is graded and recovered by the watchdogs in [Resilience and
 Recovery](resilience_and_recovery.md). In dry-run, `fake_worker_processes.py` substitutes canned image
 results.

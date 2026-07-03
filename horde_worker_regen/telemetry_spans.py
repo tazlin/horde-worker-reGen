@@ -11,7 +11,7 @@ import logfire
 inference_duration_histogram = logfire.metric_histogram(
     "inference.duration_seconds",
     unit="s",
-    description="Time spent in basic_inference",
+    description="Time spent in hordelib inference",
 )
 
 model_load_duration_histogram = logfire.metric_histogram(
@@ -77,7 +77,7 @@ def span_inference(
     height: int,
     **extra: Any,  # type: ignore # noqa
 ) -> Generator[logfire.LogfireSpan, None, None]:
-    """Wrap the basic_inference call in the child process."""
+    """Wrap the hordelib inference call in the child process."""
     with logfire.span(
         "job.inference",
         model=model,
