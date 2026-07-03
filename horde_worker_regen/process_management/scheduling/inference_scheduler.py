@@ -710,7 +710,7 @@ class InferenceScheduler:
         exclusively, its prior over-budget fault streak, and the per-slot residency + device-wide free
         VRAM at admit time (the over-commit signature: e.g. another slot resident while this loads).
         """
-        exclusive = self._runtime_config.bridge_data.overbudget_exclusive_mode
+        exclusive = self._job_tracker.is_admitted_exclusive(job)
         fault_count = self._job_tracker.get_model_overbudget_fault_count(job.model)
         logger.opt(ansi=True).warning(
             f"<fg #f0beff>VRAM budget cannot fit head-of-queue model {job.model} even after reclaiming all idle "
@@ -719,18 +719,29 @@ class InferenceScheduler:
             f"wedging the queue. {self._process_map.residency_snapshot()}</>",
         )
 
-    def _mark_overbudget_admit(self, job: ImageGenerateJobPopResponse) -> None:
+    def _mark_overbudget_admit(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast | None) -> None:
         """Tag ``job`` as an over-budget best-effort admit, opening the heavy-head load grace on first admit.
 
         Records the load-grace start the first time the job is admitted (so its multi-gigabyte load is not
         mistaken for a structural wedge; see :meth:`heavy_head_load_grace_active`). When over-budget
-        exclusive mode is configured, also marks it exclusive so the scheduler suppresses concurrent
-        pre-staging and dispatch for its duration, leaving the device un-contended while it completes.
+        exclusive mode is configured *and* the forecast shows the model's footprint dominates the card,
+        also marks it exclusive so the scheduler suppresses concurrent pre-staging and dispatch for its
+        duration, leaving the device un-contended while it completes.
+
+        Exclusivity guards a heavy model against a concurrent sibling load pushing its weights into
+        host-RAM streaming; that risk needs a footprint that actually dominates the device. A card-light
+        model can reach this path purely through reserve arithmetic (free VRAM depressed by retained
+        sibling contexts), and isolating it caps a multi-thread card at one job for the admit's whole
+        lifetime while blocking every other preload. So the exclusive tag follows the same
+        ``is_card_demanding`` trust test the whole-card machinery uses; an unsized or missing forecast
+        keeps the conservative isolation.
         """
         if not self._job_tracker.is_admitted_over_budget(job):
             self._heavy_head_admitted_at = time.time()
         self._job_tracker.mark_admitted_over_budget(job)
-        if self._runtime_config.bridge_data.overbudget_exclusive_mode:
+        if self._runtime_config.bridge_data.overbudget_exclusive_mode and (
+            forecast is None or forecast.is_card_demanding
+        ):
             self._job_tracker.mark_admitted_exclusive(job)
 
     def set_measured_per_process_overhead_mb(self, overhead_mb: int | float) -> None:
@@ -3083,14 +3094,38 @@ class InferenceScheduler:
         # estimate is a deliberately conservative single-resident-peak figure, but a large combined
         # checkpoint is streamed through VRAM component-by-component by the backend, so its true peak is
         # well under the summed estimate. Give the head the device rather than deferring it forever (which
-        # would wedge the queue and fault the head anyway), after also reclaiming system RAM from idle
-        # residents: a heavy head loads its checkpoint through RAM first. Tag it so a crash/hang of its
-        # over-committed slot is classified as a resource failure (earning the bounded, isolated retry)
-        # instead of a plain re-dispatch.
-        self.unload_models(under_pressure=True, for_head_of_queue=True)
-        self._mark_overbudget_admit(job)
+        # would wedge the queue and fault the head anyway), after reclaiming system RAM from idle residents
+        # when the host actually lacks the room (a heavy head loads its checkpoint through RAM first). Tag
+        # it so a crash/hang of its over-committed slot is classified as a resource failure (earning the
+        # bounded, isolated retry) instead of a plain re-dispatch.
+        self._reclaim_ram_for_overbudget_admit(job, baseline)
+        self._mark_overbudget_admit(job, forecast)
         self._log_overbudget_admit(job)
         return VramGateResult.ADMIT_OVER_BUDGET
+
+    def _reclaim_ram_for_overbudget_admit(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+    ) -> None:
+        """Reclaim idle system RAM ahead of a best-effort over-budget load, only when the host is short.
+
+        A heavy head loads its checkpoint through system RAM before it reaches the device, so an admit on
+        a RAM-tight host must first evict an idle resident copy. On a host with ample available RAM that
+        eviction buys nothing and costs a warm cache: the sibling's model drops to disk, and the next job
+        for it pays a full checkpoint reload (with the allocator-stuck slot the unload leaves behind then
+        recycled, compounding the churn). So the reclaim is gated on the RAM budget's own verdict for the
+        incoming load rather than performed unconditionally.
+        """
+        ram_verdict = self._ram_budget.check_job(
+            job,
+            baseline,
+            self._measured_available_ram_mb(),
+            committed_reserve_mb=self._reserve_ledger.total_ram_mb(),
+        )
+        if ram_verdict.fits:
+            return
+        self.unload_models(under_pressure=True, for_head_of_queue=True)
 
     def _apply_ram_verdict(
         self,
@@ -3200,7 +3235,7 @@ class InferenceScheduler:
             return True
         if whole_card is _WholeCardDemandOutcome.TERMINAL_ADMIT:
             self._log_whole_card_terminal_admit(job)
-            self._mark_overbudget_admit(job)
+            self._mark_overbudget_admit(job, forecast)
             return True
 
         # Head-of-queue starvation backstop (see _HEAD_STARVATION_FORCE_ADMIT_SECONDS): once the head has been
@@ -3214,7 +3249,7 @@ class InferenceScheduler:
         )
         if force_admit_starved_head:
             self._log_head_starvation_force_admit(job)
-            self._mark_overbudget_admit(job)
+            self._mark_overbudget_admit(job, forecast)
             return True
 
         return self._apply_resource_verdicts(
@@ -4989,6 +5024,7 @@ class InferenceScheduler:
         wanted_models = self._compute_wanted_models()
         in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
 
+        eligible: list[HordeProcessInfo] = []
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
                 continue
@@ -5027,10 +5063,19 @@ class InferenceScheduler:
                 ):
                     continue
 
-                self.unload_from_ram(process_info.process_id)
-                return True
+                eligible.append(process_info)
 
-        return False
+        if not eligible:
+            return False
+
+        # Among the reclaimable idle residents, sacrifice the cheapest cache to rebuild: a light model's
+        # checkpoint reloads from disk in a fraction of a card-dominating one's time, so evicting by size
+        # tier (map order breaking ties) keeps the most expensive warm copy alive whenever any cheaper
+        # candidate can free the RAM instead. A lone heavy resident is still evicted, so the tier
+        # preference can never wedge the reclaim.
+        victim = min(eligible, key=lambda p: self._model_size_tier(p.loaded_horde_model_name))
+        self.unload_from_ram(victim.process_id)
+        return True
 
     def _is_heavy_model_and_workflow(
         self,

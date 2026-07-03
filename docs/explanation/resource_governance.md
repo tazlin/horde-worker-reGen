@@ -136,14 +136,30 @@ the judgment calls live as pure functions in
    ([`preload_concurrency_blocked`][horde_worker_regen.process_management.scheduling.governance.preload_admission.preload_concurrency_blocked]).
 4. **Budget verdicts**: the VRAM gate answers with an explicit
    [`VramGateResult`][horde_worker_regen.process_management.scheduling.governance.preload_admission.VramGateResult]
-   (fits / defer / admitted over budget), so an over-budget admit visibly bypasses the RAM gate whose
-   reclaim it already performed. When a verdict rejects, the scheduler runs the reclaim attempts and
+   (fits / defer / admitted over budget), so an over-budget admit visibly bypasses the RAM gate. Before
+   admitting, it reclaims idle system RAM only when the RAM budget judges the incoming load short of
+   available memory: a heavy head does route its checkpoint through RAM first, but purging a sibling's
+   warm RAM copy on a host with ample headroom only converts that sibling's next job into a disk
+   reload. When a verdict rejects, the scheduler runs the reclaim attempts and
    the pure outcome deciders
    ([`decide_vram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_vram_reclaim_outcome],
    [`decide_ram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_ram_reclaim_outcome])
    resolve what the exhausted pass means. Same-tick reclaim side effects stay behind the
    [`ReclamationExecutor`][horde_worker_regen.process_management.scheduling.governance.preload_admission.ReclamationExecutor]
    protocol, implemented by the scheduler because it owns live process state and logging.
+
+Two scoping rules keep these last-resort remedies from taxing a healthy host:
+
+- **Exclusivity follows the footprint.** An over-budget admit runs with the device to itself
+  (`overbudget_exclusive_mode`) only when the streaming forecast shows the model's persistent footprint
+  dominates the card, the same trust test the whole-card machinery applies. Isolation protects a heavy
+  checkpoint from a concurrent sibling load spilling its weights to host RAM; a card-light model that
+  reaches the admit through reserve arithmetic alone (free VRAM depressed by retained sibling contexts)
+  shares the device, since isolating it would cap a multi-thread card at one job and block every other
+  preload for the admit's whole lifetime.
+- **RAM eviction sacrifices the cheapest cache.** When an idle RAM resident must be reclaimed, the
+  victim is the smallest size-tier candidate (map order breaking ties), never a card-dominating
+  checkpoint whose disk reload costs several times an ordinary model's, unless it is the only candidate.
 
 ## Whole-card residency state
 

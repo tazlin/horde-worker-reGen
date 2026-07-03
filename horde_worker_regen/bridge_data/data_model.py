@@ -749,8 +749,12 @@ class reGenBridgeData(CombinedHordeBridgeData):
     process loading another model concurrently pushes free VRAM to ~0 and the heavy model's weights spill
     to system RAM over PCIe, collapsing its step rate (~50-80x) until the step-timeout watchdog kills it.
     When true (the default), such a job evicts every other resident model first and suppresses concurrent
-    pre-staging/dispatch for its duration, so it runs on an un-contended device. Only used when
-    `enable_vram_budget` is true."""
+    pre-staging/dispatch for its duration, so it runs on an un-contended device. The isolation only
+    attaches when the streaming forecast shows the model's footprint actually dominates the card: a
+    card-light model that reaches the best-effort admit through reserve arithmetic alone (free VRAM
+    depressed by retained sibling contexts) shares the device, since isolating it would cap a
+    multi-thread card at one job for the admit's whole lifetime. Only used when `enable_vram_budget`
+    is true."""
 
     whole_card_exclusive_residency: bool = Field(default=True)
     """Give a model whose weights need most of the device sole residency *before* it streams, not after a fault.
