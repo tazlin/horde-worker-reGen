@@ -14,7 +14,7 @@ from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
 from pydantic import ConfigDict
 
-from horde_worker_regen.consts import KNOWN_CONTROLNET_WORKFLOWS, VRAM_HEAVY_MODELS
+from horde_worker_regen.consts import KNOWN_CONTROLNET_WORKFLOWS
 from horde_worker_regen.process_management.ipc.messages import (
     HordeHeartbeatType,
     HordeProcessState,
@@ -657,23 +657,16 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """Return true if we should keep only a single inference process running.
 
         This is used to prevent overloading the system with inference processes, such as with batched jobs.
+
+        Card-demanding models are deliberately not a rule here: their serialization belongs to the
+        scheduler's size-tier overlap gate, which is derived from the model reference (not a hand-kept
+        name list), scopes to the card the in-flight job runs on, and relaxes against measured headroom.
+        A worker-wide hold from this map would sit on top of that gate, blind to devices and to models
+        the list never learned about.
         """
         for p in self.values():
             if p.batch_amount > 1 and p.last_process_state == HordeProcessState.INFERENCE_STARTING:
                 return True, "Batched job"
-
-            if (
-                (
-                    p.last_process_state == HordeProcessState.INFERENCE_STARTING
-                    or (
-                        p.last_process_state == HordeProcessState.INFERENCE_POST_PROCESSING
-                        and not post_process_job_overlap
-                    )
-                )
-                and p.last_job_referenced is not None
-                and p.last_job_referenced.model in VRAM_HEAVY_MODELS
-            ):
-                return True, "VRAM heavy model"
 
             if (
                 p.last_job_referenced is not None

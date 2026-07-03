@@ -153,6 +153,7 @@ def test_facefixers_sort_last_preserving_order() -> None:
 def test_chain_runs_per_image_and_signals_post_processing_state() -> None:
     """Each image runs the full chain and the process signals the post-processing transition."""
     from hordelib.api import FacefixPayload, UpscalePayload
+
     from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 
     fake = _FakeInferenceProcess()

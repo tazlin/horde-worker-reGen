@@ -377,39 +377,27 @@ class TestKeepSingleInferenceReadsRetainedReference:
         assert keep is True
         assert reason == "ControlNet XL"
 
-    async def test_vram_heavy_keeps_single_inference_only_while_actively_inferring(self) -> None:
-        """The VRAM-heavy guard, unlike the ControlNet-XL one, is scoped to active inference, not idle.
+    async def test_card_demanding_model_does_not_hold_worker_single(self) -> None:
+        """A card-demanding model actively inferring places no worker-wide single-process hold here.
 
-        Documenting this asymmetry is the point: a VRAM-heavy reference on an idle slot does NOT hold the
-        worker single-process, so the two readers of ``last_job_referenced`` have deliberately different
-        sensitivity to a stale, idle reference.
+        Its serialization belongs to the scheduler's size-tier overlap gate, which is derived from the
+        model reference, scopes to the in-flight job's card, and relaxes against measured headroom. A
+        second name-list hold in the process map would stack on that gate while being blind to devices
+        and to demanding models the list never learned about.
         """
-        vram_heavy_model = "Flux.1-Schnell fp8 (Compact)"
+        card_demanding_model = "Flux.1-Schnell fp8 (Compact)"
 
         actively_inferring = make_mock_process_info(
             1,
-            model_name=vram_heavy_model,
+            model_name=card_demanding_model,
             state=HordeProcessState.INFERENCE_STARTING,
         )
-        actively_inferring.last_job_referenced = make_mock_job(model=vram_heavy_model)
-        keep_busy, reason_busy = ProcessMap({1: actively_inferring}).keep_single_inference(
+        actively_inferring.last_job_referenced = make_mock_job(model=card_demanding_model)
+        keep_busy, _reason_busy = ProcessMap({1: actively_inferring}).keep_single_inference(
             stable_diffusion_model_reference={},
-            post_process_job_overlap=False,
+            post_process_job_overlap=True,
         )
-        assert keep_busy is True
-        assert reason_busy == "VRAM heavy model"
-
-        idle_with_stale_ref = make_mock_process_info(
-            1,
-            model_name=vram_heavy_model,
-            state=HordeProcessState.WAITING_FOR_JOB,
-        )
-        idle_with_stale_ref.last_job_referenced = make_mock_job(model=vram_heavy_model)
-        keep_idle, _reason_idle = ProcessMap({1: idle_with_stale_ref}).keep_single_inference(
-            stable_diffusion_model_reference={},
-            post_process_job_overlap=False,
-        )
-        assert keep_idle is False
+        assert keep_busy is False
 
 
 class TestReferenceClearedOnModelTeardown:

@@ -598,12 +598,15 @@ class WholeCardResidencyState:
 def predict_job_weight_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
     """Return a job's resident weight footprint (MB), or None when it cannot be estimated.
 
-    Uses hordelib's per-baseline weight seed (:meth:`BaselineBurden.resident_weight_estimate_mb`), which is
-    the figure ComfyUI compares against its weight budget when deciding to keep weights resident or stream
-    them, distinct from :func:`predict_job_vram_mb`'s activation-inclusive steady estimate. Weights do not
-    scale with resolution or batch (activations do), so there is no per-megapixel term here. Imported from
-    the torch-free ``feature_impact`` submodule, not the ``hordelib.api`` facade, so the orchestrator stays
-    torch-free. Never raises.
+    Uses hordelib's per-baseline footprint (:meth:`BaselineBurden.resident_footprint_estimate_mb`): the
+    core diffusion weights plus the support components (text encoders, VAE) the engine force-loads onto
+    the device over the course of every job. Room and residency verdicts must charge the whole set; a
+    multi-component checkpoint judged by its core weights alone is under-counted by the full
+    text-encoder size, and the room granted against that smaller figure is room that does not exist
+    (the components then evict each other all job long). Distinct from :func:`predict_job_vram_mb`'s
+    activation-inclusive steady estimate; weights do not scale with resolution or batch (activations
+    do), so there is no per-megapixel term here. Imported from the torch-free ``feature_impact``
+    submodule, not the ``hordelib.api`` facade, so the orchestrator stays torch-free. Never raises.
     """
     if baseline is None:
         return None
@@ -613,7 +616,7 @@ def predict_job_weight_mb(job: ImageGenerateJobPopResponse, baseline: str | None
         entry = get_baseline_burden(str(baseline))
         if entry is None:
             return None
-        return float(entry.resident_weight_estimate_mb())
+        return float(entry.resident_footprint_estimate_mb())
     except Exception as e:
         logger.debug(f"Job weight estimate failed for {baseline!r}: {type(e).__name__} {e}")
         return None

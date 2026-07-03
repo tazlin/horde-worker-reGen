@@ -42,7 +42,8 @@ class SlotDutyBucket(StrEnum):
     RESIDENT_SLOT_BUSY = "resident_slot_busy"
     """The next job's model was resident, but only on a process busy with other work."""
     KEEP_SINGLE_INFERENCE = "keep_single_inference"
-    """The keep-single-inference guard held dispatch (heavy workflow or post-processing overlap rule)."""
+    """The keep-single-inference guard held dispatch (batched job, ControlNet workflow, or the
+    post-processing overlap rule)."""
     EXCLUSIVE_ISOLATION = "exclusive_isolation"
     """An exclusively-admitted over-budget job had the device; other dispatch was suppressed."""
     CONCURRENCY_CAP = "concurrency_cap"

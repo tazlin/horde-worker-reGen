@@ -872,11 +872,11 @@ wheels = [
 
 [[package]]
 name = "filelock"
-version = "3.29.4"
+version = "3.29.5"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e6/dc/be6cbe99670cd6e4ad387123647cb08e0c32975e223f82551e914c5568a6/filelock-3.29.4.tar.gz", hash = "sha256:10cdb3656fc44541cdf30652a93fb10ec6b05325620eb316bd26893e4201538a", size = 63028, upload-time = "2026-06-13T16:12:00.744Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/ee/29c668c50888588c432a702f7c2e8ee8a0c9e5286028d91f170308d6b2e9/filelock-3.29.5.tar.gz", hash = "sha256:6e6034c57a00a020e767f2614a5539863f056de7e7991d6d1473aef7ff73f156", size = 68927, upload-time = "2026-07-03T03:50:31.818Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/13/37/a065dc3bd6e49423a6532c642ca7378d3f467b1ef44c2800c937af7f9739/filelock-3.29.4-py3-none-any.whl", hash = "sha256:dac1648087d5115554850d113e7dd8c83ab2d38e3435dde2d4f163847e57b767", size = 42757, upload-time = "2026-06-13T16:11:59.582Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/e3/f1fae3647d170919c2cf2a898e77e7d1a4e5c7cae0aed7bb4bd3f5ebff6f/filelock-3.29.5-py3-none-any.whl", hash = "sha256:8af830889ba3a0ffcefbd6c7d2af8a54012058103771f2e10848222f476a1693", size = 45073, upload-time = "2026-07-03T03:50:30.445Z" },
 ]
 
 [[package]]
@@ -1116,7 +1116,7 @@ wheels = [
 
 [[package]]
 name = "horde-engine"
-version = "4.0.0"
+version = "4.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1182,9 +1182,9 @@ dependencies = [
     { name = "yapf" },
     { name = "yarl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/72/97/c1bcd58a59a92a312759110f616271e627c35a415f248cc8033e59969413/horde_engine-4.0.0.tar.gz", hash = "sha256:0e7f53949f6fad148b20feb481d9c27f06f3df915a1bdbdf10c8b7ef01b901e3", size = 424765, upload-time = "2026-07-03T03:19:49.924Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c8/4f/3840f830eaaa2439ee73a81ddab300966890d3e8acd52d24e724cfc514c5/horde_engine-4.0.1.tar.gz", hash = "sha256:9f9fceb101d34b610a888b28d45f233c05382bd81f85c977b91cfaafd811bab8", size = 425743, upload-time = "2026-07-03T03:51:00.885Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/30/f1/5c2d2b8638ede6be9822489b8a825896d342074b0c5289a10d77e23e3b61/horde_engine-4.0.0-py3-none-any.whl", hash = "sha256:59057aced246a4481f84bbdfed8e79c9c640bd3290602bba302989d423acc9a8", size = 546531, upload-time = "2026-07-03T03:19:47.675Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/5b/4c72bbec09f547258873a568be9de346258f8bd9cd32a1353edd83e35451/horde_engine-4.0.1-py3-none-any.whl", hash = "sha256:8c0354489ad0f6be0965555c036c8bd094fbec65a7ce2ba7af9a5080295a25f7", size = 547522, upload-time = "2026-07-03T03:50:58.837Z" },
 ]
 
 [package.optional-dependencies]
@@ -1379,7 +1379,7 @@ requires-dist = [
     { name = "blurhash", specifier = ">=1.1.5" },
     { name = "certifi" },
     { name = "horde-engine", extras = ["controlnet"], marker = "extra == 'controlnet'" },
-    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=4.0.0,<5.0.0" },
+    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=4.0.1,<5.0.0" },
     { name = "horde-engine", extras = ["rembg"], marker = "extra == 'post-processing'" },
     { name = "horde-model-reference", specifier = ">=7.0.2,<8.0.0" },
     { name = "horde-safety", specifier = "~=0.3.0" },
