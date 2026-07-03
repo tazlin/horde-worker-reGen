@@ -135,7 +135,10 @@ class TestSchedulerActuatesProcessReduction:
         process count to what fits and defers one tick while the freed VRAM drains.
         """
         # A heavy checkpoint whose weights overflow the four-context floor but fit with fewer processes.
+        # Weight and footprint pinned together: this scenario's checkpoint is single-component, so its
+        # full resident footprint is its core weights.
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: 9500.0)
+        monkeypatch.setattr(resource_budget, "predict_job_footprint_mb", lambda job, baseline: 9500.0)
         # Modest activation working set so the model reads activation-light (not weight-dominant), exercising
         # the needs_process_count_reduction path rather than needs_exclusive_residency.
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 9500.0 + 600)
