@@ -180,7 +180,9 @@ class StreamForecast:
     """
 
     weights_mb: float | None
-    """Resident weight footprint ComfyUI compares against its budget, or None when it cannot be estimated."""
+    """Core (diffusion) resident weight footprint ComfyUI compares against its budget, or None when it
+    cannot be estimated. Streaming and fits-alone judgments key on this figure: support components can
+    time-share a card the full set does not fit, at per-phase swap cost."""
     reserve_mb: float
     """The free-VRAM headroom that must remain after the weights load to avoid streaming."""
     free_now_mb: float | None
@@ -191,6 +193,12 @@ class StreamForecast:
     """Free VRAM achievable with siblings alive but model-free (all contexts resident), or None when total
     VRAM is unknown. Sits between ``free_now_mb`` and ``free_if_alone_mb``: lower than alone (sibling
     contexts still cost VRAM) but it is the best a model can get without stopping any process."""
+    footprint_mb: float | None = None
+    """Full per-job resident weight footprint: core weights plus the support components (text encoders,
+    VAE) the engine force-loads over each job. Sibling-room and card-dominance judgments key on this
+    figure; a multi-component checkpoint judged by its core weights alone reads as co-residable on a
+    card where its own components then evict each other all job long. None falls back to
+    ``weights_mb`` so a directly-constructed forecast keeps its prior single-figure behavior."""
     total_vram_mb: float | None = None
     """Device total VRAM (MB), or None when unknown. Kept so the forecast can size a partial teardown."""
     per_process_overhead_mb: float = 0.0
@@ -237,6 +245,11 @@ class StreamForecast:
     def _effective_base_reserve(self) -> float:
         """The bounded weight-footprint reserve, falling back to ``reserve_mb`` when unset."""
         return self.base_reserve_mb if self.base_reserve_mb is not None else self.reserve_mb
+
+    @property
+    def _effective_footprint_mb(self) -> float | None:
+        """The full resident footprint for room/dominance judgments, falling back to the core weights."""
+        return self.footprint_mb if self.footprint_mb is not None else self.weights_mb
 
     @property
     def _effective_marginal_overhead_mb(self) -> float:
@@ -316,10 +329,11 @@ class StreamForecast:
         floor, against :data:`_CORESIDENT_SIBLING_MODEL_FLOOR_MB`. False when unsized, so intent is preserved on a
         card whose room cannot be established (the conservative direction).
         """
-        if self.free_if_alone_mb is None or self.weights_mb is None:
+        footprint_mb = self._effective_footprint_mb
+        if self.free_if_alone_mb is None or footprint_mb is None:
             return False
         return (
-            self.free_if_alone_mb - self.weights_mb - self._effective_base_reserve
+            self.free_if_alone_mb - footprint_mb - self._effective_base_reserve
         ) >= _CORESIDENT_SIBLING_MODEL_FLOOR_MB
 
     @property
@@ -453,9 +467,10 @@ class StreamForecast:
         """
         if self.wants_whole_card:
             return True
-        if self.weights_mb is None or self.total_vram_mb is None or self.total_vram_mb <= 0:
+        footprint_mb = self._effective_footprint_mb
+        if footprint_mb is None or self.total_vram_mb is None or self.total_vram_mb <= 0:
             return True
-        return (self.weights_mb + self._effective_base_reserve) >= self.total_vram_mb * _WHOLE_CARD_WARRANT_FRACTION
+        return (footprint_mb + self._effective_base_reserve) >= self.total_vram_mb * _WHOLE_CARD_WARRANT_FRACTION
 
     @property
     def admit_requires_isolation(self) -> bool:
@@ -503,9 +518,12 @@ class StreamForecast:
         returns 1, so the behavior stays hardware-relative. Only when the footprint cannot be sized at all does a
         whole-card-intent model still collapse to 1 (conservative); an ordinary model is then unsizable (None).
         """
-        if self.weights_mb is None or self.total_vram_mb is None or self.per_process_overhead_mb <= 0:
+        footprint_mb = self._effective_footprint_mb
+        if footprint_mb is None or self.total_vram_mb is None or self.per_process_overhead_mb <= 0:
             return 1 if (self.wants_whole_card and self.known) else None
-        budget = self.total_vram_mb - self.weights_mb - self.reserve_mb
+        # Sized on the full footprint: while the job runs, its support components share the card with
+        # the core weights, so contexts kept beyond that set must fit beside all of it.
+        budget = self.total_vram_mb - footprint_mb - self.reserve_mb
         if budget <= self.per_process_overhead_mb:
             return 1
         additional = int((budget - self.per_process_overhead_mb) // self._effective_marginal_overhead_mb)
@@ -596,17 +614,41 @@ class WholeCardResidencyState:
 
 
 def predict_job_weight_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
-    """Return a job's resident weight footprint (MB), or None when it cannot be estimated.
+    """Return a job's core (diffusion) resident weight footprint (MB), or None when unestimable.
 
-    Uses hordelib's per-baseline footprint (:meth:`BaselineBurden.resident_footprint_estimate_mb`): the
-    core diffusion weights plus the support components (text encoders, VAE) the engine force-loads onto
-    the device over the course of every job. Room and residency verdicts must charge the whole set; a
-    multi-component checkpoint judged by its core weights alone is under-counted by the full
-    text-encoder size, and the room granted against that smaller figure is room that does not exist
-    (the components then evict each other all job long). Distinct from :func:`predict_job_vram_mb`'s
-    activation-inclusive steady estimate; weights do not scale with resolution or batch (activations
-    do), so there is no per-megapixel term here. Imported from the torch-free ``feature_impact``
-    submodule, not the ``hordelib.api`` facade, so the orchestrator stays torch-free. Never raises.
+    Uses hordelib's per-baseline weight seed (:meth:`BaselineBurden.resident_weight_estimate_mb`), which is
+    the figure ComfyUI compares against its weight budget when deciding to keep weights resident or stream
+    them, distinct from :func:`predict_job_vram_mb`'s activation-inclusive steady estimate. Weights do not
+    scale with resolution or batch (activations do), so there is no per-megapixel term here. This is the
+    *core* figure: support components (text encoders, VAE) time-share a constrained card via per-phase
+    swaps, so streaming and fits-alone judgments key on the core weights; sibling-room judgments use
+    :func:`predict_job_footprint_mb` instead. Imported from the torch-free ``feature_impact`` submodule,
+    not the ``hordelib.api`` facade, so the orchestrator stays torch-free. Never raises.
+    """
+    if baseline is None:
+        return None
+    try:
+        from hordelib.feature_impact import get_baseline_burden
+
+        entry = get_baseline_burden(str(baseline))
+        if entry is None:
+            return None
+        return float(entry.resident_weight_estimate_mb())
+    except Exception as e:
+        logger.debug(f"Job weight estimate failed for {baseline!r}: {type(e).__name__} {e}")
+        return None
+
+
+def predict_job_footprint_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
+    """Return a job's full resident weight footprint (MB): core weights plus support components.
+
+    Uses hordelib's :meth:`BaselineBurden.resident_footprint_estimate_mb`: the core diffusion weights
+    plus the text encoders and VAE the engine force-loads onto the device over the course of every job.
+    Sibling-room and isolation verdicts must charge this whole set; a multi-component checkpoint judged
+    by its core weights alone is under-counted by the full text-encoder size, and room granted against
+    that smaller figure is room that does not exist (the components then evict each other all job long).
+    Streaming and fits-alone judgments keep using :func:`predict_job_weight_mb`: the components can
+    time-share a card the full set does not fit, at per-phase swap cost. Never raises.
     """
     if baseline is None:
         return None
@@ -618,7 +660,7 @@ def predict_job_weight_mb(job: ImageGenerateJobPopResponse, baseline: str | None
             return None
         return float(entry.resident_footprint_estimate_mb())
     except Exception as e:
-        logger.debug(f"Job weight estimate failed for {baseline!r}: {type(e).__name__} {e}")
+        logger.debug(f"Job footprint estimate failed for {baseline!r}: {type(e).__name__} {e}")
         return None
 
 
@@ -695,6 +737,7 @@ def forecast_weight_streaming(
     governs whether sole residency is even achievable. Never raises.
     """
     weights_mb = predict_job_weight_mb(job, baseline)
+    footprint_mb = predict_job_footprint_mb(job, baseline)
     base_reserve_mb = effective_inference_reserve_mb(
         total_vram_mb,
         configured_reserve_floor_mb,
@@ -755,6 +798,7 @@ def forecast_weight_streaming(
         free_after_model_evict_mb = max(0.0, float(total_vram_mb) - overhead - marginal * additional_contexts)
     return StreamForecast(
         weights_mb=weights_mb,
+        footprint_mb=footprint_mb,
         reserve_mb=reserve_mb,
         base_reserve_mb=base_reserve_mb,
         free_now_mb=free_now_mb,

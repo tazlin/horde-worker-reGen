@@ -23,7 +23,11 @@ from __future__ import annotations
 
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
-from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
+from horde_worker_regen.process_management.resources.resource_budget import (
+    StreamForecast,
+    predict_job_footprint_mb,
+    predict_job_weight_mb,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -40,6 +44,7 @@ _CARD_DEMANDING_MODEL = "Flux.1-Schnell fp8 (Compact)"
 def _make_forecast(
     *,
     weights_mb: float | None,
+    footprint_mb: float | None = None,
     total_vram_mb: float | None = _CARD_TOTAL_MB,
     free_if_alone_mb: float | None = 20801.0,
     wants_whole_card: bool = False,
@@ -47,6 +52,7 @@ def _make_forecast(
     """Build a forecast whose footprint and room fields drive the isolation verdict deterministically."""
     return StreamForecast(
         weights_mb=weights_mb,
+        footprint_mb=footprint_mb,
         reserve_mb=2048.0,
         free_now_mb=10162.0,
         free_if_alone_mb=free_if_alone_mb,
@@ -197,3 +203,43 @@ class TestOverbudgetExclusiveScope:
         scheduler._mark_overbudget_admit(job, _tight_card_demanding_forecast())
 
         assert job_tracker.is_admitted_exclusive(job) is False
+
+
+class TestFootprintEstimateDrivesIsolation:
+    """The live weight estimator and the isolation verdict compose to the intended per-model outcomes.
+
+    The footprint charges every component the engine force-loads over a job (core diffusion weights
+    plus text encoders and VAE), not the core weights alone. A multi-component checkpoint judged by
+    its core weights reads as co-residable on a card where its own components then evict each other
+    all job long: the text encoder is evicted for the core load, and the core is evicted for the VAE
+    decode, a PCIe round-trip per phase on every job.
+    """
+
+    def test_flux_footprint_charges_support_components(self) -> None:
+        """Flux fp8's footprint includes its ~4.8GB text encoder and VAE on top of the ~11.5GB core."""
+        job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        weights_mb = predict_job_weight_mb(job, "flux_schnell")
+        footprint_mb = predict_job_footprint_mb(job, "flux_schnell")
+        assert weights_mb is not None and footprint_mb is not None
+        assert footprint_mb >= weights_mb + 4000.0
+
+    def test_flux_requires_isolation_on_24gb_card(self) -> None:
+        """With the honest footprint, a 24GB card has no sibling-model room beside Flux: isolation."""
+        job = make_job_pop_response(model=_CARD_DEMANDING_MODEL)
+        forecast = _make_forecast(
+            weights_mb=predict_job_weight_mb(job, "flux_schnell"),
+            footprint_mb=predict_job_footprint_mb(job, "flux_schnell"),
+            wants_whole_card=True,
+        )
+        assert forecast.is_card_demanding is True
+        assert forecast.admit_requires_isolation is True
+
+    def test_sdxl_stays_shared_on_24gb_card(self) -> None:
+        """SDXL's footprint (core plus ~1.7GB support) still leaves sibling room on a 24GB card."""
+        job = make_job_pop_response(model=_CARD_LIGHT_MODEL)
+        forecast = _make_forecast(
+            weights_mb=predict_job_weight_mb(job, "stable_diffusion_xl"),
+            footprint_mb=predict_job_footprint_mb(job, "stable_diffusion_xl"),
+        )
+        assert forecast.is_card_demanding is False
+        assert forecast.admit_requires_isolation is False
