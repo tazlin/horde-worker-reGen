@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 from enum import auto
+from typing import ClassVar
 
 from horde_model_reference.model_reference_records import ImageGenerationModelRecord
 from horde_sdk.ai_horde_api import GENERATION_STATE
@@ -11,6 +12,7 @@ from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
     ImageGenerateJobPopResponse,
 )
+from horde_sdk.ai_horde_api.consts import METADATA_TYPE
 from horde_sdk.ai_horde_api.fields import GenerationID
 from hordelib.metrics import DownloadEvent, JobPhaseMetrics
 from loguru import logger
@@ -342,6 +344,8 @@ class HordeInferenceResultMessage(HordeProcessMessage):
     """The state of the job to be sent to the API."""
     sdk_api_job_info: ImageGenerateJobPopResponse
 
+    non_reportable_faults: ClassVar[list[METADATA_TYPE]] = [METADATA_TYPE.aesthetic_score, METADATA_TYPE.information]
+
     @property
     def faults_count(self) -> int:
         """Return a count of all generation faults."""
@@ -350,7 +354,11 @@ class HordeInferenceResultMessage(HordeProcessMessage):
         total = 0
         for f in self.job_image_results:
             if f.generation_faults is not None:
-                total += len(f.generation_faults)
+                total += sum(
+                    1
+                    for fault in f.generation_faults
+                    if fault not in HordeInferenceResultMessage.non_reportable_faults
+                )
         return total
 
 
