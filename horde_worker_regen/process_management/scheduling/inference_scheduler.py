@@ -4210,9 +4210,13 @@ class InferenceScheduler:
 
         - **same model queued next**: another pending-inference job (not this one, not already in flight)
           reuses this model, so the retained weights are actually consumed rather than idly pinned.
-        - **budget fits**: the VRAM budget confirms the model's footprint fits the *measured* free VRAM,
-          so retention never starves a different model another process must load. A missing budget or
-          unmeasured VRAM yields False: retention is granted on evidence, never assumed.
+        - **budget fits**: the VRAM budget confirms the card could still admit this job from scratch.
+          The measured free figure is taken *while the job's weights occupy the card*, so they are
+          credited back before the check: retention holds a state the admission already approved, and
+          demanding the footprint fit inside the remaining free VRAM as well would double-charge the
+          weights and refuse retention on precisely the contended cards where the reload skip pays.
+          A missing budget or unmeasured VRAM yields False: retention is granted on evidence, never
+          assumed.
 
         Even when granted, hordelib's force-load overflow guard remains the hard backstop, and the
         worker's under-pressure eviction can still reclaim the retained model, so a wrong call degrades
@@ -4234,10 +4238,11 @@ class InferenceScheduler:
         if free_vram_mb is None:
             return False
         baseline = self._model_metadata.get_baseline(model)
+        resident_weights_mb = predict_job_weight_mb(dispatched_job, baseline) or 0.0
         verdict = self._vram_budget.check_job(
             dispatched_job,
             baseline,
-            free_vram_mb,
+            free_vram_mb + resident_weights_mb,
             committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
         )
         return verdict.fits

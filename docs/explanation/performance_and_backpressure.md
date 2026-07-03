@@ -355,8 +355,11 @@ The scheduler suppresses that eviction for one dispatch when, and only when, bot
 
 - **the next queued inference job reuses this model**, so the retained weights are actually consumed
   rather than idly pinning VRAM another model could use, and
-- **the [VRAM budget](#the-vram-and-ram-budget) confirms the footprint fits the measured free VRAM**, so
-  holding the model resident never starves a different model another process must load.
+- **the [VRAM budget](#the-vram-and-ram-budget) confirms the card could still admit this job from
+  scratch**. The free-VRAM reading is taken while the job's own weights occupy the card, so the check
+  credits them back before asking whether the footprint fits; demanding it fit inside the *remaining*
+  free VRAM as well would charge the weights twice and refuse retention on exactly the contended cards
+  where skipping the reload pays the most.
 
 When both hold, the dispatch carries a "keep resident after" hint to the engine, which skips the post-job
 VRAM cleanup so the following same-model job samples immediately with no reload. Retention is granted on

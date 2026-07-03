@@ -4,8 +4,10 @@ hordelib evicts a job's model from VRAM after every run so sibling GPU instances
 over-commit. That eviction forces a RAM->VRAM reload on the next job, the dominant non-sampling cost on
 small jobs. :meth:`InferenceScheduler._should_keep_model_resident` decides when to suppress that eviction
 for one dispatch: only when the next queued inference job reuses the model *and* the measured VRAM budget
-confirms the footprint fits, so retention is granted on evidence and a wrong call degrades to a reload
-(never an OOM, thanks to hordelib's force-load overflow backstop).
+confirms the card could still admit this job from scratch. The measured free figure is taken while the
+job's own weights occupy the card, so the check credits them back; without that credit, retention is
+unreachable on exactly the contended cards where the reload skip pays. Retention is granted on evidence
+and a wrong call degrades to a reload (never an OOM, thanks to hordelib's force-load overflow backstop).
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from unittest.mock import Mock
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeInferenceControlMessage
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -102,6 +105,31 @@ async def test_no_retain_when_free_vram_unmeasured() -> None:
     scheduler = _budget_on_scheduler(job_tracker, free_vram_mb=None)
 
     assert scheduler._should_keep_model_resident(dispatched, device_index=None) is False
+
+
+async def test_budget_check_credits_resident_weights(monkeypatch) -> None:  # noqa: ANN001
+    """The fit check runs against free VRAM plus the job's own resident weights.
+
+    The free reading is taken while the dispatched model occupies the card; asking the footprint to
+    fit inside the remainder would charge the weights twice and deny retention on any busy card.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+    await track_popped_job_async(job_tracker, make_job_pop_response(model=_MODEL))
+
+    scheduler = _budget_on_scheduler(job_tracker, free_vram_mb=3000.0)
+    monkeypatch.setattr(inference_scheduler_module, "predict_job_weight_mb", lambda job, baseline: 5000.0)
+    seen_free: list[float] = []
+
+    def record_check(job, baseline, free_vram_mb, committed_reserve_mb=0.0):  # noqa: ANN001, ANN202
+        seen_free.append(free_vram_mb)
+        return Mock(fits=True)
+
+    scheduler._vram_budget.check_job = record_check  # type: ignore[method-assign]
+
+    assert scheduler._should_keep_model_resident(dispatched, device_index=None) is True
+    assert seen_free == [8000.0]
 
 
 async def test_no_retain_when_budget_rejects_footprint() -> None:

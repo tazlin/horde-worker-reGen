@@ -280,6 +280,14 @@ never the binding constraint (it overlaps across the spare inference processes);
 is the VRAM that would let the next model load while the current one samples. Crossing into the
 high-duty regime on a large model set is a "buy more VRAM" (24 GB+) outcome, not a "tune harder" one.
 
+Not every load that *looks* structural is. On a contended card, ComfyUI's VAE-decode step frees its
+worst-case decode estimate up front, which used to evict the just-sampled diffusion model to host a few
+hundred MB of autoencoder: an inflated `vae` phase plus a `vram_load` on the very next same-model job,
+misread as an unavoidable swap. The engine now clamps that estimate for small support-model loads
+(falling back to tiled decoding on a genuine shortfall), and the worker's same-model VRAM retention
+credits the resident weights when judging fit, so back-to-back same-model jobs can sample with no
+reload even when the free-VRAM reading looks tight.
+
 This is exactly why the attribution above matters: it lets you distinguish a genuinely fixable
 efficiency loss (high churn from an avoidable swap pattern, a slow disk inflating `disk_load`) from the
 structural ceiling, so you stop tuning when there is nothing left to win.
