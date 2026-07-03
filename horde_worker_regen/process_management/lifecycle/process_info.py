@@ -89,6 +89,8 @@ class HordeProcessInfo:
     """The baseline of the horde model that is (supposedly) currently loaded in this process."""
     last_control_flag: HordeControlFlag | None
     """The last control flag sent, to avoid duplication."""
+    last_preload_requested_at: float
+    """Epoch time when the parent last sent ``PRELOAD_MODEL`` to this process."""
 
     last_job_referenced: ImageGenerateJobPopResponse | None
 
@@ -213,6 +215,7 @@ class HordeProcessInfo:
         self.loaded_horde_model_name = None
         self.loaded_horde_model_baseline = None
         self.last_control_flag = None
+        self.last_preload_requested_at = 0.0
 
         self.last_heartbeat_timestamp = time.time()
         self.last_heartbeat_delta = 0

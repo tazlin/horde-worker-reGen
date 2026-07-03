@@ -21,6 +21,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+    _PRELOAD_FIRST_REPORT_GRACE_SECONDS,
     _RESIDENCY_GRACE_SECONDS,
     InferenceScheduler,
 )
@@ -248,6 +249,88 @@ class TestPreloadModels:
         assert process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
         assert horde_model_map.root["new_model"].horde_model_load_state == ModelLoadState.LOADING
         assert horde_model_map.root["new_model"].process_id == 0
+
+    @pytest.mark.parametrize(
+        "process_state",
+        [
+            HordeProcessState.DOWNLOADING_AUX_MODEL,
+            HordeProcessState.DOWNLOAD_AUX_COMPLETE,
+            HordeProcessState.UNLOADED_MODEL_FROM_RAM,
+        ],
+    )
+    def test_loading_entry_survives_aux_download_preload_states(self, process_state: HordeProcessState) -> None:
+        """Aux-download preload states are valid owners of a LOADING model-map entry."""
+        process_info = make_mock_process_info(0, model_name="new_model", state=process_state)
+        process_map = ProcessMap({0: process_info})
+        horde_model_map = HordeModelMap(
+            root={
+                "new_model": ModelInfo(
+                    horde_model_name="new_model",
+                    horde_model_load_state=ModelLoadState.LOADING,
+                    process_id=0,
+                ),
+            },
+        )
+        inference_scheduler = _make_inference_scheduler(process_map=process_map, horde_model_map=horde_model_map)
+
+        expired = inference_scheduler._expire_stale_model_map_entries()
+
+        assert expired == []
+        assert "new_model" in horde_model_map.root
+
+    async def test_recent_preload_request_graces_waiting_for_first_state_report(self) -> None:
+        """A just-sent PRELOAD_MODEL must not expire before the child publishes its first preload state."""
+        process_info = make_mock_process_info(0, model_name="new_model", state=HordeProcessState.WAITING_FOR_JOB)
+        process_info.last_control_flag = HordeControlFlag.PRELOAD_MODEL
+        process_info.last_preload_requested_at = time.time()
+        process_map = ProcessMap({0: process_info})
+        horde_model_map = HordeModelMap(
+            root={
+                "new_model": ModelInfo(
+                    horde_model_name="new_model",
+                    horde_model_load_state=ModelLoadState.LOADING,
+                    process_id=0,
+                ),
+            },
+        )
+        job_tracker = JobTracker()
+
+        job = make_job_pop_response("new_model")
+        await track_popped_job_async(job_tracker, job)
+
+        inference_scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+        )
+
+        result = inference_scheduler.preload_models()
+
+        assert result is False
+        assert "new_model" in horde_model_map.root
+        assert horde_model_map.root["new_model"].horde_model_load_state == ModelLoadState.LOADING
+
+    def test_old_preload_request_does_not_grace_stale_idle_loading_entry(self) -> None:
+        """The first-report grace is bounded so abandoned loading entries can still expire."""
+        process_info = make_mock_process_info(0, model_name="new_model", state=HordeProcessState.WAITING_FOR_JOB)
+        process_info.last_control_flag = HordeControlFlag.PRELOAD_MODEL
+        process_info.last_preload_requested_at = time.time() - _PRELOAD_FIRST_REPORT_GRACE_SECONDS - 1.0
+        process_map = ProcessMap({0: process_info})
+        horde_model_map = HordeModelMap(
+            root={
+                "new_model": ModelInfo(
+                    horde_model_name="new_model",
+                    horde_model_load_state=ModelLoadState.LOADING,
+                    process_id=0,
+                ),
+            },
+        )
+        inference_scheduler = _make_inference_scheduler(process_map=process_map, horde_model_map=horde_model_map)
+
+        expired = inference_scheduler._expire_stale_model_map_entries()
+
+        assert expired == ["new_model"]
+        assert "new_model" not in horde_model_map.root
 
     async def test_no_available_process_returns_false(self) -> None:
         """Preload should return False if there are no available processes to load the model."""

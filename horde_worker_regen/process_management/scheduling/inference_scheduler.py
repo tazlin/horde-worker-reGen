@@ -193,6 +193,14 @@ _DEFAULT_RAM_RESERVE_MB = 4096.0
 _STALE_RAM_UNLOAD_REPLACE_BYTES = 1024 * 1024 * 1024
 """RSS threshold above which a model-less idle process is still materially holding RAM after unload."""
 
+_PRELOAD_FIRST_REPORT_GRACE_SECONDS = 5.0
+"""How long a just-sent preload may still look idle before its first child state report arrives.
+
+The parent records the model as ``LOADING`` immediately after sending ``PRELOAD_MODEL``, but the child
+may still read as ``WAITING_FOR_JOB`` until it drains the control pipe and publishes its first preload
+state. This short grace keeps stale-entry cleanup from expiring a healthy, just-sent preload while still
+letting genuinely abandoned loading entries clear promptly.
+"""
 _LINE_SKIP_REJECTION_LOG_INTERVAL = 5.0
 """Minimum seconds between repeats of an identical line-skip rejection log line.
 
@@ -2795,7 +2803,12 @@ class InferenceScheduler:
             HordeProcessState.PROCESS_STARTING,
             HordeProcessState.DOWNLOADING_MODEL,
             HordeProcessState.PRELOADING_MODEL,
+            HordeProcessState.DOWNLOADING_AUX_MODEL,
+            HordeProcessState.DOWNLOAD_AUX_COMPLETE,
+            HordeProcessState.UNLOADED_MODEL_FROM_RAM,
         }
+
+        now = time.time()
 
         for model_name, model_info in list(self._horde_model_map.root.items()):
             process_info = self._process_map.get(model_info.process_id)
@@ -2807,9 +2820,16 @@ class InferenceScheduler:
                 )
                 continue
 
+            recent_preload_request = (
+                model_info.horde_model_load_state == ModelLoadState.LOADING
+                and process_info.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+                and process_info.loaded_horde_model_name == model_name
+                and (now - process_info.last_preload_requested_at) <= _PRELOAD_FIRST_REPORT_GRACE_SECONDS
+            )
             if (
                 model_info.horde_model_load_state == ModelLoadState.LOADING
                 and process_info.last_process_state not in loading_owner_states
+                and not recent_preload_request
             ):
                 self._horde_model_map.expire_entry(model_name)
                 expired.append(model_name)
@@ -2927,6 +2947,7 @@ class InferenceScheduler:
 
         if preload_sent:
             available_process.last_control_flag = HordeControlFlag.PRELOAD_MODEL
+            available_process.last_preload_requested_at = time.time()
             if is_model_swap:
                 self._record_churn("model_swap")
             self._process_lifecycle.action_ledger.record(
