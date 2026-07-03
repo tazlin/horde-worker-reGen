@@ -479,11 +479,14 @@ class StreamForecast:
         Isolation protects a heavy checkpoint from a concurrent sibling load pushing its weights into
         host-RAM streaming; that hazard needs both a footprint that dominates the card
         (:attr:`is_card_demanding`) *and* a card too small to host a sibling model beside it. A
-        card-dominating model on a genuinely roomy card (:attr:`_has_room_for_coresident_model`, e.g. a
-        Flux fp8 on 24 GB) co-resides safely: its no-co-*sampling* contract is upheld by the concurrency
-        overlap gate, so reserving the device for its admit only freezes the sibling lane through the
-        model's multi-GB load. Unsized forecasts read as isolating (room reads False, dominance reads
-        True), keeping the conservative direction wherever the card cannot be measured.
+        card-dominating model on a genuinely roomy card (:attr:`_has_room_for_coresident_model`)
+        co-resides safely: its no-co-*sampling* contract is upheld by the concurrency overlap gate, so
+        reserving the device for its admit only freezes the sibling lane through the model's multi-GB
+        load. Both judgments charge the full resident footprint (core weights plus force-loaded support
+        components); a Flux fp8 whose trio occupies ~16 GB has no sibling room on a 24 GB card even
+        though its core weights alone would suggest otherwise. Unsized forecasts read as isolating
+        (room reads False, dominance reads True), keeping the conservative direction wherever the card
+        cannot be measured.
         """
         if self._has_room_for_coresident_model:
             return False
