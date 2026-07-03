@@ -421,6 +421,14 @@ class StatsSample(BaseModel):
     last_pop_skipped_reasons: dict[str, int] = Field(default_factory=dict)
     churn_counts: dict[str, int] = Field(default_factory=dict)
     """Cumulative reload/respawn churn counts by kind at sample time."""
+    slot_duty_totals: dict[str, float] = Field(default_factory=dict)
+    """Cumulative slot-seconds per slot-duty bucket (sampling vs each empty-slot attribution) at sample
+    time. Monotonically growing; consumers difference two samples for a window's capacity-normalized
+    active/idle/gated breakdown."""
+    slot_duty_capacity: int = 0
+    """Configured concurrent-inference slot count the slot-duty totals are normalized against."""
+    dispatch_hold_bucket: str | None = None
+    """The slot-duty bucket currently holding the next dispatch (None when dispatching or no work waits)."""
 
 
 class StatsRollupRow(BaseModel):

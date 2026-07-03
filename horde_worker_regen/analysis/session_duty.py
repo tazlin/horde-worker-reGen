@@ -143,6 +143,17 @@ class SessionDutyReport:
     operator_recommendations: list[str]
     maintainer_notes: list[str]
     unknown_event_count: int = 0
+    slot_duty_seconds: dict[str, float] = field(default_factory=dict)
+    """Slot-seconds per slot-duty bucket over the session (difference of the worker's cumulative totals).
+
+    Capacity-normalized: the shares sum to ~100% of ``capacity x wall``, so ``sampling`` is the
+    productive share and every other bucket names what an empty slot was waiting on. Empty for stats
+    files written before the worker recorded slot duty."""
+    slot_duty_capacity: int | None = None
+    """Configured concurrent-inference slot count the slot-duty totals are normalized against."""
+    concurrency_occupancy: dict[str, float] = field(default_factory=dict)
+    """Seconds spent at each concurrent in-flight job count (key = the count as text), from adjacent
+    stats samples. The direct read of how much of the configured thread capacity actually ran."""
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable representation with enum values, not enum objects."""
@@ -250,6 +261,8 @@ def analyze_stats_files(
     duration_hours = _duration_hours(samples)
     completed_jobs = sum(1 for job in jobs if not bool(job.get("faulted")) and not bool(job.get("is_alchemy")))
     churn_delta = _counter_delta(samples, "churn_counts")
+    slot_duty_delta = _counter_delta(samples, "slot_duty_totals")
+    slot_duty_capacity = _last_int_or_none(samples, "slot_duty_capacity")
 
     report = SessionDutyReport(
         session_id=session_id,
@@ -277,6 +290,9 @@ def analyze_stats_files(
         operator_recommendations=[],
         maintainer_notes=[],
         unknown_event_count=unknown_event_count,
+        slot_duty_seconds=slot_duty_delta,
+        slot_duty_capacity=slot_duty_capacity,
+        concurrency_occupancy=_concurrency_occupancy(samples),
     )
     report.busy_fraction_percent = (
         report.mean_gpu_busy_fraction * 100.0 if report.mean_gpu_busy_fraction is not None else None
@@ -299,6 +315,23 @@ def render_session_duty_report(reports: list[SessionDutyReport]) -> str:
         duty = "?" if report.mean_gpu_duty_percent is None else f"{report.mean_gpu_duty_percent:.0f}%"
         busy = "?" if report.busy_fraction_percent is None else f"{report.busy_fraction_percent:.0f}%"
         out.append(f"   duty: mean {duty}  busy {busy}  completed jobs {report.completed_jobs}")
+        if report.concurrency_occupancy:
+            occupancy_total = sum(report.concurrency_occupancy.values())
+            if occupancy_total > 0:
+                shares = "  ".join(
+                    f"{count}x {seconds / occupancy_total:.0%}"
+                    for count, seconds in sorted(report.concurrency_occupancy.items(), key=lambda kv: kv[0])
+                )
+                capacity = f" (capacity {report.slot_duty_capacity})" if report.slot_duty_capacity else ""
+                out.append(f"   concurrency occupancy{capacity}: {shares}")
+        if report.slot_duty_seconds:
+            slot_total = sum(report.slot_duty_seconds.values())
+            if slot_total > 0:
+                slots = "  ".join(
+                    f"{bucket} {seconds / slot_total:.0%} ({seconds:.0f}s)"
+                    for bucket, seconds in sorted(report.slot_duty_seconds.items(), key=lambda kv: -kv[1])[:6]
+                )
+                out.append(f"   slot duty: {slots}")
         top = [bucket for bucket in report.buckets if bucket.total_seconds > 0.0][:5]
         if top:
             rendered = "  ".join(
@@ -736,6 +769,33 @@ def _dominant_partial_kind(phase_totals: dict[str, float]) -> DutyLossKind:
         if kind is not None:
             return kind
     return DutyLossKind.UNKNOWN
+
+
+def _last_int_or_none(samples: list[dict[str, Any]], key: str) -> int | None:
+    """The last sample's integer value for ``key``, or None when absent/invalid (pre-field stats files)."""
+    for sample in reversed(samples):
+        value = sample.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def _concurrency_occupancy(samples: list[dict[str, Any]]) -> dict[str, float]:
+    """Seconds spent at each concurrent in-flight job count, from adjacent stats samples.
+
+    Each inter-sample interval is attributed to the earlier sample's ``jobs_in_progress`` reading, the
+    same convention the loss windows use. This is the summary the slot-duty buckets explain: occupancy
+    says how much of the configured capacity ran; the buckets say why the rest did not.
+    """
+    intervals = _sample_intervals(samples)
+    occupancy: dict[str, float] = {}
+    for sample, interval in zip(samples, intervals, strict=False):
+        in_progress = sample.get("jobs_in_progress")
+        if not isinstance(in_progress, int) or isinstance(in_progress, bool) or in_progress < 0:
+            continue
+        key = str(in_progress)
+        occupancy[key] = occupancy.get(key, 0.0) + interval
+    return occupancy
 
 
 def _counter_delta(samples: list[dict[str, Any]], key: str) -> dict[str, float]:

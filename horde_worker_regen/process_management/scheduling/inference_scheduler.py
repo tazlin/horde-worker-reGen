@@ -93,6 +93,7 @@ from horde_worker_regen.process_management.scheduling.governance import (
 )
 from horde_worker_regen.process_management.scheduling.model_affinity import affinity_active
 from horde_worker_regen.process_management.scheduling.performance_model import PerformanceModel, signature_from_job
+from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator, SlotDutyBucket
 from horde_worker_regen.telemetry_spans import span_preload_model
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.job_utils import (
@@ -511,6 +512,13 @@ class InferenceScheduler:
         # than every sub-second control-loop tick.
         self._dispatch_stall_last_reason: str | None = None
         self._dispatch_stall_log_time: float = 0.0
+
+        # Capacity-normalized wall-clock accounting: every scheduler tick attributes each configured
+        # inference slot's elapsed time to SAMPLING or to the gate/supply state that kept it empty, so
+        # "active vs idle vs gated" is a direct read over any window. Fed once per scheduling cycle
+        # (record_slot_duty); snapshotted into the stats stream and the periodic duty-cycle log line.
+        self._slot_duty = SlotDutyAccumulator()
+        self._slot_duty_current_hold: SlotDutyBucket | None = None
 
         # The head whose dispatch is currently held for post-processing-peak headroom (job id, shortfall MB),
         # or None. Set when a dispatch defers (the peak overflows the contended card now but fits it alone and
@@ -1729,18 +1737,28 @@ class InferenceScheduler:
         head: ImageGenerateJobPopResponse,
         stable_diffusion_reference: dict[str, ImageGenerationModelRecord],
     ) -> str:
-        """Return why the head-of-queue job is not being dispatched (read-only; never raises into the loop).
+        """Return why the head-of-queue job is not being dispatched (read-only; never raises into the loop)."""
+        return self._classify_dispatch_stall(head, stable_diffusion_reference)[1]
+
+    def _classify_dispatch_stall(
+        self,
+        head: ImageGenerateJobPopResponse,
+        stable_diffusion_reference: dict[str, ImageGenerationModelRecord],
+    ) -> tuple[SlotDutyBucket, str]:
+        """Name the gate parking the head-of-queue job, as a duty bucket plus the operator-facing text.
 
         The scheduler returns ``None`` from :meth:`get_next_job_and_process` at several points without saying
         why, so a stuck queue with idle processes leaves no record of which gate parked the head. This
-        re-derives that reason for the diagnostic, with the most detail for the genuinely suspicious case --
-        the head's model is resident on an *idle* process yet nothing dispatches, since that is the
-        scheduler-bug-shaped stall that is otherwise invisible.
+        re-derives that reason, with the most detail for the genuinely suspicious case -- the head's model is
+        resident on an *idle* process yet nothing dispatches, since that is the scheduler-bug-shaped stall
+        that is otherwise invisible. The bucket half feeds the slot-duty accounting every tick
+        (:meth:`record_slot_duty`), so the same derivation prices the empty slot's wall clock; the text half
+        feeds the throttled parked-head log line. Read-only; never raises into the loop.
         """
         process = self._resident_process_for_job(head)
         if process is None:
             if head.model is not None and self._horde_model_map.is_model_loading(head.model):
-                return "its model is loading (a preload is in progress)"
+                return SlotDutyBucket.MODEL_LOADING, "its model is loading (a preload is in progress)"
             # A whole-card residency held for a *different* model reserves the card and tore its siblings down,
             # so a head of another model cannot load until that residency restores. Name it: otherwise this
             # reads as a generic VRAM-budget defer (the card looks idle with ample free VRAM) when the real
@@ -1754,17 +1772,17 @@ class InferenceScheduler:
                 None,
             )
             if nonhead_residency_model is not None:
-                return (
+                return SlotDutyBucket.WHOLE_CARD_RESERVED, (
                     f"its model is not resident because a whole-card residency is held for non-head model "
                     f"{nonhead_residency_model!r}: the card is reserved for that model and its siblings were "
                     f"torn down, so this head cannot load until that residency restores"
                 )
-            return (
+            return SlotDutyBucket.PRELOAD_DEFERRED, (
                 "its model is not resident and no preload has been admitted "
                 "(usually a VRAM/RAM budget defer; see the budget lines above)"
             )
         if not process.can_accept_job():
-            return (
+            return SlotDutyBucket.RESIDENT_SLOT_BUSY, (
                 f"its model is resident on process {process.process_id}, but that process is busy "
                 f"({process.last_process_state.name})"
             )
@@ -1776,19 +1794,29 @@ class InferenceScheduler:
         )
         pending_and_active = len(self._job_tracker.jobs_pending_inference) + len(self._job_tracker.jobs_in_progress)
         if keep_single and pending_and_active > 1:
-            return (
+            return SlotDutyBucket.KEEP_SINGLE_INFERENCE, (
                 f"its model is resident and idle on process {process.process_id}, but dispatch is held by "
                 f"keep-single-inference ({single_reason})"
             )
         in_progress = len(self._job_tracker.jobs_in_progress)
         cap = self._max_jobs_in_progress_allowed(0)
         if in_progress >= cap:
-            return (
+            # The exclusive-admit hold collapses the cap to the running job; name it distinctly so the
+            # serialization is attributed to the admit, not to a generic cap the operator would chase
+            # through max_threads.
+            if self._job_tracker.has_exclusive_job_in_progress() and not self._job_tracker.is_admitted_exclusive(
+                head,
+            ):
+                return SlotDutyBucket.EXCLUSIVE_ISOLATION, (
+                    f"its model is resident and idle on process {process.process_id}, but an exclusively-"
+                    f"admitted over-budget job has the device to itself (in_progress={in_progress})"
+                )
+            return SlotDutyBucket.CONCURRENCY_CAP, (
                 f"its model is resident and idle on process {process.process_id}, but the concurrency cap is "
                 f"reached (in_progress={in_progress}, cap={cap})"
             )
         if not self._concurrent_overlap_allowed(head, target_device_index=process.device_index):
-            return (
+            return SlotDutyBucket.OVERLAP_HEADWAY, (
                 f"its model is resident and idle on process {process.process_id}, but the overlap-headway gate "
                 "is holding it (the in-flight job has not made enough progress to share the card)"
             )
@@ -1805,13 +1833,13 @@ class InferenceScheduler:
             blockers = self._whole_card_convergence_blockers(process, residency_device)
             if blockers:
                 pinned = ", ".join(f"process {pid} holds queued model {model!r}" for pid, model in blockers)
-                return (
+                return SlotDutyBucket.WHOLE_CARD_CONVERGENCE, (
                     f"its model is resident and idle on process {process.process_id}, but the whole-card "
                     f"residency stuck: cannot reach sole residency because {pinned}; the convergence teardown "
                     f"should have stopped that idle sibling (only the head's holder is spared), so the shrink "
                     f"has not collapsed the pool and the head never dispatches"
                 )
-            return (
+            return SlotDutyBucket.WHOLE_CARD_CONVERGENCE, (
                 f"its model is resident and idle on process {process.process_id}, but its whole-card residency "
                 f"has not yet converged to sole residency (siblings still tearing down or the device draining)"
             )
@@ -1822,13 +1850,13 @@ class InferenceScheduler:
             and self._post_processing_dispatch_defer[0] == str(head.id_)
         ):
             shortfall_mb = self._post_processing_dispatch_defer[1]
-            return (
+            return SlotDutyBucket.POST_PROCESSING_HEADROOM, (
                 f"its model is resident and idle on process {process.process_id}, but dispatch is held for "
                 f"post-processing-peak headroom (~{shortfall_mb:.0f}MB short on the contended card); it keeps "
                 "its head-of-queue position and dispatches once an in-flight sibling frees room"
             )
 
-        return (
+        return SlotDutyBucket.UNEXPLAINED, (
             f"its model is resident and idle on process {process.process_id} but dispatch was withheld with no "
             "matching gate; this is a scheduler stall worth reporting"
         )
@@ -1899,6 +1927,46 @@ class InferenceScheduler:
             f"<fg #ff8c69>Inference dispatch stalled: head {str(head.id_)[:8]} ({head.model}) has been parked "
             f"{self._head_starved_seconds(head):.0f}s: {reason}.</>",
         )
+
+    def record_slot_duty(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
+        """Attribute the wall clock since the last scheduling cycle across the configured inference slots.
+
+        Called once per scheduling cycle. Busy slots accrue ``SAMPLING``; when capacity is spare and a
+        queued job is waiting, the empty slots accrue the bucket the stall classifier names (the same
+        derivation that explains a parked head, but priced every tick instead of only after a multi-second
+        park); with no waiting work they accrue ``NO_LOCAL_WORK``. The classification is a read-only
+        diagnostic: any failure inside it degrades to ``UNEXPLAINED`` rather than touching scheduling.
+        """
+        capacity = max(int(self._max_concurrent_inference_processes or 0), 0)
+        in_progress = self._job_tracker.jobs_in_progress
+        busy = len(in_progress)
+        head = next((j for j in self._job_tracker.jobs_pending_inference if j not in in_progress), None)
+        waiting = len(self._job_tracker.jobs_pending_inference) - busy
+
+        hold: SlotDutyBucket | None = None
+        if head is not None and busy < capacity:
+            try:
+                hold = self._classify_dispatch_stall(head, stable_diffusion_reference)[0]
+            except Exception:  # noqa: BLE001 - a diagnostic must never crash the scheduling cycle
+                hold = SlotDutyBucket.UNEXPLAINED
+        self._slot_duty_current_hold = hold
+
+        self._slot_duty.observe(
+            time.time(),
+            capacity=capacity,
+            busy_slots=busy,
+            waiting_jobs=max(waiting, 0),
+            hold=hold,
+        )
+
+    def slot_duty_snapshot(self) -> tuple[dict[str, float], int, str | None]:
+        """The cumulative slot-second totals, the current capacity, and the currently-named hold bucket.
+
+        Consumers difference successive totals for a window's breakdown (the stats stream carries the
+        cumulative figures; the periodic duty log line differences its own anchor).
+        """
+        hold = self._slot_duty_current_hold
+        return self._slot_duty.totals(), self._slot_duty.capacity, str(hold) if hold is not None else None
 
     def _log_head_starvation_force_admit(self, job: ImageGenerateJobPopResponse) -> None:
         """Announce a head-of-queue force-admit, with the residency snapshot for the post-mortem."""
@@ -5182,6 +5250,7 @@ class InferenceScheduler:
         bridge_data = self._runtime_config.bridge_data
 
         self._refresh_model_demand()
+        self.record_slot_duty(stable_diffusion_reference)
 
         # Resource governance is not driven here: the process manager runs run_governance_tick() every
         # control-loop iteration, so the danger-floor verdict and shed/restore response are already fresh

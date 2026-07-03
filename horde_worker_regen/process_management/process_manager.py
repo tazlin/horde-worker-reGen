@@ -141,6 +141,7 @@ from horde_worker_regen.process_management.scheduling.pop_governor_registry impo
     PopGovernorRegistry,
 )
 from horde_worker_regen.process_management.scheduling.pop_throttler import CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS
+from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator
 from horde_worker_regen.process_management.scheduling.workload_flow import FlowCoordinator, WorkloadKind
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
@@ -998,6 +999,9 @@ class HordeWorkerProcessManager:
         self._gpu_sampler = GpuUtilizationSampler(interval_seconds=1.0)
         self._last_duty_cycle_log_time = 0.0
         self._last_no_jobs_seconds_at_duty_log = 0.0
+        # Anchor for the periodic slot-duty attribution line: the scheduler's cumulative slot-second
+        # totals at the previous duty-cycle log, so each line reports only its own window's breakdown.
+        self._last_slot_duty_totals_at_duty_log: dict[str, float] = {}
         self._first_inference_started_at: float | None = None
         """Epoch second the worker's first-ever inference began sampling, cached once. The duty cycle
         excludes everything before it: cold-boot model loading is one-time warm-up, not inter-job
@@ -2309,6 +2313,9 @@ class HordeWorkerProcessManager:
         churn = summary.format_churn_summary()
         if churn:
             explanation_parts.append(f"reload churn: {churn}")
+        slot_attribution = self._format_slot_duty_window()
+        if slot_attribution:
+            explanation_parts.append(slot_attribution)
         explanation = "; ".join(explanation_parts) if explanation_parts else "no per-job attribution yet"
 
         context = (
@@ -2325,6 +2332,19 @@ class HordeWorkerProcessManager:
             logger.info(message)
         else:
             logger.warning(message)
+
+    def _format_slot_duty_window(self) -> str | None:
+        """The slot-duty attribution for the window since the previous duty-cycle log line, or None.
+
+        Differences the scheduler's cumulative slot-second totals against the anchor taken at the last
+        emit, so each duty line carries its own window's capacity-normalized active/idle/gated breakdown
+        beside the device-utilization figure. Advances the anchor, so call at most once per emit.
+        """
+        totals, capacity, _hold = self._inference_scheduler.slot_duty_snapshot()
+        previous = self._last_slot_duty_totals_at_duty_log
+        self._last_slot_duty_totals_at_duty_log = totals
+        window = {k: v - previous.get(k, 0.0) for k, v in totals.items() if v - previous.get(k, 0.0) > 0.0}
+        return SlotDutyAccumulator.format_window(window, capacity=capacity)
 
     def _build_stage_age_line(self) -> str | None:
         """A one-line per-stage census with the oldest age in each stage, or None when nothing is tracked.
@@ -3529,6 +3549,7 @@ class HordeWorkerProcessManager:
         maintenance_mode = (
             self._state.last_pop_maintenance_mode or self._state.supervisor_paused or self._state.self_throttle_paused
         )
+        slot_duty_totals, slot_duty_capacity, dispatch_hold_bucket = self._inference_scheduler.slot_duty_snapshot()
 
         stats_sample = self._run_metrics.record_stats_sample(
             StatsSample(
@@ -3566,6 +3587,9 @@ class HordeWorkerProcessManager:
                 last_pop_no_jobs_available=self._state.last_pop_no_jobs_available,
                 last_pop_skipped_reasons=dict(self._state.last_pop_skipped_reasons),
                 churn_counts={kind: len(times) for kind, times in run_metrics.churn_event_times.items()},
+                slot_duty_totals=slot_duty_totals,
+                slot_duty_capacity=slot_duty_capacity,
+                dispatch_hold_bucket=dispatch_hold_bucket,
             ),
         )
         latest_stats_sample = stats_sample or self._run_metrics.latest_stats_sample()

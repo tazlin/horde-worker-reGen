@@ -176,6 +176,31 @@ this is efficiency loss, not lack of demand); the biggest worker-side sinks were
 safety checks; and 23 swaps plus 18 evictions in three minutes is the churn driving those gaps. The
 trailing context confirms there was always a job in flight, ruling out an idle horde.
 
+### Slot-duty attribution: what the configured capacity was doing
+
+The device counters cannot distinguish a saturated one-thread worker from a two-thread worker running
+at half capacity: one busy sampler reads as "busy" either way. The same duty line therefore also
+carries a **slot attribution** fragment from
+[`SlotDutyAccumulator`][horde_worker_regen.process_management.scheduling.slot_duty.SlotDutyAccumulator]:
+every scheduler tick attributes each configured inference slot's elapsed time to `sampling` or to
+exactly one named reason the slot stayed empty, so the shares sum to 100% of `capacity x wall` and
+"active vs idle vs gated" is a direct read:
+
+```text
+slot attribution (capacity 2): sampling 61%, overlap_headway 17%, no_local_work 12%, model_loading 6%
+```
+
+`no_local_work` is supply-side (no queued job wanted the slot: horde demand or a pop governor, which
+the pop-governor registry names). Every other bucket is a scheduler gate, derived by the same
+classification that explains a parked head
+([`InferenceScheduler._classify_dispatch_stall`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler._classify_dispatch_stall]),
+so the attribution line and the `Inference dispatch stalled` text never name different causes.
+`unexplained` growing is itself a finding: an empty slot with queued work that no gate claims is the
+scheduler-bug-shaped case. The cumulative totals also ride every stats sample (`slot_duty_totals`),
+so `horde-log duty` reports the same breakdown per session offline, alongside a **concurrency
+occupancy** line (share of wall at each in-flight count) computed from the samples' `jobs_in_progress`,
+which works even on stats files predating the slot-duty fields.
+
 ### The dashboard
 
 The [TUI dashboard](../how-to/use-the-dashboard.md) shows the same sampled figure live: the health

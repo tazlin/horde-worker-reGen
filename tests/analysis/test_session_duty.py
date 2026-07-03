@@ -291,3 +291,99 @@ class TestDutyReportCli:
         duty_report_main()
 
         assert "Epoch 0" in capsys.readouterr().out
+
+
+class TestSlotDutyAndOccupancy:
+    """The stats stream's slot-duty counters and in-flight occupancy reach the report and its rendering.
+
+    The slot-duty totals are cumulative in the worker (monotonically growing), so the session figure is
+    the last-minus-first difference; occupancy is the inter-sample time spent at each jobs_in_progress
+    count. Together they answer, from a bundle alone, how much of the configured capacity ran and what
+    the empty capacity was waiting on. Stats files from workers predating the fields degrade to empty
+    values rather than failing.
+    """
+
+    def test_slot_duty_delta_and_occupancy_computed(self, tmp_path: Path) -> None:
+        """Cumulative slot-duty counters difference into session totals; occupancy sums sample gaps."""
+        stats_dir = tmp_path / "stats"
+        stats_dir.mkdir()
+        _write_jsonl(
+            stats_dir / "stats-v1.0.0-20260101-000000-000.jsonl",
+            [
+                _job(stage_timestamps={"INFERENCE_STARTED": 90.0, "PENDING_SUBMIT": 99.0, "FINALIZED": 100.0}),
+                _sample(
+                    100.0,
+                    jobs_in_progress=1,
+                    slot_duty_totals={"sampling": 100.0, "overlap_headway": 40.0},
+                    slot_duty_capacity=2,
+                ),
+                _sample(
+                    110.0,
+                    jobs_in_progress=1,
+                    slot_duty_totals={"sampling": 110.0, "overlap_headway": 50.0},
+                    slot_duty_capacity=2,
+                ),
+                _sample(
+                    120.0,
+                    jobs_in_progress=2,
+                    slot_duty_totals={"sampling": 130.0, "overlap_headway": 50.0},
+                    slot_duty_capacity=2,
+                ),
+            ],
+        )
+
+        reports = analyze_stats_sessions(stats_dir)
+
+        assert len(reports) == 1
+        report = reports[0]
+        assert report.slot_duty_capacity == 2
+        assert report.slot_duty_seconds == {"sampling": 30.0, "overlap_headway": 10.0}
+        assert report.concurrency_occupancy["1"] > 0.0
+        assert report.concurrency_occupancy["2"] > 0.0
+
+    def test_render_includes_slot_duty_and_occupancy_lines(self, tmp_path: Path) -> None:
+        """The text report surfaces both new sections when the fields are present."""
+        from horde_worker_regen.analysis.session_duty import render_session_duty_report
+
+        stats_dir = tmp_path / "stats"
+        stats_dir.mkdir()
+        _write_jsonl(
+            stats_dir / "stats-v1.0.0-20260101-000000-000.jsonl",
+            [
+                _job(stage_timestamps={"INFERENCE_STARTED": 90.0, "PENDING_SUBMIT": 99.0, "FINALIZED": 100.0}),
+                _sample(100.0, jobs_in_progress=1, slot_duty_totals={"sampling": 10.0}, slot_duty_capacity=2),
+                _sample(
+                    130.0,
+                    jobs_in_progress=1,
+                    slot_duty_totals={"sampling": 40.0, "preload_deferred": 30.0},
+                    slot_duty_capacity=2,
+                ),
+            ],
+        )
+
+        output = render_session_duty_report(analyze_stats_sessions(stats_dir))
+
+        assert "slot duty:" in output
+        assert "sampling" in output
+        assert "preload_deferred" in output
+        assert "concurrency occupancy (capacity 2):" in output
+
+    def test_pre_field_stats_files_degrade_gracefully(self, tmp_path: Path) -> None:
+        """Sessions recorded before the slot-duty fields existed report empty slot-duty, not errors."""
+        stats_dir = tmp_path / "stats"
+        stats_dir.mkdir()
+        _write_jsonl(
+            stats_dir / "stats-v0.9.0-20260101-000000-000.jsonl",
+            [
+                _job(stage_timestamps={"INFERENCE_STARTED": 90.0, "PENDING_SUBMIT": 99.0, "FINALIZED": 100.0}),
+                _sample(100.0, jobs_in_progress=1),
+                _sample(110.0, jobs_in_progress=0),
+            ],
+        )
+
+        reports = analyze_stats_sessions(stats_dir)
+
+        assert len(reports) == 1
+        assert reports[0].slot_duty_seconds == {}
+        assert reports[0].slot_duty_capacity is None
+        assert reports[0].concurrency_occupancy["1"] > 0.0
