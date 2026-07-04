@@ -1299,16 +1299,19 @@ class ProcessLifecycleManager:
             self._post_process_replacement_intentional = True
             self._initiate_post_process_replacement()
         logger.info(
-            "Whole-card residency: stopping the post-processing lane to free its VRAM context for the "
-            "heavy model.",
+            "Whole-card residency: stopping the post-processing lane to free its VRAM context for the heavy model.",
         )
         return True
 
     def restore_post_process_off_gpu(self) -> bool:
         """Restart the dedicated post-processing lane after a whole-card job has released the device.
 
-        A no-op (returns False) when the lane is not currently paused. Clears the override so the per-tick
-        :meth:`start_post_process_processes` hook brings the lane back up on its next pass.
+        A no-op (returns False) when the lane is not currently paused. Clears the override and starts the
+        lane directly: no recurring hook exists to bring it back otherwise. The bring-up callers
+        (:meth:`start_inference_processes` via the download coordinator) are one-shot latches, and the
+        replacement state machine consumed its flag during the pause, when its final start call was
+        suppressed by the pause gate, so without this call the lane would stay down for the rest of the
+        session and every post-processing job would queue against a lane that never returns.
 
         Returns:
             True if a restore was initiated, False if it was not paused.
@@ -1318,6 +1321,7 @@ class ProcessLifecycleManager:
         self._post_process_gpu_paused = False
         self._post_process_gpu_restore_count += 1
         logger.info("Whole-card residency complete: restarting the post-processing lane.")
+        self.start_post_process_processes()
         return True
 
     def _initiate_safety_replacement(self) -> None:

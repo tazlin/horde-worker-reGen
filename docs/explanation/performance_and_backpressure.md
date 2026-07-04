@@ -356,17 +356,53 @@ non-sampling time on small jobs and shows up as the `vram_transfer` loss in the
 [duty-cycle report](duty-cycle.md). It is paid even when the very next job uses the *same* model on the
 *same* process.
 
-The scheduler suppresses that eviction for one dispatch when, and only when, both of these hold:
+The scheduler suppresses that eviction for one dispatch only under gates that cannot over-commit the
+card even when the driver's free-VRAM figure lies. A WDDM driver in demand-paging keeps reporting
+generous free VRAM while the card is actually saturated, so the gates lean on the parent's own
+bookkeeping and on constants rather than trusting the measurement:
 
-- **the next queued inference job reuses this model**, so the retained weights are actually consumed
-  rather than idly pinning VRAM another model could use, and
-- **the [VRAM budget](#the-vram-and-ram-budget) confirms the card could still admit this job from
-  scratch**. The free-VRAM reading is taken while the job's own weights occupy the card, so the check
-  credits them back before asking whether the footprint fits; demanding it fit inside the *remaining*
-  free VRAM as well would charge the weights twice and refuse retention on exactly the contended cards
-  where skipping the reload pays the most.
+- **Sole residency**: no other process on the card may hold a VRAM-resident model (judged from the
+  model map, which the children keep honest by reporting where the weights actually ended up after each
+  job). Retention only ever extends the card's single resident across consecutive jobs; it never
+  creates a second resident.
+- **Static fit**: the card's reported *total* VRAM (a constant the driver cannot misreport under
+  pressure) must absorb the job's sampling peak plus the configured reserve and any committed reserves.
+- **Measured veto**: the [VRAM budget](#the-vram-and-ram-budget) check against measured free VRAM can
+  still deny, never solely grant. The job's own weights are credited back into the reading only when
+  the dispatching process already holds this model in VRAM; only then was the reading taken with the
+  weights occupying the card, and demanding the footprint also fit inside the *remainder* would charge
+  them twice.
 
-When both hold, the dispatch carries a "keep resident after" hint to the engine, which skips the post-job
+No queue lookahead gates the grant. The pop cycle refills the queue immediately *after* a dispatch drains
+it, so at the dispatch instant a same-model successor is almost never visible in the pending set even
+when one arrives milliseconds later; conditioning retention on seeing one makes it structurally
+unreachable. Reclaim is instead just-in-time, by the parties that can actually see the demand: the
+per-dispatch VRAM sweep takes back an idle retained copy the moment a different process needs the card,
+and the under-pressure reclaim overrides retention outright. An unused hold therefore costs only the
+interval until the next dispatch. The sweep spares the resident copy of a model still in the queue
+lookahead, but only when the card can statically afford that copy alongside the head-of-queue job's
+sampling peak; on a card where they cannot coexist, keeping the copy warm would force silent driver
+demand-paging during sampling, which costs far more than the one reload the protection saves.
+
+The support processes are additionally held to allocator-enforced VRAM quotas on CUDA hosts: the
+dedicated post-processing lane and the on-GPU safety process cap their own caching allocators at the
+share of the card their role justifies (an upscale chain's working set; the safety models plus one
+evaluation). The parent can schedule when work runs, but only the allocator can bound how much a
+process *keeps*: freed tensors stay in a process's pool, and under WDDM an over-committed card silently
+demand-pages every process instead of failing. With the cap, an overstep becomes a crisp out-of-memory
+inside the offender, on paths that already degrade gracefully (a faulted chain delivers its raw images;
+a faulted safety evaluation recycles the process). On non-CUDA backends the quota is a logged no-op.
+
+On Windows the worker also watches the one signal the driver cannot fake: the per-process
+`GPU Process Memory` counters (the data behind Task Manager's "Shared GPU memory" column). When a worker
+child's *shared* (system-backed) GPU usage climbs past a threshold for consecutive samples, its
+allocations were demoted out of dedicated VRAM: measured, PID-attributed demand-paging by the worker
+itself, as opposed to external VRAM pressure from another application's process. That verdict denies
+retention outright while active and triggers one under-pressure sweep of idle resident models on its
+rising edge. The telemetry is WDDM-level and vendor-neutral; on Linux, or any host where the counters
+are unavailable, the monitor simply collects nothing and the verdict stays off.
+
+When granted, the dispatch carries a "keep resident after" hint to the engine, which skips the post-job
 VRAM cleanup so the following same-model job samples immediately with no reload. Retention is granted on
 evidence, never assumed: a disabled budget or unmeasured VRAM falls back to eviction, and even a granted
 retention is a soft hold. The engine's force-load overflow guard and the worker's under-pressure

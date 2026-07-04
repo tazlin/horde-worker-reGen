@@ -805,6 +805,13 @@ class HordeInferenceProcess(HordeProcess):
     (hordelib swallows exceptions raised inside the progress callback)."""
 
     _last_job_inference_rate: str | None = None
+    _current_job_kept_model_resident: bool = False
+    """Whether the job now finishing was dispatched with the keep-model-resident hint.
+
+    Decides the post-job model-state report: LOADED_IN_VRAM only when the eviction was actually
+    deferred, LOADED_IN_RAM otherwise. The parent's retention gate reads that map to enforce a single
+    VRAM-resident model per card, so reporting VRAM residency for weights hordelib just evicted would
+    make every recently-active sibling look like a resident and starve retention."""
     _last_inference_error: str | None = None
     """Summary of the exception that failed the current job's inference, or None if it succeeded.
 
@@ -1024,6 +1031,7 @@ class HordeInferenceProcess(HordeProcess):
         self._current_job_inference_steps_complete = False
         self._inference_slot_released = False
         self._vae_lock_was_acquired = False
+        self._current_job_kept_model_resident = keep_model_resident
         self._last_job_inference_rate = None
         self._last_inference_error = None
         self._last_progress_step_seen = None
@@ -1317,7 +1325,14 @@ class HordeInferenceProcess(HordeProcess):
         self.on_horde_model_state_change(
             process_state=process_state,
             horde_model_name=self._active_model_name,
-            horde_model_state=ModelLoadState.LOADED_IN_VRAM,
+            # Report where the weights actually are: hordelib evicts them from VRAM after the job
+            # unless the dispatch deferred it, and the parent's retention gate enforces its
+            # one-resident-per-card rule from this map entry.
+            horde_model_state=(
+                ModelLoadState.LOADED_IN_VRAM
+                if self._current_job_kept_model_resident
+                else ModelLoadState.LOADED_IN_RAM
+            ),
         )
 
         self.send_process_state_change_message(

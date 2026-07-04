@@ -23,9 +23,12 @@ from horde_worker_regen.process_management.ipc.messages import HordeControlFlag,
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, ModelLoadState
+from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
 from tests.process_management.conftest import (
+    make_job_pop_response,
     make_mock_bridge_data,
     make_mock_process_info,
+    track_popped_job_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
@@ -81,6 +84,82 @@ class TestVramUnloadNextModelGuard:
 
         assert freed is True
         assert sibling.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+
+class TestVramUnloadSparesEveryLookaheadModel:
+    """Every model in the queue lookahead keeps its resident copy under gentle reclaim.
+
+    The guard is set membership, not a single element: with several distinct models queued, sparing
+    only one of them (as an order-dependent pick would) evicts weights another queued job must
+    immediately reload. Only a resident copy no queued job wants is fair game.
+    """
+
+    _UNQUEUED_MODEL = "AlbedoBase XL (SDXL)"
+
+    def _scheduler_with_three_residents(self, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN202
+        requester = make_mock_process_info(1, model_name=None)
+        head_holder = make_mock_process_info(2, model_name=_NEXT_MODEL)
+        tail_holder = make_mock_process_info(3, model_name=_OTHER_MODEL)
+        idle_holder = make_mock_process_info(4, model_name=self._UNQUEUED_MODEL)
+        process_map = ProcessMap({1: requester, 2: head_holder, 3: tail_holder, 4: idle_holder})
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=HordeModelMap(root={}),
+            job_tracker=JobTracker(),
+            bridge_data=make_mock_bridge_data(max_threads=2),
+            max_concurrent=2,
+            max_inference=4,
+        )
+        monkeypatch.setattr(scheduler, "get_next_n_models", lambda n: [_NEXT_MODEL, _OTHER_MODEL])
+        return scheduler, requester, head_holder, tail_holder, idle_holder
+
+    def test_lookahead_models_spared_unqueued_model_evicted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Gentle reclaim leaves both queued models resident and takes the copy nothing queued wants."""
+        scheduler, requester, head_holder, tail_holder, idle_holder = self._scheduler_with_three_residents(
+            monkeypatch,
+        )
+
+        freed = scheduler.unload_models_from_vram(requester, under_pressure=True)
+
+        assert freed is True
+        assert head_holder.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        assert tail_holder.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        assert idle_holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+    async def test_lookahead_protection_dropped_when_card_cannot_afford_coresidency(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """On a card that cannot hold a queued resident alongside the head's sampling peak, evict it.
+
+        Sparing the copy would force driver demand-paging during the head's sampling (silent on WDDM,
+        which keeps reporting free VRAM while saturated), costing far more than the one reload the
+        protection saves. The affordability judgment is static: reported total minus reserve minus the
+        head job's sampling peak minus the resident's weight footprint.
+        """
+        scheduler, requester, head_holder, tail_holder, idle_holder = self._scheduler_with_three_residents(
+            monkeypatch,
+        )
+        # A 16 GB card: peak 8258 + footprint 6600 + reserve leaves no room for co-residency.
+        for process_info in (requester, head_holder, tail_holder, idle_holder):
+            process_info.total_vram_mb = 16376
+        await track_popped_job_async(scheduler._job_tracker, make_job_pop_response(_NEXT_MODEL))
+        monkeypatch.setattr(
+            inference_scheduler_module,
+            "predict_job_sampling_vram_mb",
+            lambda job, baseline: 8258.0,
+        )
+        monkeypatch.setattr(
+            inference_scheduler_module,
+            "predict_job_footprint_mb",
+            lambda job, baseline: 6600.0,
+        )
+
+        freed = scheduler.unload_models_from_vram(requester, under_pressure=True)
+
+        assert freed is True
+        assert head_holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        assert tail_holder.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
 
 class TestStaleRamUnloadRecycleScope:

@@ -155,6 +155,7 @@ from horde_worker_regen.utils.disk_monitor import DiskSpaceMonitor
 from horde_worker_regen.utils.gpu_monitor import GpuUtilizationSampler
 from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 from horde_worker_regen.utils.kudos_utils import generate_kudos_info_string as _generate_kudos_info_string
+from horde_worker_regen.utils.wddm_paging_monitor import WddmPagingMonitor, assess_worker_paging
 
 if TYPE_CHECKING:
     from horde_worker_regen.process_management.ipc.messages import HordeJobMetricsMessage
@@ -992,6 +993,13 @@ class HordeWorkerProcessManager:
         # is far cheaper than the benchmark's 0.1s sampler. It no-ops on CPU/fake/non-NVIDIA backends
         # (no telemetry -> no thread), so creating it here is always safe.
         self._gpu_sampler = GpuUtilizationSampler(interval_seconds=1.0)
+        # Direct WDDM demand-paging telemetry: per-process GPU shared-segment usage, the signal the
+        # driver cannot fake when the card is over-subscribed (measured free VRAM and core utilization
+        # both read healthy in that regime). No-ops on non-Windows hosts and on any PDH failure (no
+        # thread, latest() stays None), so creating it here is always safe on every backend.
+        self._wddm_paging_monitor = WddmPagingMonitor()
+        self._last_wddm_sample_timestamp = 0.0
+        self._wddm_elevated_streak = 0
         self._last_duty_cycle_log_time = 0.0
         self._last_no_jobs_seconds_at_duty_log = 0.0
         # Anchor for the periodic slot-duty attribution line: the scheduler's cumulative slot-second
@@ -1077,6 +1085,12 @@ class HordeWorkerProcessManager:
                 process_info,
                 under_pressure=True,
                 device_index=device_index,
+            ),
+            sampling_coresidency_check=(
+                lambda pp_reserve_mb: self._inference_scheduler.pp_sampling_coresidency_affordable(
+                    sampling_peak_mb=self._inference_scheduler.max_in_progress_sampling_peak_mb(),
+                    pp_reserve_mb=pp_reserve_mb,
+                )
             ),
         )
 
@@ -1783,6 +1797,47 @@ class HordeWorkerProcessManager:
     _last_status_message_time = 0.0
     """The epoch time of the last status message."""
 
+    _WDDM_PAGING_SHARED_THRESHOLD_MB = 256.0
+    """Per-process shared (system-backed) GPU usage above which a worker child counts as demand-paged.
+
+    A compute process normally maps only tens of MB of the shared segment (runtime bookkeeping); crossing
+    a quarter GB means real allocations were demoted out of dedicated VRAM."""
+
+    _WDDM_PAGING_CONSECUTIVE_SAMPLES = 2
+    """Fresh elevated readings required before the paging verdict fires, so a single transient demotion
+    spike (e.g. during a model load) does not trigger reclaim."""
+
+    def _evaluate_wddm_paging(self) -> None:
+        """Judge the latest per-process GPU shared-usage reading and feed the verdict to the scheduler.
+
+        Attribution is the point: only the worker's own child PIDs count toward the verdict, so a game or
+        browser claiming VRAM shows up as external pressure (unchanged budget behavior) rather than
+        tripping worker-side reclaim. A no-op on hosts without the telemetry (non-Windows, PDH failure):
+        ``latest()`` stays None there.
+        """
+        sample = self._wddm_paging_monitor.latest()
+        if sample is None or sample.timestamp <= self._last_wddm_sample_timestamp:
+            return
+        self._last_wddm_sample_timestamp = sample.timestamp
+
+        worker_pids = {
+            process_info.os_pid for process_info in self._process_map.values() if process_info.os_pid is not None
+        }
+        elevated = assess_worker_paging(
+            sample,
+            worker_pids,
+            shared_threshold_mb=self._WDDM_PAGING_SHARED_THRESHOLD_MB,
+        )
+        if elevated:
+            self._wddm_elevated_streak += 1
+        else:
+            self._wddm_elevated_streak = 0
+
+        self._inference_scheduler.note_wddm_paging(
+            elevated,
+            active=self._wddm_elevated_streak >= self._WDDM_PAGING_CONSECUTIVE_SAMPLES,
+        )
+
     async def _control_loop_tick(self) -> bool:
         """Run a single iteration of the process control loop.
 
@@ -1802,6 +1857,7 @@ class HordeWorkerProcessManager:
             await self._sleep(self._loop_interval)
 
             await self.receive_and_handle_process_messages()
+            self._evaluate_wddm_paging()
             self._download_coordinator.maybe_start_safety_processes()
             self._download_coordinator.maybe_start_inference_processes()
             # A child may have just reported a CPU-only torch build (image generation disabled); collapse the
@@ -1982,6 +2038,7 @@ class HordeWorkerProcessManager:
     async def _process_control_loop(self) -> None:
         self._download_coordinator.download_wait_started = time.time()
         self._gpu_sampler.start()
+        self._wddm_paging_monitor.start()
         if self._enable_background_downloads:
             self._process_lifecycle.start_download_process()
             # Both the safety and inference processes are started lazily once their required models are on
@@ -2030,6 +2087,7 @@ class HordeWorkerProcessManager:
             await asyncio.sleep(0.2)
 
         self._gpu_sampler.stop()
+        self._wddm_paging_monitor.stop()
         self._process_lifecycle.end_inference_processes(force=True)
         self._process_lifecycle.end_safety_processes()
         self._process_lifecycle.end_download_process()

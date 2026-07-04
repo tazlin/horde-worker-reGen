@@ -120,7 +120,8 @@ levers, [model stickiness](#tuning-levers-and-what-they-cannot-do) and residency
 A distinct cost hides inside `vram_load` even when no swap or eviction is counted: the engine evicts a
 job's model from VRAM after every run, so the next job re-streams the same weights from RAM, a RAM→VRAM
 reload paid even for the *same* model back-to-back. The scheduler now suppresses that per-job eviction
-when the next queued job reuses the model and the VRAM budget confirms it fits (see
+whenever the VRAM budget confirms the card can afford to carry the weights, reclaiming an unused hold
+just-in-time at the next dispatch that needs the card (see
 [keeping a model resident between same-model jobs](performance_and_backpressure.md#keeping-a-model-resident-between-same-model-jobs)),
 so a homogeneous or sticky workload stops paying `vram_transfer` on its hot model and the residual reload
 loss narrows to genuine model *switches*.

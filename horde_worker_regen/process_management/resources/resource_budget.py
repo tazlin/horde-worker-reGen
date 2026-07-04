@@ -785,9 +785,7 @@ def forecast_weight_streaming(
     # evicting a sibling model or claiming the card rather than co-residing into VRAM that is about to be
     # reclaimed. The configured operator margin joins the activation working set here (not the weight floor):
     # it is the co-residency headroom the operator wants preserved while a model samples beside siblings.
-    reserve_mb = (
-        max(base_reserve_mb, activation_working_set_mb, configured_floor_mb) + max(0.0, committed_reserve_mb)
-    )
+    reserve_mb = max(base_reserve_mb, activation_working_set_mb, configured_floor_mb) + max(0.0, committed_reserve_mb)
     overhead = max(0.0, per_process_overhead_mb)
     # The first context pays the one-time CUDA runtime cost; each additional context costs only the marginal.
     # Default the marginal to the full overhead so an unsupplied marginal reproduces the old contexts*overhead.

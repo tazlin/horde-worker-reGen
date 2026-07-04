@@ -496,6 +496,15 @@ def start_safety_process(
             )
             sys.exit(1)
 
+        if not cpu_only and not dry_run_skip_safety:
+            # Cap the on-GPU safety process's caching allocator so its evaluation models and retained pool
+            # take only the share of the card their role justifies; an eval that cannot fit the cap faults
+            # inside this process (which is recycled) rather than silently demand-paging the whole device.
+            # After the device pin the process sees its card as device 0. A no-op on non-CUDA backends.
+            from horde_worker_regen.utils.vram_quota import SAFETY_VRAM_QUOTA_MB, apply_process_vram_quota_mb
+
+            apply_process_vram_quota_mb(SAFETY_VRAM_QUOTA_MB, device_index=0)
+
         from horde_worker_regen.process_management.workers.safety_process import HordeSafetyProcess
 
         logger.debug(
@@ -611,6 +620,15 @@ def start_post_process_process(
                 launch_identifier=process_launch_identifier,
             )
             sys.exit(1)
+
+        if not dry_run_skip_post_processing:
+            # Cap the lane's caching allocator so its modules and retained pool can never squat the share
+            # of the card the inference pool needs; a chain that cannot fit the cap faults inside the lane
+            # and the job is delivered with its raw images instead. After the device pin the lane sees its
+            # card as device 0. A no-op on non-CUDA backends.
+            from horde_worker_regen.utils.vram_quota import POST_PROCESS_VRAM_QUOTA_MB, apply_process_vram_quota_mb
+
+            apply_process_vram_quota_mb(POST_PROCESS_VRAM_QUOTA_MB, device_index=0)
 
         from horde_worker_regen.process_management.workers.post_process_process import HordePostProcessProcess
 

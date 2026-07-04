@@ -66,6 +66,95 @@ class TestStartPostProcessing:
         assert job_info in process_manager._job_tracker.jobs_pending_post_processing
         assert job_info not in process_manager._job_tracker.jobs_being_post_processed
 
+    async def test_absent_lane_ages_job_out_to_raw_submit(self) -> None:
+        """With no lane process (and no deliberate pause), a pending job's patience clock starts.
+
+        Deferral records are otherwise only created against a live lane process; without this arming, a
+        job queued while the lane is dead (crash, failed restart) would never age out and would wait
+        forever, wedging the drain and forfeiting its finished inference.
+        """
+        process_manager = make_testable_process_manager()
+        job_info = _make_pp_job_info()
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+        orchestrator = process_manager._post_process_orchestrator
+        key = str(job_info.sdk_api_job_info.id_)
+        assert key in orchestrator._deferrals
+
+        # Push the record past the patience window: the next pass must deliver the raw images.
+        orchestrator._deferrals[key].first_deferred_at -= (
+            post_process_orchestrator_module._ADMISSION_PATIENCE_SECONDS + 1.0
+        )
+        await process_manager.start_post_processing()
+
+        assert job_info not in process_manager._job_tracker.jobs_pending_post_processing
+        assert job_info in process_manager._job_tracker.jobs_pending_safety_check
+
+    async def test_paused_lane_does_not_age_jobs_out(self) -> None:
+        """During a deliberate whole-card pause the patience clock stays unarmed.
+
+        The residency lifecycle restarts the lane when the card is released, so jobs wait for the real
+        lane rather than forfeiting their post-processing to a raw-image submit.
+        """
+        process_manager = make_testable_process_manager()
+        process_manager._process_lifecycle._post_process_gpu_paused = True
+        job_info = _make_pp_job_info()
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        orchestrator = process_manager._post_process_orchestrator
+        assert str(job_info.sdk_api_job_info.id_) not in orchestrator._deferrals
+        assert job_info in process_manager._job_tracker.jobs_pending_post_processing
+
+    async def test_chain_waits_while_sampling_holds_a_tight_card(self) -> None:
+        """With sampling in progress and co-residency unaffordable, the chain is not dispatched.
+
+        Co-running a chain against active sampling on a card that cannot hold both peaks silently
+        demand-pages both sides for the whole overlap; the chain waits for the card instead. The
+        patience record arms so a never-idle card still ages the job out to a raw-image submit.
+        """
+        process_manager = make_testable_process_manager()
+        lane = _make_lane_process()
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane})
+        orchestrator = process_manager._post_process_orchestrator
+        orchestrator._sampling_coresidency_check = lambda reserve_mb: False
+
+        sampling_job = make_job_pop_response(model="AlbedoBase XL (SDXL)")
+        await track_popped_job_async(process_manager._job_tracker, sampling_job)
+        await process_manager._job_tracker.mark_inference_started(sampling_job, device_index=None)
+
+        job_info = _make_pp_job_info()
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        assert job_info in process_manager._job_tracker.jobs_pending_post_processing
+        lane.pipe_connection.send.assert_not_called()
+        assert str(job_info.sdk_api_job_info.id_) in orchestrator._deferrals
+
+    async def test_chain_dispatches_when_coresidency_affordable(self) -> None:
+        """On a card that can hold both peaks, sampling in progress does not delay the chain."""
+        process_manager = make_testable_process_manager()
+        lane = _make_lane_process()
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane})
+        orchestrator = process_manager._post_process_orchestrator
+        orchestrator._sampling_coresidency_check = lambda reserve_mb: True
+
+        sampling_job = make_job_pop_response(model="AlbedoBase XL (SDXL)")
+        await track_popped_job_async(process_manager._job_tracker, sampling_job)
+        await process_manager._job_tracker.mark_inference_started(sampling_job, device_index=None)
+
+        job_info = _make_pp_job_info()
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        assert job_info in process_manager._job_tracker.jobs_being_post_processed
+
     async def test_successful_dispatch_moves_job_and_sends_operations(self) -> None:
         """A successful dispatch moves the job to being-post-processed and sends images plus operations."""
         process_manager = make_testable_process_manager()

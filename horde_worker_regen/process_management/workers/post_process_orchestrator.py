@@ -76,6 +76,7 @@ class PostProcessOrchestrator:
         model_metadata: ModelMetadata,
         reserve_ledger: CommittedReserveLedger,
         request_vram_reclaim: Callable[[HordeProcessInfo, int], bool],
+        sampling_coresidency_check: Callable[[float], bool] | None = None,
     ) -> None:
         """Initialize the orchestrator with references to its dependencies.
 
@@ -89,6 +90,8 @@ class PostProcessOrchestrator:
             model_metadata: Provides the baseline needed for post-processing VRAM estimates.
             reserve_ledger: Shared committed-resource ledger used by every workload flow.
             request_vram_reclaim: Callback that asks the scheduler to evict idle VRAM on the lane's card.
+            sampling_coresidency_check: Given a chain's estimated peak (MB), whether the card can run it
+                alongside the sampling currently in progress. None (unit tests) allows co-running always.
         """
         self._process_map = process_map
         self._job_tracker = job_tracker
@@ -97,6 +100,7 @@ class PostProcessOrchestrator:
         self._model_metadata = model_metadata
         self._reserve_ledger = reserve_ledger
         self._request_vram_reclaim = request_vram_reclaim
+        self._sampling_coresidency_check = sampling_coresidency_check
         # Overridable so the load simulator can drive the aging window off its virtual clock; monotonic
         # keeps the window immune to wall-clock jumps.
         self._clock = time.monotonic
@@ -218,6 +222,29 @@ class PostProcessOrchestrator:
         ):
             return
 
+        # Deferral records are otherwise only created against a live lane process, so with the lane
+        # absent (crashed, failed to start, or torn down without coming back) no patience clock would
+        # ever start and these jobs would wait forever. Arm the clock here so the aging escape below
+        # can deliver their raw images. A deliberate whole-card pause is excluded: the residency
+        # lifecycle restarts the lane when the card is released, so those jobs wait for the real lane
+        # rather than forfeiting their post-processing.
+        if (
+            self._process_map.num_post_process_processes() == 0
+            and not self._process_lifecycle.is_post_process_gpu_paused
+        ):
+            for job_info in pending:
+                key = str(job_info.sdk_api_job_info.id_)
+                if key not in self._deferrals:
+                    self._deferrals[key] = _DeferralRecord(
+                        first_deferred_at=now,
+                        last_logged_at=now,
+                        reclaim_requested=True,
+                    )
+                    logger.warning(
+                        f"Post-processing lane has no process; starting the patience window for job "
+                        f"{job_info.sdk_api_job_info.id_} (raw images are submitted if the lane does not return).",
+                    )
+
         # A raw-image submit needs no lane, so age out unservable jobs whether or not the lane is free: a
         # busy or unfittable head must never hold a long-waiting job past its patience window.
         await self._age_out_unfittable(now=now)
@@ -240,6 +267,30 @@ class PostProcessOrchestrator:
                 continue
 
             reserve_vram_mb = self._estimate_post_processing_vram_mb(completed_job_info)
+            if (
+                self._sampling_coresidency_check is not None
+                and len(self._job_tracker.jobs_in_progress) > 0
+                and not self._sampling_coresidency_check(reserve_vram_mb)
+            ):
+                # The card cannot hold this chain alongside the sampling in progress; starting it now
+                # would silently demand-page both for the whole overlap. Wait for the sampling to finish
+                # (seconds; the dispatch-side gate keeps the next sampling job from jumping in over an
+                # already-running chain). The patience record still arms so a pathological never-idle
+                # card ages the job out to a raw-image submit rather than parking it forever.
+                key = str(completed_job_info.sdk_api_job_info.id_)
+                if key not in self._deferrals:
+                    self._deferrals[key] = _DeferralRecord(
+                        first_deferred_at=now,
+                        last_logged_at=now,
+                        reclaim_requested=True,
+                    )
+                    logger.debug(
+                        f"Deferring post-processing for job {completed_job_info.sdk_api_job_info.id_}: "
+                        f"its chain ({reserve_vram_mb:.0f}MB) cannot share the card with the sampling in "
+                        "progress; waiting for the card.",
+                    )
+                return False
+
             if self._has_post_processing_headroom(
                 post_process_process=post_process_process,
                 reserve_vram_mb=reserve_vram_mb,
@@ -274,9 +325,9 @@ class PostProcessOrchestrator:
 
             waited = now - record.first_deferred_at
             logger.warning(
-                f"Post-processing for job {job_id} could not be admitted within {waited:.0f}s (its estimated "
-                "peak never fit the lane card's free VRAM after commitments); submitting the raw images so "
-                "the finished inference is not forfeited.",
+                f"Post-processing for job {job_id} could not be admitted within {waited:.0f}s (no lane "
+                "process, or its estimated peak never fit the lane card's free VRAM after commitments); "
+                "submitting the raw images so the finished inference is not forfeited.",
             )
             await self._job_tracker.queue_for_safety_post_processed(job_info)
             self._deferrals.pop(str(job_id), None)

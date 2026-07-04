@@ -37,6 +37,8 @@ from __future__ import annotations
 import multiprocessing
 from unittest.mock import Mock
 
+import pytest
+
 from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState, ModelLoadState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
@@ -286,6 +288,72 @@ class TestNonHeadContextReductionBlocked:
             assert held_model != _RESIDENT_SDXL, (
                 f"if a residency is held, it must be for the head model, not {_RESIDENT_SDXL!r}"
             )
+
+
+class TestContextReductionSizingFloor:
+    """The teardown-depth sizing keys on the honest streaming floor, not the configured margin.
+
+    ``vram_reserve_mb`` is a co-residency/activation margin that paces admission; folding it into the
+    context budget as well charges it twice, and on a 16 GB card that manufactures whole-card collapses
+    for ordinary SDXL jobs whose peak physically co-resides with the full process pool. Only the ComfyUI
+    streaming floor is a genuine structural constraint on the co-resident count.
+    """
+
+    def _scheduler_for_verdict(self, *, report_total: bool):  # noqa: ANN202
+        process_info = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        if report_total:
+            process_info.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+        scheduler = _make_inference_scheduler(
+            process_map=ProcessMap({1: process_info}),
+            bridge_data=make_mock_bridge_data(
+                enable_vram_budget=True,
+                vram_reserve_mb=4096,
+                ram_reserve_mb=4096,
+                whole_card_exclusive_residency=True,
+            ),
+        )
+        scheduler._vram_budget.check_job = Mock(  # type: ignore[method-assign]
+            return_value=Mock(fits=False, predicted_mb=8258.0, reserve_mb=4096.0, reason=Mock(return_value="over")),
+        )
+        scheduler._measured_free_vram_mb = Mock(return_value=1000.0)  # type: ignore[method-assign]
+        scheduler.unload_models_from_vram = Mock(return_value=False)  # type: ignore[method-assign]
+        return scheduler, process_info
+
+    def _captured_sizing_reserve(self, scheduler, process_info) -> float | None:  # noqa: ANN001
+        captured: list[float] = []
+
+        def record_sizing(peak_mb: float, reserve_mb: float, *, device_index=None):  # noqa: ANN001, ANN202
+            captured.append(reserve_mb)
+            return 5
+
+        scheduler._max_coresident_for_peak_mb = record_sizing  # type: ignore[method-assign]
+        result = scheduler._apply_vram_verdict(
+            make_job_pop_response(_RESIDENT_SDXL),
+            process_info,
+            None,
+            Mock(is_card_demanding=False),
+            is_head_blocker=True,
+            target_device_index=None,
+            no_live_resource_consumer=False,
+        )
+        assert result is not None
+        return captured[0] if captured else None
+
+    def test_sizing_uses_streaming_floor_when_total_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With the card total known, the depth is sized against the ComfyUI floor, not the 4096 margin."""
+        monkeypatch.setattr(
+            "horde_worker_regen.process_management.scheduling.inference_scheduler.effective_inference_reserve_mb",
+            lambda total, floor: 1519.0,
+        )
+        scheduler, process_info = self._scheduler_for_verdict(report_total=True)
+
+        assert self._captured_sizing_reserve(scheduler, process_info) == 1519.0
+
+    def test_sizing_falls_back_to_verdict_reserve_without_total(self) -> None:
+        """Cold start (no reported total): the conservative configured reserve is retained."""
+        scheduler, process_info = self._scheduler_for_verdict(report_total=False)
+
+        assert self._captured_sizing_reserve(scheduler, process_info) == 4096.0
 
 
 class TestWholeCardResidencyProtectsFromVramEviction:

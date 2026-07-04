@@ -618,6 +618,33 @@ def test_pause_and_restore_post_process_lane_stops_and_restarts_it_for_whole_car
     assert plm.restore_post_process_off_gpu() is False
 
 
+def test_restore_post_process_lane_starts_it_when_none_running() -> None:
+    """Restoring after a whole-card pause must itself relaunch the lane.
+
+    By restore time the replacement state machine has already ended and deleted the paused lane process
+    and consumed its flag (its final start call was suppressed by the pause gate), and the bring-up
+    callers are one-shot latches. If the restore did not start the lane directly, no code path would
+    ever bring it back, and every post-processing job for the rest of the session would queue against a
+    lane that never returns.
+    """
+    fake_ctx = Mock()
+    fake_ctx.get_start_method.return_value = "spawn"
+    fake_ctx.Pipe.return_value = (Mock(), Mock())
+    fake_ctx.Process.return_value.pid = 12345
+    fake_ctx.Process.return_value.exitcode = None
+
+    plm = _make_plm(ctx=fake_ctx)
+    plm._runtime_config.bridge_data.post_processing_lane_enabled = True
+    plm._runtime_config.bridge_data.dry_run_skip_post_processing = False
+
+    assert plm.pause_post_process_off_gpu() is True
+    # The paused-lane teardown already ran to completion: no lane process remains in the map.
+    assert plm._process_map.num_post_process_processes() == 0
+
+    assert plm.restore_post_process_off_gpu() is True
+    assert plm._process_map.num_post_process_processes() == 1
+
+
 def test_pause_post_process_lane_is_noop_when_lane_disabled() -> None:
     """With the dedicated lane disabled there is no lane to stop, so the pause is a no-op."""
     plm = _make_plm()
