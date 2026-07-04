@@ -232,6 +232,12 @@ class HordeProcessInfo:
         self.ram_usage_bytes = 0
         self.vram_usage_mb = 0
         self.total_vram_mb = 0
+        self.open_fds: int | None = None
+        """Open descriptors/handles last reported by the process, or None if the platform metric is absent."""
+        self.fd_soft_limit: int | None = None
+        """The process's soft ``RLIMIT_NOFILE`` ceiling, or None where there is no finite limit."""
+        self.fd_headroom_warned = False
+        """Whether a low-descriptor-headroom warning has already fired for the current climb (rising-edge latch)."""
         self.batch_amount = 1
 
         self.last_iterations_per_second = None

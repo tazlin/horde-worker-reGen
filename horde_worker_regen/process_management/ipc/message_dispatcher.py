@@ -457,6 +457,8 @@ class MessageDispatcher:
             ram_usage_bytes=message.ram_usage_bytes,
             vram_usage_mb=message.vram_usage_mb,
             total_vram_mb=message.vram_total_mb,
+            open_fds=message.open_fds,
+            fd_soft_limit=message.fd_soft_limit,
         )
 
     def _handle_process_state_change(self, message: HordeProcessStateChangeMessage) -> None:

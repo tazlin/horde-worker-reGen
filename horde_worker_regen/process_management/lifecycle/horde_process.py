@@ -22,6 +22,7 @@ import psutil
 from loguru import logger
 
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
+from horde_worker_regen.process_management.fd_limits import descriptor_soft_limit, open_descriptor_count
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeControlMessage,
@@ -339,6 +340,8 @@ class HordeProcess(abc.ABC):
             info="Memory report",
             time_elapsed=None,
             ram_usage_bytes=psutil.Process().memory_info().rss,
+            open_fds=open_descriptor_count(),
+            fd_soft_limit=descriptor_soft_limit(),
             device_index=self.device_index,
         )
 

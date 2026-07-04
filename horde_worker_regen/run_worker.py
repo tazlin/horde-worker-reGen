@@ -31,6 +31,13 @@ def main(
     supervisor_connection: Connection | None = None,
 ) -> None:
     """Check for a valid config and start the driver ('main') process for the reGen worker."""
+    from horde_worker_regen.process_management.fd_limits import raise_open_file_soft_limit
+
+    # Harden the whole process tree against descriptor leaks before any child is spawned: children inherit
+    # the raised soft RLIMIT_NOFILE, so a slow leak takes far longer than a session to reach EMFILE. No-op
+    # on platforms without the limit (Windows).
+    raise_open_file_soft_limit()
+
     from pydantic import ValidationError
 
     from horde_worker_regen.bridge_data.load_config import BridgeDataLoader, reGenBridgeData

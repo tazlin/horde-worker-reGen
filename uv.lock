@@ -1116,7 +1116,7 @@ wheels = [
 
 [[package]]
 name = "horde-engine"
-version = "5.0.0"
+version = "5.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
@@ -1182,9 +1182,9 @@ dependencies = [
     { name = "yapf" },
     { name = "yarl" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/50/4a/4e96c3d3b33d21cf5139882b504e6a8a8e3af39643f6ed0f5c43a2c5d1e0/horde_engine-5.0.0.tar.gz", hash = "sha256:4f5889f7bcbf84aab52d3165a43f7cf8f65b876f7005fab2f4ae215238548da4", size = 437881, upload-time = "2026-07-04T16:57:37.244Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8b/aa/5ba72fae7c25549a9dceafb73e429ae4b1806f22a741a1191a78748b7068/horde_engine-5.0.1.tar.gz", hash = "sha256:d784810e52706b7dfd97325a5b5bb46581d98787eedd390e5938e905cfaf3e2c", size = 439336, upload-time = "2026-07-04T20:10:05.228Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e2/82/72db05e8ae207ced1a80f1de2b9e7c53cd60f0a6c10799412a92c81bf454/horde_engine-5.0.0-py3-none-any.whl", hash = "sha256:f29a43f6711967d5d6bc057d550e5295151c3a8e3a4d8d144fb77612547ed2e4", size = 561816, upload-time = "2026-07-04T16:57:35.219Z" },
+    { url = "https://files.pythonhosted.org/packages/85/2d/086721fcf9ffe760b0a3756fadfd872527d9322a8b7e463b6b846085b654/horde_engine-5.0.1-py3-none-any.whl", hash = "sha256:5e84cb4b71306bc210c2acce6a4f8e1b98e64d82d78068f2c1f891afea0b0f44", size = 563672, upload-time = "2026-07-04T20:10:03.491Z" },
 ]
 
 [package.optional-dependencies]
@@ -1379,7 +1379,7 @@ requires-dist = [
     { name = "blurhash", specifier = ">=1.1.5" },
     { name = "certifi" },
     { name = "horde-engine", extras = ["controlnet"], marker = "extra == 'controlnet'" },
-    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=5.0.0,<6.0.0" },
+    { name = "horde-engine", extras = ["layerdiffuse", "upscale-extra"], specifier = ">=5.0.1,<6.0.0" },
     { name = "horde-engine", extras = ["rembg"], marker = "extra == 'post-processing'" },
     { name = "horde-model-reference", specifier = ">=7.0.2,<8.0.0" },
     { name = "horde-safety", specifier = "~=0.3.0" },

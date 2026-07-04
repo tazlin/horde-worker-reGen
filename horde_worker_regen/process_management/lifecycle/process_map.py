@@ -15,6 +15,10 @@ from loguru import logger
 from pydantic import ConfigDict
 
 from horde_worker_regen.consts import KNOWN_CONTROLNET_WORKFLOWS
+from horde_worker_regen.process_management.fd_limits import (
+    FD_HEADROOM_WARN_FRACTION,
+    descriptor_headroom_fraction,
+)
 from horde_worker_regen.process_management.ipc.messages import (
     HordeHeartbeatType,
     HordeProcessState,
@@ -266,6 +270,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         ram_usage_bytes: int,
         vram_usage_mb: int | None = 0,
         total_vram_mb: int | None = 0,
+        open_fds: int | None = None,
+        fd_soft_limit: int | None = None,
     ) -> None:
         """Update the memory usage for the given process ID.
 
@@ -274,17 +280,55 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             ram_usage_bytes (int): The amount of RAM used by this process.
             vram_usage_mb (int): The amount of VRAM used by this process.
             total_vram_mb (int): The total amount of VRAM available to this process.
+            open_fds (int | None): Open descriptors/handles the process reported, or None if unavailable.
+            fd_soft_limit (int | None): The process's soft ``RLIMIT_NOFILE`` ceiling, or None if unbounded.
         """
-        self[process_id].ram_usage_bytes = ram_usage_bytes
-        self[process_id].vram_usage_mb = vram_usage_mb or 0
-        self[process_id].total_vram_mb = total_vram_mb or 0
+        process_info = self[process_id]
+        process_info.ram_usage_bytes = ram_usage_bytes
+        process_info.vram_usage_mb = vram_usage_mb or 0
+        process_info.total_vram_mb = total_vram_mb or 0
+        process_info.open_fds = open_fds
+        process_info.fd_soft_limit = fd_soft_limit
 
-        self[process_id].last_received_timestamp = time.time()
+        process_info.last_received_timestamp = time.time()
+
+        self._warn_on_low_descriptor_headroom(process_info)
 
         logger.debug(
             f"Process {process_id} memory report: "
-            f"ram: {ram_usage_bytes} vram: {vram_usage_mb} total vram: {total_vram_mb}",
+            f"ram: {ram_usage_bytes} vram: {vram_usage_mb} total vram: {total_vram_mb} "
+            f"fds: {open_fds}/{fd_soft_limit}",
         )
+
+    def _warn_on_low_descriptor_headroom(self, process_info: HordeProcessInfo) -> None:
+        """Warn once when a process crosses the descriptor-headroom threshold, re-arming when it recovers.
+
+        A file-descriptor leak (the classic case being PyTorch's ``file_descriptor`` tensor-sharing
+        strategy) climbs toward the process's ``RLIMIT_NOFILE`` ceiling and ends in ``EMFILE``, from which
+        the slot faults every job while still heart-beating. Surfacing the climb at ``WARNING`` while the
+        slot is still serving turns that silent poisoning into an early, named signal. The warning latches
+        (rising edge) so it does not spam every report, and re-arms only after usage falls well clear of the
+        threshold, so a value hovering at the line does not flap.
+        """
+        fraction = descriptor_headroom_fraction(process_info.open_fds, process_info.fd_soft_limit)
+        if fraction is None:
+            return
+        if fraction >= FD_HEADROOM_WARN_FRACTION:
+            if not process_info.fd_headroom_warned:
+                process_info.fd_headroom_warned = True
+                logger.warning(
+                    f"Process {process_info.process_id} "
+                    f"({process_info.loaded_horde_model_name or 'no model loaded'}) is nearing its "
+                    f"file-descriptor ceiling: {process_info.open_fds}/{process_info.fd_soft_limit} "
+                    f"({fraction * 100:.0f}% in use). A descriptor leak ends in EMFILE ('Too many open "
+                    f"files'), which faults every job on the slot until it is recycled.",
+                )
+        elif process_info.fd_headroom_warned and fraction < FD_HEADROOM_WARN_FRACTION * 0.9:
+            process_info.fd_headroom_warned = False
+            logger.info(
+                f"Process {process_info.process_id} file-descriptor headroom recovered: "
+                f"{process_info.open_fds}/{process_info.fd_soft_limit} ({fraction * 100:.0f}% in use).",
+            )
 
     def on_job_metrics(self, process_id: int, phase_metrics: JobPhaseMetrics) -> None:
         """Record a finished job's metrics snapshot for the given process ID."""

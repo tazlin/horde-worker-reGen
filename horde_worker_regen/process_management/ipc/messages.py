@@ -187,6 +187,13 @@ class HordeProcessMemoryMessage(HordeProcessMessage):
 
     ram_usage_bytes: int
     """The number of bytes of RAM used by the process."""
+    open_fds: int | None = None
+    """Open file descriptors/handles held by the process, or None if the platform metric is unavailable.
+
+    Reported so the parent can watch descriptor headroom and surface a leak (which ends in EMFILE, "Too
+    many open files") as it grows, rather than only after it has poisoned the slot."""
+    fd_soft_limit: int | None = None
+    """The process's soft ``RLIMIT_NOFILE`` ceiling, or None where there is no finite limit (e.g. Windows)."""
     vram_usage_mb: int | None = None
     """The MB of VRAM used on the GPU."""
     vram_total_mb: int | None = None
