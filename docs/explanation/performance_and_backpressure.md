@@ -270,6 +270,12 @@ still exceeds the threshold, so the cap bypass and the pop bias last only as lon
 as the stall does. Set `aux_model_download_line_skip_threshold_seconds` to unset
 to disable the breaker entirely.
 
+Already-popped post-processing work has priority over the line-skip dispatch while the blocked head is only
+downloading auxiliary models. The post-processing overlap gate waits for active sampling on the PP lane's
+card, not for the broader in-progress job stage, so a `DOWNLOADING_AUX_MODEL` slot does not make the PP lane
+idle. The control loop drains pending PP work first; the line-skip job is then free to use the card once the
+lane has no immediately admissible image post-processing work.
+
 ### Concurrent-overlap gating
 
 `max_threads` caps how many jobs may be *in flight* at once, but it only counts jobs; it does not look at

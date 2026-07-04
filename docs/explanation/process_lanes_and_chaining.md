@@ -60,6 +60,11 @@ chain from parking the queue:
 - **One-shot reclaim**: an unfittable job asks the scheduler to evict idle VRAM once per starvation episode,
   not once per scheduling tick, so deferral does not churn idle inference residency in a loop.
 
+The overlap gate is keyed to active sampling on the lane's card, not to every job in the inference
+`IN_PROGRESS` stage. A job that is only blocked in `DOWNLOADING_AUX_MODEL` holds an in-flight slot but is not
+using the GPU for denoising, so already-popped post-processing work is admitted and drained before any
+line-skip candidate is launched to keep the card busy during that download.
+
 A post-processing failure never falls back to raw submission. Requested post-processing is part of the
 worker's contract for that job; if the lane cannot honor it, the worker submits a no-image fault so the horde
 reissues the job to another worker. Repeated lane faults feed the post-processing circuit breaker

@@ -907,10 +907,19 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 count += 1
         return count
 
-    def num_busy_with_inference(self) -> int:
-        """Return the number of processes that are actively engaged in an inference task."""
+    def num_busy_with_inference(self, *, device_index: int | None = None) -> int:
+        """Return the number of processes that are actively sampling.
+
+        Args:
+            device_index: When given, count only processes pinned to that card; when None, count across
+                every card.
+        """
         count = 0
         for p in self.values():
+            if p.process_type != HordeProcessType.INFERENCE:
+                continue
+            if device_index is not None and p.device_index != device_index:
+                continue
             if p.last_process_state == HordeProcessState.INFERENCE_STARTING:
                 count += 1
         return count

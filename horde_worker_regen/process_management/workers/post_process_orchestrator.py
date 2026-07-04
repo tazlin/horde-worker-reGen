@@ -280,7 +280,7 @@ class PostProcessOrchestrator:
             reserve_vram_mb = self._estimate_post_processing_vram_mb(completed_job_info)
             if (
                 self._sampling_coresidency_check is not None
-                and len(self._job_tracker.jobs_in_progress) > 0
+                and self._process_map.num_busy_with_inference(device_index=post_process_process.device_index) > 0
                 and not self._sampling_coresidency_check(reserve_vram_mb)
             ):
                 # The card cannot hold this chain alongside the sampling in progress; starting it now
