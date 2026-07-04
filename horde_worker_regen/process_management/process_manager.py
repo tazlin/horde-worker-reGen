@@ -677,6 +677,12 @@ class HordeWorkerProcessManager:
     _loop_interval: float = 0.20
     """The number of seconds to wait between each loop of the main process (inter process management) loop."""
 
+    _ELIGIBLE_MAX_TICK_DT_SECONDS: float = 5.0
+    """Upper bound on the wall-time a single control tick may credit to the eligible-seconds clock.
+
+    Ticks run many times a second, so a gap far larger than this means the parent loop stalled; clamping
+    keeps a stall from dumping a spurious burst of "productive" time into the kudos/hr denominator."""
+
     _sleep: Callable[[float], Awaitable[None]]
     """Pacing sleep used by the control loop. Defaults to asyncio.sleep; tests inject a no-op
     so the loop can be driven tick-by-tick without wall-clock delays."""
@@ -1533,15 +1539,13 @@ class HordeWorkerProcessManager:
         """Calculate and log information about the kudos generated in the current session."""
         # Use KudosCalculator to compute all metrics
         (
-            time_since_session_start,
+            eligible_seconds_total,
             kudos_per_hour_session,
             kudos_total_past_hour,
-            active_kudos_per_hour,
             cleaned_events,
         ) = KudosCalculator.calculate_all_metrics(
             self._state.kudos_generated_this_session,
-            self.session_start_time,
-            self._job_popper.time_spent_no_jobs_available,
+            self._state.eligible_seconds_total,
             self._state.kudos_events,
         )
 
@@ -1549,10 +1553,9 @@ class HordeWorkerProcessManager:
         self._state.kudos_events = cleaned_events
 
         kudos_info_string = self.generate_kudos_info_string(
-            time_since_session_start,
+            eligible_seconds_total,
             kudos_per_hour_session,
             kudos_total_past_hour,
-            active_kudos_per_hour,
         )
 
         self.log_kudos_info(kudos_info_string)
@@ -1572,30 +1575,25 @@ class HordeWorkerProcessManager:
 
     def generate_kudos_info_string(
         self,
-        time_since_session_start: float,
-        kudos_per_hour_session: float,
+        eligible_seconds_total: float,
+        kudos_per_hour_session: float | None,
         kudos_total_past_hour: float,
-        active_kudos_per_hour: float,
     ) -> str:
         """Generate a string with information about the kudos generated in the current session.
 
         Args:
-            time_since_session_start: The time since the session started.
-            kudos_per_hour_session: The kudos per hour generated in the current session.
+            eligible_seconds_total: Productive seconds since the first submit (the rate's denominator).
+            kudos_per_hour_session: The kudos per hour over productive time, or None while warming up.
             kudos_total_past_hour: The total kudos generated in the past hour.
-            active_kudos_per_hour: The kudos per hour generated while active (jobs available).
 
         Returns:
             A string with information about the kudos generated in the current session.
         """
         return _generate_kudos_info_string(
             kudos_generated_this_session=self._state.kudos_generated_this_session,
-            time_since_session_start=time_since_session_start,
+            eligible_seconds_total=eligible_seconds_total,
             kudos_per_hour_session=kudos_per_hour_session,
             kudos_total_past_hour=kudos_total_past_hour,
-            active_kudos_per_hour=active_kudos_per_hour,
-            time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
-            max_time_spent_no_jobs_available=self._job_popper._pop_throttler._max_time_spent_no_jobs_available,
         )
 
     def log_kudos_info(self, kudos_info_string: str) -> None:
@@ -1972,6 +1970,11 @@ class HordeWorkerProcessManager:
         self._maybe_log_duty_cycle()
         self._sample_disk_space()
         self._update_pop_governors()
+        self._state.tick_eligible_seconds(
+            time.time(),
+            has_pipeline_work=self._has_pipeline_work(),
+            max_dt=self._ELIGIBLE_MAX_TICK_DT_SECONDS,
+        )
         self._publish_supervisor_snapshot()
 
         await self._sleep(self._loop_interval / 2)
@@ -3616,6 +3619,29 @@ class HordeWorkerProcessManager:
             workloads = workloads - {WorkloadKind.IMAGE_GENERATION}
         return [workload.value for workload in workloads]
 
+    def _has_pipeline_work(self) -> bool:
+        """Whether the worker currently holds any job or alchemy form anywhere in its pipeline.
+
+        Drives the eligible-seconds (productive-time) clock: an empty pipeline earns no kudos regardless of
+        why it is empty (idle, server maintenance, or a pause that has already drained the local queue),
+        while a still-draining pipeline keeps earning kudos and so counts as productive time.
+        """
+        tracker = self._job_tracker
+        if (
+            tracker.jobs_pending_inference
+            or tracker.jobs_in_progress
+            or tracker.jobs_pending_safety_check
+            or tracker.jobs_being_safety_checked
+            or tracker.jobs_pending_post_processing
+            or tracker.jobs_being_post_processed
+            or tracker.jobs_pending_submit
+        ):
+            return True
+        coordinator = self._alchemy_coordinator
+        return bool(
+            coordinator.num_forms_pending or coordinator.num_forms_in_flight or coordinator.num_forms_awaiting_submit,
+        )
+
     def _build_worker_state_snapshot(self) -> WorkerStateSnapshot:
         """Assemble current worker state for the supervisor pipe (mirrors what StatusReporter prints)."""
         import horde_worker_regen
@@ -3633,9 +3659,15 @@ class HordeWorkerProcessManager:
             disk_min_free_bytes=self._disk_monitor.min_free_bytes,
         )
 
-        session_hours = max((time.time() - self.session_start_time) / 3600.0, 1e-6)
         kudos_session = self._state.kudos_generated_this_session
-        kudos_per_hour = kudos_session / session_hours if kudos_session else None
+        eligible_seconds = self._state.eligible_seconds_total
+        # Denominate by productive seconds since the first submit, not wall-clock since process start: this
+        # keeps the cold-start lead-in and idle/maintenance/drained-pause stretches out of the rate.
+        kudos_per_hour = (
+            kudos_session / eligible_seconds * 3600.0
+            if self._state.first_kudos_event_time is not None and eligible_seconds > 0
+            else None
+        )
 
         now = time.time()
         gpu_utilization_mean_percent = self._gpu_sampler.mean_percent(
@@ -3671,6 +3703,8 @@ class HordeWorkerProcessManager:
                 jobs_submitted=self._job_tracker.total_num_completed_jobs,
                 jobs_faulted=self._job_tracker.num_jobs_faulted,
                 kudos_per_hour=kudos_per_hour,
+                kudos_this_session=kudos_session,
+                eligible_seconds_total=eligible_seconds,
                 gpu_duty_percent=gpu_utilization_mean_percent,
                 gpu_busy_fraction=gpu_utilization_busy_fraction,
                 pending_megapixelsteps=self._job_tracker.get_pending_megapixelsteps(),
@@ -3784,6 +3818,7 @@ class HordeWorkerProcessManager:
             time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
             kudos_per_hour=kudos_per_hour,
             kudos_this_session=kudos_session,
+            eligible_seconds_total=eligible_seconds,
             active_models=active_models,
             gpu_utilization_mean_percent=gpu_utilization_mean_percent,
             gpu_utilization_busy_fraction=gpu_utilization_busy_fraction,

@@ -140,6 +140,26 @@ class WorkerState:
     kudos_generated_this_session: float = 0.0
     kudos_events: deque[tuple[float, float]] = dataclasses.field(default_factory=deque)
 
+    first_kudos_event_time: float | None = None
+    """Wall-clock of the first successful submit (image or alchemy), or None before any kudos land.
+
+    The kudos/hr rate is undefined until this is set: a cold worker reads "warming up" rather than a
+    misleadingly low number built on the process-start-to-first-job lead-in."""
+
+    eligible_seconds_total: float = 0.0
+    """Cumulative *productive* wall-seconds since :attr:`first_kudos_event_time`: time during which the
+    worker held at least one job anywhere in its pipeline. This is the honest denominator for the kudos/hr
+    rate.
+
+    Time with an empty pipeline (server exhaustion, server maintenance, or an operator pause that has
+    already drained the local queue) earns no kudos and is not counted, so the rate neither decays while
+    idle nor charges the cold-start lead-in. A pause or maintenance while queued work is still draining *is*
+    productive (kudos keep landing) and is counted, so the exclusion keys off actual pipeline occupancy
+    rather than the pause/maintenance flags."""
+
+    _eligible_last_tick_time: float | None = None
+    """Internal marker: wall-clock of the last :meth:`tick_eligible_seconds` call, for delta accumulation."""
+
     alchemy_forms_in_flight: int = 0
     """Alchemy forms currently anywhere in the pop->dispatch->submit pipeline.
 
@@ -172,6 +192,29 @@ class WorkerState:
             self.avg_safety_seconds = seconds
         else:
             self.avg_safety_seconds = (1 - alpha) * self.avg_safety_seconds + alpha * seconds
+
+    def note_first_kudos_event(self, now: float) -> None:
+        """Record the first successful submit, which starts the kudos/hr measurement window (idempotent)."""
+        if self.first_kudos_event_time is None:
+            self.first_kudos_event_time = now
+
+    def tick_eligible_seconds(self, now: float, *, has_pipeline_work: bool, max_dt: float) -> None:
+        """Advance the productive-time clock that denominates the kudos/hr rate; call once per control tick.
+
+        Before the first submit the clock does not run (only the last-tick marker is kept fresh so the first
+        productive interval is not overcounted). After it, wall-time since the previous tick is added only
+        while the pipeline holds work, so idle, maintenance, and drained-pause stretches never inflate the
+        denominator. ``max_dt`` clamps a stalled-loop gap so a long pause between ticks cannot dump a
+        spurious burst of "productive" time into the total.
+        """
+        previous = self._eligible_last_tick_time
+        self._eligible_last_tick_time = now
+        if self.first_kudos_event_time is None or previous is None:
+            return
+        if has_pipeline_work:
+            dt = now - previous
+            if dt > 0:
+                self.eligible_seconds_total += min(dt, max_dt)
 
     def initiate_shutdown(self) -> None:
         """Mark the worker as shutting down (idempotent)."""

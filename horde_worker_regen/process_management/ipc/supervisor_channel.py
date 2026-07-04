@@ -393,6 +393,10 @@ class StatsSample(BaseModel):
     jobs_submitted: int = 0
     jobs_faulted: int = 0
     kudos_per_hour: float | None = None
+    kudos_this_session: float | None = None
+    """Cumulative kudos earned this session at sample time, for windowed kudos/hr deltas."""
+    eligible_seconds_total: float = 0.0
+    """Cumulative productive (pipeline-occupied) seconds at sample time; the kudos/hr denominator."""
     gpu_duty_percent: float | None = None
     gpu_busy_fraction: float | None = None
     pending_megapixelsteps: int = 0
@@ -976,6 +980,8 @@ class WorkerStateSnapshot(BaseModel):
 
     kudos_per_hour: float | None = None
     kudos_this_session: float | None = None
+    eligible_seconds_total: float = 0.0
+    """Cumulative productive (pipeline-occupied) seconds since the first submit; the kudos/hr denominator."""
 
     active_models: list[str] = Field(default_factory=list)
 

@@ -962,8 +962,10 @@ class AlchemyCoordinator:
             f"Submitted alchemy form {submit.form_id[:8]} (<u>{submit.result_message.form}</u>) "
             f"for {response.reward:,.2f} kudos. Form popped {time_taken} seconds ago.",
         )
+        submit_time = time.time()
+        self._state.note_first_kudos_event(submit_time)
         self._state.kudos_generated_this_session += response.reward
-        self._state.kudos_events.append((time.time(), response.reward))
+        self._state.kudos_events.append((submit_time, response.reward))
         submit.succeed(int(response.reward))
         self.num_forms_submitted += 1
         # A successfully-delivered submit can still carry a faulted generation (e.g. a source-image

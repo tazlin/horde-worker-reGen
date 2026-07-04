@@ -7,98 +7,31 @@ from horde_worker_regen.utils.kudos_calculator import KudosCalculator
 
 
 def test_calculate_kudos_per_hour_normal() -> None:
-    """Test kudos per hour calculation with normal values."""
+    """Test kudos per hour calculation over productive time."""
     kudos_generated = 100.0
-    time_elapsed = 1800  # 30 minutes
+    eligible_seconds = 1800  # 30 productive minutes
 
-    result = KudosCalculator.calculate_kudos_per_hour(kudos_generated, time_elapsed)
+    result = KudosCalculator.calculate_kudos_per_hour(kudos_generated, eligible_seconds)
 
-    # 100 kudos in 30 minutes = 200 kudos per hour
+    # 100 kudos in 30 productive minutes = 200 kudos per hour
     assert result == 200.0
 
 
-def test_calculate_kudos_per_hour_zero_time() -> None:
-    """Test kudos per hour calculation with zero time elapsed."""
-    kudos_generated = 100.0
-    time_elapsed = 0
+def test_calculate_kudos_per_hour_no_productive_time() -> None:
+    """With no productive time accrued yet the rate is undefined (the worker is still warming up)."""
+    result = KudosCalculator.calculate_kudos_per_hour(100.0, 0)
 
-    result = KudosCalculator.calculate_kudos_per_hour(kudos_generated, time_elapsed)
-
-    assert result == 0.0
+    assert result is None
 
 
 def test_calculate_kudos_per_hour_one_hour() -> None:
-    """Test kudos per hour calculation with exactly one hour."""
+    """Test kudos per hour calculation with exactly one productive hour."""
     kudos_generated = 150.0
-    time_elapsed = 3600  # 1 hour
+    eligible_seconds = 3600  # 1 productive hour
 
-    result = KudosCalculator.calculate_kudos_per_hour(kudos_generated, time_elapsed)
+    result = KudosCalculator.calculate_kudos_per_hour(kudos_generated, eligible_seconds)
 
     assert result == 150.0
-
-
-def test_calculate_active_kudos_per_hour_normal() -> None:
-    """Test active kudos per hour calculation with normal values."""
-    kudos_generated = 100.0
-    time_elapsed = 1800  # 30 minutes
-    time_spent_idle = 300  # 5 minutes idle
-
-    result = KudosCalculator.calculate_active_kudos_per_hour(
-        kudos_generated,
-        time_elapsed,
-        time_spent_idle,
-    )
-
-    # 100 kudos in 25 minutes active = 240 kudos per hour
-    assert result == 240.0
-
-
-def test_calculate_active_kudos_per_hour_no_idle_time() -> None:
-    """Test active kudos per hour calculation with no idle time."""
-    kudos_generated = 100.0
-    time_elapsed = 1800  # 30 minutes
-    time_spent_idle = 0
-
-    result = KudosCalculator.calculate_active_kudos_per_hour(
-        kudos_generated,
-        time_elapsed,
-        time_spent_idle,
-    )
-
-    # Same as regular kudos per hour
-    assert result == 200.0
-
-
-def test_calculate_active_kudos_per_hour_all_idle() -> None:
-    """Test active kudos per hour calculation when all time is idle."""
-    kudos_generated = 100.0
-    time_elapsed = 1800  # 30 minutes
-    time_spent_idle = 1800  # All idle
-
-    result = KudosCalculator.calculate_active_kudos_per_hour(
-        kudos_generated,
-        time_elapsed,
-        time_spent_idle,
-    )
-
-    # No active time = 0
-    assert result == 0.0
-
-
-def test_calculate_active_kudos_per_hour_more_idle_than_elapsed() -> None:
-    """Test active kudos per hour calculation when idle time exceeds elapsed time."""
-    kudos_generated = 100.0
-    time_elapsed = 1800  # 30 minutes
-    time_spent_idle = 2000  # More than elapsed (edge case)
-
-    result = KudosCalculator.calculate_active_kudos_per_hour(
-        kudos_generated,
-        time_elapsed,
-        time_spent_idle,
-    )
-
-    # Negative active time = 0
-    assert result == 0.0
 
 
 def test_calculate_kudos_totals_past_hour_all_recent() -> None:
@@ -177,17 +110,16 @@ def test_calculate_kudos_totals_past_hour_maxlen_preserved() -> None:
         maxlen=original_maxlen,
     )
 
-    total, cleaned = KudosCalculator.calculate_kudos_totals_past_hour(kudos_events)
+    _total, cleaned = KudosCalculator.calculate_kudos_totals_past_hour(kudos_events)
 
     assert cleaned.maxlen == original_maxlen
 
 
 def test_calculate_all_metrics_integration() -> None:
-    """Test calculate_all_metrics returns all expected values."""
+    """Test calculate_all_metrics returns the session rate over productive seconds and the past-hour total."""
     current_time = time.time()
     kudos_generated_this_session = 200.0
-    session_start_time = current_time - 3600  # Started 1 hour ago
-    time_spent_no_jobs_available = 600  # 10 minutes idle
+    eligible_seconds_total = 3000.0  # 50 productive minutes (10 of the last hour were idle)
     kudos_events = deque(
         [
             (current_time - 1800, 100.0),  # 30 minutes ago
@@ -197,32 +129,24 @@ def test_calculate_all_metrics_integration() -> None:
     )
 
     (
-        time_since_session_start,
+        echoed_eligible_seconds,
         kudos_per_hour_session,
         kudos_total_past_hour,
-        active_kudos_per_hour,
         cleaned_events,
     ) = KudosCalculator.calculate_all_metrics(
         kudos_generated_this_session,
-        session_start_time,
-        time_spent_no_jobs_available,
+        eligible_seconds_total,
         kudos_events,
     )
 
-    # Check time_since_session_start is approximately 1 hour (allow small delta for test execution time)
-    assert abs(time_since_session_start - 3600) < 1
+    assert echoed_eligible_seconds == eligible_seconds_total
 
-    # Check kudos_per_hour_session: 200 kudos in 1 hour = 200/hr
-    assert abs(kudos_per_hour_session - 200.0) < 1
+    # 200 kudos over 50 productive minutes = 240/hr
+    assert kudos_per_hour_session is not None
+    assert abs(kudos_per_hour_session - 240.0) < 1
 
-    # Check kudos_total_past_hour: both events are within the hour
+    # Both events are within the hour
     assert kudos_total_past_hour == 200.0
-
-    # Check active_kudos_per_hour: 200 kudos in 50 minutes active = 240/hr
-    expected_active = 200.0 / (3600 - 600) * 3600
-    assert abs(active_kudos_per_hour - expected_active) < 1
-
-    # Check cleaned_events has both events
     assert len(cleaned_events) == 2
 
 
@@ -230,8 +154,7 @@ def test_calculate_all_metrics_with_old_events() -> None:
     """Test calculate_all_metrics properly cleans old events."""
     current_time = time.time()
     kudos_generated_this_session = 300.0
-    session_start_time = current_time - 7200  # Started 2 hours ago
-    time_spent_no_jobs_available = 1200  # 20 minutes idle
+    eligible_seconds_total = 6000.0
     kudos_events = deque(
         [
             (current_time - 7000, 50.0),  # ~2 hours ago (should be excluded)
@@ -243,50 +166,32 @@ def test_calculate_all_metrics_with_old_events() -> None:
     )
 
     (
-        time_since_session_start,
-        kudos_per_hour_session,
+        _echoed_eligible_seconds,
+        _kudos_per_hour_session,
         kudos_total_past_hour,
-        active_kudos_per_hour,
         cleaned_events,
     ) = KudosCalculator.calculate_all_metrics(
         kudos_generated_this_session,
-        session_start_time,
-        time_spent_no_jobs_available,
+        eligible_seconds_total,
         kudos_events,
     )
 
-    # Check kudos_total_past_hour only includes recent events
+    # Only the recent events count toward the past-hour total.
     assert kudos_total_past_hour == 200.0
-
-    # Check cleaned_events only has recent events
     assert len(cleaned_events) == 2
 
 
-def test_calculate_all_metrics_no_idle_time() -> None:
-    """Test calculate_all_metrics with no idle time."""
-    current_time = time.time()
-    kudos_generated_this_session = 100.0
-    session_start_time = current_time - 1800  # Started 30 minutes ago
-    time_spent_no_jobs_available = 0  # No idle time
-    kudos_events = deque(
-        [
-            (current_time - 900, 100.0),  # 15 minutes ago
-        ],
-        maxlen=100,
-    )
-
+def test_calculate_all_metrics_warming_up() -> None:
+    """Before any productive time accrues, the session rate is None ("warming up")."""
     (
-        time_since_session_start,
+        _echoed_eligible_seconds,
         kudos_per_hour_session,
-        kudos_total_past_hour,
-        active_kudos_per_hour,
-        cleaned_events,
+        _kudos_total_past_hour,
+        _cleaned_events,
     ) = KudosCalculator.calculate_all_metrics(
-        kudos_generated_this_session,
-        session_start_time,
-        time_spent_no_jobs_available,
-        kudos_events,
+        0.0,
+        0.0,
+        deque([], maxlen=100),
     )
 
-    # When there's no idle time, active and regular kudos per hour should be the same
-    assert abs(kudos_per_hour_session - active_kudos_per_hour) < 0.01
+    assert kudos_per_hour_session is None

@@ -1212,10 +1212,10 @@ class HordeWorkerTUI(App[None]):
         self._tick()
 
     def action_reset_trends(self) -> None:
-        """Soft-reset the Overview trend epoch without discarding older session samples."""
+        """Reset the Overview trend view: clear the (display-only) sample buffers and start a fresh epoch."""
         with contextlib.suppress(NoMatches):
             self.query_one(OverviewView).soft_reset_trends()
-        self.notify("Overview trends soft-reset.")
+        self.notify("Overview trends reset.")
         self._tick()
 
     def action_toggle_work_ledger_recent_jobs(self) -> None:

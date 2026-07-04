@@ -10,40 +10,21 @@ class KudosCalculator:
     """Handles kudos calculations and metrics."""
 
     @staticmethod
-    def calculate_kudos_per_hour(kudos_generated: float, time_elapsed: float) -> float:
-        """Calculate kudos per hour from total kudos and elapsed time.
+    def calculate_kudos_per_hour(kudos_generated: float, eligible_seconds: float) -> float | None:
+        """Calculate kudos per hour over productive time.
 
         Args:
             kudos_generated: Total kudos generated.
-            time_elapsed: Time elapsed in seconds.
+            eligible_seconds: Productive (pipeline-occupied) seconds since the first submit. This is the
+                honest denominator: it excludes the cold-start lead-in and any idle, maintenance, or
+                drained-pause time during which no kudos could be earned.
 
         Returns:
-            Kudos per hour rate.
+            Kudos per hour rate, or None until productive time has accrued (a cold worker is "warming up").
         """
-        if time_elapsed == 0:
-            return 0.0
-        return kudos_generated / time_elapsed * 3600
-
-    @staticmethod
-    def calculate_active_kudos_per_hour(
-        kudos_generated: float,
-        time_elapsed: float,
-        time_spent_idle: float,
-    ) -> float:
-        """Calculate kudos per hour excluding idle time.
-
-        Args:
-            kudos_generated: Total kudos generated.
-            time_elapsed: Total time elapsed in seconds.
-            time_spent_idle: Time spent without jobs available in seconds.
-
-        Returns:
-            Kudos per hour rate when actively processing jobs.
-        """
-        active_time = time_elapsed - time_spent_idle
-        if active_time <= 0:
-            return 0.0
-        return kudos_generated / active_time * 3600
+        if eligible_seconds <= 0:
+            return None
+        return kudos_generated / eligible_seconds * 3600
 
     @staticmethod
     def calculate_kudos_totals_past_hour(
@@ -85,37 +66,27 @@ class KudosCalculator:
     @staticmethod
     def calculate_all_metrics(
         kudos_generated_this_session: float,
-        session_start_time: float,
-        time_spent_no_jobs_available: float,
+        eligible_seconds_total: float,
         kudos_events: deque[tuple[float, float]],
-    ) -> tuple[float, float, float, float, deque[tuple[float, float]]]:
-        """Calculate all kudos metrics.
+    ) -> tuple[float, float | None, float, deque[tuple[float, float]]]:
+        """Calculate the session kudos metrics over productive time.
 
         Args:
             kudos_generated_this_session: Total kudos generated in this session.
-            session_start_time: Session start timestamp.
-            time_spent_no_jobs_available: Time spent idle in seconds.
+            eligible_seconds_total: Productive (pipeline-occupied) seconds since the first submit; the
+                honest rate denominator (see :meth:`calculate_kudos_per_hour`).
             kudos_events: Deque of (timestamp, kudos) tuples.
 
         Returns:
             Tuple of:
-            - time_since_session_start (seconds)
-            - kudos_per_hour_session
+            - eligible_seconds_total (echoed back for display)
+            - kudos_per_hour_session (None until productive time has accrued)
             - kudos_total_past_hour
-            - active_kudos_per_hour
             - cleaned kudos_events deque
         """
-        time_since_session_start = time.time() - session_start_time
-
         kudos_per_hour_session = KudosCalculator.calculate_kudos_per_hour(
             kudos_generated_this_session,
-            time_since_session_start,
-        )
-
-        active_kudos_per_hour = KudosCalculator.calculate_active_kudos_per_hour(
-            kudos_generated_this_session,
-            time_since_session_start,
-            time_spent_no_jobs_available,
+            eligible_seconds_total,
         )
 
         kudos_total_past_hour, cleaned_events = KudosCalculator.calculate_kudos_totals_past_hour(
@@ -123,9 +94,8 @@ class KudosCalculator:
         )
 
         return (
-            time_since_session_start,
+            eligible_seconds_total,
             kudos_per_hour_session,
             kudos_total_past_hour,
-            active_kudos_per_hour,
             cleaned_events,
         )

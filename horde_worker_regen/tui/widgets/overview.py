@@ -67,7 +67,12 @@ from horde_worker_regen.tui.responsive import (
     select_columns,
     shed_hint,
 )
-from horde_worker_regen.tui.trends import fixed_counter_deltas, fixed_float_buckets, trend_bounds
+from horde_worker_regen.tui.trends import (
+    fixed_counter_deltas,
+    fixed_float_buckets,
+    fixed_ratio_deltas,
+    trend_bounds,
+)
 from horde_worker_regen.tui.widgets.downloads import summarize_download_activity
 from horde_worker_regen.tui.widgets.overview_layout import OVERVIEW_ELEMENTS
 from horde_worker_regen.update_check import UpdateInfo, current_version
@@ -243,7 +248,10 @@ class OverviewView(Vertical):
         """Set up the view, including the client-side trend history for the Trends sparklines."""
         super().__init__()
         self._gpu_duty_history: deque[tuple[float, float]] = deque(maxlen=_TREND_HISTORY)
-        self._kudos_history: deque[tuple[float, float]] = deque(maxlen=_TREND_HISTORY)
+        # (timestamp, cumulative kudos, cumulative productive seconds): the windowed kudos/hr divides the
+        # kudos earned across the window by the productive seconds earned across it, so idle/maintenance
+        # time inside the window is excluded rather than dragging a raw-wall-clock rate down.
+        self._kudos_history: deque[tuple[float, float, float]] = deque(maxlen=_TREND_HISTORY)
         self._jobs_history: deque[tuple[float, int]] = deque(maxlen=_TREND_HISTORY)
         self._forms_history: deque[tuple[float, int]] = deque(maxlen=_TREND_HISTORY)
         self._last_trend_sample = 0.0
@@ -261,8 +269,17 @@ class OverviewView(Vertical):
         """Return the current trend window."""
         return self._trend_window
 
-    def soft_reset_trends(self, *, notice: str = "Trends soft-reset; waiting for fresh samples.") -> None:
-        """Start a new trend epoch while retaining older session samples for All-mode context."""
+    def soft_reset_trends(self, *, notice: str = "Trends reset; waiting for fresh samples.") -> None:
+        """Reset the client-side trend view: clear the sample buffers and start a fresh epoch.
+
+        Every buffer here is display-only (no scheduling, throttle, or dispatch path reads them), so clearing
+        them cannot affect worker behavior. Backend session accounting (the console kudos line, the Stats-tab
+        "this session" totals) is deliberately left running; this reset is purely the operator's trend view.
+        """
+        self._gpu_duty_history.clear()
+        self._kudos_history.clear()
+        self._jobs_history.clear()
+        self._forms_history.clear()
         self._trend_epoch = time.time()
         self._trend_notice = notice
 
@@ -507,13 +524,14 @@ class OverviewView(Vertical):
         now = sample.timestamp if sample is not None else (snapshot.timestamp or time.time())
         self._trend_session_start = snapshot.session_start_time or self._trend_session_start
         gpu_duty = sample.gpu_duty_percent if sample is not None else snapshot.gpu_utilization_mean_percent
-        kudos_per_hour = sample.kudos_per_hour if sample is not None else snapshot.kudos_per_hour
+        kudos_total = sample.kudos_this_session if sample is not None else snapshot.kudos_this_session
+        eligible_seconds = sample.eligible_seconds_total if sample is not None else snapshot.eligible_seconds_total
         jobs_submitted = sample.jobs_submitted if sample is not None else snapshot.num_jobs_submitted
         forms_submitted = sample.alchemy_total_submitted if sample is not None else snapshot.alchemy_total_submitted
         if gpu_duty is not None:
             self._gpu_duty_history.append((now, gpu_duty))
-        if kudos_per_hour is not None:
-            self._kudos_history.append((now, kudos_per_hour))
+        if kudos_total is not None:
+            self._kudos_history.append((now, kudos_total, eligible_seconds))
         self._jobs_history.append((now, jobs_submitted))
         self._forms_history.append((now, forms_submitted))
 
@@ -1519,6 +1537,22 @@ class OverviewView(Vertical):
             return Text(f"▼ {abs(change) * 100:.0f}%", style="red")
         return Text("→", style="grey50")
 
+    def _kudos_per_hour(self) -> tuple[float | None, list[float]]:
+        """Derive windowed kudos/hr and per-bucket kudos deltas over productive seconds in the window.
+
+        Unlike a sampled session average, this is a stable windowed rate (the kudos/hr analogue of jobs/hr):
+        it divides the kudos earned across the window by the productive seconds earned across it, so it does
+        not sawtooth on each submit and does not charge idle/maintenance time inside the window.
+        """
+        rate, deltas, _sampled_span = fixed_ratio_deltas(
+            list(self._kudos_history),
+            self._trend_window,
+            session_start=self._trend_session_start,
+            epoch=self._trend_epoch,
+            buckets=_TREND_SPARK_WIDTH,
+        )
+        return rate, deltas
+
     def _jobs_per_hour(self) -> tuple[float | None, list[float]]:
         """Derive jobs/hr and fixed-window completion buckets from the cumulative job counter."""
         rate, deltas, _sampled_span = fixed_counter_deltas(
@@ -1597,7 +1631,8 @@ class OverviewView(Vertical):
         window start, and the GPU row adds a duty bar so "how much of the time it is working" reads
         at a glance alongside the over-time shape.
         """
-        kudos_series = self._windowed_float_series(self._kudos_history)[-_TREND_SPARK_WIDTH:]
+        kudos_rate, kudos_deltas = self._kudos_per_hour()
+        kudos_deltas = kudos_deltas[-_TREND_SPARK_WIDTH:]
         gpu_series = self._windowed_float_series(self._gpu_duty_history)[-_TREND_SPARK_WIDTH:]
         rate, jobs_deltas = self._jobs_per_hour()
         jobs_deltas = jobs_deltas[-_TREND_SPARK_WIDTH:]
@@ -1609,14 +1644,15 @@ class OverviewView(Vertical):
         grid.add_column(no_wrap=True)
         grid.add_column(style="grey50", no_wrap=True)
 
-        kudos_now = "-" if snapshot.kudos_per_hour is None else f"{snapshot.kudos_per_hour:,.0f}"
-        kudos_peak = f"peak {max(kudos_series):,.0f}" if kudos_series else ""
+        kudos_now = "-" if kudos_rate is None else f"{kudos_rate:,.0f}"
+        kudos_total = snapshot.kudos_this_session
+        kudos_tail = f"{kudos_total:,.0f} kudos" if kudos_total else ""
         grid.add_row(
             "Kudos/hr",
             kudos_now,
-            self._trend_arrow(kudos_series),
-            Text(sparkline(kudos_series) or "…", style="cyan"),
-            kudos_peak,
+            self._trend_arrow(kudos_deltas),
+            Text(sparkline(kudos_deltas) or "…", style="cyan"),
+            kudos_tail,
         )
 
         jobs_now = "-" if rate is None else f"{rate:,.0f}"
@@ -1740,7 +1776,7 @@ class OverviewView(Vertical):
         line = Text.assemble(*parts)
         line.append_text(Text.assemble(sep, (f"{snapshot.num_jobs_submitted:,}", "bold"), (" done", "grey50")))
         line.append_text(Text.assemble(sep, (kudos, "bold cyan"), ("/h ", "grey50")))
-        line.append_text(self._trend_arrow(self._windowed_float_series(self._kudos_history)[-_TREND_SPARK_WIDTH:]))
+        line.append_text(self._trend_arrow(self._kudos_per_hour()[1][-_TREND_SPARK_WIDTH:]))
         gpu_pct = format_percent(snapshot.gpu_utilization_mean_percent)
         line.append_text(Text.assemble((" gpu ", "grey50"), (gpu_pct, "")))
         if busy_fraction is not None:

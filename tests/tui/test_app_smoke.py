@@ -113,6 +113,35 @@ async def test_trend_window_cycle_does_not_soft_reset_existing_history(tmp_path:
         assert store.load().overview_trend_window is OverviewTrendWindow.THIRTY_MINUTES
 
 
+async def test_reset_trends_clears_all_display_buffers(tmp_path: Path) -> None:
+    """The explicit reset action empties every (display-only) trend buffer, not just the render epoch."""
+    store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")
+    store.set_auto_start_worker(True)
+    store.record_onboarding_choice(OnboardingChoice.DECLINED)
+    fake = FakeSupervisor(alive=True)
+    fake.latest_snapshot = WorkerStateSnapshot(
+        config=WorkerConfigSummary(dreamer_name="Reset", worker_version="0.0.0")
+    )
+    app = HordeWorkerTUI(fake, config_path=Path("bridgeData.yaml"), app_state_store=store)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        app._tick()
+        await pilot.pause()
+        overview = app.query_one(OverviewView)
+        overview._kudos_history.append((10.0, 100.0, 60.0))
+        overview._jobs_history.append((10.0, 3))
+        overview._forms_history.append((10.0, 2))
+        overview._gpu_duty_history.append((10.0, 50.0))
+
+        app.action_reset_trends()
+        await pilot.pause()
+
+        assert not overview._kudos_history
+        assert not overview._jobs_history
+        assert not overview._forms_history
+        assert not overview._gpu_duty_history
+
+
 async def test_control_tab_forwards_relegated_controls(tmp_path: Path) -> None:
     """The Control tab owns local pause, auto-start, and horde-maintenance controls."""
     store = AppStateStore(tmp_path / ".horde_worker_regen" / "state.json")

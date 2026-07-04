@@ -64,6 +64,47 @@ def fixed_float_buckets(
     return [totals[index] / counts[index] if counts[index] else 0.0 for index in range(buckets)]
 
 
+def fixed_ratio_deltas(
+    samples: Sequence[tuple[float, float, float]],
+    window: OverviewTrendWindow,
+    *,
+    now: float | None = None,
+    session_start: float | None = None,
+    epoch: float | None = None,
+    buckets: int = 48,
+) -> tuple[float | None, list[float], float]:
+    """Return a windowed rate, bucketed numerator deltas, and sampled span for paired cumulative counters.
+
+    Each sample is ``(timestamp, numerator_cumulative, denominator_cumulative)``. The rate is the numerator
+    earned across the window divided by the *denominator* earned across it (times 3600). When the denominator
+    is productive seconds, this yields an "active" rate that excludes idle/maintenance time inside the window
+    rather than dividing by raw wall-clock. The bucket series is the per-bucket numerator delta (throughput
+    shape), matching how the counter-delta sparklines read; empty buckets stay zero.
+    """
+    start, end, configured = trend_bounds(window, now=now, session_start=session_start, epoch=epoch)
+    span = configured if configured is not None else max(end - start, 1.0)
+    if buckets <= 0 or span <= 0:
+        return None, [], 0.0
+    bucket_seconds = span / buckets
+    in_window = [
+        (timestamp, numerator, denominator)
+        for timestamp, numerator, denominator in samples
+        if start <= timestamp <= end
+    ]
+    if len(in_window) < 2:
+        return None, [0.0 for _ in range(buckets)], 0.0
+    deltas = [0.0 for _ in range(buckets)]
+    for previous, current in zip(in_window, in_window[1:], strict=False):
+        numerator_delta = max(0.0, current[1] - previous[1])
+        index = min(buckets - 1, max(0, int((current[0] - start) / bucket_seconds)))
+        deltas[index] += numerator_delta
+    numerator_total = max(0.0, in_window[-1][1] - in_window[0][1])
+    denominator_total = max(0.0, in_window[-1][2] - in_window[0][2])
+    sampled_span = max(in_window[-1][0] - in_window[0][0], 0.0)
+    rate = (numerator_total / denominator_total * 3600.0) if denominator_total > 0 else None
+    return rate, deltas, sampled_span
+
+
 def fixed_counter_deltas(
     samples: Sequence[tuple[float, int]],
     window: OverviewTrendWindow,

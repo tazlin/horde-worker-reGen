@@ -366,8 +366,10 @@ class JobSubmitter:
             )
             await self._job_tracker.increment_jobs_faulted()
 
+        submit_time = time.time()
+        self._state.note_first_kudos_event(submit_time)
         self._state.kudos_generated_this_session += job_submit_response.reward
-        self._state.kudos_events.append((time.time(), job_submit_response.reward))
+        self._state.kudos_events.append((submit_time, job_submit_response.reward))
         new_submit.succeed(new_submit.kudos_reward, new_submit.kudos_per_second)
         return new_submit
 
