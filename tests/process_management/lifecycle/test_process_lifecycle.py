@@ -587,6 +587,45 @@ def test_pause_safety_on_gpu_is_noop_when_safety_not_on_gpu() -> None:
     assert plm.is_safety_gpu_paused is False
 
 
+def test_pause_and_restore_post_process_lane_stops_and_restarts_it_for_whole_card() -> None:
+    """A whole-card model stops the post-processing lane (freeing its context), then restarts it after.
+
+    Unlike safety (which cycles cpu_only), the lane has no useful CPU fallback, so it is stopped outright:
+    the per-tick start hook must stay a no-op while paused so the lane does not resurrect, and clearing the
+    pause lets the next start bring it back. The pause/restart is marked intentional so it is not counted as
+    a lane crash.
+    """
+    running_lane = make_mock_process_info(1, process_type=HordeProcessType.POST_PROCESS)
+    plm = _make_plm(process_map=ProcessMap({1: running_lane}))
+    plm._runtime_config.bridge_data.post_processing_lane_enabled = True
+
+    assert plm.is_post_process_gpu_paused is False
+    assert plm.pause_post_process_off_gpu() is True
+    assert plm.is_post_process_gpu_paused is True
+    # The lane-replacement state machine was armed (to end the running lane) and marked intentional.
+    assert plm.post_process_processes_should_be_replaced is True
+    assert plm._post_process_replacement_intentional is True
+    # Idempotent: a second pause does nothing.
+    assert plm.pause_post_process_off_gpu() is False
+
+    # The per-tick start hook must not resurrect the lane while it is paused.
+    plm.start_post_process_processes()
+    assert plm._process_map.num_post_process_processes() == 1  # only the still-ending original, no new start
+
+    assert plm.restore_post_process_off_gpu() is True
+    assert plm.is_post_process_gpu_paused is False
+    # Idempotent: restoring when not paused does nothing.
+    assert plm.restore_post_process_off_gpu() is False
+
+
+def test_pause_post_process_lane_is_noop_when_lane_disabled() -> None:
+    """With the dedicated lane disabled there is no lane to stop, so the pause is a no-op."""
+    plm = _make_plm()
+    plm._runtime_config.bridge_data.post_processing_lane_enabled = False
+    assert plm.pause_post_process_off_gpu() is False
+    assert plm.is_post_process_gpu_paused is False
+
+
 def _captured_safety_cpu_only(plm: ProcessLifecycleManager) -> bool:
     """Start a safety process with a mocked spawn and return the cpu_only arg it was launched with."""
     # A real integer pid so the owned-process ledger event validates (it records os_pid).

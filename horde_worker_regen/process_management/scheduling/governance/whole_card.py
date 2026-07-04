@@ -226,13 +226,25 @@ class WholeCardResidencyMachine(WholeCardResidencyLedger):
         loaded_process_count: int,
         safety_pause_required: bool,
         safety_paused: bool,
+        post_process_pause_required: bool = False,
+        post_process_cleared: bool = True,
         weights_fit_live: bool,
         drain_backstop_elapsed: bool,
     ) -> bool:
-        """Return whether a held residency has cleared enough room for the head to sample."""
+        """Return whether a held residency has cleared enough room for the head to sample.
+
+        The head must not be admitted until every VRAM consumer the residency displaces has actually vacated
+        the card: the live inference-process count is at (or below) the forecast's target, safety is off-GPU if
+        this residency needs it, and the dedicated post-processing lane has left the card if it needs to. The
+        lane's context is only freed when its process exits, so ``post_process_cleared`` is a structural check
+        (the lane is gone), distinct from the pause merely having been requested; admitting the head while the
+        lane's ~1.4GB context is still resident is exactly what leaves too little room and streams the weights.
+        """
         if loaded_process_count > self.target_process_count(forecast):
             return False
         if safety_pause_required and not safety_paused:
+            return False
+        if post_process_pause_required and not post_process_cleared:
             return False
         if weights_fit_live:
             return True

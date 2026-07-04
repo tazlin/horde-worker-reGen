@@ -289,6 +289,21 @@ class ProcessLifecycleManager:
         # Without this, repeated whole-card jobs cycling safety off/on read as a safety crash loop and trip
         # save-our-ship. Mirrors the intentional_reclaim path for inference RAM reclaim.
         self._safety_replacement_intentional = False
+        # Runtime override forcing the dedicated post-processing lane off the GPU (stopped, not merely
+        # model-unloaded) while a whole-card (single-residency) model claims the device. Unlike the safety
+        # process, which cycles cpu_only, the post-processing lane has no useful CPU fallback (upscalers on
+        # CPU are impractically slow), so the whole lane is stopped: its CUDA context AND any warm upscaler
+        # models are freed for the heavy model. On a tight card (Flux ~11.5GB weights + ~3GB activation on a
+        # 16GB card) the lane's ~1.4GB bare context alone tips the head into host-RAM weight streaming, so it
+        # must vacate the card exactly as safety does. The lane is restarted after the residency restores;
+        # in-flight post-processing work is recorded known-lost so the recovery coordinator requeues it (it
+        # ages out to a raw-image submit rather than faulting).
+        self._post_process_gpu_paused = False
+        self._post_process_gpu_pause_count = 0
+        self._post_process_gpu_restore_count = 0
+        # Marks the *next* post-processing-lane rebuild as an intentional whole-card pause/restore cycle, so
+        # its completion is not counted as a crash recovery (mirrors ``_safety_replacement_intentional``).
+        self._post_process_replacement_intentional = False
         self._recently_recovered = False
         self._hung_processes_detected = False
         self._hung_processes_detected_time = 0.0
@@ -520,9 +535,18 @@ class ProcessLifecycleManager:
             return ordered_cards[1]
         return ordered_cards[0]
 
+    def post_process_lane_card_index(self) -> int:
+        """Return the device index the dedicated post-processing lane is (or would be) pinned to."""
+        return self._post_process_card().device_index
+
     def start_post_process_processes(self) -> None:
         """Start the dedicated post-processing process, if enabled and not already running."""
         if not self.post_process_lane_enabled():
+            return
+
+        # While a whole-card model holds the card the lane is deliberately kept off-GPU: this per-tick start
+        # hook must not resurrect it until the residency restores and clears the pause.
+        if self._post_process_gpu_paused:
             return
 
         if self._process_map.num_post_process_processes() > 0:
@@ -631,7 +655,12 @@ class ProcessLifecycleManager:
             self.start_post_process_processes()
             self._post_process_processes_ending = False
             self._post_process_processes_should_be_replaced = False
-            self._num_process_recoveries += 1
+            if self._post_process_replacement_intentional:
+                # A deliberate whole-card pause (or its restore), not a lane crash: keep it out of the
+                # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
+                self._post_process_replacement_intentional = False
+            else:
+                self._num_process_recoveries += 1
 
     @property
     def post_process_processes_should_be_replaced(self) -> bool:
@@ -1231,6 +1260,64 @@ class ProcessLifecycleManager:
         self._safety_replacement_intentional = True
         self._initiate_safety_replacement()
         logger.info("Whole-card residency complete: restoring the safety process to the GPU.")
+        return True
+
+    @property
+    def is_post_process_gpu_paused(self) -> bool:
+        """Whether the dedicated post-processing lane is being held off-GPU for a whole-card job."""
+        return self._post_process_gpu_paused
+
+    @property
+    def post_process_gpu_pause_count(self) -> int:
+        """How many whole-card residency post-processing-lane off-GPU pauses this manager initiated."""
+        return self._post_process_gpu_pause_count
+
+    @property
+    def post_process_gpu_restore_count(self) -> int:
+        """How many whole-card residency post-processing-lane restores this manager initiated."""
+        return self._post_process_gpu_restore_count
+
+    def pause_post_process_off_gpu(self) -> bool:
+        """Stop the dedicated post-processing lane so its CUDA context and models free for a whole-card model.
+
+        A no-op (returns False) when the lane is not enabled or is already paused. Otherwise sets the override
+        (which suppresses the per-tick restart in :meth:`start_post_process_processes`) and triggers the lane
+        replacement state machine to end the running process; the intentional flag keeps that teardown out of
+        the crash-recovery count. Unlike safety, the lane does not come back cpu_only (post-processing on CPU
+        is impractically slow): it stays stopped until :meth:`restore_post_process_off_gpu` clears the pause.
+        Any post-processing job in flight on the lane is recorded known-lost so the recovery coordinator
+        requeues it (it ages out to a raw-image submit rather than faulting).
+
+        Returns:
+            True if a pause was initiated, False if it was already paused or the lane is not enabled.
+        """
+        if not self.post_process_lane_enabled() or self._post_process_gpu_paused:
+            return False
+        self._post_process_gpu_paused = True
+        self._post_process_gpu_pause_count += 1
+        if self._process_map.num_post_process_processes() > 0:
+            self._post_process_replacement_intentional = True
+            self._initiate_post_process_replacement()
+        logger.info(
+            "Whole-card residency: stopping the post-processing lane to free its VRAM context for the "
+            "heavy model.",
+        )
+        return True
+
+    def restore_post_process_off_gpu(self) -> bool:
+        """Restart the dedicated post-processing lane after a whole-card job has released the device.
+
+        A no-op (returns False) when the lane is not currently paused. Clears the override so the per-tick
+        :meth:`start_post_process_processes` hook brings the lane back up on its next pass.
+
+        Returns:
+            True if a restore was initiated, False if it was not paused.
+        """
+        if not self._post_process_gpu_paused:
+            return False
+        self._post_process_gpu_paused = False
+        self._post_process_gpu_restore_count += 1
+        logger.info("Whole-card residency complete: restarting the post-processing lane.")
         return True
 
     def _initiate_safety_replacement(self) -> None:

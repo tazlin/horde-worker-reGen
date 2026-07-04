@@ -1017,8 +1017,15 @@ class InferenceScheduler:
         num_safety_contexts = self._process_map.num_safety_processes(device_index=device_index) if safety_on_gpu else 0
         # The dedicated post-processing lane holds a CUDA context (and its resident post-processing models)
         # on the card it is pinned to; like the safety context, that is a real device-wide commitment idle
-        # inference siblings cannot reclaim, so it is charged as an extra resident context here.
-        num_post_process_contexts = self._process_map.num_post_process_processes(device_index=device_index)
+        # inference siblings cannot reclaim, so it is charged as an extra resident context here. Charge it only
+        # while the lane is actually on the card: once a whole-card job has stopped the lane off-GPU its context
+        # is freed, so continuing to charge it would keep the structural floor below the model's demand and
+        # defer the head forever (the same reasoning as the paused safety context above).
+        num_post_process_contexts = (
+            0
+            if self._process_lifecycle.is_post_process_gpu_paused
+            else self._process_map.num_post_process_processes(device_index=device_index)
+        )
         # Refresh the clean all-contexts idle baseline (a no-op once startup has passed) so the marginal
         # per-context cost reflects measurement rather than the one-time-cost-times-N over-count, then let a
         # later lower reading invalidate a latched floor that was a transient spike rather than sustained.
@@ -1070,6 +1077,41 @@ class InferenceScheduler:
             return False
         return self._process_lifecycle.pause_safety_on_gpu()
 
+    def _residency_should_pause_post_process(self, device_index: int | None) -> bool:
+        """Whether a whole-card residency on this card should also stop the dedicated post-processing lane.
+
+        Requires the lane to be enabled and to sit on the residency's card: its permanent CUDA context (and any
+        warm upscaler models) is real device-wide VRAM that a sibling teardown cannot reclaim, so on a card too
+        tight to host a whole-card model beside it (Flux on 16GB) the lane must vacate the card exactly as safety
+        does. A residency on a card the lane does not occupy leaves it untouched. The worker-wide key (``None``,
+        single-GPU) always qualifies: the lane shares the one card.
+        """
+        if not self._process_lifecycle.post_process_lane_enabled():
+            return False
+        if device_index is None or not self._card_runtimes:
+            return True
+        return device_index == self._process_lifecycle.post_process_lane_card_index()
+
+    def _has_post_process_backlog(self) -> bool:
+        """Return whether a post-processing job is actively on the lane (interrupting it loses its result).
+
+        Keyed on jobs *being* post-processed, not merely pending: a pending job is handled by the orchestrator's
+        aging escape (raw-image submit) while the lane is down, but a job mid-upscale on the lane would be
+        recorded known-lost and requeued. Mirrors :meth:`_has_safety_backlog` so the lane is stopped only at an
+        idle moment.
+        """
+        return bool(self._job_tracker.jobs_being_post_processed)
+
+    def _pause_post_process_for_residency_if_idle(self, device_index: int | None) -> bool:
+        """Stop the post-processing lane for whole-card residency only when no job is mid-flight on it."""
+        if not self._residency_should_pause_post_process(device_index):
+            return False
+        if self._process_lifecycle.is_post_process_gpu_paused:
+            return False
+        if self._has_post_process_backlog():
+            return False
+        return self._process_lifecycle.pause_post_process_off_gpu()
+
     def _establish_whole_card_residency(
         self,
         job: ImageGenerateJobPopResponse,
@@ -1115,8 +1157,9 @@ class InferenceScheduler:
             )
 
         safety_paused = self._pause_safety_for_residency_if_idle(device_index)
+        post_process_paused = self._pause_post_process_for_residency_if_idle(device_index)
 
-        if announce or after < current or safety_paused:
+        if announce or after < current or safety_paused or post_process_paused:
             safety_note = " and moving safety off-GPU" if safety_paused else ""
             total_mb = forecast.total_vram_mb
             card_phrase = f"the whole ~{total_mb / 1024:.0f}GB card" if total_mb else "nearly the whole card"
@@ -1266,6 +1309,7 @@ class InferenceScheduler:
                     whole_card_model=model,
                 )
             self._pause_safety_for_residency_if_idle(device_index)
+            self._pause_post_process_for_residency_if_idle(device_index)
 
     def _whole_card_residency_has_holder(self, model: str, device_index: int | None) -> bool:
         """Whether a held whole-card model is staged or resident on a live process.
@@ -1391,6 +1435,8 @@ class InferenceScheduler:
             loaded_process_count=self._process_map.num_loaded_inference_processes(device_index=device_index),
             safety_pause_required=self._residency_should_pause_safety(device_index),
             safety_paused=self._process_lifecycle.is_safety_gpu_paused,
+            post_process_pause_required=self._residency_should_pause_post_process(device_index),
+            post_process_cleared=self._process_map.num_post_process_processes(device_index=device_index) == 0,
             weights_fit_live=self._whole_card_weights_fit_live(forecast, device_index=device_index),
             drain_backstop_elapsed=self._whole_card_drain_backstop_elapsed(device_index),
         )
@@ -1614,16 +1660,22 @@ class InferenceScheduler:
                 if self._residency_should_pause_safety(device_index)
                 else False
             )
+            post_process_restored = (
+                self._process_lifecycle.restore_post_process_off_gpu()
+                if self._residency_should_pause_post_process(device_index)
+                else False
+            )
             ceiling = self._residency_restore_ceiling(device_index)
             current = self._process_map.num_loaded_inference_processes(device_index=device_index)
-            if current >= ceiling and not safety_restored:
+            if current >= ceiling and not safety_restored and not post_process_restored:
                 continue
             after = self._process_lifecycle.scale_inference_processes(ceiling, device_index=device_index)
             self._reconcile_worker_shed_to_pool()
             safety_note = " and restoring safety to the GPU" if safety_restored else ""
+            post_process_note = " and restarting the post-processing lane" if post_process_restored else ""
             logger.opt(ansi=True).info(
                 f"<fg #7b7d7d>Whole-card residency for {model} complete; restoring inference processes "
-                f"({current} -> {after} of {ceiling}){safety_note}.</>",
+                f"({current} -> {after} of {ceiling}){safety_note}{post_process_note}.</>",
             )
 
     def _reconcile_worker_shed_to_pool(self) -> None:

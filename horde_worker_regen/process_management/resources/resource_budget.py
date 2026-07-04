@@ -225,16 +225,20 @@ class StreamForecast:
     an un-loadable model loadable, since the ``fits_alone`` guard still applies."""
 
     base_reserve_mb: float | None = None
-    """The bounded inference-reserve floor (ComfyUI ``minimum_inference_memory`` / the configured floor).
+    """The weight-fit floor: ComfyUI's own inference-reserve streaming threshold (``minimum_inference_memory``).
 
     Sizes the decisions about the persistent *weight* footprint (``fits_alone``, ``streams_unavoidably``,
     and the weight-headroom gate), as distinct from the activation-inclusive ``reserve_mb`` that sizes the
-    co-resident streaming check and the teardown *depth*. Folding the conservative, batch-and-resolution
-    scaled activation peak into every fit decision conflates a transient activation spike with the persistent
-    footprint: it can flip a moderate-weight model into claiming the whole card, or push a model whose weights
-    fit alone marginally past free-if-alone so it falsely reads as streaming-unavoidable. Keeping the weight
-    decisions on this bounded floor holds them independent of the activation estimate. None falls back to
-    ``reserve_mb`` so a directly-constructed forecast keeps its prior single-reserve behavior."""
+    co-resident streaming check and the teardown *depth*. This is deliberately the ComfyUI threshold alone,
+    *not* the operator's configured ``vram_reserve_mb``: that configured figure is a co-residency/sampling
+    safety margin (folded into ``reserve_mb``), and enforcing it as a load-feasibility floor makes a model
+    whose weights fit the drained card (Flux ~11.5 GB on 16 GB) read as streaming-unavoidable so its
+    whole-card dispatch gate never converges. Folding the conservative, batch-and-resolution scaled activation
+    peak into every fit decision conflates a transient activation spike with the persistent footprint: it can
+    flip a moderate-weight model into claiming the whole card, or push a model whose weights fit alone
+    marginally past free-if-alone so it falsely reads as streaming-unavoidable. Keeping the weight decisions on
+    this bounded threshold holds them independent of both the activation estimate and the operator margin. None
+    falls back to ``reserve_mb`` so a directly-constructed forecast keeps its prior single-reserve behavior."""
 
     @property
     def known(self) -> bool:
@@ -741,11 +745,22 @@ def forecast_weight_streaming(
     """
     weights_mb = predict_job_weight_mb(job, baseline)
     footprint_mb = predict_job_footprint_mb(job, baseline)
+    # The weight-fit floor is ComfyUI's *own* streaming threshold (``minimum_inference_memory``), NOT the
+    # operator's configured ``vram_reserve_mb``. That configured figure is a sampling / co-residency safety
+    # margin (how much headroom to keep free while a model samples beside siblings), not a statement about
+    # whether a model can physically load at all. Folding it into the weight-fit floor conflates the two: on
+    # a 16 GB card a 4096 MB reserve makes an 11.5 GB Flux checkpoint read as needing 15.6 GB free to "fit
+    # alone" when a fully drained card only reaches ~15.1 GB, so its whole-card dispatch gate can never
+    # converge and the head wedges. Load feasibility (``fits_alone`` / ``fits_weights_now`` /
+    # ``streams_unavoidably``) therefore keys on the streaming threshold alone; the configured margin is
+    # applied to the activation-inclusive ``reserve_mb`` below, where it governs co-residency and teardown
+    # depth (its proper role) without ever making a model that fits the drained card unservable.
     base_reserve_mb = effective_inference_reserve_mb(
         total_vram_mb,
-        configured_reserve_floor_mb,
+        0.0,
         reserve_vram_gb=reserve_vram_gb,
     )
+    configured_floor_mb = max(0.0, configured_reserve_floor_mb)
     # The reserve must cover the model's *sampling-phase activation working set*, not a flat constant.
     # ComfyUI's own minimum_inference_memory (and the configured floor) is sized for an SD1.5/SDXL step; a
     # heavy or high-resolution model (Flux at 1024^2) needs several GB of attention activations per sampling
@@ -768,8 +783,11 @@ def forecast_weight_streaming(
     # bounded weight floor ``base_reserve_mb``, since it is transient and not this model's persistent
     # weights) keeps the co-residency and weight-dominant tests forward-looking: a heavy model escalates to
     # evicting a sibling model or claiming the card rather than co-residing into VRAM that is about to be
-    # reclaimed.
-    reserve_mb = max(base_reserve_mb, activation_working_set_mb) + max(0.0, committed_reserve_mb)
+    # reclaimed. The configured operator margin joins the activation working set here (not the weight floor):
+    # it is the co-residency headroom the operator wants preserved while a model samples beside siblings.
+    reserve_mb = (
+        max(base_reserve_mb, activation_working_set_mb, configured_floor_mb) + max(0.0, committed_reserve_mb)
+    )
     overhead = max(0.0, per_process_overhead_mb)
     # The first context pays the one-time CUDA runtime cost; each additional context costs only the marginal.
     # Default the marginal to the full overhead so an unsupplied marginal reproduces the old contexts*overhead.

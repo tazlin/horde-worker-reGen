@@ -251,3 +251,52 @@ class TestWholeCardResidencyMachine:
             weights_fit_live=False,
             drain_backstop_elapsed=True,
         )
+
+    def test_teardown_complete_waits_for_post_process_lane_to_vacate_the_card(self) -> None:
+        """A residency that must stop the post-processing lane holds the head until that lane is gone.
+
+        The lane's CUDA context is only freed when its process exits, so admitting the head while it is still
+        resident (even with the weights nominally fitting) is exactly what leaves too little room and streams
+        the weights. The gate must therefore wait on the structural ``post_process_cleared`` signal.
+        """
+        machine = WholeCardResidencyMachine()
+        forecast = StreamForecast(
+            weights_mb=11_500.0,
+            reserve_mb=1_500.0,
+            free_now_mb=14_000.0,
+            free_if_alone_mb=15_000.0,
+            free_after_model_evict_mb=13_000.0,
+            total_vram_mb=16_000.0,
+            per_process_overhead_mb=1_000.0,
+        )
+        # Sole residency reached, safety off, weights read as fitting live: but the lane has not yet vacated.
+        assert not machine.teardown_complete(
+            forecast,
+            loaded_process_count=1,
+            safety_pause_required=True,
+            safety_paused=True,
+            post_process_pause_required=True,
+            post_process_cleared=False,
+            weights_fit_live=True,
+            drain_backstop_elapsed=True,
+        )
+        # Once the lane is gone the head may load.
+        assert machine.teardown_complete(
+            forecast,
+            loaded_process_count=1,
+            safety_pause_required=True,
+            safety_paused=True,
+            post_process_pause_required=True,
+            post_process_cleared=True,
+            weights_fit_live=True,
+            drain_backstop_elapsed=True,
+        )
+        # A residency on a card the lane does not occupy never waits on it (default: not required, cleared).
+        assert machine.teardown_complete(
+            forecast,
+            loaded_process_count=1,
+            safety_pause_required=False,
+            safety_paused=False,
+            weights_fit_live=True,
+            drain_backstop_elapsed=False,
+        )

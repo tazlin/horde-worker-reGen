@@ -129,19 +129,22 @@ class TestSchedulerActuatesProcessReduction:
     ) -> None:
         """A head whose weights are squeezed off the card by live contexts triggers a partial teardown.
 
-        Weights ~9500 MB: with four ~1288 MB contexts live the model-evicted floor (~11223 MB) no longer
-        holds the weights + reserve, but the card fits it with fewer processes (max_resident == 3). Before the
-        fix the moderate (not weight-dominant) head fell through to deferral; now the scheduler reduces the
-        process count to what fits and defers one tick while the freed VRAM drains.
+        Weights ~10000 MB: with four ~1288 MB contexts live the model-evicted floor (~11223 MB) no longer
+        holds the weights + the streaming floor, but the card fits it with fewer processes (max_resident == 3).
+        Before the fix the moderate (not weight-dominant) head fell through to deferral; now the scheduler
+        reduces the process count to what fits and defers one tick while the freed VRAM drains. The weight sits
+        above the four-context floor against ComfyUI's own streaming threshold (~1519 MB), which is what gates
+        weight residency: the operator's configured ``vram_reserve_mb`` is a co-residency/activation margin,
+        not a load-feasibility floor, so it does not decide whether the weights fit the live contexts.
         """
         # A heavy checkpoint whose weights overflow the four-context floor but fit with fewer processes.
         # Weight and footprint pinned together: this scenario's checkpoint is single-component, so its
         # full resident footprint is its core weights.
-        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: 9500.0)
-        monkeypatch.setattr(resource_budget, "predict_job_footprint_mb", lambda job, baseline: 9500.0)
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: 10000.0)
+        monkeypatch.setattr(resource_budget, "predict_job_footprint_mb", lambda job, baseline: 10000.0)
         # Modest activation working set so the model reads activation-light (not weight-dominant), exercising
         # the needs_process_count_reduction path rather than needs_exclusive_residency.
-        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 9500.0 + 600)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 10000.0 + 600)
 
         scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=4)
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=3)
