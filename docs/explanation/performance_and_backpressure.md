@@ -391,14 +391,29 @@ sampling peak; on a card where they cannot coexist, keeping the copy warm would 
 demand-paging during sampling, which costs far more than the one reload the protection saves.
 
 The support processes are additionally held to allocator-enforced VRAM quotas on CUDA hosts: the
-dedicated post-processing lane and the on-GPU safety process cap their own caching allocators at the
-share of the card their role justifies (an upscale chain's working set; the safety models plus one
-evaluation). The parent can schedule when work runs, but only the allocator can bound how much a
-process *keeps*: freed tensors stay in a process's pool, and under WDDM an over-committed card silently
-demand-pages every process instead of failing. With the cap, an overstep becomes a crisp out-of-memory
-inside the offender, on paths that already degrade deliberately (a faulted post-processing chain is reported
-without images so the horde reissues it; a faulted safety evaluation recycles the process). On non-CUDA
-backends the quota is a logged no-op.
+dedicated post-processing lane and the on-GPU safety process cap their own caching allocators. The parent
+can schedule when work runs, but only the allocator can bound how much a process *keeps*: freed tensors
+stay in a process's pool, and under WDDM an over-committed card silently demand-pages every process
+instead of failing. On non-CUDA backends the quota is a logged no-op.
+
+The post-processing lane's quota is a *runaway guard*, not a per-job limiter. It is sized to the card:
+above the largest realistic upscale/face-fix working set where the card has room, so legitimate chains
+run in VRAM, while still bounding a pool that would otherwise squat the whole card between chains (a
+small card keeps the guard tight and leaves the inference pool its share). Because the guard sits above
+real jobs, three cooperating behaviors keep it from faulting work the card can host:
+
+- **Gate reconciliation.** The dispatch gate knows the lane's effective cap. A chain whose estimated
+  peak exceeds it can never run in the lane no matter how idle the card becomes, so the gate faults it
+  without images at admission (the horde reissues it to a larger worker) rather than dispatching it into
+  a guaranteed out-of-memory.
+- **Self-reclaim and retry.** If a chain does hit an out-of-memory (typically a previous chain's pool
+  still resident), the lane evicts its own post-processing models, empties the cache, and retries the
+  chain once before reporting a fault. Only a second out-of-memory becomes a no-image fault.
+- **Crisp attribution.** A genuine overstep still becomes an out-of-memory inside the offender, on a
+  path that degrades deliberately (the faulted chain is reported without images).
+
+The safety process's quota is a fixed cap sized to its resident set (the safety models plus one
+evaluation); a faulted safety evaluation recycles the process.
 
 On Windows the worker also watches the one signal the driver cannot fake: the per-process
 `GPU Process Memory` counters (the data behind Task Manager's "Shared GPU memory" column). When a worker

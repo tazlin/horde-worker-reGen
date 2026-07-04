@@ -21,8 +21,9 @@ try:
     from multiprocessing.connection import PipeConnection as Connection  # type: ignore
 except Exception:
     from multiprocessing.connection import Connection  # type: ignore
+from collections.abc import Callable
 from multiprocessing.synchronize import Lock
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, TypeVar, override
 
 import PIL.Image
 from horde_sdk.ai_horde_api import GENERATION_STATE
@@ -42,6 +43,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
+from horde_worker_regen.utils.oom_signature import is_out_of_memory_text
 
 if TYPE_CHECKING:
     from hordelib.api import HordeLib, SharedModelManager
@@ -52,6 +54,9 @@ else:
 
     class SharedModelManager:
         """Dummy class to prevent type errors."""
+
+
+_T = TypeVar("_T")
 
 
 def _sort_facefixers_last(post_processing: list[str]) -> list[str]:
@@ -183,6 +188,49 @@ class HordePostProcessProcess(HordeProcess):
         current_image.save(buffer, format="PNG")
         return HordeImageResult(image_bytes=buffer.getvalue(), generation_faults=faults)
 
+    def _post_process_all_images(self, message: HordePostProcessControlMessage) -> list[HordeImageResult]:
+        """Post-process every image in the job, raising if any operation yields no output image."""
+        processed_images: list[HordeImageResult] = []
+        for image_bytes in message.images_bytes:
+            processed = self._post_process_one_image(image_bytes, message.post_processing)
+            if processed is None:
+                raise RuntimeError("post-processing produced no output image")
+            processed_images.append(processed)
+        return processed_images
+
+    def _reclaim_own_vram_for_retry(self) -> None:
+        """Evict this lane's own resident post-processing models and cached pool before a retry.
+
+        hordelib's node-level tiling has already tried to fit the chain within the currently committed
+        VRAM, so merely emptying the cache would not free room; only unloading the lane's retained models
+        gives a retried chain a clean allocator. This recovers the case where a chain OOMs because a prior
+        chain's pool is still resident, not because the chain genuinely exceeds the card.
+        """
+        if self._dry_run_skip_post_processing:
+            return
+        self._horde.backend.free_vram()
+        self.clear_gc_and_torch_cache()
+        self.send_memory_report_message(include_vram=True)
+
+    def _run_with_oom_retry(self, run: Callable[[], _T], *, context: str) -> _T:
+        """Run ``run``; on a CUDA out-of-memory failure, reclaim the lane's VRAM and retry it once.
+
+        The OOM reaches the lane as a generic error wrapping the CUDA text (ComfyUI swallows the typed
+        error), so it is recognized by fingerprint. A non-OOM failure, or a second OOM after reclaiming,
+        propagates to the caller's fault handling unchanged.
+        """
+        try:
+            return run()
+        except Exception as first_error:
+            if not is_out_of_memory_text(f"{type(first_error).__name__}: {first_error}"):
+                raise
+            logger.warning(
+                f"Post-processing hit CUDA out-of-memory for {context}; reclaiming lane VRAM and retrying "
+                f"once before faulting: {type(first_error).__name__} {first_error}",
+            )
+            self._reclaim_own_vram_for_retry()
+            return run()
+
     def _run_post_processing(self, message: HordePostProcessControlMessage) -> None:
         """Run an image job's post-processing phase and return the processed images."""
         self.send_process_state_change_message(
@@ -198,14 +246,11 @@ class HordePostProcessProcess(HordeProcess):
         if self._dry_run_skip_post_processing:
             job_image_results = [HordeImageResult(image_bytes=image_bytes) for image_bytes in message.images_bytes]
         else:
-            processed_images: list[HordeImageResult] = []
             try:
-                for image_bytes in message.images_bytes:
-                    processed = self._post_process_one_image(image_bytes, message.post_processing)
-                    if processed is None:
-                        raise RuntimeError("post-processing produced no output image")
-                    processed_images.append(processed)
-                job_image_results = processed_images
+                job_image_results = self._run_with_oom_retry(
+                    lambda: self._post_process_all_images(message),
+                    context=f"job {message.job_id}",
+                )
             except Exception as e:
                 logger.error(f"Post-processing failed for job {message.job_id}: {type(e).__name__} {e}")
                 state = GENERATION_STATE.faulted
@@ -231,14 +276,38 @@ class HordePostProcessProcess(HordeProcess):
         self.send_process_state_change_message(process_state=process_state, info=f"Finished job {message.job_id}")
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
 
+    def _run_alchemy_form_bytes(self, form: AlchemyFormSpec) -> bytes:
+        """Run a single graph-backed alchemy form and return its WebP-encoded result bytes.
+
+        Raises on an unknown form or a graph that yields no image, so the caller's OOM retry and fault
+        handling see a clean exception. Encoding matches the legacy alchemist (WebP quality 95) so the main
+        process can upload the result to R2 without re-encoding.
+        """
+        from hordelib.api import classify_post_processor
+
+        if classify_post_processor(form.form) is None:
+            raise ValueError(f"Unknown alchemy form for post-processing process: {form.form}")
+
+        source_image = PIL.Image.open(io.BytesIO(form.source_image_bytes))
+        result = self._horde.post_process(
+            {
+                "model": form.form,
+                "source_image": source_image,
+            },
+        )
+        if result.image is None:
+            raise RuntimeError("Alchemy form produced no image")
+
+        buffer = io.BytesIO()
+        result.image.save(buffer, format="WebP", quality=95, method=6)
+        return buffer.getvalue()
+
     def _run_graph_alchemy(self, form: AlchemyFormSpec) -> None:
         """Run a graph-backed alchemy form (upscale/facefix/strip_background) and report the result.
 
         The result image is WebP-encoded (quality 95, matching the legacy alchemist) so the main process
         can upload it to R2 without re-encoding.
         """
-        from hordelib.api import classify_post_processor
-
         self.send_process_state_change_message(
             process_state=HordeProcessState.ALCHEMY_STARTING,
             info=f"Starting alchemy form {form.form} ({form.form_id})",
@@ -249,22 +318,10 @@ class HordePostProcessProcess(HordeProcess):
         image_bytes: bytes | None = None
 
         try:
-            if classify_post_processor(form.form) is None:
-                raise ValueError(f"Unknown alchemy form for post-processing process: {form.form}")
-
-            source_image = PIL.Image.open(io.BytesIO(form.source_image_bytes))
-            result = self._horde.post_process(
-                {
-                    "model": form.form,
-                    "source_image": source_image,
-                },
+            image_bytes = self._run_with_oom_retry(
+                lambda: self._run_alchemy_form_bytes(form),
+                context=f"alchemy form {form.form} ({form.form_id})",
             )
-            if result.image is None:
-                raise RuntimeError("Alchemy form produced no image")
-
-            buffer = io.BytesIO()
-            result.image.save(buffer, format="WebP", quality=95, method=6)
-            image_bytes = buffer.getvalue()
             state = GENERATION_STATE.ok
         except Exception as e:
             logger.error(f"Alchemy form {form.form} ({form.form_id}) failed: {type(e).__name__} {e}")

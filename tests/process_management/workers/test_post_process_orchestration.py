@@ -309,6 +309,62 @@ class TestStartPostProcessing:
         assert idle_inference.last_control_flag is not None
         assert lane.pipe_connection.send.call_count == 0
 
+    async def test_chain_over_lane_cap_faults_clean_without_dispatch(self, monkeypatch: object) -> None:
+        """A chain estimated above the lane's cap is faulted at the gate, never dispatched into an OOM.
+
+        On a small card the lane's allocator guard cannot host a large upscale/face-fix peak no matter how
+        idle the card is; dispatching it would only burn the patience window on a guaranteed in-lane OOM.
+        The job is faulted without images (breaker-counted) so the horde reissues it to a larger worker.
+        """
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            post_process_orchestrator_module,
+            "predict_job_post_processing_vram_mb",
+            lambda *_args, **_kwargs: 6429.0,
+        )
+        process_manager = make_testable_process_manager(enable_vram_budget=True, vram_reserve_mb=2048)
+        lane = _make_lane_process()
+        # 8GB card -> guard clamps to 4096MB; a 6429MB chain can never fit the lane here.
+        lane.total_vram_mb = 8192
+        lane.vram_usage_mb = 2000
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane})
+
+        job_info = _make_pp_job_info(["RealESRGAN_x4plus"])
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        assert job_info not in process_manager._job_tracker.jobs_pending_post_processing
+        assert job_info in process_manager._job_tracker.jobs_pending_submit
+        assert job_info.state == GENERATION_STATE.faulted
+        assert job_info.job_image_results is None
+        assert process_manager._reserve_ledger.total_vram_mb() == 0.0
+        assert lane.pipe_connection.send.call_count == 0
+
+    async def test_chain_within_lane_cap_on_headroom_card_dispatches(self, monkeypatch: object) -> None:
+        """The same large chain dispatches on a card whose guard is sized to host it."""
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            post_process_orchestrator_module,
+            "predict_job_post_processing_vram_mb",
+            lambda *_args, **_kwargs: 6429.0,
+        )
+        process_manager = make_testable_process_manager(enable_vram_budget=True, vram_reserve_mb=2048)
+        lane = _make_lane_process()
+        # 24GB card -> guard 8192MB hosts the 6429MB chain, with ample free VRAM for the headroom check.
+        lane.total_vram_mb = 24576
+        lane.vram_usage_mb = 2000
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane})
+
+        job_info = _make_pp_job_info(["RealESRGAN_x4plus"])
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        assert job_info in process_manager._job_tracker.jobs_being_post_processed
+        assert process_manager._reserve_ledger.total_vram_mb() == 6429.0
+        assert lane.pipe_connection.send.call_count == 1
+
     async def test_send_failure_on_live_lane_flags_replacement(self) -> None:
         """A failed send to a live, loaded lane process arms the lane-replacement state machine."""
         process_manager = make_testable_process_manager()

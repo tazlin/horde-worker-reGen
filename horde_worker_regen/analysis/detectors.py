@@ -19,6 +19,8 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from horde_worker_regen.utils.oom_signature import OOM_TEXT_RE
+
 from .correlate import SessionContext, find_child_crash
 from .governor_signatures import GOVERNOR_ENTER_RE, GOVERNOR_EXIT_RE, GOVERNOR_LABELS
 from .log_ingest import LogRecord
@@ -29,9 +31,8 @@ _QUARANTINE_RE = re.compile(r"quarantined \(crash on start")
 _SOFT_RESET_RE = re.compile(r"Save-our-ship soft reset")
 _POOLS_RECOVERED_RE = re.compile(r"pools recovered.*limp-by cleared")
 _ABANDON_SHIP_RE = re.compile(r"abandoning ship|cannot restore a working process pool")
-_OOM_RE = re.compile(
-    r"CUDA out of memory|OutOfMemoryError|torch\.cuda\.OutOfMemoryError|RuntimeError: .*out of memory",
-)
+# The live worker reclaims-and-retries on this same fingerprint; keep the signature single-sourced.
+_OOM_RE = OOM_TEXT_RE
 # A faulted-inference result names its model and the failing node in a stable shape:
 #   "... produced no results. Model: <name>. Error: <stage> (<NodeClass>): <underlying error>"
 # Both the OOM and the file-descriptor detectors read the model off this to name the culprit, because the

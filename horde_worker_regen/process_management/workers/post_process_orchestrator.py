@@ -24,6 +24,7 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     predict_job_post_processing_vram_mb,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
+from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
 
 _ADMISSION_PATIENCE_SECONDS = 90.0
 """How long a job may sit unfittable in the pending post-processing queue before it is faulted.
@@ -144,6 +145,47 @@ class PostProcessOrchestrator:
         required_mb = reserve_vram_mb + bridge_data.vram_reserve_mb
         available_mb = free_vram_mb - committed_elsewhere_mb
         return available_mb >= required_mb
+
+    def _effective_lane_cap_mb(self, post_process_process: HordeProcessInfo) -> float | None:
+        """Return the lane's allocator-guard cap (MB) for its card, or None when the card total is unknown.
+
+        Derived from the same policy the lane applies to its own allocator, so the gate reasons about the
+        exact ceiling the lane enforces rather than only the card's free VRAM.
+        """
+        total_mb = self._process_map.get_reported_total_vram_mb(device_index=post_process_process.device_index)
+        if total_mb is None:
+            return None
+        return effective_post_process_vram_quota_mb(total_mb)
+
+    async def _fault_if_exceeds_lane_cap(
+        self,
+        *,
+        completed_job_info: HordeJobInfo,
+        post_process_process: HordeProcessInfo,
+        reserve_vram_mb: float,
+    ) -> bool:
+        """Fault a chain whose estimated peak exceeds the lane's cap; return whether it was faulted.
+
+        This is structural, not transient: a chain estimated above the lane's own allocator guard cannot
+        run in the lane no matter how idle the card becomes, so dispatching it would only burn the patience
+        window on a guaranteed in-lane out-of-memory. Faulting it now (no images) lets the horde reissue it
+        to a larger worker instead. Only consulted when the VRAM budget is enabled and an estimate exists;
+        otherwise the lane's own cap and its reclaim-and-retry remain the backstop.
+        """
+        if not self._runtime_config.bridge_data.enable_vram_budget or reserve_vram_mb <= 0:
+            return False
+        lane_cap_mb = self._effective_lane_cap_mb(post_process_process)
+        if lane_cap_mb is None or reserve_vram_mb <= lane_cap_mb:
+            return False
+        await self._fault_without_images(
+            completed_job_info,
+            reason=(
+                f"post-processing chain's estimated peak {reserve_vram_mb:.0f}MB exceeds the lane's "
+                f"{lane_cap_mb:.0f}MB VRAM cap on card {post_process_process.device_index}; it cannot be "
+                "hosted on this card"
+            ),
+        )
+        return True
 
     def _note_deferral(
         self,
@@ -278,6 +320,13 @@ class PostProcessOrchestrator:
                 continue
 
             reserve_vram_mb = self._estimate_post_processing_vram_mb(completed_job_info)
+            if await self._fault_if_exceeds_lane_cap(
+                completed_job_info=completed_job_info,
+                post_process_process=post_process_process,
+                reserve_vram_mb=reserve_vram_mb,
+            ):
+                continue
+
             if (
                 self._sampling_coresidency_check is not None
                 and self._process_map.num_busy_with_inference(device_index=post_process_process.device_index) > 0

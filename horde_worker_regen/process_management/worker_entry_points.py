@@ -638,13 +638,14 @@ def start_post_process_process(
             sys.exit(1)
 
         if not dry_run_skip_post_processing:
-            # Cap the lane's caching allocator so its modules and retained pool can never squat the share
-            # of the card the inference pool needs; a chain that cannot fit the cap faults inside the lane
-            # and the job is reported as a no-image fault instead. After the device pin the lane sees its
-            # card as device 0. A no-op on non-CUDA backends.
-            from horde_worker_regen.utils.vram_quota import POST_PROCESS_VRAM_QUOTA_MB, apply_process_vram_quota_mb
+            # Cap the lane's caching allocator as a runaway/leak guard: sized above the largest realistic
+            # chain where the card allows, so legitimate upscale/face-fix jobs run in VRAM, while still
+            # bounding a pool that would otherwise squat the card between chains. Deciding *when* a chain
+            # co-resides with sampling is the orchestrator's admission gate, not this cap. After the device
+            # pin the lane sees its card as device 0. A no-op on non-CUDA backends.
+            from horde_worker_regen.utils.vram_quota import apply_post_process_vram_quota
 
-            apply_process_vram_quota_mb(POST_PROCESS_VRAM_QUOTA_MB, device_index=0)
+            apply_post_process_vram_quota(device_index=0)
 
         from horde_worker_regen.process_management.workers.post_process_process import HordePostProcessProcess
 
