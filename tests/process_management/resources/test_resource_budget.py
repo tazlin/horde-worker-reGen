@@ -19,7 +19,6 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     assess_ram_pressure,
     ram_pressure_floor_mb,
 )
-from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -514,119 +513,6 @@ class TestUpscaleDoesNotDriveResidency:
         assert forecast.fits_coresident is True
         assert forecast.needs_exclusive_residency is False
         assert forecast.requires_sibling_teardown is False
-
-
-class TestCommittedPostProcessingReserve:
-    """The scheduler sums the imminent post-processing peaks of in-flight jobs into a committed reserve."""
-
-    async def test_zero_when_nothing_post_processing(self) -> None:
-        """With no process in the post-processing phase, the reserve self-scales to zero."""
-        idle = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
-        scheduler = _make_inference_scheduler(
-            process_map=ProcessMap({0: idle}),
-            bridge_data=_budget_bridge_data(),
-            max_concurrent=2,
-            max_inference=2,
-        )
-        assert scheduler._committed_post_processing_reserve_mb() == 0.0
-
-    async def test_sums_in_flight_post_processing_peaks(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Each process in the post-processing phase contributes its job's predicted peak."""
-        from horde_worker_regen.process_management.scheduling import inference_scheduler as scheduler_module
-
-        monkeypatch.setattr(scheduler_module, "predict_job_post_processing_vram_mb", lambda job, baseline: 1500.0)
-
-        job_tracker = JobTracker()
-        pp_job = make_job_pop_response("model_pp")
-        await track_popped_job_async(job_tracker, pp_job)
-        await job_tracker.mark_inference_started(pp_job)
-
-        pp_proc = _post_processing_process(0, pp_job)
-        idle = make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
-
-        scheduler = _make_inference_scheduler(
-            process_map=ProcessMap({0: pp_proc, 1: idle}),
-            job_tracker=job_tracker,
-            bridge_data=_budget_bridge_data(),
-            max_concurrent=2,
-            max_inference=2,
-        )
-        assert scheduler._committed_post_processing_reserve_mb() == 1500.0
-
-    async def test_zero_when_feature_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The reserve is suppressed when post_processing_budget_reserve_enabled is off."""
-        from horde_worker_regen.process_management.scheduling import inference_scheduler as scheduler_module
-
-        monkeypatch.setattr(scheduler_module, "predict_job_post_processing_vram_mb", lambda job, baseline: 1500.0)
-
-        job_tracker = JobTracker()
-        pp_job = make_job_pop_response("model_pp")
-        await track_popped_job_async(job_tracker, pp_job)
-        await job_tracker.mark_inference_started(pp_job)
-
-        scheduler = _make_inference_scheduler(
-            process_map=ProcessMap({0: _post_processing_process(0, pp_job)}),
-            job_tracker=job_tracker,
-            bridge_data=make_mock_bridge_data(
-                enable_vram_budget=True,
-                vram_reserve_mb=2000,
-                ram_reserve_mb=4096,
-                post_processing_budget_reserve_enabled=False,
-                image_models_to_load=["model_pp"],
-            ),
-            max_concurrent=2,
-            max_inference=2,
-        )
-        assert scheduler._committed_post_processing_reserve_mb() == 0.0
-
-
-class TestPostProcessingOverlapGate:
-    """The overlap concurrency bump is withheld when the device lacks headroom for the committed reserve."""
-
-    def _overlap_scheduler(self, free_vram_mb: float) -> InferenceScheduler:
-        spare = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
-        spare.total_vram_mb = 16000
-        spare.vram_usage_mb = 16000 - int(free_vram_mb)
-        return _make_inference_scheduler(
-            process_map=ProcessMap({0: spare}),
-            bridge_data=_budget_bridge_data(),
-            max_concurrent=2,
-            max_inference=4,
-        )
-
-    def test_bump_kept_with_ample_headroom(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """With ample effective free VRAM the overlap bump is granted."""
-        scheduler = self._overlap_scheduler(free_vram_mb=16000.0)
-        monkeypatch.setattr(scheduler, "_committed_post_processing_reserve_mb", lambda: 0.0)
-        # base path (lease off): max_concurrent (2) + post_processing_bump (1).
-        assert scheduler._max_jobs_in_progress_allowed(1) == 3
-
-    def test_bump_dropped_when_committed_reserve_eats_headroom(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When the committed reserve drops effective free below the bump floor, the bump is withheld."""
-        scheduler = self._overlap_scheduler(free_vram_mb=16000.0)
-        # Effective free = 16000 - 14000 = 2000, below the bump floor (max of 3000 and the 2000 reserve).
-        monkeypatch.setattr(scheduler, "_committed_post_processing_reserve_mb", lambda: 14000.0)
-        assert scheduler._max_jobs_in_progress_allowed(1) == 2
-
-    def test_bump_unaffected_when_feature_disabled(self) -> None:
-        """With the feature off, the overlap bump keeps its prior unconditional behavior."""
-        spare = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
-        spare.total_vram_mb = 16000
-        spare.vram_usage_mb = 15000  # only 1000 free, well under any floor
-        scheduler = _make_inference_scheduler(
-            process_map=ProcessMap({0: spare}),
-            bridge_data=make_mock_bridge_data(
-                enable_vram_budget=True,
-                vram_reserve_mb=2000,
-                ram_reserve_mb=4096,
-                post_processing_budget_reserve_enabled=False,
-                image_models_to_load=["model_a"],
-            ),
-            max_concurrent=2,
-            max_inference=4,
-        )
-        # Feature off: the bump is retained regardless of free VRAM (prior behavior).
-        assert scheduler._max_jobs_in_progress_allowed(1) == 3
 
 
 class TestMarginalProcessOverhead:

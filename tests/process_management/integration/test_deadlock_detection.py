@@ -13,6 +13,7 @@ from horde_worker_regen.process_management.ipc.messages import HordeProcessMemor
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from tests.process_management.conftest import (
     make_mock_bridge_data,
     make_mock_job,
@@ -52,6 +53,7 @@ def _make_message_dispatcher(
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
         model_metadata=make_test_model_metadata(),
         action_ledger=ActionLedger(),
+        reserve_ledger=CommittedReserveLedger(),
         on_unload_vram=Mock(),
         state=state,
     )

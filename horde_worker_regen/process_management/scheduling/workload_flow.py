@@ -41,6 +41,10 @@ class WorkloadKind(StrEnum):
     # VIDEO_GENERATION = "video_generation"  # reserved
 
 
+POST_PROCESS_RESERVE_FLOW = "image_post_processing"
+"""Committed-reserve ledger flow name for image jobs active on the dedicated post-processing lane."""
+
+
 _WORKLOAD_CAPABILITIES: dict[WorkloadKind, WorkerCapability] = {
     WorkloadKind.IMAGE_GENERATION: WorkerCapability.IMAGE_GEN,
     WorkloadKind.ALCHEMY: WorkerCapability.ALCHEMY_GRAPH | WorkerCapability.ALCHEMY_CLIP,

@@ -257,7 +257,7 @@ class HordeProcessInfo:
         """
         return (
             self.last_process_state == HordeProcessState.INFERENCE_STARTING
-            or self.last_process_state == HordeProcessState.INFERENCE_POST_PROCESSING
+            or self.last_process_state == HordeProcessState.POST_PROCESSING
             or self.last_process_state == HordeProcessState.ALCHEMY_STARTING
             or self.last_process_state == HordeProcessState.DOWNLOADING_MODEL
             or self.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL

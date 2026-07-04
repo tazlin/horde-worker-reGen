@@ -119,14 +119,14 @@ class TestPerCardConcurrencyCap:
         cards = _two_cards(card0_max_concurrent=2, card1_max_concurrent=1)
         scheduler = _make_scheduler(card_runtimes=cards)
         # The big card admits two concurrent jobs; the small card only one, even though they share a worker.
-        assert scheduler._max_jobs_in_progress_allowed(0, card=cards[0]) == 2
-        assert scheduler._max_jobs_in_progress_allowed(0, card=cards[1]) == 1
+        assert scheduler._max_jobs_in_progress_allowed(card=cards[0]) == 2
+        assert scheduler._max_jobs_in_progress_allowed(card=cards[1]) == 1
 
     def test_global_path_matches_worker_wide_ceiling(self) -> None:
         """Passing no card keeps the worker-wide ceiling: the byte-identical single-GPU path."""
         cards = _two_cards(card0_max_concurrent=2, card1_max_concurrent=1)
         scheduler = _make_scheduler(card_runtimes=cards)
-        assert scheduler._max_jobs_in_progress_allowed(0) == scheduler._max_concurrent_inference_processes
+        assert scheduler._max_jobs_in_progress_allowed() == scheduler._max_concurrent_inference_processes
 
 
 class TestJobsInProgressByCard:

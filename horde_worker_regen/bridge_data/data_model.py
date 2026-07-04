@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Self
+from typing import Literal, Self
 
 from horde_sdk.generation_parameters.alchemy.consts import KNOWN_ALCHEMY_FORMS
 from horde_sdk.worker.dispatch.ai_horde.bridge_data import CombinedHordeBridgeData
@@ -306,6 +306,36 @@ class reGenBridgeData(CombinedHordeBridgeData):
     )
     """If true, the safety model will be run on the GPU."""
 
+    dedicated_post_processing: Literal["auto", "on", "off"] = Field(
+        default="auto",
+    )
+    """Whether to run a dedicated post-processing process.
+
+    The dedicated process keeps the post-processing models (upscalers, face-fixers, background removal)
+    resident and runs every post-processing phase off the inference processes, converting the transient
+    per-job post-processing VRAM spike into one fixed, budgetable footprint.
+
+    - "auto": run the lane whenever any of its work is served (post-processing allowed, or an
+      alchemist worker whose graph forms run on the lane).
+    - "on": always run the lane.
+    - "off": do not run the lane; the worker will not offer post-processing at all.
+    """
+
+    @property
+    def post_processing_lane_enabled(self) -> bool:
+        """Whether the dedicated post-processing lane should be running.
+
+        The lane is the only place post-processing and graph alchemy forms (upscale/facefix/
+        strip_background) run; "off" therefore also implies the worker does not offer post-processing.
+        "auto" ties the lane to whether any of its work is served: embedded job post-processing
+        (``allow_post_processing``) or graph alchemy forms (``alchemist``).
+        """
+        if self.dedicated_post_processing == "off":
+            return False
+        if self.dedicated_post_processing == "on":
+            return True
+        return bool(self.allow_post_processing) or bool(self.alchemist)
+
     _yaml_loader: YAML | None = None
 
     cycle_process_on_model_change: bool = Field(
@@ -459,9 +489,6 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     very_fast_disk_mode: bool = Field(default=False)
     """If you have a very fast disk, set this to true to concurrently load more models at a time from disk."""
-
-    post_process_job_overlap: bool = Field(default=False)
-    """High and moderate performance modes will skip post processing if this is set to true."""
 
     gpu_sampling_lease_enabled: bool = Field(default=False)
     """Coordinate the GPU denoising loop across inference processes with a shared lease.
@@ -677,37 +704,6 @@ class reGenBridgeData(CombinedHordeBridgeData):
     when every process is busy). The ceiling is only consulted while the host is under the danger floor, so a
     roomy host never recycles needlessly. Set to 0 to disable. Only used when `enable_vram_budget` is true."""
 
-    post_processing_budget_reserve_enabled: bool = Field(default=True)
-    """Hold back the imminent post-processing VRAM peak of in-flight jobs when admitting new ones.
-
-    When a job finishes sampling it releases its inference slot for overlap *before* its upscaler or
-    face-fixer allocates VRAM, so the measured free figure transiently overstates what is available. With
-    this on (the default), the scheduler subtracts the predicted post-processing peak of every job currently
-    in post-processing from the free VRAM it gates dispatch, the overlap cap, and the residency forecast
-    against, so a freshly-released slot is not handed VRAM an in-flight job is about to claim (the cause of
-    the post-processing-phase thrash that trips the post-process watchdog on a shared GPU). It also gates the
-    overlap/pre-staging cap against the *imminent* peak of a job that is still sampling, so a second
-    concurrent sample is not co-scheduled onto a card already owed a large upscale peak (the overlap that
-    over-commits the device mid-flight, which a dispatch-time check alone cannot see). The reserve self-scales
-    to zero whenever nothing in flight will post-process, so roomy cards are unaffected. Set false to restore
-    the prior instantaneous behavior. Only used when `enable_vram_budget` is true."""
-
-    post_processing_active_reclaim_enabled: bool = Field(default=True)
-    """Proactively reclaim cross-process VRAM before a job's own post-processing peak lands.
-
-    The post-processing budget reserve (`post_processing_budget_reserve_enabled`) protects an in-flight job's
-    upscaler/face-fixer peak from *new* dispatch, but it never charges the dispatching job's *own* peak
-    against its placement. So a job admitted on its sampling footprint can reach its 4x-upscale peak (~8.5 GB
-    for an SDXL image) on a card already full of warm sibling models and process contexts, where the upscaler
-    allocates into near-zero free VRAM and tile-thrashes until the post-process watchdog reaps the slot. When
-    true, at dispatch the scheduler sizes that own peak against the measured
-    headroom and, if it will not fit even after the job's own weights are freed in-child, frees cross-process
-    room (an idle sibling's resident model, then a context) so the room is ready by the time the peak lands.
-    On by default (the over-commit it prevents otherwise reaches the post-process watchdog); only used when
-    `enable_vram_budget` is true. Complements the overlap gate of `post_processing_budget_reserve_enabled`
-    (which withholds a *concurrent* sample from co-scheduling onto an imminent peak) and pairs with
-    `post_processing_fault_breaker_enabled`, which protects the worker if a peak still cannot be hosted."""
-
     post_processing_fault_breaker_enabled: bool = Field(default=True)
     """Disable post-processing on this worker after repeated post-processing VRAM-over-commit faults.
 
@@ -856,6 +852,9 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     dry_run_skip_safety: bool = Field(default=False)
     """Skip the safety (NSFW/CSAM) evaluation model."""
+
+    dry_run_skip_post_processing: bool = Field(default=False)
+    """Skip real post-processing on the dedicated post-processing process and echo images back."""
 
     dry_run_skip_api: bool = Field(default=False)
     """Skip API calls (job pop and submit) and use canned scenarios."""

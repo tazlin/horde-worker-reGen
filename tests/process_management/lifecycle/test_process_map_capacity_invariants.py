@@ -43,7 +43,7 @@ class TestNumAvailableInferenceProcesses:
             {
                 1: make_mock_process_info(1, state=HordeProcessState.INFERENCE_STARTING),
                 2: make_mock_process_info(2, state=HordeProcessState.PRELOADING_MODEL),
-                3: make_mock_process_info(3, state=HordeProcessState.INFERENCE_POST_PROCESSING),
+                3: make_mock_process_info(3, state=HordeProcessState.POST_PROCESSING),
             },
         )
 
@@ -176,3 +176,21 @@ class TestVramAccountingIgnoresTornDownSlots:
 
         assert process_map.get_free_vram_mb() is None
         assert process_map.get_reported_total_vram_mb() is None
+
+    def test_post_process_vram_report_participates_in_free_vram_reading(self) -> None:
+        """The dedicated post-processing lane is GPU-bearing, so its VRAM sample must affect the budget."""
+        inference = make_mock_process_info(1, state=HordeProcessState.WAITING_FOR_JOB)
+        inference.total_vram_mb = 16000
+        inference.vram_usage_mb = 4000
+        post_process = make_mock_process_info(
+            2,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.POST_PROCESS,
+        )
+        post_process.total_vram_mb = 16000
+        post_process.vram_usage_mb = 15000
+        process_map = ProcessMap({1: inference, 2: post_process})
+
+        assert process_map.get_free_vram_mb() == 1000.0
+        assert process_map.get_reported_total_vram_mb() == 16000.0
+        assert "post-process[WAITING_FOR_JOB]" in process_map.residency_snapshot()

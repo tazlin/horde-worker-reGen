@@ -123,7 +123,7 @@ class TestOverbudgetExclusiveScope:
         assert job_tracker.is_admitted_over_budget(job) is True
         assert job_tracker.is_admitted_exclusive(job) is False
         assert job_tracker.has_exclusive_job_in_progress() is False
-        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+        assert scheduler._max_jobs_in_progress_allowed() == 2
 
     async def test_card_light_admit_keeps_overbudget_classification(self, job_tracker: JobTracker) -> None:
         """Sharing the device does not forfeit the over-budget tags (step grace, resource-fault retries)."""
@@ -153,7 +153,7 @@ class TestOverbudgetExclusiveScope:
 
         assert job_tracker.is_admitted_over_budget(job) is True
         assert job_tracker.is_admitted_exclusive(job) is False
-        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+        assert scheduler._max_jobs_in_progress_allowed() == 2
 
     async def test_tight_card_demanding_admit_stays_exclusive(self, job_tracker: JobTracker) -> None:
         """CONTROL: the same model on a card too small for a sibling keeps the device to itself.
@@ -169,7 +169,7 @@ class TestOverbudgetExclusiveScope:
         scheduler._mark_overbudget_admit(job, _tight_card_demanding_forecast())
 
         assert job_tracker.is_admitted_exclusive(job) is True
-        assert scheduler._max_jobs_in_progress_allowed(0) == 1
+        assert scheduler._max_jobs_in_progress_allowed() == 1
 
     async def test_unsized_forecast_stays_exclusive(self, job_tracker: JobTracker) -> None:
         """CONTROL: a forecast that cannot size the footprint keeps the conservative isolation."""

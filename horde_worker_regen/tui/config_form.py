@@ -293,13 +293,6 @@ CONFIG_FIELDS: list[ConfigField] = [
         "Fill the queue somewhat faster (12–16 GB cards). Overridden by high_performance_mode.",
     ),
     ConfigField(
-        "post_process_job_overlap",
-        "Post-process overlap",
-        FieldKind.BOOL,
-        "Memory & performance",
-        "Start the next job before the current finishes post-processing (24 GB+ cards).",
-    ),
-    ConfigField(
         "unload_models_from_vram_often",
         "Unload VRAM often",
         FieldKind.BOOL,
@@ -666,7 +659,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=15,
         maximum=600,
         unit="s",
-        explicit_default=60,
+        explicit_default=120,
     ),
     ConfigField(
         "preload_timeout",
@@ -677,7 +670,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         minimum=15,
         maximum=600,
         unit="s",
-        explicit_default=80,
+        explicit_default=150,
     ),
     ConfigField(
         "inference_step_timeout",
@@ -855,26 +848,6 @@ CONFIG_FIELDS: list[ConfigField] = [
         explicit_default=0,
     ),
     # Post-processing budget
-    ConfigField(
-        "post_processing_budget_reserve_enabled",
-        "Reserve for post-processing peak",
-        FieldKind.BOOL,
-        "Post-processing budget",
-        "Hold back the imminent upscaler/face-fixer VRAM peak of in-flight jobs when admitting new ones, "
-        "so a freshly-released slot is not handed VRAM another job is about to claim. Only used when the "
-        "VRAM budget is enabled.",
-        explicit_default=True,
-    ),
-    ConfigField(
-        "post_processing_active_reclaim_enabled",
-        "Reclaim for own PP peak",
-        FieldKind.BOOL,
-        "Post-processing budget",
-        "Before a job's own post-processing peak lands, free cross-process VRAM (an idle sibling's model, "
-        "then a context) if it will not otherwise fit. Prevents an upscale tile-thrash on a full card. "
-        "Only used when the VRAM budget is enabled.",
-        explicit_default=True,
-    ),
     ConfigField(
         "post_processing_fault_breaker_enabled",
         "Post-processing fault breaker",

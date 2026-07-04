@@ -1064,7 +1064,7 @@ class TestSpeculativeDispatchCap:
             max_inference=4,
             bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=False),
         )
-        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+        assert scheduler._max_jobs_in_progress_allowed() == 2
 
     def test_cap_raised_to_all_processes_when_lease_on_and_vram_ample(self) -> None:
         """With the lease and free VRAM, spare processes may stage ahead up to the process count."""
@@ -1074,7 +1074,7 @@ class TestSpeculativeDispatchCap:
             max_inference=4,
             bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
         )
-        assert scheduler._max_jobs_in_progress_allowed(0) == 4
+        assert scheduler._max_jobs_in_progress_allowed() == 4
 
     def test_cap_falls_back_when_vram_low(self) -> None:
         """Pre-staging is withheld when free VRAM is below the headroom threshold."""
@@ -1084,7 +1084,7 @@ class TestSpeculativeDispatchCap:
             max_inference=4,
             bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
         )
-        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+        assert scheduler._max_jobs_in_progress_allowed() == 2
 
     def test_cap_falls_back_when_vram_unknown(self) -> None:
         """With no VRAM report yet (cold start), do not speculate."""
@@ -1093,16 +1093,7 @@ class TestSpeculativeDispatchCap:
             max_inference=4,
             bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=True),
         )
-        assert scheduler._max_jobs_in_progress_allowed(0) == 2
-
-    def test_post_processing_count_added(self) -> None:
-        """Post-processing overlap slots extend the cap additively."""
-        scheduler = _make_inference_scheduler(
-            max_concurrent=2,
-            max_inference=4,
-            bridge_data=make_mock_bridge_data(gpu_sampling_lease_enabled=False),
-        )
-        assert scheduler._max_jobs_in_progress_allowed(1) == 3
+        assert scheduler._max_jobs_in_progress_allowed() == 2
 
 
 class TestGetSingleJobEffectiveMegapixelsteps:

@@ -174,6 +174,26 @@ class SafetyProcessEntryPoint(Protocol):
         """Run a safety process until told to end."""
 
 
+class PostProcessProcessEntryPoint(Protocol):
+    """The signature a callable must have to serve as the dedicated post-processing process target."""
+
+    def __call__(
+        self,
+        process_id: int,
+        process_message_queue: ProcessQueue,
+        pipe_connection: Connection,
+        disk_lock: Lock,
+        process_launch_identifier: int,
+        *,
+        device_index: int = 0,
+        accelerator_kind: str | None = None,
+        amd_gpu: bool = False,
+        directml: int | None = None,
+        dry_run_skip_post_processing: bool = False,
+    ) -> None:
+        """Run a post-processing process until told to end."""
+
+
 class DownloadProcessEntryPoint(Protocol):
     """The signature a callable must have to serve as the background download process target."""
 
@@ -496,6 +516,117 @@ def start_safety_process(
         worker_process.main_loop()
 
 
+def start_post_process_process(
+    process_id: int,
+    process_message_queue: ProcessQueue,
+    pipe_connection: Connection,
+    disk_lock: Lock,
+    process_launch_identifier: int,
+    *,
+    device_index: int = 0,
+    accelerator_kind: str | None = None,
+    amd_gpu: bool = False,
+    directml: int | None = None,
+    dry_run_skip_post_processing: bool = False,
+) -> None:
+    """Start the dedicated post-processing process.
+
+    Mirrors the inference process's hordelib bring-up (the post-processing graphs run on the same comfy
+    backend) but never loads an image-generation checkpoint. The process is pinned to its assigned card
+    before torch loads, the same as an inference process.
+
+    Args:
+        process_id (int): The reserved id for this process.
+        process_message_queue (ProcessQueue): The queue to send messages to the main process.
+        pipe_connection (Connection): Receives ``HordeControlMessage``s from the main process.
+        disk_lock (Lock): The lock to use for disk access.
+        process_launch_identifier (int): The unique identifier for this launch.
+        device_index (int, optional): The stable index of the GPU this process is assigned to. Defaults to 0.
+        accelerator_kind (str | None, optional): The backend kind (``cuda``/``rocm``/...) used to pin the \
+            process to its card. None applies no pinning. Defaults to None.
+        amd_gpu (bool, optional): Whether this is an AMD GPU. Defaults to False.
+        directml (int | None, optional): The DirectML device index, if any. Defaults to None.
+        dry_run_skip_post_processing (bool, optional): Skip real post-processing (and hordelib init) and \
+            echo images back. Defaults to False.
+    """
+    _spawn_timing_mark(process_id, "post_process", "entry")
+    if not dry_run_skip_post_processing:
+        _apply_device_pin(
+            process_id=process_id,
+            device_index=device_index,
+            accelerator_kind=accelerator_kind,
+            role="post_process",
+        )
+        _enable_expandable_segments(amd_gpu=amd_gpu, directml=directml)
+    enable_child_faulthandler(f"post_process_{process_id}")
+    neutralize_inherited_argv()
+    with contextlib.nullcontext():
+        logger.remove()
+        maybe_wait_for_process_debugger(process_id, "post_process")
+
+        try:
+            from horde_worker_regen.telemetry import claim_logfire_ownership, enforce_telemetry_default_off
+
+            claim_logfire_ownership()
+            enforce_telemetry_default_off()
+
+            from hordelib.api import HordeLog
+
+            HordeLog.initialise(
+                setup_logging=True,
+                process_id=process_id,
+                verbosity_count=resolve_worker_log_verbosity(),
+            )
+
+            from horde_worker_regen.telemetry import configure_child_telemetry
+
+            configure_child_telemetry(process_id)
+
+            if not dry_run_skip_post_processing:
+                import hordelib
+
+                extra_comfyui_args = ["--disable-smart-memory"]
+                if amd_gpu:
+                    extra_comfyui_args.append("--use-pytorch-cross-attention")
+                if directml is not None:
+                    extra_comfyui_args.append(f"--directml={directml}")
+
+                with logger.catch(reraise=True):
+                    hordelib.initialise(
+                        setup_logging=None,
+                        process_id=process_id,
+                        logging_verbosity=0,
+                        force_normal_vram_mode=False,
+                        extra_comfyui_args=extra_comfyui_args,
+                    )
+            else:
+                logger.info(f"Dry-run mode: skipping hordelib initialisation for post-process process {process_id}")
+
+        except Exception as e:
+            logger.critical(f"Failed to initialise post-process process: {type(e).__name__} {e}")
+            write_startup_crash(
+                f"post_process_{process_id}",
+                e,
+                os_pid=os.getpid(),
+                launch_identifier=process_launch_identifier,
+            )
+            sys.exit(1)
+
+        from horde_worker_regen.process_management.workers.post_process_process import HordePostProcessProcess
+
+        worker_process = HordePostProcessProcess(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+            device_index=device_index,
+            dry_run_skip_post_processing=dry_run_skip_post_processing,
+        )
+
+        worker_process.main_loop()
+
+
 def start_download_process(
     process_id: int,
     process_message_queue: ProcessQueue,
@@ -614,6 +745,7 @@ class ProcessEntryPoints:
 
     inference_entry_point: InferenceProcessEntryPoint
     safety_entry_point: SafetyProcessEntryPoint
+    post_process_entry_point: PostProcessProcessEntryPoint
     download_entry_point: DownloadProcessEntryPoint
 
     def __init__(
@@ -621,6 +753,7 @@ class ProcessEntryPoints:
         *,
         inference_entry_point: InferenceProcessEntryPoint | None = None,
         safety_entry_point: SafetyProcessEntryPoint | None = None,
+        post_process_entry_point: PostProcessProcessEntryPoint | None = None,
         download_entry_point: DownloadProcessEntryPoint | None = None,
     ) -> None:
         """Initialise with the given entry points, defaulting to the real ones.
@@ -630,6 +763,8 @@ class ProcessEntryPoints:
                 inference processes. Defaults to `start_inference_process`.
             safety_entry_point (SafetyProcessEntryPoint | None, optional): The target for \
                 safety processes. Defaults to `start_safety_process`.
+            post_process_entry_point (PostProcessProcessEntryPoint | None, optional): The target for \
+                the dedicated post-processing process. Defaults to `start_post_process_process`.
             download_entry_point (DownloadProcessEntryPoint | None, optional): The target for \
                 the background download process. Defaults to `start_download_process`.
         """
@@ -637,6 +772,9 @@ class ProcessEntryPoints:
             inference_entry_point if inference_entry_point is not None else start_inference_process
         )
         self.safety_entry_point = safety_entry_point if safety_entry_point is not None else start_safety_process
+        self.post_process_entry_point = (
+            post_process_entry_point if post_process_entry_point is not None else start_post_process_process
+        )
         self.download_entry_point = (
             download_entry_point if download_entry_point is not None else start_download_process
         )

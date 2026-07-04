@@ -221,9 +221,11 @@ and logs an operator advisory to downgrade settings. The suppression is
 because the over-commit is structural and auto-recovery would simply re-trip it.
 It mirrors the per-model unservable breaker and the self-maintenance throttle: a
 worker that protects its own standing on the horde rather than bleeding dropped
-jobs until the server intervenes. The active reclaim
-(`post_processing_active_reclaim_enabled`) is the preventative complement that
-keeps the breaker from being needed in the first place.
+jobs until the server intervenes. The dedicated post-processing lane (see
+[Process lanes and job chaining](process_lanes_and_chaining.md)) is the structural
+complement that keeps the breaker from being needed in the first place: its
+fixed resident footprint replaces the transient per-job peak that caused the
+over-commits.
 
 ## The action ledger
 

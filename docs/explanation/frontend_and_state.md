@@ -37,7 +37,8 @@ defines the structured protocol over it:
   objects at a steady cadence (the same data the overview, per-process view, and
   Downloads tab render), including an `orchestration_intent` summary (what the
   scheduler/popper is doing next and why), a `work_ledger` of active/recent job
-  state, a `SystemMemorySnapshot` (machine total/available
+  state (including post-processing stage rows and each active image job's current pop-order),
+  post-processing lane counters, a `SystemMemorySnapshot` (machine total/available
   RAM plus per-role worker RSS) and a `per_card` list of
   [`CardSnapshot`][horde_worker_regen.process_management.ipc.supervisor_channel.CardSnapshot]
   (one per driven GPU: VRAM headroom, inference contexts, whole-card residency, and
@@ -47,7 +48,7 @@ defines the structured protocol over it:
   worker-owned stats data: the latest one-second `StatsSample`, bounded stats-history backfill for
   reconnecting frontends, model/baseline `StatsRollupRow` tables, and `StatsExportState` for the JSONL
   export toggle and disk-size warning. The snapshot is versioned by `SUPERVISOR_PROTOCOL_VERSION`
-  (currently 15) so a frontend can detect a mismatch with a worker built from different code.
+  (currently 16) so a frontend can detect a mismatch with a worker built from different code.
 - The worker drains
   [`SupervisorControlMessage`][horde_worker_regen.process_management.ipc.supervisor_channel.SupervisorControlMessage]
   commands each loop tick (start/stop intent, download pause/resume and rate

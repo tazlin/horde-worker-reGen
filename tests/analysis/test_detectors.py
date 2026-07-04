@@ -847,7 +847,71 @@ class TestPostProcessingVramStall:
         assert "post_processing_vram_stall" in findings
         assert findings["post_processing_vram_stall"].severity is Severity.CRITICAL
 
+    def test_dedicated_lane_low_vram_warning_fires(self, tmp_path: Path) -> None:
+        """Dedicated post-processing plus Comfy low-free-VRAM warnings is enough to diagnose the overlap."""
+        child = "\n".join(
+            [
+                "2026-06-28 16:53:12.000 | INFO | horde_worker_regen.process_management.workers.post_process_process:_run_post_processing:190 - Post-processing job 9bccbf84",
+                "2026-06-28 16:53:14.000 | WARNING | comfy.model_management:free_memory:1110 - Free VRAM: 316 MB (+5272 MB reclaimable torch cache; comfy sees 5588)",
+            ],
+        )
+        bridge = self._bridge("2026-06-28 16:54:00.000 | INFO | x:y:1 - Session still active")
+        findings = _diagnose(tmp_path, bridge, {"bridge_1.log": child})
+        finding = findings["post_processing_vram_stall"]
+        assert finding.severity is Severity.WARNING
+        assert "low-free-VRAM" in finding.verdict
+
     def test_silent_without_signals(self, tmp_path: Path) -> None:
         """A crash-on-start recovery is not a post-processing stall, so the detector stays silent."""
         bridge = self._bridge(_recovery("16:53:31.000", 1, reason="inference process replaced (crashed or hung)"))
         assert "post_processing_vram_stall" not in _diagnose(tmp_path, bridge)
+
+
+class TestPostProcessingDeferralStarvation:
+    """The admission gate deferring the same job in a loop, with and without lane completions."""
+
+    _JOB = "4e17ddbd-a9cc-494d-b668-8f6fcb6d08aa"
+
+    def _defer(self, ts: str, job_id: str) -> str:
+        return (
+            f"2026-06-28 {ts} | WARNING | horde_worker_regen.process_management.workers."
+            f"post_process_orchestrator:_has_post_processing_headroom:102 - Deferring post-processing for "
+            f"job {job_id}: estimated peak 8533 MB plus reserve 2048 MB exceeds free VRAM after commitments "
+            "(6675 MB available on card 0). No idle VRAM reclaim was available."
+        )
+
+    def _finished(self, ts: str, job_id: str) -> str:
+        return (
+            f"2026-06-28 {ts} | INFO | horde_worker_regen.process_management.ipc."
+            f"message_dispatcher:_handle_post_process_result:803 - Post-processing finished for job "
+            f"{job_id[:8]} in 2.12 seconds on process 1."
+        )
+
+    def _bridge(self, *lines: str) -> str:
+        return "\n".join(
+            [f"2026-06-28 16:50:00.000 | DEBUG | hordelib.utils.logger:set_sinks:269 - {_STARTUP}", *lines],
+        )
+
+    def _defer_storm(self, count: int, *, start_minute: int = 53) -> list[str]:
+        return [self._defer(f"16:{start_minute + i // 60:02d}:{i % 60:02d}.000", self._JOB) for i in range(count)]
+
+    def test_starved_lane_is_critical(self, tmp_path: Path) -> None:
+        """A long same-job deferral storm with zero completions afterwards is the critical starvation."""
+        findings = _diagnose(tmp_path, self._bridge(*self._defer_storm(40)))
+        finding = findings["post_processing_deferral_starvation"]
+        assert finding.severity is Severity.CRITICAL
+        assert self._JOB in finding.verdict
+        assert "starved the entire lane" in finding.verdict
+
+    def test_storm_with_completions_is_a_warning(self, tmp_path: Path) -> None:
+        """A deferral storm while other jobs still complete is head starvation, reported as a warning."""
+        lines = self._defer_storm(40) + [self._finished("16:56:30.000", "1bef2bda-0000-0000-0000-000000000000")]
+        findings = _diagnose(tmp_path, self._bridge(*lines))
+        finding = findings["post_processing_deferral_starvation"]
+        assert finding.severity is Severity.WARNING
+
+    def test_transient_deferral_does_not_fire(self, tmp_path: Path) -> None:
+        """A handful of deferrals (healthy backpressure across a VRAM spike) produces no finding."""
+        lines = self._defer_storm(4) + [self._finished("16:53:30.000", self._JOB)]
+        findings = _diagnose(tmp_path, self._bridge(*lines))
+        assert "post_processing_deferral_starvation" not in findings

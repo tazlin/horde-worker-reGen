@@ -29,12 +29,22 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import auto
 
+from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
     ImageGenerateJobPopResponse,
 )
 from horde_sdk.ai_horde_api.consts import METADATA_TYPE, METADATA_VALUE
 from horde_sdk.ai_horde_api.fields import GenerationID
+from horde_sdk.worker.chaining import (
+    CHAIN_NODE_STATE,
+    POST_PROCESS_STAGE_NAME,
+    SAFETY_CHECK_STAGE_NAME,
+    ChainConsistencyError,
+    ChainExecutionContext,
+    image_generation_flow,
+)
+from horde_sdk.worker.consts import GENERATION_PROGRESS
 from loguru import logger
 
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
@@ -57,8 +67,12 @@ class JobStage(enum.Enum):
     """Sent to an inference process which has not yet returned a result."""
     DETACHED = auto()
     """Tracked but not in any queue; a transient hand-off state."""
+    PENDING_POST_PROCESSING = auto()
+    """Inference finished and the job requested post-processing; waiting for the post-processing lane."""
+    POST_PROCESSING = auto()
+    """Sent to the post-processing process; awaiting the post-processed images."""
     PENDING_SAFETY_CHECK = auto()
-    """Inference finished; waiting for a safety process slot."""
+    """Inference (and any post-processing) finished; waiting for a safety process slot."""
     SAFETY_CHECKING = auto()
     """Sent to the safety process; awaiting its verdict."""
     PENDING_SUBMIT = auto()
@@ -84,13 +98,41 @@ class InferenceFailureResolution(enum.Enum):
 
 _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
     JobStage.PENDING_INFERENCE: frozenset(
-        {JobStage.INFERENCE_IN_PROGRESS, JobStage.DETACHED, JobStage.PENDING_SAFETY_CHECK, JobStage.PENDING_SUBMIT},
+        {
+            JobStage.INFERENCE_IN_PROGRESS,
+            JobStage.DETACHED,
+            JobStage.PENDING_POST_PROCESSING,
+            JobStage.PENDING_SAFETY_CHECK,
+            JobStage.PENDING_SUBMIT,
+        },
     ),
     JobStage.INFERENCE_IN_PROGRESS: frozenset(
-        {JobStage.PENDING_INFERENCE, JobStage.DETACHED, JobStage.PENDING_SAFETY_CHECK, JobStage.PENDING_SUBMIT},
+        {
+            JobStage.PENDING_INFERENCE,
+            JobStage.DETACHED,
+            JobStage.PENDING_POST_PROCESSING,
+            JobStage.PENDING_SAFETY_CHECK,
+            JobStage.PENDING_SUBMIT,
+        },
     ),
     JobStage.DETACHED: frozenset(
-        {JobStage.PENDING_SAFETY_CHECK, JobStage.PENDING_SUBMIT, JobStage.PENDING_INFERENCE},
+        {
+            JobStage.PENDING_POST_PROCESSING,
+            JobStage.PENDING_SAFETY_CHECK,
+            JobStage.PENDING_SUBMIT,
+            JobStage.PENDING_INFERENCE,
+        },
+    ),
+    JobStage.PENDING_POST_PROCESSING: frozenset(
+        {JobStage.POST_PROCESSING, JobStage.PENDING_SAFETY_CHECK, JobStage.PENDING_SUBMIT, JobStage.DETACHED},
+    ),
+    JobStage.POST_PROCESSING: frozenset(
+        {
+            JobStage.DETACHED,
+            JobStage.PENDING_POST_PROCESSING,
+            JobStage.PENDING_SAFETY_CHECK,
+            JobStage.PENDING_SUBMIT,
+        },
     ),
     JobStage.PENDING_SAFETY_CHECK: frozenset(
         {JobStage.SAFETY_CHECKING, JobStage.PENDING_SUBMIT, JobStage.DETACHED},
@@ -105,6 +147,8 @@ _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
 _QUEUED_STAGES: tuple[JobStage, ...] = (
     JobStage.PENDING_INFERENCE,
     JobStage.INFERENCE_IN_PROGRESS,
+    JobStage.PENDING_POST_PROCESSING,
+    JobStage.POST_PROCESSING,
     JobStage.PENDING_SAFETY_CHECK,
     JobStage.SAFETY_CHECKING,
     JobStage.PENDING_SUBMIT,
@@ -165,6 +209,12 @@ class TrackedJob:
 
     Keys this model's over-budget fault streak per card so a model unservable on a small card can still be
     advertised and run on a larger one. None on single-GPU keeps the streak worker-wide, exactly as before."""
+    chain_context: ChainExecutionContext | None = None
+    """The chain-stage state for this job's unit of work, or None for jobs registered outside the pop path.
+
+    Built at registration from the job's requested stages (generate, optional post-processing, safety,
+    submit) and advanced in lockstep with :class:`JobStage` transitions, so any observer can read which
+    stage of the routing plan the job is in without re-deriving it from queue membership."""
 
 
 @dataclass(frozen=True)
@@ -176,6 +226,8 @@ class JobTrackerSnapshot:
     job_faults: dict[GenerationID, list[GenMetadataEntry]]
     jobs_pending_safety_check: tuple[HordeJobInfo, ...]
     jobs_being_safety_checked: tuple[HordeJobInfo, ...]
+    jobs_pending_post_processing: tuple[HordeJobInfo, ...]
+    jobs_being_post_processed: tuple[HordeJobInfo, ...]
     jobs_pending_submit: tuple[HordeJobInfo, ...]
     jobs_pending_inference: tuple[ImageGenerateJobPopResponse, ...]
     job_pop_timestamps: dict[ImageGenerateJobPopResponse, float]
@@ -381,12 +433,71 @@ class JobTracker:
                 f"{tracked.stage.name} -> {new_stage.name}. Transition refused.",
             )
             return False
+        old_stage = tracked.stage
         tracked.stage = new_stage
         tracked.stage_sequence = self._next_sequence()
         now = time.time()
         tracked.stage_timestamps.setdefault(new_stage.name, now)
         tracked.current_stage_since = now
+        self._sync_chain_with_stage(tracked, old_stage, new_stage)
         return True
+
+    def _advance_chain(self, tracked: TrackedJob, progress: GENERATION_PROGRESS) -> None:
+        """Advance a job's chain context from a generation-progress observation, tolerating refusals.
+
+        A refusal means the chain's routing plan and the worker's queue bookkeeping disagree (e.g. a
+        recovery path re-entered a stage the chain considers finished); the queue bookkeeping remains
+        authoritative, so the disagreement is logged rather than raised.
+        """
+        context = tracked.chain_context
+        if context is None:
+            return
+        try:
+            context.advance_for_progress(progress)
+        except ChainConsistencyError as e:
+            logger.warning(f"Chain state for job {tracked.job_id} refused progress {progress}: {e}")
+
+    def _sync_chain_with_stage(self, tracked: TrackedJob, old_stage: JobStage, new_stage: JobStage) -> None:
+        """Mirror a queue-stage transition into the job's chain context.
+
+        The chain is the descriptive routing plan; :class:`JobStage` (queue membership) remains the
+        executor of record. Milestone progress values are derived from the transition: entering a working
+        stage marks its node executing, and entering the next queue marks the preceding node's completion
+        milestone. Fault paths that jump to ``PENDING_SUBMIT`` are recognized by the safety node not being
+        mid-execution, leaving the chain to record only the stages that genuinely ran.
+        """
+        if tracked.chain_context is None:
+            return
+        snapshot = tracked.chain_context.snapshot()
+
+        if new_stage == JobStage.INFERENCE_IN_PROGRESS:
+            self._advance_chain(tracked, GENERATION_PROGRESS.GENERATING)
+            return
+
+        if new_stage == JobStage.PENDING_POST_PROCESSING and old_stage != JobStage.POST_PROCESSING:
+            self._advance_chain(tracked, GENERATION_PROGRESS.GENERATION_COMPLETE)
+            return
+
+        if new_stage == JobStage.POST_PROCESSING:
+            self._advance_chain(tracked, GENERATION_PROGRESS.POST_PROCESSING)
+            return
+
+        if new_stage == JobStage.PENDING_SAFETY_CHECK:
+            self._advance_chain(tracked, GENERATION_PROGRESS.GENERATION_COMPLETE)
+            if snapshot.get(POST_PROCESS_STAGE_NAME) == CHAIN_NODE_STATE.EXECUTING:
+                self._advance_chain(tracked, GENERATION_PROGRESS.POST_PROCESSING_COMPLETE)
+            return
+
+        if new_stage == JobStage.SAFETY_CHECKING:
+            self._advance_chain(tracked, GENERATION_PROGRESS.SAFETY_CHECKING)
+            return
+
+        if (
+            new_stage == JobStage.PENDING_SUBMIT
+            and snapshot.get(SAFETY_CHECK_STAGE_NAME) == CHAIN_NODE_STATE.EXECUTING
+        ):
+            self._advance_chain(tracked, GENERATION_PROGRESS.SAFETY_CHECK_COMPLETE)
+            return
 
     def _register(
         self,
@@ -406,6 +517,17 @@ class JobTracker:
             )
             del self._jobs[job_id]
 
+        # A chain context is only meaningful when the job enters at the start of its routing plan; a job
+        # re-registered mid-flow (orphan recovery) would have to fake the stages it never traversed here.
+        chain_context: ChainExecutionContext | None = None
+        if stage == JobStage.PENDING_INFERENCE:
+            chain_context = ChainExecutionContext(
+                image_generation_flow(
+                    post_processing=bool(sdk_api_job_info.payload.post_processing),
+                    safety_check=True,
+                ),
+            )
+
         tracked = TrackedJob(
             job_id=job_id,
             sdk_api_job_info=sdk_api_job_info,
@@ -414,6 +536,7 @@ class JobTracker:
             time_popped=time_popped,
             pop_order=self._next_sequence(),
             stage_sequence=self._next_sequence(),
+            chain_context=chain_context,
         )
         now = time.time()
         tracked.stage_timestamps[stage.name] = now
@@ -490,6 +613,18 @@ class JobTracker:
         return tuple(t.job_info for t in self._jobs_in_stage(JobStage.SAFETY_CHECKING) if t.job_info is not None)
 
     @property
+    def jobs_pending_post_processing(self) -> tuple[HordeJobInfo, ...]:
+        """Return the `HordeJobInfo` objects for jobs pending the dedicated post-processing lane."""
+        return tuple(
+            t.job_info for t in self._jobs_in_stage(JobStage.PENDING_POST_PROCESSING) if t.job_info is not None
+        )
+
+    @property
+    def jobs_being_post_processed(self) -> tuple[HordeJobInfo, ...]:
+        """Return the `HordeJobInfo` objects for jobs currently being post-processed."""
+        return tuple(t.job_info for t in self._jobs_in_stage(JobStage.POST_PROCESSING) if t.job_info is not None)
+
+    @property
     def jobs_pending_submit(self) -> tuple[HordeJobInfo, ...]:
         """Return the `HordeJobInfo` objects for jobs pending submit."""
         return tuple(t.job_info for t in self._jobs_in_stage(JobStage.PENDING_SUBMIT) if t.job_info is not None)
@@ -547,6 +682,8 @@ class JobTracker:
             job_faults=self.job_faults,
             jobs_pending_safety_check=self.jobs_pending_safety_check,
             jobs_being_safety_checked=self.jobs_being_safety_checked,
+            jobs_pending_post_processing=self.jobs_pending_post_processing,
+            jobs_being_post_processed=self.jobs_being_post_processed,
             jobs_pending_submit=self.jobs_pending_submit,
             jobs_pending_inference=self.jobs_pending_inference,
             job_pop_timestamps=self.job_pop_timestamps,
@@ -736,6 +873,110 @@ class JobTracker:
         # None on a single-GPU host). Counted on the result message so a per-card rate excludes crash faults.
         self.note_card_inference_result(tracked.last_dispatched_device_index)
 
+    async def queue_for_post_processing(self, job_info: HordeJobInfo) -> None:
+        """Queue an inference-complete job (that requested post-processing) for the post-processing lane.
+
+        Inference genuinely produced these (raw) images, so the model-inference success bookkeeping is
+        recorded here exactly as :meth:`queue_for_safety` does for the no-post-processing path; the job's
+        move to the safety stage after post-processing (:meth:`queue_for_safety_post_processed`) therefore
+        does not re-record it.
+        """
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None:
+            if job_info.sdk_api_job_info.id_ is None:
+                logger.error(
+                    "Refusing to queue a job without a generation ID for post-processing; it cannot be submitted",
+                )
+                return
+            logger.debug(
+                f"Job {job_info.sdk_api_job_info.id_} was not tracked when queued for post-processing; "
+                "registering it now",
+            )
+            self._register(
+                job_id=job_info.sdk_api_job_info.id_,
+                sdk_api_job_info=job_info.sdk_api_job_info,
+                stage=JobStage.PENDING_POST_PROCESSING,
+                job_info=job_info,
+                time_popped=None,
+            )
+            return
+        if not self._set_stage(tracked, JobStage.PENDING_POST_PROCESSING):
+            logger.warning(
+                f"Refusing to re-queue job {job_info.sdk_api_job_info.id_} for post-processing from stage "
+                f"{tracked.stage.name}; keeping its existing result (likely a stale/duplicate result).",
+            )
+            return
+        tracked.job_info = job_info
+        self.record_model_inference_success(
+            job_info.sdk_api_job_info.model,
+            device_index=tracked.last_dispatched_device_index,
+        )
+        self.note_card_inference_result(tracked.last_dispatched_device_index)
+
+    async def queue_for_safety_post_processed(self, job_info: HordeJobInfo) -> None:
+        """Move a post-processed job on to the safety stage, adopting its post-processed images.
+
+        The inference-success bookkeeping was already recorded when the job entered post-processing, so
+        (unlike :meth:`queue_for_safety`) this only validates the transition and adopts the new result.
+        """
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None:
+            if job_info.sdk_api_job_info.id_ is None:
+                logger.error("Refusing to queue a post-processed job without a generation ID for safety")
+                return
+            self._register(
+                job_id=job_info.sdk_api_job_info.id_,
+                sdk_api_job_info=job_info.sdk_api_job_info,
+                stage=JobStage.PENDING_SAFETY_CHECK,
+                job_info=job_info,
+                time_popped=None,
+            )
+            return
+        if not self._set_stage(tracked, JobStage.PENDING_SAFETY_CHECK):
+            logger.warning(
+                f"Refusing to move post-processed job {job_info.sdk_api_job_info.id_} to safety from stage "
+                f"{tracked.stage.name}; keeping its existing result.",
+            )
+            return
+        tracked.job_info = job_info
+
+    async def begin_post_processing(self, job_info: HordeJobInfo) -> None:
+        """Mark a job as sent to the post-processing process."""
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None:
+            logger.error(
+                f"Job {job_info.sdk_api_job_info.id_} is not tracked; cannot begin its post-processing",
+            )
+            return
+        self._set_stage(tracked, JobStage.POST_PROCESSING)
+
+    async def abandon_pending_post_processing(self, job_info: HordeJobInfo) -> None:
+        """Abandon a job from the pending post-processing state (it remains tracked, detached)."""
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None or tracked.stage != JobStage.PENDING_POST_PROCESSING:
+            return
+        self._set_stage(tracked, JobStage.DETACHED)
+
+    async def requeue_one_being_post_processed(self, job_id: GenerationID) -> bool:
+        """Move a single job from POST_PROCESSING back to PENDING_POST_PROCESSING for a fresh attempt.
+
+        Used by the post-processing-orphan watchdog when a job's post-processing result was lost (the
+        process was replaced, or a result message was dropped). Returns True if the job was in
+        POST_PROCESSING and was requeued, False otherwise.
+        """
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.stage != JobStage.POST_PROCESSING:
+            return False
+        return self._set_stage(tracked, JobStage.PENDING_POST_PROCESSING)
+
+    async def take_being_post_processed(self, job_id: GenerationID) -> HordeJobInfo | None:
+        """Take a job that is currently being post-processed by its ID, detaching it."""
+        tracked = self._tracked_by_id(job_id)
+        if tracked is None or tracked.stage != JobStage.POST_PROCESSING:
+            return None
+        self._set_stage(tracked, JobStage.DETACHED)
+        return tracked.job_info
+
     async def queue_for_submit(self, job_info: HordeJobInfo) -> None:
         """Queue a job for submission."""
         tracked = self._tracked_for(job_info.sdk_api_job_info)
@@ -886,6 +1127,15 @@ class JobTracker:
             )
 
         tracked.stage_timestamps.setdefault("FINALIZED", time.time())
+
+        # Close out the chain: a job that faulted terminally aborts (failing whichever stage was
+        # executing); a successful one walks the submit stage to completion.
+        if completed_job_info.state == GENERATION_STATE.faulted:
+            self._advance_chain(tracked, GENERATION_PROGRESS.ABORTED)
+        else:
+            self._advance_chain(tracked, GENERATION_PROGRESS.SUBMITTING)
+            self._advance_chain(tracked, GENERATION_PROGRESS.SUBMIT_COMPLETE)
+
         if self._finalize_observer is not None:
             try:
                 self._finalize_observer(tracked, completed_job_info)

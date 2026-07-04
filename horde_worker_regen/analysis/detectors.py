@@ -106,14 +106,18 @@ _WHOLE_CARD_DECLINED_RE = re.compile(r"Declined a whole-card residency for")
 # detector rather than folding into a generic hang. The phrase is the worker's verbatim reap line.
 _STUCK_STEP_RE = re.compile(r"stuck on a non-advancing sampling step|stuck-step watchdog")
 
-# The post-processing-stage watchdog reaping a slot that went silent in INFERENCE_POST_PROCESSING. The
-# upscaler/face-fixer peak (a 4x SDXL upscale is ~8.5 GB) lands after sampling and is never charged against
-# the job's placement, so on a card already holding warm sibling models and several contexts it allocates
-# into near-zero free VRAM and tile-thrashes silently until the post_process_timeout + 3*max_batch silence
-# reaps the slot. Distinct from a generic hang: the cause is a VRAM over-commit at the post-sampling peak,
-# and the remedy is the active post-processing reclaim (free cross-process room before the peak), not a
-# longer timeout. The phrase is the worker's verbatim reap line (process_lifecycle._check_and_replace_process).
+# The post-processing-stage watchdog reaping a slot that went silent. Older workers reported this as
+# INFERENCE_POST_PROCESSING; dedicated-lane workers report POST_PROCESS / POST_PROCESSING. The peak is still
+# an upscaler/face-fixer allocation landing after sampling, concurrent with warm inference siblings.
 _POST_PROCESSING_STALL_RE = re.compile(r"seems to be stuck post processing")
+_DEDICATED_POST_PROCESS_RE = re.compile(
+    r"\bPOST_PROCESS(?:\)|ING\b)|Post-processing (?:job|for job|finished)|dedicated post-process",
+    re.IGNORECASE,
+)
+_LOW_VRAM_STREAM_RE = re.compile(
+    r"Free VRAM: \d+ MB.*(?:below .*inference reserve|reclaimable torch cache|stream|til)",
+    re.IGNORECASE,
+)
 # The feature-level circuit breaker disabling post-processing after a run of over-commit faults. Its trip
 # line is the operator advisory: it confirms the spiral reached the self-protective latch (post-processing is
 # now off until restart), so a session carrying it is escalated and the remediation points at the restart +
@@ -168,6 +172,26 @@ Detector = Callable[[SessionContext], "list[Finding]"]
 def _matching(records: list[LogRecord], pattern: re.Pattern[str]) -> list[LogRecord]:
     """Orchestrator records whose message matches ``pattern``."""
     return [record for record in records if pattern.search(record.message)]
+
+
+def _record_in_session(context: SessionContext, record: LogRecord) -> bool:
+    """Return whether ``record`` belongs to the session's wall-clock window."""
+    if record.timestamp is None:
+        return False
+    start, end = context.session.start_ts, context.session.end_ts
+    if start is not None and record.timestamp < start:
+        return False
+    return not (end is not None and record.timestamp > end)
+
+
+def _child_records_in_session(context: SessionContext) -> list[LogRecord]:
+    """Return child loop records whose timestamps fall inside the diagnosed session."""
+    records: list[LogRecord] = []
+    for process_id in context.bundle.process_ids():
+        records.extend(
+            record for record in context.bundle.child_records(process_id) if _record_in_session(context, record)
+        )
+    return records
 
 
 def _median(values: list[float]) -> float | None:
@@ -333,32 +357,35 @@ def detect_stuck_inference_step(context: SessionContext) -> list[Finding]:
 
 
 def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
-    """A slot reaped silent in post-processing: the upscaler/face-fixer peak over-committed the card.
+    """Post-processing overlapped with generation until ComfyUI fell back to low-VRAM streaming.
 
-    A post-processing job is admitted on its sampling footprint, but the much larger peak that lands *after*
-    sampling (a 4x SDXL upscale is ~8.5 GB) is never charged against its placement. On a card already holding
-    warm sibling models and several process contexts, the upscaler allocates into near-zero free VRAM and
-    tile-thrashes silently until the post-processing-stage watchdog reaps the slot. ComfyUI's own
-    ``free_memory`` can only release *this* process's weights; the sibling models and contexts are
-    cross-process and only the orchestrator can reclaim them, so the in-child retry never finds room. Each
-    reap strands the in-flight job and burns a process recovery; the same job stalling twice faults it, and
-    repeated faulting trips the horde's forced maintenance.
+    The dedicated post-processing lane keeps the upscaler/face-fixer work out of the inference process, but
+    it still allocates on the same GPU. A low-free-VRAM warning while that lane is active means the
+    post-processing peak and concurrent inference residency were admitted against the same device headroom.
     """
     stalls = _matching(context.session.records, _POST_PROCESSING_STALL_RE)
     breaker_trips = _matching(context.session.records, _POST_PROCESSING_BREAKER_RE)
-    if not stalls and not breaker_trips:
+    child_records = _child_records_in_session(context)
+    dedicated_activity = _matching(context.session.records, _DEDICATED_POST_PROCESS_RE) + _matching(
+        child_records,
+        _DEDICATED_POST_PROCESS_RE,
+    )
+    low_vram_warnings = _matching(child_records, _LOW_VRAM_STREAM_RE)
+    if not stalls and not breaker_trips and not (dedicated_activity and low_vram_warnings):
         return []
-    post_processing_recoveries = [r for r in context.recoveries if r.last_state == "INFERENCE_POST_PROCESSING"]
+    post_processing_recoveries = [
+        r for r in context.recoveries if r.last_state in {"INFERENCE_POST_PROCESSING", "POST_PROCESSING"}
+    ]
     dropped = _total_dropped_jobs(context.session.records)
     forced_maintenance = bool(_matching(context.session.records, _MAINTENANCE_POP_RE))
     escalated = dropped > 0 or forced_maintenance or bool(breaker_trips)
     verdict = (
-        f"{len(stalls)} time(s) an inference slot went silent in post-processing and was reaped by the "
-        "post-processing-stage watchdog. The upscaler/face-fixer peak that lands after sampling (a 4x SDXL "
-        "upscale is ~8.5 GB) was never charged against the job's placement, so on a contended card it "
-        "allocated into near-zero free VRAM and tile-thrashed until the silence timeout fired. The in-child "
-        "retry cannot recover: ComfyUI frees only this process's own weights, while the sibling models and "
-        "contexts that fill the card are reclaimable only by the orchestrator."
+        f"{len(stalls)} post-processing watchdog reap(s), {len(low_vram_warnings)} child low-free-VRAM "
+        "warning(s), and dedicated post-processing activity were observed in the same session. The "
+        "upscaler/face-fixer peak that lands after sampling was competing with inference models and CUDA "
+        "contexts on the same card, pushing ComfyUI toward tiled/streaming execution instead of fast in-VRAM "
+        "sampling. ComfyUI can only release this process's own cache; sibling process models and contexts are "
+        "reclaimable only by the orchestrator."
     )
     if breaker_trips:
         verdict += (
@@ -376,10 +403,10 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
             title="Post-processing stalled on an over-committed card",
             verdict=verdict,
             remediation=(
-                "Enable the active post-processing reclaim (`post_processing_active_reclaim_enabled`) so the "
-                "scheduler frees cross-process VRAM (an idle sibling model, then a context) before the peak "
-                "lands. As a stopgap, lower concurrency/queue or disable post-processing on this card; a 4x "
-                "upscale needs ~8.5 GB free at peak that a multi-context card cannot spare. The "
+                "Run with the VRAM budget enabled on a build where the dedicated post-processing lane "
+                "participates in committed-reserve accounting and idle VRAM reclaim. As a stopgap, lower "
+                "concurrency/queue or disable post-processing on this card; a 4x upscale needs several GB "
+                "free at peak that a multi-context card may not spare. The "
                 "`post_processing_fault_breaker_enabled` breaker disables post-processing automatically after "
                 "repeated stalls so the worker stops feeding the forced-maintenance spiral"
                 + (
@@ -389,9 +416,81 @@ def detect_post_processing_vram_stall(context: SessionContext) -> list[Finding]:
                     else "."
                 )
             ),
-            evidence=[_evidence(r) for r in (stalls[:4] + breaker_trips[:1])]
+            evidence=[_evidence(r) for r in (stalls[:4] + low_vram_warnings[:4] + breaker_trips[:1])]
             + [_evidence(r.record) for r in post_processing_recoveries[:2]],
             see_also="vram_ram_budget_subsystem",
+        ),
+    ]
+
+
+_PP_DEFER_RE = re.compile(r"Deferring post-processing for job ([0-9a-f][0-9a-f-]{7,35})")
+_PP_FINISHED_RE = re.compile(r"Post-processing finished for job")
+
+# A handful of deferrals is healthy backpressure while a transient VRAM spike passes; the same job
+# deferred this many times means its headroom condition is structurally unsatisfiable on this card.
+_PP_DEFER_STARVATION_THRESHOLD = 30
+_PP_DEFER_WARNING_THRESHOLD = 10
+
+
+def detect_post_processing_deferral_starvation(context: SessionContext) -> list[Finding]:
+    """The post-processing lane deferring the same job indefinitely instead of serving or degrading it.
+
+    The lane's admission gate compares a job's estimated peak (plus the configured reserve) against the
+    card's free VRAM after commitments. When that inequality can never be satisfied for the head of the
+    pending queue, the head is deferred every scheduling tick, everything behind it waits, and the
+    finished raw images are never submitted. The signature is one job accumulating deferral warnings by
+    the tens to hundreds; when no lane completion lands after the storm begins, the whole lane is
+    starved, not just the head.
+    """
+    defer_records: dict[str, list[LogRecord]] = {}
+    for record in context.session.records:
+        match = _PP_DEFER_RE.search(record.message)
+        if match is not None:
+            defer_records.setdefault(match.group(1), []).append(record)
+    if not defer_records:
+        return []
+
+    worst_job, worst = max(defer_records.items(), key=lambda item: len(item[1]))
+    if len(worst) < _PP_DEFER_WARNING_THRESHOLD:
+        return []
+
+    storm_start = next((r.timestamp for r in worst if r.timestamp is not None), None)
+    completions_after = [
+        r
+        for r in _matching(context.session.records, _PP_FINISHED_RE)
+        if storm_start is None or (r.timestamp is not None and r.timestamp >= storm_start)
+    ]
+    lane_fully_starved = not completions_after
+    starved = len(worst) >= _PP_DEFER_STARVATION_THRESHOLD
+
+    verdict = (
+        f"Job {worst_job} was deferred by the post-processing admission gate {len(worst)} time(s) "
+        f"({len(defer_records)} job(s) deferred in total). Its estimated peak plus the VRAM reserve never "
+        "fit the card's free-after-commitments figure, and no aging or raw-image fallback ever released it, "
+        "so its finished inference was held unsubmitted."
+    )
+    if lane_fully_starved:
+        verdict += (
+            " No post-processing completed after the deferrals began: the head of the queue starved the "
+            "entire lane (head-of-line blocking)."
+        )
+    return [
+        Finding(
+            id="post_processing_deferral_starvation",
+            severity=Severity.CRITICAL if starved and lane_fully_starved else Severity.WARNING,
+            title="Post-processing lane starved by its admission gate",
+            verdict=verdict,
+            remediation=(
+                "Verify the admission inputs: the free-VRAM figure must reflect the lane's card (not a stale "
+                "minimum across children) and must not re-subtract commitments already realised in the "
+                "measurement, and the per-chain peak estimate must match measured op costs. A deferred job "
+                "must age out to a raw-image submit after a bounded wait instead of parking forever, and "
+                "fittable jobs behind an unfittable head must be dispatched ahead of it. As a stopgap, "
+                "lower resident VRAM on the lane's card (fewer processes or models) or disable "
+                "post-processing on this worker."
+            ),
+            evidence=[_evidence(r) for r in (worst[:2] + worst[-2:])],
+            see_also="process_lanes_and_chaining",
         ),
     ]
 
@@ -1154,6 +1253,7 @@ DETECTORS: list[Detector] = [
     detect_pop_governor_dominance,
     detect_stuck_inference_step,
     detect_post_processing_vram_stall,
+    detect_post_processing_deferral_starvation,
     detect_oom,
     detect_swallowed_oom,
     detect_orphan_wedge,

@@ -20,6 +20,8 @@ from loguru import logger
 if TYPE_CHECKING:
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
+from horde_sdk.ai_horde_api.fields import GenerationID
+
 from horde_worker_regen.compute_mode import is_cpu_only_install
 from horde_worker_regen.consts import VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
@@ -194,6 +196,8 @@ class ProcessLifecycleManager:
     _num_process_recoveries: int
     _safety_processes_should_be_replaced: bool
     _safety_processes_ending: bool
+    _post_process_processes_should_be_replaced: bool
+    _post_process_processes_ending: bool
     _recently_recovered: bool
     _hung_processes_detected: bool
     _hung_processes_detected_time: float
@@ -271,6 +275,9 @@ class ProcessLifecycleManager:
         self._num_slowdown_events = 0
         self._safety_processes_should_be_replaced = False
         self._safety_processes_ending = False
+        self._post_process_processes_should_be_replaced = False
+        self._post_process_processes_ending = False
+        self._post_process_results_known_lost: set[GenerationID] = set()
         # Runtime override forcing the safety process off-GPU (cpu_only) even when safety_on_gpu is configured.
         # Set while a whole-card (single-residency) job claims the device, so the safety process's CUDA
         # context (only reclaimable by the process exiting) is freed for the heavy model. Restored after.
@@ -494,6 +501,147 @@ class ProcessLifecycleManager:
             logger.info(f"Started safety process (id: {pid})")
             self.num_processes_launched += 1
 
+    def post_process_lane_enabled(self) -> bool:
+        """Whether the dedicated post-processing lane should be running."""
+        return self._runtime_config.bridge_data.post_processing_lane_enabled
+
+    def _post_process_card(self) -> CardRuntime:
+        """Return the card the dedicated post-processing lane is pinned to.
+
+        The lane avoids sharing a card with an on-GPU safety context when another card exists; otherwise
+        it takes the first configured card.
+        """
+        ordered_cards = [self._card_runtimes[index] for index in sorted(self._card_runtimes)]
+        bridge_data = self._runtime_config.bridge_data
+        safety_holds_first_card = (
+            bridge_data.safety_on_gpu and not is_cpu_only_install() and not self._safety_gpu_paused
+        )
+        if safety_holds_first_card and len(ordered_cards) > 1:
+            return ordered_cards[1]
+        return ordered_cards[0]
+
+    def start_post_process_processes(self) -> None:
+        """Start the dedicated post-processing process, if enabled and not already running."""
+        if not self.post_process_lane_enabled():
+            return
+
+        if self._process_map.num_post_process_processes() > 0:
+            return
+
+        bridge_data = self._runtime_config.bridge_data
+        pid = self._allocate_inference_pid()
+        pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
+
+        lane_card = self._post_process_card()
+
+        process = self._new_process(
+            target=self._entry_points.post_process_entry_point,
+            args=(
+                pid,
+                self._process_message_queue,
+                child_pipe_connection,
+                self._disk_lock,
+                self.num_processes_launched,
+            ),
+            kwargs={
+                "device_index": lane_card.device_index,
+                "accelerator_kind": lane_card.mask_kind,
+                "amd_gpu": self._amd_gpu,
+                "directml": self._directml,
+                "dry_run_skip_post_processing": bridge_data.dry_run_skip_post_processing,
+            },
+        )
+
+        process.start()
+
+        self._process_map[pid] = HordeProcessInfo(
+            mp_process=process,
+            pipe_connection=pipe_connection,
+            process_id=pid,
+            process_type=HordeProcessType.POST_PROCESS,
+            last_process_state=HordeProcessState.PROCESS_STARTING,
+            process_launch_identifier=self.num_processes_launched,
+            device_index=lane_card.device_index,
+        )
+        self._register_owned(self._process_map[pid])
+
+        logger.info(f"Started post-process process (id: {pid}, device_index: {lane_card.device_index})")
+        self.num_processes_launched += 1
+
+    def end_post_process_processes(self) -> None:
+        """End any dedicated post-processing processes."""
+        for process_info in self._process_map.get_stoppable_post_process_processes():
+            process_info.end_intended = True
+            process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
+            self._process_map.on_process_ending(process_id=process_info.process_id)
+            self._forget_owned(process_info)
+
+            logger.info(f"Ended post-process process {process_info.process_id}")
+
+    def _initiate_post_process_replacement(self) -> None:
+        """Flag the post-processing lane for replacement so the control loop's state machine restarts it."""
+        self._post_process_processes_should_be_replaced = True
+
+    def take_post_process_results_known_lost(self) -> set[GenerationID]:
+        """Return and clear the jobs whose post-processing result was lost to a lane replacement.
+
+        A single lane serves every post-processing job, so tearing it down positively loses the result of
+        any job mid-flight on it; the recovery coordinator drains this set to requeue those jobs at once
+        rather than waiting out the orphan watchdog's grace.
+        """
+        lost = self._post_process_results_known_lost
+        self._post_process_results_known_lost = set()
+        return lost
+
+    def _replace_all_post_process_process(self) -> None:
+        """Replace the dedicated post-processing process across control-loop ticks.
+
+        Mirrors the safety replacement state machine: enter the ending phase, wait for the old process to
+        drain out of the map, then start a fresh one. Entering the ending phase unconditionally covers a
+        process that died while still PROCESS_STARTING (never "loaded"), the same startup-crash wedge the
+        safety flow guards against.
+        """
+        if not self._post_process_processes_should_be_replaced:
+            return
+
+        if not self._post_process_processes_ending:
+            self._post_process_processes_ending = True
+            # The lane being torn down positively loses any in-flight result; record those jobs so the
+            # recovery coordinator requeues them immediately instead of after the orphan grace.
+            self._post_process_results_known_lost.update(
+                job_info.sdk_api_job_info.id_
+                for job_info in self._job_tracker.jobs_being_post_processed
+                if job_info.sdk_api_job_info.id_ is not None
+            )
+            if self._process_map.num_loaded_post_process_processes() > 0:
+                self.end_post_process_processes()
+            return
+
+        if (
+            self._process_map.num_loaded_post_process_processes() == 0
+            and self._process_map.num_post_process_processes() > 0
+        ):
+            self._process_map.delete_post_process_processes()
+
+        if (
+            self._post_process_processes_ending
+            and self._process_map.num_loaded_post_process_processes() == 0
+            and self._process_map.num_post_process_processes() == 0
+        ):
+            self.start_post_process_processes()
+            self._post_process_processes_ending = False
+            self._post_process_processes_should_be_replaced = False
+            self._num_process_recoveries += 1
+
+    @property
+    def post_process_processes_should_be_replaced(self) -> bool:
+        """Whether the dedicated post-processing lane is flagged for replacement."""
+        return self._post_process_processes_should_be_replaced
+
+    @post_process_processes_should_be_replaced.setter
+    def post_process_processes_should_be_replaced(self, value: bool) -> None:
+        self._post_process_processes_should_be_replaced = value
+
     def start_download_process(self) -> None:
         """Start the singleton background download process, if not already running.
 
@@ -702,6 +850,11 @@ class ProcessLifecycleManager:
 
     def start_inference_processes(self) -> None:
         """Start all the inference processes configured to be used, across every driven card."""
+        # The dedicated post-processing lane rides the same readiness gates as the inference pool (its
+        # models live in the same on-disk cache); starting it here covers every bring-up path and is a
+        # no-op when the lane is disabled or already running.
+        self.start_post_process_processes()
+
         num_processes_to_start = self._max_inference_processes - self._process_map.num_inference_processes()
 
         if num_processes_to_start < 0:
@@ -1123,6 +1276,9 @@ class ProcessLifecycleManager:
         if process_info.process_type == HordeProcessType.SAFETY:
             self._initiate_safety_replacement()
             self._replace_all_safety_process()
+        elif process_info.process_type == HordeProcessType.POST_PROCESS:
+            self._initiate_post_process_replacement()
+            self._replace_all_post_process_process()
         elif process_info.process_type == HordeProcessType.INFERENCE:
             self._replace_inference_process(process_info)
         return True
@@ -1710,13 +1866,15 @@ class ProcessLifecycleManager:
                 # flag is set, so omitting this (the historical bug) made the safety branch a silent no-op.
                 self._initiate_safety_replacement()
                 self._replace_all_safety_process()
-            if process_info.process_type == HordeProcessType.INFERENCE:
-                # A slot reaped silent in post-processing is a post-processing VRAM over-commit: the
-                # upscaler/face-fixer peak could not be hosted and the allocation thrashed until this
-                # timeout. Feed the feature-level circuit breaker so a run of these disables post-processing
-                # before the worker keeps faulting into the horde's forced-maintenance.
-                if state == HordeProcessState.INFERENCE_POST_PROCESSING:
+            if process_info.process_type == HordeProcessType.POST_PROCESS:
+                # A lane reaped silent mid-post-processing means the upscaler/face-fixer peak could not be
+                # hosted (or the pass wedged). Feed the feature-level circuit breaker so a run of these
+                # disables post-processing before the worker keeps faulting into forced-maintenance.
+                if state == HordeProcessState.POST_PROCESSING:
                     self._job_tracker.note_post_processing_overcommit_fault()
+                self._initiate_post_process_replacement()
+                self._replace_all_post_process_process()
+            if process_info.process_type == HordeProcessType.INFERENCE:
                 self._replace_inference_process(process_info)
             return True
         return False
@@ -1977,7 +2135,7 @@ class ProcessLifecycleManager:
                     ),
                     (
                         bridge_data.post_process_timeout + (3 * bridge_data.max_batch),
-                        HordeProcessState.INFERENCE_POST_PROCESSING,
+                        HordeProcessState.POST_PROCESSING,
                         "seems to be stuck post processing",
                         False,
                     ),

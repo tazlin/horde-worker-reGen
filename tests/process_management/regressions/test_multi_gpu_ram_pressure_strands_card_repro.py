@@ -113,9 +113,7 @@ def _full_two_card_process_map(*, busy_card1_lead: bool) -> ProcessMap:
     With ``busy_card1_lead`` process 3 (card 1) reads busy, so a reduction that spares only busy processes
     keeps card 1's context and must take any further victims from the idle contexts on either card.
     """
-    card1_lead_state = (
-        HordeProcessState.INFERENCE_POST_PROCESSING if busy_card1_lead else HordeProcessState.WAITING_FOR_JOB
-    )
+    card1_lead_state = HordeProcessState.INFERENCE_STARTING if busy_card1_lead else HordeProcessState.WAITING_FOR_JOB
     procs = {
         1: make_mock_process_info(1, model_name=None, state=HordeProcessState.WAITING_FOR_JOB, device_index=0),
         2: make_mock_process_info(2, model_name=None, state=HordeProcessState.WAITING_FOR_JOB, device_index=0),

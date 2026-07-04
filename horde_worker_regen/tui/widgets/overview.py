@@ -87,7 +87,7 @@ _TWO_COLUMN_MIN_WIDTH = 100
 _THREE_COLUMN_MIN_WIDTH = 165
 """Minimum Overview width (columns) at which the widest panel regions spread across three columns."""
 
-_SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "INFERENCE_POST_PROCESSING", "ALCHEMY_STARTING"})
+_SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "POST_PROCESSING", "ALCHEMY_STARTING"})
 """States with a live sampling step/it-s; outside these the snapshot's step numbers are last-job residue."""
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -1286,6 +1286,7 @@ class OverviewView(Vertical):
             WorkLedgerStage.QUEUED: "cyan",
             WorkLedgerStage.PREPARING: "yellow",
             WorkLedgerStage.INFERENCE: "green",
+            WorkLedgerStage.POST_PROCESSING: "green3",
             WorkLedgerStage.SAFETY: "magenta",
             WorkLedgerStage.SUBMIT: "blue",
             WorkLedgerStage.COMPLETED: "grey70",
@@ -1413,9 +1414,10 @@ class OverviewView(Vertical):
 
         queue = snapshot.jobs_pending_inference
         inference = snapshot.jobs_in_progress
+        post_processing = snapshot.jobs_pending_post_processing + snapshot.jobs_being_post_processed
         safety = snapshot.jobs_pending_safety_check + snapshot.jobs_being_safety_checked
         submit = snapshot.jobs_pending_submit
-        peak = max(queue, inference, safety, submit, 1)
+        peak = max(queue, inference, post_processing, safety, submit, 1)
 
         arrow = Text(" ▶ ", style="grey50")
         rows: list[Text] = []
@@ -1423,19 +1425,36 @@ class OverviewView(Vertical):
         # An alchemist-only worker pops no image jobs, so its image lifecycle row is permanently empty;
         # the alchemy flow becomes the primary (and only) pipeline content instead.
         if not alchemist_only:
-            rows.append(
-                Text.assemble(
-                    self._stage_segment("Queue", queue, peak),
-                    arrow,
-                    self._stage_segment("Inference", inference, peak),
-                    arrow,
-                    self._stage_segment("Safety", safety, peak),
-                    arrow,
-                    self._stage_segment("Submit", submit, peak),
-                    ("    ", ""),
-                    (f"✓ {snapshot.num_jobs_submitted:,} submitted", "grey62"),
-                ),
-            )
+            if snapshot.config.allow_post_processing or post_processing:
+                rows.append(
+                    Text.assemble(
+                        self._stage_segment("Queue", queue, peak),
+                        arrow,
+                        self._stage_segment("Inference", inference, peak),
+                        arrow,
+                        self._stage_segment("Post-proc", post_processing, peak),
+                        arrow,
+                        self._stage_segment("Safety", safety, peak),
+                        arrow,
+                        self._stage_segment("Submit", submit, peak),
+                        ("    ", ""),
+                        (f"✓ {snapshot.num_jobs_submitted:,} submitted", "grey62"),
+                    )
+                )
+            else:
+                rows.append(
+                    Text.assemble(
+                        self._stage_segment("Queue", queue, peak),
+                        arrow,
+                        self._stage_segment("Inference", inference, peak),
+                        arrow,
+                        self._stage_segment("Safety", safety, peak),
+                        arrow,
+                        self._stage_segment("Submit", submit, peak),
+                        ("    ", ""),
+                        (f"✓ {snapshot.num_jobs_submitted:,} submitted", "grey62"),
+                    )
+                )
 
         alchemy_active = (
             snapshot.alchemy_forms_pending + snapshot.alchemy_forms_in_flight + snapshot.alchemy_forms_awaiting_submit
@@ -1467,7 +1486,7 @@ class OverviewView(Vertical):
             border = "green" if alchemy_active else "grey37"
         else:
             title = "Job pipeline"
-            border = "green" if (queue or inference or safety or submit) else "grey37"
+            border = "green" if (queue or inference or post_processing or safety or submit) else "grey37"
         return Panel(Group(*rows), title=title, title_align="left", border_style=border, padding=(0, 1))
 
     @staticmethod
@@ -1899,7 +1918,7 @@ class OverviewView(Vertical):
     @staticmethod
     def _state_style(state: str) -> str:
         """Map a process state name to a display colour."""
-        if state in ("INFERENCE_STARTING", "INFERENCE_POST_PROCESSING", "ALCHEMY_STARTING"):
+        if state in ("INFERENCE_STARTING", "POST_PROCESSING", "ALCHEMY_STARTING"):
             return "green"
         if state in ("INFERENCE_FAILED", "ALCHEMY_FAILED", "SAFETY_FAILED", "PROCESS_ENDED"):
             return "red"
@@ -2050,6 +2069,7 @@ def _heartbeat_age(row: _ProcessRow) -> float | None:
 _WORK_LEDGER_COLUMNS: list[ColumnSpec[WorkLedgerEntry]] = [
     ColumnSpec("Stage", DensityTier.ESSENTIAL, OverviewView._work_stage_cell, width=9, no_wrap=True),
     ColumnSpec("Job", DensityTier.ESSENTIAL, lambda e: job_id_text(e.job_id), width=8, no_wrap=True),
+    ColumnSpec("Order", DensityTier.NORMAL, lambda e: _queue_order_cell(e.queue_order), width=6, no_wrap=True),
     ColumnSpec("Model", DensityTier.ESSENTIAL, OverviewView._work_model_cell, min_width=18, no_wrap=True),
     ColumnSpec("Progress", DensityTier.ESSENTIAL, OverviewView._work_progress_cell, width=12, no_wrap=True),
     ColumnSpec("Intent", DensityTier.NORMAL, lambda e: shorten(e.intent, 28) if e.intent else "-", min_width=16),
@@ -2079,7 +2099,7 @@ _WORK_LEDGER_COLUMNS: list[ColumnSpec[WorkLedgerEntry]] = [
 
 _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
     ColumnSpec("ID", DensityTier.ESSENTIAL, lambda r: str(r.process.process_id), justify="right", width=3),
-    ColumnSpec("Type", DensityTier.ESSENTIAL, lambda r: r.process.process_type.title(), width=9),
+    ColumnSpec("Type", DensityTier.ESSENTIAL, lambda r: _process_type_label(r.process.process_type), width=9),
     ColumnSpec("State", DensityTier.ESSENTIAL, OverviewView._process_state_cell, width=18, no_wrap=True),
     ColumnSpec("GPU", DensityTier.NORMAL, lambda r: str(r.process.device_index), justify="right", width=4),
     ColumnSpec(
@@ -2132,6 +2152,21 @@ _PROCESS_COLUMNS: list[ColumnSpec[_ProcessRow]] = [
 """The process table's columns, tagged by the density tier at which each appears."""
 
 
+def _process_type_label(process_type: str) -> str:
+    """Humanize process type enum names for compact tables."""
+    return {
+        "INFERENCE": "Inference",
+        "SAFETY": "Safety",
+        "POST_PROCESS": "Post-proc",
+        "DOWNLOAD": "Download",
+    }.get(process_type, process_type.replace("_", " ").title())
+
+
+def _queue_order_cell(order: int | None) -> str:
+    """Render a 1-based queue/pop order, or a dash for rows outside the image queue."""
+    return f"#{order}" if order is not None else "-"
+
+
 def _entry_features(entry: JobQueueEntry) -> str:
     """Comma-joined feature tags for a queued job, or a dash when it carries none."""
     return ", ".join(entry.features.as_tags()) if entry.features is not None else "-"
@@ -2144,6 +2179,7 @@ def _entry_size(entry: JobQueueEntry) -> str:
 
 _QUEUE_COLUMNS: list[ColumnSpec[JobQueueEntry]] = [
     ColumnSpec("Job", DensityTier.ESSENTIAL, lambda e: job_id_text(e.job_id), width=8, no_wrap=True),
+    ColumnSpec("Order", DensityTier.ESSENTIAL, lambda e: _queue_order_cell(e.queue_order), width=6, no_wrap=True),
     ColumnSpec("Model", DensityTier.ESSENTIAL, lambda e: shorten(e.model, 28), min_width=20, no_wrap=True),
     ColumnSpec("Baseline", DensityTier.NORMAL, lambda e: short_baseline(e.baseline), width=8, no_wrap=True),
     ColumnSpec("Size", DensityTier.NORMAL, _entry_size, justify="right", width=10),

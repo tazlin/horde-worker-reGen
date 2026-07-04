@@ -233,8 +233,6 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.self_maintenance_fault_threshold = 6
     bd.self_maintenance_window_seconds = 600
     bd.self_maintenance_cooldown_seconds = 300
-    bd.post_processing_active_reclaim_enabled = True
-    bd.post_processing_budget_reserve_enabled = True
     bd.post_processing_fault_breaker_enabled = True
     bd.post_processing_fault_threshold = 4
     bd.post_processing_fault_window_seconds = 1800
@@ -334,6 +332,7 @@ def make_job_pop_response(
     prompt: str = "test prompt",
     loras: list[LorasPayloadEntry] | None = None,
     r2_upload: str | None = None,
+    post_processing: list[str] | None = None,
 ) -> ImageGenerateJobPopResponse:
     """Create a real ImageGenerateJobPopResponse for testing."""
     job_id = uuid.uuid4()
@@ -353,6 +352,8 @@ def make_job_pop_response(
         "skipped": {},
         "source_processing": "txt2img",
     }
+    if post_processing is not None:
+        data["payload"]["post_processing"] = post_processing  # pyrefly: ignore - validated by pydantic
     if loras is not None:
         data["payload"]["loras"] = loras  # pyrefly: ignore - type safety doesn't matter here; violations will be caught elsewhere
     if r2_upload is not None:

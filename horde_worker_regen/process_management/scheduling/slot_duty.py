@@ -52,8 +52,6 @@ class SlotDutyBucket(StrEnum):
     """The overlap gate held the candidate until the in-flight work made enough progress."""
     WHOLE_CARD_CONVERGENCE = "whole_card_convergence"
     """A whole-card head waited for the pool to converge to sole residency."""
-    POST_PROCESSING_HEADROOM = "post_processing_headroom"
-    """Dispatch was held for an imminent post-processing peak on a contended card."""
     UNEXPLAINED = "unexplained"
     """No gate claimed the empty slot: the scheduler-stall-shaped case worth reporting."""
 

@@ -30,15 +30,11 @@ from horde_sdk.ai_horde_api.apimodels import (
     GenMetadataEntry,
     ImageGenerateJobPopResponse,
 )
-from horde_sdk.generation_parameters.alchemy import SingleAlchemyParameters
 from loguru import logger
 
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
     AUX_DOWNLOAD_FAILED_INFO,
-    AlchemyFormSpec,
-    HordeAlchemyControlMessage,
-    HordeAlchemyResultMessage,
     HordeAuxModelStateChangeMessage,
     HordeControlFlag,
     HordeControlMessage,
@@ -794,12 +790,9 @@ class HordeInferenceProcess(HordeProcess):
 
     _start_inference_time: float = 0.0
 
-    _in_post_processing: bool = False
-
     _current_job_inference_steps_complete: bool = False
     _vae_lock_was_acquired: bool = False
     _inference_slot_released: bool = False
-    _post_processing_memory_report_sent: bool = False
 
     _last_progress_step_seen: int | None = None
     """The sampling step reported by the previous progress callback for the current job, or None."""
@@ -852,7 +845,7 @@ class HordeInferenceProcess(HordeProcess):
         Args:
             progress_report (ProgressReport): The progress report from the HordeLib instance.
         """
-        from hordelib.api import ComfyUIProgressUnit, ProgressState, log_free_ram
+        from hordelib.api import ComfyUIProgressUnit, log_free_ram
 
         # Track non-advancing sampling progress before any early return, so the post-completion repeats
         # (the wedge signature: ComfyUI re-reporting the final step forever) are counted too. A healthy
@@ -866,20 +859,6 @@ class HordeInferenceProcess(HordeProcess):
             else:
                 self._nonadvancing_progress_repeats = 0
                 self._last_progress_step_seen = reported_step
-
-        if progress_report.hordelib_progress_state == ProgressState.post_processing or (
-            self._in_post_processing and progress_report.hordelib_progress_state == ProgressState.progress
-        ):
-            self.send_process_state_change_message(
-                process_state=HordeProcessState.INFERENCE_POST_PROCESSING,
-                info="Post Processing",
-                time_elapsed=time.time() - self._start_inference_time,
-            )
-            self._in_post_processing = True
-            self._release_inference_slot()
-            if not self._post_processing_memory_report_sent:
-                self._post_processing_memory_report_sent = True
-                self._send_inference_memory_report()
 
         if self._current_job_inference_steps_complete:
             if not self._vae_lock_was_acquired:
@@ -1045,7 +1024,6 @@ class HordeInferenceProcess(HordeProcess):
         self._current_job_inference_steps_complete = False
         self._inference_slot_released = False
         self._vae_lock_was_acquired = False
-        self._post_processing_memory_report_sent = False
         self._last_job_inference_rate = None
         self._last_inference_error = None
         self._last_progress_step_seen = None
@@ -1089,7 +1067,6 @@ class HordeInferenceProcess(HordeProcess):
             return None
         finally:
             self._is_busy = False
-            self._in_post_processing = False
             self._current_job_inference_steps_complete = False
             self._last_progress_step_seen = None
             self._nonadvancing_progress_repeats = 0
@@ -1114,12 +1091,13 @@ class HordeInferenceProcess(HordeProcess):
         *,
         keep_model_resident: bool,
     ) -> list[ResultingImageReturn]:
-        """Run a job through hordelib's typed generation path, then its embedded post-processing.
+        """Run a job through hordelib's typed generation path.
 
         The AI-Horde job is translated to backend-agnostic generation parameters by the SDK
-        (hordelib itself has no knowledge of the AI-Horde API models), inference runs via
-        `HordeLib.generate` with automatic pipeline selection, and any post-processing the job
-        requested is driven here per image via the typed `HordeLib.post_process`.
+        (hordelib itself has no knowledge of the AI-Horde API models) and inference runs via
+        `HordeLib.generate` with automatic pipeline selection. Any post-processing the job
+        requested is not run here: the raw images are returned and the main process routes them
+        to the dedicated post-processing lane.
         """
         from horde_sdk.worker.dispatch.ai_horde.image.convert import (
             convert_image_job_pop_response_to_parameters,
@@ -1141,122 +1119,9 @@ class HordeInferenceProcess(HordeProcess):
             defer_vram_unload=keep_model_resident,
         )
 
-        alchemy_params = conversion_result.generation_parameters.alchemy_params
-        if alchemy_params is None:
-            for single_result in results:
-                single_result.faults = conversion_result.faults + single_result.faults
-            return results
-
-        return self._run_embedded_post_processing(
-            results,
-            alchemy_params.all_alchemy_operations,
-            conversion_result.faults,
-        )
-
-    def _run_embedded_post_processing(
-        self,
-        results: list[ResultingImageReturn],
-        operations: list[SingleAlchemyParameters],
-        conversion_faults: list[GenMetadataEntry],
-    ) -> list[ResultingImageReturn]:
-        """Apply a job's embedded post-processing chain to each generated image.
-
-        Each image accumulates the conversion, inference, and post-processing faults. An image
-        whose chain ends without an output is dropped from the results (an empty result list
-        faults the whole job upstream). Facefixers run last regardless of the requested order;
-        otherwise the requested order is preserved.
-        """
-        from horde_sdk.generation_parameters.alchemy import (
-            FacefixAlchemyParameters,
-            UpscaleAlchemyParameters,
-        )
-        from horde_sdk.generation_parameters.alchemy.consts import is_strip_background_form
-        from hordelib.api import (
-            FacefixPayload,
-            ResultingImageReturn,
-            StripBackgroundPayload,
-            UpscalePayload,
-        )
-
-        # Post-processing runs after the sampling slot is no longer needed: mirror the state
-        # transition hordelib's embedded loop used to trigger via ProgressState.post_processing,
-        # so the next job can start sampling while this one post-processes.
-        self.send_process_state_change_message(
-            process_state=HordeProcessState.INFERENCE_POST_PROCESSING,
-            info="Post Processing",
-            time_elapsed=time.time() - self._start_inference_time,
-        )
-        self._in_post_processing = True
-        self._release_inference_slot()
-        if not self._post_processing_memory_report_sent:
-            self._post_processing_memory_report_sent = True
-            self._send_inference_memory_report()
-
-        ordered_operations = self._facefixers_last(operations)
-
-        post_processed_results: list[ResultingImageReturn] = []
         for single_result in results:
-            single_image_faults = conversion_faults + single_result.faults
-            final_image = single_result.image
-            final_rawpng = single_result.rawpng
-
-            for operation in ordered_operations:
-                if final_image is None:
-                    logger.error("No image available to post-process; aborting remaining operations")
-                    break
-
-                if isinstance(operation, UpscaleAlchemyParameters):
-                    upscale_result = self._horde.post_process(
-                        UpscalePayload(model=str(operation.upscaler), source_image=final_image),
-                    )
-                    single_image_faults += upscale_result.faults
-                    final_rawpng = upscale_result.rawpng
-                    final_image = upscale_result.image
-                elif isinstance(operation, FacefixAlchemyParameters):
-                    # The carried codeformer_fidelity is deliberately not forwarded: the legacy
-                    # mapping never wired facefixer_strength to the fixer, so honoring it would
-                    # change existing job output.
-                    facefix_result = self._horde.post_process(
-                        FacefixPayload(model=str(operation.facefixer), source_image=final_image),
-                    )
-                    single_image_faults += facefix_result.faults
-                    final_rawpng = facefix_result.rawpng
-                    final_image = facefix_result.image
-                elif is_strip_background_form(operation.form):
-                    # The pre-strip rawpng is intentionally kept (legacy parity)
-                    final_image = self._horde.post_process(
-                        StripBackgroundPayload(source_image=final_image),
-                    ).image
-                else:
-                    logger.warning(f"Unknown post-processor requested; skipping: {operation.form}")
-
-            if final_image is None:
-                logger.error("Post processing failed and there is no output image!")
-            else:
-                post_processed_results.append(
-                    ResultingImageReturn(
-                        image=final_image,
-                        rawpng=final_rawpng,
-                        faults=single_image_faults,
-                    ),
-                )
-
-        return post_processed_results
-
-    @staticmethod
-    def _facefixers_last(operations: list[SingleAlchemyParameters]) -> list[SingleAlchemyParameters]:
-        """Return the operations reordered so facefixers run last, preserving order otherwise.
-
-        Execution policy inherited from the legacy embedded loop: upscaling before facefixing
-        keeps the facefixer working on the final resolution (and the pinned reference images
-        encode this order).
-        """
-        from horde_sdk.generation_parameters.alchemy import FacefixAlchemyParameters
-
-        return sorted(
-            operations,
-            key=lambda operation: 1 if isinstance(operation, FacefixAlchemyParameters) else 0,
-        )
+            single_result.faults = conversion_result.faults + single_result.faults
+        return results
 
     @staticmethod
     def _make_dummy_inference_result(
@@ -1278,75 +1143,6 @@ class HordeInferenceProcess(HordeProcess):
         for _ in range(n_iter):
             results.append(_DryRunResultingImage(rawpng=io.BytesIO(png_bytes)))
         return results  # type: ignore[return-value]
-
-    def start_alchemy(self, form: AlchemyFormSpec) -> None:
-        """Run a graph-backed alchemy form (upscale/facefix/strip_background) and report the result.
-
-        The result image is WebP-encoded here (quality 95, matching the legacy alchemist)
-        so the main process can upload it to R2 without re-encoding.
-        """
-        import PIL.Image
-        from hordelib.api import classify_post_processor
-
-        self.send_process_state_change_message(
-            process_state=HordeProcessState.ALCHEMY_STARTING,
-            info=f"Starting alchemy form {form.form} ({form.form_id})",
-        )
-
-        time_start = time.time()
-        state = GENERATION_STATE.faulted
-        image_bytes: bytes | None = None
-
-        try:
-            kind = classify_post_processor(form.form)
-            if kind is None:
-                raise ValueError(f"Unknown alchemy form for inference process: {form.form}")
-
-            source_image = PIL.Image.open(io.BytesIO(form.source_image_bytes))
-
-            result = self._horde.post_process(
-                {
-                    "model": form.form,
-                    "source_image": source_image,
-                },
-            )
-            if result.image is None:
-                raise RuntimeError("Alchemy form produced no image")
-
-            buffer = io.BytesIO()
-            # WebP keeps submit bandwidth low; quality/method match the legacy alchemist.
-            result.image.save(buffer, format="WebP", quality=95, method=6)
-            image_bytes = buffer.getvalue()
-            state = GENERATION_STATE.ok
-        except Exception as e:
-            logger.error(f"Alchemy form {form.form} ({form.form_id}) failed: {type(e).__name__} {e}")
-
-        self.process_message_queue.put(
-            HordeAlchemyResultMessage(
-                process_id=self.process_id,
-                process_launch_identifier=self.process_launch_identifier,
-                info=f"Alchemy form {form.form} ({form.form_id})",
-                time_elapsed=time.time() - time_start,
-                form_id=form.form_id,
-                form=form.form,
-                state=state,
-                image_bytes=image_bytes,
-            ),
-        )
-
-        self._send_job_metrics_message(form.form_id, is_alchemy=True)
-
-        process_state = (
-            HordeProcessState.ALCHEMY_COMPLETE if state == GENERATION_STATE.ok else HordeProcessState.ALCHEMY_FAILED
-        )
-        self.send_process_state_change_message(
-            process_state=process_state,
-            info=f"Finished alchemy form {form.form} ({form.form_id})",
-        )
-        self.send_process_state_change_message(
-            process_state=HordeProcessState.WAITING_FOR_JOB,
-            info="Waiting for job",
-        )
 
     @staticmethod
     def clear_gc_and_torch_cache() -> None:
@@ -1676,12 +1472,6 @@ class HordeInferenceProcess(HordeProcess):
             else:
                 logger.critical(f"Received unexpected message: {message}")
                 return
-        elif isinstance(message, HordeAlchemyControlMessage):
-            if message.control_flag == HordeControlFlag.START_ALCHEMY:
-                self.start_alchemy(message.form)
-            else:
-                logger.critical(f"Received unexpected message: {message}")
-            return
         elif message.control_flag == HordeControlFlag.END_PROCESS:
             self.send_process_state_change_message(
                 process_state=HordeProcessState.PROCESS_ENDING,

@@ -28,7 +28,6 @@ safety_on_gpu: true
 high_performance_mode: true
 unload_models_from_vram_often: false
 max_threads: 1       # 2 is often viable for xx90 cards
-post_process_job_overlap: true
 max_power: 64        # Reduce if max_threads: 2
 max_batch: 8         # Increase if max_threads: 1, decrease if max_threads: 2
 allow_sdxl_controlnet: true

@@ -27,7 +27,7 @@ class TestClassifyProcessTemperature:
     def test_active_inference_is_hot(self) -> None:
         """A slot sampling on the GPU is hot regardless of what is queued."""
         assert _classify("INFERENCE_STARTING", "model_a", set()) == ProcessTemperature.HOT
-        assert _classify("INFERENCE_POST_PROCESSING", "model_a", {"model_a"}) == ProcessTemperature.HOT
+        assert _classify("POST_PROCESSING", "model_a", {"model_a"}) == ProcessTemperature.HOT
 
     def test_resident_model_a_queued_job_needs_is_next(self) -> None:
         """A ready slot whose resident model a queued job will use fires next."""

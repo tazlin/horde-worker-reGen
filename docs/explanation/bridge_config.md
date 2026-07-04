@@ -144,8 +144,6 @@ for how it works.
 | `ram_pressure_pause_percent` | `85.0` | Absolute whole-host RAM danger floor, evaluated every scheduling tick. At/above this usage percentage the worker degrades (refuses new model loads, sheds idle resident processes, recycles an over-ceiling process, pauses pops) until RAM recovers, rather than loading weights through an out-of-RAM host and being OS OOM-killed. The default leaves ~15% free because a resident process can allocate several GB in a single step. |
 | `ram_pressure_min_free_mb`   | `1024` | Free-RAM (MB) companion floor: the worker also degrades below this many MB free. The effective floor is `max((100 - ram_pressure_pause_percent)% of total RAM, this)`, so the percentage protects large-RAM hosts and the absolute floor protects small ones. |
 | `ram_per_process_max_mb`     | `18432` | Resident RAM (MB) one inference process may hold before it is a reclaim candidate *while the host is under the danger floor*. Over it, an idle process is recycled immediately and a busy one is drained (fed no new work) then recycled once its job finishes, so a single process's balloon cannot drive the summed footprint into an OS OOM kill. Consulted only under the floor, so a roomy host never recycles. `0` disables. |
-| `post_processing_budget_reserve_enabled` | `true` | Subtract the predicted post-processing peak of in-flight jobs from the free VRAM the budget gates new dispatch/overlap against, so a freshly-released slot is not handed VRAM an in-flight upscaler is about to claim. Self-scales to zero when nothing is post-processing. |
-| `post_processing_active_reclaim_enabled` | `true` | Proactively reclaim cross-process VRAM before a job's *own* post-processing peak lands (see below). |
 | `post_processing_fault_breaker_enabled` | `true` | Disable post-processing on this worker after repeated post-processing over-commit faults, so it stops feeding the horde's forced-maintenance spiral (see below). |
 | `post_processing_fault_threshold` | `4` | The breaker trips when *more than* this many post-processing over-commit faults occur within the window (tolerates 4, trips on the 5th). |
 | `post_processing_fault_window_seconds` | `1800` | Rolling window (seconds) over which `post_processing_fault_threshold` is counted. |
@@ -187,75 +185,24 @@ preloads and is less aggressive about keeping models in VRAM.
 standard horde model reference. These are added to the pop request alongside the
 configured `image_models_to_load`.
 
-### Post-processing overlap
+### The dedicated post-processing lane
 
-When `post_process_job_overlap` is enabled (and a performance mode is active),
-inference processes can start a new job while the previous job's post-processing
-(image encoding, etc.) is still running. This is a throughput optimization for
-fast GPUs. (Distinct from `allow_post_processing`, which controls whether the
-worker advertises post-processing capability to the API at pop time.)
-
-### Post-processing VRAM over-commit
-
-A job's upscaler/face-fixer peak lands *after* sampling and can be far larger
-than its sampling footprint: a 4x upscale on an SDXL image needs roughly 8.5 GB
-at peak. The preload budget deliberately admits a job on its sampling cost alone
-(folding the transient post-processing spike into placement would misroute
-ordinary upscale jobs onto the heavy-head path). On a contended card (warm
-sibling models plus several process contexts already resident), that peak can
-allocate into near-zero free VRAM and tile-thrash silently until the
-post-process watchdog reaps the slot, faulting the job. ComfyUI's own
-`free_memory` can only release *this* process's weights; the sibling models and
-contexts that fill the card are cross-process and only the orchestrator can
-reclaim them.
-
-Two protections close that gap, both on by default. The decisive one is an
-**overlap gate** on the imminent peak, part of
-`post_processing_budget_reserve_enabled`. The over-commit usually emerges
-*mid-flight*: while one job is still sampling, `post_process_job_overlap`
-pre-stages a second concurrent sample, and by the time the first job reaches its
-upscaler the card already holds both. A dispatch-time check cannot see that --
-at each job's dispatch neither peak is live yet. So the reserve also charges the
-*imminent* post-processing peak of any in-flight job that is still sampling
-against the overlap/pre-staging cap: a second concurrent sample is withheld when
-the card is already owed a large upscale peak. It self-scales to zero when
-nothing in flight will post-process, so ordinary overlap is unaffected.
-
-`post_processing_active_reclaim_enabled` is the complement for the non-overlap
-saturated case. At dispatch the scheduler sizes the dispatching job's own
-post-processing peak against the *effective* headroom: the measured free VRAM less
-the room in-flight sibling work has committed or will imminently commit (the same
-not-yet-realised reserve the overlap gate subtracts), so an optimistic or stale
-free reading cannot make the peak look like it fits a card that is about to fill.
-When the peak overflows that headroom it frees cross-process room, choosing for
-what it can actually reclaim. If an idle sibling holds an evictable model it frees
-that first -- even when freeing the dispatching job's own weights would nominally
-cover the peak -- because on a contended card that sibling model is the room the
-upscaler needs and the child's in-process `free_memory` cannot reach it. Only when
-no reclaimable sibling holds room does it defer to that in-child own-weights free,
-then to stopping an idle context on the contended card. When none of those can free
-room *now*, it asks one more question before faulting: can the card host the peak at
-all? If the peak fits the card drained to this job's process alone and a sibling is
-mid-inference whose completion will free the room, the dispatch is *held* (the job
-keeps its head-of-queue position) until that room appears, rather than faulting a job
-the card can serve moments from now. This matters most on the large-card overlap
-case: a 24 GB card running several processes can have two or more siblings mid-upscale
-at once, whose committed peaks pull the effective free below zero, yet a fresh ~5 GB
-peak still fits the card the instant a sibling finishes, so waiting beats faulting.
-The hold is self-bounding and wedge-safe: it only ever spans a window the recovery
-supervisor already exempts as inference-in-progress, and the moment no sibling is left
-in flight to free room the plan re-evaluates and faults instead of parking forever.
-
-Only a peak that cannot fit even the drained card (or one with no in-flight sibling to
-wait on, such as the tiny single-process card) faults gracefully so the horde reissues
-the job, rather than dispatching it into a guaranteed stall. That fault is terminal
-(non-retryable): a local retry would only re-dispatch into the same unchanged,
-still-overflowing card, so the job is left for the horde to reissue elsewhere. The
-whole mechanism is evidence-gated: with the peak unknown or free VRAM unmeasured it
-does nothing, and on a roomy card where the peak already fits it is a no-op. Each
-decision is logged at debug with the peak, the effective free, and the chosen action,
-and a held dispatch logs its hold and surfaces in the dispatch-stall diagnostic, so a
-stall the reclaim declined to prevent (or chose to wait out) leaves a trace.
+Post-processing (upscalers, face-fixers, background removal) runs on a dedicated
+process lane rather than inside the inference processes, controlled by
+`dedicated_post_processing` (`auto`/`on`/`off`; `off` also stops the worker
+offering post-processing, since the lane is the only place it runs). The lane
+keeps the post-processing models resident (no per-job reload), frees the
+inference slot the moment sampling and VAE decode finish, and reports its VRAM
+telemetry into the same device-free budget view as inference processes. The
+budget charges the lane's fixed CUDA context through the normal process-count
+forecast and charges each active post-processing job's estimated upscale/face-fix
+peak through the shared committed-reserve ledger until its result returns. Under
+pressure, the scheduler can evict idle inference models and ask an idle
+post-processing lane to unload its modules from VRAM/RAM before starting more
+work. See
+[Process lanes and job chaining](process_lanes_and_chaining.md) for the full
+picture, including how a lane failure falls back to submitting the raw images
+instead of faulting the job.
 
 `post_processing_fault_breaker_enabled` is the self-protective backstop. If
 post-processing peaks keep failing to host (more than

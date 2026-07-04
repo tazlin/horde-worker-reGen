@@ -249,9 +249,7 @@ class ShutdownManager:
             if process_info.process_type != HordeProcessType.INFERENCE:
                 continue
 
-            if (process_info.last_process_state == HordeProcessState.INFERENCE_STARTING) or (
-                process_info.last_process_state == HordeProcessState.INFERENCE_POST_PROCESSING
-            ):
+            if process_info.last_process_state == HordeProcessState.INFERENCE_STARTING:
                 any_process_alive = True
                 continue
 

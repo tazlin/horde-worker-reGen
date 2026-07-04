@@ -371,7 +371,6 @@ class TestKeepSingleInferenceReadsRetainedReference:
 
         keep, reason = process_map.keep_single_inference(
             stable_diffusion_model_reference=reference,
-            post_process_job_overlap=False,
         )
 
         assert keep is True
@@ -395,7 +394,6 @@ class TestKeepSingleInferenceReadsRetainedReference:
         actively_inferring.last_job_referenced = make_mock_job(model=card_demanding_model)
         keep_busy, _reason_busy = ProcessMap({1: actively_inferring}).keep_single_inference(
             stable_diffusion_model_reference={},
-            post_process_job_overlap=True,
         )
         assert keep_busy is False
 

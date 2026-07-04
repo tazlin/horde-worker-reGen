@@ -40,7 +40,7 @@ _BAR_WIDTH = 36
 _ACTIVE_STATES = frozenset(
     {
         "INFERENCE_STARTING",
-        "INFERENCE_POST_PROCESSING",
+        "POST_PROCESSING",
         "ALCHEMY_STARTING",
         "PRELOADING_MODEL",
         "DOWNLOADING_MODEL",
@@ -51,7 +51,7 @@ _ACTIVE_STATES = frozenset(
 )
 # Only these states have a live, meaningful sampling step/it-s; the snapshot may still carry the last
 # job's numbers, so the panel renders the progress row only while the process is genuinely sampling.
-_SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "INFERENCE_POST_PROCESSING", "ALCHEMY_STARTING"})
+_SAMPLING_STATES = frozenset({"INFERENCE_STARTING", "POST_PROCESSING", "ALCHEMY_STARTING"})
 _FAILED_STATES = frozenset({"INFERENCE_FAILED", "ALCHEMY_FAILED", "SAFETY_FAILED", "PROCESS_ENDED"})
 _EXPECTED_QUIET_STATES = frozenset(
     {
@@ -65,6 +65,16 @@ _EXPECTED_QUIET_STATES = frozenset(
 
 _STALE_AFTER_SECONDS = 4.0
 """Beyond this snapshot age the live view is no longer trustworthy; it dims and flags the panels."""
+
+
+def _process_type_label(process_type: str) -> str:
+    """Humanize process type enum names for live-panel titles."""
+    return {
+        "INFERENCE": "Inference",
+        "SAFETY": "Safety",
+        "POST_PROCESS": "Post-proc",
+        "DOWNLOAD": "Download",
+    }.get(process_type, process_type.replace("_", " ").title())
 
 
 def _progress_bar(fraction: float) -> Text:
@@ -264,7 +274,9 @@ class LiveView(VerticalScroll):
         body.add_row("State", Text(state_label, style=state_colour))
         # A process running an alchemy form holds no horde image model, so the Model row would read blank;
         # label it as alchemy work instead so the role is clear rather than looking idle/misconfigured.
-        if process.last_process_state == "ALCHEMY_STARTING" and not process.loaded_horde_model_name:
+        if process.process_type == "POST_PROCESS":
+            body.add_row("Work", Text("Post-processing", style="green3"))
+        elif process.last_process_state == "ALCHEMY_STARTING" and not process.loaded_horde_model_name:
             body.add_row("Work", Text("⚗ Alchemy", style="magenta"))
         else:
             body.add_row("Model", shorten(process.loaded_horde_model_name, 40))
@@ -326,12 +338,17 @@ class LiveView(VerticalScroll):
                 body.add_row("HB type", process.last_heartbeat_type.replace("_", " ").title())
         # A running tally so a healthy-but-quiet process (the safety process especially, whose checks
         # are each over in milliseconds) visibly does work rather than looking parked.
-        work_label = "Checked" if process.process_type == "SAFETY" else "Completed"
+        if process.process_type == "SAFETY":
+            work_label = "Checked"
+        elif process.process_type == "POST_PROCESS":
+            work_label = "Processed"
+        else:
+            work_label = "Completed"
         body.add_row(work_label, f"{process.num_jobs_completed:,} jobs")
 
         title = Text.assemble(
             (f" Process {process.process_id} ", "bold"),
-            (f"· {process.process_type.title()} ", "grey62"),
+            (f"· {_process_type_label(process.process_type)} ", "grey62"),
         )
         return Panel(body, title=title, border_style=state_colour, title_align="left", padding=(0, 1))
 

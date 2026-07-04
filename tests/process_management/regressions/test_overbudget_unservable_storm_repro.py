@@ -267,7 +267,7 @@ class TestExclusiveRunSuppressesConcurrency:
         )
 
         # Baseline: two concurrent slots permitted.
-        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+        assert scheduler._max_jobs_in_progress_allowed() == 2
 
         job = make_job_pop_response(model=_UNSERVABLE_MODEL)
         await job_tracker.record_popped_job(job)
@@ -276,7 +276,7 @@ class TestExclusiveRunSuppressesConcurrency:
 
         assert job_tracker.has_exclusive_job_in_progress() is True
         # No additional dispatch alongside the exclusive job.
-        assert scheduler._max_jobs_in_progress_allowed(0) == 1
+        assert scheduler._max_jobs_in_progress_allowed() == 1
 
     async def test_no_exclusive_flag_keeps_normal_concurrency(self, job_tracker: JobTracker) -> None:
         """CONTROL: the same in-progress job *without* the exclusive flag keeps normal concurrency."""
@@ -293,7 +293,7 @@ class TestExclusiveRunSuppressesConcurrency:
         await job_tracker.mark_inference_started(job)
 
         assert job_tracker.has_exclusive_job_in_progress() is False
-        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+        assert scheduler._max_jobs_in_progress_allowed() == 2
 
 
 class TestOverBudgetStepGrace:

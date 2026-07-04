@@ -145,6 +145,7 @@ from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyA
 from horde_worker_regen.process_management.scheduling.workload_flow import FlowCoordinator, WorkloadKind
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
+from horde_worker_regen.process_management.workers.post_process_orchestrator import PostProcessOrchestrator
 from horde_worker_regen.process_management.workers.safety_orchestrator import SafetyOrchestrator
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
 from horde_worker_regen.reporting.maintenance_messenger import MaintenanceModeMessenger
@@ -706,17 +707,6 @@ class HordeWorkerProcessManager:
     _directml: int | None
     """ID of the potential directml device."""
 
-    @property
-    def post_process_job_overlap_allowed(self) -> bool:
-        """Return true if a new inference job can start while the previous job's post-processing is still running.
-
-        Distinct from ``allow_post_processing`` (from the SDK), which advertises
-        to the horde API that this worker accepts post-processing jobs at all.
-        """
-        return (
-            self.bridge_data.moderate_performance_mode or self.bridge_data.high_performance_mode
-        ) and self.bridge_data.post_process_job_overlap
-
     def __init__(
         self,
         *,
@@ -944,6 +934,10 @@ class HordeWorkerProcessManager:
         # memory (so the timeout diagnostics dump works); mirrored to a JSONL file only outside tests.
         ledger_path = None if os.environ.get("AI_HORDE_TESTING") else (default_app_state_dir() / "action_ledger.jsonl")
         self._action_ledger = ActionLedger(path=ledger_path)
+        # One committed-VRAM/RAM reserve ledger shared by every workload flow (image generation,
+        # post-processing, and alchemy today; audio/video later), so they account for one another's
+        # in-flight cost and cannot independently admit against the same free VRAM.
+        self._reserve_ledger = CommittedReserveLedger()
 
         self._process_lifecycle = ProcessLifecycleManager(
             ctx=ctx,
@@ -986,6 +980,7 @@ class HordeWorkerProcessManager:
             runtime_config=self._runtime_config,
             model_metadata=self._model_metadata,
             action_ledger=self._action_ledger,
+            reserve_ledger=self._reserve_ledger,
             on_unload_vram=self.unload_models_from_vram,
             state=self._state,
         )
@@ -1046,11 +1041,6 @@ class HordeWorkerProcessManager:
             process_lifecycle=self._process_lifecycle,
         )
 
-        # One committed-VRAM/RAM reserve ledger shared by every workload flow (image generation and
-        # alchemy today; audio/video later), so they account for one another's in-flight cost and cannot
-        # independently admit against the same free VRAM.
-        self._reserve_ledger = CommittedReserveLedger()
-
         self._inference_scheduler = InferenceScheduler(
             state=self._state,
             process_map=self._process_map,
@@ -1076,6 +1066,20 @@ class HordeWorkerProcessManager:
         # the run metrics so the periodic duty-cycle line can name it alongside the per-job phase gaps.
         self._inference_scheduler.set_churn_observer(self._run_metrics.record_churn)
 
+        self._post_process_orchestrator = PostProcessOrchestrator(
+            process_map=self._process_map,
+            job_tracker=self._job_tracker,
+            process_lifecycle=self._process_lifecycle,
+            runtime_config=self._runtime_config,
+            model_metadata=self._model_metadata,
+            reserve_ledger=self._reserve_ledger,
+            request_vram_reclaim=lambda process_info, device_index: self._inference_scheduler.unload_models_from_vram(
+                process_info,
+                under_pressure=True,
+                device_index=device_index,
+            ),
+        )
+
         self._recovery_coordinator = WorkerRecoveryCoordinator(
             state=self._state,
             runtime_config=self._runtime_config,
@@ -1085,6 +1089,7 @@ class HordeWorkerProcessManager:
             message_dispatcher=self._message_dispatcher,
             inference_scheduler=self._inference_scheduler,
             action_ledger=self._action_ledger,
+            reserve_ledger=self._reserve_ledger,
             bridge_data_provider=lambda: self.bridge_data,
             max_inference_processes_provider=lambda: self.max_inference_processes,
             abort_callback=lambda: self._abort(),
@@ -1340,7 +1345,7 @@ class HordeWorkerProcessManager:
             f"{window:.0f}s (threshold {threshold}). Disabling post-processing on this worker for the rest of "
             "the session so it stops being handed upscale/face-fix jobs it cannot host (which keep faulting and "
             "risk the horde forcing maintenance). To restore it, downgrade settings (lower max_threads or "
-            "queue_size, or enable post_processing_active_reclaim_enabled) and restart the worker.",
+            "queue_size) and restart the worker.",
         )
 
     def set_maintenance(self, enabled: bool) -> None:
@@ -1490,6 +1495,10 @@ class HordeWorkerProcessManager:
     async def start_evaluate_safety(self) -> None:
         """Start evaluating the safety of the next job pending a safety check, if any."""
         await self._safety_orchestrator.start_evaluate_safety()
+
+    async def start_post_processing(self) -> None:
+        """Dispatch the next job pending post-processing to the dedicated lane, if any."""
+        await self._post_process_orchestrator.start_post_processing()
 
     _user_info_failed = False
     """Whether the API request to fetch user info failed."""
@@ -1808,6 +1817,9 @@ class HordeWorkerProcessManager:
             if len(self._job_tracker.jobs_pending_safety_check) > 0:
                 await self.start_evaluate_safety()
 
+            if len(self._job_tracker.jobs_pending_post_processing) > 0:
+                await self.start_post_processing()
+
             free_process_or_model_loaded = self.is_free_inference_process_available() or self.is_any_model_preloaded()
 
             if (
@@ -1847,6 +1859,7 @@ class HordeWorkerProcessManager:
                 await self._sleep(self._loop_interval / 2)
                 await self._sleep(self._loop_interval / 2)
             self._process_lifecycle._replace_all_safety_process()
+            self._process_lifecycle._replace_all_post_process_process()
 
             # Backstop the per-slot recovery: punt any job left in-progress with no owning live slot
             # before it can wedge the head of the queue.
@@ -1856,6 +1869,10 @@ class HordeWorkerProcessManager:
             # (re-check it, or fault it with no image if safety is pathological) before the backlog wedges
             # the pipeline.
             await self._recovery_coordinator.reconcile_orphaned_safety_jobs()
+
+            # The post-processing analogue: re-attempt (bounded) any job stranded in POST_PROCESSING, then
+            # fall back to submitting its raw images so finished inference is never forfeited.
+            await self._recovery_coordinator.reconcile_orphaned_post_process_jobs()
 
             # Save-our-ship: above the per-slot recovery, escalate a worker that is wedged as a whole
             # (no live process for pending work) to a soft reset and finally to giving up cleanly.
@@ -1877,11 +1894,14 @@ class HordeWorkerProcessManager:
                 if (
                     len(self._job_tracker.jobs_pending_safety_check) == 0
                     and len(self._job_tracker.jobs_being_safety_checked) == 0
+                    and len(self._job_tracker.jobs_pending_post_processing) == 0
+                    and len(self._job_tracker.jobs_being_post_processed) == 0
                     and self._alchemy_coordinator.num_forms_pending == 0
                     and self._alchemy_coordinator.num_forms_in_flight == 0
                     and self._alchemy_coordinator.num_forms_awaiting_submit == 0
                 ):
                     self._process_lifecycle.end_safety_processes()
+                    self._process_lifecycle.end_post_process_processes()
 
             if self.is_time_for_shutdown():
                 return False
@@ -2658,30 +2678,53 @@ class HordeWorkerProcessManager:
             JobStage.PENDING_INFERENCE: WorkLedgerStage.QUEUED,
             JobStage.INFERENCE_IN_PROGRESS: WorkLedgerStage.INFERENCE,
             JobStage.DETACHED: WorkLedgerStage.PREPARING,
+            JobStage.PENDING_POST_PROCESSING: WorkLedgerStage.POST_PROCESSING,
+            JobStage.POST_PROCESSING: WorkLedgerStage.POST_PROCESSING,
             JobStage.PENDING_SAFETY_CHECK: WorkLedgerStage.SAFETY,
             JobStage.SAFETY_CHECKING: WorkLedgerStage.SAFETY,
             JobStage.PENDING_SUBMIT: WorkLedgerStage.SUBMIT,
         }[stage]
 
-    def _process_for_job(self, job_id: str) -> ProcessSnapshot | None:
-        """Return the process snapshot currently referencing ``job_id``, if any."""
+    def _process_for_job(self, job_id: str, stage: WorkLedgerStage) -> ProcessSnapshot | None:
+        """Return the process snapshot actively serving ``job_id`` in ``stage``, if any."""
         for process in (ProcessSnapshot.from_process_info(info) for info in self._process_map.values()):
-            if process.current_job_id == job_id:
+            if process.current_job_id != job_id:
+                continue
+            if stage == WorkLedgerStage.INFERENCE and process.last_process_state == "INFERENCE_STARTING":
+                return process
+            if stage == WorkLedgerStage.POST_PROCESSING and process.last_process_state == "POST_PROCESSING":
+                return process
+            if stage == WorkLedgerStage.SAFETY and process.last_process_state == "EVALUATING_SAFETY":
                 return process
         return None
 
-    def _tracked_job_to_ledger_entry(self, tracked: TrackedJob, *, now: float) -> WorkLedgerEntry:
+    def _queue_order_by_job_id(self) -> dict[str, int]:
+        """Return a 1-based order for active image jobs by original pop order."""
+        ordered = sorted(
+            (tracked for tracked in self._job_tracker.tracked_jobs() if tracked.time_popped is not None),
+            key=lambda tracked: tracked.pop_order,
+        )
+        return {self._job_id_text(tracked.job_id): index + 1 for index, tracked in enumerate(ordered)}
+
+    def _tracked_job_to_ledger_entry(
+        self,
+        tracked: TrackedJob,
+        *,
+        now: float,
+        queue_order_by_job_id: dict[str, int],
+    ) -> WorkLedgerEntry:
         """Project an active tracked job into the Overview work ledger."""
         sdk_job = tracked.sdk_api_job_info
         payload = sdk_job.payload
         features = JobFeatureSummary.from_payload(payload)
         job_id = self._job_id_text(tracked.job_id)
-        process = self._process_for_job(job_id)
         stage = self._ledger_stage(tracked.stage)
+        process = self._process_for_job(job_id, stage)
         intent = {
             WorkLedgerStage.QUEUED: "waiting for model/process",
             WorkLedgerStage.PREPARING: "between orchestration stages",
             WorkLedgerStage.INFERENCE: "sampling" if process is not None and process.is_busy else "dispatched",
+            WorkLedgerStage.POST_PROCESSING: "post-processing",
             WorkLedgerStage.SAFETY: "safety check",
             WorkLedgerStage.SUBMIT: "awaiting submit",
         }.get(stage)
@@ -2702,6 +2745,7 @@ class HordeWorkerProcessManager:
             age_seconds=max(0.0, now - tracked.current_stage_since) if tracked.current_stage_since else None,
             intent=intent,
             raw_reason=getattr(self._inference_scheduler, "_dispatch_stall_last_reason", None),
+            queue_order=queue_order_by_job_id.get(job_id),
         )
 
     def _recent_job_to_ledger_entry(self, job: RecentJobRecord) -> WorkLedgerEntry:
@@ -2749,7 +2793,15 @@ class HordeWorkerProcessManager:
         its model and the source-image resolution as its size), then recent finished work, all capped.
         """
         now = time.time()
-        rows = [self._tracked_job_to_ledger_entry(tracked, now=now) for tracked in self._job_tracker.tracked_jobs()]
+        queue_order_by_job_id = self._queue_order_by_job_id()
+        rows = [
+            self._tracked_job_to_ledger_entry(
+                tracked,
+                now=now,
+                queue_order_by_job_id=queue_order_by_job_id,
+            )
+            for tracked in self._job_tracker.tracked_jobs()
+        ]
         rows.extend(
             self._alchemy_status_to_ledger_entry(status) for status in self._alchemy_coordinator.active_form_statuses()
         )
@@ -2907,8 +2959,6 @@ class HordeWorkerProcessManager:
                 if resident is not None:
                     if resident.last_process_state.name == "INFERENCE_STARTING":
                         why = f"Process {resident.process_id} is busy sampling."
-                    elif resident.last_process_state.name == "INFERENCE_POST_PROCESSING":
-                        why = f"Process {resident.process_id} is finishing post-processing."
                     elif resident.last_process_state.name == "DOWNLOADING_AUX_MODEL":
                         why = f"Process {resident.process_id} is downloading auxiliary models."
                     else:
@@ -3014,6 +3064,7 @@ class HordeWorkerProcessManager:
         queue reads the same way for both workloads.
         """
         entries: list[JobQueueEntry] = []
+        queue_order_by_job_id = self._queue_order_by_job_id()
         for api_job in self._job_tracker.jobs_pending_inference[:PENDING_JOBS_IN_SNAPSHOT]:
             payload = api_job.payload
             candidate = JobFeatureSummary.from_payload(payload)
@@ -3028,6 +3079,7 @@ class HordeWorkerProcessManager:
                     width=payload.width,
                     height=payload.height,
                     features=features,
+                    queue_order=queue_order_by_job_id.get(str(api_job.id_.root) if api_job.id_ is not None else ""),
                 )
             )
         for status in self._alchemy_coordinator.active_form_statuses():
@@ -3405,8 +3457,7 @@ class HordeWorkerProcessManager:
                 if info.process_type == HordeProcessType.INFERENCE
                 and info.device_index == device_index
                 and info.is_process_alive()
-                and info.last_process_state
-                in (HordeProcessState.INFERENCE_STARTING, HordeProcessState.INFERENCE_POST_PROCESSING)
+                and info.last_process_state == HordeProcessState.INFERENCE_STARTING
             )
 
             residency_model, residency_phase = self._inference_scheduler.card_residency(fault_key)
@@ -3662,6 +3713,8 @@ class HordeWorkerProcessManager:
             jobs_in_progress=len(self._job_tracker.jobs_in_progress),
             jobs_pending_safety_check=len(self._job_tracker.jobs_pending_safety_check),
             jobs_being_safety_checked=len(self._job_tracker.jobs_being_safety_checked),
+            jobs_pending_post_processing=len(self._job_tracker.jobs_pending_post_processing),
+            jobs_being_post_processed=len(self._job_tracker.jobs_being_post_processed),
             jobs_pending_submit=len(self._job_tracker.jobs_pending_submit),
             time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
             kudos_per_hour=kudos_per_hour,

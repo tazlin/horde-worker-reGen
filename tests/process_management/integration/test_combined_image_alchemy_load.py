@@ -144,10 +144,13 @@ class TestSharedBudgetNoDoubleCommit:
         assert scheduler._committed_vram_reserve_mb() == 2000.0
 
     def test_manager_wires_one_shared_ledger(self) -> None:
-        """The scheduler and alchemy coordinator are handed the very same ledger instance."""
+        """Every resource-aware coordinator is handed the same ledger instance."""
         pm = make_testable_process_manager(alchemist=True)
         assert pm._inference_scheduler._reserve_ledger is pm._reserve_ledger
         assert pm._alchemy_coordinator._reserve_ledger is pm._reserve_ledger
+        assert pm._message_dispatcher._reserve_ledger is pm._reserve_ledger
+        assert pm._post_process_orchestrator._reserve_ledger is pm._reserve_ledger
+        assert pm._recovery_coordinator._reserve_ledger is pm._reserve_ledger
 
 
 class TestAlchemyAdmissionMatrix:

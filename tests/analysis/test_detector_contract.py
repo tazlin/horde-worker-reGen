@@ -100,6 +100,15 @@ def _post_processing_stall(ts: str, *, slot: int = 3) -> str:
     )
 
 
+def _pp_deferral(ts: str, *, job_id: str) -> str:
+    """post_process_orchestrator._has_post_processing_headroom: the admission gate deferring a job."""
+    return (
+        f"2026-06-24 {ts} | WARNING | horde_worker_regen.process_management.workers.post_process_orchestrator:_has_post_processing_headroom:102 - "
+        f"Deferring post-processing for job {job_id}: estimated peak 8533 MB plus reserve 2048 MB exceeds "
+        "free VRAM after commitments (6675 MB available on card 0). No idle VRAM reclaim was available."
+    )
+
+
 def _oom(ts: str) -> str:
     """An explicit CUDA out-of-memory fault surfaced from an inference slot."""
     return f"2026-06-24 {ts} | ERROR | x:y:1 - CUDA out of memory. Tried to allocate 2.00 GiB"
@@ -175,6 +184,20 @@ CONTRACTS: dict[str, Contract] = {
         # A 10-minute re-entry-cooldown spell over a ~10.5-minute session: well past the dominance share.
         bridge=_bridge(_governor_enter("18:30:00.000"), _governor_exit("18:40:00.000")),
         severity=Severity.INFO,
+    ),
+    "detect_post_processing_deferral_starvation": Contract(
+        # The same job deferred every scheduling tick with no lane completion afterwards: the
+        # admission-gate starvation storm.
+        bridge=_bridge(
+            *[
+                _pp_deferral(
+                    f"18:{30 + i // 60}:{i % 60:02d}.000",
+                    job_id="4e17ddbd-a9cc-494d-b668-8f6fcb6d08aa",
+                )
+                for i in range(35)
+            ],
+        ),
+        severity=Severity.CRITICAL,
     ),
     "detect_scheduler_starvation_wedge": Contract(
         bridge=_bridge(

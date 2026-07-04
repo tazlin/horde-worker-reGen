@@ -6,6 +6,7 @@ nav:
     - bridge_config.md
     - ipc_and_messaging.md
     - process_lifecycle.md
+    - process_lanes_and_chaining.md
     - performance_and_backpressure.md
     - duty-cycle.md
     - compute_backends.md

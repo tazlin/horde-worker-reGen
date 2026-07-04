@@ -472,7 +472,7 @@ class StatusReporter:
                     f"allow_controlnet: {bridge_data.allow_controlnet}",
                     f"allow_sdxl_controlnet: {bridge_data.allow_sdxl_controlnet}",
                     f"allow_post_processing: {bridge_data.allow_post_processing}",
-                    f"post_process_job_overlap: {bridge_data.post_process_job_overlap}",
+                    f"dedicated_post_processing: {bridge_data.dedicated_post_processing}",
                 ],
             ),
         )

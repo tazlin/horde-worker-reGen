@@ -39,6 +39,7 @@ from horde_worker_regen.process_management.lifecycle.process_map import ProcessM
 from horde_worker_regen.process_management.models.download_scheduler import DownloadKind, DownloadTask
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
+from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.simulation.fake_worker_processes import FakeDownloadProcess
 from horde_worker_regen.process_management.workers.download_process import (
     DOWNLOAD_PROCESS_ID,
@@ -769,6 +770,7 @@ class TestDispatcherRoutesDownloadMessages:
             runtime_config=make_test_runtime_config(),
             model_metadata=make_test_model_metadata(),
             action_ledger=ActionLedger(),
+            reserve_ledger=CommittedReserveLedger(),
             on_unload_vram=_noop_unload,  # type: ignore[arg-type]
             state=WorkerState(),
         )

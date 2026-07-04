@@ -34,6 +34,7 @@ class LedgerEventType(enum.StrEnum):
     INFERENCE_DISPATCHED = "inference_dispatched"
     INFERENCE_RETRIED = "inference_retried"
     INFERENCE_FAULTED = "inference_faulted"
+    POST_PROCESS_FAULTED = "post_process_faulted"
     PRELOAD_REQUESTED = "preload_requested"
     SEMAPHORE_RELEASED = "semaphore_released"
     TIMEOUT_DETECTED = "timeout_detected"

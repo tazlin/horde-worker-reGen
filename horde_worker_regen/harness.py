@@ -62,6 +62,7 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
 from horde_worker_regen.process_management.simulation.fake_worker_processes import (
     start_fake_download_process,
     start_fake_inference_process,
+    start_fake_post_process_process,
     start_fake_safety_process,
 )
 from horde_worker_regen.process_management.simulation.fault_injection import FaultProfile
@@ -138,6 +139,9 @@ class HarnessConfig:
 
     safety_fault_profile: FaultProfile | None = None
     """If set (fake process mode only), scripts the safety fakes' misbehaviour on the eval path."""
+
+    post_process_fault_profile: FaultProfile | None = None
+    """If set (fake process mode only), scripts the post-processing fake's misbehaviour on the job path."""
 
     sim_vram_ledger: SimVramLedger | None = None
     """If set (fake process mode only), a shared simulated-device-VRAM ledger the inference fakes report
@@ -422,6 +426,7 @@ def build_harness_bridge_data(config: HarnessConfig, scenario: list[ImageGenerat
         "dry_run_skip_api": config.skip_api,
         "dry_run_skip_inference": config.process_mode != "real",
         "dry_run_skip_safety": config.process_mode != "real",
+        "dry_run_skip_post_processing": config.process_mode != "real",
         "dry_run_inference_delay": config.job_delay_seconds,
     }
     if config.alchemy_forms or config.soak_alchemy_templates:
@@ -556,6 +561,17 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
             else start_fake_safety_process
         )
 
+        post_process_kwargs: dict = {}
+        if config.post_process_fault_profile is not None:
+            post_process_kwargs["fault_profile"] = config.post_process_fault_profile
+        if config.sim_vram_ledger is not None:
+            post_process_kwargs["sim_vram_ledger"] = config.sim_vram_ledger
+        post_process_entry_point = (
+            functools.partial(start_fake_post_process_process, **post_process_kwargs)
+            if post_process_kwargs
+            else start_fake_post_process_process
+        )
+
         available_models = (
             config.fake_initially_available_models
             if config.fake_initially_available_models is not None
@@ -572,6 +588,7 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
         entry_points = ProcessEntryPoints(
             inference_entry_point=inference_entry_point,
             safety_entry_point=safety_entry_point,
+            post_process_entry_point=post_process_entry_point,
             download_entry_point=download_entry_point,
         )
 
@@ -1053,6 +1070,7 @@ def _build_warm_bridge_data(
         "dry_run_skip_api": True,
         "dry_run_skip_inference": process_mode != "real",
         "dry_run_skip_safety": process_mode != "real",
+        "dry_run_skip_post_processing": process_mode != "real",
     }
     if process_mode == "real":
         # See _REAL_BENCHMARK_STARTUP_TIMEOUT_SECONDS: the warm worker cold-starts once, and must not
@@ -1127,6 +1145,7 @@ class WarmHarnessSession:
             entry_points = ProcessEntryPoints(
                 inference_entry_point=start_fake_inference_process,
                 safety_entry_point=start_fake_safety_process,
+                post_process_entry_point=start_fake_post_process_process,
             )
         system_resources = _build_harness_system_resources() if self._process_mode != "real" else None
         # Inject a minimal reference covering every level's models in all modes (mirrors

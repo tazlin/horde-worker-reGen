@@ -80,12 +80,11 @@ class FaultProfile(BaseModel):
     dispatcher's tolerance of malformed or mismatched messages."""
 
     post_processing_peak_mb: int | None = None
-    """When set (and a simulated-VRAM ledger is wired in), every job enters an ``INFERENCE_POST_PROCESSING``
-    phase after sampling and tries to allocate this peak against the ledger. If the simulated device cannot
-    host it once the process frees its *own* models (a sibling-residency / context over-commit the process
-    cannot self-reclaim), the upscaler stalls: the process stops emitting heartbeats so the post-processing
-    watchdog reaps it, the post-processing over-commit recovery. With room, the peak fits and the job
-    completes normally. Without a ledger this field is inert (the fake reports no real device state)."""
+    """When set (and a simulated-VRAM ledger is wired in), every job on the fake post-processing lane tries
+    to allocate this peak against the ledger while in ``POST_PROCESSING``. If the simulated device cannot
+    host it, the upscaler stalls: the process stops emitting heartbeats so the post-processing watchdog
+    reaps it, the post-processing over-commit recovery. With room, the peak fits and the job completes
+    normally. Without a ledger this field is inert (the fake reports no real device state)."""
 
     def is_noop(self) -> bool:
         """Return True if this profile requests no misbehaviour at all."""

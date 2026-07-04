@@ -25,6 +25,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeInferenceResultMessage,
     HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
+    HordePostProcessResultMessage,
     HordeProcessHeartbeatMessage,
     HordeProcessMemoryMessage,
     HordeProcessMessage,
@@ -40,6 +41,8 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.telemetry_spans import (
     inference_duration_histogram,
@@ -53,7 +56,6 @@ _excludes_for_job_dump = {"source_image", "source_mask", "extra_source_images", 
 _INFERENCE_ACTIVE_STATES = frozenset(
     {
         HordeProcessState.INFERENCE_STARTING,
-        HordeProcessState.INFERENCE_POST_PROCESSING,
         HordeProcessState.INFERENCE_COMPLETE,
         HordeProcessState.INFERENCE_FAILED,
     },
@@ -119,6 +121,7 @@ class MessageDispatcher:
     _runtime_config: RuntimeConfig
     _model_metadata: ModelMetadata
     _action_ledger: ActionLedger
+    _reserve_ledger: CommittedReserveLedger
     _on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]]
     _on_alchemy_result: Callable[[HordeAlchemyResultMessage], None] | None = None
     _on_job_metrics: Callable[[HordeJobMetricsMessage], None] | None = None
@@ -150,6 +153,7 @@ class MessageDispatcher:
         runtime_config: RuntimeConfig,
         model_metadata: ModelMetadata,
         action_ledger: ActionLedger,
+        reserve_ledger: CommittedReserveLedger,
         on_unload_vram: Callable[[HordeProcessInfo], Awaitable[None]],
         state: WorkerState,
     ) -> None:
@@ -164,6 +168,8 @@ class MessageDispatcher:
             model_metadata (ModelMetadata): Provides lookups against the stable-diffusion model reference.
             action_ledger (ActionLedger): The shared lifecycle audit ledger; inference retries and terminal
                 faults are recorded here so a job's failure history is self-explaining in a post-mortem.
+            reserve_ledger: Shared committed-resource ledger used to release post-processing holds when a
+                result arrives or is known lost.
             on_unload_vram (Callable[[HordeProcessInfo], None]): A callback to invoke when a process reports that it
                 has unloaded a model from VRAM. This is used to trigger the unloading of the model from any other
                 processes that have it loaded, if the current bridge configuration requires aggressive VRAM management.
@@ -177,6 +183,7 @@ class MessageDispatcher:
         self._runtime_config = runtime_config
         self._model_metadata = model_metadata
         self._action_ledger = action_ledger
+        self._reserve_ledger = reserve_ledger
         self._on_unload_vram = on_unload_vram
         self._state = state
         self._safety_verdicts_known_lost: set[GenerationID] = set()
@@ -188,10 +195,23 @@ class MessageDispatcher:
         only after the watchdog's grace elapses.
         """
 
+        self._post_process_results_known_lost: set[GenerationID] = set()
+        """Jobs whose post-processing result was dropped because its producing launch was retired.
+
+        The post-processing analogue of ``_safety_verdicts_known_lost``: positive evidence the result will
+        never arrive, drained by the recovery coordinator to skip the orphan watchdog's grace.
+        """
+
     def take_safety_verdicts_known_lost(self) -> set[GenerationID]:
         """Return and clear the jobs whose safety verdict was dropped with their launch retired."""
         lost = self._safety_verdicts_known_lost
         self._safety_verdicts_known_lost = set()
+        return lost
+
+    def take_post_process_results_known_lost(self) -> set[GenerationID]:
+        """Return and clear the jobs whose post-processing result was dropped with their launch retired."""
+        lost = self._post_process_results_known_lost
+        self._post_process_results_known_lost = set()
         return lost
 
     def set_alchemy_result_handler(self, handler: Callable[[HordeAlchemyResultMessage], None]) -> None:
@@ -315,6 +335,9 @@ class MessageDispatcher:
             if isinstance(message, HordeInferenceResultMessage):
                 self._record_completed_job(message.process_id)
                 await self._handle_inference_result(message)
+            elif isinstance(message, HordePostProcessResultMessage):
+                self._record_completed_job(message.process_id)
+                await self._handle_post_process_result(message)
             elif isinstance(message, HordeSafetyResultMessage):
                 self._record_completed_job(message.process_id)
                 await self._handle_safety_result(message)
@@ -336,7 +359,12 @@ class MessageDispatcher:
 
         if isinstance(
             message,
-            (HordeInferenceResultMessage, HordeSafetyResultMessage, HordeAlchemyResultMessage),
+            (
+                HordeInferenceResultMessage,
+                HordeSafetyResultMessage,
+                HordeAlchemyResultMessage,
+                HordePostProcessResultMessage,
+            ),
         ):
             logger.warning(
                 f"Ignoring result message from retired {retired_launch.process_type.name.lower()} process "
@@ -350,6 +378,9 @@ class MessageDispatcher:
             # this several such drops can pile up faster than the watchdog clears them and wedge the pipeline.
             if isinstance(message, HordeSafetyResultMessage):
                 self._safety_verdicts_known_lost.add(message.job_id)
+            if isinstance(message, HordePostProcessResultMessage):
+                self._post_process_results_known_lost.add(message.job_id)
+                self._release_post_process_reserve(message.job_id)
             return True
 
         if self._is_late_retired_liveness_message(message):
@@ -385,6 +416,10 @@ class MessageDispatcher:
         process_info = self._process_map.get(process_id)
         if process_info is not None:
             process_info.num_jobs_completed += 1
+
+    def _release_post_process_reserve(self, job_id: GenerationID) -> None:
+        """Drop the active post-processing VRAM reserve for ``job_id``."""
+        self._reserve_ledger.release(POST_PROCESS_RESERVE_FLOW, str(job_id))
 
     def _handle_heartbeat(self, message: HordeProcessHeartbeatMessage) -> None:
         """Handle a heartbeat message from a child process."""
@@ -731,7 +766,62 @@ class MessageDispatcher:
         job_info.job_image_results = message.job_image_results
 
         jobs_completed_counter.add(1)
+
+        requested_post_processing = job_info.sdk_api_job_info.payload.post_processing
+        if requested_post_processing:
+            if self._runtime_config.bridge_data.post_processing_lane_enabled:
+                await self._job_tracker.queue_for_post_processing(job_info)
+                return
+            # The lane is the only post-processing path; with it disabled the job should never have been
+            # popped with post-processing at all. Deliver the raw images rather than strand the job.
+            logger.error(
+                f"Job {message.sdk_api_job_info.id_} requested post-processing "
+                f"({requested_post_processing}) but the dedicated post-processing lane is disabled; "
+                "submitting the raw images.",
+            )
+
         await self._job_tracker.queue_for_safety(job_info)
+
+    async def _handle_post_process_result(self, message: HordePostProcessResultMessage) -> None:
+        """Handle a post-processing result: adopt the processed images and move the job on to safety.
+
+        A faulted post-processing pass falls back to the raw images (recorded as a post-processing fault
+        against the feature's circuit window) so the job still completes; re-running inference cannot fix
+        a post-processing failure, and dropping the job would forfeit work that already succeeded.
+        """
+        self._release_post_process_reserve(message.job_id)
+        completed_job_info = await self._job_tracker.take_being_post_processed(message.job_id)
+
+        if completed_job_info is None:
+            logger.error(
+                f"Expected to find a job being post-processed with ID {message.job_id} but none was found. "
+                "This should only happen when certain process crashes occur.",
+            )
+            return
+
+        if message.time_elapsed is not None:
+            logger.info(
+                f"Post-processing finished for job {str(message.job_id)[:8]} in "
+                f"{round(message.time_elapsed, 2)} seconds on process {message.process_id}.",
+            )
+
+        if message.state == GENERATION_STATE.faulted or message.job_image_results is None:
+            logger.error(
+                f"Post-processing faulted for job {message.job_id} on process {message.process_id}; "
+                "submitting the raw images instead.",
+            )
+            self._job_tracker.note_post_processing_overcommit_fault()
+            self._action_ledger.record(
+                LedgerEventType.POST_PROCESS_FAULTED,
+                process_id=message.process_id,
+                job_id=str(message.job_id),
+                reason=message.info or "post-processing failed",
+                detail={"fallback": "raw_images"},
+            )
+        else:
+            completed_job_info.job_image_results = message.job_image_results
+
+        await self._job_tracker.queue_for_safety_post_processed(completed_job_info)
 
     async def _handle_faulted_inference_result(
         self,

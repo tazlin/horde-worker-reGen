@@ -121,8 +121,6 @@ class HordeProcessState(enum.Enum):
 
     INFERENCE_STARTING = auto()
     """The process is starting inference."""
-    INFERENCE_POST_PROCESSING = auto()
-    """The process is post-processing as a part of an inference job."""
     INFERENCE_COMPLETE = auto()
     """The process has finished inference."""
     INFERENCE_FAILED = auto()
@@ -134,6 +132,13 @@ class HordeProcessState(enum.Enum):
     """The process has finished performing alchemy jobs."""
     ALCHEMY_FAILED = auto()
     """The process has failed performing alchemy jobs."""
+
+    POST_PROCESSING = auto()
+    """The dedicated post-processing process is running the post-processing phase of an image job."""
+    POST_PROCESSING_COMPLETE = auto()
+    """The dedicated post-processing process has finished an image job's post-processing phase."""
+    POST_PROCESSING_FAILED = auto()
+    """The dedicated post-processing process failed an image job's post-processing phase."""
 
     EVALUATING_SAFETY = auto()
     """The process is evaluating safety."""
@@ -425,6 +430,8 @@ class HordeControlFlag(enum.Enum):
     """Signal the child process to start inference."""
     START_ALCHEMY = auto()
     """Signal the child process to run an alchemy form (upscale, caption, etc.)."""
+    START_POST_PROCESS = auto()
+    """Signal the dedicated post-processing process to run an image job's post-processing phase."""
     EVALUATE_SAFETY = auto()
     """Signal the child process to evaluate safety of images from inference."""
     UNLOAD_MODELS_FROM_VRAM = auto()
@@ -613,3 +620,37 @@ class HordeSafetyControlMessage(HordeControlMessage):
             self.censor_nsfw = True
 
         return self
+
+
+class HordePostProcessControlMessage(HordeControlMessage):
+    """Dispatch an image job's post-processing phase to the dedicated post-processing process.
+
+    Carries the raw (pre-post-processing) images and the requested post-processor list, so the
+    post-processing process runs the same per-image, per-operation loop the inference process used
+    to run inline, but on models it keeps resident.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.START_POST_PROCESS
+    job_id: GenerationID
+    """The ID of the job whose images are to be post-processed."""
+    images_bytes: list[bytes]
+    """The encoded bytes of the raw images to post-process, in generation order."""
+    post_processing: list[str]
+    """The requested post-processor names (upscalers/face-fixers/strip-background), in request order."""
+    trace_context: str | None = None
+    """W3C traceparent string for cross-process span correlation."""
+
+
+class HordePostProcessResultMessage(HordeProcessMessage):
+    """The result of an image job's post-processing phase, sent from the post-processing process.
+
+    Mirrors :class:`HordeInferenceResultMessage`: the processed images (and any faults recorded during
+    post-processing) replace the raw images before the job proceeds to the safety stage.
+    """
+
+    job_id: GenerationID
+    """The ID of the job whose images were post-processed."""
+    job_image_results: list[HordeImageResult] | None = None
+    """The post-processed per-image results, or None if post-processing faulted with no usable output."""
+    state: GENERATION_STATE
+    """The state of the job to be sent to the API (``ok`` or ``faulted``)."""

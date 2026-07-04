@@ -44,6 +44,9 @@ class HordeProcessType(enum.Enum):
     SAFETY = auto()
     DOWNLOAD = auto()
     """A background model-downloading process; serves no jobs and lives outside the process map."""
+    POST_PROCESS = auto()
+    """A dedicated post-processing process that keeps the upscaler/face-fixer models resident and runs the
+    post-processing phase of image jobs (and the graph-backed alchemy forms) off the inference processes."""
 
 
 class WorkerCapability(enum.Flag):
@@ -64,8 +67,9 @@ class WorkerCapability(enum.Flag):
 
 
 DEFAULT_CAPABILITIES: dict[HordeProcessType, WorkerCapability] = {
-    HordeProcessType.INFERENCE: WorkerCapability.IMAGE_GEN | WorkerCapability.ALCHEMY_GRAPH,
+    HordeProcessType.INFERENCE: WorkerCapability.IMAGE_GEN,
     HordeProcessType.SAFETY: WorkerCapability.SAFETY_EVAL | WorkerCapability.ALCHEMY_CLIP,
+    HordeProcessType.POST_PROCESS: WorkerCapability.ALCHEMY_GRAPH,
     HordeProcessType.DOWNLOAD: WorkerCapability(0),
 }
 """The capabilities each process type declares by default."""

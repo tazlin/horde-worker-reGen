@@ -703,7 +703,7 @@ def forecast_weight_streaming(
     configured_reserve_floor_mb: float,
     reserve_vram_gb: float | None = None,
     num_extra_resident_contexts: int = 0,
-    post_processing_reserve_mb: float = 0.0,
+    committed_reserve_mb: float = 0.0,
     marginal_process_overhead_mb: float | None = None,
     wants_whole_card: bool = False,
 ) -> StreamForecast:
@@ -757,22 +757,19 @@ def forecast_weight_streaming(
     # on the already-resident model, temporally disjoint from weight residency, so charging it against the
     # sampling footprint conflates a transient, output-scaled spike with the persistent weights and can flip a
     # moderate model (an SDXL job that merely requests a 4x upscaler) into falsely reading as weight-dominant
-    # and claiming the whole card. The post-processing phase is reserved separately, when imminent, via
-    # ``post_processing_reserve_mb`` below.
+    # and claiming the whole card. Post-processing runs on the dedicated lane, whose resident context is
+    # charged via ``num_extra_resident_contexts``.
     peak_mb = predict_job_sampling_vram_mb(job, baseline)
     activation_working_set_mb = 0.0
     if peak_mb is not None and weights_mb is not None:
         activation_working_set_mb = max(0.0, peak_mb - weights_mb)
-    # ``post_processing_reserve_mb`` is the imminent post-processing peak of in-flight jobs whose inference
-    # slots have already been released (so the measurement still reads high) but whose upscalers/face-fixers
-    # are about to allocate. Folding it into the activation-inclusive reserve (never the bounded weight floor
-    # ``base_reserve_mb``, since it is a transient activation peak and not this model's persistent weights)
-    # makes the co-residency and weight-dominant tests forward-looking: a heavy model will escalate to
+    # ``committed_reserve_mb`` is the VRAM in-flight concurrent work (alchemy forms today) has committed
+    # but the measurement may not yet reflect. Folding it into the activation-inclusive reserve (never the
+    # bounded weight floor ``base_reserve_mb``, since it is transient and not this model's persistent
+    # weights) keeps the co-residency and weight-dominant tests forward-looking: a heavy model escalates to
     # evicting a sibling model or claiming the card rather than co-residing into VRAM that is about to be
-    # reclaimed. Because ``activation_working_set_mb`` is now sampling-only, this term carries the whole
-    # post-processing contribution: the loading model's own post-proc is reserved by the scheduler's committed
-    # reserve once it reaches that phase, not pre-charged here against its sampling-phase residency.
-    reserve_mb = max(base_reserve_mb, activation_working_set_mb) + max(0.0, post_processing_reserve_mb)
+    # reclaimed.
+    reserve_mb = max(base_reserve_mb, activation_working_set_mb) + max(0.0, committed_reserve_mb)
     overhead = max(0.0, per_process_overhead_mb)
     # The first context pays the one-time CUDA runtime cost; each additional context costs only the marginal.
     # Default the marginal to the full overhead so an unsupplied marginal reproduces the old contexts*overhead.

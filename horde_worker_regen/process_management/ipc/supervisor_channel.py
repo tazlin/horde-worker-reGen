@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 15
+SUPERVISOR_PROTOCOL_VERSION = 16
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -59,6 +59,8 @@ pop/scheduling governor holding back or reshaping job pops, for the Overview str
 v14 added :class:`WorkerFatalConfigError`, a one-shot frame the worker sends before exiting on a fatal,
 non-retryable configuration problem (e.g. a worker name taken by another account) so the supervisor can
 stop relaunching and the dashboard can show the specific reason and remedy instead of a generic crash.
+v16 added post-processing lane counters and per-entry queue order so the TUI can show the image job route
+through the dedicated post-processing process.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -128,6 +130,8 @@ class JobQueueEntry(BaseModel):
     width: int | None = None
     height: int | None = None
     features: JobFeatureSummary | None = None
+    queue_order: int | None = None
+    """1-based order among currently tracked image jobs by pop order; None for non-image forms."""
 
 
 class WorkLedgerStage(enum.StrEnum):
@@ -136,6 +140,7 @@ class WorkLedgerStage(enum.StrEnum):
     QUEUED = "queued"
     PREPARING = "preparing"
     INFERENCE = "inference"
+    POST_PROCESSING = "post_processing"
     SAFETY = "safety"
     SUBMIT = "submit"
     COMPLETED = "completed"
@@ -158,6 +163,8 @@ class WorkLedgerEntry(BaseModel):
     height: int | None = None
     steps: int | None = None
     features: JobFeatureSummary | None = None
+    queue_order: int | None = None
+    """1-based order among currently tracked image jobs by pop order; None for recent/alchemy rows."""
     age_seconds: float | None = None
     queue_wait_seconds: float | None = None
     safety_seconds: float | None = None
@@ -392,6 +399,8 @@ class StatsSample(BaseModel):
     jobs_in_progress: int = 0
     jobs_pending_safety_check: int = 0
     jobs_being_safety_checked: int = 0
+    jobs_pending_post_processing: int = 0
+    jobs_being_post_processed: int = 0
     jobs_pending_submit: int = 0
     time_spent_no_jobs_available: float = 0.0
     num_process_recoveries: int = 0
@@ -953,6 +962,8 @@ class WorkerStateSnapshot(BaseModel):
     jobs_in_progress: int = 0
     jobs_pending_safety_check: int = 0
     jobs_being_safety_checked: int = 0
+    jobs_pending_post_processing: int = 0
+    jobs_being_post_processed: int = 0
     jobs_pending_submit: int = 0
     """Jobs that have cleared safety and are queued for API submission (the pipeline's tail stage)."""
     time_spent_no_jobs_available: float = 0.0

@@ -19,7 +19,9 @@ from horde_worker_regen.process_management.lifecycle.horde_process import HordeP
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.lifecycle.recovery_supervisor import RecoveryAction, RecoverySupervisor
+from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 
 
 class WorkerRecoveryCoordinator:
@@ -31,6 +33,10 @@ class WorkerRecoveryCoordinator:
     ORPHAN_SAFETY_GRACE_SECONDS = 45.0
     SAFETY_REQUEUE_MAX = 3
     SAFETY_SOFT_PAUSE_SECONDS = 60.0
+    ORPHAN_POST_PROCESS_GRACE_SECONDS = 90.0
+    """Grace before a job stuck in POST_PROCESSING with no result is requeued. Wider than the safety grace
+    because a legitimate multi-operation upscale pass on a large batch can run for over a minute."""
+    POST_PROCESS_REQUEUE_MAX = 2
     RUNAWAY_RECOVERY_WINDOW_SECONDS = 300.0
     RUNAWAY_RECOVERY_CEILING = 20
     HEALTHY_HOLD_WATCHDOG_GRACE_SECONDS = 120.0
@@ -52,6 +58,7 @@ class WorkerRecoveryCoordinator:
         message_dispatcher: MessageDispatcher,
         inference_scheduler: InferenceScheduler,
         action_ledger: ActionLedger,
+        reserve_ledger: CommittedReserveLedger,
         bridge_data_provider: Callable[[], reGenBridgeData],
         max_inference_processes_provider: Callable[[], int],
         abort_callback: Callable[[], None],
@@ -69,6 +76,7 @@ class WorkerRecoveryCoordinator:
             message_dispatcher: Dispatcher that owns queue-deadlock snapshots.
             inference_scheduler: Scheduler exposing bounded grace windows.
             action_ledger: Recovery/action audit sink.
+            reserve_ledger: Shared committed-resource ledger used to release stranded post-processing holds.
             bridge_data_provider: Return the current live bridge data.
             max_inference_processes_provider: Return the provisioned inference-process count.
             abort_callback: Abort the worker promptly.
@@ -83,6 +91,7 @@ class WorkerRecoveryCoordinator:
         self._message_dispatcher = message_dispatcher
         self._inference_scheduler = inference_scheduler
         self._action_ledger = action_ledger
+        self._reserve_ledger = reserve_ledger
         self._bridge_data_provider = bridge_data_provider
         self._max_inference_processes_provider = max_inference_processes_provider
         self._abort_callback = abort_callback
@@ -98,6 +107,8 @@ class WorkerRecoveryCoordinator:
         self.orphan_punt_history: list[float] = []
         self.orphan_safety_since: dict[GenerationID, float] = {}
         self.safety_requeue_count: dict[GenerationID, int] = {}
+        self.orphan_post_process_since: dict[GenerationID, float] = {}
+        self.post_process_requeue_count: dict[GenerationID, int] = {}
         # Healthy-hold watchdog episode timestamps: when the healthy-but-held condition was first observed,
         # and when a governance-baseline reset was applied for it (to time the escalation). Both None when
         # no episode is open.
@@ -294,6 +305,84 @@ class WorkerRecoveryCoordinator:
                     f"Job {job_id} awaited a safety verdict for {now - first_seen:.0f}s with none returned; "
                     f"requeued it for a fresh safety check (attempt {requeues + 1}/{self.SAFETY_REQUEUE_MAX}). "
                     "Its images are re-checked, never submitted unchecked.",
+                )
+
+    def is_post_process_lane_ready(self) -> bool:
+        """Return whether the dedicated post-processing process is alive and able to accept work."""
+        return any(
+            process_info.process_type == HordeProcessType.POST_PROCESS and process_info.can_accept_job()
+            for process_info in self._process_map.values()
+        )
+
+    async def reconcile_orphaned_post_process_jobs(self) -> None:
+        """Recover jobs stranded in post-processing whose result will never return.
+
+        Unlike a lost safety verdict, a lost post-processing result never forfeits the job: the raw
+        inference images are still held, so after bounded re-attempts the job proceeds to safety with
+        the raw images rather than being faulted.
+        """
+        now = self._clock()
+        being_post_processed = self._job_tracker.jobs_being_post_processed
+        current_ids = {
+            info.sdk_api_job_info.id_ for info in being_post_processed if info.sdk_api_job_info.id_ is not None
+        }
+
+        # Results positively dropped (their post-process launch was retired mid-job, or the lane itself was
+        # torn down with the job in flight) skip the grace: the result is known lost, not merely late.
+        known_lost = (
+            self._message_dispatcher.take_post_process_results_known_lost()
+            | self._process_lifecycle.take_post_process_results_known_lost()
+        )
+        for job_id in known_lost:
+            if job_id in current_ids:
+                self.orphan_post_process_since[job_id] = now - self.ORPHAN_POST_PROCESS_GRACE_SECONDS
+
+        for job_id in list(self.orphan_post_process_since):
+            if job_id not in current_ids:
+                del self.orphan_post_process_since[job_id]
+        for job_id in list(self.post_process_requeue_count):
+            if job_id not in current_ids and self._job_tracker.get_stage(job_id) != JobStage.PENDING_POST_PROCESSING:
+                del self.post_process_requeue_count[job_id]
+
+        for job_info in being_post_processed:
+            job_id = job_info.sdk_api_job_info.id_
+            if job_id is None:
+                continue
+            first_seen = self.orphan_post_process_since.setdefault(job_id, now)
+            if (now - first_seen) < self.ORPHAN_POST_PROCESS_GRACE_SECONDS:
+                continue
+
+            requeues = self.post_process_requeue_count.get(job_id, 0)
+            if requeues >= self.POST_PROCESS_REQUEUE_MAX:
+                logger.error(
+                    f"Job {job_id} could not be post-processed (requeued {requeues} times without a "
+                    "result); submitting its raw images instead so the finished inference is not forfeited.",
+                )
+                self._action_ledger.record(
+                    LedgerEventType.POST_PROCESS_FAULTED,
+                    job_id=str(job_id),
+                    reason="post-processing unrecoverable",
+                    detail={"stuck_seconds": round(now - first_seen, 1), "post_process_requeues": requeues},
+                )
+                self._job_tracker.note_post_processing_overcommit_fault()
+                taken_job_info = await self._job_tracker.take_being_post_processed(job_id)
+                self._reserve_ledger.release(POST_PROCESS_RESERVE_FLOW, str(job_id))
+                if taken_job_info is not None:
+                    await self._job_tracker.queue_for_safety_post_processed(taken_job_info)
+                self.orphan_post_process_since.pop(job_id, None)
+                self.post_process_requeue_count.pop(job_id, None)
+                continue
+
+            if await self._job_tracker.requeue_one_being_post_processed(job_id):
+                self._reserve_ledger.release(POST_PROCESS_RESERVE_FLOW, str(job_id))
+                self.post_process_requeue_count[job_id] = requeues + 1
+                self.orphan_post_process_since.pop(job_id, None)
+                if not self.is_post_process_lane_ready():
+                    self._process_lifecycle.post_process_processes_should_be_replaced = True
+                logger.warning(
+                    f"Job {job_id} awaited a post-processing result for {now - first_seen:.0f}s with none "
+                    f"returned; requeued it for a fresh attempt "
+                    f"(attempt {requeues + 1}/{self.POST_PROCESS_REQUEUE_MAX}).",
                 )
 
     def assess_wedge(self) -> bool:

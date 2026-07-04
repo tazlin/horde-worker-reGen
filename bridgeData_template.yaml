@@ -55,6 +55,14 @@ safety_on_gpu: false
 #   12GB-16GB VRAM: true (consider false if offering Cascade or Flux)
 #   8GB-10GB VRAM: false
 
+# Run post-processing (upscalers/face-fixers/background removal) on a dedicated process that keeps
+# those models resident, instead of inside the inference processes. This gives post-processing a
+# fixed, budgetable VRAM footprint and avoids reloading the models per job.
+#   auto: run the lane whenever post-processing is allowed (recommended)
+#   on:   always run the lane
+#   off:  disable the lane; the worker will not offer post-processing at all
+dedicated_post_processing: auto
+
 # Only pick up jobs where the user has the required kudos upfront.
 # Excludes all anonymous accounts and registered accounts who haven't contributed.
 require_upfront_kudos: false
@@ -113,12 +121,6 @@ high_performance_mode: false
 moderate_performance_mode: false
 # Suggested values:
 #   12GB-16GB VRAM: true
-
-# Start processing the next job before the current job finishes post-processing.
-# Reduces time between jobs but may cause crashes on low RAM or VRAM systems.
-post_process_job_overlap: false
-# Suggested values:
-#   24GB+ VRAM: true
 
 # Aggressively unload models from VRAM when not in use.
 # Should be true for most workers with GPUs with less than 16GB of VRAM.
@@ -553,26 +555,6 @@ ram_pressure_min_free_mb: 1024
 # finishes. Only consulted under the danger floor, so a roomy host never recycles needlessly. 0 disables.
 # Only used with enable_vram_budget.
 ram_per_process_max_mb: 18432
-
-# Hold back the imminent post-processing VRAM peak of in-flight jobs when admitting new ones. A job releases
-# its inference slot for overlap *before* its upscaler/face-fixer allocates, so measured free VRAM
-# transiently overstates what is available. When true (default), the scheduler subtracts the predicted
-# post-processing peak of every in-flight post-processing job from the free VRAM it gates dispatch/overlap
-# against, so a freshly-released slot is not handed VRAM an in-flight upscaler is about to claim. Self-scales
-# to zero when nothing is post-processing. Only used when enable_vram_budget is true.
-post_processing_budget_reserve_enabled: true
-
-# Proactively reclaim cross-process VRAM before a job's *own* post-processing peak lands. A 4x upscale on an
-# SDXL image needs ~8.5 GB at peak, which arrives after sampling and is never charged against the job's
-# placement, so on a contended card (warm sibling models + several process contexts) the upscaler can
-# allocate into near-zero free VRAM and stall until the post-process watchdog reaps the slot. When true, at
-# dispatch the scheduler sizes that peak against the measured headroom and, if it will not fit even after the
-# job's own weights are freed in-child, frees an idle sibling's model (then a context) so the room is ready
-# by the time the peak lands; a peak nothing can host faults gracefully instead of stalling. Most useful on
-# 16 GB (and smaller) cards running post-processing with overlap and multiple contexts; a no-op on roomy
-# cards where the peak already fits. On by default; complements the overlap gate of
-# post_processing_budget_reserve_enabled. Only used with enable_vram_budget.
-post_processing_active_reclaim_enabled: true
 
 # Disable post-processing on this worker after repeated post-processing VRAM-over-commit faults. A peak that
 # cannot be hosted faults the job (the horde reissues it), but a worker that keeps faulting trips the horde's

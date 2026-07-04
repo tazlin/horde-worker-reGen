@@ -240,7 +240,7 @@ class TestPhantomInProgressJobWedgesDispatch:
 
         # Symptom: the in-progress cap (1) is fully consumed by the phantom, so the ready head cannot be
         # dispatched even though its process is preloaded and idle-capable.
-        assert pm._inference_scheduler._max_jobs_in_progress_allowed(0) == 1
+        assert pm._inference_scheduler._max_jobs_in_progress_allowed() == 1
         assert await pm._inference_scheduler.get_next_job_and_process() is None
 
         # The watchdog runs every control-loop tick; advance its grace clock and let it act.

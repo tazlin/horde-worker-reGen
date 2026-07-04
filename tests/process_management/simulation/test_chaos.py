@@ -109,10 +109,10 @@ def test_idle_slot_stuck_with_work_pending_is_detected() -> None:
 def test_crash_in_postprocessing_releases_inference_semaphore() -> None:
     """A process that crashes while holding the inference semaphore must have it released on replacement.
 
-    INFERENCE_POST_PROCESSING is a state in which the slot can still hold concurrency; if the release
-    is keyed only on INFERENCE_STARTING the semaphore leaks and caps throughput forever.
+    A slot can crash between acquiring the semaphore and its release (e.g. mid VAE decode); if the
+    release is keyed only on INFERENCE_STARTING the semaphore leaks and caps throughput forever.
     """
-    dead = make_mock_process_info(0, model_name="m", state=HordeProcessState.INFERENCE_POST_PROCESSING)
+    dead = make_mock_process_info(0, model_name="m", state=HordeProcessState.INFERENCE_STARTING)
     plm = _make_plm(process_map=ProcessMap({0: dead}))
     # Avoid touching real OS processes: stub the end/start so only the release logic under test runs.
     plm._end_inference_process = Mock()  # type: ignore[method-assign]

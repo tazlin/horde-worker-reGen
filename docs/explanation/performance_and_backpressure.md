@@ -174,11 +174,16 @@ response stay live even when the queue is empty.
    a free process and send `PRELOAD_MODEL`, subject to the
    [VRAM and RAM budget](#the-vram-and-ram-budget), which defers the preload (and
    reclaims idle resident models) when the device cannot absorb the new model.
+   The scheduler records the model as `LOADING` as soon as the command is sent;
+   stale-entry cleanup must keep that entry while the child is in early preload
+   states, including the short `WAITING_FOR_JOB` first-report race and the
+   `UNLOADED_MODEL_FROM_RAM` -> `DOWNLOADING_AUX_MODEL` ->
+   `DOWNLOAD_AUX_COMPLETE` aux-model download path.
 2. **Peek ahead**: call `get_next_job_and_process(information_only=True)` to
    decide whether to block on a heavy model or batch.
 3. **Blocking rules**: defer launch if:
     - `keep_single_inference` is active (batch mode, VRAM-heavy model,
-      ControlNet-XL, post-processing overlap).
+      ControlNet-XL).
     - A batch/heavy-workflow job is waiting but not enough jobs have accumulated
       for the batch.
 4. **Start inference**: send `START_INFERENCE` with the job payload. A
@@ -387,8 +392,9 @@ predict a job's peak VRAM and RAM cost from hordelib's per-job burden estimate
 (`hordelib.feature_impact.estimate_job_burden`, the same estimate the benchmark
 pre-flight trusts) and compare it against:
 
-- **measured device-wide free VRAM**: the conservative minimum across inference
-  processes' memory reports
+- **measured device-wide free VRAM**: the conservative minimum across
+  GPU-bearing child-process memory reports (inference and the dedicated
+  post-processing lane)
   ([`ProcessMap.get_free_vram_mb`][horde_worker_regen.process_management.lifecycle.process_map.ProcessMap.get_free_vram_mb]),
   plus
 - **measured available system RAM**: read live from the parent via psutil.
@@ -465,18 +471,22 @@ The reductions above are the runtime backstop; the **plan-time process count** i
 sized to the hardware up front so the worker rarely has to reach for them. The
 resolved per-card plan is `queue_size + ceiling` processes, which is sound per card
 but, summed across a multi-GPU host, double-counts the single shared system-RAM
-pool (a second card doubles VRAM, not RAM) and ignores the post-processing VRAM
-peak. So when the worker drives more than one card,
+pool (a second card doubles VRAM, not RAM). So when the worker drives more than
+one card,
 [`cap_card_process_counts`][horde_worker_regen.process_management.process_manager.cap_card_process_counts]
-lowers each card's spawned-process count so the card keeps the upscale peak's VRAM
-free on top of its resident contexts, and the worker-wide resident-context count
+lowers each card's spawned-process count so the worker-wide resident-context count
 fits system RAM, never below one context per card and only ever reducing the
 resolved plan. It uses conservative footprint estimates (no model reference or
 measurement exists at startup); the measured runtime budget then refines the live
 count downward under real pressure. A single-GPU host never double-counts the RAM
-pool, so the cap is multi-GPU only and the single-card plan stays byte-identical
-(its per-card post-processing headroom is the runtime post-processing reclaim's
-job, not the plan's).
+pool, so the cap is multi-GPU only and the single-card plan stays byte-identical.
+Post-processing VRAM is split across two budget paths: the lane's fixed CUDA
+context is part of the resident-process forecast, while each active
+post-processing job's estimated upscale/face-fix peak is entered in the shared
+committed-reserve ledger until the result arrives or orphan recovery clears it.
+The lane reports VRAM into the same `get_free_vram_mb` view as inference, and an
+idle lane can receive the same unload-from-VRAM/RAM commands used for pressure
+reclaim (see [Process lanes and job chaining](process_lanes_and_chaining.md)).
 
 On a multi-GPU worker the whole admission decision is scoped to the card a preload
 would land on (the slot chosen for it). A device-pinned child reports only its own

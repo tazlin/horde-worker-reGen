@@ -48,7 +48,6 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     assess_ram_pressure,
     forecast_weight_streaming,
     is_model_locally_unservable_for,
-    predict_job_post_processing_vram_mb,
     predict_job_weight_mb,
 )
 from horde_worker_regen.process_management.resources.run_metrics import ChurnKind
@@ -102,44 +101,6 @@ from horde_worker_regen.utils.job_utils import (
 from horde_worker_regen.utils.job_utils import line_skip_candidate_emps_limit
 
 
-class PostProcessingReclaimAction(enum.Enum):
-    """What the scheduler should do to host a running job's imminent post-processing-phase VRAM peak.
-
-    A job's upscaler/face-fixer peak (``predict_job_post_processing_vram_mb``) lands *after* sampling, on
-    a card whose process contexts and any warm sibling models are already committed. The planner sizes that
-    peak against the measured headroom and the room the job's own (idle-during-upscale) weights would free,
-    and picks the cheapest action that fits it:
-
-    1. :attr:`DELEGATE_IN_PROCESS`: the peak fits once the job's own weights are freed, which ComfyUI's
-       per-process ``free_memory`` already does in-child, so the orchestrator need do nothing.
-    2. :attr:`EVICT_SIBLING_MODEL`: own-weights room is not enough, so evict a *different* model resident
-       on an idle sibling process (the running model may still be demanded by the queue, so it is kept).
-    3. :attr:`REDUCE_CONTEXT`: nothing idle holds an evictable model, so stop a sibling process to reclaim
-       its context. Expected only on the smallest cards or one over-committed by out-of-worker allocation.
-    4. :attr:`DEFER`: nothing idle is reclaimable right now, but the peak fits the card drained to this
-       job's process alone and a sibling is mid-inference whose completion will free the room, so hold the
-       dispatch (the job keeps its head-of-queue position) until that room appears rather than faulting it.
-
-    :attr:`NONE` means the peak fits as-is (or the job does no post-processing). :attr:`INSUFFICIENT` means
-    no reclaim the orchestrator can perform and no in-flight sibling will free room hosts the peak (e.g. a
-    single-process worker on a tiny card, or a peak that overflows even the card alone), so the job must fault
-    gracefully rather than thrash; that fault feeds the post-processing circuit breaker.
-    """
-
-    NONE = enum.auto()
-    """The post-processing peak fits the measured headroom as-is; no reclaim required."""
-    DELEGATE_IN_PROCESS = enum.auto()
-    """Freeing the job's own (now idle) weights suffices; ComfyUI does this in-child, no orchestrator action."""
-    EVICT_SIBLING_MODEL = enum.auto()
-    """Evict a different model resident on an idle sibling process (cross-process room only the parent frees)."""
-    REDUCE_CONTEXT = enum.auto()
-    """Stop a sibling process to reclaim its context when nothing idle is evictable (the rare last rung)."""
-    DEFER = enum.auto()
-    """Hold the dispatch (keep the head's position) until an in-flight sibling frees room the peak fits into."""
-    INSUFFICIENT = enum.auto()
-    """No orchestrator-reclaimable room hosts the peak; fault gracefully and feed the circuit breaker."""
-
-
 @dataclass(frozen=True)
 class LatestPreloadAdmission:
     """Operator-facing record of the most recent preload-admission decision."""
@@ -154,20 +115,6 @@ class LatestPreloadAdmission:
     """Short human-readable explanation for the decision."""
     timestamp: float
     """Worker wall-clock time when the decision was recorded."""
-
-
-@dataclass(frozen=True)
-class PostProcessingReclaimPlan:
-    """Represents the scheduler's decision for hosting a job's imminent post-processing VRAM peak.
-
-    Pairs the chosen :class:`PostProcessingReclaimAction` with the sibling process it targets (for the
-    eviction/teardown rungs) and the measured shortfall that drove the decision, so the enactment site can
-    act without re-deriving the fit math and the logs can report why room was reclaimed.
-    """
-
-    action: PostProcessingReclaimAction
-    target_process_id: int | None = None
-    shortfall_mb: float = 0.0
 
 
 _SPECULATIVE_DISPATCH_MIN_FREE_VRAM_MB = 3000.0
@@ -532,7 +479,6 @@ class InferenceScheduler:
         # or None. Set when a dispatch defers (the peak overflows the contended card now but fits it alone and
         # an in-flight sibling will free room); read by the dispatch-stall diagnostic so a held head reads as
         # an explained wait. Cleared the moment any job dispatches.
-        self._post_processing_dispatch_defer: tuple[str | None, float] | None = None
 
     def set_churn_observer(self, observer: Callable[[ChurnKind], None]) -> None:
         """Register the sink for between-jobs reload/respawn events (see :data:`ChurnKind`)."""
@@ -558,12 +504,6 @@ class InferenceScheduler:
     def _max_concurrent_inference_processes(self) -> int:
         """The live concurrent-inference cap (effective ``max_threads``), bounded by the ceiling."""
         return self._runtime_config.effective_max_threads
-
-    @property
-    def post_process_job_overlap_allowed(self) -> bool:
-        """Return true if post processing jobs are allowed to overlap."""
-        bd = self._runtime_config.bridge_data
-        return (bd.moderate_performance_mode or bd.high_performance_mode) and bd.post_process_job_overlap
 
     def get_single_job_effective_megapixelsteps(self, job: ImageGenerateJobPopResponse) -> int:
         """Return the number of effective megapixelsteps for a single job."""
@@ -1075,6 +1015,10 @@ class InferenceScheduler:
             not self._process_lifecycle.is_safety_gpu_paused
         )
         num_safety_contexts = self._process_map.num_safety_processes(device_index=device_index) if safety_on_gpu else 0
+        # The dedicated post-processing lane holds a CUDA context (and its resident post-processing models)
+        # on the card it is pinned to; like the safety context, that is a real device-wide commitment idle
+        # inference siblings cannot reclaim, so it is charged as an extra resident context here.
+        num_post_process_contexts = self._process_map.num_post_process_processes(device_index=device_index)
         # Refresh the clean all-contexts idle baseline (a no-op once startup has passed) so the marginal
         # per-context cost reflects measurement rather than the one-time-cost-times-N over-count, then let a
         # later lower reading invalidate a latched floor that was a transient spike rather than sustained.
@@ -1093,8 +1037,8 @@ class InferenceScheduler:
             per_process_overhead_mb=self._per_process_overhead_mb(),
             num_inference_processes=num_processes,
             configured_reserve_floor_mb=floor_mb,
-            num_extra_resident_contexts=num_safety_contexts,
-            post_processing_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
+            num_extra_resident_contexts=num_safety_contexts + num_post_process_contexts,
+            committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
             marginal_process_overhead_mb=self._marginal_process_overhead_mb(),
             wants_whole_card=wants_whole_card,
         )
@@ -1798,7 +1742,6 @@ class InferenceScheduler:
         # Resident on an idle process: the interesting case. Name the gate that is holding dispatch.
         keep_single, single_reason = self._process_map.keep_single_inference(
             stable_diffusion_model_reference=stable_diffusion_reference,
-            post_process_job_overlap=self._runtime_config.bridge_data.post_process_job_overlap,
         )
         pending_and_active = len(self._job_tracker.jobs_pending_inference) + len(self._job_tracker.jobs_in_progress)
         if keep_single and pending_and_active > 1:
@@ -1807,7 +1750,7 @@ class InferenceScheduler:
                 f"keep-single-inference ({single_reason})"
             )
         in_progress = len(self._job_tracker.jobs_in_progress)
-        cap = self._max_jobs_in_progress_allowed(0)
+        cap = self._max_jobs_in_progress_allowed()
         if in_progress >= cap:
             # The exclusive-admit hold collapses the cap to the running job; name it distinctly so the
             # serialization is attributed to the admit, not to a generic cap the operator would chase
@@ -1850,18 +1793,6 @@ class InferenceScheduler:
             return SlotDutyBucket.WHOLE_CARD_CONVERGENCE, (
                 f"its model is resident and idle on process {process.process_id}, but its whole-card residency "
                 f"has not yet converged to sole residency (siblings still tearing down or the device draining)"
-            )
-
-        if (
-            self._post_processing_dispatch_defer is not None
-            and head.id_ is not None
-            and self._post_processing_dispatch_defer[0] == str(head.id_)
-        ):
-            shortfall_mb = self._post_processing_dispatch_defer[1]
-            return SlotDutyBucket.POST_PROCESSING_HEADROOM, (
-                f"its model is resident and idle on process {process.process_id}, but dispatch is held for "
-                f"post-processing-peak headroom (~{shortfall_mb:.0f}MB short on the contended card); it keeps "
-                "its head-of-queue position and dispatches once an in-flight sibling frees room"
             )
 
         return SlotDutyBucket.UNEXPLAINED, (
@@ -1997,8 +1928,8 @@ class InferenceScheduler:
     def _measured_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
         """Return the most conservative measured free VRAM (MB), or None when not yet reported.
 
-        Sourced from the inference processes' VRAM reports via :meth:`ProcessMap.get_free_vram_mb`, which
-        the children compute through hordelib's backend-agnostic accelerator layer (comfy /
+        Sourced from GPU-bearing child VRAM reports via :meth:`ProcessMap.get_free_vram_mb`, which the
+        children compute through hordelib's backend-agnostic accelerator layer (comfy /
         ``torch.cuda.mem_get_info``, accurate and not NVIDIA-specific). The parent stays free of any direct
         GPU query, so this works on every backend the execution layer supports.
 
@@ -2396,127 +2327,24 @@ class InferenceScheduler:
         snapshot = self._build_host_memory_snapshot(self._ram_pressure_verdict())
         self._execute_governance_actions(decide_shed_card_restore(snapshot))
 
-    def _committed_post_processing_reserve_mb(self, *, device_index: int | None = None) -> float:
-        """Sum the imminent post-processing-phase VRAM peaks of jobs currently in post-processing (MB).
-
-        When a job finishes sampling it releases its inference slot for overlap *before* its
-        upscaler/face-fixer allocates, so the measured free-VRAM figure still reads as if that headroom
-        were available. This derives the VRAM that is therefore spoken-for but not yet realised: for each
-        inference process in ``INFERENCE_POST_PROCESSING``, the predicted post-processing peak of the job it
-        is running. Subtracted from measured free VRAM at the dispatch/overlap gates and folded into the
-        residency forecast, it stops a freshly-released slot being handed VRAM an in-flight job is about to
-        claim. Returns 0.0 when nothing is post-processing (so the reserve self-scales away on roomy cards)
-        or when the feature is disabled. Never raises: a bad per-job estimate is skipped.
-
-        Args:
-            device_index: When given, sum only the post-processing peaks on that card (the per-card reserve,
-                since a post-processing peak only spends the VRAM of the card running it); when None, sum
-                across every card.
-        """
-        if not self._budget_active() or not self._runtime_config.bridge_data.post_processing_budget_reserve_enabled:
-            return 0.0
-        return sum(
-            (
-                self._job_post_processing_peak_mb(job)
-                for process_info, job in self._in_flight_jobs_by_inference_process(device_index=device_index)
-                if process_info.last_process_state == HordeProcessState.INFERENCE_POST_PROCESSING
-            ),
-            0.0,
-        )
-
-    def _job_post_processing_peak_mb(self, job: ImageGenerateJobPopResponse) -> float:
-        """Return ``job``'s predicted post-processing-phase VRAM peak (MB), or 0.0 when none/unknown."""
-        baseline = self._model_metadata.get_baseline(job.model) if job.model is not None else None
-        peak_mb = predict_job_post_processing_vram_mb(job, str(baseline) if baseline is not None else None)
-        return peak_mb if peak_mb is not None else 0.0
-
-    def _in_flight_jobs_by_inference_process(
-        self,
-        *,
-        device_index: int | None,
-    ) -> list[tuple[HordeProcessInfo, ImageGenerateJobPopResponse]]:
-        """Return each inference process running an in-flight job, paired with that job.
-
-        A process's ``last_job_referenced`` still points at its job through the post-processing stage (the
-        result that ends the inference stage only arrives once post-processing completes), so a process whose
-        reference has already left the in-progress set is skipped as stale. ``device_index`` restricts the
-        scan to one card (a post-processing peak only spends the VRAM of the card running it); None spans
-        every card.
-        """
-        jobs_in_progress = self._job_tracker.jobs_in_progress
-        pairs: list[tuple[HordeProcessInfo, ImageGenerateJobPopResponse]] = []
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            job = process_info.last_job_referenced
-            if job is None or job not in jobs_in_progress:
-                continue
-            pairs.append((process_info, job))
-        return pairs
-
-    def _imminent_post_processing_reserve_mb(self, *, device_index: int | None = None) -> float:
-        """Sum the post-processing peaks of in-flight jobs that *will* post-process but have not reached it.
-
-        The committed reserve only counts a peak once its process is in ``INFERENCE_POST_PROCESSING``. But the
-        over-commit that stalls an upscaler is set up earlier: while a job is still sampling, the overlap /
-        pre-staging path can admit a *second* concurrent job, and by the time the first job reaches its
-        upscaler the card is already committed to both. This counts the not-yet-realised peak of every
-        in-flight job currently sampling or staging (its process busy but not yet post-processing), so the
-        overlap gate can withhold a fresh sample when an imminent peak would not co-fit. Disjoint from the
-        committed reserve (which counts the realised peaks), so the two sum without double-counting. Returns
-        0.0 when nothing in flight will post-process or the reserve is disabled.
-
-        Args:
-            device_index: When given, sum only the imminent peaks on that card; when None, sum across cards.
-        """
-        if not self._budget_active() or not self._runtime_config.bridge_data.post_processing_budget_reserve_enabled:
-            return 0.0
-        return sum(
-            (
-                self._job_post_processing_peak_mb(job)
-                for process_info, job in self._in_flight_jobs_by_inference_process(device_index=device_index)
-                if process_info.last_process_state != HordeProcessState.INFERENCE_POST_PROCESSING
-                and process_info.is_process_busy()
-            ),
-            0.0,
-        )
-
-    _IMAGE_PP_RESERVE_FLOW = "image_post_processing"
-    """The shared-ledger flow namespace under which this scheduler registers its post-processing reserve."""
-
     def _committed_vram_reserve_mb(self, *, device_index: int | None = None) -> float:
-        """Return the combined committed VRAM (MB) across every flow, refreshing this scheduler's own entry.
+        """Return the combined committed VRAM (MB) across every flow in the shared ledger.
 
-        Each call re-derives the image-generation post-processing reserve from live process state and
-        publishes it into the shared :class:`CommittedReserveLedger` as a single aggregate entry, then
-        returns the ledger total (which also includes any in-flight alchemy forms other flows registered).
-        Re-publishing every call keeps the entry self-healing: it always reflects current state and never
-        leaks. This combined figure is what the VRAM admission and residency-forecast gates subtract, so a
-        freshly-released slot is not handed VRAM that image post-processing *or* concurrent alchemy is about
-        to claim.
+        The dedicated post-processing lane has a fixed resident context charged by the process residency
+        forecast, but each active post-processing job still registers its estimated upscaler/face-fixer peak
+        here until the lane result arrives. Alchemy forms use the same ledger. Admission and
+        residency-forecast gates subtract the combined figure so a freshly released slot is not handed VRAM
+        concurrent work is about to claim.
 
         Args:
-            device_index: When given, return that card's committed reserve: its own post-processing reserve
-                plus the worker-global non-image-post-processing flows (alchemy is not card-attributed, so it
-                is charged conservatively against the card). When None, return the worker-wide ledger total
-                (the single-GPU reading). The worker-wide image-post-processing aggregate is refreshed in the
-                ledger either way, so the status snapshot and other readers are unaffected.
+            device_index: Accepted for call-site symmetry; ledger flows are not card-attributed, so the
+                worker-wide total is charged conservatively against any card.
         """
-        self._reserve_ledger.set(
-            self._IMAGE_PP_RESERVE_FLOW,
-            "aggregate",
-            vram_mb=self._committed_post_processing_reserve_mb(),
-        )
-        if device_index is None:
-            return self._reserve_ledger.total_vram_mb()
-        per_card_post_processing = self._committed_post_processing_reserve_mb(device_index=device_index)
-        return per_card_post_processing + self._reserve_ledger.total_vram_mb_excluding(self._IMAGE_PP_RESERVE_FLOW)
+        del device_index
+        return self._reserve_ledger.total_vram_mb()
 
     def _max_jobs_in_progress_allowed(
         self,
-        processes_post_processing: int,
         *,
         card: CardRuntime | None = None,
     ) -> int:
@@ -2532,8 +2360,6 @@ class InferenceScheduler:
         falls back to the sampling-slot cap so speculation never over-commits the device.
 
         Args:
-            processes_post_processing: How many processes are mid post-processing (per the caller's
-                scope, global or per-card), used for the overlap bump.
             card: When the worker drives more than one card, the card this decision is scoped to: its
                 own sampling-slot and process ceilings are used so the big card's spare threads never
                 inflate a small card's allowance. ``None`` keeps the worker-wide global ceilings, which
@@ -2556,27 +2382,7 @@ class InferenceScheduler:
             concurrent_ceiling = self._max_concurrent_inference_processes
             process_ceiling = self._max_inference_processes
 
-        # The post-processing overlap bump raises the cap *because* a process is post-processing, but that
-        # process is holding (or about to hold) its upscaler/face-fixer VRAM peak, the worst moment to admit
-        # another job. Grant the bump only while the device still has staging headroom once the in-flight
-        # post-processing reserve is held back; otherwise drop it so the post-proc peaks of several jobs
-        # cannot align and over-commit the card. Gated on the feature flag so behavior is unchanged when off.
-        post_processing_bump = processes_post_processing
-        if (
-            post_processing_bump > 0
-            and self._budget_active()
-            and self._runtime_config.bridge_data.post_processing_budget_reserve_enabled
-        ):
-            free_vram_mb = self._process_map.get_free_vram_mb()
-            if free_vram_mb is not None:
-                bump_floor = max(_SPECULATIVE_DISPATCH_MIN_FREE_VRAM_MB, self._vram_budget.reserve_mb)
-                available_mb = (
-                    free_vram_mb - self._committed_vram_reserve_mb() - self._imminent_post_processing_reserve_mb()
-                )
-                if available_mb < bump_floor:
-                    post_processing_bump = 0
-
-        base = concurrent_ceiling + post_processing_bump
+        base = concurrent_ceiling
         if not self._runtime_config.bridge_data.gpu_sampling_lease_enabled:
             return base
 
@@ -2588,14 +2394,10 @@ class InferenceScheduler:
             staging_floor = max(staging_floor, self._vram_budget.reserve_mb)
 
         free_vram_mb = self._process_map.get_free_vram_mb()
-        # Subtract the imminent post-processing peak of any in-flight job that is still sampling: pre-staging a
-        # second concurrent sample onto a card already owed a big upscale peak is exactly the overlap that
-        # over-commits the device and stalls the upscaler. Self-scales to zero when nothing in flight will
-        # post-process (and when the reserve is disabled), so ordinary overlap is unaffected.
-        if free_vram_mb is None or (free_vram_mb - self._imminent_post_processing_reserve_mb()) < staging_floor:
+        if free_vram_mb is None or free_vram_mb < staging_floor:
             return base
 
-        return process_ceiling + post_processing_bump
+        return process_ceiling
 
     def _model_size_tier(self, model_name: str | None) -> _ModelSizeTier:
         """Classify a model by how much of the device its inference is expected to want.
@@ -4056,17 +3858,11 @@ class InferenceScheduler:
         ):
             target_card = self._card_runtimes.get(process_with_model.device_index)
 
-        processes_post_processing = 0
-        if self.post_process_job_overlap_allowed:
-            processes_post_processing = self._process_map.num_busy_with_post_processing(
-                device_index=target_card.device_index if target_card is not None else None,
-            )
-
         if target_card is not None:
             jobs_in_progress_count = len(self._jobs_in_progress_on_card(target_card.device_index))
         else:
             jobs_in_progress_count = len(self._job_tracker.jobs_in_progress)
-        max_jobs_allowed = self._max_jobs_in_progress_allowed(processes_post_processing, card=target_card)
+        max_jobs_allowed = self._max_jobs_in_progress_allowed(card=target_card)
         if self._state.wants_line_skip_candidate and (
             bridge_data.aux_model_download_line_skip_threshold_seconds is None
             or not self._process_map.any_model_downloading_aux_more_than_threshold(
@@ -4152,10 +3948,7 @@ class InferenceScheduler:
                 return None
 
         if not process_with_model.can_accept_job():
-            if (process_with_model.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL) or (
-                self.post_process_job_overlap_allowed
-                and process_with_model.last_process_state == HordeProcessState.INFERENCE_POST_PROCESSING
-            ):
+            if process_with_model.last_process_state == HordeProcessState.DOWNLOADING_AUX_MODEL:
                 line_skip_selection = self._select_line_skip_candidate(
                     next_job,
                     next_n_jobs=next_n_jobs,
@@ -4267,335 +4060,6 @@ class InferenceScheduler:
             committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
         )
         return verdict.fits
-
-    def _idle_post_processing_reclaim_siblings(
-        self,
-        *,
-        dispatching_process_id: int | None,
-        device_index: int | None,
-    ) -> list[HordeProcessInfo]:
-        """Return the idle inference processes whose VRAM a post-processing reclaim may target.
-
-        Excludes the process dispatching the post-processing job (it is the one that needs the room) and,
-        when ``device_index`` is given, any process pinned to a different card (freeing another card's VRAM
-        returns nothing to this one). A busy process is never a candidate: only a process that has finished
-        its work holds reclaimable room without interrupting live inference. Processes already ending are
-        skipped since their context is on its way out regardless.
-        """
-        candidates: list[HordeProcessInfo] = []
-        for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
-                continue
-            if process_info.process_id == dispatching_process_id:
-                continue
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            if process_info.is_process_busy():
-                continue
-            if process_info.last_process_state in (
-                HordeProcessState.PROCESS_ENDING,
-                HordeProcessState.PROCESS_ENDED,
-            ):
-                continue
-            candidates.append(process_info)
-        return candidates
-
-    def _evictable_sibling_model_process(
-        self,
-        dispatched_model: str | None,
-        idle_siblings: list[HordeProcessInfo],
-    ) -> HordeProcessInfo | None:
-        """Return the first idle sibling holding a model whose eviction would free cross-process VRAM.
-
-        Mirrors the eviction eligibility :meth:`unload_models_from_vram` enforces, so the planner only
-        promises room the enactment can actually reclaim: the sibling must hold a resident model that is not
-        the dispatched job's own model, not the model of an in-progress job, and not protected by a held
-        whole-card residency. A bare idle context (no resident model) is not an eviction target; it is the
-        :attr:`PostProcessingReclaimAction.REDUCE_CONTEXT` rung instead.
-        """
-        wanted_models = self._compute_wanted_models()
-        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
-        for process_info in idle_siblings:
-            model_name = process_info.loaded_horde_model_name
-            if model_name is None or model_name == dispatched_model:
-                continue
-            if model_name in in_progress_models:
-                continue
-            if self._residency_protects_from_unload(model_name, wanted_models, vram=True, under_pressure=True):
-                continue
-            return process_info
-        return None
-
-    def _plan_post_processing_reclaim(
-        self,
-        dispatched_job: ImageGenerateJobPopResponse,
-        *,
-        device_index: int | None,
-        dispatching_process_id: int | None = None,
-    ) -> PostProcessingReclaimPlan:
-        """Return how to free room for ``dispatched_job``'s imminent post-processing peak (see the actions).
-
-        The peak (:func:`predict_job_post_processing_vram_mb`) is the upscaler/face-fixer cost that lands
-        after sampling, once the card already holds this job's weights, its process contexts, and any warm
-        sibling models. When it overflows the available headroom the worker must reclaim room before the
-        upscaler allocates, or the allocation streams/thrashes until the post-processing watchdog replaces
-        the process.
-
-        The peak is measured against *effective* free VRAM: the measured free reading less the VRAM in-flight
-        sibling work has committed or will imminently commit (the same not-yet-realised reserve the
-        concurrent-dispatch gate subtracts), so an optimistic or stale reading does not let the peak look like
-        it fits a card that is about to fill.
-
-        The decision is evidence-gated: an unavailable peak estimate or unmeasured free VRAM yields a
-        :attr:`PostProcessingReclaimAction.NONE` plan (never act on absent telemetry, mirroring
-        :meth:`_should_keep_model_resident`). When the peak fits the effective headroom there is nothing to
-        do. Otherwise the action is chosen for the room it can actually reclaim: when an idle sibling holds an
-        evictable model, freeing it (:attr:`EVICT_SIBLING_MODEL`) is preferred, since that resident model is
-        the cross-process room the upscaler needs and ComfyUI's in-child free cannot reach it; failing a
-        reclaimable sibling, delegating to ComfyUI freeing the job's own (idle-during-upscale) weights
-        in-child (:attr:`DELEGATE_IN_PROCESS`) when that alone suffices on an uncontended card; else stopping
-        an idle sibling's bare context (:attr:`REDUCE_CONTEXT`); or, when none of those can host it (a
-        single-process worker on a tiny card), :attr:`INSUFFICIENT`, which faults the job gracefully rather
-        than thrashing the card.
-        """
-        baseline = self._model_metadata.get_baseline(dispatched_job.model) if dispatched_job.model else None
-        post_processing_peak_mb = predict_job_post_processing_vram_mb(dispatched_job, baseline)
-        if post_processing_peak_mb is None or post_processing_peak_mb <= 0.0:
-            logger.debug(
-                f"Post-processing reclaim: no post-processing peak estimate for job "
-                f"{str(dispatched_job.id_)[:8]} ({dispatched_job.model}); not reserving (action NONE).",
-            )
-            return PostProcessingReclaimPlan(action=PostProcessingReclaimAction.NONE)
-
-        measured_free_mb = self._measured_free_vram_mb(device_index=device_index)
-        if measured_free_mb is None:
-            logger.debug(
-                f"Post-processing reclaim: no measured free VRAM for device {device_index}; not reserving "
-                f"for job {str(dispatched_job.id_)[:8]} ({dispatched_job.model}) (action NONE).",
-            )
-            return PostProcessingReclaimPlan(action=PostProcessingReclaimAction.NONE)
-
-        # The measured free reading lags VRAM that in-flight sibling work has committed (peaks already
-        # post-processing) or will imminently commit (jobs still sampling/staging that will post-process):
-        # the same not-yet-realised cost the concurrent-dispatch gate subtracts. Charging it here too keeps
-        # an optimistic or stale free reading from making the peak look like it fits a card that is about to
-        # fill, which would otherwise leave the upscaler to allocate into a full card. (This job is not yet
-        # in-flight at plan time, so it is excluded from both reserves and never charged against itself.)
-        committed_reserve_mb = self._committed_vram_reserve_mb(device_index=device_index)
-        imminent_reserve_mb = self._imminent_post_processing_reserve_mb(device_index=device_index)
-        effective_free_mb = measured_free_mb - committed_reserve_mb - imminent_reserve_mb
-
-        own_weights_mb = predict_job_weight_mb(dispatched_job, baseline) or 0.0
-        idle_siblings = self._idle_post_processing_reclaim_siblings(
-            dispatching_process_id=dispatching_process_id,
-            device_index=device_index,
-        )
-        evictable_sibling = self._evictable_sibling_model_process(dispatched_job.model, idle_siblings)
-        shortfall_mb = post_processing_peak_mb - effective_free_mb
-
-        if post_processing_peak_mb <= effective_free_mb:
-            plan = PostProcessingReclaimPlan(action=PostProcessingReclaimAction.NONE)
-        elif evictable_sibling is not None:
-            # The peak does not fit the effective free VRAM and an idle sibling holds an evictable model: free
-            # it. This is preferred over the in-child own-weights delegation even when freeing this job's own
-            # weights would nominally cover the peak, because on a contended card the room the upscaler needs
-            # is occupied by the *sibling's* resident model, which ComfyUI's in-child free cannot reclaim.
-            # Relying on the own-weights credit while a sibling fills the card lets the upscaler allocate into
-            # a full card and stall until the watchdog reaps the slot.
-            plan = PostProcessingReclaimPlan(
-                action=PostProcessingReclaimAction.EVICT_SIBLING_MODEL,
-                target_process_id=evictable_sibling.process_id,
-                shortfall_mb=shortfall_mb,
-            )
-        elif post_processing_peak_mb <= effective_free_mb + own_weights_mb:
-            # No reclaimable sibling holds the room, but freeing this job's own (idle-during-upscale) weights,
-            # which ComfyUI does in-child once sampling ends, yields enough on an otherwise-uncontended card.
-            plan = PostProcessingReclaimPlan(action=PostProcessingReclaimAction.DELEGATE_IN_PROCESS)
-        elif idle_siblings:
-            plan = PostProcessingReclaimPlan(
-                action=PostProcessingReclaimAction.REDUCE_CONTEXT,
-                target_process_id=idle_siblings[0].process_id,
-                shortfall_mb=shortfall_mb,
-            )
-        elif self._post_processing_peak_fits_solo(
-            post_processing_peak_mb,
-            device_index=device_index,
-        ) and self._post_processing_reclaim_can_wait(
-            dispatching_process_id=dispatching_process_id,
-            device_index=device_index,
-        ):
-            # Nothing idle is reclaimable right now, but the peak would fit once the card drains to this job's
-            # process alone, and a sibling is mid-inference whose completion frees that room. Hold the dispatch
-            # (the job keeps its head-of-queue position) rather than faulting a job the card can host moments
-            # from now. The wait is wedge-exempt while sibling inference is in progress, and self-bounds: once
-            # no sibling is left in flight to free room, this condition fails and the plan faults terminally.
-            plan = PostProcessingReclaimPlan(
-                action=PostProcessingReclaimAction.DEFER,
-                shortfall_mb=shortfall_mb,
-            )
-        else:
-            plan = PostProcessingReclaimPlan(
-                action=PostProcessingReclaimAction.INSUFFICIENT,
-                shortfall_mb=shortfall_mb,
-            )
-
-        logger.debug(
-            f"Post-processing reclaim plan for job {str(dispatched_job.id_)[:8]} ({dispatched_job.model}) on "
-            f"device {device_index}: {plan.action.name} (peak ~{post_processing_peak_mb:.0f}MB vs effective "
-            f"free {effective_free_mb:.0f}MB [measured {measured_free_mb:.0f}MB - committed "
-            f"{committed_reserve_mb:.0f}MB - imminent {imminent_reserve_mb:.0f}MB]; own-weights "
-            f"~{own_weights_mb:.0f}MB; {len(idle_siblings)} idle sibling(s), evictable="
-            f"{evictable_sibling is not None}).",
-        )
-        return plan
-
-    def _post_processing_peak_fits_solo(self, post_processing_peak_mb: float, *, device_index: int | None) -> bool:
-        """Whether a post-processing peak fits the card drained to this job's process alone.
-
-        The achievable headroom under sole residency is the device total less one process context (the
-        per-process overhead the upscaler's own process keeps) and the configured VRAM reserve; the job's own
-        diffusion weights are freed in-child during the upscale, so they are not charged here (mirroring the
-        :attr:`PostProcessingReclaimAction.DELEGATE_IN_PROCESS` rung). A peak that exceeds even this can never
-        be hosted on the card no matter how it drains, so waiting cannot help and the caller faults instead of
-        deferring. Unknown total VRAM (cold start) reads False, the conservative direction (do not defer on a
-        guess).
-        """
-        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
-        if total_vram_mb is None:
-            return False
-        configured_reserve = config_number(self._runtime_config.bridge_data.vram_reserve_mb)
-        reserve_mb = configured_reserve if configured_reserve is not None and configured_reserve >= 0 else None
-        if reserve_mb is None:
-            reserve_mb = _DEFAULT_VRAM_RESERVE_MB
-        solo_free_mb = float(total_vram_mb) - self._per_process_overhead_mb() - reserve_mb
-        return post_processing_peak_mb <= solo_free_mb
-
-    def _post_processing_reclaim_can_wait(
-        self,
-        *,
-        dispatching_process_id: int | None,
-        device_index: int | None,
-    ) -> bool:
-        """Whether an in-flight sibling will free cross-process room as it completes.
-
-        A peak that overflows the contended card now but fits the card alone is hostable by waiting, not
-        faulting, only while a sibling is actively *inferencing* (sampling or post-processing): its completion
-        releases the activations/upscaler VRAM and leaves its model idle and evictable, which is the room the
-        upscaler needs. Siblings that are merely preloading or starting are excluded, since those grow the
-        card's commitment rather than freeing it. With no such sibling (a single-process worker, or every
-        sibling already idle and unevictable) waiting cannot help, so the caller faults. This is also what
-        keeps the deferral wedge-safe: it holds the dispatch only over a window the recovery supervisor
-        already exempts as inference-in-progress, and the moment that window closes the dispatch faults
-        rather than parking.
-        """
-        for process_info in self._process_map.values():
-            if process_info.process_type is not HordeProcessType.INFERENCE:
-                continue
-            if dispatching_process_id is not None and process_info.process_id == dispatching_process_id:
-                continue
-            if device_index is not None and process_info.device_index != device_index:
-                continue
-            if process_info.last_process_state in (
-                HordeProcessState.INFERENCE_STARTING,
-                HordeProcessState.INFERENCE_POST_PROCESSING,
-            ):
-                return True
-        return False
-
-    def _note_post_processing_dispatch_defer(
-        self,
-        job: ImageGenerateJobPopResponse,
-        shortfall_mb: float,
-    ) -> None:
-        """Record, and throttled-log, that a job's dispatch is held for post-processing-peak headroom.
-
-        The job keeps its head-of-queue position; the recorded state lets the dispatch-stall diagnostic name
-        the hold rather than report a gate-less scheduler stall. The log is collapsed to one line per changed
-        (job, shortfall) so a multi-second hold does not flood the file each control-loop tick.
-        """
-        job_id = str(job.id_) if job.id_ is not None else None
-        self._post_processing_dispatch_defer = (job_id, shortfall_mb)
-        state_key = (job_id, self._diagnostic_mb_bucket(shortfall_mb))
-        suppressed_count = self._scheduler_diagnostic_suppressed_count("post_processing_dispatch_defer", state_key)
-        if suppressed_count is None:
-            return
-        logger.info(
-            f"Post-processing reclaim: holding dispatch of job {str(job_id)[:8]} ({job.model}); its "
-            f"post-processing peak overflows the contended card by ~{shortfall_mb:.0f}MB now but fits the card "
-            "alone, and an in-flight sibling will free the room. Keeping its head-of-queue position rather "
-            f"than faulting it{self._suppressed_suffix(suppressed_count)}.",
-        )
-
-    async def _enact_post_processing_reclaim(
-        self,
-        plan: PostProcessingReclaimPlan,
-        dispatched_job: ImageGenerateJobPopResponse,
-        process_with_model: HordeProcessInfo,
-        *,
-        device_index: int | None,
-    ) -> bool:
-        """Carry out a post-processing reclaim ``plan`` before the job dispatches; return whether to dispatch.
-
-        Reuses the existing reclaim primitives: an idle sibling model is freed via
-        :meth:`unload_models_from_vram` (which already enforces the in-progress/next-model/residency guards),
-        and an idle context is shed via the lifecycle's ``scale_inference_processes`` (which never stops a busy
-        slot). The async eviction completes during this job's sampling, so the room is ready by the time the
-        post-processing peak lands. :attr:`PostProcessingReclaimAction.INSUFFICIENT` cannot be hosted, so the
-        job is faulted gracefully (the horde reissues it) rather than dispatched into a guaranteed stall, and
-        the caller does not send ``START_INFERENCE``.
-        """
-        action = plan.action
-        if action in (PostProcessingReclaimAction.NONE, PostProcessingReclaimAction.DELEGATE_IN_PROCESS):
-            return True
-
-        if action is PostProcessingReclaimAction.EVICT_SIBLING_MODEL:
-            logger.info(
-                f"Post-processing reclaim: freeing an idle sibling model on process {plan.target_process_id} "
-                f"to host job {str(dispatched_job.id_)[:8]}'s ~{plan.shortfall_mb:.0f}MB post-processing "
-                "shortfall before its upscaler allocates.",
-            )
-            self.unload_models_from_vram(process_with_model, under_pressure=True, device_index=device_index)
-            return True
-
-        if action is PostProcessingReclaimAction.REDUCE_CONTEXT:
-            # Size the reduction from the contended card itself, not the worker-wide pool: on a multi-GPU host
-            # a worker-wide count would leave the per-card scale a no-op (the target never drops below the
-            # card's own context count) and the peak would go unrelieved. None is the single-GPU/worker-wide
-            # case, sized as before.
-            if device_index is None:
-                current_loaded = self._process_map.num_loaded_inference_processes()
-                needed = max(1, len(self._job_tracker.jobs_in_progress))
-            else:
-                current_loaded = self._process_map.num_loaded_inference_processes(device_index=device_index)
-                needed = max(1, self._card_inference_load(device_index))
-            target = max(1, min(current_loaded - 1, needed))
-            logger.warning(
-                f"Post-processing reclaim: reducing inference contexts on device {device_index} to {target} "
-                f"(from {current_loaded}) to host job {str(dispatched_job.id_)[:8]}'s "
-                f"~{plan.shortfall_mb:.0f}MB post-processing shortfall; no idle sibling held an evictable model.",
-            )
-            self._process_lifecycle.scale_inference_processes(target, device_index=device_index)
-            return True
-
-        # INSUFFICIENT: no orchestrator-reclaimable room hosts the peak (e.g. a single-process worker on a
-        # tiny card). Fault gracefully so the horde reissues the job, rather than dispatch it into a card it
-        # cannot fit and let the post-processing watchdog reap the slot once its timeout elapses.
-        logger.warning(
-            f"Post-processing reclaim: job {str(dispatched_job.id_)[:8]}'s post-processing peak overflows the "
-            f"card by ~{plan.shortfall_mb:.0f}MB and no cross-process VRAM can be reclaimed to host it; "
-            "faulting it rather than stalling the device.",
-        )
-        # Terminal, not retryable: a local retry would only re-dispatch into the same unchanged, still
-        # overflowing card (a guaranteed second fault) and feed the breaker a second over-commit count for one
-        # job. The horde reissues the faulted job elsewhere, which is the intended recovery here.
-        await self._job_tracker.handle_job_fault(
-            faulted_job=dispatched_job,
-            process_info=process_with_model,
-            process_timeout=self._runtime_config.bridge_data.process_timeout,
-            retryable=False,
-        )
-        self._job_tracker.note_post_processing_overcommit_fault()
-        return False
 
     def _log_job_dispatch_details(self, next_job: ImageGenerateJobPopResponse) -> None:
         """Log the model, conditioning extras, and the resolution/steps/sampler line for a dispatching job.
@@ -4779,19 +4243,6 @@ class InferenceScheduler:
                 " which is currently downloading extra models.",
             )
 
-        processes_post_processing = 0
-        if self.post_process_job_overlap_allowed:
-            processes_post_processing = self._process_map.num_busy_with_post_processing()
-
-        if (
-            processes_post_processing > 0
-            and len(self._job_tracker.jobs_in_progress) >= self._max_concurrent_inference_processes
-        ):
-            logger.debug(
-                "Proceeding with inference, but post processing is still running on "
-                f"{processes_post_processing} processes",
-            )
-
         if bridge_data.unload_models_from_vram_often:
             self.unload_models_from_vram(process_with_model)
 
@@ -4811,36 +4262,6 @@ class InferenceScheduler:
             next_job,
             device_index=dispatched_device_index,
         )
-
-        if self._runtime_config.bridge_data.post_processing_active_reclaim_enabled and self._budget_active():
-            # Charge the job's *own* imminent post-processing peak against the device now and, if it will not
-            # fit, reclaim cross-process room before sampling so the upscaler does not allocate into a full
-            # card and stall. The async reclaim completes during sampling; an unhostable peak faults the job
-            # here instead of dispatching it into a guaranteed stall.
-            reclaim_plan = self._plan_post_processing_reclaim(
-                next_job,
-                device_index=dispatched_device_index,
-                dispatching_process_id=process_with_model.process_id,
-            )
-            if reclaim_plan.action is PostProcessingReclaimAction.DEFER:
-                # The peak overflows the contended card now but fits the card alone, and an in-flight sibling
-                # will free the room as it completes. Hold the dispatch and keep the head's position rather
-                # than faulting a job the card can host shortly; the next pass re-plans against the drained
-                # card and dispatches (or, once no sibling is left in flight, faults terminally).
-                self._note_post_processing_dispatch_defer(next_job, reclaim_plan.shortfall_mb)
-                return False
-            should_dispatch = await self._enact_post_processing_reclaim(
-                reclaim_plan,
-                next_job,
-                process_with_model,
-                device_index=dispatched_device_index,
-            )
-            if not should_dispatch:
-                self._pending_line_skip = None
-                self._post_processing_dispatch_defer = None
-                return True
-
-        self._post_processing_dispatch_defer = None
 
         # Past every hold/fault gate: this job is dispatching now, so emit the start logging here rather than
         # before the reclaim decision (where a deferred or faulted job would mislead the log as "starting").
@@ -5017,6 +4438,34 @@ class InferenceScheduler:
             if process_info.process_id == process_with_model.process_id:
                 continue
 
+            if process_info.process_type == HordeProcessType.POST_PROCESS:
+                if device_index is not None and process_info.device_index != device_index:
+                    continue
+
+                if process_info.is_process_busy():
+                    logger.debug(f"Post-processing process {process_info.process_id} is busy")
+                    continue
+
+                if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+                    continue
+
+                logger.info(f"Unloading post-processing models from VRAM on process {process_info.process_id}")
+                if (
+                    not process_info.safe_send_message(
+                        HordeControlMessage(control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM),
+                    )
+                    and not self._state.shutting_down
+                ):
+                    logger.warning(
+                        f"Failed to send UNLOAD_MODELS_FROM_VRAM to post-processing process "
+                        f"{process_info.process_id}; marking the lane for replacement.",
+                    )
+                    self._process_lifecycle.post_process_processes_should_be_replaced = True
+                process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+                unloaded_any = True
+                self._record_churn("vram_eviction")
+                continue
+
             if process_info.process_type != HordeProcessType.INFERENCE:
                 continue
 
@@ -5089,8 +4538,25 @@ class InferenceScheduler:
 
         process_info = self._process_map[process_id]
 
+        if process_info.process_type == HordeProcessType.POST_PROCESS:
+            if process_info.is_process_busy():
+                logger.warning(f"Post-processing process {process_id} is busy, not unloading models from RAM")
+                return
+
+            logger.debug(f"Unloading post-processing models from RAM on process {process_id}")
+            process_info.safe_send_message(
+                HordeControlMessage(
+                    control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_RAM,
+                ),
+            )
+            process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_RAM
+            self._process_map.on_model_ram_clear(process_id=process_id)
+            return
+
         if process_info.process_type != HordeProcessType.INFERENCE:
-            logger.warning(f"Process {process_id} is not an inference process, not unloading models")
+            logger.warning(
+                f"Process {process_id} is not an inference or post-processing process, not unloading models"
+            )
             return
 
         if process_info.recently_unloaded_from_ram:
@@ -5290,7 +4756,6 @@ class InferenceScheduler:
 
             keep_single_inference, single_inf_reason = self._process_map.keep_single_inference(
                 stable_diffusion_model_reference=stable_diffusion_reference,
-                post_process_job_overlap=bridge_data.post_process_job_overlap,
             )
 
             pending_and_active = len(self._job_tracker.jobs_pending_inference) + len(

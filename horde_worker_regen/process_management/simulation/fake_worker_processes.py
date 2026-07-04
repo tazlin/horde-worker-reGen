@@ -45,6 +45,8 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeInferenceResultMessage,
     HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
+    HordePostProcessControlMessage,
+    HordePostProcessResultMessage,
     HordePreloadInferenceModelMessage,
     HordeProcessState,
     HordeSafetyControlMessage,
@@ -310,8 +312,6 @@ class FakeInferenceProcess(HordeProcess):
         if profile.corrupt_on_job_n == self._jobs_started:
             self._emit_corrupt_result(job_info)
 
-        self._maybe_run_fake_post_processing()
-
         n_iter = job_info.payload.n_iter if job_info.payload.n_iter else 1
         job_image_results = None
         if not should_fail:
@@ -373,41 +373,6 @@ class FakeInferenceProcess(HordeProcess):
             HordeProcessState.WAITING_FOR_JOB,
             info="Waiting for job",
         )
-
-    def _maybe_run_fake_post_processing(self) -> None:
-        """Run a simulated post-processing phase against the VRAM ledger, stalling if the peak cannot fit.
-
-        Inert unless the fault profile sets ``post_processing_peak_mb`` and a ledger is wired in. Otherwise
-        the process enters ``INFERENCE_POST_PROCESSING`` and tries to allocate the peak: the process frees
-        its own model (ComfyUI's per-process ``free_memory``), then, if the simulated device still lacks
-        room (a sibling-residency / context over-commit it cannot self-reclaim), it hangs, emitting no
-        further messages so the parent's post-processing watchdog reaps it, reproducing the post-processing
-        over-commit stall and recovery. With room, the peak fits and the method returns so the job completes
-        normally.
-        """
-        peak_mb = self._fault_profile.post_processing_peak_mb
-        if peak_mb is None or self._sim_vram_ledger is None:
-            return
-
-        self.send_process_state_change_message(
-            process_state=HordeProcessState.INFERENCE_POST_PROCESSING,
-            info="Post Processing.",
-        )
-        fits = simulate_post_processing_allocation(
-            self._sim_vram_ledger,
-            device_index=self.device_index,
-            process_id=self.process_id,
-            post_processing_peak_mb=float(peak_mb),
-        )
-        if not fits:
-            _hang_forever(
-                f"fake inference {self.process_id}",
-                f"post-processing peak {peak_mb}MB does not fit "
-                f"{self._sim_vram_ledger.device_free_mb(self.device_index):.0f}MB free after self-eviction",
-            )
-        # The peak fit; release it now that this fake's post-processing is "done" so the slot's residency
-        # returns to just its weights for the next scheduling decision.
-        self._sim_vram_ledger.clear_transient(self.device_index, self.process_id)
 
     def _run_fake_alchemy(self, form: AlchemyFormSpec) -> None:
         """Pretend to run an alchemy form, emitting the same message sequence as the real process."""
@@ -779,6 +744,233 @@ def start_fake_safety_process(
         # See start_fake_inference_process: leave a discoverable trace for a startup death that would
         # otherwise be silent (logger.remove() drops all sinks).
         write_startup_crash(f"fake_safety_{process_id}", e)
+        raise
+
+
+class FakePostProcessProcess(HordeProcess):
+    """A lightweight stand-in for ``HordePostProcessProcess`` that echoes images back unchanged."""
+
+    _fault_profile: FaultProfile
+    _jobs_started: int = 0
+
+    def __init__(
+        self,
+        process_id: int,
+        process_message_queue: ProcessQueue,
+        pipe_connection: Connection,
+        disk_lock: Lock,
+        process_launch_identifier: int,
+        *,
+        post_processing_delay_seconds: float = 0.0,
+        fault_profile: FaultProfile | None = None,
+        sim_vram_ledger: SimVramLedger | None = None,
+        sim_context_mb: float = 0.0,
+    ) -> None:
+        """Initialise the fake post-processing process.
+
+        Args:
+            process_id (int): The ID of the process. This is not the same as the PID.
+            process_message_queue (ProcessQueue): The queue to send messages to the main process.
+            pipe_connection (Connection): Receives `HordeControlMessage`s from the main process.
+            disk_lock (Lock): The lock to use for disk access.
+            process_launch_identifier (int): The unique identifier for this launch.
+            post_processing_delay_seconds (float, optional): How long each fake job takes. Defaults to 0.0.
+            fault_profile (FaultProfile | None, optional): A misbehaviour script applied to the
+                post-processing path (crash on start, crash/hang on the nth job, slow). With
+                ``post_processing_peak_mb`` set and a ledger wired in, each job allocates that peak against
+                the simulated device and stalls (hangs silently) when it does not fit. Defaults to a
+                no-op profile.
+            sim_vram_ledger (SimVramLedger | None, optional): A shared simulated-VRAM ledger this process
+                reports from and allocates its post-processing peaks against. Defaults to None.
+            sim_context_mb (float, optional): This process's fixed CUDA-context overhead to register on the
+                ledger. Defaults to 0.0.
+        """
+        super().__init__(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+        )
+        self.process_type = HordeProcessType.POST_PROCESS
+        self._post_processing_delay_seconds = post_processing_delay_seconds
+        self._fault_profile = fault_profile if fault_profile is not None else FaultProfile()
+        self._sim_vram_ledger = sim_vram_ledger
+        if self._sim_vram_ledger is not None:
+            self._sim_vram_ledger.set_context_overhead(self.device_index, self.process_id, sim_context_mb)
+
+        if self._fault_profile.crash_on_start:
+            os._exit(72)
+
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.WAITING_FOR_JOB,
+            info="Waiting for job",
+        )
+
+    @override
+    def get_vram_usage_mb(self) -> int:
+        """Return a fixed fake VRAM usage value."""
+        return 0
+
+    @override
+    def get_vram_total_mb(self) -> int:
+        """Return a fixed fake VRAM total value."""
+        return 0
+
+    def _run_fake_post_processing(self, message: HordePostProcessControlMessage) -> None:
+        """Pretend to post-process a job's images, echoing them back unchanged."""
+        self._jobs_started += 1
+        profile = self._fault_profile
+
+        if profile.crash_on_job_n == self._jobs_started:
+            logger.error(f"Fake post-process {self.process_id} crashing on job {self._jobs_started} (injected)")
+            os._exit(73)
+
+        if profile.hang_after_n_jobs is not None and self._jobs_started > profile.hang_after_n_jobs:
+            _hang_forever(f"fake post-process {self.process_id}", f"hung on job {self._jobs_started}")
+
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.POST_PROCESSING,
+            info=f"Post-processing job {message.job_id}",
+        )
+
+        peak_mb = profile.post_processing_peak_mb
+        if peak_mb is not None and self._sim_vram_ledger is not None:
+            fits = simulate_post_processing_allocation(
+                self._sim_vram_ledger,
+                device_index=self.device_index,
+                process_id=self.process_id,
+                post_processing_peak_mb=float(peak_mb),
+            )
+            if not fits:
+                _hang_forever(
+                    f"fake post-process {self.process_id}",
+                    f"post-processing peak {peak_mb}MB does not fit "
+                    f"{self._sim_vram_ledger.device_free_mb(self.device_index):.0f}MB free",
+                )
+            self._sim_vram_ledger.clear_transient(self.device_index, self.process_id)
+
+        time_start = time.time()
+        effective_delay = self._post_processing_delay_seconds * profile.slow_factor
+        if effective_delay > 0:
+            time.sleep(effective_delay)
+
+        self.process_message_queue.put(
+            HordePostProcessResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"Post-processing for job {message.job_id}",
+                time_elapsed=time.time() - time_start,
+                job_id=message.job_id,
+                job_image_results=[HordeImageResult(image_bytes=image_bytes) for image_bytes in message.images_bytes],
+                state=GENERATION_STATE.ok,
+            ),
+        )
+
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.POST_PROCESSING_COMPLETE,
+            info=f"Finished job {message.job_id}",
+        )
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.WAITING_FOR_JOB,
+            info="Waiting for job",
+        )
+
+    def _run_fake_graph_alchemy(self, form: AlchemyFormSpec) -> None:
+        """Pretend to run a graph-backed alchemy form, echoing the source image back."""
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.ALCHEMY_STARTING,
+            info=f"Starting alchemy form {form.form} ({form.form_id})",
+        )
+        time_start = time.time()
+        if self._post_processing_delay_seconds > 0:
+            time.sleep(self._post_processing_delay_seconds)
+
+        self.process_message_queue.put(
+            HordeAlchemyResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"Alchemy form {form.form} ({form.form_id})",
+                time_elapsed=time.time() - time_start,
+                form_id=form.form_id,
+                form=form.form,
+                state=GENERATION_STATE.ok,
+                image_bytes=form.source_image_bytes,
+            ),
+        )
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.ALCHEMY_COMPLETE,
+            info=f"Finished alchemy form {form.form} ({form.form_id})",
+        )
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.WAITING_FOR_JOB,
+            info="Waiting for job",
+        )
+
+    @override
+    def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
+        """Handle post-processing jobs and graph alchemy forms with echo results."""
+        if isinstance(message, HordePostProcessControlMessage):
+            self._run_fake_post_processing(message)
+            return
+
+        if isinstance(message, HordeAlchemyControlMessage):
+            self._run_fake_graph_alchemy(message.form)
+            return
+
+        logger.critical(f"Fake post-process received unexpected message type: {type(message).__name__}")
+
+    @override
+    def cleanup_for_exit(self) -> None:
+        """No resources to release; report the final state like the real process."""
+        self.send_process_state_change_message(
+            process_state=HordeProcessState.PROCESS_ENDED,
+            info="Process ended",
+        )
+
+
+def start_fake_post_process_process(
+    process_id: int,
+    process_message_queue: ProcessQueue,
+    pipe_connection: Connection,
+    disk_lock: Lock,
+    process_launch_identifier: int,
+    *,
+    device_index: int = 0,
+    accelerator_kind: str | None = None,
+    amd_gpu: bool = False,
+    directml: int | None = None,
+    dry_run_skip_post_processing: bool = False,
+    fault_profile: FaultProfile | None = None,
+    sim_vram_ledger: SimVramLedger | None = None,
+    sim_context_mb: float = 0.0,
+) -> None:
+    """Start a fake post-processing process.
+
+    Signature-compatible with ``worker_entry_points.start_post_process_process`` so it can be injected
+    as a drop-in multiprocessing target. GPU related arguments are accepted and ignored.
+    ``fault_profile`` scripts misbehaviour on the post-processing path; inject it with
+    ``functools.partial`` (partials of module-level functions stay picklable).
+    """
+    enable_child_faulthandler(f"fake_post_process_{process_id}")
+    logger.remove()
+    maybe_wait_for_process_debugger(process_id, "fake post-process")
+    try:
+        worker_process = FakePostProcessProcess(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+            fault_profile=fault_profile,
+            sim_vram_ledger=sim_vram_ledger,
+            sim_context_mb=sim_context_mb,
+        )
+        worker_process.main_loop()
+    except Exception as e:
+        # See start_fake_inference_process: leave a discoverable trace for a startup death that would
+        # otherwise be silent (logger.remove() drops all sinks).
+        write_startup_crash(f"fake_post_process_{process_id}", e)
         raise
 
 

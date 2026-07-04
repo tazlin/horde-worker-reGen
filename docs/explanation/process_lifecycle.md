@@ -136,10 +136,10 @@ post-processing pipeline but then stalls while packaging or sending the final
 result to the parent. Each such reap feeds the post-processing fault breaker (see
 [Resilience and recovery](resilience_and_recovery.md)); the
 `detect_post_processing_vram_stall` detector attributes the reap line to the
-post-processing stall. The preventative fix for the VRAM-over-commit case is the
-scheduler's active post-processing reclaim (`post_processing_active_reclaim_enabled`, see
-[bridge config](bridge_config.md#post-processing-vram-over-commit)), which frees
-cross-process VRAM before the peak lands so the reap never happens.
+post-processing stall. Post-processing runs on the dedicated lane (see
+[Process lanes and job chaining](process_lanes_and_chaining.md)), so a reap replaces
+only that lane; the affected job is requeued by the orphan watchdog and, after
+bounded re-attempts, proceeds with its raw images rather than faulting.
 
 When a process exceeds its timeout, it is **replaced immediately** within the
 same call (see below); there is no separate notification sent to the message

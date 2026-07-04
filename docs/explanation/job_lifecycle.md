@@ -178,11 +178,11 @@ receives the control message and runs the job in three explicit stages: it trans
 `ImageGenerateJobPopResponse` into backend-agnostic generation parameters via horde_sdk's
 `convert_image_job_pop_response_to_parameters` (hordelib has no knowledge of AI-Horde API models),
 runs inference through hordelib's typed `HordeLib.generate` (with registry-based automatic pipeline
-selection), then drives the job's requested post-processing itself, per image, through the typed
-`HordeLib.post_process` (facefixers last; an image whose chain produces no output is dropped, and an
-empty result list faults the job). Throughout, it streams back heartbeats, memory reports, and state
-changes (including `INFERENCE_POST_PROCESSING`, which frees the sampling slot for the next job),
-ending with `HordeInferenceResultMessage` (state `ok`/`censored`/`faulted` + base64 images).
+selection), and returns the raw images; any post-processing the job requested runs afterwards on the
+dedicated post-processing lane (see
+[Process lanes and job chaining](process_lanes_and_chaining.md)). Throughout, it streams back
+heartbeats, memory reports, and state changes,
+ending with `HordeInferenceResultMessage` (state `ok`/`censored`/`faulted` + image bytes).
 A job that stops reporting progress is graded and recovered by the watchdogs in [Resilience and
 Recovery](resilience_and_recovery.md). In dry-run, `fake_worker_processes.py` substitutes canned image
 results.

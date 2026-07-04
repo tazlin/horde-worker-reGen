@@ -113,7 +113,7 @@ class TestExclusivityRelease:
         job_tracker.set_retry_policy(1)
         scheduler = _make_scheduler(job_tracker)
         job = await _exclusive_job_in_progress(job_tracker)
-        assert scheduler._max_jobs_in_progress_allowed(0) == 1
+        assert scheduler._max_jobs_in_progress_allowed() == 1
 
         resolution = job_tracker.handle_job_fault_now(
             faulted_job=job,
@@ -122,7 +122,7 @@ class TestExclusivityRelease:
 
         assert resolution is InferenceFailureResolution.FAULTED
         assert job_tracker.has_exclusive_job_in_progress() is False
-        assert scheduler._max_jobs_in_progress_allowed(0) == 2
+        assert scheduler._max_jobs_in_progress_allowed() == 2
 
     async def test_retryable_fault_keeps_isolation_for_the_retry(self, job_tracker: JobTracker) -> None:
         """A retryable fault re-queues the job still exclusive, so the bounded retry re-runs isolated.
