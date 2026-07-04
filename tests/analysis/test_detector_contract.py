@@ -114,6 +114,20 @@ def _oom(ts: str) -> str:
     return f"2026-06-24 {ts} | ERROR | x:y:1 - CUDA out of memory. Tried to allocate 2.00 GiB"
 
 
+def _fd_exhaustion(ts: str, *, slot: int = 3, model: str = "WAI-NSFW-illustrious-SDXL") -> str:
+    """message_dispatcher._handle_faulted_inference_result: a job faulted by EMFILE (errno 24).
+
+    Mirrors the real emit: the generic 'Pipeline failed to run ... produced no results' wrapper, the
+    faulting model, and the underlying 'Too many open files' the process hit once over RLIMIT_NOFILE.
+    """
+    return (
+        f"2026-06-24 {ts} | WARNING  | horde_worker_regen.process_management.ipc.message_dispatcher:_handle_faulted_inference_result:892 - "
+        f"Job 597d4471-b223-4383-b874-86c6a1549594 faulted on process {slot} (RuntimeError: Pipeline failed "
+        f"to run - declared output node(s) ['output_image'] produced no results. Model: {model}. Error: "
+        f"sampler (KSampler): OSError: [Errno 24] Too many open files: '/proc/meminfo'"
+    )
+
+
 def _no_images(ts: str) -> str:
     """A generic 'no images produced' fault (the swallowed-OOM classification gap)."""
     return f"2026-06-24 {ts} | WARNING | x:y:1 - Job faulted: no images were produced"
@@ -262,6 +276,10 @@ CONTRACTS: dict[str, Contract] = {
     ),
     "detect_oom": Contract(
         bridge=_bridge(_oom("18:00:10.000")),
+        severity=Severity.CRITICAL,
+    ),
+    "detect_file_descriptor_exhaustion": Contract(
+        bridge=_bridge(_fd_exhaustion("20:09:24.000")),
         severity=Severity.CRITICAL,
     ),
     "detect_swallowed_oom": Contract(

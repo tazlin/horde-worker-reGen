@@ -473,6 +473,40 @@ class TestConsecutiveFailurePause:
         assert "consecutive_failure_pause" not in _diagnose(tmp_path, bridge)
 
 
+def _oom_coresident(ts: str, *, slot: int = 4, model: str = "Z-Image-Turbo") -> str:
+    """A faulted-inference OOM carrying the allocator's co-residency accounting (the over-admission case).
+
+    Mirrors the real emit: the generic wrapper, the faulting model, the free-VRAM figure, and two sibling
+    'Process N has X GiB memory in use' lines (so total co-residency is 3 with the faulting process).
+    """
+    return (
+        f"2026-06-24 {ts} | ERROR    | horde_worker_regen.process_management.ipc.message_dispatcher:_handle_faulted_inference_result:912 - "
+        f"Job 9cbb045c faulted on process {slot}: RuntimeError: Pipeline failed to run - declared output "
+        f"node(s) ['output_image'] produced no results. Model: {model}. Error: sampler (KSampler): "
+        f"torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 30.00 MiB. GPU 0 has a total "
+        f"capacity of 23.51 GiB of which 193.56 MiB is free. Process 2733578 has 3.97 GiB memory in use. "
+        f"Process 2733829 has 3.43 GiB memory in use. Including non-PyTorch memory, this process has 12.85 "
+        f"GiB memory in use."
+    )
+
+
+def _fd_fault(
+    ts: str,
+    *,
+    slot: int = 3,
+    model: str = "WAI-NSFW-illustrious-SDXL",
+    node: str = "sampler",
+    resource: str = "/proc/meminfo",
+) -> str:
+    """A faulted-inference result whose underlying error is EMFILE (errno 24, 'Too many open files')."""
+    return (
+        f"2026-06-24 {ts} | WARNING  | horde_worker_regen.process_management.ipc.message_dispatcher:_handle_faulted_inference_result:892 - "
+        f"Job 597d4471 faulted on process {slot} (RuntimeError: Pipeline failed to run - declared output "
+        f"node(s) ['output_image'] produced no results. Model: {model}. Error: {node} (HordeCheckpointLoader): "
+        f"OSError: [Errno 24] Too many open files: '{resource}'"
+    )
+
+
 class TestResourceFindings:
     """OOM and the swallowed-OOM classification gap."""
 
@@ -495,6 +529,70 @@ class TestResourceFindings:
             ],
         )
         assert "swallowed_oom" in _diagnose(tmp_path, bridge)
+
+    def test_oom_names_model_and_coresidency(self, tmp_path: Path) -> None:
+        """The OOM finding names the faulting model and the card's over-admission fingerprint.
+
+        A bare count ("8 OOM faults") does not tell a maintainer whether one model was too large or many
+        were over-admitted. The allocator message carries both; the finding must lift them.
+        """
+        bridge = "\n".join([f"2026-06-24 18:00:00.000 | DEBUG | x:y:1 - {_STARTUP}", _oom_coresident("18:00:10.000")])
+        findings = _diagnose(tmp_path, bridge)
+        assert "oom" in findings
+        verdict = findings["oom"].verdict
+        assert "Z-Image-Turbo" in verdict
+        assert "slot(s) 4" in verdict
+        # Two sibling "Process N has ..." lines + the faulting process itself == 3 co-resident.
+        assert "3 processes co-resident" in verdict
+        assert "194 MiB free" in verdict
+
+    def test_fd_exhaustion_detected(self, tmp_path: Path) -> None:
+        """An EMFILE (errno 24) run of faults is surfaced as its own critical finding.
+
+        This must not be swallowed by the OOM detector: it shares the generic 'produced no results'
+        wrapper but is a descriptor leak, needing a different fix. The finding names the slot, the model
+        that was running when the ceiling was hit, the refused open, and the slot replacement.
+        """
+        bridge = "\n".join(
+            [
+                f"2026-06-24 20:00:00.000 | DEBUG | x:y:1 - {_STARTUP}",
+                _fd_fault("20:09:24.000", node="sampler", resource="/proc/meminfo"),
+                _fd_fault("20:13:46.000", node="model_loader", resource="/proc/meminfo"),
+                _fd_fault("20:16:00.000", node="model_loader", resource="/proc/2733826/stat"),
+                _recovery(
+                    "20:16:16.000",
+                    3,
+                    reason="inference process replaced (failed to load model WAI-NSFW-illustrious-SDXL)",
+                    last_state="PRELOADING_MODEL",
+                ),
+            ],
+        )
+        findings = _diagnose(tmp_path, bridge)
+        assert "file_descriptor_exhaustion" in findings
+        fd = findings["file_descriptor_exhaustion"]
+        assert fd.severity is Severity.CRITICAL
+        assert "WAI-NSFW-illustrious-SDXL" in fd.verdict
+        assert "slot(s) 3" in fd.verdict
+        assert "/proc/meminfo" in fd.verdict
+        assert "replaced" in fd.verdict
+        # The mechanism note that keeps a maintainer from mistaking it for an OOM.
+        assert "descriptor leak" in fd.verdict
+
+    def test_fd_exhaustion_and_oom_are_distinct(self, tmp_path: Path) -> None:
+        """A descriptor-exhaustion session raises no OOM finding, and vice versa (no cross-contamination)."""
+        fd_bridge = "\n".join(
+            [f"2026-06-24 20:00:00.000 | DEBUG | x:y:1 - {_STARTUP}", _fd_fault("20:09:24.000")],
+        )
+        fd_findings = _diagnose(tmp_path, fd_bridge)
+        assert "file_descriptor_exhaustion" in fd_findings
+        assert "oom" not in fd_findings
+
+        oom_bridge = "\n".join(
+            [f"2026-06-24 20:00:00.000 | DEBUG | x:y:1 - {_STARTUP}", _oom_coresident("20:20:26.000")],
+        )
+        oom_findings = _diagnose(tmp_path, oom_bridge)
+        assert "oom" in oom_findings
+        assert "file_descriptor_exhaustion" not in oom_findings
 
 
 def _safety_lost_result(ts: str, *, job_id: str = "ab3164c9") -> str:

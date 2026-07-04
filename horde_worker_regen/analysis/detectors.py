@@ -32,6 +32,24 @@ _ABANDON_SHIP_RE = re.compile(r"abandoning ship|cannot restore a working process
 _OOM_RE = re.compile(
     r"CUDA out of memory|OutOfMemoryError|torch\.cuda\.OutOfMemoryError|RuntimeError: .*out of memory",
 )
+# A faulted-inference result names its model and the failing node in a stable shape:
+#   "... produced no results. Model: <name>. Error: <stage> (<NodeClass>): <underlying error>"
+# Both the OOM and the file-descriptor detectors read the model off this to name the culprit, because the
+# outer "Pipeline failed to run ... produced no results" wrapper is identical across unrelated root causes.
+_FAULT_MODEL_RE = re.compile(r"Model: (?P<model>.+?)\. Error:")
+_FAULTED_ON_PROCESS_RE = re.compile(r"faulted on process (?P<pid>\d+)")
+# The CUDA allocator's own accounting from an OOM message: how little was free, and the sibling processes
+# co-resident on the card. Several siblings each holding GiB with almost nothing free is the over-admission
+# fingerprint (many models sharing one card), distinct from a single model that simply will not fit.
+_OOM_FREE_VRAM_RE = re.compile(r"of which ([\d.]+) MiB is free")
+_OOM_SIBLING_RE = re.compile(r"Process \d+ has ([\d.]+) GiB memory in use")
+# The per-process file-descriptor ceiling (RLIMIT_NOFILE / EMFILE, errno 24). The kernel message is
+# "Too many open files" (distinct from the system-wide ENFILE "... in system"); it arrives either as an
+# os/psutil "[Errno 24] Too many open files: '<path>'" or as safetensors' "Too many open files (24)".
+_FD_EXHAUSTION_RE = re.compile(r"Too many open files(?! in system)")
+# The resource whose open() was refused, naming where the exhaustion bit: a /proc probe (psutil's
+# free-RAM read, or the child's own /proc/<pid>/stat control-message read) or a checkpoint/LoRA .safetensors.
+_FD_RESOURCE_RE = re.compile(r"Too many open files: '(?P<path>[^']+)'|open file <(?P<file>[^>]+)> in read-only mode")
 _NO_IMAGES_RE = re.compile(r"no images were produced|no images produced")
 # The in-progress orphan watchdog names itself in its punt line ("...(orphaned-job watchdog).") rather
 # than using the words "orphaned in-progress", so the watchdog tag is the signature that actually
@@ -495,22 +513,162 @@ def detect_post_processing_deferral_starvation(context: SessionContext) -> list[
     ]
 
 
+def _distinct_ordered(values: list[str]) -> list[str]:
+    """The distinct members of ``values`` in first-seen order (a small, stable, de-duplicated set)."""
+    seen: dict[str, None] = {}
+    for value in values:
+        seen.setdefault(value, None)
+    return list(seen)
+
+
+def _faulting_models(records: list[LogRecord]) -> list[str]:
+    """The distinct model names named across a set of faulted-inference records (the culprit models)."""
+    models = [m.group("model") for r in records if (m := _FAULT_MODEL_RE.search(r.message))]
+    return _distinct_ordered(models)
+
+
+def _affected_slots(records: list[LogRecord]) -> list[int]:
+    """The distinct inference slot numbers named by 'faulted on process N' across ``records``, sorted."""
+    slots = {int(m.group("pid")) for r in records if (m := _FAULTED_ON_PROCESS_RE.search(r.message))}
+    return sorted(slots)
+
+
+def _clause_join(items: list[str]) -> str:
+    """Join names as 'a', 'a and b', or 'a, b and c' for a readable inline clause."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
 def detect_oom(context: SessionContext) -> list[Finding]:
-    """Out-of-memory faults (explicit CUDA OOM)."""
+    """Out-of-memory faults (explicit CUDA OOM), naming the faulting model and the card's co-residency.
+
+    The bare fault count does not tell a maintainer whether one model is simply too large for the card or
+    many models were over-admitted onto it. The allocator's own message carries both: the model that
+    faulted, and the sibling processes holding memory with almost nothing free. Naming them turns a plain
+    count into a finding that identifies the faulting model and whether the card was over-committed (many
+    processes co-resident with near-zero free VRAM), which points at the fix.
+    """
     oom = _matching(context.session.records, _OOM_RE)
     if not oom:
         return []
+
+    models = _faulting_models(oom)
+    slots = _affected_slots(oom)
+    free_vrams = [float(m.group(1)) for r in oom if (m := _OOM_FREE_VRAM_RE.search(r.message))]
+    sibling_counts = [len(_OOM_SIBLING_RE.findall(r.message)) for r in oom]
+    max_siblings = max(sibling_counts, default=0)
+
+    verdict = f"{len(oom)} out-of-memory fault(s) during the session"
+    if models:
+        verdict += f", faulting {_clause_join([f'`{m}`' for m in models])}"
+    if slots:
+        verdict += f" on slot(s) {_clause_join([str(s) for s in slots])}"
+    verdict += "."
+    if free_vrams:
+        verdict += f" The allocator reported as little as {min(free_vrams):.0f} MiB free at the fault"
+        if max_siblings:
+            # A sibling count here is (co-resident processes) - 1 (the message excludes the faulting
+            # process's own line), so +1 to state the total sharing the card.
+            verdict += (
+                f", with {max_siblings + 1} processes co-resident on the card: the over-admission "
+                "fingerprint (many models sharing one device), not a single model too large to fit"
+            )
+        verdict += "."
+
     return [
         Finding(
             id="oom",
             severity=Severity.CRITICAL,
             title="GPU out-of-memory faults",
-            verdict=f"{len(oom)} out-of-memory fault(s) during the session.",
+            verdict=verdict,
             remediation=(
                 "Reduce concurrency/queue or enable a more conservative VRAM budget; if these recur under "
-                "a budget that should fit, suspect over-admission of a heavy head (Flux fp8 / SDXL)."
+                "a budget that should fit, suspect over-admission of a heavy head (Flux fp8 / SDXL). The "
+                "named co-residency and free-VRAM figures say which: several co-resident processes with "
+                "near-zero free VRAM points at too many models admitted onto one card, not at the faulting "
+                "model being individually oversized."
             ),
             evidence=[_evidence(r) for r in oom[:4]],
+        ),
+    ]
+
+
+def detect_file_descriptor_exhaustion(context: SessionContext) -> list[Finding]:
+    """An inference process that ran its descriptor table into RLIMIT_NOFILE (EMFILE, errno 24).
+
+    A descriptor leak in one inference child climbs until every ``open()`` is refused. The exhaustion then
+    surfaces wherever a file is next opened, which is misleadingly far from the leak: psutil's free-RAM
+    probe cannot read ``/proc/meminfo`` (it runs on every tqdm progress redraw during sampling), the
+    checkpoint and LoRA ``.safetensors`` cannot be opened, and even the child's own control-message handler
+    cannot read ``/proc/<pid>/stat``. From that point the process faults every job it is handed, yet it
+    keeps heart-beating, so the silence-based hang watchdog stays blind; only the "failed to load model"
+    recovery path eventually replaces the slot, after a long poisoned window of dropped jobs.
+
+    This is a resource leak, not memory capacity, and it wears the same generic "Pipeline failed to run ...
+    produced no results" wrapper as a CUDA OOM. Without its own detector it is read as an OOM and given the
+    wrong remediation (reduce concurrency / VRAM budget), which does nothing for a descriptor leak. The
+    faulting model named here is the job that happened to be running when the ceiling was hit, not the
+    cause: the cause is whatever leaked descriptors, which these logs cannot pinpoint because the worker
+    emits no descriptor-headroom telemetry (the actionable gap this finding calls out).
+    """
+    faults = _matching(context.session.records, _FD_EXHAUSTION_RE)
+    if not faults:
+        return []
+
+    models = _faulting_models(faults)
+    slots = _affected_slots(faults)
+    resources = _distinct_ordered(
+        [m.group("path") or m.group("file") for r in faults if (m := _FD_RESOURCE_RE.search(r.message))],
+    )
+    timestamps = [r.timestamp for r in faults if r.timestamp is not None]
+    window_minutes = (timestamps[-1] - timestamps[0]).total_seconds() / 60 if len(timestamps) >= 2 else 0.0
+    window_clause = f" over a {window_minutes:.0f}-minute poisoned window" if window_minutes >= 1 else ""
+
+    # A recovery that replaced the affected slot after the leak (the "failed to load model" path), which is
+    # the only thing that clears the poisoned process; naming it confirms the slot was eventually recycled.
+    recovery = next(
+        (r for r in context.recoveries if (not slots or r.process_id in slots) and "failed to load model" in r.reason),
+        None,
+    )
+
+    slot_clause = f" on slot(s) {_clause_join([str(s) for s in slots])}" if slots else ""
+    model_clause = f" serving {_clause_join([f'`{m}`' for m in models])}" if models else ""
+    resource_clause = (
+        f" The refused opens include {_clause_join([f'`{path}`' for path in resources[:4]])}." if resources else ""
+    )
+    recovery_clause = (
+        f" The recovery supervisor eventually replaced the slot ({recovery.reason})."
+        if recovery is not None
+        else " No slot replacement was recorded, so the process may have stayed poisoned until the session ended."
+    )
+
+    return [
+        Finding(
+            id="file_descriptor_exhaustion",
+            severity=Severity.CRITICAL,
+            title="Inference process exhausted its file-descriptor limit (EMFILE)",
+            verdict=(
+                f"An inference process hit its per-process file-descriptor ceiling (errno 24, EMFILE) "
+                f"{len(faults)} time(s){slot_clause}{model_clause}{window_clause}. Once over RLIMIT_NOFILE "
+                f"every open() is refused, so the process faults every job while still heart-beating (the "
+                f"silence watchdog cannot see it).{resource_clause}{recovery_clause} The named model is "
+                "whatever was running when the ceiling was hit, not the cause: this is a descriptor leak, "
+                "distinct from a CUDA OOM despite sharing the generic 'produced no results' fault text."
+            ),
+            remediation=(
+                "Treat this as a descriptor leak, not memory pressure: reducing concurrency or the VRAM "
+                "budget will not help. As an immediate stopgap, raise the worker's soft descriptor limit "
+                "(ulimit -n, or LimitNOFILE= in the systemd unit) so a slow leak takes far longer to reach "
+                "the ceiling. The real fix is to find what leaks descriptors in the inference child; these "
+                "logs cannot pinpoint it because the worker emits no descriptor-headroom telemetry, so add "
+                "RLIMIT_NOFILE headroom to the per-process status line (alongside the free-RAM/VRAM figures) "
+                "so the next occurrence names the leaking growth. This fault is POSIX-specific (Windows has "
+                "no RLIMIT_NOFILE and a far higher handle ceiling), so it is a concern for Linux hosts."
+            ),
+            evidence=[_evidence(r) for r in faults[:4]] + ([_evidence(recovery.record)] if recovery else []),
         ),
     ]
 
@@ -1255,6 +1413,7 @@ DETECTORS: list[Detector] = [
     detect_post_processing_vram_stall,
     detect_post_processing_deferral_starvation,
     detect_oom,
+    detect_file_descriptor_exhaustion,
     detect_swallowed_oom,
     detect_orphan_wedge,
     detect_session_summary,
