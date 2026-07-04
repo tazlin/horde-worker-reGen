@@ -72,6 +72,14 @@ class WorkerState:
     post_processing_breaker_tripped_at: float = 0.0
     """Wall-clock time the post-processing breaker tripped; 0 when not tripped (for the operator advisory/TUI)."""
 
+    post_processing_disabled_reason: str = ""
+    """Operator-facing reason post-processing was session-disabled; empty when still enabled.
+
+    The fault breaker and whole-card residency compatibility checks both use
+    ``post_processing_disabled_by_breaker`` to stop advertising post-processing. This detail tells the TUI and
+    logs which structural condition caused the session latch.
+    """
+
     lora_disk_exhausted: bool = False
     """The LoRA cache volume is below its free-space floor and eviction could not clear it.
 

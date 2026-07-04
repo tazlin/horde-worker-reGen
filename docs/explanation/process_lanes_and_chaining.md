@@ -41,7 +41,7 @@ The lane replaces prediction with structure:
   the previous one post-processes on the lane.
 - The scheduler charges the lane's fixed CUDA context in its residency forecast and charges each active
   post-processing job's estimated peak in the shared committed-reserve ledger. The hold is released when the
-  lane result arrives, when a retired result is known lost, or when orphan recovery requeues/falls back.
+  lane result arrives, when a retired result is known lost, or when orphan recovery requeues or faults.
 - The lane reports VRAM like an inference process. Its sample participates in `ProcessMap.get_free_vram_mb`,
   so the parent sees the same low-free-VRAM condition that would make ComfyUI tile or stream.
 - Idle reclaim commands apply to the lane too: under pressure, the scheduler can ask an idle `POST_PROCESS`
@@ -54,17 +54,26 @@ chain from parking the queue:
 
 - **Queue scan**: the first *fittable* pending job is dispatched, so an unfittable head never blocks the
   fittable jobs queued behind it.
-- **Aging escape**: a job that stays unfittable past the admission-patience window is submitted with its raw
-  images, so its finished inference is delivered un-post-processed rather than deferred forever. This is an
-  admission decision, not a lane fault, and does not feed the circuit breaker; the lane never ran the job.
+- **Aging escape**: a job that stays unfittable past the admission-patience window is submitted as a no-image
+  fault, so the horde reissues it to another worker rather than letting it park forever. This feeds the
+  circuit breaker because the worker accepted post-processing work it could not host.
 - **One-shot reclaim**: an unfittable job asks the scheduler to evict idle VRAM once per starvation episode,
   not once per scheduling tick, so deferral does not churn idle inference residency in a loop.
 
-A post-processing failure never forfeits the job: the raw inference images are still held by the main
-process, so after bounded retries the job proceeds to safety with the raw images and the fault is recorded in
-its generation metadata. Repeated lane faults feed the post-processing circuit breaker
+A post-processing failure never falls back to raw submission. Requested post-processing is part of the
+worker's contract for that job; if the lane cannot honor it, the worker submits a no-image fault so the horde
+reissues the job to another worker. Repeated lane faults feed the post-processing circuit breaker
 (`post_processing_fault_breaker_enabled`), which stops advertising post-processing before the horde forces
-maintenance.
+maintenance. A queued job that was already popped when the breaker trips is faulted on the next orchestrator
+pass; a job already running on the lane is allowed a best-effort chance to finish, then the orphan watchdog
+requeues it a bounded number of times before faulting it without images.
+
+Whole-card residency treats the lane separately from its resident models. When the lane's bare GPU context
+fits beside the resident model, the scheduler asks the idle `POST_PROCESS` process to unload its modules from
+VRAM and keeps the lane alive so jobs peeling off the resident model can still post-process. If the bare PP
+context cannot coexist with a model that requires whole-card residency, post-processing is disabled for the
+session with an operator warning (logs, and the TUI health row when attached); stopping the lane is then a
+structural compatibility decision, not the normal residency lever.
 
 ## The chain model
 
@@ -86,9 +95,9 @@ executor of record, and every stage transition is mirrored into the chain via
 - New stages and lanes (text, audio/video, chained jobs that feed one generation's output into another) are
   new nodes and edges over the same machinery rather than new special cases.
 
-A terminal fault marks the executing node failed and skips everything downstream; a job that falls back
-(e.g. raw images after a post-processing failure) records the fault in metadata while the chain reflects the
-stages that actually ran.
+A terminal fault marks the executing node failed and skips everything downstream. Post-processing faults are
+terminal no-image faults rather than raw-image fallbacks, so the chain reflects that the requested downstream
+stage did not complete.
 
 ## The job's path through the lanes
 
@@ -98,9 +107,8 @@ stages that actually ran.
    at the generate stage's completion milestone.
 3. **Post-process** (when requested): the dispatcher queues the job for the lane; the post-processing
    orchestrator dispatches the first fittable pending job, sends the raw images and the requested operations,
-   and the processed images replace the raw ones. A chain that never fits the card ages out to a raw-image
-   submit; an orphan watchdog requeues a job whose result was lost (bounded), then falls back to the raw
-   images.
+   and the processed images replace the raw ones. A chain that never fits the card ages out to a no-image
+   fault; an orphan watchdog requeues a job whose result was lost (bounded), then faults without images.
 4. **Safety**: unchanged; the safety orchestrator sends the (possibly post-processed) images for evaluation.
 5. **Submit**: unchanged; the chain closes out (`SUBMIT_COMPLETE`) when the job finalizes.
 

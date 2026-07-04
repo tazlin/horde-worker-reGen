@@ -6,8 +6,8 @@ allocator keeps: freed tensors stay in a process's pool, and under Windows' WDDM
 does not fail allocations, it silently demand-pages every process on the device. A quota moves that
 arbitration into the allocator itself: a support process (lane, safety) is capped at the share of the
 card its role justifies, so an overstep becomes a crisp out-of-memory inside the offender, on paths
-that already degrade gracefully (a faulted chain falls back to a raw-image submit; a faulted safety
-eval recycles the process), instead of an invisible device-wide slowdown.
+that already degrade deliberately (a faulted post-processing chain is submitted without images so the
+horde reissues it; a faulted safety eval recycles the process), instead of an invisible device-wide slowdown.
 
 CUDA-only by mechanism (``torch.cuda.set_per_process_memory_fraction`` is the caching-allocator cap);
 on any other backend (XPU, DirectML, CPU) or on any failure this is a logged no-op, never an exception:
@@ -23,8 +23,8 @@ POST_PROCESS_VRAM_QUOTA_MB = 4096.0
 
 Sized for an upscaler/face-fixer chain's working set (a 4x ESRGAN pass on a 1MP image peaks around
 3.1GB plus the resident module); a chain that genuinely needs more faults inside the lane and the job
-is delivered with its raw images. Without the cap the lane's allocator pool was observed retaining
-5GB+ of the card between chains."""
+is reported as a no-image fault. Without the cap the lane's allocator pool was observed retaining 5GB+
+of the card between chains."""
 
 SAFETY_VRAM_QUOTA_MB = 4096.0
 """The safety process's allocator cap (MB).

@@ -390,8 +390,9 @@ share of the card their role justifies (an upscale chain's working set; the safe
 evaluation). The parent can schedule when work runs, but only the allocator can bound how much a
 process *keeps*: freed tensors stay in a process's pool, and under WDDM an over-committed card silently
 demand-pages every process instead of failing. With the cap, an overstep becomes a crisp out-of-memory
-inside the offender, on paths that already degrade gracefully (a faulted chain delivers its raw images;
-a faulted safety evaluation recycles the process). On non-CUDA backends the quota is a logged no-op.
+inside the offender, on paths that already degrade deliberately (a faulted post-processing chain is reported
+without images so the horde reissues it; a faulted safety evaluation recycles the process). On non-CUDA
+backends the quota is a logged no-op.
 
 On Windows the worker also watches the one signal the driver cannot fake: the per-process
 `GPU Process Memory` counters (the data behind Task Manager's "Shared GPU memory" column). When a worker

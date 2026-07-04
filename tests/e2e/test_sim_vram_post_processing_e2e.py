@@ -6,11 +6,11 @@ simulated-VRAM ledger. Together they prove that finished inference is never forf
 VRAM shortfall, by exercising both defenses end to end:
 
 - With the VRAM budget on (the default), the admission gate sees the over-committed card and never
-  dispatches the unfittable chain: after the admission-patience window it submits the job's raw images
-  (:func:`test_post_processing_ages_out_to_raw_images_on_overcommitted_card`).
+  dispatches the unfittable chain: after the admission-patience window it submits a no-image fault
+  (:func:`test_post_processing_ages_out_to_fault_on_overcommitted_card`).
 - With the budget off, the job is dispatched and stalls the lane; the silence watchdog reaps and replaces
   it, the orphan watchdog requeues the job, and once the re-attempt budget is spent the job submits its raw
-  images (:func:`test_post_processing_stall_recovers_with_raw_images_without_budget_gate`). This is the
+  no-image fault (:func:`test_post_processing_stall_recovers_to_fault_without_budget_gate`). This is the
   recovery net for a chain that was admitted (fit the estimate) but stalled in reality.
 
 The same job and fault profile complete cleanly on a roomy card, isolating the peak as the cause. The
@@ -51,7 +51,7 @@ _ROOMY_TOTAL_MB = 49152.0
 # The post-processing watchdog fires at post_process_timeout (floored at 15) + 3 * max_batch; pin both low
 # so a stalled lane is reaped quickly. The lane teardown marks the in-flight job's result known-lost, so
 # the orphan watchdog requeues it without waiting out its grace; after the bounded re-attempts the job
-# proceeds with its raw images.
+# is reported as a no-image fault.
 _BRIDGE_OVERRIDES: dict[str, object] = {
     "max_threads": 1,
     "max_batch": 1,
@@ -68,13 +68,13 @@ def _seed_ledger(manager: multiprocessing.managers.SyncManager, total_mb: float)
 
 
 @pytest.mark.e2e
-async def test_post_processing_ages_out_to_raw_images_on_overcommitted_card() -> None:
-    """With the budget gate on, the unfittable chain is never dispatched; its raw images are submitted.
+async def test_post_processing_ages_out_to_fault_on_overcommitted_card() -> None:
+    """With the budget gate on, the unfittable chain is never dispatched; it is faulted without images.
 
     The admission gate compares the estimated post-processing peak (plus the reserve) against the card's
     free VRAM, which the over-commit drives below the requirement. Rather than dispatch the chain into a
-    stall, the gate defers it and, after the admission-patience window, submits the job's raw images so its
-    finished inference is delivered un-post-processed. The lane never runs the job, so nothing is faulted.
+    stall, the gate defers it and, after the admission-patience window, faults the job without images so the
+    horde can reissue it to another worker. The lane never runs the job.
     """
     with multiprocessing.Manager() as manager:
         ledger = _seed_ledger(manager, _OVERCOMMITTED_TOTAL_MB)
@@ -94,18 +94,18 @@ async def test_post_processing_ages_out_to_raw_images_on_overcommitted_card() ->
     assert not result.timed_out, result.failure_summary()
     assert result.all_jobs_accounted_for, result.failure_summary()
     assert result.num_jobs_completed >= 1, result.failure_summary()
-    assert result.num_jobs_submitted_faulted == 0, result.failure_summary()
+    assert result.num_jobs_submitted_faulted >= 1, result.failure_summary()
     assert result.audit_failures == []
 
 
 @pytest.mark.e2e
-async def test_post_processing_stall_recovers_with_raw_images_without_budget_gate() -> None:
-    """With the budget gate off, a dispatched chain stalls the lane and is recovered to its raw images.
+async def test_post_processing_stall_recovers_to_fault_without_budget_gate() -> None:
+    """With the budget gate off, a dispatched chain stalls the lane and is recovered to a no-image fault.
 
     Disabling the admission gate is the way to reach the recovery net for a chain that *was* admitted (its
     estimate fit) yet stalled in reality. The stalled lane is detected by the silence watchdog and replaced
     (a real recovery); the orphan watchdog requeues the job onto the fresh lane, which stalls the same way;
-    once the re-attempt budget is spent the job proceeds to safety and submit with the raw inference images.
+    once the re-attempt budget is spent the job is submitted faulted without images.
     Finished inference is never forfeited to a post-processing failure.
     """
     with multiprocessing.Manager() as manager:
@@ -126,7 +126,7 @@ async def test_post_processing_stall_recovers_with_raw_images_without_budget_gat
     assert not result.timed_out, result.failure_summary()
     assert result.all_jobs_accounted_for, result.failure_summary()
     assert result.num_jobs_completed >= 1, result.failure_summary()
-    assert result.num_jobs_submitted_faulted == 0, result.failure_summary()
+    assert result.num_jobs_submitted_faulted >= 1, result.failure_summary()
     assert result.audit_failures == []
 
 

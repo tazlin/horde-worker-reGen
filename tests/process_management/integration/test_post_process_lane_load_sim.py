@@ -11,7 +11,7 @@ Invariants:
 - **Conservation**: every job queued for post-processing is always accounted for (pending, being
   post-processed, or terminal). A job silently vanishing is the worst possible outcome because its
   finished inference is forfeited without any log or fault.
-- **Bounded patience**: a job must reach a terminal outcome (post-processed or raw-image fallback)
+- **Bounded patience**: a job must reach a terminal outcome (post-processed or no-image fault)
   within a patience window even when its chain never fits the card. Parking a finished generation
   forever forfeits kudos and risks server-side timeouts.
 - **No head-of-line blocking**: a chain too large for the card must not starve fittable jobs queued
@@ -19,7 +19,7 @@ Invariants:
 - **Bounded reclaim requests**: deferral must not fire a VRAM-reclaim request every scheduling tick.
 
 The dispatch policy satisfies all four: a queue scan dispatches the first fittable job ahead of an
-unfittable head, an aging window submits a job's raw images once it has been unfittable past the
+unfittable head, an aging window submits a no-image fault once a job has been unfittable past the
 admission patience, and the idle-VRAM reclaim is issued once per starvation episode rather than per tick.
 """
 
@@ -303,7 +303,7 @@ _SCENARIOS = {s.name: s for s in canned_scenarios()}
 
 # Scenarios containing traffic the card structurally cannot host: at least one chain's estimated peak
 # plus the fixed VRAM reserve exceeds the card's steady free figure. Under the dispatch policy these
-# jobs must not park; they age out to a raw-image submit within patience.
+# jobs must not park; they age out to a no-image fault within patience.
 _SCENARIOS_WITH_UNFITTABLE_TRAFFIC = {
     "average_typical",
     "average_heavy",
@@ -344,14 +344,17 @@ class TestScenarioPatience:
         )
 
     @pytest.mark.parametrize("name", sorted(_SCENARIOS_WITH_UNFITTABLE_TRAFFIC))
-    async def test_unfittable_traffic_degrades_to_raw_submit_within_patience(self, name: str) -> None:
-        """Traffic the card cannot host must still terminate (raw images) within patience."""
+    async def test_unfittable_traffic_faults_without_images_within_patience(self, name: str) -> None:
+        """Traffic the card cannot host must still terminate as no-image faults within patience."""
         simulator = LaneLoadSimulator(_SCENARIOS[name])
         outcome = await simulator.run()
 
         assert not outcome.starved, (
             f"{len(outcome.starved)} job(s) were parked past the patience window in scenario {name} "
-            "instead of falling back to a raw-image submit"
+            "instead of faulting without images"
+        )
+        assert any(r.job_info.state == GENERATION_STATE.faulted for r in outcome.terminal), (
+            f"scenario {name} contains unfittable PP traffic but did not produce a faulted submit"
         )
 
 

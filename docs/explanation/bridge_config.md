@@ -201,8 +201,8 @@ pressure, the scheduler can evict idle inference models and ask an idle
 post-processing lane to unload its modules from VRAM/RAM before starting more
 work. See
 [Process lanes and job chaining](process_lanes_and_chaining.md) for the full
-picture, including how a lane failure falls back to submitting the raw images
-instead of faulting the job.
+picture, including how lane failures are reported as no-image faults rather than
+silently submitting raw images for jobs that requested post-processing.
 
 `post_processing_fault_breaker_enabled` is the self-protective backstop. If
 post-processing peaks keep failing to host (more than
@@ -213,7 +213,10 @@ host, ending the fault-to-forced-maintenance spiral, and logs an advisory to
 downgrade settings. The suppression is session-latched: the over-commit is
 structural, so it clears only on restart. See
 [Resilience and recovery](resilience_and_recovery.md) for how it sits alongside
-the other self-protective throttles.
+the other self-protective throttles. The same session-latched suppression is
+used when a whole-card model cannot fit beside even the post-processing lane's
+bare GPU context; in that case the worker logs an operator warning and the TUI
+health view shows post-processing as disabled until restart.
 
 ### Alchemy
 

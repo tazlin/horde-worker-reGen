@@ -66,12 +66,13 @@ class TestStartPostProcessing:
         assert job_info in process_manager._job_tracker.jobs_pending_post_processing
         assert job_info not in process_manager._job_tracker.jobs_being_post_processed
 
-    async def test_absent_lane_ages_job_out_to_raw_submit(self) -> None:
+    async def test_absent_lane_ages_job_out_to_no_image_fault(self) -> None:
         """With no lane process (and no deliberate pause), a pending job's patience clock starts.
 
         Deferral records are otherwise only created against a live lane process; without this arming, a
         job queued while the lane is dead (crash, failed restart) would never age out and would wait
-        forever, wedging the drain and forfeiting its finished inference.
+        forever, wedging the drain. Once the patience window elapses the job is reported faulted without
+        images so the horde reissues it to another worker.
         """
         process_manager = make_testable_process_manager()
         job_info = _make_pp_job_info()
@@ -82,20 +83,64 @@ class TestStartPostProcessing:
         key = str(job_info.sdk_api_job_info.id_)
         assert key in orchestrator._deferrals
 
-        # Push the record past the patience window: the next pass must deliver the raw images.
+        # Push the record past the patience window: the next pass must fault the job without images.
         orchestrator._deferrals[key].first_deferred_at -= (
             post_process_orchestrator_module._ADMISSION_PATIENCE_SECONDS + 1.0
         )
         await process_manager.start_post_processing()
 
         assert job_info not in process_manager._job_tracker.jobs_pending_post_processing
-        assert job_info in process_manager._job_tracker.jobs_pending_safety_check
+        assert job_info in process_manager._job_tracker.jobs_pending_submit
+        assert job_info.state == GENERATION_STATE.faulted
+        assert job_info.job_image_results is None
+
+    async def test_breaker_disabled_pending_job_faults_without_images(self) -> None:
+        """A job already queued for post-processing when the breaker flips is not left pending."""
+        process_manager = make_testable_process_manager()
+        process_manager._state.post_processing_disabled_by_breaker = True
+        process_manager._state.post_processing_disabled_reason = "post-processing disabled by test"
+        job_info = _make_pp_job_info()
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        assert job_info not in process_manager._job_tracker.jobs_pending_post_processing
+        assert job_info in process_manager._job_tracker.jobs_pending_submit
+        assert job_info.state == GENERATION_STATE.faulted
+        assert job_info.job_image_results is None
+
+    async def test_breaker_trip_faults_pending_but_leaves_active_best_effort(self) -> None:
+        """Already-popped PP work is bounded after the breaker flips.
+
+        Pending jobs are faulted on the next orchestrator pass; an active lane job is left alone so it can
+        finish best-effort. If it does not return, the post-processing orphan watchdog owns the bounded fault.
+        """
+        process_manager = make_testable_process_manager(
+            post_processing_fault_threshold=1,
+            post_processing_fault_window_seconds=1800,
+        )
+        pending_job = _make_pp_job_info()
+        active_job = _make_pp_job_info()
+        tracker = process_manager._job_tracker
+        await tracker.queue_for_post_processing(pending_job)
+        await tracker.queue_for_post_processing(active_job)
+        await tracker.begin_post_processing(active_job)
+
+        for _ in range(2):
+            tracker.note_post_processing_overcommit_fault()
+        process_manager._apply_post_processing_fault_breaker()
+        await process_manager.start_post_processing()
+
+        assert pending_job in tracker.jobs_pending_submit
+        assert pending_job.state == GENERATION_STATE.faulted
+        assert pending_job.job_image_results is None
+        assert active_job in tracker.jobs_being_post_processed
 
     async def test_paused_lane_does_not_age_jobs_out(self) -> None:
         """During a deliberate whole-card pause the patience clock stays unarmed.
 
         The residency lifecycle restarts the lane when the card is released, so jobs wait for the real
-        lane rather than forfeiting their post-processing to a raw-image submit.
+        lane rather than being immediately faulted during the residency window.
         """
         process_manager = make_testable_process_manager()
         process_manager._process_lifecycle._post_process_gpu_paused = True
@@ -113,7 +158,7 @@ class TestStartPostProcessing:
 
         Co-running a chain against active sampling on a card that cannot hold both peaks silently
         demand-pages both sides for the whole overlap; the chain waits for the card instead. The
-        patience record arms so a never-idle card still ages the job out to a raw-image submit.
+        patience record arms so a never-idle card still ages the job out to a no-image fault.
         """
         process_manager = make_testable_process_manager()
         lane = _make_lane_process()
@@ -309,11 +354,10 @@ class TestPostProcessResultHandling:
 
         assert process_manager._reserve_ledger.total_vram_mb() == 0.0
 
-    async def test_faulted_result_falls_back_to_raw_images(self) -> None:
-        """A faulted result keeps the raw images, feeds the breaker window, and still reaches safety."""
+    async def test_faulted_result_reports_no_image_fault(self) -> None:
+        """A faulted result clears images, feeds the breaker window, and reaches submit as a fault."""
         process_manager = make_testable_process_manager()
         job_info = await self._job_being_post_processed(process_manager)
-        raw_results = job_info.job_image_results
 
         message = HordePostProcessResultMessage(
             process_id=7,
@@ -327,8 +371,9 @@ class TestPostProcessResultHandling:
 
         await process_manager._message_dispatcher._handle_post_process_result(message)
 
-        assert job_info in process_manager._job_tracker.jobs_pending_safety_check
-        assert job_info.job_image_results == raw_results
+        assert job_info in process_manager._job_tracker.jobs_pending_submit
+        assert job_info.state == GENERATION_STATE.faulted
+        assert job_info.job_image_results is None
         assert process_manager._job_tracker.count_recent_post_processing_faults(60.0) == 1
 
 
@@ -356,8 +401,8 @@ class TestPostProcessOrphanRecovery:
         assert coordinator.post_process_requeue_count[job_id] == 1
         assert process_manager._reserve_ledger.total_vram_mb() == 0.0
 
-    async def test_orphan_falls_back_to_raw_images_after_budget(self) -> None:
-        """Once the requeue budget is spent, the job proceeds to safety with its raw images."""
+    async def test_orphan_faults_without_images_after_budget(self) -> None:
+        """Once the requeue budget is spent, the job is reported faulted without images."""
         process_manager = make_testable_process_manager()
         coordinator = process_manager._recovery_coordinator
         job_info = _make_pp_job_info()
@@ -374,7 +419,9 @@ class TestPostProcessOrphanRecovery:
 
         await coordinator.reconcile_orphaned_post_process_jobs()
 
-        assert job_info in tracker.jobs_pending_safety_check
+        assert job_info in tracker.jobs_pending_submit
+        assert job_info.state == GENERATION_STATE.faulted
+        assert job_info.job_image_results is None
         assert tracker.count_recent_post_processing_faults(60.0) == 1
         assert process_manager._reserve_ledger.total_vram_mb() == 0.0
 

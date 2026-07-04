@@ -433,14 +433,14 @@ _PP_DEFER_WARNING_THRESHOLD = 10
 
 
 def detect_post_processing_deferral_starvation(context: SessionContext) -> list[Finding]:
-    """The post-processing lane deferring the same job indefinitely instead of serving or degrading it.
+    """The post-processing lane deferring the same job indefinitely instead of serving or faulting it.
 
     The lane's admission gate compares a job's estimated peak (plus the configured reserve) against the
     card's free VRAM after commitments. When that inequality can never be satisfied for the head of the
     pending queue, the head is deferred every scheduling tick, everything behind it waits, and the
-    finished raw images are never submitted. The signature is one job accumulating deferral warnings by
-    the tens to hundreds; when no lane completion lands after the storm begins, the whole lane is
-    starved, not just the head.
+    worker never reports the job faulted. The signature is one job accumulating deferral warnings by the
+    tens to hundreds; when no lane completion lands after the storm begins, the whole lane is starved, not
+    just the head.
     """
     defer_records: dict[str, list[LogRecord]] = {}
     for record in context.session.records:
@@ -466,8 +466,8 @@ def detect_post_processing_deferral_starvation(context: SessionContext) -> list[
     verdict = (
         f"Job {worst_job} was deferred by the post-processing admission gate {len(worst)} time(s) "
         f"({len(defer_records)} job(s) deferred in total). Its estimated peak plus the VRAM reserve never "
-        "fit the card's free-after-commitments figure, and no aging or raw-image fallback ever released it, "
-        "so its finished inference was held unsubmitted."
+        "fit the card's free-after-commitments figure, and no bounded no-image fault ever released it, so its "
+        "finished inference was held unsubmitted."
     )
     if lane_fully_starved:
         verdict += (
@@ -484,7 +484,7 @@ def detect_post_processing_deferral_starvation(context: SessionContext) -> list[
                 "Verify the admission inputs: the free-VRAM figure must reflect the lane's card (not a stale "
                 "minimum across children) and must not re-subtract commitments already realised in the "
                 "measurement, and the per-chain peak estimate must match measured op costs. A deferred job "
-                "must age out to a raw-image submit after a bounded wait instead of parking forever, and "
+                "must age out to a no-image fault after a bounded wait instead of parking forever, and "
                 "fittable jobs behind an unfittable head must be dispatched ahead of it. As a stopgap, "
                 "lower resident VRAM on the lane's card (fewer processes or models) or disable "
                 "post-processing on this worker."

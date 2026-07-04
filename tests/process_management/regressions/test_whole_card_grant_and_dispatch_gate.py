@@ -26,10 +26,19 @@ import time
 from unittest.mock import Mock
 
 import pytest
+from horde_sdk.ai_horde_api import GENERATION_STATE
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState, ModelLoadState
+from horde_worker_regen.process_management.ipc.messages import (
+    HordeControlFlag,
+    HordeImageResult,
+    HordeProcessState,
+    ModelLoadState,
+)
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
@@ -37,7 +46,10 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     _CORESIDENT_SIBLING_MODEL_FLOOR_MB,
     StreamForecast,
 )
-from horde_worker_regen.process_management.scheduling.inference_scheduler import _WHOLE_CARD_ESTABLISH_GRACE_SECONDS
+from horde_worker_regen.process_management.scheduling.inference_scheduler import (
+    _WHOLE_CARD_ESTABLISH_GRACE_SECONDS,
+    InferenceScheduler,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -401,6 +413,128 @@ def _make_real_plm(
         abort_callback=Mock(),
         state=WorkerState(),
     )
+
+
+def _make_pp_job_info() -> HordeJobInfo:
+    """Build a post-inference job that is waiting for the dedicated post-processing lane."""
+    job = make_job_pop_response(_FLUX_MODEL, post_processing=["RealESRGAN_x4plus"])
+    return HordeJobInfo(
+        sdk_api_job_info=job,
+        job_image_results=[HordeImageResult(image_bytes=b"raw-image")],
+        state=GENERATION_STATE.ok,
+        time_popped=time.time(),
+    )
+
+
+def _scheduler_with_post_process_lane(
+    *,
+    job_tracker: JobTracker | None = None,
+) -> tuple[InferenceScheduler, ProcessLifecycleManager, WorkerState, HordeProcessInfo]:
+    """Create a scheduler whose post-processing lane is a real lifecycle-managed process."""
+    state = WorkerState()
+    tracker = job_tracker or JobTracker()
+    bridge_data = _bridge_data(post_processing_lane_enabled=True)
+    pp_process = make_mock_process_info(
+        50,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.POST_PROCESS,
+    )
+    pp_process.total_vram_mb = _CARD16_TOTAL_MB
+    pp_process.vram_usage_mb = _CARD16_PPO_MB
+    process_map = ProcessMap({50: pp_process})
+    horde_model_map = HordeModelMap(root={})
+    scheduler = _make_inference_scheduler(
+        state=state,
+        process_map=process_map,
+        job_tracker=tracker,
+        horde_model_map=horde_model_map,
+        bridge_data=bridge_data,
+        max_concurrent=1,
+        max_inference=1,
+    )
+    lifecycle = _make_real_plm(
+        process_map=process_map,
+        job_tracker=tracker,
+        horde_model_map=horde_model_map,
+        bridge_data=bridge_data,
+    )
+    scheduler._process_lifecycle = lifecycle
+    return scheduler, lifecycle, state, pp_process
+
+
+class TestWholeCardPostProcessLanePolicy:
+    """The whole-card residency lever unloads or disables PP; it never strands queued PP work."""
+
+    def test_context_compatible_residency_unloads_pp_models_without_disabling_lane(self) -> None:
+        """When the bare PP context fits, residency asks the lane to unload models but keeps PP enabled."""
+        scheduler, lifecycle, state, pp_process = _scheduler_with_post_process_lane()
+        forecast = _forecast_16gb(
+            weights_mb=10000.0,
+            reserve_mb=_FLUX_ESTABLISH_RESERVE_MB,
+            free_now_mb=_FLUX16_ESTABLISH_FREE_NOW_MB,
+            wants_whole_card=True,
+        )
+
+        paused = scheduler._pause_post_process_for_residency_if_idle(
+            None,
+            model_name=_FLUX_MODEL,
+            forecast=forecast,
+        )
+
+        assert paused is True
+        assert pp_process.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        assert lifecycle.is_post_process_gpu_paused is False
+        assert state.post_processing_disabled_by_breaker is False
+
+    def test_context_incompatible_idle_lane_disables_pp_and_stops_lane(self) -> None:
+        """If the PP context itself cannot coexist with the whole-card model, PP is disabled for the session."""
+        scheduler, lifecycle, state, pp_process = _scheduler_with_post_process_lane()
+        forecast = _forecast_16gb(
+            weights_mb=_FLUX_WEIGHTS_MB,
+            reserve_mb=_FLUX_ESTABLISH_RESERVE_MB,
+            free_now_mb=_FLUX16_ESTABLISH_FREE_NOW_MB,
+            wants_whole_card=True,
+        )
+
+        paused = scheduler._pause_post_process_for_residency_if_idle(
+            None,
+            model_name=_FLUX_MODEL,
+            forecast=forecast,
+        )
+
+        assert paused is True
+        assert state.post_processing_disabled_by_breaker is True
+        assert _FLUX_MODEL in state.post_processing_disabled_reason
+        assert lifecycle.is_post_process_gpu_paused is True
+        assert lifecycle.post_process_processes_should_be_replaced is True
+        assert pp_process.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+    async def test_context_incompatible_backlog_disables_pp_but_leaves_lane_for_drain(self) -> None:
+        """A queued PP job blocks stopping the lane; the orchestrator owns the bounded no-image fault."""
+        tracker = JobTracker()
+        pending_job = _make_pp_job_info()
+        await tracker.queue_for_post_processing(pending_job)
+        scheduler, lifecycle, state, pp_process = _scheduler_with_post_process_lane(job_tracker=tracker)
+        forecast = _forecast_16gb(
+            weights_mb=_FLUX_WEIGHTS_MB,
+            reserve_mb=_FLUX_ESTABLISH_RESERVE_MB,
+            free_now_mb=_FLUX16_ESTABLISH_FREE_NOW_MB,
+            wants_whole_card=True,
+        )
+
+        paused = scheduler._pause_post_process_for_residency_if_idle(
+            None,
+            model_name=_FLUX_MODEL,
+            forecast=forecast,
+        )
+
+        assert paused is False
+        assert state.post_processing_disabled_by_breaker is True
+        assert pending_job in tracker.jobs_pending_post_processing
+        assert lifecycle.is_post_process_gpu_paused is False
+        assert lifecycle.post_process_processes_should_be_replaced is False
+        assert pp_process.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
 
 
 class TestReservedHeadNeverWaitsIndefinitely:

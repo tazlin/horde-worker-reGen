@@ -1105,22 +1105,69 @@ class InferenceScheduler:
         return device_index == self._process_lifecycle.post_process_lane_card_index()
 
     def _has_post_process_backlog(self) -> bool:
-        """Return whether a post-processing job is actively on the lane (interrupting it loses its result).
+        """Return whether a post-processing job is pending or actively on the lane.
 
-        Keyed on jobs *being* post-processed, not merely pending: a pending job is handled by the orchestrator's
-        aging escape (raw-image submit) while the lane is down, but a job mid-upscale on the lane would be
-        recorded known-lost and requeued. Mirrors :meth:`_has_safety_backlog` so the lane is stopped only at an
-        idle moment.
+        Whole-card residency must leave a bounded window for post-processing jobs that peel off the resident
+        model. Pending work therefore counts as backlog: the normal residency lever is to unload the idle lane's
+        modules from VRAM, not to remove the lane and strand its queue. The one exception is a structurally
+        incompatible card/model/lane combination, which first disables post-processing for the session and then
+        stops the idle lane so the heavy model can fit.
         """
-        return bool(self._job_tracker.jobs_being_post_processed)
+        return bool(self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed)
 
-    def _pause_post_process_for_residency_if_idle(self, device_index: int | None) -> bool:
-        """Stop the post-processing lane for whole-card residency only when no job is mid-flight on it."""
+    def _post_process_context_fits_with_residency(
+        self,
+        forecast: StreamForecast,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Whether the residency model can load with the post-processing lane's bare context alive."""
+        if not self._residency_should_pause_post_process(device_index):
+            return True
+        if forecast.weights_mb is None or forecast.total_vram_mb is None:
+            return True
+        target = self._whole_card_ledger.target_process_count(forecast)
+        marginal = forecast._effective_marginal_overhead_mb  # noqa: SLF001 - same budget object owns the estimate.
+        extra_contexts = max(0, target - 1) + 1  # surviving inference siblings plus the PP lane context.
+        free_with_pp_lane_mb = max(
+            0.0,
+            float(forecast.total_vram_mb) - forecast.per_process_overhead_mb - marginal * extra_contexts,
+        )
+        return (free_with_pp_lane_mb - forecast.weights_mb) >= forecast._effective_base_reserve  # noqa: SLF001
+
+    def _disable_post_processing_for_whole_card(self, model_name: str | None, forecast: StreamForecast) -> None:
+        """Session-disable post-processing because a whole-card model cannot fit beside the lane context."""
+        if self._state.post_processing_disabled_by_breaker:
+            return
+        model = model_name or "the whole-card model"
+        self._state.post_processing_disabled_by_breaker = True
+        self._state.post_processing_breaker_tripped_at = time.time()
+        self._state.post_processing_disabled_reason = (
+            f"Disabled: {model} needs whole-card residency and cannot fit beside the dedicated "
+            "post-processing lane's GPU context. Disable post-processing or move this workload to a card "
+            "with more VRAM, then restart."
+        )
+        logger.warning(
+            f"Disabling post-processing for this session: {model} needs whole-card residency and cannot fit "
+            "beside the dedicated post-processing lane's GPU context. Keeping post-processing enabled would "
+            "thrash the large model in and out of VRAM for every post-processing job. To restore it, disable "
+            "whole-card models or post-processing for this worker, move the workload to a larger card, and restart.",
+        )
+
+    def _pause_post_process_for_residency_if_idle(
+        self,
+        device_index: int | None,
+        *,
+        model_name: str | None,
+        forecast: StreamForecast,
+    ) -> bool:
+        """Reclaim the post-processing lane for residency without stranding supported PP work."""
         if not self._residency_should_pause_post_process(device_index):
             return False
-        if self._process_lifecycle.is_post_process_gpu_paused:
-            return False
-        if self._has_post_process_backlog():
+        if self._post_process_context_fits_with_residency(forecast, device_index=device_index):
+            return self.unload_post_process_models_from_vram(device_index=device_index)
+        self._disable_post_processing_for_whole_card(model_name, forecast)
+        if self._process_lifecycle.is_post_process_gpu_paused or self._has_post_process_backlog():
             return False
         return self._process_lifecycle.pause_post_process_off_gpu()
 
@@ -1169,7 +1216,11 @@ class InferenceScheduler:
             )
 
         safety_paused = self._pause_safety_for_residency_if_idle(device_index)
-        post_process_paused = self._pause_post_process_for_residency_if_idle(device_index)
+        post_process_paused = self._pause_post_process_for_residency_if_idle(
+            device_index,
+            model_name=job.model,
+            forecast=forecast,
+        )
 
         if announce or after < current or safety_paused or post_process_paused:
             safety_note = " and moving safety off-GPU" if safety_paused else ""
@@ -1321,7 +1372,8 @@ class InferenceScheduler:
                     whole_card_model=model,
                 )
             self._pause_safety_for_residency_if_idle(device_index)
-            self._pause_post_process_for_residency_if_idle(device_index)
+            if forecast is not None:
+                self._pause_post_process_for_residency_if_idle(device_index, model_name=model, forecast=forecast)
 
     def _whole_card_residency_has_holder(self, model: str, device_index: int | None) -> bool:
         """Whether a held whole-card model is staged or resident on a live process.
@@ -1447,7 +1499,10 @@ class InferenceScheduler:
             loaded_process_count=self._process_map.num_loaded_inference_processes(device_index=device_index),
             safety_pause_required=self._residency_should_pause_safety(device_index),
             safety_paused=self._process_lifecycle.is_safety_gpu_paused,
-            post_process_pause_required=self._residency_should_pause_post_process(device_index),
+            post_process_pause_required=(
+                self._residency_should_pause_post_process(device_index)
+                and not self._post_process_context_fits_with_residency(forecast, device_index=device_index)
+            ),
             post_process_cleared=self._process_map.num_post_process_processes(device_index=device_index) == 0,
             weights_fit_live=self._whole_card_weights_fit_live(forecast, device_index=device_index),
             drain_backstop_elapsed=self._whole_card_drain_backstop_elapsed(device_index),
@@ -1675,6 +1730,7 @@ class InferenceScheduler:
             post_process_restored = (
                 self._process_lifecycle.restore_post_process_off_gpu()
                 if self._residency_should_pause_post_process(device_index)
+                and not self._state.post_processing_disabled_by_breaker
                 else False
             )
             ceiling = self._residency_restore_ceiling(device_index)
@@ -4790,6 +4846,37 @@ class InferenceScheduler:
             return True
 
         return not vram and self._is_recently_demanded(model_name)
+
+    def unload_post_process_models_from_vram(self, *, device_index: int | None = None) -> bool:
+        """Ask an idle post-processing lane to unload its modules while keeping the lane alive."""
+        unloaded_any = False
+        for process_info in self._process_map.values():
+            if process_info.process_type is not HordeProcessType.POST_PROCESS:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.is_process_busy():
+                logger.debug(f"Post-processing process {process_info.process_id} is busy")
+                continue
+            if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+                continue
+
+            logger.info(f"Unloading post-processing models from VRAM on process {process_info.process_id}")
+            if (
+                not process_info.safe_send_message(
+                    HordeControlMessage(control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM),
+                )
+                and not self._state.shutting_down
+            ):
+                logger.warning(
+                    f"Failed to send UNLOAD_MODELS_FROM_VRAM to post-processing process "
+                    f"{process_info.process_id}; marking the lane for replacement.",
+                )
+                self._process_lifecycle.post_process_processes_should_be_replaced = True
+            process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+            unloaded_any = True
+            self._record_churn("vram_eviction")
+        return unloaded_any
 
     def unload_models_from_vram(
         self,

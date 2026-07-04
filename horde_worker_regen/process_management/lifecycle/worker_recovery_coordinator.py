@@ -317,9 +317,10 @@ class WorkerRecoveryCoordinator:
     async def reconcile_orphaned_post_process_jobs(self) -> None:
         """Recover jobs stranded in post-processing whose result will never return.
 
-        Unlike a lost safety verdict, a lost post-processing result never forfeits the job: the raw
-        inference images are still held, so after bounded re-attempts the job proceeds to safety with
-        the raw images rather than being faulted.
+        Unlike a lost safety verdict, a lost post-processing result is recoverable for a bounded number of
+        re-attempts because the raw inference images are still held. If those attempts are exhausted the
+        worker reports a no-image fault to the horde; returning raw images would violate the post-processing
+        contract the worker advertised when it accepted the job.
         """
         now = self._clock()
         being_post_processed = self._job_tracker.jobs_being_post_processed
@@ -354,21 +355,22 @@ class WorkerRecoveryCoordinator:
 
             requeues = self.post_process_requeue_count.get(job_id, 0)
             if requeues >= self.POST_PROCESS_REQUEUE_MAX:
+                reason = f"post-processing result lost after {requeues} requeue attempt(s)"
                 logger.error(
                     f"Job {job_id} could not be post-processed (requeued {requeues} times without a "
-                    "result); submitting its raw images instead so the finished inference is not forfeited.",
+                    "result); reporting it faulted without images so the horde reissues it.",
                 )
                 self._action_ledger.record(
                     LedgerEventType.POST_PROCESS_FAULTED,
                     job_id=str(job_id),
-                    reason="post-processing unrecoverable",
+                    reason=reason,
                     detail={"stuck_seconds": round(now - first_seen, 1), "post_process_requeues": requeues},
                 )
                 self._job_tracker.note_post_processing_overcommit_fault()
-                taken_job_info = await self._job_tracker.take_being_post_processed(job_id)
                 self._reserve_ledger.release(POST_PROCESS_RESERVE_FLOW, str(job_id))
-                if taken_job_info is not None:
-                    await self._job_tracker.queue_for_safety_post_processed(taken_job_info)
+                tracked = self._job_tracker.get_tracked_job(job_id)
+                if tracked is not None and tracked.job_info is not None:
+                    await self._job_tracker.fault_post_inference_job(tracked.job_info, reason=reason)
                 self.orphan_post_process_since.pop(job_id, None)
                 self.post_process_requeue_count.pop(job_id, None)
                 continue

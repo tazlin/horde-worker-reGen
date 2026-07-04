@@ -422,6 +422,15 @@ def _build_checks(
                 "Disabled: LoRA cache disk is full and cannot be cleared. Free disk space to restore.",
             )
         )
+    if snapshot.post_processing_disabled:
+        checks.append(
+            HealthCheck(
+                "Post-processing",
+                HealthStatus.WARN,
+                snapshot.post_processing_disabled_reason
+                or "Disabled for this session after structural post-processing failures.",
+            )
+        )
 
     if snapshot.too_many_consecutive_failed_jobs:
         checks.append(

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from loguru import logger
 
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
+from horde_worker_regen.process_management.config.worker_state import WorkerState
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordePostProcessControlMessage,
@@ -25,13 +26,13 @@ from horde_worker_regen.process_management.resources.resource_budget import (
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 
 _ADMISSION_PATIENCE_SECONDS = 90.0
-"""How long a job may sit unfittable in the pending post-processing queue before its raw images are
-submitted instead.
+"""How long a job may sit unfittable in the pending post-processing queue before it is faulted.
 
 A chain whose estimated peak plus the VRAM reserve never fits the lane card's free VRAM would otherwise
-be deferred forever, forfeiting its finished inference. Past this window the job's raw (un-post-processed)
-images are delivered to the safety stage so the generation is never lost. Sits below the orphan-recovery
-grace and the server-side timeout so a structurally unfittable chain terminates well within patience."""
+be deferred forever. Past this window the worker reports the job faulted with no images so the horde reissues
+it to another worker; returning raw images would violate the post-processing contract the worker advertised.
+Sits below the orphan-recovery grace and the server-side timeout so a structurally unfittable chain terminates
+well within patience."""
 
 _DEFER_LOG_INTERVAL_SECONDS = 30.0
 """Minimum spacing between repeated deferral warnings for one job.
@@ -61,6 +62,7 @@ class PostProcessOrchestrator:
     _job_tracker: JobTracker
     _process_lifecycle: ProcessLifecycleManager
     _runtime_config: RuntimeConfig
+    _state: WorkerState
     _model_metadata: ModelMetadata
     _reserve_ledger: CommittedReserveLedger
     _request_vram_reclaim: Callable[[HordeProcessInfo, int], bool]
@@ -73,6 +75,7 @@ class PostProcessOrchestrator:
         job_tracker: JobTracker,
         process_lifecycle: ProcessLifecycleManager,
         runtime_config: RuntimeConfig,
+        state: WorkerState,
         model_metadata: ModelMetadata,
         reserve_ledger: CommittedReserveLedger,
         request_vram_reclaim: Callable[[HordeProcessInfo, int], bool],
@@ -87,6 +90,7 @@ class PostProcessOrchestrator:
             process_lifecycle (ProcessLifecycleManager): The process lifecycle manager to signal if the
                 post-processing lane needs to be replaced.
             runtime_config (RuntimeConfig): Holds the current bridge configuration snapshot.
+            state: Shared worker state, including session-latched post-processing suppression.
             model_metadata: Provides the baseline needed for post-processing VRAM estimates.
             reserve_ledger: Shared committed-resource ledger used by every workload flow.
             request_vram_reclaim: Callback that asks the scheduler to evict idle VRAM on the lane's card.
@@ -97,6 +101,7 @@ class PostProcessOrchestrator:
         self._job_tracker = job_tracker
         self._process_lifecycle = process_lifecycle
         self._runtime_config = runtime_config
+        self._state = state
         self._model_metadata = model_metadata
         self._reserve_ledger = reserve_ledger
         self._request_vram_reclaim = request_vram_reclaim
@@ -203,13 +208,19 @@ class PostProcessOrchestrator:
         - **Queue scan**: the first *fittable* pending job is dispatched, so an unfittable head never
           blocks the fittable jobs queued behind it.
         - **Aging escape**: a job that has been unfittable for longer than the admission-patience window is
-          submitted with its raw images, so its finished inference is delivered rather than parked forever.
+          reported faulted without images, so the horde reissues it rather than the worker parking it forever.
         - **One-shot reclaim**: an unfittable job asks the scheduler to evict idle VRAM once per starvation
           episode, not once per scheduling tick.
         """
         pending = self._job_tracker.jobs_pending_post_processing
         self._prune_deferrals(pending)
         if not pending:
+            return
+
+        if self._state.post_processing_disabled_by_breaker:
+            reason = self._state.post_processing_disabled_reason or "post-processing disabled for this session"
+            for job_info in list(pending):
+                await self._fault_without_images(job_info, reason=reason)
             return
 
         now = self._clock()
@@ -225,9 +236,9 @@ class PostProcessOrchestrator:
         # Deferral records are otherwise only created against a live lane process, so with the lane
         # absent (crashed, failed to start, or torn down without coming back) no patience clock would
         # ever start and these jobs would wait forever. Arm the clock here so the aging escape below
-        # can deliver their raw images. A deliberate whole-card pause is excluded: the residency
-        # lifecycle restarts the lane when the card is released, so those jobs wait for the real lane
-        # rather than forfeiting their post-processing.
+        # can fault them. A deliberate whole-card pause is excluded: the residency lifecycle restarts the
+        # lane when the card is released, so those jobs wait for the real lane unless post-processing is
+        # session-disabled as structurally unsupported.
         if (
             self._process_map.num_post_process_processes() == 0
             and not self._process_lifecycle.is_post_process_gpu_paused
@@ -242,10 +253,10 @@ class PostProcessOrchestrator:
                     )
                     logger.warning(
                         f"Post-processing lane has no process; starting the patience window for job "
-                        f"{job_info.sdk_api_job_info.id_} (raw images are submitted if the lane does not return).",
+                        f"{job_info.sdk_api_job_info.id_} (the job is faulted if the lane does not return).",
                     )
 
-        # A raw-image submit needs no lane, so age out unservable jobs whether or not the lane is free: a
+        # A no-image fault needs no lane, so age out unservable jobs whether or not the lane is free: a
         # busy or unfittable head must never hold a long-waiting job past its patience window.
         await self._age_out_unfittable(now=now)
 
@@ -276,7 +287,7 @@ class PostProcessOrchestrator:
                 # would silently demand-page both for the whole overlap. Wait for the sampling to finish
                 # (seconds; the dispatch-side gate keeps the next sampling job from jumping in over an
                 # already-running chain). The patience record still arms so a pathological never-idle
-                # card ages the job out to a raw-image submit rather than parking it forever.
+                # card ages the job out to a no-image fault rather than parking it forever.
                 key = str(completed_job_info.sdk_api_job_info.id_)
                 if key not in self._deferrals:
                     self._deferrals[key] = _DeferralRecord(
@@ -311,11 +322,10 @@ class PostProcessOrchestrator:
         return False
 
     async def _age_out_unfittable(self, *, now: float) -> None:
-        """Submit the raw images of any job that has been unfittable past the admission-patience window.
+        """Fault any job that has been unfittable past the admission-patience window.
 
-        The job's finished inference is delivered un-post-processed rather than forfeited. It is an
-        admission decision, not a lane fault, so it does not feed the lane's fault breaker; the lane never
-        ran the job.
+        This is an admission decision, not a lane fault, but it still feeds the lane's fault breaker because
+        the worker accepted post-processing work it could not host.
         """
         for job_info in list(self._job_tracker.jobs_pending_post_processing):
             job_id = job_info.sdk_api_job_info.id_
@@ -324,13 +334,25 @@ class PostProcessOrchestrator:
                 continue
 
             waited = now - record.first_deferred_at
-            logger.warning(
-                f"Post-processing for job {job_id} could not be admitted within {waited:.0f}s (no lane "
-                "process, or its estimated peak never fit the lane card's free VRAM after commitments); "
-                "submitting the raw images so the finished inference is not forfeited.",
+            reason = (
+                f"post-processing could not be admitted within {waited:.0f}s: no lane process, or its "
+                "estimated peak never fit the lane card's free VRAM after commitments"
             )
-            await self._job_tracker.queue_for_safety_post_processed(job_info)
+            logger.warning(
+                f"Post-processing for job {job_id} could not be admitted within {waited:.0f}s; faulting it."
+            )
+            await self._fault_without_images(job_info, reason=reason)
             self._deferrals.pop(str(job_id), None)
+
+    async def _fault_without_images(self, job_info: HordeJobInfo, *, reason: str) -> None:
+        """Terminally fault a post-inference job without submitting raw images."""
+        logger.error(
+            f"Faulting job {job_info.sdk_api_job_info.id_} without images: {reason}. "
+            "The horde will reissue it to another worker.",
+        )
+        self._job_tracker.note_post_processing_overcommit_fault()
+        await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
+        self._deferrals.pop(str(job_info.sdk_api_job_info.id_), None)
 
     def _is_deliverable(self, completed_job_info: HordeJobInfo, post_process_process: HordeProcessInfo) -> bool:
         """Return whether the job has the identity, result, and operations post-processing needs."""
@@ -351,12 +373,10 @@ class PostProcessOrchestrator:
         post_process_process: HordeProcessInfo,
     ) -> None:
         """Terminally fault an undeliverable job and remove it from the pending post-processing queue."""
-        bridge_data = self._runtime_config.bridge_data
-        await self._job_tracker.handle_job_fault(
-            faulted_job=completed_job_info.sdk_api_job_info,
-            process_info=post_process_process,
-            process_timeout=bridge_data.process_timeout,
-            retryable=False,
+        reason = "job could not be started on the post-processing lane"
+        await self._job_tracker.fault_post_inference_job(
+            completed_job_info,
+            reason=reason,
         )
         logger.error(f"Failed to start post-processing for job {completed_job_info.sdk_api_job_info.id_}")
         await self._job_tracker.abandon_pending_post_processing(completed_job_info)

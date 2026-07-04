@@ -657,6 +657,7 @@ def start_fake_inference_process(
     dry_run_inference_delay: float = 1.0,
     gpu_sampling_lease: Semaphore | None = None,
     expect_image_models: bool = True,
+    shared_components_endpoint: object | None = None,
     fail_every_n: int = 0,
     fault_profile: FaultProfile | None = None,
     sim_vram_ledger: SimVramLedger | None = None,
@@ -667,7 +668,8 @@ def start_fake_inference_process(
 
     Signature-compatible with ``worker_entry_points.start_inference_process`` so it can
     be injected as a drop-in multiprocessing target. Memory/GPU related arguments (and
-    ``expect_image_models``, which only gates the real worker's image-model presence check)
+    ``expect_image_models``, which only gates the real worker's image-model presence check, and
+    ``shared_components_endpoint``, which only the real worker registers with hordelib)
     are accepted and ignored; ``dry_run_inference_delay`` controls how long fake jobs take.
     ``fail_every_n`` makes every nth job report a faulted result (0 = never), and
     ``fault_profile`` scripts richer misbehaviour (hang, crash, drop heartbeats, slow, OOM,
@@ -677,6 +679,7 @@ def start_fake_inference_process(
     (stall-and-recover vs. complete) without a GPU. Inject any of these with ``functools.partial``
     (partials of module-level functions stay picklable under spawn).
     """
+    _ = shared_components_endpoint
     enable_child_faulthandler(f"fake_inference_{process_id}")
     logger.remove()
     maybe_wait_for_process_debugger(process_id, "fake inference")

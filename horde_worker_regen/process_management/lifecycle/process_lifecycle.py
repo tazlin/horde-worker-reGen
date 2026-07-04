@@ -314,8 +314,8 @@ class ProcessLifecycleManager:
         # models are freed for the heavy model. On a tight card (Flux ~11.5GB weights + ~3GB activation on a
         # 16GB card) the lane's ~1.4GB bare context alone tips the head into host-RAM weight streaming, so it
         # must vacate the card exactly as safety does. The lane is restarted after the residency restores;
-        # in-flight post-processing work is recorded known-lost so the recovery coordinator requeues it (it
-        # ages out to a raw-image submit rather than faulting).
+        # in-flight post-processing work is recorded known-lost so the recovery coordinator requeues it
+        # (bounded), then reports a no-image fault if the lane cannot return a result.
         self._post_process_gpu_paused = False
         self._post_process_gpu_pause_count = 0
         self._post_process_gpu_restore_count = 0
@@ -1313,7 +1313,7 @@ class ProcessLifecycleManager:
         the crash-recovery count. Unlike safety, the lane does not come back cpu_only (post-processing on CPU
         is impractically slow): it stays stopped until :meth:`restore_post_process_off_gpu` clears the pause.
         Any post-processing job in flight on the lane is recorded known-lost so the recovery coordinator
-        requeues it (it ages out to a raw-image submit rather than faulting).
+        requeues it (bounded), then reports a no-image fault if the lane cannot return a result.
 
         Returns:
             True if a pause was initiated, False if it was already paused or the lane is not enabled.

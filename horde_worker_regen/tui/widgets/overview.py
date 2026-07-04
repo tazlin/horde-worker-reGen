@@ -1194,7 +1194,10 @@ class OverviewView(Vertical):
         if config.allow_controlnet:
             flags.append("controlnet")
         if config.allow_post_processing:
-            flags.append("post")
+            if snapshot.post_processing_disabled:
+                flags.append("post OFF")
+            else:
+                flags.append("post")
         return ", ".join(flags) if flags else "none"
 
     @staticmethod

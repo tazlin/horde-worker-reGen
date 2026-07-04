@@ -139,7 +139,7 @@ result to the parent. Each such reap feeds the post-processing fault breaker (se
 post-processing stall. Post-processing runs on the dedicated lane (see
 [Process lanes and job chaining](process_lanes_and_chaining.md)), so a reap replaces
 only that lane; the affected job is requeued by the orphan watchdog and, after
-bounded re-attempts, proceeds with its raw images rather than faulting.
+bounded re-attempts, is reported as a no-image fault so the horde can reissue it.
 
 When a process exceeds its timeout, it is **replaced immediately** within the
 same call (see below); there is no separate notification sent to the message

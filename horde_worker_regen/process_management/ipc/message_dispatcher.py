@@ -773,23 +773,61 @@ class MessageDispatcher:
                 await self._job_tracker.queue_for_post_processing(job_info)
                 return
             # The lane is the only post-processing path; with it disabled the job should never have been
-            # popped with post-processing at all. Deliver the raw images rather than strand the job.
+            # popped with post-processing at all. Report a no-image fault so the horde reissues it instead
+            # of silently returning a result that did not receive the requested post-processing.
+            reason = "job requested post-processing but the dedicated post-processing lane is disabled"
             logger.error(
                 f"Job {message.sdk_api_job_info.id_} requested post-processing "
                 f"({requested_post_processing}) but the dedicated post-processing lane is disabled; "
-                "submitting the raw images.",
+                "reporting the job faulted without images.",
             )
+            self._job_tracker.note_post_processing_overcommit_fault()
+            await self._job_tracker.fault_post_inference_job(job_info, reason=reason)
+            return
 
         await self._job_tracker.queue_for_safety(job_info)
 
     async def _handle_post_process_result(self, message: HordePostProcessResultMessage) -> None:
         """Handle a post-processing result: adopt the processed images and move the job on to safety.
 
-        A faulted post-processing pass falls back to the raw images (recorded as a post-processing fault
-        against the feature's circuit window) so the job still completes; re-running inference cannot fix
-        a post-processing failure, and dropping the job would forfeit work that already succeeded.
+        A faulted post-processing pass is reported to the horde as a no-image fault. The worker advertised
+        post-processing for this job, so returning raw images would violate the job contract; the horde should
+        reissue the job to another worker instead.
         """
         self._release_post_process_reserve(message.job_id)
+
+        if message.time_elapsed is not None:
+            logger.info(
+                f"Post-processing finished for job {str(message.job_id)[:8]} in "
+                f"{round(message.time_elapsed, 2)} seconds on process {message.process_id}.",
+            )
+
+        if message.state == GENERATION_STATE.faulted or message.job_image_results is None:
+            tracked = self._job_tracker.get_tracked_job(message.job_id)
+            if tracked is None or tracked.job_info is None:
+                logger.error(
+                    f"Post-processing faulted for job {message.job_id} on process {message.process_id}, "
+                    "but the job is no longer tracked.",
+                )
+                return
+            logger.error(
+                f"Post-processing faulted for job {message.job_id} on process {message.process_id}; "
+                "reporting the job faulted without images so the horde reissues it.",
+            )
+            self._job_tracker.note_post_processing_overcommit_fault()
+            self._action_ledger.record(
+                LedgerEventType.POST_PROCESS_FAULTED,
+                process_id=message.process_id,
+                job_id=str(message.job_id),
+                reason=message.info or "post-processing failed",
+                detail={"fallback": "fault_no_images"},
+            )
+            await self._job_tracker.fault_post_inference_job(
+                tracked.job_info,
+                reason=message.info or "post-processing failed",
+            )
+            return
+
         completed_job_info = await self._job_tracker.take_being_post_processed(message.job_id)
 
         if completed_job_info is None:
@@ -799,27 +837,7 @@ class MessageDispatcher:
             )
             return
 
-        if message.time_elapsed is not None:
-            logger.info(
-                f"Post-processing finished for job {str(message.job_id)[:8]} in "
-                f"{round(message.time_elapsed, 2)} seconds on process {message.process_id}.",
-            )
-
-        if message.state == GENERATION_STATE.faulted or message.job_image_results is None:
-            logger.error(
-                f"Post-processing faulted for job {message.job_id} on process {message.process_id}; "
-                "submitting the raw images instead.",
-            )
-            self._job_tracker.note_post_processing_overcommit_fault()
-            self._action_ledger.record(
-                LedgerEventType.POST_PROCESS_FAULTED,
-                process_id=message.process_id,
-                job_id=str(message.job_id),
-                reason=message.info or "post-processing failed",
-                detail={"fallback": "raw_images"},
-            )
-        else:
-            completed_job_info.job_image_results = message.job_image_results
+        completed_job_info.job_image_results = message.job_image_results
 
         await self._job_tracker.queue_for_safety_post_processed(completed_job_info)
 

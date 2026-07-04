@@ -1005,6 +1005,32 @@ class JobTracker:
             return
         tracked.job_info = job_info
 
+    async def fault_post_inference_job(self, job_info: HordeJobInfo, *, reason: str) -> None:
+        """Fault a job after inference produced images, without submitting those images.
+
+        Downstream worker-owned stages must either honor the advertised contract or report a no-image fault so
+        the horde reissues the job. Inference completion was already counted when the raw images arrived, so
+        this method only clears those images, records a diagnostic, and moves the tracked job to submit.
+        """
+        tracked = self._tracked_for(job_info.sdk_api_job_info)
+        if tracked is None:
+            logger.error(f"Job {job_info.sdk_api_job_info.id_} is not tracked; cannot fault it")
+            return
+        job_info.fault_job()
+        tracked.job_info = job_info
+        self._job_faults.setdefault(tracked.job_id, []).append(
+            GenMetadataEntry(
+                type=METADATA_TYPE.information,
+                value=METADATA_VALUE.see_ref,
+                ref=f"faulted after inference: {reason}"[:255],
+            ),
+        )
+        if not self._set_stage(tracked, JobStage.PENDING_SUBMIT):
+            logger.warning(
+                f"Refusing to fault post-inference job {job_info.sdk_api_job_info.id_} from stage "
+                f"{tracked.stage.name}; keeping its existing state.",
+            )
+
     async def begin_safety_check(self, job_info: HordeJobInfo) -> None:
         """Begin the safety check process for a job."""
         tracked = self._tracked_for(job_info.sdk_api_job_info)
@@ -1212,6 +1238,7 @@ class JobTracker:
         is_resource_failure: bool = False,
         retryable: bool = True,
         scheduling_fault: bool = False,
+        fault_reason: str | None = None,
     ) -> InferenceFailureResolution:
         """Resolve a faulted job: requeue it for another (possibly degraded) attempt, or fault it.
 
@@ -1228,6 +1255,7 @@ class JobTracker:
             is_resource_failure=is_resource_failure,
             retryable=retryable,
             scheduling_fault=scheduling_fault,
+            fault_reason=fault_reason,
         )
 
     def handle_job_fault_now(
@@ -1239,6 +1267,7 @@ class JobTracker:
         is_resource_failure: bool = False,
         retryable: bool = True,
         scheduling_fault: bool = False,
+        fault_reason: str | None = None,
     ) -> InferenceFailureResolution:
         """Synchronous fault path for sync callers (e.g. process crash handling). See :meth:`handle_job_fault`."""
         return self._resolve_inference_failure_impl(
@@ -1248,6 +1277,7 @@ class JobTracker:
             is_resource_failure=is_resource_failure,
             retryable=retryable,
             scheduling_fault=scheduling_fault,
+            fault_reason=fault_reason,
         )
 
     def _resolve_inference_failure_impl(
@@ -1259,6 +1289,7 @@ class JobTracker:
         is_resource_failure: bool,
         retryable: bool,
         scheduling_fault: bool = False,
+        fault_reason: str | None = None,
     ) -> InferenceFailureResolution:
         tracked = self._tracked_for(faulted_job)
 
@@ -1304,7 +1335,7 @@ class JobTracker:
         # Terminal fault: out of attempts, not retryable, or the requeue transition was refused.
         tracked.job_info.fault_job()
         tracked.job_info.time_to_generate = process_timeout
-        self._record_fault_diagnostics(tracked, is_resource_failure=resource_failure)
+        self._record_fault_diagnostics(tracked, is_resource_failure=resource_failure, fault_reason=fault_reason)
 
         # A terminal resource fault feeds the circuit-breaker (per-model "locally unservable" streak) and
         # the self-throttle backstop. A model the device cannot run faults every attempt no matter how it
@@ -1328,13 +1359,19 @@ class JobTracker:
             self._total_num_completed_jobs += 1
         return InferenceFailureResolution.FAULTED
 
-    def _record_fault_diagnostics(self, tracked: TrackedJob, *, is_resource_failure: bool) -> None:
+    def _record_fault_diagnostics(
+        self,
+        tracked: TrackedJob,
+        *,
+        is_resource_failure: bool,
+        fault_reason: str | None = None,
+    ) -> None:
         """Attach a fault diagnostic to the job so it rides along on the faulted submit's gen_metadata.
 
         A faulted job carries no image to hang per-image faults on, so this is the only record of *why*
         it faulted that reaches the horde. The reason and attempt count also aid local post-mortems.
         """
-        reason = "resource/OOM" if is_resource_failure else "inference failure"
+        reason = fault_reason or ("resource/OOM" if is_resource_failure else "inference failure")
         self._job_faults.setdefault(tracked.job_id, []).append(
             GenMetadataEntry(
                 type=METADATA_TYPE.information,

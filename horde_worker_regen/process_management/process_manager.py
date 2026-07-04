@@ -1038,8 +1038,8 @@ class HordeWorkerProcessManager:
             job_tracker=self._job_tracker,
             process_lifecycle=self._process_lifecycle,
             runtime_config=self._runtime_config,
-            model_metadata=self._model_metadata,
             state=self._state,
+            model_metadata=self._model_metadata,
         )
 
         self._shutdown_manager = ShutdownManager(
@@ -1079,6 +1079,7 @@ class HordeWorkerProcessManager:
             job_tracker=self._job_tracker,
             process_lifecycle=self._process_lifecycle,
             runtime_config=self._runtime_config,
+            state=self._state,
             model_metadata=self._model_metadata,
             reserve_ledger=self._reserve_ledger,
             request_vram_reclaim=lambda process_info, device_index: self._inference_scheduler.unload_models_from_vram(
@@ -1354,6 +1355,10 @@ class HordeWorkerProcessManager:
             return
         self._state.post_processing_disabled_by_breaker = True
         self._state.post_processing_breaker_tripped_at = now
+        self._state.post_processing_disabled_reason = (
+            f"{recent} post-processing over-commit faults in {window:.0f}s; disable post-processing or lower "
+            "max_threads/queue_size and restart."
+        )
         logger.warning(
             f"Post-processing fault breaker tripped: {recent} post-processing over-commit fault(s) in the last "
             f"{window:.0f}s (threshold {threshold}). Disabling post-processing on this worker for the rest of "
@@ -1927,7 +1932,7 @@ class HordeWorkerProcessManager:
             await self._recovery_coordinator.reconcile_orphaned_safety_jobs()
 
             # The post-processing analogue: re-attempt (bounded) any job stranded in POST_PROCESSING, then
-            # fall back to submitting its raw images so finished inference is never forfeited.
+            # report a no-image fault so the horde reissues work whose advertised post-processing could not run.
             await self._recovery_coordinator.reconcile_orphaned_post_process_jobs()
 
             # Save-our-ship: above the per-slot recovery, escalate a worker that is wedged as a whole
@@ -3750,6 +3755,8 @@ class HordeWorkerProcessManager:
             gpu_torch_incompatible_reason=(self._state.gpu_torch_incompatible_reason or None),
             torch_build_cpu_only=self._state.torch_build_cpu_only,
             torch_build_cpu_only_reason=(self._state.torch_build_cpu_only_reason or None),
+            post_processing_disabled=self._state.post_processing_disabled_by_breaker,
+            post_processing_disabled_reason=(self._state.post_processing_disabled_reason or None),
             worker_registered=self.user_info is not None,
             user_info_failed=self._user_info_failed,
             user_info_failed_reason=self._user_info_failed_reason,

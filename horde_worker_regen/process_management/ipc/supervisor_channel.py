@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from horde_worker_regen.process_management.resources.run_metrics import JobMetricsRecord
     from horde_worker_regen.process_management.resources.system_memory import SystemMemorySummary
 
-SUPERVISOR_PROTOCOL_VERSION = 16
+SUPERVISOR_PROTOCOL_VERSION = 17
 """Bumped when the snapshot/command schema changes incompatibly; the TUI checks it on connect.
 
 v2 added per-process ``num_jobs_completed`` and the snapshot's worker-details maintenance/paused and
@@ -61,6 +61,7 @@ non-retryable configuration problem (e.g. a worker name taken by another account
 stop relaunching and the dashboard can show the specific reason and remedy instead of a generic crash.
 v16 added post-processing lane counters and per-entry queue order so the TUI can show the image job route
 through the dedicated post-processing process.
+v17 added the operator-facing reason post-processing was session-disabled.
 """
 
 RECENT_JOBS_IN_SNAPSHOT = 25
@@ -927,6 +928,11 @@ class WorkerStateSnapshot(BaseModel):
     installing a GPU build and restarting."""
     torch_build_cpu_only_reason: str | None = None
     """Operator-facing detail for ``torch_build_cpu_only`` (why image gen is off + remedy); None when not tripped."""
+
+    post_processing_disabled: bool = False
+    """Post-processing is session-disabled and no longer advertised to the Horde."""
+    post_processing_disabled_reason: str | None = None
+    """Operator-facing detail for why post-processing was disabled; None when not tripped."""
 
     # Connectivity / health signals the worker already tracks (surfaced for the status monitor).
     worker_registered: bool = False

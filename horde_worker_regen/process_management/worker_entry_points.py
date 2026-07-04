@@ -640,7 +640,7 @@ def start_post_process_process(
         if not dry_run_skip_post_processing:
             # Cap the lane's caching allocator so its modules and retained pool can never squat the share
             # of the card the inference pool needs; a chain that cannot fit the cap faults inside the lane
-            # and the job is delivered with its raw images instead. After the device pin the lane sees its
+            # and the job is reported as a no-image fault instead. After the device pin the lane sees its
             # card as device 0. A no-op on non-CUDA backends.
             from horde_worker_regen.utils.vram_quota import POST_PROCESS_VRAM_QUOTA_MB, apply_process_vram_quota_mb
 
