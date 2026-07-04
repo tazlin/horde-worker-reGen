@@ -240,6 +240,7 @@ def start_inference_process(
     dry_run_inference_delay: float = 1.0,
     gpu_sampling_lease: Semaphore | None = None,
     expect_image_models: bool = True,
+    shared_components_endpoint: object | None = None,
 ) -> None:
     """Start an inference process.
 
@@ -271,6 +272,9 @@ def start_inference_process(
         expect_image_models (bool, optional): Whether this worker serves image generation. False for an
             alchemist-only worker (e.g. a CPU install) that loads no image models, so an empty image-model
             database is expected rather than a fatal error. Defaults to True.
+        shared_components_endpoint (object | None, optional): This child's endpoint onto the cross-process
+            component-sharing bus (a hordelib ``SharedComponentEndpoint``), or None when sharing is off.
+            Handed out by the parent only when ``HORDE_SHARED_COMPONENTS=1``. Defaults to None.
     """
     _spawn_timing_mark(process_id, "inference", "entry")
     # Must precede the first torch/hordelib import below so the allocator reads it, and the device mask
@@ -374,6 +378,18 @@ def start_inference_process(
             sys.exit(1)
 
         _spawn_timing_mark(process_id, "inference", "hordelib-initialised")
+
+        if shared_components_endpoint is not None:
+            # Install this process's component-sharing client: the checkpoint loader then dedupes
+            # byte-identical CLIP/VAE weights across sibling processes (CPU shared memory anywhere;
+            # the same VRAM via cudaIpc on Linux). Enabled explicitly because the parent only hands
+            # out endpoints when HORDE_SHARED_COMPONENTS=1; failure just leaves sharing off.
+            try:
+                from hordelib.execution.shared_components import SharedComponentClient, set_client
+
+                set_client(SharedComponentClient(shared_components_endpoint, enabled=True))  # type: ignore[arg-type]
+            except Exception as sharing_error:  # noqa: BLE001 - sharing must never block child startup
+                logger.warning(f"Component sharing disabled for process {process_id} ({sharing_error})")
 
         from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 

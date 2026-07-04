@@ -266,6 +266,24 @@ class ProcessLifecycleManager:
         self._state = state
         self._entry_points = entry_points if entry_points is not None else ProcessEntryPoints()
         self._owned_registry = owned_registry
+        # Cross-process model-component sharing fabric (opt-in via HORDE_SHARED_COMPONENTS=1; the
+        # transport is CPU-shm everywhere and CUDA IPC on Linux). Built here from plain
+        # multiprocessing primitives so the parent stays torch-free; tensor payloads only ever
+        # transit child-to-child queues. Endpoints are pre-created for every process id the worker
+        # can allocate (inference pids start at 1; slot 0 is safety; the lane and replacements
+        # allocate from the same range), so replacements keep working without re-plumbing.
+        self._shared_component_bus = None
+        if os.environ.get("HORDE_SHARED_COMPONENTS") == "1":
+            try:
+                from horde_worker_regen.utils.shared_components_bridge import build_component_bus
+
+                self._shared_component_bus = build_component_bus(
+                    self._ctx,
+                    list(range(self._max_inference_processes + 4)),
+                )
+                logger.info("Cross-process component sharing enabled (HORDE_SHARED_COMPONENTS=1).")
+            except Exception as bus_error:  # noqa: BLE001 - sharing is an optimization, never a startup failure
+                logger.warning(f"Cross-process component sharing unavailable ({bus_error})")
         # The ledger is always present (an in-memory ring by default) so diagnostics work under test;
         # the parent manager injects a file-backed one in a real run.
         self._action_ledger = action_ledger if action_ledger is not None else ActionLedger()
@@ -953,6 +971,7 @@ class ProcessLifecycleManager:
                 # An alchemist-only worker (no image models configured, e.g. a CPU install) must not
                 # treat an empty image-model database as a fatal error in the child.
                 "expect_image_models": bool(card.config.image_models_to_load),
+                "shared_components_endpoint": self._shared_components_endpoint_for(pid),
             },
         )
         process.start()
@@ -969,6 +988,14 @@ class ProcessLifecycleManager:
         self._register_owned(process_info)
         self.num_processes_launched += 1
         return process_info
+
+    def _shared_components_endpoint_for(self, pid: int) -> object | None:
+        """The component-sharing endpoint to hand a spawning child, or None when sharing is off."""
+        if self._shared_component_bus is None:
+            return None
+        from horde_worker_regen.utils.shared_components_bridge import endpoint_for
+
+        return endpoint_for(self._shared_component_bus, pid)
 
     def _allocate_inference_pid(self) -> int:
         """Return the lowest inference process id not currently in use.
