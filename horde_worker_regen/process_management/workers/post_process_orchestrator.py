@@ -269,7 +269,9 @@ class PostProcessOrchestrator:
         Three behaviors keep a job whose chain cannot fit the lane's card from wedging the lane:
 
         - **Queue scan**: the first *fittable* pending job is dispatched, so an unfittable head never
-          blocks the fittable jobs queued behind it.
+          blocks the fittable jobs queued behind it. A chain that cannot share the card with the current
+          sampler is treated the same way: it waits for the sampler while the scan looks for later work that
+          can safely co-run.
         - **Aging escape**: a job that has been unfittable for longer than the admission-patience window is
           reported faulted without images, so the horde reissues it rather than the worker parking it forever.
         - **One-shot reclaim**: an unfittable job asks the scheduler to evict idle VRAM once per starvation
@@ -373,7 +375,7 @@ class PostProcessOrchestrator:
                         f"its chain ({reserve_vram_mb:.0f}MB) cannot share the card with the sampling in "
                         "progress; waiting for the card.",
                     )
-                return False
+                continue
 
             if self._arbiter_admits_post_processing(
                 post_process_process=post_process_process,

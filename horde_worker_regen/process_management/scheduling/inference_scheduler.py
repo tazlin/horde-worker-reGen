@@ -6149,49 +6149,110 @@ class InferenceScheduler:
             )
         return 0.0
 
-    def _should_defer_dispatch_for_post_processing(self, next_job: ImageGenerateJobPopResponse) -> bool:
-        """Whether this dispatch must wait for an in-flight post-processing chain to release the card.
+    def _sampling_peak_mb(self, job: ImageGenerateJobPopResponse) -> float | None:
+        """Return the sampling peak estimate for ``job``, raised by any learned SAMPLE-stage watermark."""
+        if job.model is None:
+            return None
+        baseline = self._model_metadata.get_baseline(job.model)
+        static_peak_mb = predict_job_sampling_vram_mb(job, baseline)
+        if static_peak_mb is None:
+            return None
+        return self._learned_sampling_peak_mb(
+            job,
+            baseline,
+            static_seed_mb=static_peak_mb,
+            stage=FootprintStage.SAMPLE,
+        )
+
+    def _pending_post_processing_reserve_mb(self, *, device_index: int | None) -> float:
+        """Return the smallest known pending post-processing peak for an idle lane on ``device_index``.
+
+        The lane orchestrator scans for the first pending chain that can run. For the dispatch-side hold, the
+        smallest known pending peak is enough: if the next sampler cannot share the card with even that chain,
+        starting it would extend the no-drain window for every pending chain. Unknown estimates do not hold
+        inference; every memory gate in this scheduler restricts only on evidence.
+        """
+        post_process_process = self._process_map.get_first_available_post_process_process()
+        if post_process_process is None:
+            return 0.0
+        if device_index is not None and post_process_process.device_index != device_index:
+            return 0.0
+
+        estimates_mb: list[float] = []
+        for job_info in self._job_tracker.jobs_pending_post_processing:
+            sdk_job = job_info.sdk_api_job_info
+            baseline = self._model_metadata.get_baseline(sdk_job.model) if sdk_job.model is not None else None
+            baseline_name = str(getattr(baseline, "value", baseline)) if baseline is not None else None
+            estimate = predict_job_post_processing_vram_mb(sdk_job, baseline_name)
+            if estimate is None or estimate <= 0:
+                continue
+            estimates_mb.append(estimate)
+
+        if not estimates_mb:
+            return 0.0
+        return min(estimates_mb)
+
+    def _should_defer_dispatch_for_post_processing(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        *,
+        process_with_model: HordeProcessInfo | None = None,
+    ) -> bool:
+        """Whether this dispatch must wait for post-processing to release or receive the card.
 
         The counterpart of the orchestrator's chain-admission gate: together they time-slice a card that
-        cannot hold a sampling peak and an upscale chain at once. The hold lasts only while a chain's
-        committed reserve is outstanding and the lane is actually busy, so it is bounded by one chain's
-        run time (seconds); the job keeps its queue position and dispatches the moment the lane result
-        lands.
+        cannot hold a sampling peak and an upscale chain at once. Active chains hold dispatch until their
+        result lands. Pending chains can also hold dispatch while another sampler is already occupying the
+        lane card; otherwise a fresh sampler can keep the card never-idle and prevent the pending lane work
+        from ever getting its turn.
         """
+        device_index = process_with_model.device_index if process_with_model is not None else None
+
         pp_committed_mb = self._reserve_ledger.total_vram_mb() - self._reserve_ledger.total_vram_mb_excluding(
             POST_PROCESS_RESERVE_FLOW,
         )
-        if pp_committed_mb <= 0:
-            return False
-        if not any(
-            process_info.process_type == HordeProcessType.POST_PROCESS and process_info.is_process_busy()
+        pp_busy = any(
+            process_info.process_type == HordeProcessType.POST_PROCESS
+            and process_info.is_process_busy()
+            and (device_index is None or process_info.device_index == device_index)
             for process_info in self._process_map.values()
-        ):
-            return False
-        if next_job.model is None:
-            return False
-        baseline = self._model_metadata.get_baseline(next_job.model)
-        static_peak_mb = predict_job_sampling_vram_mb(next_job, baseline)
-        sampling_peak_mb = (
-            self._learned_sampling_peak_mb(
-                next_job,
-                baseline,
-                static_seed_mb=static_peak_mb,
-                stage=FootprintStage.SAMPLE,
-            )
-            if static_peak_mb is not None
-            else None
         )
+        if pp_committed_mb > 0 and pp_busy:
+            sampling_peak_mb = self._sampling_peak_mb(next_job)
+            affordable = self.pp_sampling_coresidency_affordable(
+                sampling_peak_mb=sampling_peak_mb,
+                pp_reserve_mb=pp_committed_mb,
+                device_index=device_index,
+            )
+            if not affordable and not self._pp_mutex_hold_logged:
+                self._pp_mutex_hold_logged = True
+                logger.info(
+                    f"Holding dispatch of {next_job.model}: an in-flight post-processing chain "
+                    f"({pp_committed_mb:.0f}MB committed) and this job's sampling peak cannot share the card; "
+                    "dispatching when the chain finishes.",
+                )
+            if affordable:
+                self._pp_mutex_hold_logged = False
+            return not affordable
+
+        pending_pp_reserve_mb = self._pending_post_processing_reserve_mb(device_index=device_index)
+        if pending_pp_reserve_mb <= 0:
+            return False
+        if self._process_map.num_busy_with_inference(device_index=device_index) <= 0:
+            return False
+
+        sampling_peak_mb = self._sampling_peak_mb(next_job)
         affordable = self.pp_sampling_coresidency_affordable(
             sampling_peak_mb=sampling_peak_mb,
-            pp_reserve_mb=pp_committed_mb,
+            pp_reserve_mb=pending_pp_reserve_mb,
+            device_index=device_index,
         )
         if not affordable and not self._pp_mutex_hold_logged:
             self._pp_mutex_hold_logged = True
             logger.info(
-                f"Holding dispatch of {next_job.model}: an in-flight post-processing chain "
-                f"({pp_committed_mb:.0f}MB committed) and this job's sampling peak cannot share the card; "
-                "dispatching when the chain finishes.",
+                f"Holding dispatch of {next_job.model}: pending post-processing "
+                f"({pending_pp_reserve_mb:.0f}MB estimated) is waiting behind active sampling and this job's "
+                "sampling peak cannot share the card; dispatching when the lane has a drain window.",
             )
         if affordable:
             self._pp_mutex_hold_logged = False
@@ -6703,9 +6764,9 @@ class InferenceScheduler:
             # head-of-queue position, so it dispatches the moment the residency converges.
             return False
 
-        if self._should_defer_dispatch_for_post_processing(next_job):
-            # A post-processing chain holds the card and this job's sampling peak cannot share it: wait
-            # out the chain (seconds) rather than co-run and demand-page both for the whole overlap.
+        if self._should_defer_dispatch_for_post_processing(next_job, process_with_model=process_with_model):
+            # Post-processing either holds the card or is waiting for the active sampler to drain, and this
+            # job's sampling peak cannot share the card with it.
             return False
 
         if self._dispatch_residency_reconciliation_holds(

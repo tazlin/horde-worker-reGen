@@ -218,6 +218,53 @@ class TestStartPostProcessing:
         lane.pipe_connection.send.assert_not_called()
         assert str(job_info.sdk_api_job_info.id_) in orchestrator._deferrals
 
+    async def test_sampling_blocked_chain_does_not_hold_back_later_fittable_work(
+        self,
+        monkeypatch: object,
+    ) -> None:
+        """A chain waiting for sampling to finish does not idle the lane when later work can share the card."""
+
+        def _estimate_peak(job: object, _baseline_name: object) -> float:
+            post_processing = getattr(getattr(job, "payload", None), "post_processing", [])
+            if "RealESRGAN_x4plus" in post_processing:
+                return 5000.0
+            return 1000.0
+
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            post_process_orchestrator_module,
+            "predict_job_post_processing_vram_mb",
+            _estimate_peak,
+        )
+        process_manager = make_testable_process_manager()
+        lane = _make_lane_process()
+        sampling_process = make_mock_process_info(
+            3,
+            model_name="AlbedoBase XL (SDXL)",
+            state=HordeProcessState.INFERENCE_STARTING,
+        )
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane, 3: sampling_process})
+        orchestrator = process_manager._post_process_orchestrator
+        orchestrator._sampling_coresidency_check = lambda reserve_mb: reserve_mb < 2000.0
+
+        sampling_job = make_job_pop_response(model="AlbedoBase XL (SDXL)")
+        await track_popped_job_async(process_manager._job_tracker, sampling_job)
+        await process_manager._job_tracker.mark_inference_started(sampling_job, device_index=None)
+
+        blocked_job = _make_pp_job_info(["RealESRGAN_x4plus"])
+        fittable_job = _make_pp_job_info(["CodeFormers"])
+        await process_manager._job_tracker.queue_for_post_processing(blocked_job)
+        await process_manager._job_tracker.queue_for_post_processing(fittable_job)
+
+        await process_manager.start_post_processing()
+
+        assert blocked_job in process_manager._job_tracker.jobs_pending_post_processing
+        assert fittable_job in process_manager._job_tracker.jobs_being_post_processed
+        assert str(blocked_job.sdk_api_job_info.id_) in orchestrator._deferrals
+        assert str(fittable_job.sdk_api_job_info.id_) not in orchestrator._deferrals
+        sent = lane.pipe_connection.send.call_args.args[0]
+        assert sent.job_id == fittable_job.sdk_api_job_info.id_
+
     async def test_chain_dispatches_while_in_progress_job_is_only_downloading_aux(self) -> None:
         """Aux downloads do not use the GPU, so pending post-processing drains before line-skip work."""
         process_manager = make_testable_process_manager()

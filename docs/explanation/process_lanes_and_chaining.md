@@ -53,7 +53,9 @@ see [Performance and backpressure](performance_and_backpressure.md)), and three 
 chain from parking the queue:
 
 - **Queue scan**: the first *fittable* pending job is dispatched, so an unfittable head never blocks the
-  fittable jobs queued behind it.
+  fittable jobs queued behind it. The same rule applies when active sampling temporarily blocks one chain's
+  co-residency: that chain keeps its patience record, and the scan continues so a later chain that can share
+  the card may use the idle lane.
 - **Aging escape**: a job that stays unfittable past the admission-patience window is submitted as a no-image
   fault, so the horde reissues it to another worker rather than letting it park forever. This feeds the
   circuit breaker because the worker accepted post-processing work it could not host.
@@ -63,7 +65,11 @@ chain from parking the queue:
 The overlap gate is keyed to active sampling on the lane's card, not to every job in the inference
 `IN_PROGRESS` stage. A job that is only blocked in `DOWNLOADING_AUX_MODEL` holds an in-flight slot but is not
 using the GPU for denoising, so already-popped post-processing work is admitted and drained before any
-line-skip candidate is launched to keep the card busy during that download.
+line-skip candidate is launched to keep the card busy during that download. If sampling is active and one
+pending chain cannot safely co-run with it, the orchestrator records that chain's deferral but keeps scanning
+for later pending work whose estimated peak can co-reside. If no pending chain can co-run and the lane is
+waiting behind an active sampler, the inference scheduler holds the next sampler that would also be unable to
+co-reside, giving the lane a drain window instead of extending the never-idle period.
 
 A post-processing failure never falls back to raw submission. Requested post-processing is part of the
 worker's contract for that job; if the lane cannot honor it, the worker submits a no-image fault so the horde
