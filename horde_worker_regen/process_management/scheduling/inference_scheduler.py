@@ -3113,13 +3113,30 @@ class InferenceScheduler:
         monotonically, so an anchor whose reservation has already grown stays consumed regardless of the load
         state it later revisits. Keyed by process id to match the unit :meth:`_send_preload` registers each
         grant under.
+
+        A planned charge only survives while its target process could still materialise it. A model-map entry
+        that still reads ``LOADING`` on a process that has since died or entered its terminal shutdown states can
+        outlive the (throttled, once-per-cooldown) missing-process recovery that expires it, and a dead target's
+        reservation never grows, so its charge would otherwise decay by neither materialisation nor omission and
+        pin the overlay at full weight indefinitely; a head re-asking that same load then finds its own stale
+        planned charge holding the card against it, a self-deadlock the identity cannot escape. Excluding process
+        ids that are absent from the process map or in a terminal state drops such a charge here, through the
+        same reconcile-by-omission that
+        releases a finished load, with no separate death-path delete to keep in sync. Mirrors the committed
+        ledger's own exclusion of ending/ended tenants, so the two overlays agree on which processes are live.
         """
         units: set[str] = set()
         for model_info in self._horde_model_map.root.values():
             if model_info.process_id is None:
                 continue
-            if model_info.horde_model_load_state in (ModelLoadState.LOADING, ModelLoadState.LOADED_IN_RAM):
-                units.add(str(model_info.process_id))
+            if model_info.horde_model_load_state not in (ModelLoadState.LOADING, ModelLoadState.LOADED_IN_RAM):
+                continue
+            process_info = self._process_map.get(model_info.process_id)
+            if process_info is None:
+                continue
+            if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
+                continue
+            units.add(str(model_info.process_id))
         return units
 
     def _measured_admission_verdict(
@@ -3216,16 +3233,38 @@ class InferenceScheduler:
             stage=FootprintStage.SAMPLE_ISOLATED if disaggregated else FootprintStage.SAMPLE,
         )
         resident_credit_mb = 0.0
-        if job.model is not None and process_id is not None:
-            model_info = self._horde_model_map.root.get(job.model)
-            already_resident_here = (
-                model_info is not None
-                and model_info.process_id == process_id
-                and model_info.horde_model_load_state in (ModelLoadState.LOADED_IN_VRAM, ModelLoadState.IN_USE)
-            )
-            if already_resident_here:
-                resident_credit_mb = predict_job_weight_mb(job, baseline) or 0.0
+        if self._candidate_weights_resident_on_process(job.model, process_id):
+            resident_credit_mb = predict_job_weight_mb(job, baseline) or 0.0
         return max(0.0, gross_mb - resident_credit_mb)
+
+    def _candidate_weights_resident_on_process(self, model_name: str | None, process_id: int | None) -> bool:
+        """Whether ``model_name``'s weights already occupy VRAM on ``process_id`` (dispatch materialises nothing).
+
+        The single residency truth two admission concerns share: the resident-weight credit that keeps a
+        candidate delta from re-charging weights the committed floor already counts, and the arbiter's
+        ``candidate_already_resident`` no-op admit. Read primarily from the horde model map's residency state on
+        the matching process. The committed floor charges those weights by the process's own measured
+        reservation, keyed by the process map's ``loaded_horde_model_name``; when the model map's process pointer
+        transiently lags that record the two disagree, so a fallback also credits residency when the target
+        process itself reports this model loaded and the model map agrees the model is VRAM-resident. Aligning
+        the credit with the floor's own truth stops the divergence from double-charging resident weights (once
+        in the committed floor, again as the candidate delta) and wedging a dispatch to an idle resident model.
+        """
+        if model_name is None or process_id is None:
+            return False
+        model_info = self._horde_model_map.root.get(model_name)
+        model_map_says_vram_resident = model_info is not None and model_info.horde_model_load_state in (
+            ModelLoadState.LOADED_IN_VRAM,
+            ModelLoadState.IN_USE,
+        )
+        if model_info is not None and model_info.process_id == process_id and model_map_says_vram_resident:
+            return True
+        process_info = self._process_map.get(process_id)
+        return (
+            process_info is not None
+            and process_info.loaded_horde_model_name == model_name
+            and model_map_says_vram_resident
+        )
 
     def _measured_admission_admits(
         self,
@@ -4439,11 +4478,35 @@ class InferenceScheduler:
                 process_id=available_process.process_id,
                 disaggregated=self._is_disaggregation_class_eligible(job),
             ),
+            candidate_already_resident=self._candidate_weights_resident_on_process(
+                job.model,
+                available_process.process_id,
+            ),
+            own_planned_unmaterialized_mb=self._own_planned_charge_mb(
+                device_index=target_device_index,
+                target_process_id=available_process.process_id,
+            ),
             is_head_of_queue=is_head_blocker,
             starved_seconds=self._head_starved_seconds(job),
             has_reclaimable_idle_model=has_reclaimable_idle_model,
             can_reduce_live_contexts=can_reduce_live_contexts,
             idle_contexts_teardownable=idle_contexts_teardownable,
+        )
+
+    def _own_planned_charge_mb(self, *, device_index: int | None, target_process_id: int | None) -> float:
+        """Return the planned-overlay charge (MB) attributable to a request's own target process.
+
+        The arbiter subtracts this from the device's planned overlay so a re-ask nets out the load it itself
+        admitted on an earlier cycle (the candidate delta already represents it), preventing the head-of-queue
+        self-deadlock where a load's own not-yet-materialised plan holds the card against its re-ask. Every
+        other process's planned charge is left intact, so genuinely-concurrent admissions still count in full.
+        """
+        if target_process_id is None:
+            return 0.0
+        return self._reserve_ledger.planned_charge_for_unit(
+            PRELOAD_ADMISSION_FLOW,
+            str(target_process_id),
+            self._committed_process_reserved_by_pid(device_index),
         )
 
     def _context_reduction_demand(
@@ -6519,6 +6582,14 @@ class InferenceScheduler:
                 baseline,
                 process_id=process_with_model.process_id,
                 disaggregated=self._is_disaggregation_class_eligible(next_job),
+            ),
+            candidate_already_resident=self._candidate_weights_resident_on_process(
+                next_job.model,
+                process_with_model.process_id,
+            ),
+            own_planned_unmaterialized_mb=self._own_planned_charge_mb(
+                device_index=device_index,
+                target_process_id=process_with_model.process_id,
             ),
             is_head_of_queue=is_head_of_queue,
             starved_seconds=self._head_starved_seconds(next_job),

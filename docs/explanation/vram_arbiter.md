@@ -120,7 +120,24 @@ The planned overlay carries each admitted-but-not-yet-materialised preload as an
 target process's measured reservation grows to cover it. Consumption is monotonic: an anchor is measured
 against the greatest growth ever seen for it, so once a preload has materialised, a later eviction that
 returns its VRAM to the card cannot resurrect the charge. A materialised anchor never re-charges; only a
-genuinely new admission on that process charges again.
+genuinely new admission on that process charges again. An anchor whose target process dies or ends before the
+load materialises decays by neither route (a dead target's reservation never grows), so the scheduler
+excludes ended and missing processes from the in-flight set it reconciles the overlay against: the charge is
+then released by omission, the same self-healing path a finished load takes, with no death-path delete to keep
+in sync.
+
+A request's own footprint counts at most once in the identity. Two adjustments enforce this so a head can
+never wedge on state it alone produced. First, the request nets its own target process's outstanding planned
+charge out of the overlay before the inequality: that charge is the same load the candidate delta already
+represents, so leaving it in would count the load twice and let a re-ask (whose earlier plan lingered after a
+reclaim or a target death) defer forever on its own weight. Only the target process's own charge is removed;
+every other process's planned load stays fully charged, so genuinely-concurrent admissions still stack. Second,
+a candidate whose weights already occupy VRAM on the target process is admitted directly as a no-op: dispatching
+(or preloading) onto an already-resident idle model materialises nothing, its weights are already in the
+committed floor, and its next activation is the monolithic status quo the card has already served. The ledger
+identity cannot express that no-op (the resident model's own reservation can legitimately sit above the
+noise-adjusted ceiling, which would otherwise withhold a dispatch that needs no memory), so this is the
+whole-card analogue of the disaggregated stage dispatch a resident lane never withholds.
 
 If it does not fit, the arbiter first asks whether reclaim can still make progress. Reclaim can still make
 progress when the arbiter's own ladder emits a command, or when the device-free governor is SATURATED and
@@ -129,9 +146,12 @@ preload the scheduler runs the described actuation and the request re-asks next 
 verification has either shown reclaimed memory or advanced to the next rung.
 
 Once reclaim is exhausted and the demand still does not fit, the verdict depends on the shortfall. If the
-worker's own committed load plus the planned overlay still exceeds capacity, live worker work is holding the
-card and the head stays queued until a slot drains. If the worker's own committed load fits capacity but the
-candidate tips the inequality over, the shortfall is foreign pressure. Foreign pressure admits only when the
+worker's own committed load plus the (self-netted) planned overlay still exceeds capacity, live worker work is
+holding the card and the head stays queued until a slot drains. Because the request's own footprint is netted
+out first, this branch can only be reached by load that is genuinely other than the request itself (a live
+sibling holding the card): it can never be composed from the request's own resident weights, its own lingering
+plan, or its own candidate delta, which is exactly the self-deadlock the netting closes. If the worker's own
+committed load fits capacity but the candidate tips the inequality over, the shortfall is foreign pressure. Foreign pressure admits only when the
 candidate physically fits the truthful device-free read minus the noise buffer at that moment, and only for
 the true head of queue. That is the remaining useful "best effort" case: fitting into measured reality, not
 hoping an over-commit will work. A non-head request (a line-skip job selected ahead of a downloading head) is
@@ -195,8 +215,12 @@ fractions rather than reading the admit-on-missing-telemetry relaxation as evide
 an idle sibling whose weights are still resident from a prior job. Yet the instant a RAM-staged job is handed
 to its child, its weights and first activation commit to VRAM, and that materialisation lands on top of any
 idle resident. Neither the preload nor the second-sampler seam prices that moment, so a dispatch is the last
-uncrossed admission point. The scheduler's dispatch adapter closes it with the same `MONOLITHIC_DISPATCH`
-identity: before a staged job is dispatched, it prices the job's expected materialisation against the card
+uncrossed admission point. This gate prices only a genuine materialisation: a dispatch whose model is already
+resident in VRAM on its target moves nothing, so it is released as a no-op (the identity's
+`candidate_already_resident` admit) rather than priced against a card its resident weights already legitimately
+overshoot. The scheduler's dispatch adapter closes the remaining seam with the same `MONOLITHIC_DISPATCH`
+identity: before a staged (not yet VRAM-resident) job is dispatched, it prices the job's expected
+materialisation against the card
 (the learned per-signature peak the admission overlay already uses, against the truthful device-free reading
 net of the proportional buffer that the identity's foreign-pressure branch enforces). A `FITS` releases the
 dispatch. A conflict holds it: the job keeps its head-of-queue position and is never faulted, the idle

@@ -186,6 +186,25 @@ class VramRequest:
     device_index: int | None
     target_process_id: int | None = None
     candidate_delta_mb: float | None = None
+    candidate_already_resident: bool = False
+    """True when the candidate's weights are already materialised in VRAM on the target process, so admitting
+    this request adds no new device footprint. A dispatch or preload onto an already-resident idle model moves
+    nothing: its weights are already in the measured committed floor and its next activation is the monolithic
+    status quo the card has already demonstrated it holds. Such a request is admitted directly, the same way a
+    disaggregated stage dispatch to a resident lane is never withheld, because the ledger identity cannot
+    express a no-op (the resident model's own reservation can legitimately sit above the noise-adjusted
+    admission ceiling, which would otherwise deny a dispatch that needs no memory). Set only when the target
+    genuinely holds the weights in VRAM; a RAM-staged load whose weights materialise on dispatch leaves it
+    False so the identity prices the materialisation."""
+    own_planned_unmaterialized_mb: float = 0.0
+    """The portion (MB) of the device's planned overlay attributable to this request's own target process, netted
+    out of the identity so a re-ask can never double-count itself. A preload that was admitted, recorded a
+    planned charge, and then had its target reclaimed or its process die before the load materialised leaves
+    that charge outstanding until the overlay reconciles; if the head re-asks the same load while the charge
+    lingers, the unnetted identity would count the load once as this planned charge and once as the candidate
+    delta and defer forever on its own footprint. Subtracting the target process's own planned charge makes the
+    request's load count at most once (as the candidate), while every other process's planned load stays fully
+    charged."""
     is_head_of_queue: bool = False
     first_of_kind: bool = False
     starved_seconds: float = 0.0
@@ -420,9 +439,14 @@ class VramArbiter:
 
     def _measured(self, request: VramRequest, state: DeviceVramState) -> AdmissionVerdict:
         candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
+        # Net the request's own outstanding planned charge out of the overlay before pricing it. That charge is
+        # this same load admitted on an earlier cycle and not yet materialised; the candidate delta already
+        # represents it, so leaving it in the overlay would count the load twice and let a re-ask defer forever
+        # on its own footprint. Only the target process's own charge is removed; every other planned load stays.
+        net_planned_mb = max(0.0, state.planned_unmaterialized_mb - max(0.0, request.own_planned_unmaterialized_mb))
         return evaluate_admission(
             measured_committed_mb=state.committed_vram_mb,
-            planned_unmaterialized_mb=state.planned_unmaterialized_mb,
+            planned_unmaterialized_mb=net_planned_mb,
             candidate_delta_mb=candidate_delta_mb,
             total_vram_mb=state.total_vram_mb,
             baseline_mb=state.baseline_mb,
@@ -432,6 +456,21 @@ class VramArbiter:
 
     def _evaluate_admission(self, request: VramRequest, state: DeviceVramState) -> VramVerdict:
         measured = self._measured(request, state)
+        if request.candidate_already_resident:
+            # The candidate's weights already occupy VRAM on the target process: dispatching (or preloading) onto
+            # it materialises nothing. Its footprint is already in the measured committed floor and its next
+            # activation is the monolithic status quo the card has already served, so there is nothing to admit
+            # into. The ledger identity cannot express this no-op, because the resident model's own reservation
+            # can legitimately sit above the noise-adjusted ceiling; pricing it there would withhold a dispatch
+            # to an idle, already-loaded model and wedge the head behind a slot that is already open. This is the
+            # whole-card analogue of the disaggregated stage dispatch that a resident lane never withholds.
+            return VramVerdict(
+                disposition=VramDisposition.FITS,
+                request_kind=request.kind,
+                device_index=request.device_index,
+                reason=f"candidate already resident on the target process; no new VRAM. {measured.reason()}",
+                measured=measured,
+            )
         if measured.fits:
             return VramVerdict(
                 disposition=VramDisposition.FITS,

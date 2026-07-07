@@ -231,8 +231,14 @@ class TestLineSkipDispatchHeadTruth:
 class TestHeldDispatchSurvivesWatchdogs:
     """A held dispatch is not reaped by the clocks that time the preloaded-to-inference-started transition."""
 
-    async def test_stale_model_map_expiry_spares_the_held_resident(self) -> None:
-        """The stale-entry expiry never touches the held head's resident model (it is not a LOADING entry)."""
+    async def test_stale_model_map_expiry_spares_the_resident_dispatch_target(self) -> None:
+        """The stale-entry expiry never touches a resident (LOADED_IN_VRAM) dispatch target; it is not LOADING.
+
+        With the model genuinely resident in VRAM on its target, the dispatch is a no-op: it materialises
+        nothing, so the gate releases it even over an over-committed card rather than pricing a load that never
+        happens. The subject here is the stale-entry expiry, which reclaims only LOADING entries and must leave
+        the resident model in place so the released dispatch can run.
+        """
         scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
         scheduler.unload_models_from_vram = Mock(return_value=True)  # type: ignore[method-assign]
         scheduler._horde_model_map.update_entry(
@@ -242,14 +248,16 @@ class TestHeldDispatchSurvivesWatchdogs:
         )
         _install_cycle(scheduler, _over_committed_state())
 
-        assert scheduler._dispatch_residency_reconciliation_holds(job, target) is True
+        # A dispatch to an already-VRAM-resident idle model is released, not held: it adds no device footprint.
+        assert scheduler._dispatch_residency_reconciliation_holds(job, target) is False
+        scheduler.unload_models_from_vram.assert_not_called()
 
         expired = scheduler._expire_stale_model_map_entries()
 
         assert "model_a" not in expired
         assert "model_a" in scheduler._horde_model_map.root
-        # The held job is still queued (never faulted) and never entered in-progress, so the lost-result reap
-        # and the orphaned-in-progress reconciler have nothing to act on.
+        # The job is still queued (never faulted) and never entered in-progress, so the lost-result reap and the
+        # orphaned-in-progress reconciler have nothing to act on.
         assert job in scheduler._job_tracker.jobs_pending_inference
         assert job not in scheduler._job_tracker.jobs_in_progress
 

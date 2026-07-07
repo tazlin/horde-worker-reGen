@@ -1301,6 +1301,28 @@ class CommittedReserveLedger:
             total += max(0.0, entry.vram_mb - entry.materialized_watermark_mb)
         return total
 
+    def planned_charge_for_unit(self, flow: str, unit: str, process_reserved_by_pid: dict[int, float]) -> float:
+        """Return one planned unit's still-outstanding charge (MB), decayed by what has materialised, or zero.
+
+        The single-entry counterpart of :meth:`effective_planned_vram_mb`, used to net a request's own planned
+        charge out of the admission identity so a re-ask cannot double-count itself: the caller subtracts this
+        from the overlay for the request that targets ``unit``. Read-only, so it never advances the entry's
+        materialisation watermark (the per-cycle :meth:`effective_planned_vram_mb` owns that ratchet); it reports
+        the outstanding charge against the greater of the recorded watermark and the target's current growth.
+
+        Args:
+            flow: The workload flow namespace the unit lives under.
+            unit: The unit-of-work key within the flow.
+            process_reserved_by_pid: Current measured allocator reservation (MB) keyed by process id; a target
+                absent from the map is treated as holding zero.
+        """
+        entry = self._planned.get((flow, unit))
+        if entry is None:
+            return 0.0
+        current_reserved = process_reserved_by_pid.get(entry.target_process_id, 0.0)
+        materialised = max(entry.materialized_watermark_mb, max(0.0, current_reserved - entry.reserved_at_admit_mb))
+        return max(0.0, entry.vram_mb - materialised)
+
     def reconcile_planned(self, flow: str, live_units: Iterable[str]) -> None:
         """Prune ``flow``'s planned charges to only the units whose admission is still in flight (self-healing).
 
