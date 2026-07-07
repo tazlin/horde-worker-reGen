@@ -698,17 +698,31 @@ floor still guarding actual overgrowth.
 
 The reductions above are the runtime backstop; the **plan-time process count** is
 sized to the hardware up front so the worker rarely has to reach for them. The
-resolved per-card plan is `queue_size + ceiling` processes, which is sound per card
-but, summed across a multi-GPU host, double-counts the single shared system-RAM
-pool (a second card doubles VRAM, not RAM). So when the worker drives more than
-one card,
+resolved per-card plan is `queue_size + ceiling` processes. Two plan-time caps can
+lower it, each only ever reducing a card and never below one context per card.
+
+First,
+[`cap_card_processes_to_vram_fit`][horde_worker_regen.process_management.process_manager.cap_card_processes_to_vram_fit]
+bounds **every** card, single-GPU included, to the inference contexts its VRAM
+physically holds: solving `contexts * idle_overhead + heaviest_footprint <= total -
+noise_buffer` for the context count. It charges each planned context the idle
+CUDA/runtime baseline and the heaviest offered model only once (the state the
+runtime governor steers toward: contexts idle-staged, one heaviest model resident
+at a time), net of the same proportional admission noise buffer runtime admission
+keeps. This is the cap that closes the single-GPU over-configuration gap where one
+card is asked to spawn more contexts than it can hold.
+
+Second, the resolved plan summed across a multi-GPU host double-counts the single
+shared system-RAM pool (a second card doubles VRAM, not RAM). So when the worker
+drives more than one card,
 [`cap_card_process_counts`][horde_worker_regen.process_management.process_manager.cap_card_process_counts]
-lowers each card's spawned-process count so the worker-wide resident-context count
-fits system RAM, never below one context per card and only ever reducing the
-resolved plan. It uses conservative footprint estimates (no model reference or
-measurement exists at startup); the measured runtime budget then refines the live
-count downward under real pressure. A single-GPU host never double-counts the RAM
-pool, so the cap is multi-GPU only and the single-card plan stays byte-identical.
+lowers each card's spawned-process count further so the worker-wide resident-context
+count fits system RAM. Both caps use conservative footprint estimates (no model
+reference or measurement exists at startup); the measured runtime budget then refines
+the live count downward under real pressure. The `horde-benchmark` path provisions an
+elevated concurrency ceiling to probe higher parallelism than steady-state operation
+keeps, so it is exempt from the VRAM-fit cap (capping it would forbid the levels it
+exists to measure); the runtime governor still enforces real residency during the run.
 Post-processing VRAM is split across two budget paths: the lane's fixed CUDA
 context is part of the resident-process forecast, while each active
 post-processing job's estimated upscale/face-fix peak is entered in the shared

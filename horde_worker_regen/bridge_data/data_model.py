@@ -675,9 +675,10 @@ class reGenBridgeData(CombinedHordeBridgeData):
     monolithically. A role dying after a job is claimed is backstopped by the pipeline's per-stage patience,
     which faults the job for horde reissue rather than parking it forever.
 
-    Enabling this forces the dedicated post-processing (image) lane on regardless of
-    post_processing_lane_enabled, since the pipeline's decode stage runs there. Default false (the
-    monolithic path) until validated on the operator's card."""
+    The pipeline's VAE-encode/decode stage runs on the dedicated VAE lane (a separate process the worker
+    starts when this flag is on), not on the post-processing lane. Enabling disaggregation therefore does not
+    force the post-processing lane on: that lane follows its own configuration and only carries the
+    upscale/face-fix work. Default false (the monolithic path) until validated on the operator's card."""
 
     vram_reserve_mb: int = Field(default=2048, ge=0)
     """Free VRAM (MB) the budget keeps in reserve on top of a job's estimated peak.

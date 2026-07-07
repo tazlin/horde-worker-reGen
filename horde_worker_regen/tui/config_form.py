@@ -1582,8 +1582,9 @@ def current_value(field: ConfigField, data: Any) -> Any:  # noqa: ANN401 - kind-
 # below MIRROR the worker's authoritative computation (reGenBridgeData validators + resolve_card_concurrency
 # in process_manager.py); they are duplicated here only because this module is import-light and must not
 # pull in the SDK/torch chain. The estimate is intentionally an upper bound: the running worker further
-# reduces the count to fit shared system RAM and each card's VRAM (cap_card_process_counts), which cannot
-# be known at edit time.
+# reduces the count to fit each card's VRAM (cap_card_processes_to_vram_fit, per card including single-GPU)
+# and the shared system RAM pool across cards (cap_card_process_counts), neither of which can be known at
+# edit time.
 # ---------------------------------------------------------------------------------------------------
 
 _META_COMMAND_PREFIXES = ("top", "bottom", "all")

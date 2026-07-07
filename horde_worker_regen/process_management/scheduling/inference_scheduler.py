@@ -4334,6 +4334,10 @@ class InferenceScheduler:
             for_head_of_queue=is_head_blocker,
             device_index=target_device_index,
         )
+        idle_contexts_teardownable = is_head_blocker and self._has_teardownable_idle_context(
+            available_process,
+            device_index=target_device_index,
+        )
         request = self._build_preload_request(
             job,
             available_process,
@@ -4342,6 +4346,7 @@ class InferenceScheduler:
             is_head_blocker=is_head_blocker,
             has_reclaimable_idle_model=has_reclaimable_idle_model,
             can_reduce_live_contexts=can_reduce_live_contexts,
+            idle_contexts_teardownable=idle_contexts_teardownable,
         )
         verdict = arbiter.evaluate(request)
 
@@ -4419,6 +4424,7 @@ class InferenceScheduler:
         is_head_blocker: bool,
         has_reclaimable_idle_model: bool,
         can_reduce_live_contexts: bool,
+        idle_contexts_teardownable: bool,
     ) -> VramRequest:
         """Assemble the arbiter request for one preload, priced identically to the measured admission overlay."""
         return VramRequest(
@@ -4437,6 +4443,7 @@ class InferenceScheduler:
             starved_seconds=self._head_starved_seconds(job),
             has_reclaimable_idle_model=has_reclaimable_idle_model,
             can_reduce_live_contexts=can_reduce_live_contexts,
+            idle_contexts_teardownable=idle_contexts_teardownable,
         )
 
     def _context_reduction_demand(
@@ -4533,6 +4540,42 @@ class InferenceScheduler:
             ):
                 continue
             if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+                continue
+            return True
+        return False
+
+    def _has_teardownable_idle_context(
+        self,
+        head_process: HordeProcessInfo,
+        *,
+        device_index: int | None,
+    ) -> bool:
+        """Return whether an idle sibling inference context could be torn down to reclaim VRAM for a starved head.
+
+        A bare CUDA context's VRAM is reclaimed only when its process exits, which weight eviction (model
+        unload, cache release) cannot achieve. When whole-card residency is enabled, an idle inference process
+        on the card other than the head's own target slot, not busy and not serving an in-progress job, is a
+        teardown candidate the starvation escalation can reduce via
+        :meth:`reduce_live_contexts`. Excludes the head's target slot and every busy process, matching that
+        actuator's own protections; returns False when whole-card residency is disabled (the teardown runs
+        through the residency machinery, so it must not fire without it).
+        """
+        if not self._whole_card_residency_enabled():
+            return False
+        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.process_id == head_process.process_id:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.is_process_busy():
+                continue
+            if (
+                process_info.loaded_horde_model_name is not None
+                and process_info.loaded_horde_model_name in in_progress_models
+            ):
                 continue
             return True
         return False
@@ -6424,6 +6467,8 @@ class InferenceScheduler:
         self,
         next_job: ImageGenerateJobPopResponse,
         process_with_model: HordeProcessInfo,
+        *,
+        is_head_of_queue: bool = True,
     ) -> bool:
         """Return whether ``next_job``'s dispatch must be held because its VRAM would over-commit the card now.
 
@@ -6443,6 +6488,13 @@ class InferenceScheduler:
         arbiter next verdicts FITS, matching the verified-reclaim doctrine that a demand is admitted into
         measured reality rather than into hope. Can't-fit-ever models are excluded upstream by model
         serviceability, so this gate only ever holds a can't-fit-now dispatch.
+
+        ``is_head_of_queue`` is the truth of whether this dispatch is the genuine head of queue: a line-skip
+        dispatch (a smaller ready job selected ahead of a downloading head) is not, so it presents
+        ``is_head_of_queue=False`` and forfeits the arbiter's best-effort over-budget admit. That admit reserves
+        the card's physical room for the true head, so a line-skipper is held rather than materialising into
+        space the head it jumped needs. A line-skip likewise routes its reclaim through the non-head eviction
+        path, which respects the residency and queued-lookahead guards the head escalation would override.
         """
         self._prune_abandoned_dispatch_holds()
 
@@ -6453,7 +6505,7 @@ class InferenceScheduler:
         baseline = self._model_metadata.get_baseline(next_job.model)
         has_reclaimable_idle_model = self._has_reclaimable_idle_model(
             process_with_model,
-            for_head_of_queue=True,
+            for_head_of_queue=is_head_of_queue,
             device_index=device_index,
         )
         request = VramRequest(
@@ -6468,11 +6520,13 @@ class InferenceScheduler:
                 process_id=process_with_model.process_id,
                 disaggregated=self._is_disaggregation_class_eligible(next_job),
             ),
-            is_head_of_queue=True,
+            is_head_of_queue=is_head_of_queue,
             starved_seconds=self._head_starved_seconds(next_job),
             has_reclaimable_idle_model=has_reclaimable_idle_model,
             # A staged dispatch never reduces the live inference-context count: it evicts idle residents to make
-            # room, it does not collapse the co-resident pool the way a whole-card preload does.
+            # room, it does not collapse the co-resident pool the way a whole-card preload does. A dispatch-gate
+            # hold therefore never tears an idle context down (idle_contexts_teardownable stays False), matching
+            # the whole-card path being the only teardown-eligible seam.
             can_reduce_live_contexts=False,
         )
         verdict = self._ensure_preload_arbiter().evaluate(request)
@@ -6496,7 +6550,7 @@ class InferenceScheduler:
             self._execute_preload_actuations(
                 actuations,
                 device_index=device_index,
-                for_head_of_queue=True,
+                for_head_of_queue=is_head_of_queue,
             )
         finally:
             self._preload_actuation = None
@@ -6583,7 +6637,14 @@ class InferenceScheduler:
             # out the chain (seconds) rather than co-run and demand-page both for the whole overlap.
             return False
 
-        if self._dispatch_residency_reconciliation_holds(next_job, process_with_model):
+        if self._dispatch_residency_reconciliation_holds(
+            next_job,
+            process_with_model,
+            # A line-skip dispatch is not the true head of queue, so it presents is_head_of_queue=False and
+            # forfeits the arbiter's best-effort over-budget admit: the card's physical room is reserved for the
+            # head the line-skipper jumped, not consumed by the skipper.
+            is_head_of_queue=next_job_and_process.line_skip is None,
+        ):
             # The staged job's VRAM materialisation would over-commit the card against an idle sibling's
             # still-resident weights: hold the dispatch (the job keeps its head-of-queue position) while the
             # single reclaim owner evicts the idle residents, and re-ask next pass once the arbiter verifies the

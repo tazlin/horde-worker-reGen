@@ -18,6 +18,12 @@ priority_usernames: []
 # The maximum number of parallel jobs to run at the same time.
 # Only high-end cards (e.g., 3080 or better) benefit from this setting.
 # If you have a 20xx or earlier, or a xx60/xx70, do not change this setting from 1.
+# Cost: each extra thread spawns a whole additional inference process. That process holds a full inference
+# context resident, which is multiple GB of VRAM even while idle (the CUDA/runtime baseline), plus the weights
+# of whatever model it loads (also multiple GB), and a matching chunk of system RAM. It is not a lightweight
+# worker. The worker will not spawn more inference contexts than a card's VRAM physically fits (idle contexts
+# plus the heaviest model you offer, net of a small safety buffer); if you configure more than that it silently
+# spawns fewer and logs why, and the runtime governor further reduces live concurrency under memory pressure.
 max_threads: 1
 # Suggested values:
 #   24GB+ VRAM: 1 (only increase if you have >32gb system RAM and are *not* offering Flux/Cascade)
@@ -26,8 +32,10 @@ max_threads: 1
 
 # Number of extra requests to keep in the queue to start working as soon as a thread is available.
 # Generally should be 1 or 2. Never set this higher than 2 if your max_threads is 2.
-# Warning: Increasing this value directly increases system RAM usage significantly. Close unused programs if you increase this value.
-# It does not significantly increase VRAM usage, but ~150mb of fixed VRAM per queue slot is reserved at all times.
+# Cost: like max_threads, each queue slot spawns an additional inference process, so it carries the same full
+# per-context VRAM and system RAM cost described above (multiple GB each), not a small fixed reservation. Close
+# unused programs if you increase this value, and expect the per-card VRAM-fit cap to reduce the spawned count
+# on a card that cannot hold every configured context.
 queue_size: 1
 # Suggested values:
 #   >64gb system RAM: 3

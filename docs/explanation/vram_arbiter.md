@@ -132,13 +132,26 @@ Once reclaim is exhausted and the demand still does not fit, the verdict depends
 worker's own committed load plus the planned overlay still exceeds capacity, live worker work is holding the
 card and the head stays queued until a slot drains. If the worker's own committed load fits capacity but the
 candidate tips the inequality over, the shortfall is foreign pressure. Foreign pressure admits only when the
-candidate physically fits the truthful device-free read minus the noise buffer at that moment. That is the
-remaining useful "best effort" case: fitting into measured reality, not hoping an over-commit will work. If
-it does not physically fit, the disposition is `DEFER` and the
-`admission_foreign_pressure_defers` counter advances.
+candidate physically fits the truthful device-free read minus the noise buffer at that moment, and only for
+the true head of queue. That is the remaining useful "best effort" case: fitting into measured reality, not
+hoping an over-commit will work. A non-head request (a line-skip job selected ahead of a downloading head) is
+denied that admit even when the card physically has room right now, because materialising into it starves the
+head the skipper jumped: the head needs the same space and took precedence. If it does not physically fit (or
+the requester is not the head), the disposition is `DEFER` and the `admission_foreign_pressure_defers` counter
+advances. The dispatch-reconciliation gate plumbs the same truth, presenting `is_head_of_queue=False` for a
+line-skip dispatch so a line-skipper is held rather than committing over the head at the dispatch seam.
 
-There is no starved-head overcommit admit. A head deferred longer than 60 seconds while reclaim is exhausted and
-no verified progress is being made emits a warning with the full arithmetic and increments
+There is no starved-head overcommit admit, but a starved head does escalate reclaim. When a head has been the
+undispatched head of an idle device longer than 60 seconds with weight eviction exhausted, and its remaining
+deficit is held by its own idle sibling contexts (a bare CUDA context whose VRAM returns only when the process
+exits, so no model-unload or cache-release rung can reclaim it), the arbiter escalates to a verified context
+teardown: it defers with a `REDUCE_LIVE_CONTEXTS` actuation that reduces the live inference-context count
+(protecting the head's own target slot and every busy process) and advances `starvation_context_teardowns`.
+The freed room is verified at device level before the head is admitted, so the escalation never force-admits;
+it only makes room the re-ask can then fit. This escalation belongs to the preload/whole-card path alone: a
+dispatch-gate hold (a `MONOLITHIC_DISPATCH` request) never tears a context down, matching the
+`can_reduce_live_contexts` semantics that gate stays under. A head deferred past the threshold with reclaim
+exhausted and no such teardown target emits a warning with the full arithmetic and increments
 `starvation_diagnostics`; it still does not admit. The job stays queued for the structural queue wedge
 recovery supervisor, which detects a stuck queue with no dispatch progress, soft-resets the pools, and then
 faults wedged jobs non-retryably so the horde can reissue them elsewhere.

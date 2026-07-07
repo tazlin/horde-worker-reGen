@@ -127,6 +127,7 @@ from horde_worker_regen.process_management.models.lora_disk_guard import (
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.device_free_governor import (
     DeviceFreeGovernor,
     GovernorState,
@@ -397,6 +398,15 @@ class _EstimatedContextFootprint:
     """Resident VRAM working set of a typical SDXL/SD context (weights plus the per-context CUDA overhead)."""
     HEAVY_CONTEXT_VRAM_MB = 13000.0
     """Resident VRAM working set when a VRAM-heavy family (Flux/Cascade) is offered."""
+    IDLE_CONTEXT_VRAM_MB = 3835.0
+    """VRAM an inference context holds resident with no model loaded: the CUDA/runtime context baseline alone.
+
+    Separated from the per-family working-set figures above because the per-card spawn cap (see
+    :func:`cap_card_processes_to_vram_fit`) charges every planned context this idle baseline plus one copy of
+    the heaviest offered model's footprint, rather than assuming every context simultaneously holds the
+    heaviest model. That models the state the runtime governor steers toward (contexts idle-staged, one
+    heaviest model resident at a time) so the spawn bound is a viable-configuration ceiling, not a paranoid
+    one. Measured on a consumer 24GB card; deliberately conservative and hardware-independent."""
     CONTEXT_RAM_MB = 9000.0
     """System RAM a resident context retains (CPU-side weights plus allocator retention freed only by a respawn)."""
 
@@ -491,6 +501,54 @@ def cap_card_process_counts(
         victim = max(trimmable_indices, key=lambda index: capped[index])
         capped[victim] -= 1
 
+    return capped
+
+
+def cap_card_processes_to_vram_fit(
+    *,
+    per_card_target_processes: Mapping[int, int],
+    total_vram_mb_by_card: Mapping[int, float | None],
+    idle_context_overhead_mb: float,
+    heaviest_model_footprint_mb: float,
+) -> dict[int, int]:
+    """Bound each card's spawned inference contexts to what its VRAM physically holds.
+
+    A card must fit every planned context's idle CUDA/runtime baseline plus one copy of the heaviest offered
+    model's resident footprint, within the card total net of the proportional admission noise buffer (the same
+    :func:`~horde_worker_regen.process_management.resources.admission_identity.admission_noise_buffer_mb` slack
+    runtime admission keeps, scaling with card capacity). Solving
+    ``contexts * idle_overhead + heaviest_footprint <= total - noise`` for the context count yields the per-card
+    ceiling. This charges the idle baseline per context but the heaviest model only once, matching the state the
+    runtime governor steers toward (contexts idle-staged, one heaviest model resident at a time) rather than
+    assuming every context holds the heaviest model at once.
+
+    Unlike :func:`cap_card_process_counts` (the worker-wide shared-RAM cap, which only matters across cards) this
+    applies to every card independently, single-GPU included: a single card can be over-configured to spawn more
+    inference contexts than its VRAM fits just as easily as one card of a pair. It is a spawn-time upper bound
+    only. The runtime device-free governor still down-regulates concurrency dynamically within it, so this must
+    never fight that: it never reduces a card below one context (a card must keep one to serve at all) and only
+    ever lowers a card below its resolved plan.
+
+    Args:
+        per_card_target_processes: The resolved ``target_process_count`` per device index.
+        total_vram_mb_by_card: Each card's total VRAM in MB, or None where capacity is unknown (then this cap
+            abstains for that card and only the runtime budget gates its loads).
+        idle_context_overhead_mb: VRAM one context holds resident with no model loaded (the CUDA/runtime
+            baseline), charged once per planned context.
+        heaviest_model_footprint_mb: Resident footprint of the heaviest offered model, charged once for the card.
+
+    Returns:
+        The capped ``target_process_count`` per device index (each at most its input, at least 1).
+    """
+    capped = dict(per_card_target_processes)
+    if idle_context_overhead_mb <= 0:
+        return capped
+    for device_index, total_vram_mb in total_vram_mb_by_card.items():
+        if total_vram_mb is None or total_vram_mb <= 0 or device_index not in capped:
+            continue
+        usable_mb = total_vram_mb - admission_noise_buffer_mb(total_vram_mb) - heaviest_model_footprint_mb
+        max_contexts = max(1, int(usable_mb // idle_context_overhead_mb))
+        capped[device_index] = min(capped[device_index], max_contexts)
     return capped
 
 
@@ -1365,11 +1423,9 @@ class HordeWorkerProcessManager:
         if mp_primitives is None:
             mp_primitives = MultiprocessingPrimitives.create(ctx=ctx, per_card=per_card_concurrency)
 
-        # Right-size the resolved per-card plan to the hardware when this worker drives more than one card:
-        # the summed plan would otherwise over-commit the single shared system-RAM pool (a second card doubles
-        # VRAM, not RAM) and ignore the post-processing VRAM peak. The cap only ever lowers the spawn count and
-        # never below one context per card; the single-GPU path is left byte-identical. The concurrency
-        # ceiling and semaphore sizes are unchanged: only how many processes are spawned is reduced.
+        # Right-size the resolved per-card plan to the hardware. Two independent caps compose here, each only
+        # ever lowering a card's spawned-process count and never below one per card; the concurrency ceiling and
+        # semaphore sizes are untouched, so only how many processes spawn is reduced.
         target_process_counts = {index: per_card_concurrency[index].target_process_count for index in device_indices}
         total_vram_mb_by_card = {
             index: (info.total_memory / (1024 * 1024))
@@ -1377,7 +1433,46 @@ class HordeWorkerProcessManager:
             else None
             for index in device_indices
         }
+
+        # Per-card VRAM-fit cap: no card may be planned to spawn more inference contexts than its VRAM physically
+        # holds (idle context baselines plus the heaviest offered model, net of the noise buffer). This applies
+        # to every card, single-GPU included, since one card is as over-configurable as one of a pair. The
+        # benchmark deliberately over-provisions max_threads_ceiling above the configured max_threads to probe
+        # higher concurrency, so it is exempt: capping its spawn count would forbid the very concurrency levels
+        # it exists to measure. The runtime governor still enforces real residency dynamically within the bound.
+        configured_max_threads = max((cfg.max_threads for cfg in effective_configs.values()), default=1)
+        benchmark_ceiling_provisioning = max_threads_ceiling > configured_max_threads
+        if not benchmark_ceiling_provisioning:
+            heaviest_model_footprint_mb = (
+                _EstimatedContextFootprint.HEAVY_CONTEXT_VRAM_MB
+                if any(m in VRAM_HEAVY_MODELS for m in bridge_data.image_models_to_load)
+                else _EstimatedContextFootprint.SDXL_CONTEXT_VRAM_MB
+            )
+            vram_fit_counts = cap_card_processes_to_vram_fit(
+                per_card_target_processes=target_process_counts,
+                total_vram_mb_by_card=total_vram_mb_by_card,
+                idle_context_overhead_mb=_EstimatedContextFootprint.IDLE_CONTEXT_VRAM_MB,
+                heaviest_model_footprint_mb=heaviest_model_footprint_mb,
+            )
+            for index in device_indices:
+                if vram_fit_counts[index] < target_process_counts[index]:
+                    total_mb = total_vram_mb_by_card[index]
+                    logger.warning(
+                        f"VRAM-fit sizing device {index} to {vram_fit_counts[index]} inference process(es) "
+                        f"(configured plan was {per_card_concurrency[index].target_process_count}): card total "
+                        f"{total_mb:.0f} MB net of the {admission_noise_buffer_mb(total_mb):.0f} MB noise buffer "
+                        f"holds {vram_fit_counts[index]} idle context(s) of "
+                        f"~{_EstimatedContextFootprint.IDLE_CONTEXT_VRAM_MB:.0f} MB each plus the heaviest offered "
+                        f"model (~{heaviest_model_footprint_mb:.0f} MB). The runtime governor still adjusts "
+                        f"concurrency within this bound; lower max_threads/queue_size to change it.",
+                    )
+            target_process_counts = vram_fit_counts
+
+        # Worker-wide shared-RAM cap: the summed plan would over-commit the single system-RAM pool across cards
+        # (a second card doubles VRAM, not RAM). Only meaningful with more than one card; a single-GPU host never
+        # double-counts the pool, so its plan is left as the VRAM-fit cap resolved it.
         if len(device_indices) > 1:
+            pre_ram_cap_counts = dict(target_process_counts)
             target_process_counts = cap_card_process_counts(
                 per_card_target_processes=target_process_counts,
                 total_ram_bytes=self.total_ram_bytes,
@@ -1386,11 +1481,10 @@ class HordeWorkerProcessManager:
                 has_vram_heavy_models=any(m in VRAM_HEAVY_MODELS for m in bridge_data.image_models_to_load),
             )
             for index in device_indices:
-                resolved = per_card_concurrency[index].target_process_count
-                if target_process_counts[index] < resolved:
+                if target_process_counts[index] < pre_ram_cap_counts[index]:
                     logger.warning(
                         f"Right-sizing device {index} to {target_process_counts[index]} inference process(es) "
-                        f"(resolved plan was {resolved}): the shared system RAM pool or this card's VRAM "
+                        f"(plan was {pre_ram_cap_counts[index]}): the shared system RAM pool or this card's VRAM "
                         f"cannot hold the full plan's resident contexts across {len(device_indices)} cards. "
                         f"The post-processing peak is handled at dispatch, not reserved here. "
                         f"Lower max_threads/queue_size to raise it intentionally.",
@@ -3474,10 +3568,17 @@ class HordeWorkerProcessManager:
 
     @staticmethod
     def _ledger_stage(stage: JobStage) -> WorkLedgerStage:
-        """Map the internal job stage to the operator-facing work-ledger stage."""
+        """Map the internal job stage to the operator-facing work-ledger stage.
+
+        Every :class:`JobStage` a tracked job can occupy must map, so snapshot assembly never raises on the
+        control loop (a ``KeyError`` here would drop the whole supervisor snapshot for that tick). A disaggregated
+        job whose sampling has finished is still being decoded on the image lane, so it reads as INFERENCE: the
+        pipeline is still producing this job's images even though its sampler slot has been released.
+        """
         return {
             JobStage.PENDING_INFERENCE: WorkLedgerStage.QUEUED,
             JobStage.INFERENCE_IN_PROGRESS: WorkLedgerStage.INFERENCE,
+            JobStage.DISAGGREGATION_DECODING: WorkLedgerStage.INFERENCE,
             JobStage.DETACHED: WorkLedgerStage.PREPARING,
             JobStage.PENDING_POST_PROCESSING: WorkLedgerStage.POST_PROCESSING,
             JobStage.POST_PROCESSING: WorkLedgerStage.POST_PROCESSING,

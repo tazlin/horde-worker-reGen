@@ -24,10 +24,15 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.resources.admission_identity import evaluate_admission
 from horde_worker_regen.process_management.resources.vram_arbiter import (
     DeviceVramState,
     MeasuredVramSnapshot,
     VramArbiter,
+    VramDisposition,
+    VramRequest,
+    VramRequestKind,
+    VramVerdict,
 )
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -162,6 +167,65 @@ class TestGatePredicate:
 
         assert scheduler.latest_dispatch_reconciliation_released_by_reclaim() == 0
         assert scheduler.latest_dispatch_reconciliation_released_by_natural_free() == 1
+
+
+class _CapturingArbiter:
+    """A stand-in arbiter that records the request it is asked to evaluate and returns a fixed verdict."""
+
+    def __init__(self, verdict: VramVerdict) -> None:
+        self._verdict = verdict
+        self.last_request: VramRequest | None = None
+
+    @property
+    def has_cycle(self) -> bool:
+        """Always report a frozen cycle so the gate never tries to build its own snapshot."""
+        return True
+
+    def evaluate(self, request: VramRequest) -> VramVerdict:
+        """Record the request and return the fixed verdict."""
+        self.last_request = request
+        return self._verdict
+
+
+class TestLineSkipDispatchHeadTruth:
+    """A line-skip dispatch is not the true head of queue, so the gate must present is_head_of_queue=False.
+
+    The dispatch gate stamped is_head_of_queue=True unconditionally, which handed a line-skipper the head's
+    best-effort over-budget admit. The truth of whether a dispatch is the genuine head (``line_skip is None``)
+    is plumbed through so a line-skipper forfeits that admit and the head keeps first claim on the card.
+    """
+
+    def _fits_verdict(self) -> VramVerdict:
+        """A FITS verdict on the predictive path, so the gate releases and only the request truth is asserted."""
+        measured = evaluate_admission(
+            measured_committed_mb=0.0,
+            planned_unmaterialized_mb=0.0,
+            candidate_delta_mb=0.0,
+            total_vram_mb=None,
+            baseline_mb=0.0,
+            committed_is_stale=False,
+        )
+        return VramVerdict(
+            disposition=VramDisposition.FITS,
+            request_kind=VramRequestKind.MONOLITHIC_DISPATCH,
+            device_index=None,
+            reason="test-fits",
+            measured=measured,
+        )
+
+    async def test_true_head_presents_head_and_line_skip_presents_non_head(self) -> None:
+        """The gate stamps is_head_of_queue from the caller: True for the real head, False for a line-skip."""
+        scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
+        capture = _CapturingArbiter(self._fits_verdict())
+        scheduler._vram_arbiter = capture  # type: ignore[assignment]
+
+        assert scheduler._dispatch_residency_reconciliation_holds(job, target) is False
+        assert capture.last_request is not None
+        assert capture.last_request.is_head_of_queue is True
+
+        assert scheduler._dispatch_residency_reconciliation_holds(job, target, is_head_of_queue=False) is False
+        assert capture.last_request is not None
+        assert capture.last_request.is_head_of_queue is False
 
 
 class TestHeldDispatchSurvivesWatchdogs:
