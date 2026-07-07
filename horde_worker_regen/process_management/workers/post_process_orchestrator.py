@@ -16,12 +16,17 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     predict_job_post_processing_vram_mb,
+)
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    VramArbiter,
+    VramRequest,
+    VramRequestKind,
 )
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
@@ -111,6 +116,46 @@ class PostProcessOrchestrator:
         # keeps the window immune to wall-clock jumps.
         self._clock = time.monotonic
         self._deferrals: dict[str, _DeferralRecord] = {}
+        # The single VRAM arbiter, injected by the manager. It is the deciding authority for the lane's memory
+        # admission question (replacing the banned free-VRAM read). None until wired (and in tests), where the
+        # gate admits on missing telemetry.
+        self._vram_arbiter: VramArbiter | None = None
+
+    def set_vram_arbiter(self, arbiter: VramArbiter) -> None:
+        """Inject the single VRAM arbiter: the deciding authority for the lane's memory admission question."""
+        self._vram_arbiter = arbiter
+
+    def _arbiter_admits_post_processing(
+        self,
+        *,
+        post_process_process: HordeProcessInfo,
+        reserve_vram_mb: float,
+    ) -> bool:
+        """Whether the lane can start this chain without over-committing its card, the VRAM arbiter deciding.
+
+        A pure predicate over the frozen cycle measurement: the chain's estimated peak is charged against the
+        card's measured admission floor, so a FITS verdict admits and a DEFER or DENY withholds. The
+        reserve bypass is preserved (a disabled VRAM budget or a zero-peak chain always admits), and a cold or
+        unwired arbiter admits, matching the every-gate-admits-on-missing-telemetry contract. The deferral
+        bookkeeping (reclaim request, throttled warning, aging) is the caller's, so this stays side-effect free
+        and can be evaluated for every candidate in a queue scan.
+        """
+        bridge_data = self._runtime_config.bridge_data
+        if not bridge_data.enable_vram_budget or reserve_vram_mb <= 0:
+            return True
+        arbiter = self._vram_arbiter
+        if arbiter is None or not arbiter.has_cycle:
+            return True
+        verdict = arbiter.evaluate(
+            VramRequest(
+                kind=VramRequestKind.PP_JOB,
+                job_label="post_process",
+                baseline=None,
+                device_index=post_process_process.device_index,
+                candidate_delta_mb=reserve_vram_mb,
+            ),
+        )
+        return verdict.admits
 
     def _estimate_post_processing_vram_mb(self, completed_job_info: HordeJobInfo) -> float:
         """Return the committed VRAM reserve for this post-processing unit."""
@@ -121,30 +166,6 @@ class PostProcessOrchestrator:
         if estimate is None:
             return 0.0
         return max(0.0, estimate)
-
-    def _has_post_processing_headroom(
-        self,
-        *,
-        post_process_process: HordeProcessInfo,
-        reserve_vram_mb: float,
-    ) -> bool:
-        """Return whether the lane can start this chain without over-committing its card's VRAM.
-
-        A pure predicate: the deferral bookkeeping (reclaim request, throttled warning, aging) is the
-        caller's, so this can be evaluated for every candidate in a queue scan without side effects.
-        """
-        bridge_data = self._runtime_config.bridge_data
-        if not bridge_data.enable_vram_budget or reserve_vram_mb <= 0:
-            return True
-
-        free_vram_mb = self._process_map.get_free_vram_mb(device_index=post_process_process.device_index)
-        if free_vram_mb is None:
-            return True
-
-        committed_elsewhere_mb = self._reserve_ledger.total_vram_mb()
-        required_mb = reserve_vram_mb + bridge_data.vram_reserve_mb
-        available_mb = free_vram_mb - committed_elsewhere_mb
-        return available_mb >= required_mb
 
     def _effective_lane_cap_mb(self, post_process_process: HordeProcessInfo) -> float | None:
         """Return the lane's allocator-guard cap (MB) for its card, or None when the card total is unknown.
@@ -278,12 +299,15 @@ class PostProcessOrchestrator:
         # Deferral records are otherwise only created against a live lane process, so with the lane
         # absent (crashed, failed to start, or torn down without coming back) no patience clock would
         # ever start and these jobs would wait forever. Arm the clock here so the aging escape below
-        # can fault them. A deliberate whole-card pause is excluded: the residency lifecycle restarts the
-        # lane when the card is released, so those jobs wait for the real lane unless post-processing is
-        # session-disabled as structurally unsupported.
+        # can fault them. Only a whole-card residency pause suppresses the clock: it has a live restore path
+        # (the residency completion loop restarts the lane when the card is released) and heavy jobs are
+        # expected to wait for it. A reclaim-ladder pause does NOT suppress it: the ladder restores the lane
+        # only if the card recovers to HEALTHY, which is not guaranteed within the patience window (a card
+        # stuck saturated may never recover), so its pending post-processing must run the liveness countdown
+        # and age out to the raw-image fallback rather than wait on a lane that may never return.
         if (
             self._process_map.num_post_process_processes() == 0
-            and not self._process_lifecycle.is_post_process_gpu_paused
+            and self._process_lifecycle.post_process_pause_owner is not PauseOwner.WHOLE_CARD
         ):
             for job_info in pending:
                 key = str(job_info.sdk_api_job_info.id_)
@@ -351,7 +375,7 @@ class PostProcessOrchestrator:
                     )
                 return False
 
-            if self._has_post_processing_headroom(
+            if self._arbiter_admits_post_processing(
                 post_process_process=post_process_process,
                 reserve_vram_mb=reserve_vram_mb,
             ):

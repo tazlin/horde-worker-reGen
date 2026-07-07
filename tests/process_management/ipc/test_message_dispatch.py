@@ -22,6 +22,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     ModelLoadState,
 )
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
@@ -132,6 +133,13 @@ class TestReceiveAndHandleProcessMessages:
         msg.ram_usage_bytes = 1024
         msg.vram_usage_mb = 2048
         msg.vram_total_mb = 4096
+        msg.open_fds = None
+        msg.fd_soft_limit = None
+        msg.process_reserved_mb = 6000
+        msg.process_allocated_mb = 5000
+        msg.process_peak_reserved_mb = 6500
+        msg.process_aimdo_mb = 10000
+        msg.sampled_at = 1234.5
         msg.info = "memory"
 
         _enqueue(message_dispatcher, msg)
@@ -142,6 +150,13 @@ class TestReceiveAndHandleProcessMessages:
             ram_usage_bytes=1024,
             vram_usage_mb=2048,
             total_vram_mb=4096,
+            open_fds=None,
+            fd_soft_limit=None,
+            process_reserved_mb=6000,
+            process_allocated_mb=5000,
+            process_peak_reserved_mb=6500,
+            process_aimdo_mb=10000,
+            report_sampled_at=1234.5,
         )
 
     def test_record_completed_job_increments_producing_process(self) -> None:
@@ -424,6 +439,48 @@ class TestReceiveAndHandleProcessMessages:
         await message_dispatcher.receive_and_handle_process_messages()
 
         process_map.on_process_ending.assert_called_once_with(process_id=0)
+
+
+class TestInferenceStartingIsTypeScoped:
+    """``INFERENCE_STARTING`` bookkeeping applies only to whole-job INFERENCE slots, never stage lanes.
+
+    A disaggregated text-encode stage runs on a ``COMPONENT`` lane process that reuses the busy
+    ``INFERENCE_STARTING`` state to mark itself working, but holds no parent-tracked model. Before the
+    type guard, that state change reached the whole-job handler, which raised ``ValueError`` on the
+    absent model and took the whole worker down over routine stage traffic. These lock the guard: the
+    stage lane is tolerated, while the invariant still fires for a real whole-job slot with no model.
+    """
+
+    def _inference_starting_message(self, process_id: int) -> HordeProcessStateChangeMessage:
+        return HordeProcessStateChangeMessage(
+            process_id=process_id,
+            process_launch_identifier=0,
+            process_state=HordeProcessState.INFERENCE_STARTING,
+            info="Text-encode 1234",
+        )
+
+    def test_component_lane_inference_starting_without_model_does_not_raise(self) -> None:
+        """A COMPONENT stage lane reporting INFERENCE_STARTING with no loaded model is tolerated."""
+        component = make_mock_process_info(1, model_name=None, process_type=HordeProcessType.COMPONENT)
+        dispatcher = _make_dispatcher(process_map=ProcessMap({1: component}))
+
+        # Must not raise: the whole-job model/batch bookkeeping is skipped for a non-INFERENCE process.
+        dispatcher._handle_process_state_change(self._inference_starting_message(1))
+
+    def test_post_process_lane_inference_starting_without_model_does_not_raise(self) -> None:
+        """A POST_PROCESS image lane is likewise exempt from the whole-job INFERENCE_STARTING bookkeeping."""
+        lane = make_mock_process_info(2, model_name=None, process_type=HordeProcessType.POST_PROCESS)
+        dispatcher = _make_dispatcher(process_map=ProcessMap({2: lane}))
+
+        dispatcher._handle_process_state_change(self._inference_starting_message(2))
+
+    def test_whole_job_inference_slot_without_model_still_raises(self) -> None:
+        """The invariant is not weakened: a whole-job INFERENCE slot starting with no model still faults."""
+        inference = make_mock_process_info(0, model_name=None, process_type=HordeProcessType.INFERENCE)
+        dispatcher = _make_dispatcher(process_map=ProcessMap({0: inference}))
+
+        with pytest.raises(ValueError, match="no model loaded"):
+            dispatcher._handle_process_state_change(self._inference_starting_message(0))
 
 
 class TestHandleInferenceResult:

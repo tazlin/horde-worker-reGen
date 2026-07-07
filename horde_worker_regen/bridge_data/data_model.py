@@ -656,6 +656,29 @@ class reGenBridgeData(CombinedHordeBridgeData):
     proactive guard against the multi-process over-commit that OOMs a shared GPU. Set false to
     restore the prior availability-only behavior (not recommended on a shared/consumer GPU)."""
 
+    enable_pipeline_disaggregation: bool = Field(default=False)
+    """Run eligible jobs as a disaggregated pipeline (text-encode service + UNet-only samplers + image lane).
+
+    When true, a job is split into stages that run in separate processes exchanging small activations
+    rather than one process running the whole job: a dedicated text-encode service produces the
+    conditioning, UNet-only samplers produce latents, and the image lane VAE-decodes (and post-processes).
+    Because the sampler holds only the UNet, its VRAM peak is a fraction of the whole job's, which keeps two
+    samplers co-resident on a card the whole-job footprint would collapse to one, and moves the VAE decode
+    spike off the sampler onto the image lane.
+
+    A job is disaggregated only when every condition holds: this flag is on; its source processing is
+    txt2img, img2img, or remix; it requests no control_type; its model's baseline is an SD1.5 or SDXL family
+    (resolved from the loaded model reference, the only v1 families validated); and both the encode-service
+    (component) process and the image lane are live and healthy. Any condition failing leaves the job on the
+    monolithic path, where it is charged and dispatched whole; that IS the fallback (there is no
+    re-queue-on-stall), so a stage-service outage, an ineligible family, or a control/inpaint job simply runs
+    monolithically. A role dying after a job is claimed is backstopped by the pipeline's per-stage patience,
+    which faults the job for horde reissue rather than parking it forever.
+
+    Enabling this forces the dedicated post-processing (image) lane on regardless of
+    post_processing_lane_enabled, since the pipeline's decode stage runs there. Default false (the
+    monolithic path) until validated on the operator's card."""
+
     vram_reserve_mb: int = Field(default=2048, ge=0)
     """Free VRAM (MB) the budget keeps in reserve on top of a job's estimated peak.
 
@@ -846,6 +869,18 @@ class reGenBridgeData(CombinedHordeBridgeData):
 
     self_maintenance_cooldown_seconds: int = Field(default=300, ge=0)
     """How long the worker holds its self-imposed local pop-pause before resuming after a self-throttle."""
+
+    comfy_smart_memory: bool = Field(default=False)
+    """Keep ComfyUI's smart memory management on so inference children hold model weights resident in VRAM
+    across jobs.
+
+    With this on, a back-to-back same-model job reuses the resident UNet/CLIP/VAE instead of re-uploading
+    them from RAM, eliminating the per-job RAM->VRAM transfers that dominate small-job wall-clock. It is
+    OFF by default because cross-process residency is not yet reconciled at dispatch time: a sampling peak
+    landing beside an idle sibling's resident weights overcommits a tight card faster than the device-free
+    governor's reclaim ladder can evict, and the driver then demotes VRAM to system memory (a card-wide
+    slowdown far costlier than the transfers this saves). Enable only for experimentation on cards with
+    headroom well above one sampling peak plus one resident model."""
 
     dry_run_skip_inference: bool = Field(default=False)
     """Skip real GPU inference and return a dummy 1x1 image instead."""

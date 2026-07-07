@@ -23,12 +23,21 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessStateChangeMessage,
     HordeSafetyControlMessage,
     HordeSafetyResultMessage,
+    HordeSampleControlMessage,
+    HordeSampleResultMessage,
+    HordeVaeDecodeControlMessage,
+    HordeVaeDecodeResultMessage,
+    HordeVaeEncodeControlMessage,
+    HordeVaeEncodeResultMessage,
     ModelLoadState,
+    SampleSliceSpec,
 )
 from horde_worker_regen.process_management.simulation.fake_worker_processes import (
     FakeInferenceProcess,
+    FakePostProcessProcess,
     FakeSafetyProcess,
 )
+from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
 from tests.process_management.conftest import make_job_pop_response
 
 
@@ -63,6 +72,37 @@ def make_fake_inference_process(**kwargs: object) -> tuple[FakeInferenceProcess,
         disk_lock=Mock(),
         process_launch_identifier=0,
         **kwargs,  # type: ignore[arg-type]
+    )
+    return process, queue
+
+
+def make_fake_post_process_process() -> tuple[FakePostProcessProcess, RecordingQueue]:
+    """Construct a FakePostProcessProcess wired to a recording queue and mock primitives."""
+    queue = RecordingQueue()
+    process = FakePostProcessProcess(
+        process_id=3,
+        process_message_queue=queue,  # type: ignore[arg-type]
+        pipe_connection=Mock(),
+        disk_lock=Mock(),
+        process_launch_identifier=0,
+    )
+    return process, queue
+
+
+def make_vae_lane_process() -> tuple[HordeVaeLaneProcess, RecordingQueue]:
+    """Construct a dry-run HordeVaeLaneProcess wired to a recording queue and mock primitives.
+
+    The dry-run VAE lane is ML-free (it returns plausible stand-in latent/image bytes), so it stands in
+    for the real lane in these protocol tests exactly as it does in the harness.
+    """
+    queue = RecordingQueue()
+    process = HordeVaeLaneProcess(
+        process_id=4,
+        process_message_queue=queue,  # type: ignore[arg-type]
+        pipe_connection=Mock(),
+        disk_lock=Mock(),
+        process_launch_identifier=0,
+        dry_run=True,
     )
     return process, queue
 
@@ -191,6 +231,130 @@ class TestFakeInferenceProcess:
         )
 
         assert process._active_model_name is None
+
+    def test_sample_stage_emits_starting_result_and_waiting(self) -> None:
+        """A START_SAMPLE message must report INFERENCE_STARTING, return a LATENT per slice, then idle.
+
+        This mirrors the real sampler's disaggregated stage: the ``INFERENCE_STARTING`` is a plain
+        process-state change (no model-state traffic), so the fake never fakes a model residency the
+        parent tracks. Two slices must yield two per-slice results, in order.
+        """
+        process, queue = make_fake_inference_process()
+        job_a = make_job_pop_response(model="SDXL 1.0")
+        job_b = make_job_pop_response(model="SDXL 1.0")
+
+        process._receive_and_handle_control_message(
+            HordeSampleControlMessage(
+                horde_model_name="SDXL 1.0",
+                slices=[
+                    SampleSliceSpec(
+                        job_id=job_a.id_,
+                        positive_conditioning_bytes=b"pos",
+                        negative_conditioning_bytes=b"neg",
+                        sdk_api_job_info=job_a,
+                    ),
+                    SampleSliceSpec(
+                        job_id=job_b.id_,
+                        positive_conditioning_bytes=b"pos",
+                        negative_conditioning_bytes=b"neg",
+                        sdk_api_job_info=job_b,
+                    ),
+                ],
+            ),
+        )
+
+        result_messages = queue.of_type(HordeSampleResultMessage)
+        assert len(result_messages) == 1
+        result = result_messages[0]
+        assert [r.job_id for r in result.results] == [job_a.id_, job_b.id_]
+        assert all(r.latent_bytes is not None for r in result.results)
+        assert all(r.state == GENERATION_STATE.ok for r in result.results)
+
+        # No HordeModelStateChangeMessage: the pinned sampler's residency is the parent's to track.
+        assert queue.of_type(HordeModelStateChangeMessage) == []
+        states = queue.state_changes()
+        assert HordeProcessState.INFERENCE_STARTING in states
+        assert states[-1] == HordeProcessState.WAITING_FOR_JOB
+
+
+class TestVaeLaneProcess:
+    """The dry-run VAE lane must mirror the real lane's observable protocol for the VAE stages."""
+
+    def test_vae_encode_emits_post_processing_latent_and_waiting(self) -> None:
+        """A VAE-encode message must report POST_PROCESSING, return a source LATENT, then idle."""
+        process, queue = make_vae_lane_process()
+        job = make_job_pop_response(model="SDXL 1.0")
+
+        process._receive_and_handle_control_message(
+            HordeVaeEncodeControlMessage(
+                horde_model_name="SDXL 1.0",
+                job_id=job.id_,
+                sdk_api_job_info=job,
+            ),
+        )
+
+        result_messages = queue.of_type(HordeVaeEncodeResultMessage)
+        assert len(result_messages) == 1
+        result = result_messages[0]
+        assert result.job_id == job.id_
+        assert result.latent_bytes is not None
+        assert result.state == GENERATION_STATE.ok
+
+        states = queue.state_changes()
+        assert HordeProcessState.POST_PROCESSING in states
+        assert states[-1] == HordeProcessState.WAITING_FOR_JOB
+
+    def test_vae_decode_emits_post_processing_images_and_waiting(self) -> None:
+        """A VAE-decode message must report POST_PROCESSING, return one PNG per iteration, then idle."""
+        process, queue = make_vae_lane_process()
+        job = make_job_pop_response(model="SDXL 1.0", n_iter=2)
+
+        process._receive_and_handle_control_message(
+            HordeVaeDecodeControlMessage(
+                horde_model_name="SDXL 1.0",
+                job_id=job.id_,
+                sdk_api_job_info=job,
+                latent_bytes=b"latent",
+            ),
+        )
+
+        result_messages = queue.of_type(HordeVaeDecodeResultMessage)
+        assert len(result_messages) == 1
+        result = result_messages[0]
+        assert result.job_id == job.id_
+        assert result.state == GENERATION_STATE.ok
+        assert result.job_image_results is not None
+        assert len(result.job_image_results) == 2
+        for image_result in result.job_image_results:
+            assert image_result.image_bytes.startswith(b"\x89PNG")
+
+        states = queue.state_changes()
+        assert HordeProcessState.POST_PROCESSING in states
+        assert states[-1] == HordeProcessState.WAITING_FOR_JOB
+
+
+class TestFakePostProcessProcess:
+    """The fake post-processing lane serves only PP work now; VAE messages must be rejected, not served."""
+
+    def test_vae_decode_message_is_rejected_without_a_result(self) -> None:
+        """A VAE stage message reaching the post-processing lane is rejected: no VAE result is emitted.
+
+        The VAE stages moved to the dedicated VAE lane, so the post-processing fake must once again treat a
+        VAE control message as an unexpected type rather than silently serving it.
+        """
+        process, queue = make_fake_post_process_process()
+        job = make_job_pop_response(model="SDXL 1.0")
+
+        process._receive_and_handle_control_message(
+            HordeVaeDecodeControlMessage(
+                horde_model_name="SDXL 1.0",
+                job_id=job.id_,
+                sdk_api_job_info=job,
+                latent_bytes=b"latent",
+            ),
+        )
+
+        assert queue.of_type(HordeVaeDecodeResultMessage) == []
 
 
 class TestFakeSafetyProcess:

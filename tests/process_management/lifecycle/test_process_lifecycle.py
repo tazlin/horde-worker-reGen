@@ -14,7 +14,7 @@ from horde_worker_regen.process_management.ipc.messages import HordeControlFlag,
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -35,9 +35,11 @@ def _make_plm(
     bridge_data = Mock()
     bridge_data.image_models_to_load = ["stable_diffusion"]
     bridge_data.max_threads = 1
+    bridge_data.enable_pipeline_disaggregation = False
     bridge_data.safety_on_gpu = False
     bridge_data.process_timeout = 120
     bridge_data.inference_step_timeout = 60
+    bridge_data.inference_first_step_timeout = 120
     bridge_data.inference_stuck_step_repeat_limit = 20
     bridge_data.preload_timeout = 120
     bridge_data.download_timeout = 120
@@ -600,22 +602,22 @@ def test_pause_and_restore_post_process_lane_stops_and_restarts_it_for_whole_car
     plm._runtime_config.bridge_data.post_processing_lane_enabled = True
 
     assert plm.is_post_process_gpu_paused is False
-    assert plm.pause_post_process_off_gpu() is True
+    assert plm.pause_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is True
     assert plm.is_post_process_gpu_paused is True
     # The lane-replacement state machine was armed (to end the running lane) and marked intentional.
     assert plm.post_process_processes_should_be_replaced is True
     assert plm._post_process_replacement_intentional is True
     # Idempotent: a second pause does nothing.
-    assert plm.pause_post_process_off_gpu() is False
+    assert plm.pause_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
 
     # The per-tick start hook must not resurrect the lane while it is paused.
     plm.start_post_process_processes()
     assert plm._process_map.num_post_process_processes() == 1  # only the still-ending original, no new start
 
-    assert plm.restore_post_process_off_gpu() is True
+    assert plm.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is True
     assert plm.is_post_process_gpu_paused is False
     # Idempotent: restoring when not paused does nothing.
-    assert plm.restore_post_process_off_gpu() is False
+    assert plm.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
 
 
 def test_restore_post_process_lane_starts_it_when_none_running() -> None:
@@ -637,11 +639,11 @@ def test_restore_post_process_lane_starts_it_when_none_running() -> None:
     plm._runtime_config.bridge_data.post_processing_lane_enabled = True
     plm._runtime_config.bridge_data.dry_run_skip_post_processing = False
 
-    assert plm.pause_post_process_off_gpu() is True
+    assert plm.pause_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is True
     # The paused-lane teardown already ran to completion: no lane process remains in the map.
     assert plm._process_map.num_post_process_processes() == 0
 
-    assert plm.restore_post_process_off_gpu() is True
+    assert plm.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is True
     assert plm._process_map.num_post_process_processes() == 1
 
 
@@ -649,8 +651,129 @@ def test_pause_post_process_lane_is_noop_when_lane_disabled() -> None:
     """With the dedicated lane disabled there is no lane to stop, so the pause is a no-op."""
     plm = _make_plm()
     plm._runtime_config.bridge_data.post_processing_lane_enabled = False
-    assert plm.pause_post_process_off_gpu() is False
+    assert plm.pause_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
     assert plm.is_post_process_gpu_paused is False
+
+
+def test_pause_and_restore_vae_lane_stops_and_restarts_it_for_whole_card() -> None:
+    """A whole-card model stops the disaggregation VAE lane (freeing its context), then restarts it after.
+
+    Mirrors the post-processing lane's whole-card yield: the lane is stopped outright (its CUDA context is
+    only reclaimable by the process exiting), the per-tick start hook stays a no-op while paused, and the
+    pause/restart is marked intentional so it is not counted as a lane crash.
+    """
+    running_lane = make_mock_process_info(1, process_type=HordeProcessType.VAE_LANE)
+    plm = _make_plm(process_map=ProcessMap({1: running_lane}))
+    plm._runtime_config.bridge_data.enable_pipeline_disaggregation = True
+
+    assert plm.is_vae_lane_gpu_paused is False
+    assert plm.pause_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD) is True
+    assert plm.is_vae_lane_gpu_paused is True
+    # The lane-replacement state machine was armed (to end the running lane) and marked intentional.
+    assert plm.vae_lane_processes_should_be_replaced is True
+    assert plm._vae_lane_replacement_intentional is True
+    # Idempotent: a second pause does nothing.
+    assert plm.pause_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
+
+    # The per-tick start hook must not resurrect the lane while it is paused.
+    plm.start_vae_lane_processes()
+    assert plm._process_map.num_vae_lane_processes() == 1  # only the still-ending original, no new start
+
+    assert plm.restore_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD) is True
+    assert plm.is_vae_lane_gpu_paused is False
+    # Idempotent: restoring when not paused does nothing.
+    assert plm.restore_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
+
+
+def test_restore_vae_lane_starts_it_when_none_running() -> None:
+    """Restoring after a whole-card pause must itself relaunch the VAE lane.
+
+    By restore time the replacement state machine has already ended and deleted the paused lane and
+    consumed its flag, and the bring-up callers are one-shot latches. If the restore did not start the lane
+    directly, every VAE stage for the rest of the session would queue against a lane that never returns.
+    """
+    fake_ctx = Mock()
+    fake_ctx.get_start_method.return_value = "spawn"
+    fake_ctx.Pipe.return_value = (Mock(), Mock())
+    fake_ctx.Process.return_value.pid = 12345
+    fake_ctx.Process.return_value.exitcode = None
+
+    plm = _make_plm(ctx=fake_ctx)
+    plm._runtime_config.bridge_data.enable_pipeline_disaggregation = True
+    plm._runtime_config.bridge_data.dry_run_skip_inference = False
+
+    assert plm.pause_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD) is True
+    # No lane was running when paused, so nothing remains in the map.
+    assert plm._process_map.num_vae_lane_processes() == 0
+
+    assert plm.restore_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD) is True
+    assert plm._process_map.num_vae_lane_processes() == 1
+
+
+def test_pause_vae_lane_is_noop_when_disaggregation_disabled() -> None:
+    """With disaggregation disabled the VAE lane never runs, so the pause is a no-op."""
+    plm = _make_plm()  # _make_plm defaults enable_pipeline_disaggregation to False
+    assert plm.pause_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
+    assert plm.is_vae_lane_gpu_paused is False
+
+
+def test_post_process_lane_pause_ownership_is_isolated() -> None:
+    """A ladder-owned PP pause is not lifted by a whole-card restore, and vice versa: only the owner clears it.
+
+    The two initiators of a lane pause (the whole-card residency and the reclaim ladder) must not clear each
+    other's hold. A ladder pause cleared by the residency completion loop (which has no grant to complete)
+    would be the original wedge; a residency pause cleared by the ladder's unwind would restart the lane while
+    a heavy model still needs the card.
+    """
+    running_lane = make_mock_process_info(1, process_type=HordeProcessType.POST_PROCESS)
+    plm = _make_plm(process_map=ProcessMap({1: running_lane}))
+    plm._runtime_config.bridge_data.post_processing_lane_enabled = True
+
+    # A ladder-owned pause records the ladder as owner and refuses a whole-card restore.
+    assert plm.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.post_process_pause_owner is PauseOwner.RECLAIM_LADDER
+    assert plm.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
+    assert plm.is_post_process_gpu_paused is True
+    # The ladder's own restore clears it.
+    assert plm.restore_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.is_post_process_gpu_paused is False
+    assert plm.post_process_pause_owner is None
+
+    # Symmetric: a whole-card pause refuses a ladder unwind and is cleared only by the whole-card restore.
+    assert plm.pause_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is True
+    assert plm.post_process_pause_owner is PauseOwner.WHOLE_CARD
+    assert plm.restore_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is False
+    assert plm.is_post_process_gpu_paused is True
+    assert plm.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD) is True
+    assert plm.is_post_process_gpu_paused is False
+
+
+def test_vae_lane_pause_ownership_is_isolated() -> None:
+    """The VAE lane honors the same pause ownership: only the initiating owner's restore clears it."""
+    running_lane = make_mock_process_info(1, process_type=HordeProcessType.VAE_LANE)
+    plm = _make_plm(process_map=ProcessMap({1: running_lane}))
+    plm._runtime_config.bridge_data.enable_pipeline_disaggregation = True
+
+    assert plm.pause_vae_lane_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.vae_lane_pause_owner is PauseOwner.RECLAIM_LADDER
+    assert plm.restore_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
+    assert plm.is_vae_lane_gpu_paused is True
+    assert plm.restore_vae_lane_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.is_vae_lane_gpu_paused is False
+
+
+def test_component_lane_pause_ownership_is_isolated() -> None:
+    """The component lane honors the same pause ownership: only the initiating owner's restore clears it."""
+    running_lane = make_mock_process_info(1, process_type=HordeProcessType.COMPONENT)
+    plm = _make_plm(process_map=ProcessMap({1: running_lane}))
+    plm._runtime_config.bridge_data.enable_pipeline_disaggregation = True
+
+    assert plm.pause_component_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.component_pause_owner is PauseOwner.RECLAIM_LADDER
+    assert plm.restore_component_off_gpu(owner=PauseOwner.WHOLE_CARD) is False
+    assert plm.is_component_gpu_paused is True
+    assert plm.restore_component_off_gpu(owner=PauseOwner.RECLAIM_LADDER) is True
+    assert plm.is_component_gpu_paused is False
 
 
 def _captured_safety_cpu_only(plm: ProcessLifecycleManager) -> bool:
@@ -1032,3 +1155,167 @@ def test_oom_kill_is_labelled_oom_and_spares_the_slot_crash_breaker(monkeypatch:
     )
     # A host-RAM OOM is not slot sickness: repeated OOM kills must not quarantine an otherwise-healthy slot.
     assert plm._slot_recovery_history.get(1, []) == [], "OS OOM kills must not feed the per-slot crash-loop breaker"
+
+
+class TestPagedSlowdownWatchdog:
+    """The last reclaim rung: a crawling sampler is replaced once the card is wedged over the paging cliff.
+
+    A paged sampling process keeps emitting steps, so its heartbeat stays fresh and the silence-based hang
+    watchdog never trips; the card is lost for minutes. The kill is the terminal reclaim rung, gated on
+    device-level truth rather than per-PID attribution: the card has been continuously SATURATED past the
+    kill horizon, the verified reclaim ladder has exhausted itself without relieving it, and the slot is
+    crawling (its per-step floor tripped, or its whole-job elapsed grade reached WARN). The per-PID PDH
+    victim map no longer gates anything: WDDM demotes the least-recently-touched allocator, so the slow slot
+    and the demoted slot are usually different pids, making that gate structurally unsatisfiable.
+    """
+
+    def _crawling_slot(
+        self,
+        *,
+        per_step_floor_tripped: bool = True,
+        slowdown_level: int = 0,
+        expected_seconds: float = 10.0,
+        elapsed_seconds: float = 40.0,
+    ) -> HordeProcessInfo:
+        proc = make_mock_process_info(1, model_name="Flux.1", state=HordeProcessState.INFERENCE_STARTING)
+        proc.current_job_slowdown_level = slowdown_level
+        proc.current_job_per_step_floor_tripped = per_step_floor_tripped
+        proc.current_job_expected_sampling_seconds = expected_seconds
+        proc.current_first_step_at = time.time() - elapsed_seconds
+        proc.last_heartbeat_timestamp = time.time()
+        proc.last_received_timestamp = time.time()
+        return proc
+
+    @staticmethod
+    def _arm_saturation(plm: ProcessLifecycleManager, *, seconds: float = 15.0, unresolved: bool = True) -> None:
+        plm._device_saturation_duration_provider = lambda _device_index: seconds
+        plm._saturation_unresolved_provider = lambda _device_index: unresolved
+
+    def test_saturated_exhausted_and_crawling_slot_is_replaced(self) -> None:
+        """All three device-level gates met (SATURATED past horizon, ladder exhausted, slot crawling) replace it."""
+        proc = self._crawling_slot()
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+        self._arm_saturation(plm)
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_called_once()
+        assert plm._replace_inference_process.call_args.args[0] is proc
+        reason = plm._replace_inference_process.call_args.kwargs["resource_fault_reason"]
+        assert "SATURATED" in reason and "4.0x" in reason
+        assert plm._paging_victim_replacements == 1
+
+    def test_warn_grade_satisfies_the_crawl_condition(self) -> None:
+        """The whole-job WARN elapsed grade also counts as crawling, even without a per-step-floor trip."""
+        proc = self._crawling_slot(per_step_floor_tripped=False, slowdown_level=2)
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+        self._arm_saturation(plm)
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_called_once()
+        assert plm._paging_victim_replacements == 1
+
+    def test_not_saturated_long_enough_is_not_replaced(self) -> None:
+        """A card that has not been SATURATED past the kill horizon does not reach the last rung."""
+        proc = self._crawling_slot()
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+        self._arm_saturation(plm, seconds=3.0)
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_not_called()
+        assert plm._paging_victim_replacements == 0
+
+    def test_ladder_not_exhausted_is_not_replaced(self) -> None:
+        """While the reclaim ladder is still yielding (not exhausted), a softer rung owns the card, not a kill."""
+        proc = self._crawling_slot()
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+        self._arm_saturation(plm, unresolved=False)
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_not_called()
+        assert plm._paging_victim_replacements == 0
+
+    def test_not_crawling_is_not_replaced(self) -> None:
+        """A saturated, ladder-exhausted card with a slot that is NOT crawling leaves the slot alone.
+
+        The slot is well within its expected sampling time (no per-step-floor trip and no WARN grade), so the
+        elapsed-ratio grader also leaves it below WARN.
+        """
+        proc = self._crawling_slot(per_step_floor_tripped=False, slowdown_level=0, elapsed_seconds=5.0)
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+        self._arm_saturation(plm)
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_not_called()
+        assert plm._paging_victim_replacements == 0
+
+    def test_pdh_victim_map_no_longer_gates(self) -> None:
+        """With every device-level gate met, the slot is replaced even though the PDH victim map is empty.
+
+        This is the crux of the rework: the old contract required the slot's own pid in the paging-victim
+        set, which the LRU physics made structurally unsatisfiable. That gate is gone; the map is hint-only.
+        """
+        proc = self._crawling_slot()
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+        plm._wddm_paging_victims_provider = lambda _max_age: {}
+        self._arm_saturation(plm)
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_called_once()
+
+    def test_pdh_victim_pid_alone_does_not_replace(self) -> None:
+        """The per-PID paging attribution alone (device not saturated/exhausted) never triggers the kill now."""
+        proc = self._crawling_slot()
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+        plm._wddm_paging_victims_provider = lambda _max_age: {proc.os_pid: 512.0}
+        # Device-level gates left at their non-firing defaults (0s saturation, ladder not exhausted).
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_not_called()
+        assert plm._paging_victim_replacements == 0
+
+    def test_idle_slot_is_never_replaced(self) -> None:
+        """A slot that is not actively sampling (not INFERENCE_STARTING) is never the last rung."""
+        proc = self._crawling_slot()
+        proc.last_process_state = HordeProcessState.WAITING_FOR_JOB
+        plm = _make_plm(process_map=ProcessMap({1: proc}))
+        plm._replace_inference_process = Mock()  # type: ignore[method-assign]
+        self._arm_saturation(plm)
+
+        plm.replace_hung_processes()
+
+        plm._replace_inference_process.assert_not_called()
+
+    async def test_replaced_job_takes_the_degraded_retry_path(self) -> None:
+        """The killed job faults as a resource failure, so it earns the one degraded/isolated retry."""
+        plm = _make_plm()
+        plm._end_inference_process = Mock()  # type: ignore[method-assign]
+        plm._start_inference_process = Mock()  # type: ignore[method-assign]
+        plm._job_tracker.set_retry_policy(2)
+
+        job = make_job_pop_response(model="Flux.1")
+        await plm._job_tracker.record_popped_job(job)
+        await plm._job_tracker.mark_inference_started(job)
+
+        proc = self._crawling_slot()
+        proc.last_job_referenced = job
+        plm._process_map[1] = proc
+        self._arm_saturation(plm)
+
+        plm.replace_hung_processes()
+
+        assert plm._paging_victim_replacements == 1
+        assert plm._job_tracker.is_degraded_dispatch_pending(job) is True

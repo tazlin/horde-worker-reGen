@@ -129,6 +129,22 @@ def resolve_worker_log_verbosity() -> int:
         return _DEFAULT_WORKER_LOG_VERBOSITY
 
 
+def _seed_extra_comfyui_args(*, comfy_smart_memory: bool) -> list[str]:
+    """Build the base ``extra_comfyui_args`` for a ComfyUI-running child from the smart-memory policy.
+
+    ComfyUI's ``--disable-smart-memory`` makes it offload every model to RAM after each job, so a
+    back-to-back same-model job re-uploads the UNet/CLIP/VAE from RAM even when the worker asked hordelib
+    to keep them resident (``defer_vram_unload``): the flag acts below worker retention. With smart memory
+    on (the default, no flag) ComfyUI keeps weights device-resident across jobs. The parent's device-free
+    governor and verified reclaim ladder remain the authoritative evictor and force an actual VRAM free on
+    any idle child, so residency never overcommits the card. The flag is restored only when an operator
+    opts out via ``comfy_smart_memory=False``.
+    """
+    if comfy_smart_memory:
+        return []
+    return ["--disable-smart-memory"]
+
+
 class InferenceProcessEntryPoint(Protocol):
     """The signature a callable must have to serve as an inference process target."""
 
@@ -149,6 +165,7 @@ class InferenceProcessEntryPoint(Protocol):
         vram_heavy_models: bool = False,
         dry_run_skip_inference: bool = False,
         dry_run_inference_delay: float = 1.0,
+        comfy_smart_memory: bool = True,
     ) -> None:
         """Run an inference process until told to end."""
 
@@ -170,6 +187,7 @@ class SafetyProcessEntryPoint(Protocol):
         amd_gpu: bool = False,
         directml: int | None = None,
         dry_run_skip_safety: bool = False,
+        comfy_smart_memory: bool = True,
     ) -> None:
         """Run a safety process until told to end."""
 
@@ -190,8 +208,52 @@ class PostProcessProcessEntryPoint(Protocol):
         amd_gpu: bool = False,
         directml: int | None = None,
         dry_run_skip_post_processing: bool = False,
+        comfy_smart_memory: bool = True,
     ) -> None:
         """Run a post-processing process until told to end."""
+
+
+class VaeLaneProcessEntryPoint(Protocol):
+    """The signature a callable must have to serve as the dedicated VAE lane process target."""
+
+    def __call__(
+        self,
+        process_id: int,
+        process_message_queue: ProcessQueue,
+        pipe_connection: Connection,
+        disk_lock: Lock,
+        process_launch_identifier: int,
+        *,
+        device_index: int = 0,
+        accelerator_kind: str | None = None,
+        amd_gpu: bool = False,
+        directml: int | None = None,
+        dry_run_skip_vae_lane: bool = False,
+        comfy_smart_memory: bool = True,
+    ) -> None:
+        """Run the VAE lane process until told to end."""
+
+
+class ComponentProcessEntryPoint(Protocol):
+    """The signature a callable must have to serve as the dedicated component lane process target."""
+
+    def __call__(
+        self,
+        process_id: int,
+        process_message_queue: ProcessQueue,
+        pipe_connection: Connection,
+        disk_lock: Lock,
+        process_launch_identifier: int,
+        *,
+        device_index: int = 0,
+        accelerator_kind: str | None = None,
+        amd_gpu: bool = False,
+        directml: int | None = None,
+        horde_model_names: list[str] | None = None,
+        dry_run_skip_component_lane: bool = False,
+        comfy_smart_memory: bool = True,
+    ) -> None:
+        """Run the component lane process until told to end."""
 
 
 class DownloadProcessEntryPoint(Protocol):
@@ -240,7 +302,7 @@ def start_inference_process(
     dry_run_inference_delay: float = 1.0,
     gpu_sampling_lease: Semaphore | None = None,
     expect_image_models: bool = True,
-    shared_components_endpoint: object | None = None,
+    comfy_smart_memory: bool = True,
 ) -> None:
     """Start an inference process.
 
@@ -272,9 +334,9 @@ def start_inference_process(
         expect_image_models (bool, optional): Whether this worker serves image generation. False for an
             alchemist-only worker (e.g. a CPU install) that loads no image models, so an empty image-model
             database is expected rather than a fatal error. Defaults to True.
-        shared_components_endpoint (object | None, optional): This child's endpoint onto the cross-process
-            component-sharing bus (a hordelib ``SharedComponentEndpoint``), or None when sharing is off.
-            Handed out by the parent only when ``HORDE_SHARED_COMPONENTS=1``. Defaults to None.
+        comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
+            device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
+            offloads every model to RAM after each job. Defaults to True.
     """
     _spawn_timing_mark(process_id, "inference", "entry")
     # Must precede the first torch/hordelib import below so the allocator reads it, and the device mask
@@ -323,7 +385,7 @@ def start_inference_process(
                     f"amd_gpu={amd_gpu}, low_memory_mode={low_memory_mode}",
                 )
 
-                extra_comfyui_args = ["--disable-smart-memory"]
+                extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)
 
                 if amd_gpu:
                     extra_comfyui_args.append("--use-pytorch-cross-attention")
@@ -379,18 +441,6 @@ def start_inference_process(
 
         _spawn_timing_mark(process_id, "inference", "hordelib-initialised")
 
-        if shared_components_endpoint is not None:
-            # Install this process's component-sharing client: the checkpoint loader then dedupes
-            # byte-identical CLIP/VAE weights across sibling processes (CPU shared memory anywhere;
-            # the same VRAM via cudaIpc on Linux). Enabled explicitly because the parent only hands
-            # out endpoints when HORDE_SHARED_COMPONENTS=1; failure just leaves sharing off.
-            try:
-                from hordelib.execution.shared_components import SharedComponentClient, set_client
-
-                set_client(SharedComponentClient(shared_components_endpoint, enabled=True))  # type: ignore[arg-type]
-            except Exception as sharing_error:  # noqa: BLE001 - sharing must never block child startup
-                logger.warning(f"Component sharing disabled for process {process_id} ({sharing_error})")
-
         from horde_worker_regen.process_management.workers.inference_process import HordeInferenceProcess
 
         worker_process = HordeInferenceProcess(
@@ -427,6 +477,7 @@ def start_safety_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_safety: bool = False,
+    comfy_smart_memory: bool = True,
 ) -> None:
     """Start a safety process.
 
@@ -448,6 +499,9 @@ def start_safety_process(
             with the specified device
         dry_run_skip_safety (bool, optional): If true, skip real safety checks and return a dummy result.
             Defaults to False.
+        comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
+            device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
+            offloads every model to RAM after each job. Defaults to True.
     """
     _spawn_timing_mark(process_id, "safety", "entry")
     # The on-GPU safety model (cpu_only False) must be masked to its assigned card before torch loads, the
@@ -494,7 +548,7 @@ def start_safety_process(
 
             logger.debug(f"Initialising hordelib with process_id={process_id}")
 
-            extra_comfyui_args = ["--disable-smart-memory"]
+            extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)
 
             if amd_gpu:
                 extra_comfyui_args.append("--use-pytorch-cross-attention")
@@ -553,6 +607,7 @@ def start_post_process_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_post_processing: bool = False,
+    comfy_smart_memory: bool = True,
 ) -> None:
     """Start the dedicated post-processing process.
 
@@ -573,6 +628,9 @@ def start_post_process_process(
         directml (int | None, optional): The DirectML device index, if any. Defaults to None.
         dry_run_skip_post_processing (bool, optional): Skip real post-processing (and hordelib init) and \
             echo images back. Defaults to False.
+        comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
+            device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
+            offloads every model to RAM after each job. Defaults to True.
     """
     _spawn_timing_mark(process_id, "post_process", "entry")
     if not dry_run_skip_post_processing:
@@ -610,7 +668,7 @@ def start_post_process_process(
             if not dry_run_skip_post_processing:
                 import hordelib
 
-                extra_comfyui_args = ["--disable-smart-memory"]
+                extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)
                 if amd_gpu:
                     extra_comfyui_args.append("--use-pytorch-cross-attention")
                 if directml is not None:
@@ -657,6 +715,239 @@ def start_post_process_process(
             process_launch_identifier=process_launch_identifier,
             device_index=device_index,
             dry_run_skip_post_processing=dry_run_skip_post_processing,
+        )
+
+        worker_process.main_loop()
+
+
+def start_vae_lane_process(
+    process_id: int,
+    process_message_queue: ProcessQueue,
+    pipe_connection: Connection,
+    disk_lock: Lock,
+    process_launch_identifier: int,
+    *,
+    device_index: int = 0,
+    accelerator_kind: str | None = None,
+    amd_gpu: bool = False,
+    directml: int | None = None,
+    dry_run_skip_vae_lane: bool = False,
+    comfy_smart_memory: bool = True,
+) -> None:
+    """Start the dedicated VAE lane process.
+
+    Mirrors the post-processing lane's hordelib bring-up (the VAE stages and the decode's optional
+    post-processing graphs run on the same comfy backend) but never loads an image-generation checkpoint.
+    The process is pinned to its assigned card before torch loads, the same as an inference process.
+
+    Args:
+        process_id (int): The reserved id for this process.
+        process_message_queue (ProcessQueue): The queue to send messages to the main process.
+        pipe_connection (Connection): Receives ``HordeControlMessage``s from the main process.
+        disk_lock (Lock): The lock to use for disk access.
+        process_launch_identifier (int): The unique identifier for this launch.
+        device_index (int, optional): The stable index of the GPU this process is assigned to. Defaults to 0.
+        accelerator_kind (str | None, optional): The backend kind (``cuda``/``rocm``/...) used to pin the \
+            process to its card. None applies no pinning. Defaults to None.
+        amd_gpu (bool, optional): Whether this is an AMD GPU. Defaults to False.
+        directml (int | None, optional): The DirectML device index, if any. Defaults to None.
+        dry_run_skip_vae_lane (bool, optional): Skip the backend (and hordelib init) and return plausible \
+            stand-in latent/image bytes. Defaults to False.
+        comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
+            device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
+            offloads every model to RAM after each job. Defaults to True.
+    """
+    _spawn_timing_mark(process_id, "vae_lane", "entry")
+    if not dry_run_skip_vae_lane:
+        _apply_device_pin(
+            process_id=process_id,
+            device_index=device_index,
+            accelerator_kind=accelerator_kind,
+            role="vae_lane",
+        )
+        _enable_expandable_segments(amd_gpu=amd_gpu, directml=directml)
+    enable_child_faulthandler(f"vae_lane_{process_id}")
+    neutralize_inherited_argv()
+    with contextlib.nullcontext():
+        logger.remove()
+        maybe_wait_for_process_debugger(process_id, "vae_lane")
+
+        try:
+            from horde_worker_regen.telemetry import claim_logfire_ownership, enforce_telemetry_default_off
+
+            claim_logfire_ownership()
+            enforce_telemetry_default_off()
+
+            from hordelib.api import HordeLog
+
+            HordeLog.initialise(
+                setup_logging=True,
+                process_id=process_id,
+                verbosity_count=resolve_worker_log_verbosity(),
+            )
+
+            from horde_worker_regen.telemetry import configure_child_telemetry
+
+            configure_child_telemetry(process_id)
+
+            if not dry_run_skip_vae_lane:
+                import hordelib
+
+                extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)
+                if amd_gpu:
+                    extra_comfyui_args.append("--use-pytorch-cross-attention")
+                if directml is not None:
+                    extra_comfyui_args.append(f"--directml={directml}")
+
+                with logger.catch(reraise=True):
+                    hordelib.initialise(
+                        setup_logging=None,
+                        process_id=process_id,
+                        logging_verbosity=0,
+                        force_normal_vram_mode=False,
+                        extra_comfyui_args=extra_comfyui_args,
+                    )
+            else:
+                logger.info(f"Dry-run mode: skipping hordelib initialisation for VAE lane {process_id}")
+
+        except Exception as e:
+            logger.critical(f"Failed to initialise VAE lane process: {type(e).__name__} {e}")
+            write_startup_crash(
+                f"vae_lane_{process_id}",
+                e,
+                os_pid=os.getpid(),
+                launch_identifier=process_launch_identifier,
+            )
+            sys.exit(1)
+
+        from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
+
+        worker_process = HordeVaeLaneProcess(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+            device_index=device_index,
+            dry_run=dry_run_skip_vae_lane,
+        )
+
+        worker_process.main_loop()
+
+
+def start_component_process(
+    process_id: int,
+    process_message_queue: ProcessQueue,
+    pipe_connection: Connection,
+    disk_lock: Lock,
+    process_launch_identifier: int,
+    *,
+    device_index: int = 0,
+    accelerator_kind: str | None = None,
+    amd_gpu: bool = False,
+    directml: int | None = None,
+    horde_model_names: list[str] | None = None,
+    dry_run_skip_component_lane: bool = False,
+    comfy_smart_memory: bool = True,
+) -> None:
+    """Start the dedicated component lane process.
+
+    Mirrors the post-processing lane's hordelib bring-up, then installs the sharing client in PRODUCER role
+    (the lane is the single stable producer) before constructing the process, which materialises and publishes
+    the hot-set. The lane is pinned to its card before torch loads.
+
+    Args:
+        process_id (int): The reserved id for this process.
+        process_message_queue (ProcessQueue): The queue to send messages to the main process.
+        pipe_connection (Connection): Receives ``HordeControlMessage``s from the main process.
+        disk_lock (Lock): The lock to use for disk access.
+        process_launch_identifier (int): The unique identifier for this launch.
+        device_index (int, optional): The stable index of the GPU this process is assigned to. Defaults to 0.
+        accelerator_kind (str | None, optional): The backend kind (``cuda``/``rocm``/...) used to pin the \
+            process to its card. None applies no pinning. Defaults to None.
+        amd_gpu (bool, optional): Whether this is an AMD GPU. Defaults to False.
+        directml (int | None, optional): The DirectML device index, if any. Defaults to None.
+        horde_model_names (list[str] | None, optional): The worker's configured models; the lane holds the \
+            components shared across them. Defaults to None.
+        dry_run_skip_component_lane (bool, optional): Skip the backend and materialisation. Defaults to False.
+        comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
+            device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
+            offloads every model to RAM after each job. Defaults to True.
+    """
+    _spawn_timing_mark(process_id, "component", "entry")
+    if not dry_run_skip_component_lane:
+        _apply_device_pin(
+            process_id=process_id,
+            device_index=device_index,
+            accelerator_kind=accelerator_kind,
+            role="component",
+        )
+        _enable_expandable_segments(amd_gpu=amd_gpu, directml=directml)
+    enable_child_faulthandler(f"component_{process_id}")
+    neutralize_inherited_argv()
+    with contextlib.nullcontext():
+        logger.remove()
+        maybe_wait_for_process_debugger(process_id, "component")
+
+        try:
+            from horde_worker_regen.telemetry import claim_logfire_ownership, enforce_telemetry_default_off
+
+            claim_logfire_ownership()
+            enforce_telemetry_default_off()
+
+            from hordelib.api import HordeLog
+
+            HordeLog.initialise(
+                setup_logging=True,
+                process_id=process_id,
+                verbosity_count=resolve_worker_log_verbosity(),
+            )
+
+            from horde_worker_regen.telemetry import configure_child_telemetry
+
+            configure_child_telemetry(process_id)
+
+            if not dry_run_skip_component_lane:
+                import hordelib
+
+                extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)
+                if amd_gpu:
+                    extra_comfyui_args.append("--use-pytorch-cross-attention")
+                if directml is not None:
+                    extra_comfyui_args.append(f"--directml={directml}")
+
+                with logger.catch(reraise=True):
+                    hordelib.initialise(
+                        setup_logging=None,
+                        process_id=process_id,
+                        logging_verbosity=0,
+                        force_normal_vram_mode=False,
+                        extra_comfyui_args=extra_comfyui_args,
+                    )
+            else:
+                logger.info(f"Dry-run mode: skipping hordelib initialisation for component lane {process_id}")
+
+        except Exception as e:
+            logger.critical(f"Failed to initialise component lane process: {type(e).__name__} {e}")
+            write_startup_crash(
+                f"component_{process_id}",
+                e,
+                os_pid=os.getpid(),
+                launch_identifier=process_launch_identifier,
+            )
+            sys.exit(1)
+
+        from horde_worker_regen.process_management.workers.component_lane_process import HordeComponentLaneProcess
+
+        worker_process = HordeComponentLaneProcess(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+            device_index=device_index,
+            horde_model_names=horde_model_names,
+            dry_run=dry_run_skip_component_lane,
         )
 
         worker_process.main_loop()
@@ -781,6 +1072,8 @@ class ProcessEntryPoints:
     inference_entry_point: InferenceProcessEntryPoint
     safety_entry_point: SafetyProcessEntryPoint
     post_process_entry_point: PostProcessProcessEntryPoint
+    vae_lane_entry_point: VaeLaneProcessEntryPoint
+    component_entry_point: ComponentProcessEntryPoint
     download_entry_point: DownloadProcessEntryPoint
 
     def __init__(
@@ -789,6 +1082,8 @@ class ProcessEntryPoints:
         inference_entry_point: InferenceProcessEntryPoint | None = None,
         safety_entry_point: SafetyProcessEntryPoint | None = None,
         post_process_entry_point: PostProcessProcessEntryPoint | None = None,
+        vae_lane_entry_point: VaeLaneProcessEntryPoint | None = None,
+        component_entry_point: ComponentProcessEntryPoint | None = None,
         download_entry_point: DownloadProcessEntryPoint | None = None,
     ) -> None:
         """Initialise with the given entry points, defaulting to the real ones.
@@ -800,6 +1095,10 @@ class ProcessEntryPoints:
                 safety processes. Defaults to `start_safety_process`.
             post_process_entry_point (PostProcessProcessEntryPoint | None, optional): The target for \
                 the dedicated post-processing process. Defaults to `start_post_process_process`.
+            vae_lane_entry_point (VaeLaneProcessEntryPoint | None, optional): The target for \
+                the dedicated VAE lane process. Defaults to `start_vae_lane_process`.
+            component_entry_point (ComponentProcessEntryPoint | None, optional): The target for \
+                the dedicated component lane process. Defaults to `start_component_process`.
             download_entry_point (DownloadProcessEntryPoint | None, optional): The target for \
                 the background download process. Defaults to `start_download_process`.
         """
@@ -809,6 +1108,12 @@ class ProcessEntryPoints:
         self.safety_entry_point = safety_entry_point if safety_entry_point is not None else start_safety_process
         self.post_process_entry_point = (
             post_process_entry_point if post_process_entry_point is not None else start_post_process_process
+        )
+        self.vae_lane_entry_point = (
+            vae_lane_entry_point if vae_lane_entry_point is not None else start_vae_lane_process
+        )
+        self.component_entry_point = (
+            component_entry_point if component_entry_point is not None else start_component_process
         )
         self.download_entry_point = (
             download_entry_point if download_entry_point is not None else start_download_process

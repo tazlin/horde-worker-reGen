@@ -214,6 +214,7 @@ def make_mock_bridge_data(**overrides: object) -> Mock:
     bd.gpu_device_indices = None
     bd.gpu_pop_balance_threshold = 0.5
     bd.cycle_process_on_model_change = False
+    bd.enable_pipeline_disaggregation = False
     bd.very_fast_disk_mode = False
     bd.remove_maintenance_on_init = False
     bd.stats_output_frequency = 20.0

@@ -124,6 +124,24 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         if initial is not None:
             self.update(initial)
         self._retired_launches: dict[tuple[int, int], RetiredProcessLaunch] = {}
+        # Inference process ids reserved as the pinned sampler of an in-flight disaggregated job. A pinned
+        # sampler is booked for that job from the moment the scheduler routes it (in place of START_INFERENCE)
+        # until its sampling finishes; while reserved it is skipped by the availability finders so the
+        # scheduler cannot dispatch a second (monolithic or disaggregated) job onto it. Unlike a monolithic
+        # dispatch, no child message marks the pin, so this parent-side set is the sole booking record.
+        self._disaggregation_reserved_process_ids: set[int] = set()
+
+    def reserve_for_disaggregation(self, process_id: int) -> None:
+        """Reserve an inference process as a pinned disaggregation sampler (skipped by availability finders)."""
+        self._disaggregation_reserved_process_ids.add(process_id)
+
+    def release_disaggregation_reservation(self, process_id: int) -> None:
+        """Release a disaggregation sampler reservation, returning the process to the available pool."""
+        self._disaggregation_reserved_process_ids.discard(process_id)
+
+    def is_reserved_for_disaggregation(self, process_id: int) -> bool:
+        """Whether the process is currently pinned as an in-flight disaggregated job's sampler."""
+        return process_id in self._disaggregation_reserved_process_ids
 
     def retire_process(self, process_info: HordeProcessInfo, reason: str) -> HordeProcessInfo | None:
         """Remove a process from the active map and remember its launch for late IPC messages.
@@ -259,6 +277,13 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].ram_usage_bytes = 0
         self[process_id].vram_usage_mb = 0
         self[process_id].total_vram_mb = 0
+        # A dead process's context and allocator reservation are reclaimed by the OS, so drop its last
+        # per-process attribution: leaving it would keep charging freed VRAM against the committed ledger.
+        self[process_id].process_reserved_mb = None
+        self[process_id].process_allocated_mb = None
+        self[process_id].process_peak_reserved_mb = None
+        self[process_id].process_aimdo_mb = None
+        self[process_id].report_sampled_at = None
 
         self.reset_heartbeat_state(process_id)
 
@@ -272,6 +297,11 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         total_vram_mb: int | None = 0,
         open_fds: int | None = None,
         fd_soft_limit: int | None = None,
+        process_reserved_mb: int | None = None,
+        process_allocated_mb: int | None = None,
+        process_peak_reserved_mb: int | None = None,
+        process_aimdo_mb: int | None = None,
+        report_sampled_at: float | None = None,
     ) -> None:
         """Update the memory usage for the given process ID.
 
@@ -282,11 +312,26 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             total_vram_mb (int): The total amount of VRAM available to this process.
             open_fds (int | None): Open descriptors/handles the process reported, or None if unavailable.
             fd_soft_limit (int | None): The process's soft ``RLIMIT_NOFILE`` ceiling, or None if unbounded.
+            process_reserved_mb (int | None): This process's own committed device memory (MB) from the torch \
+                allocator (excludes its CUDA context), or None off-GPU. The honest per-process VRAM charge.
+            process_allocated_mb (int | None): This process's own live (in-use) device memory (MB), or None.
+            process_peak_reserved_mb (int | None): This process's peak reserved device memory (MB) over the \
+                last report interval, or None.
+            process_aimdo_mb (int | None): This process's device memory (MB) in the engine's direct-IO \
+                weight pool, captured only if that (currently inert) subsystem is initialised, else 0; or None \
+                off-GPU. Disjoint from ``process_reserved_mb``.
+            report_sampled_at (float | None): Wall-clock epoch when the child sampled these figures, or None \
+                (older children). Used to age the process's contribution for staleness-aware VRAM reconciliation.
         """
         process_info = self[process_id]
         process_info.ram_usage_bytes = ram_usage_bytes
         process_info.vram_usage_mb = vram_usage_mb or 0
         process_info.total_vram_mb = total_vram_mb or 0
+        process_info.process_reserved_mb = process_reserved_mb
+        process_info.process_allocated_mb = process_allocated_mb
+        process_info.process_peak_reserved_mb = process_peak_reserved_mb
+        process_info.process_aimdo_mb = process_aimdo_mb
+        process_info.report_sampled_at = report_sampled_at
         process_info.open_fds = open_fds
         process_info.fd_soft_limit = fd_soft_limit
 
@@ -435,6 +480,36 @@ class ProcessMap(dict[int, HordeProcessInfo]):
                 self.reset_heartbeat_state(process_id)
             self[process_id].last_job_referenced = last_job_referenced
 
+    def reconcile_reported_os_pid(self, process_id: int, reported_os_pid: int | None) -> None:
+        """Adopt a child's self-reported ``os.getpid()`` as the authoritative OS pid for per-PID telemetry.
+
+        The parent captures ``os_pid`` from the ``mp_process.pid`` spawn handle at launch, which is wrong when
+        the interpreter runs behind a launcher-stub ``python.exe``: the handle is the stub's pid while the real
+        interpreter (and its CUDA context) live in a grandchild, so PDH paging attribution and the NVML per-PID
+        lookups keyed on the handle pid miss entirely. The child self-reports its real pid on every message;
+        this overwrites the handle-derived value the first time they differ so per-PID telemetry addresses the
+        process that actually holds the GPU context. A None report (an older child) leaves the handle value.
+        """
+        if reported_os_pid is None or process_id not in self:
+            return
+        process_info = self[process_id]
+        if process_info.os_pid != reported_os_pid:
+            logger.debug(
+                f"Process {process_id} self-reported os_pid {reported_os_pid} "
+                f"(handle-derived was {process_info.os_pid}); adopting the child-reported pid for per-PID "
+                "telemetry.",
+            )
+            process_info.os_pid = reported_os_pid
+
+    def note_vram_materialized(self, process_id: int) -> None:
+        """Stamp the monotonic time the parent observed this process materialize VRAM.
+
+        The LIFO ranking key for the reclaim ladder. Called on a VRAM-materializing event (a model reported
+        LOADED_IN_VRAM, a GPU process spawned), so the reclaim engine can reclaim the most-recently-
+        materialized tenant first.
+        """
+        self[process_id].vram_materialized_monotonic = time.monotonic()
+
     def on_model_ram_clear(
         self,
         process_id: int,
@@ -449,6 +524,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].last_job_referenced = None
         self[process_id].recently_unloaded_from_ram = True
         self[process_id].last_received_timestamp = time.time()
+        # The model left VRAM, so it no longer has a materialization time; the next materialization restamps.
+        self[process_id].vram_materialized_monotonic = None
 
     def reset_heartbeat_state(self, process_id: int) -> None:
         """Reset the heartbeat state for the given process ID.
@@ -468,6 +545,10 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         self[process_id].last_iterations_per_second = None
         self[process_id].current_first_step_at = None
         self[process_id].nonadvancing_step_repeats = 0
+        # The per-step floor crawl detector is job-scoped like the slowdown grade: clear its streak and the
+        # tripped flag at every job boundary so a fresh job starts from a clean slate.
+        self[process_id].consecutive_slow_per_steps = 0
+        self[process_id].current_job_per_step_floor_tripped = False
 
     def delete_safety_processes(self) -> None:
         """Clear all safety processes."""
@@ -565,6 +646,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         for p in self.get_capable_processes(capability):
             if device_index is not None and p.device_index != device_index:
                 continue
+            if self.is_reserved_for_disaggregation(p.process_id):
+                continue
             if (
                 p.last_process_state in (HordeProcessState.WAITING_FOR_JOB, HordeProcessState.PRELOADED_MODEL)
                 and p.loaded_horde_model_name is None
@@ -574,6 +657,8 @@ class ProcessMap(dict[int, HordeProcessInfo]):
 
         for p in self.get_capable_processes(capability):
             if device_index is not None and p.device_index != device_index:
+                continue
+            if self.is_reserved_for_disaggregation(p.process_id):
                 continue
             if p.can_accept_job() and p.process_id not in disallowed:
                 return p
@@ -626,6 +711,78 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             return None
         return float(max(totals))
 
+    def _committed_ledger_processes(self, device_index: int | None) -> list[HordeProcessInfo]:
+        """Return the GPU processes whose footprint the committed-VRAM ledger charges (a shared predicate).
+
+        A process is counted when it has reported a ``process_reserved_mb`` (a GPU-bearing process that has
+        sent at least one VRAM-inclusive memory report) and has not entered its terminal shutdown states.
+        Both :meth:`committed_vram_mb` and :meth:`oldest_committed_report_age_seconds` key on this exact set so
+        the ledger sum and its staleness assessment can never disagree about which tenants make it up.
+        """
+        processes: list[HordeProcessInfo] = []
+        for process_info in self.values():
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_reserved_mb is None:
+                continue
+            if process_info.last_process_state in (
+                HordeProcessState.PROCESS_ENDING,
+                HordeProcessState.PROCESS_ENDED,
+            ):
+                continue
+            processes.append(process_info)
+        return processes
+
+    def committed_vram_mb(self, *, context_constant_mb: float, device_index: int | None = None) -> float:
+        """Return the device VRAM (MB) attributable to this worker: the sum of every live GPU process's footprint.
+
+        Each live GPU process's device footprint is ``context_constant_mb + process_reserved_mb +
+        process_aimdo_mb`` (the fixed CUDA-context overhead, plus the process's own byte-exact allocator
+        reservation from ``torch.cuda.memory_reserved``, plus any weights held in the engine's direct-IO pool
+        the torch allocator cannot see). The aimdo term is inert (0) in the current embedding because nothing
+        initialises that subsystem, so weights are counted by ``process_reserved_mb``; it is kept as a
+        disjoint, future-proof complement, so summing the two never double-counts. Summed over the live
+        GPU-bearing processes, this is the *exact committed device memory attributable to the worker*, the
+        ledger arithmetic that is the ONLY way to see an over-commit coming on Windows/WDDM (where the driver
+        silently spills to host RAM without ever failing an allocation or showing pressure in
+        ``mem_get_info``). It deliberately excludes the shared device baseline (OS/desktop/other apps), which
+        is attributable to no worker process; the drift reconciliation adds the baseline back at device level.
+
+        The context constant is resolved by the caller via
+        :func:`~horde_worker_regen.process_management.resources.resource_budget.platform_context_constant_mb`
+        (measured marginal when available, else the platform seed).
+
+        Args:
+            context_constant_mb: The per-process CUDA-context VRAM charge (MB) to add for each live process.
+            device_index: When given, sum only processes pinned to that card; when None, sum every card.
+        """
+        total = 0.0
+        for process_info in self._committed_ledger_processes(device_index):
+            total += (
+                context_constant_mb + (process_info.process_reserved_mb or 0) + (process_info.process_aimdo_mb or 0)
+            )
+        return total
+
+    def oldest_committed_report_age_seconds(self, *, now: float, device_index: int | None = None) -> float | None:
+        """Return the oldest memory-report age (seconds) among the committed ledger's contributors, or None.
+
+        Ages each contributing process's last VRAM-inclusive report against ``now`` and returns the maximum
+        (the least-fresh tenant). Returns None when no process currently contributes to the ledger (nothing to
+        age). A contributor that has never carried a ``report_sampled_at`` (an older child) is treated as
+        maximally stale (``inf``): its contribution cannot be dated, so the ledger it is part of cannot be
+        trusted as current. The reconciler uses this to treat a stale ledger as an UNKNOWN, incomparable
+        tenant rather than reconciling a device anchor against figures a process may have moved far past.
+
+        Args:
+            now: The wall-clock epoch (``time.time()``) to age reports against.
+            device_index: When given, consider only processes pinned to that card; when None, every card.
+        """
+        contributors = self._committed_ledger_processes(device_index)
+        if not contributors:
+            return None
+        ages = [(now - p.report_sampled_at) if p.report_sampled_at is not None else float("inf") for p in contributors]
+        return max(ages)
+
     def residency_snapshot(self) -> str:
         """One-line 'which model is resident on which inference slot' summary, for over-commit diagnostics.
 
@@ -636,10 +793,16 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         """
         parts: list[str] = []
         for process_id, process_info in sorted(self.items()):
-            if process_info.process_type not in {HordeProcessType.INFERENCE, HordeProcessType.POST_PROCESS}:
+            if process_info.process_type not in {
+                HordeProcessType.INFERENCE,
+                HordeProcessType.POST_PROCESS,
+                HordeProcessType.VAE_LANE,
+            }:
                 continue
             if process_info.process_type == HordeProcessType.POST_PROCESS:
                 parts.append(f"#{process_id}:post-process[{process_info.last_process_state.name}]")
+            elif process_info.process_type == HordeProcessType.VAE_LANE:
+                parts.append(f"#{process_id}:vae-lane[{process_info.last_process_state.name}]")
             else:
                 model = process_info.loaded_horde_model_name or "-"
                 parts.append(f"#{process_id}:{model}[{process_info.last_process_state.name}]")
@@ -912,10 +1075,129 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             logger.debug(f"Deleting post-process process {process_info.process_id} from process map")
             self.retire_process(process_info, "post-process process replacement")
 
-    def get_process_by_horde_model_name(self, horde_model_name: str) -> HordeProcessInfo | None:
-        """Return the process that has the given horde model loaded, or None if there is none."""
+    def get_component_process(self) -> HordeProcessInfo | None:
+        """Return the dedicated component lane process, or None if it is not running."""
         for p in self.values():
-            if p.loaded_horde_model_name == horde_model_name:
+            if p.process_type == HordeProcessType.COMPONENT:
+                return p
+        return None
+
+    def num_component_processes(self, *, device_index: int | None = None) -> int:
+        """Return the number of dedicated component lane processes (0 or 1).
+
+        Args:
+            device_index: When given, count only the component lane if it is pinned to that card, so a
+                per-card residency teardown gate waits only on the lane that actually sits on its card;
+                when None, count across every card.
+        """
+        return sum(
+            1
+            for p in self.values()
+            if p.process_type == HordeProcessType.COMPONENT
+            and (device_index is None or p.device_index == device_index)
+        )
+
+    def num_loaded_component_processes(self) -> int:
+        """Return the number of component lane processes past startup and not yet shutting down."""
+        count = 0
+        for p in self.values():
+            if p.process_type == HordeProcessType.COMPONENT and p.last_process_state not in (
+                HordeProcessState.PROCESS_STARTING,
+                HordeProcessState.PROCESS_ENDING,
+                HordeProcessState.PROCESS_ENDED,
+            ):
+                count += 1
+        return count
+
+    def get_stoppable_component_processes(self) -> list[HordeProcessInfo]:
+        """Return component lane processes that can be sent an end command (any not already shutting down)."""
+        return [
+            p
+            for p in self.values()
+            if p.process_type == HordeProcessType.COMPONENT
+            and p.last_process_state not in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED)
+        ]
+
+    def delete_component_processes(self) -> None:
+        """Clear all dedicated component lane processes."""
+        processes_to_delete = [p for p in self.values() if p.process_type == HordeProcessType.COMPONENT]
+        for process_info in processes_to_delete:
+            logger.debug(f"Deleting component lane process {process_info.process_id} from process map")
+            self.retire_process(process_info, "component lane replacement")
+
+    def get_first_available_vae_lane_process(self) -> HordeProcessInfo | None:
+        """Return the first available dedicated VAE lane process, or None if none are available."""
+        for p in self.values():
+            if (
+                p.process_type == HordeProcessType.VAE_LANE
+                and p.last_process_state == HordeProcessState.WAITING_FOR_JOB
+            ):
+                return p
+        return None
+
+    def num_vae_lane_processes(self, *, device_index: int | None = None) -> int:
+        """Return the number of dedicated VAE lane processes.
+
+        Args:
+            device_index: When given, count only VAE lane processes pinned to that card, so a per-card
+                residency forecast charges the lane's CUDA context only against the card it actually sits
+                on; when None, count across every card.
+        """
+        count = 0
+        for p in self.values():
+            if p.process_type == HordeProcessType.VAE_LANE and (
+                device_index is None or p.device_index == device_index
+            ):
+                count += 1
+        return count
+
+    def num_loaded_vae_lane_processes(self) -> int:
+        """Return the number of dedicated VAE lane processes that are loaded."""
+        count = 0
+        for p in self.values():
+            if (
+                p.process_type == HordeProcessType.VAE_LANE
+                and p.last_process_state != HordeProcessState.PROCESS_STARTING
+                and p.last_process_state != HordeProcessState.PROCESS_ENDING
+                and p.last_process_state != HordeProcessState.PROCESS_ENDED
+            ):
+                count += 1
+
+        return count
+
+    def get_stoppable_vae_lane_processes(self) -> list[HordeProcessInfo]:
+        """Return dedicated VAE lane processes that can be sent an end command.
+
+        Deliberately broader than ``get_first_available_vae_lane_process``: dispatch needs a process that
+        can accept work; lifecycle teardown needs any live process that has not already entered its terminal
+        shutdown states.
+        """
+        return [
+            p
+            for p in self.values()
+            if p.process_type == HordeProcessType.VAE_LANE
+            and p.last_process_state not in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED)
+        ]
+
+    def delete_vae_lane_processes(self) -> None:
+        """Clear all dedicated VAE lane processes."""
+        processes_to_delete = [p for p in self.values() if p.process_type == HordeProcessType.VAE_LANE]
+
+        for process_info in processes_to_delete:
+            logger.debug(f"Deleting VAE lane process {process_info.process_id} from process map")
+            self.retire_process(process_info, "VAE lane replacement")
+
+    def get_process_by_horde_model_name(self, horde_model_name: str) -> HordeProcessInfo | None:
+        """Return an unreserved process that has the given horde model loaded, or None if there is none.
+
+        A process pinned as an in-flight disaggregated job's sampler is skipped: dispatch selection and the
+        orchestrator's crash re-resolution both use this, and neither may steal a sampler already booked for
+        another job.
+        """
+        for p in self.values():
+            if p.loaded_horde_model_name == horde_model_name and not self.is_reserved_for_disaggregation(
+                p.process_id,
+            ):
                 return p
         return None
 
@@ -938,6 +1220,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             for p in self.values()
             if p.loaded_horde_model_name == horde_model_name
             and (allowed_cards is None or p.device_index in allowed_cards)
+            and not self.is_reserved_for_disaggregation(p.process_id)
         ]
 
     def num_busy_processes(self) -> int:

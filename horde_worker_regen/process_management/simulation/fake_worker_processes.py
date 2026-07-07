@@ -52,7 +52,10 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeSafetyControlMessage,
     HordeSafetyEvaluation,
     HordeSafetyResultMessage,
+    HordeSampleControlMessage,
+    HordeSampleResultMessage,
     ModelLoadState,
+    SampleSliceResult,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     CurrentDownloadStatus,
@@ -197,6 +200,16 @@ class FakeInferenceProcess(HordeProcess):
         if self._sim_vram_ledger is not None:
             return int(self._sim_vram_ledger.total_mb(self.device_index))
         return 0
+
+    @override
+    def get_process_vram_stats(self) -> tuple[int, int, int, int] | None:
+        """Return plausible per-process allocator stats so parent-side attribution plumbing is exercised.
+
+        The fake has no torch allocator nor direct-IO residency pool to read; it reports zeros (an idle
+        context holds no reserved weights and no aimdo pool) so the memory report still carries the fields
+        (allocated, reserved, peak, aimdo) and the ledger/drift accounting runs.
+        """
+        return 0, 0, 0, 0
 
     def on_horde_model_state_change(
         self,
@@ -374,6 +387,41 @@ class FakeInferenceProcess(HordeProcess):
             info="Waiting for job",
         )
 
+    def _run_fake_sample(self, message: HordeSampleControlMessage) -> None:
+        """Pretend to run the disaggregated sample stage, mirroring the real sampler's message sequence.
+
+        The real sampler reports ``INFERENCE_STARTING`` as a plain process-state change (not a model-state
+        change: the pinned sampler already holds its UNet and the parent keeps that residency), returns one
+        LATENT per slice in a single ``HordeSampleResultMessage``, then returns to idle. The
+        ``INFERENCE_STARTING`` this emits is the disaggregation state traffic the parent's dispatcher must
+        tolerate on a sampler holding no whole-job model bookkeeping.
+        """
+        self.send_process_state_change_message(HordeProcessState.INFERENCE_STARTING, info="Sampling")
+        time_start = time.time()
+        results = [
+            SampleSliceResult(
+                job_id=job_slice.job_id,
+                latent_bytes=self._make_dummy_latent_bytes(),
+                state=GENERATION_STATE.ok,
+            )
+            for job_slice in message.slices
+        ]
+        self.process_message_queue.put(
+            HordeSampleResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info="fake sample",
+                time_elapsed=time.time() - time_start,
+                results=results,
+            ),
+        )
+        self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, info="Waiting for job")
+
+    @staticmethod
+    def _make_dummy_latent_bytes() -> bytes:
+        """A tiny opaque stand-in for a serialized LATENT; the fake pipeline never deserializes it."""
+        return b"fake-latent"
+
     def _run_fake_alchemy(self, form: AlchemyFormSpec) -> None:
         """Pretend to run an alchemy form, emitting the same message sequence as the real process."""
         self.send_process_state_change_message(
@@ -424,6 +472,8 @@ class FakeInferenceProcess(HordeProcess):
             self._run_fake_alchemy(message.form)
         elif isinstance(message, HordePreloadInferenceModelMessage):
             self.preload_model(message.horde_model_name)
+        elif isinstance(message, HordeSampleControlMessage):
+            self._run_fake_sample(message)
         elif isinstance(message, HordeInferenceControlMessage) and (
             message.control_flag == HordeControlFlag.START_INFERENCE
         ):
@@ -465,6 +515,11 @@ class FakeInferenceProcess(HordeProcess):
                 process_state=HordeProcessState.WAITING_FOR_JOB,
                 info="Unloaded models from RAM",
             )
+        elif message.control_flag == HordeControlFlag.RELEASE_ALLOCATOR_CACHE:
+            # Mirror the real child: releasing the allocator cache keeps every model resident and only
+            # sends a fresh memory report, so the fake emits the same report traffic and no model-unload
+            # state change (the ledger residency is untouched).
+            self.send_memory_report_message(include_vram=True)
 
     @override
     def cleanup_for_exit(self) -> None:
@@ -531,6 +586,11 @@ class FakeSafetyProcess(HordeProcess):
     def get_vram_total_mb(self) -> int:
         """Return a fixed fake VRAM total value."""
         return 0
+
+    @override
+    def get_process_vram_stats(self) -> tuple[int, int, int, int] | None:
+        """Return zeroed per-process allocator stats (allocated, reserved, peak, aimdo) so plumbing is exercised."""
+        return 0, 0, 0, 0
 
     def _run_fake_alchemy(self, form: AlchemyFormSpec) -> None:
         """Pretend to run a CLIP-class alchemy form (caption/interrogation/nsfw)."""
@@ -657,7 +717,7 @@ def start_fake_inference_process(
     dry_run_inference_delay: float = 1.0,
     gpu_sampling_lease: Semaphore | None = None,
     expect_image_models: bool = True,
-    shared_components_endpoint: object | None = None,
+    comfy_smart_memory: bool = True,
     fail_every_n: int = 0,
     fault_profile: FaultProfile | None = None,
     sim_vram_ledger: SimVramLedger | None = None,
@@ -668,8 +728,7 @@ def start_fake_inference_process(
 
     Signature-compatible with ``worker_entry_points.start_inference_process`` so it can
     be injected as a drop-in multiprocessing target. Memory/GPU related arguments (and
-    ``expect_image_models``, which only gates the real worker's image-model presence check, and
-    ``shared_components_endpoint``, which only the real worker registers with hordelib)
+    ``expect_image_models``, which only gates the real worker's image-model presence check)
     are accepted and ignored; ``dry_run_inference_delay`` controls how long fake jobs take.
     ``fail_every_n`` makes every nth job report a faulted result (0 = never), and
     ``fault_profile`` scripts richer misbehaviour (hang, crash, drop heartbeats, slow, OOM,
@@ -679,7 +738,6 @@ def start_fake_inference_process(
     (stall-and-recover vs. complete) without a GPU. Inject any of these with ``functools.partial``
     (partials of module-level functions stay picklable under spawn).
     """
-    _ = shared_components_endpoint
     enable_child_faulthandler(f"fake_inference_{process_id}")
     logger.remove()
     maybe_wait_for_process_debugger(process_id, "fake inference")
@@ -721,6 +779,7 @@ def start_fake_safety_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_safety: bool = False,
+    comfy_smart_memory: bool = True,
     fault_profile: FaultProfile | None = None,
 ) -> None:
     """Start a fake safety process.
@@ -819,6 +878,11 @@ class FakePostProcessProcess(HordeProcess):
     def get_vram_total_mb(self) -> int:
         """Return a fixed fake VRAM total value."""
         return 0
+
+    @override
+    def get_process_vram_stats(self) -> tuple[int, int, int, int] | None:
+        """Return zeroed per-process allocator stats (allocated, reserved, peak, aimdo) so plumbing is exercised."""
+        return 0, 0, 0, 0
 
     def _run_fake_post_processing(self, message: HordePostProcessControlMessage) -> None:
         """Pretend to post-process a job's images, echoing them back unchanged."""
@@ -944,6 +1008,7 @@ def start_fake_post_process_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_post_processing: bool = False,
+    comfy_smart_memory: bool = True,
     fault_profile: FaultProfile | None = None,
     sim_vram_ledger: SimVramLedger | None = None,
     sim_context_mb: float = 0.0,
@@ -974,6 +1039,93 @@ def start_fake_post_process_process(
         # See start_fake_inference_process: leave a discoverable trace for a startup death that would
         # otherwise be silent (logger.remove() drops all sinks).
         write_startup_crash(f"fake_post_process_{process_id}", e)
+        raise
+
+
+def start_fake_vae_lane_process(
+    process_id: int,
+    process_message_queue: ProcessQueue,
+    pipe_connection: Connection,
+    disk_lock: Lock,
+    process_launch_identifier: int,
+    *,
+    device_index: int = 0,
+    accelerator_kind: str | None = None,
+    amd_gpu: bool = False,
+    directml: int | None = None,
+    dry_run_skip_vae_lane: bool = False,
+    comfy_smart_memory: bool = True,
+) -> None:
+    """Start a fake VAE lane process.
+
+    Signature-compatible with ``worker_entry_points.start_vae_lane_process`` so it can be injected as a
+    drop-in multiprocessing target. The real ``HordeVaeLaneProcess`` already runs ML-free under ``dry_run``
+    (it returns plausible stand-in latent/image bytes), so the fake reuses it directly; GPU arguments are
+    accepted and ignored.
+    """
+    from horde_worker_regen.process_management.workers.vae_lane_process import HordeVaeLaneProcess
+
+    _ = (accelerator_kind, amd_gpu, directml, dry_run_skip_vae_lane, comfy_smart_memory)
+    enable_child_faulthandler(f"fake_vae_lane_{process_id}")
+    logger.remove()
+    maybe_wait_for_process_debugger(process_id, "fake vae lane")
+    try:
+        worker_process = HordeVaeLaneProcess(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+            device_index=device_index,
+            dry_run=True,
+        )
+        worker_process.main_loop()
+    except Exception as e:
+        write_startup_crash(f"fake_vae_lane_{process_id}", e)
+        raise
+
+
+def start_fake_component_process(
+    process_id: int,
+    process_message_queue: ProcessQueue,
+    pipe_connection: Connection,
+    disk_lock: Lock,
+    process_launch_identifier: int,
+    *,
+    device_index: int = 0,
+    accelerator_kind: str | None = None,
+    amd_gpu: bool = False,
+    directml: int | None = None,
+    horde_model_names: list[str] | None = None,
+    dry_run_skip_component_lane: bool = False,
+    comfy_smart_memory: bool = True,
+) -> None:
+    """Start a fake component lane process.
+
+    Signature-compatible with ``worker_entry_points.start_component_process`` so it can be injected as a
+    drop-in multiprocessing target. The real ``HordeComponentLaneProcess`` already runs ML-free under
+    ``dry_run`` (it holds nothing and just reports ready), so the fake reuses it directly; GPU/endpoint
+    arguments are accepted and ignored.
+    """
+    from horde_worker_regen.process_management.workers.component_lane_process import HordeComponentLaneProcess
+
+    _ = (accelerator_kind, amd_gpu, directml, horde_model_names, comfy_smart_memory)
+    enable_child_faulthandler(f"fake_component_{process_id}")
+    logger.remove()
+    maybe_wait_for_process_debugger(process_id, "fake component")
+    try:
+        worker_process = HordeComponentLaneProcess(
+            process_id=process_id,
+            process_message_queue=process_message_queue,
+            pipe_connection=pipe_connection,
+            disk_lock=disk_lock,
+            process_launch_identifier=process_launch_identifier,
+            device_index=device_index,
+            dry_run=True,
+        )
+        worker_process.main_loop()
+    except Exception as e:
+        write_startup_crash(f"fake_component_{process_id}", e)
         raise
 
 

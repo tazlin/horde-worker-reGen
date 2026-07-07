@@ -117,6 +117,18 @@ class HordeProcessInfo:
 
     Reset to 0 at each dispatch so the graded-slowdown monitor escalates a job's notices at most once
     per rung instead of every watchdog tick."""
+    consecutive_slow_per_steps: int
+    """Count of the slot's most recent consecutive sampling steps each measured at or above the per-step
+    floor multiple of the expected per-step time. The per-step floor is a fast crawl detector: a job whose
+    individual steps have each run several times their expected pace is being demand-paged, not merely a
+    heavy job (which crawls uniformly but near its own expected pace). Reset at each job boundary; the first
+    step of a job is skipped (its inter-beat gap includes the one-time cold load/encode work)."""
+    current_job_per_step_floor_tripped: bool
+    """Whether the slot's current job has tripped the per-step floor (enough consecutive slow steps).
+
+    The crawling signal the reclaim trigger and the last-rung kill read: distinct from the whole-job
+    elapsed-ratio grade (``current_job_slowdown_level``), it fires within a couple of slow steps rather than
+    after the job is minutes past its total expected time. Reset at each job boundary."""
 
     ram_usage_bytes: int
     """The amount of RAM used by this process."""
@@ -124,6 +136,46 @@ class HordeProcessInfo:
     """The amount of VRAM (MB) used by this process."""
     total_vram_mb: int
     """The total amount of VRAM (MB) available to this process."""
+    process_reserved_mb: int | None
+    """This process's own committed device memory (MB) from the torch allocator, excluding its CUDA context.
+
+    The honest, sibling-independent, platform-independent per-process VRAM charge (from
+    ``torch.cuda.memory_reserved``). Its full device footprint is ``context_constant + process_reserved_mb``;
+    the committed-VRAM ledger sums that over live GPU processes. None until a GPU process reports it (older
+    children, CPU-only, or a cold start). Distinct from ``vram_usage_mb`` (device-wide on Linux, a
+    per-process view on Windows), which is never a per-process charge."""
+    process_allocated_mb: int | None
+    """This process's own live (in-use) device memory (MB), the in-use subset of ``process_reserved_mb``."""
+    process_peak_reserved_mb: int | None
+    """This process's peak reserved device memory (MB) over the last report interval (the child resets its
+    allocator peak after each report), or None until reported. The activation spike a between-jobs snapshot of
+    ``process_reserved_mb`` never shows."""
+    process_aimdo_mb: int | None
+    """This process's device memory in the engine's direct-IO weight pool (MB), or None until reported.
+
+    Captures the ``comfy_aimdo`` direct-IO pool *if* that subsystem is initialised, where weights would be
+    reserved outside the torch allocator. In the current embedding the subsystem is inert (nothing calls its
+    native init, so it reports 0) and weights flow through the torch allocator, counted by
+    ``process_reserved_mb``. Kept as a disjoint, future-proof complement (no double-count): the full device
+    footprint is ``context_constant + process_reserved_mb + process_aimdo_mb``."""
+    report_sampled_at: float | None
+    """Wall-clock (``time.time()`` epoch) when the child sampled its most recent memory report, or None.
+
+    The parent ages each process's contribution against this so the VRAM attribution reconciler treats a
+    process whose report has gone stale as an UNKNOWN tenant (an incomparable ledger) rather than trusting a
+    figure the process may have moved far past. Epoch, not monotonic, so it is comparable across processes on
+    the same host. None until the process has sent a memory report (older children never set it)."""
+    vram_materialized_monotonic: float | None
+    """Monotonic time the parent last observed this process materialize VRAM, or None before any such event.
+
+    The LIFO ranking key for the reclaim ladder: the reclaim engine gives back the most-recently-materialized
+    tenant first (under WDDM the driver demotes the least-recently-touched allocator, so the newest resident
+    is both the likeliest squatter and the cheapest to reclaim). Stamped when the parent observes a
+    VRAM-materializing event for this process: its model reported LOADED_IN_VRAM, or its GPU process (an
+    inference slot, a lane, or the on-GPU safety context) is spawned. Monotonic so it is immune to wall-clock
+    changes; distinct from ``last_received_timestamp``, which refreshes on any report traffic and so is a poor
+    materialization proxy. None (never materialized, or unset on an older child) falls back to the timestamp
+    proxy for ranking."""
     batch_amount: int
     """The total amount of batching being run by this process."""
 
@@ -228,10 +280,18 @@ class HordeProcessInfo:
         self.current_first_step_at = None
         self.current_job_expected_sampling_seconds = None
         self.current_job_slowdown_level = 0
+        self.consecutive_slow_per_steps = 0
+        self.current_job_per_step_floor_tripped = False
 
         self.ram_usage_bytes = 0
         self.vram_usage_mb = 0
         self.total_vram_mb = 0
+        self.process_reserved_mb = None
+        self.process_allocated_mb = None
+        self.process_peak_reserved_mb = None
+        self.process_aimdo_mb = None
+        self.report_sampled_at = None
+        self.vram_materialized_monotonic = None
         self.open_fds: int | None = None
         """Open descriptors/handles last reported by the process, or None if the platform metric is absent."""
         self.fd_soft_limit: int | None = None

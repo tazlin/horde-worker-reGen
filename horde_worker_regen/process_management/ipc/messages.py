@@ -176,6 +176,15 @@ class HordeProcessMessage(BaseModel):
     """The ID of the process that sent the message."""
     process_launch_identifier: int
     """The identifier of the process launch."""
+    reported_os_pid: int | None = None
+    """The sender's own ``os.getpid()``, self-reported over IPC, or None on an older child.
+
+    The authoritative OS pid for per-PID telemetry (WDDM paging attribution, the owned-PID registry, crash
+    diagnostics). It must come from the child, not from the parent's ``mp_process.pid`` spawn handle: where
+    the interpreter is launched through a stub ``python.exe`` (some managed-venv layouts) the handle is the
+    stub's pid while the real interpreter, and the CUDA context, live in a grandchild, so a handle-derived pid
+    makes every per-PID lookup miss. The parent overwrites its handle-derived ``os_pid`` with this value on the
+    first message that carries it."""
     info: str
     """Information about this operation sent the process."""
     time_elapsed: float | None = None
@@ -195,9 +204,53 @@ class HordeProcessMemoryMessage(HordeProcessMessage):
     fd_soft_limit: int | None = None
     """The process's soft ``RLIMIT_NOFILE`` ceiling, or None where there is no finite limit (e.g. Windows)."""
     vram_usage_mb: int | None = None
-    """The MB of VRAM used on the GPU."""
+    """Device-wide used VRAM (MB) as this process measures it, NOT this process's own share.
+
+    On Linux this is a true device-wide reading (``torch_total - torch_free`` from ``mem_get_info``, which is
+    device-wide from any process), so the parent turns it into device-wide free. On Windows/WDDM
+    ``mem_get_info`` is a *per-process view*: a process sees roughly its own baseline plus context plus usage
+    and is blind to siblings, so this must never be treated as device truth nor as a per-process charge. The
+    honest per-process VRAM charge is ``process_reserved_mb`` (plus the platform context constant); the
+    truthful device-wide figure on Windows comes only from the parent-side NVML device-total-used read."""
     vram_total_mb: int | None = None
     """The total MB of VRAM available on the GPU."""
+    process_allocated_mb: int | None = None
+    """This process's own live (in-use) device memory (MB) from the torch allocator, or None off-GPU.
+
+    The in-use subset of ``process_reserved_mb``. Byte-exact and platform-independent per-process
+    attribution: it moves only for the process that allocates."""
+    process_reserved_mb: int | None = None
+    """This process's own committed device memory (MB) from ``torch.cuda.memory_reserved`` (allocations plus
+    the allocator's cached free blocks), excluding the CUDA context, or None off-GPU.
+
+    The honest per-process VRAM charge, verified to move only for the owning process (siblings +0) on both
+    Windows/WDDM and native Linux. The process's full device footprint is ``context_constant +
+    process_reserved_mb``; the parent sums that over live GPU processes to get committed device VRAM. This is
+    the attribution the device-wide (Linux) / per-process-view (Windows) ``vram_usage_mb`` cannot provide."""
+    process_peak_reserved_mb: int | None = None
+    """This process's peak reserved device memory (MB) since the previous memory report, or None off-GPU.
+
+    Read from the allocator's peak counter, which the child resets after each report, so this is the
+    high-water reserved over the last report interval (the activation spike that never shows in a snapshot
+    ``process_reserved_mb`` sampled between jobs)."""
+    process_aimdo_mb: int | None = None
+    """This process's device memory held by the engine's direct-IO weight pool (MB), or None off-GPU.
+
+    Captures the ``comfy_aimdo`` direct-IO pool *if* that subsystem is initialised: such weights would be
+    reserved outside the torch caching allocator and so invisible to ``process_reserved_mb``. In the current
+    embedding the subsystem is inert (nothing calls its native init, so it reports 0) and weights flow through
+    the torch allocator, counted by ``process_reserved_mb``. The field is kept as a disjoint, future-proof
+    complement: the full per-process footprint is ``context_constant + process_reserved_mb + process_aimdo_mb``,
+    the two memory terms never double-counting (aimdo does not install its pluggable allocator as torch's). It
+    is 0 for children whose allocations pass through the torch allocator and None where there is no GPU
+    allocator to read."""
+    sampled_at: float | None = None
+    """Wall-clock (``time.time()`` epoch) when the child sampled the figures in this report, or None (older children).
+
+    Epoch seconds, not ``time.monotonic()``: monotonic clocks are per-process and have no cross-process zero, so
+    a child's monotonic value is meaningless to the parent, whereas both run on the same host wall clock. The
+    parent stores it so the attribution reconciler can age each process's contribution and treat a stale report
+    as an UNKNOWN tenant (an incomparable ledger) rather than as stale-but-trusted truth."""
     device_index: int = 0
     """The stable index of the GPU this process is pinned to (0 on a single-GPU host).
 
@@ -439,12 +492,28 @@ class HordeControlFlag(enum.Enum):
     """Signal the child process to run an alchemy form (upscale, caption, etc.)."""
     START_POST_PROCESS = auto()
     """Signal the dedicated post-processing process to run an image job's post-processing phase."""
+    START_TEXT_ENCODE = auto()
+    """Signal the encode service to run a job's text-encode stage (disaggregated pipeline)."""
+    START_SAMPLE = auto()
+    """Signal a sampler process to run one or more jobs' sample stage from injected conditioning."""
+    START_VAE_ENCODE = auto()
+    """Signal the image lane to VAE-encode a source image to a latent (img2img/inpaint front-end)."""
+    START_VAE_DECODE = auto()
+    """Signal the image lane to VAE-decode a latent (and run any post-processing) to final images."""
     EVALUATE_SAFETY = auto()
     """Signal the child process to evaluate safety of images from inference."""
     UNLOAD_MODELS_FROM_VRAM = auto()
     """Signal the child process to unload models from VRAM."""
     UNLOAD_MODELS_FROM_RAM = auto()
     """Signal the child process to unload models from RAM."""
+    RELEASE_ALLOCATOR_CACHE = auto()
+    """Signal the child to release the torch allocator's cached free blocks WITHOUT unloading any models.
+
+    The torch caching allocator retains freed device blocks for reuse; emptying that cache returns the
+    unused reservation to the device while every resident model stays loaded. A child handling this clears
+    its allocator cache and sends a fresh memory report so the parent's ``process_reserved_mb`` reflects
+    the release promptly. Distinct from ``UNLOAD_MODELS_FROM_VRAM`` (which evicts models): this is the
+    cheap, model-preserving reclaim the future VRAM arbiter uses to recover cached-but-unused VRAM."""
     DOWNLOAD_MODELS = auto()
     """Signal the dedicated download process to ensure a set of models are present on disk."""
     RELOAD_MODEL_DATABASE = auto()
@@ -661,3 +730,212 @@ class HordePostProcessResultMessage(HordeProcessMessage):
     """The post-processed per-image results, or None if post-processing faulted with no usable output."""
     state: GENERATION_STATE
     """The state of the job to be sent to the API (``ok`` or ``faulted``)."""
+
+
+# ---------------------------------------------------------------------------------------------------
+# Disaggregated pipeline stages (encode service, sampler, image lane).
+#
+# A job is split into stages that run in separate processes and exchange small activations, not
+# weights (see the disaggregation plan): text-encode -> sample -> vae-decode, with an optional
+# vae-encode front-end for img2img. Each stage carries the model identity it must load a subset of
+# (via HordeCheckpointLoader's output_model/clip/vae flags) plus the intermediate blobs, which are the
+# serialized CONDITIONING/LATENT produced by hordelib's stage entry points. sdk_api_job_info rides
+# along (as it does for monolithic inference) so a stage can derive prompts, LoRA/TI, sampler params
+# and seed without the parent re-deriving them.
+# ---------------------------------------------------------------------------------------------------
+
+
+class HordeStageModelMixin(BaseModel):
+    """The model identity a disaggregated stage loads a subset of, plus its load flags."""
+
+    horde_model_name: str
+    """The name of the model as defined in the horde model reference."""
+    ckpt_name: str | None = None
+    """The checkpoint file name to resolve on disk; None lets the stage resolve it from the model name."""
+    file_type: str | None = None
+    """The component file_type when the model is split (e.g. a bare unet/vae/text_encoder), else None."""
+    will_load_loras: bool = False
+    """Whether the stage patches the model with LoRa(s) (CLIP-side for encode, UNet-side for sample)."""
+    seamless_tiling_enabled: bool = False
+    """Whether seamless (circular-padding) tiling is enabled for this job."""
+
+
+class HordeTextEncodeControlMessage(HordeControlMessage, HordeStageModelMixin):
+    """Dispatch a job's text-encode stage to the encode service (control_flag == START_TEXT_ENCODE).
+
+    The service loads only the text encoders, encodes the positive/negative prompts (applying any
+    CLIP-side LoRa and textual inversions), and returns the two CONDITIONING blobs. The sampler that
+    consumes them never carries the text encoders.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.START_TEXT_ENCODE
+    job_id: GenerationID
+    """The ID of the job whose prompts are to be encoded."""
+    sdk_api_job_info: ImageGenerateJobPopResponse
+    """The job as sent by the API (prompt, LoRa/TI, clip_skip are derived from it)."""
+    trace_context: str | None = None
+    """W3C traceparent string for cross-process span correlation."""
+
+
+class HordeTextEncodeResultMessage(HordeProcessMessage):
+    """The positive/negative CONDITIONING blobs from a job's text-encode stage."""
+
+    job_id: GenerationID
+    """The ID of the job whose prompts were encoded."""
+    positive_conditioning_bytes: bytes | None = None
+    """The serialized positive CONDITIONING, or None if the stage faulted."""
+    negative_conditioning_bytes: bytes | None = None
+    """The serialized negative CONDITIONING, or None if the stage faulted."""
+    state: GENERATION_STATE
+    """The state of the stage to be sent to the API (``ok`` or ``faulted``)."""
+    fault_is_resource_class: bool = False
+    """Whether a faulted stage failed for a resource (device out-of-memory) reason rather than a genuine error.
+
+    Set by the child when the fault is a CUDA out-of-memory (or its swallowed fingerprint), so the
+    orchestrator can defer-then-retry the stage as device pressure clears, and re-route the whole job to the
+    monolithic path rather than forfeiting it. Meaningless (and ignored) when ``state`` is not ``faulted``."""
+    fault_reason: str | None = None
+    """The originating exception summary (``"{type}: {message}"``) when the stage faulted, else None.
+
+    Carries the child's real error text to the parent so the faulted disaggregated result is not blank: the
+    orchestrator threads it into the completion hand-off and the parent formats it into the synthetic result's
+    ``info``, where the resource-failure classifier and the log-analysis fault detectors can read it. None on
+    a successful stage."""
+
+
+class SampleSliceSpec(BaseModel):
+    """One job's sample-stage inputs within a (possibly batched) sample dispatch.
+
+    Same-model jobs can be sampled together; v1 always sends exactly one slice, so batching lands
+    later without an IPC schema change.
+    """
+
+    job_id: GenerationID
+    """The ID of the job this slice samples."""
+    positive_conditioning_bytes: bytes
+    """The serialized positive CONDITIONING injected into the sampler."""
+    negative_conditioning_bytes: bytes
+    """The serialized negative CONDITIONING injected into the sampler."""
+    source_latent_bytes: bytes | None = None
+    """The serialized source LATENT for img2img/remix (VAE-encoded by the lane), or None for txt2img."""
+    sdk_api_job_info: ImageGenerateJobPopResponse
+    """The job as sent by the API (seed, sampler params, UNet-side LoRa are derived from it)."""
+
+
+class HordeSampleControlMessage(HordeControlMessage, HordeStageModelMixin):
+    """Dispatch one or more same-model jobs' sample stage to a sampler process (START_SAMPLE).
+
+    The sampler loads only the UNet, consumes each slice's injected CONDITIONING (and optional source
+    LATENT), samples, and returns a LATENT per slice. Controlnet/hires stay sampler-side and are driven
+    from ``sdk_api_job_info``; the text encoders and VAE live in other processes.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.START_SAMPLE
+    slices: list[SampleSliceSpec]
+    """The per-job sample inputs; v1 sends exactly one."""
+    trace_context: str | None = None
+    """W3C traceparent string for cross-process span correlation."""
+
+
+class SampleSliceResult(BaseModel):
+    """One job's sample-stage output."""
+
+    job_id: GenerationID
+    """The ID of the job this result samples."""
+    latent_bytes: bytes | None = None
+    """The serialized LATENT, or None if this slice faulted."""
+    state: GENERATION_STATE
+    """The state of this slice to be sent to the API (``ok`` or ``faulted``)."""
+
+
+class HordeSampleResultMessage(HordeProcessMessage):
+    """The per-slice LATENTs from a sampler process's sample stage."""
+
+    results: list[SampleSliceResult]
+    """The per-job sample results, in dispatch order."""
+    fault_is_resource_class: bool = False
+    """Whether a faulted sample failed for a resource (device out-of-memory) reason rather than a genuine error.
+
+    Set by the sampler when the fault is a CUDA out-of-memory (or its swallowed fingerprint), so the
+    orchestrator can defer-then-retry and re-route the job monolithically rather than forfeiting it.
+    Meaningless (and ignored) for slices whose ``state`` is not ``faulted``."""
+
+
+class HordeVaeEncodeControlMessage(HordeControlMessage, HordeStageModelMixin):
+    """Dispatch a job's source-image VAE-encode to the image lane (START_VAE_ENCODE).
+
+    The lane loads only the VAE, encodes the source image (and, for inpaint, the mask) to a LATENT the
+    sampler starts from. img2img/remix/inpaint front-end only.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.START_VAE_ENCODE
+    job_id: GenerationID
+    """The ID of the job whose source image is to be encoded."""
+    sdk_api_job_info: ImageGenerateJobPopResponse
+    """The job as sent by the API (the source image and denoise/dimensions are derived from it)."""
+    trace_context: str | None = None
+    """W3C traceparent string for cross-process span correlation."""
+
+
+class HordeVaeEncodeResultMessage(HordeProcessMessage):
+    """The source LATENT from a job's VAE-encode stage."""
+
+    job_id: GenerationID
+    """The ID of the job whose source image was encoded."""
+    latent_bytes: bytes | None = None
+    """The serialized source LATENT, or None if the stage faulted."""
+    state: GENERATION_STATE
+    """The state of the stage to be sent to the API (``ok`` or ``faulted``)."""
+    fault_is_resource_class: bool = False
+    """Whether a faulted stage failed for a resource (device out-of-memory) reason rather than a genuine error.
+
+    Set by the lane when the fault is a CUDA out-of-memory (or its swallowed fingerprint), so the
+    orchestrator can defer-then-retry the stage as device pressure clears, and re-route the whole job to the
+    monolithic path rather than forfeiting it. Meaningless (and ignored) when ``state`` is not ``faulted``."""
+    fault_reason: str | None = None
+    """The originating exception summary (``"{type}: {message}"``) when the stage faulted, else None.
+
+    Carries the lane's real error text to the parent so the faulted disaggregated result is not blank; see
+    :class:`HordeTextEncodeResultMessage` for how it is threaded into the parent's synthetic result ``info``."""
+
+
+class HordeVaeDecodeControlMessage(HordeControlMessage, HordeStageModelMixin):
+    """Dispatch a job's latent decode (and post-processing) to the image lane (START_VAE_DECODE).
+
+    The lane loads only the VAE, decodes the sampler's LATENT to images, then runs any requested
+    post-processing (upscalers/face-fixers) on the models it keeps resident, returning final images.
+    """
+
+    control_flag: HordeControlFlag = HordeControlFlag.START_VAE_DECODE
+    job_id: GenerationID
+    """The ID of the job whose latent is to be decoded."""
+    sdk_api_job_info: ImageGenerateJobPopResponse
+    """The job as sent by the API (the VAE identity and output dimensions are derived from it)."""
+    latent_bytes: bytes
+    """The serialized LATENT to decode."""
+    post_processing: list[str] = Field(default_factory=list)
+    """The requested post-processor names to run after decode, in request order (may be empty)."""
+    trace_context: str | None = None
+    """W3C traceparent string for cross-process span correlation."""
+
+
+class HordeVaeDecodeResultMessage(HordeProcessMessage):
+    """The final images from a job's decode (and post-processing) stage."""
+
+    job_id: GenerationID
+    """The ID of the job whose latent was decoded."""
+    job_image_results: list[HordeImageResult] | None = None
+    """The per-image results (decoded, post-processed), or None if the stage faulted with no output."""
+    state: GENERATION_STATE
+    """The state of the job to be sent to the API (``ok`` or ``faulted``)."""
+    fault_is_resource_class: bool = False
+    """Whether a faulted stage failed for a resource (device out-of-memory) reason rather than a genuine error.
+
+    Set by the lane when the fault is a CUDA out-of-memory (or its swallowed fingerprint), so the
+    orchestrator can defer-then-retry the stage as device pressure clears, and re-route the whole job to the
+    monolithic path rather than forfeiting it. Meaningless (and ignored) when ``state`` is not ``faulted``."""
+    fault_reason: str | None = None
+    """The originating exception summary (``"{type}: {message}"``) when the stage faulted, else None.
+
+    Carries the lane's real error text to the parent so the faulted disaggregated result is not blank; see
+    :class:`HordeTextEncodeResultMessage` for how it is threaded into the parent's synthetic result ``info``."""

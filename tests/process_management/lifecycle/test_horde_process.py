@@ -272,8 +272,6 @@ def _make_inference_proc_for_progress() -> HordeInferenceProcess:
     proc._in_post_processing = False
     proc._post_processing_memory_report_sent = False
     proc._vae_lock_was_acquired = False
-    proc._last_periodic_memory_report_time = 0.0
-    proc._memory_report_interval = 5.0
     proc._start_inference_time = time.time()
     proc._release_inference_slot = Mock()  # pyrefly: ignore
     proc.send_process_state_change_message = Mock()  # pyrefly: ignore
@@ -296,32 +294,97 @@ def _progress_report(*, step: int = 1, total: int = 20) -> SimpleNamespace:
     )
 
 
-def test_progress_callback_emits_periodic_vram_report(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A mid-inference progress callback refreshes VRAM when the report interval has elapsed."""
-    _install_fake_hordelib_api(monkeypatch)
-    proc = _make_inference_proc_for_progress()
+def test_progress_callback_midstep_does_not_poll_vram(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mid-inference step no longer polls VRAM: the reporter thread owns interval sampling now.
 
-    proc.progress_callback(cast(Any, _progress_report(step=3)))
-
-    cast(Mock, proc.send_memory_report_message).assert_called_once_with(include_vram=True)
-
-
-def test_progress_callback_throttles_vram_reports(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Repeated progress callbacks inside the interval must not poll VRAM every step."""
+    The progress callback runs on the main thread, which is blocked for the whole GPU op, so any report it
+    emitted would still be an on-the-main-thread snapshot. Periodic sampling moved to the dedicated reporter
+    thread, so a plain mid-step callback emits only a heartbeat and no memory report.
+    """
     _install_fake_hordelib_api(monkeypatch)
     proc = _make_inference_proc_for_progress()
 
     proc.progress_callback(cast(Any, _progress_report(step=3)))
     proc.progress_callback(cast(Any, _progress_report(step=4)))
 
-    cast(Mock, proc.send_memory_report_message).assert_called_once_with(include_vram=True)
+    cast(Mock, proc.send_memory_report_message).assert_not_called()
 
 
 def test_sampling_complete_emits_one_boundary_vram_report(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The sampling-complete boundary sends a fresh report and resets the periodic throttle."""
+    """The sampling-complete boundary still sends one precise stage-transition VRAM report."""
     _install_fake_hordelib_api(monkeypatch)
     proc = _make_inference_proc_for_progress()
 
     proc.progress_callback(cast(Any, _progress_report(step=20, total=20)))
 
     cast(Mock, proc.send_memory_report_message).assert_called_once_with(include_vram=True)
+
+
+class _ReporterStubProcess(HordeProcess):
+    """A stub whose ``send_memory_report_message`` records each call's ``include_vram`` on a thread-safe list."""
+
+    @override
+    def cleanup_for_exit(self) -> None:
+        return
+
+    @override
+    def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
+        return
+
+    @override
+    def send_memory_report_message(self, include_vram: bool = False) -> bool:
+        self.reported_include_vram.append(include_vram)
+        return True
+
+
+def _make_reporter_stub(*, includes_vram: bool, sampling_ready: bool) -> _ReporterStubProcess:
+    """Build a reporter-thread stub with a fast cadence and a stubbed device-init guard."""
+    proc = _ReporterStubProcess(
+        process_id=11,
+        process_message_queue=Mock(spec=queue.Queue),
+        pipe_connection=Mock(),
+        disk_lock=Mock(),
+        process_launch_identifier=0,
+    )
+    proc.reported_include_vram: list[bool] = []
+    proc._periodic_report_includes_vram = includes_vram
+    proc._memory_report_interval = 0.02
+    proc._offthread_vram_sampling_ready = Mock(return_value=sampling_ready)  # pyrefly: ignore
+    return proc
+
+
+def test_reporter_thread_emits_reports_at_cadence_off_the_main_loop() -> None:
+    """The reporter thread sends interval reports on its own, never touching the main loop, and stops cleanly."""
+    proc = _make_reporter_stub(includes_vram=True, sampling_ready=True)
+    proc._start_memory_reporter_thread()
+    try:
+        deadline = time.time() + 5.0
+        while len(proc.reported_include_vram) < 3 and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(proc.reported_include_vram) >= 3
+        assert all(include_vram is True for include_vram in proc.reported_include_vram)
+    finally:
+        proc._memory_reporter_stop.set()
+
+    proc._memory_reporter_thread.join(timeout=2.0)  # pyrefly: ignore
+    assert not proc._memory_reporter_thread.is_alive()  # pyrefly: ignore
+
+
+def test_reporter_thread_withholds_vram_until_device_context_ready() -> None:
+    """Before CUDA is initialised the thread must report Nones (include_vram False), never triggering init.
+
+    Simulates the pre-init guard: with the stats source not ready, a VRAM-inclusive process still emits its
+    interval report but with ``include_vram=False`` so it reads only RAM/FDs and never calls a device-init
+    primitive off the main thread.
+    """
+    proc = _make_reporter_stub(includes_vram=True, sampling_ready=False)
+    proc._start_memory_reporter_thread()
+    try:
+        deadline = time.time() + 5.0
+        while len(proc.reported_include_vram) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(proc.reported_include_vram) >= 2
+        assert all(include_vram is False for include_vram in proc.reported_include_vram)
+    finally:
+        proc._memory_reporter_stop.set()
+    proc._memory_reporter_thread.join(timeout=2.0)  # pyrefly: ignore

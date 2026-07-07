@@ -635,6 +635,15 @@ self_maintenance_fault_threshold: 6
 self_maintenance_window_seconds: 600
 self_maintenance_cooldown_seconds: 300
 
+# Keep ComfyUI's smart memory management on so inference children hold model weights resident in VRAM
+# across jobs. When true, a back-to-back same-model job reuses the resident UNet/CLIP/VAE instead of
+# re-uploading them from RAM. False (the default) restores per-job offloading: cross-process residency is
+# not yet reconciled at dispatch time, so on tight cards a sampling peak beside an idle sibling's resident
+# weights overcommits the device faster than the reclaim ladder can evict, and the driver demotes VRAM to
+# system memory (a card-wide slowdown far costlier than the transfers residency saves). Enable only for
+# experimentation on cards with headroom well above one sampling peak plus one resident model.
+comfy_smart_memory: false
+
 #############################
 ## Model Downloads         ##
 #############################

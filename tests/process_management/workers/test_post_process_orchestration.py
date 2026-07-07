@@ -16,6 +16,8 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner
+from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, MeasuredVramSnapshot
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.process_management.workers import post_process_orchestrator as post_process_orchestrator_module
 from tests.process_management.conftest import (
@@ -136,14 +138,16 @@ class TestStartPostProcessing:
         assert pending_job.job_image_results is None
         assert active_job in tracker.jobs_being_post_processed
 
-    async def test_paused_lane_does_not_age_jobs_out(self) -> None:
-        """During a deliberate whole-card pause the patience clock stays unarmed.
+    async def test_whole_card_paused_lane_does_not_age_jobs_out(self) -> None:
+        """During a whole-card residency pause the patience clock stays unarmed.
 
-        The residency lifecycle restarts the lane when the card is released, so jobs wait for the real
-        lane rather than being immediately faulted during the residency window.
+        A residency pause has a live restore path (the residency completion loop restarts the lane when the
+        card is released), so jobs wait for the real lane rather than being immediately faulted during the
+        residency window.
         """
         process_manager = make_testable_process_manager()
         process_manager._process_lifecycle._post_process_gpu_paused = True
+        process_manager._process_lifecycle._post_process_pause_owner = PauseOwner.WHOLE_CARD
         job_info = _make_pp_job_info()
         await process_manager._job_tracker.queue_for_post_processing(job_info)
 
@@ -152,6 +156,35 @@ class TestStartPostProcessing:
         orchestrator = process_manager._post_process_orchestrator
         assert str(job_info.sdk_api_job_info.id_) not in orchestrator._deferrals
         assert job_info in process_manager._job_tracker.jobs_pending_post_processing
+
+    async def test_reclaim_ladder_paused_lane_arms_the_patience_clock(self) -> None:
+        """A reclaim-ladder pause does NOT suppress the patience clock, so a stranded job can age out.
+
+        Unlike a residency pause, a ladder pause has no bounded restore guarantee (the ladder only restores
+        the lane if the card recovers to HEALTHY, which may never happen), so a job behind it must run the
+        liveness countdown and eventually take the raw-image fallback rather than wait forever. This is the
+        wedge fix: the ladder pause is owned by the ladder, and the liveness floor treats it as unservable.
+        """
+        process_manager = make_testable_process_manager()
+        process_manager._process_lifecycle._post_process_gpu_paused = True
+        process_manager._process_lifecycle._post_process_pause_owner = PauseOwner.RECLAIM_LADDER
+        job_info = _make_pp_job_info()
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+        orchestrator = process_manager._post_process_orchestrator
+        key = str(job_info.sdk_api_job_info.id_)
+        assert key in orchestrator._deferrals
+
+        # Past the patience window the stranded job faults without images (the existing raw-image fallback).
+        orchestrator._deferrals[key].first_deferred_at -= (
+            post_process_orchestrator_module._ADMISSION_PATIENCE_SECONDS + 1.0
+        )
+        await process_manager.start_post_processing()
+        assert job_info not in process_manager._job_tracker.jobs_pending_post_processing
+        assert job_info in process_manager._job_tracker.jobs_pending_submit
+        assert job_info.state == GENERATION_STATE.faulted
+        assert job_info.job_image_results is None
 
     async def test_chain_waits_while_sampling_holds_a_tight_card(self) -> None:
         """With sampling in progress and co-residency unaffordable, the chain is not dispatched.
@@ -278,7 +311,12 @@ class TestStartPostProcessing:
         self,
         monkeypatch: object,
     ) -> None:
-        """A low-free-VRAM post-processing start is deferred after asking the scheduler to reclaim idle VRAM."""
+        """An arbiter-deferred post-processing start is held after asking the scheduler to reclaim idle VRAM.
+
+        The lane's memory admission is the VRAM arbiter's: a crafted over-committed cycle defers the chain's
+        4000 MB peak, so the job stays pending, its reserve is not booked, and the one-shot idle-VRAM reclaim
+        is issued.
+        """
         monkeypatch.setattr(  # type: ignore[attr-defined]
             post_process_orchestrator_module,
             "predict_job_post_processing_vram_mb",
@@ -286,17 +324,25 @@ class TestStartPostProcessing:
         )
         process_manager = make_testable_process_manager(enable_vram_budget=True, vram_reserve_mb=1500)
         lane = _make_lane_process()
-        lane.total_vram_mb = 16000
-        lane.vram_usage_mb = 15500
         idle_inference = make_mock_process_info(
             3,
             model_name="cold-model",
             state=HordeProcessState.WAITING_FOR_JOB,
         )
-        idle_inference.total_vram_mb = 16000
-        idle_inference.vram_usage_mb = 4000
         process_manager._process_map.clear()
         process_manager._process_map.update({7: lane, 3: idle_inference})
+
+        # The lane's card is committed to capacity, so the arbiter defers the 4000 MB chain peak.
+        over_committed = DeviceVramState(
+            total_vram_mb=16000.0,
+            baseline_mb=0.0,
+            committed_vram_mb=16000.0,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+        )
+        process_manager._vram_arbiter.begin_cycle(
+            MeasuredVramSnapshot(devices={lane.device_index or 0: over_committed})
+        )
 
         job_info = _make_pp_job_info(["RealESRGAN_x4plus"])
         await process_manager._job_tracker.queue_for_post_processing(job_info)

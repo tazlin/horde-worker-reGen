@@ -48,7 +48,10 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeModelStateChangeMessage,
     HordePreloadInferenceModelMessage,
     HordeProcessState,
+    HordeSampleControlMessage,
+    HordeSampleResultMessage,
     ModelLoadState,
+    SampleSliceResult,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess
 
@@ -819,8 +822,11 @@ class HordeInferenceProcess(HordeProcess):
     a faulted result carried only the empty rate string) and classify a resource/OOM failure for retry."""
 
     def _send_inference_memory_report(self) -> None:
-        """Send an inference-path VRAM report and reset the periodic report throttle."""
-        self._last_periodic_memory_report_time = time.time()
+        """Send a precise boundary VRAM report at an inference stage transition (sampling done / VAE decode).
+
+        These stage-boundary reports carry the working set at a known moment and complement the reporter
+        thread's interval sampling, which runs independently while the main loop is blocked in the GPU op.
+        """
         self.send_memory_report_message(include_vram=True)
 
     def _release_inference_slot(self) -> None:
@@ -882,7 +888,6 @@ class HordeInferenceProcess(HordeProcess):
                 heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,
                 nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
             )
-            self._maybe_send_periodic_memory_report()
             return
 
         if progress_report.comfyui_progress is not None and progress_report.comfyui_progress.current_step == (
@@ -936,8 +941,6 @@ class HordeInferenceProcess(HordeProcess):
                 heartbeat_type=HordeHeartbeatType.PIPELINE_STATE_CHANGE,
                 nonadvancing_step_repeats=self._nonadvancing_progress_repeats,
             )
-
-        self._maybe_send_periodic_memory_report()
 
     def _send_job_metrics_message(self, job_id: str, *, is_alchemy: bool = False) -> None:
         """Snapshot hordelib's per-job metrics and forward them to the main process.
@@ -1131,6 +1134,69 @@ class HordeInferenceProcess(HordeProcess):
             single_result.faults = conversion_result.faults + single_result.faults
         return results
 
+    def _run_sample_stage(self, message: HordeSampleControlMessage) -> None:
+        """Run the disaggregated sample stage for each slice, returning a LATENT per job.
+
+        A sampler process loads only the UNet (via HordeLib.sample_stage's subset-flagged loader) and
+        consumes each slice's injected CONDITIONING (and optional source LATENT for img2img), producing
+        a LATENT the image lane decodes. Each slice is faulted independently; a slice failure never
+        drops its siblings in the batch.
+        """
+        import time
+
+        from horde_sdk.worker.dispatch.ai_horde.image.convert import (
+            convert_image_job_pop_response_to_parameters,
+        )
+
+        from horde_worker_regen.reference_helper import ensure_offline_reference_manager
+
+        self.send_process_state_change_message(HordeProcessState.INFERENCE_STARTING, info="Sampling")
+        start_time = time.time()
+        reference_manager = ensure_offline_reference_manager()
+        results: list[SampleSliceResult] = []
+
+        for job_slice in message.slices:
+            try:
+                if self._dry_run_skip_inference:
+                    latent_bytes = self._make_dummy_latent_bytes()
+                else:
+                    conversion = convert_image_job_pop_response_to_parameters(
+                        api_response=job_slice.sdk_api_job_info,
+                        model_reference_manager=reference_manager,
+                    )
+                    latent_bytes = self._horde.sample_stage(
+                        conversion.generation_parameters,
+                        positive_conditioning_bytes=job_slice.positive_conditioning_bytes,
+                        negative_conditioning_bytes=job_slice.negative_conditioning_bytes,
+                        source_latent_bytes=job_slice.source_latent_bytes,
+                    )
+                results.append(
+                    SampleSliceResult(job_id=job_slice.job_id, latent_bytes=latent_bytes, state=GENERATION_STATE.ok),
+                )
+            except Exception as sample_error:  # noqa: BLE001 - one slice's fault must not drop the batch
+                logger.error(f"Sample stage faulted for job {job_slice.job_id}: {sample_error}")
+                results.append(
+                    SampleSliceResult(job_id=job_slice.job_id, latent_bytes=None, state=GENERATION_STATE.faulted),
+                )
+
+        self.process_message_queue.put(
+            HordeSampleResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info="",
+                time_elapsed=time.time() - start_time,
+                results=results,
+            ),
+        )
+        self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, info="Waiting for job")
+
+    def _make_dummy_latent_bytes(self) -> bytes:
+        """A minimal serialized LATENT for dry-run mode (no backend), shaped like an SDXL 1MP latent."""
+        import torch
+        from hordelib.execution.stage_payloads import serialize_latent
+
+        return serialize_latent({"samples": torch.zeros([1, 4, 128, 128])})
+
     @staticmethod
     def _make_dummy_inference_result(
         job_info: ImageGenerateJobPopResponse,
@@ -1184,6 +1250,20 @@ class HordeInferenceProcess(HordeProcess):
                 process_state=HordeProcessState.WAITING_FOR_JOB,
                 info="No models to unload from VRAM",
             )
+
+    @logger.catch(reraise=True)
+    def release_allocator_cache(self) -> None:
+        """Release the torch allocator's cached free blocks without unloading models, then report memory.
+
+        Empties the caching allocator's reserved-but-unused device blocks so the reservation returns to
+        the card while the resident model stays loaded, then sends a fresh memory report so the parent's
+        per-process ``process_reserved_mb`` reflects the release promptly. Deliberately emits no model
+        state change: nothing was unloaded.
+        """
+        logger.debug("Releasing allocator cache (resident models stay loaded)")
+        if not self._dry_run_skip_inference:
+            self.clear_gc_and_torch_cache()
+        self.send_memory_report_message(include_vram=True)
 
     @logger.catch(reraise=True)
     def unload_models_from_ram(self) -> None:
@@ -1386,6 +1466,8 @@ class HordeInferenceProcess(HordeProcess):
                 job_info=message.sdk_api_job_info,
                 aux_download_deadline_seconds=message.aux_download_deadline_seconds,
             )
+        elif isinstance(message, HordeSampleControlMessage):
+            self._run_sample_stage(message)
         elif isinstance(message, HordeInferenceControlMessage):
             if message.control_flag == HordeControlFlag.START_INFERENCE:
                 if self._active_model_name is None or message.horde_model_name != self._active_model_name:
@@ -1504,5 +1586,7 @@ class HordeInferenceProcess(HordeProcess):
                 self.unload_models_from_vram()
             elif message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM:
                 self.unload_models_from_ram()
+            elif message.control_flag == HordeControlFlag.RELEASE_ALLOCATOR_CACHE:
+                self.release_allocator_cache()
             elif message.control_flag == HordeControlFlag.RELOAD_MODEL_DATABASE:
                 self.reload_model_database()

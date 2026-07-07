@@ -93,6 +93,15 @@ class CensorReason(enum.Enum):
 class HordeSafetyProcess(HordeProcess):
     """The safety process, which is responsible for evaluating the safety of images."""
 
+    _periodic_report_includes_vram: bool = True
+    """Sample VRAM in the interval report so a GPU-resident safety model appears in the attribution snapshot.
+
+    When ``safety_on_gpu`` the safety models (DeepDanbooru, CLIP, and the aesthetic head) load on the GPU and
+    hold device memory the parent's committed-VRAM ledger must otherwise account for as an unexplained drift.
+    Its allocator stats then flow through the same per-process fields as every other GPU process, with no
+    special-casing. When the safety process runs on CPU it never initialises CUDA, so the reporter thread's
+    device-init guard keeps the VRAM read withheld (the fields stay None) and only RAM/FDs are reported."""
+
     _interrogator: Interrogator
     _deep_danbooru_model: DeepDanbooruModel
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import enum
 import math
 import os
 import sys
@@ -51,6 +52,25 @@ from horde_worker_regen.process_management.scheduling.performance_model import (
 )
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
+
+
+class PauseOwner(enum.StrEnum):
+    """Which subsystem holds a lane's off-GPU pause, so its restore path alone can clear it.
+
+    A lane's off-GPU pause has two independent initiators that must not clear each other's hold: the whole-card
+    residency (restored when the residency drains, by the completion loop) and the verified reclaim ladder
+    (restored when the card's saturation episode ends, by the ladder's LIFO unwind). Recording the initiator at
+    pause time lets each restore path act only on the pause it owns, so a ladder-initiated pause is never
+    stranded by a residency that has no grant to complete, and a residency pause is never lifted early by the
+    ladder unwinding its own rungs. Whichever initiator transitions the lane into the paused state owns it; a
+    second initiator finding the lane already paused is a no-op and does not take ownership.
+    """
+
+    WHOLE_CARD = "whole_card"
+    """The whole-card residency stopped the lane; its completion loop owns the restore."""
+    RECLAIM_LADDER = "reclaim_ladder"
+    """The verified reclaim ladder stopped the lane; the ladder's episode-end unwind owns the restore."""
+
 
 SAFETY_PROCESS_ID: int = 0
 """The reserved process-map slot for the safety process, by convention always PID 0.
@@ -115,6 +135,31 @@ SLOWDOWN_WARN_RATIO: float = 4.0
 
 The hard kill remains the ``inference_step_timeout`` in :meth:`replace_hung_processes`; these softer,
 evidence-based rungs sit below it so a measurable slowdown is logged before the slot is replaced."""
+
+SLOWDOWN_WARN_LEVEL: int = 2
+"""The ``current_job_slowdown_level`` value the WARN rung sets (``SLOWDOWN_WARN_RATIO`` reached).
+
+The paged-slowdown watchdog only acts at this rung, never at the softer NOTICE rung (level 1)."""
+
+WDDM_PAGING_VICTIM_MAX_AGE_SECONDS: float = 5.0
+"""How recently the parent must have attributed WDDM paging to a slot for the paged-slowdown watchdog to
+act on it.
+
+The paging verdict and the hung-process watchdog run in the same control-loop tick (a handful of ~0.2s
+loop-interval sleeps apart), and the verdict itself only fires after two consecutive elevated telemetry
+samples, so a few seconds comfortably spans the freshest verdict plus normal sampling jitter. Kept short
+so that a paging episode which has genuinely cleared (or telemetry that has stopped arriving) ages out
+before it can drive a kill: the corroboration must be current, not a stale memory of past pressure."""
+
+SATURATION_KILL_MIN_SECONDS: float = 10.0
+"""How long a card must have been continuously SATURATED, with the reclaim ladder exhausted, before a
+crawling sampler on it is replaced as the last reclaim rung.
+
+The kill is the terminal rung of the reclaim ladder, not a first response: it fires only once the governor
+has called the card SATURATED for this long without interruption AND the verified ladder has run every
+softer rung (idle-model unload, cache release, lane pause, safety off-GPU) without relieving the card. Ten
+seconds spans several governor samples plus the ladder's own per-rung verification windows, so a card that
+any softer rung could still rescue is never killed; only a card genuinely wedged over the cliff reaches it."""
 
 STEP_TIMEOUT_WORK_FACTOR: float = 2.0
 """Per-step hang grace scales with this multiple of a job's expected sampling time when no other widening
@@ -232,6 +277,9 @@ class ProcessLifecycleManager:
         entry_points: ProcessEntryPoints | None = None,
         owned_registry: OwnedProcessRegistry | None = None,
         action_ledger: ActionLedger | None = None,
+        wddm_paging_victims_provider: Callable[[float], dict[int, float]] | None = None,
+        device_saturation_duration_provider: Callable[[int], float] | None = None,
+        saturation_unresolved_provider: Callable[[int], bool] | None = None,
     ) -> None:
         """Initialize with shared references and callbacks from the parent manager."""
         # All child processes are created from this context (ctx.Process/ctx.Pipe), not the bare
@@ -266,36 +314,49 @@ class ProcessLifecycleManager:
         self._state = state
         self._entry_points = entry_points if entry_points is not None else ProcessEntryPoints()
         self._owned_registry = owned_registry
-        # Cross-process model-component sharing fabric (opt-in via HORDE_SHARED_COMPONENTS=1; the
-        # transport is CPU-shm everywhere and CUDA IPC on Linux). Built here from plain
-        # multiprocessing primitives so the parent stays torch-free; tensor payloads only ever
-        # transit child-to-child queues. Endpoints are pre-created for every process id the worker
-        # can allocate (inference pids start at 1; slot 0 is safety; the lane and replacements
-        # allocate from the same range), so replacements keep working without re-plumbing.
-        self._shared_component_bus = None
-        if os.environ.get("HORDE_SHARED_COMPONENTS") == "1":
-            try:
-                from horde_worker_regen.utils.shared_components_bridge import build_component_bus
-
-                self._shared_component_bus = build_component_bus(
-                    self._ctx,
-                    list(range(self._max_inference_processes + 4)),
-                )
-                logger.info("Cross-process component sharing enabled (HORDE_SHARED_COMPONENTS=1).")
-            except Exception as bus_error:  # noqa: BLE001 - sharing is an optimization, never a startup failure
-                logger.warning(f"Cross-process component sharing unavailable ({bus_error})")
         # The ledger is always present (an in-memory ring by default) so diagnostics work under test;
         # the parent manager injects a file-backed one in a real run.
         self._action_ledger = action_ledger if action_ledger is not None else ActionLedger()
+        # Returns the fresh WDDM paging-victim map (os_pid -> shared MB) from the scheduler, or an empty
+        # map when the parent has no current paging attribution. Injected lazily (the scheduler is built
+        # after this manager), so a bare default here keeps the manager usable standalone in tests.
+        self._wddm_paging_victims_provider: Callable[[float], dict[int, float]] = (
+            wddm_paging_victims_provider if wddm_paging_victims_provider is not None else (lambda _max_age: {})
+        )
+        # How long a card has been continuously SATURATED (device-free below the hard floor), in seconds, and
+        # whether the verified reclaim ladder has exhausted itself on that card without relieving it. These are
+        # the two device-level gates the last-rung kill reads: they replace the old per-PID paging-victim gate,
+        # which the measured LRU physics made structurally unsatisfiable (the demoted pid and the crawling pid
+        # differ). Injected lazily by the parent (governor and ladder are built after this manager); bare
+        # defaults keep the manager usable standalone in tests.
+        self._device_saturation_duration_provider: Callable[[int], float] = (
+            device_saturation_duration_provider
+            if device_saturation_duration_provider is not None
+            else (lambda _device_index: 0.0)
+        )
+        self._saturation_unresolved_provider: Callable[[int], bool] = (
+            saturation_unresolved_provider
+            if saturation_unresolved_provider is not None
+            else (lambda _device_index: False)
+        )
 
         self.num_processes_launched = 0
         self._num_process_recoveries = 0
         self._num_slowdown_events = 0
+        # Count of inference slots replaced as the reclaim ladder's last rung (a crawling sampler on a card
+        # that has been SATURATED past the kill horizon with every softer reclaim rung exhausted). Surfaced on
+        # the run-metrics snapshot as ``paging_victim_replacements`` (the counter's name is retained; it now
+        # counts last-rung replacements rather than per-PID paging-victim matches).
+        self._paging_victim_replacements = 0
         self._safety_processes_should_be_replaced = False
         self._safety_processes_ending = False
         self._post_process_processes_should_be_replaced = False
         self._post_process_processes_ending = False
         self._post_process_results_known_lost: set[GenerationID] = set()
+        self._component_processes_should_be_replaced = False
+        self._component_processes_ending = False
+        self._vae_lane_processes_should_be_replaced = False
+        self._vae_lane_processes_ending = False
         # Runtime override forcing the safety process off-GPU (cpu_only) even when safety_on_gpu is configured.
         # Set while a whole-card (single-residency) job claims the device, so the safety process's CUDA
         # context (only reclaimable by the process exiting) is freed for the heavy model. Restored after.
@@ -317,11 +378,39 @@ class ProcessLifecycleManager:
         # in-flight post-processing work is recorded known-lost so the recovery coordinator requeues it
         # (bounded), then reports a no-image fault if the lane cannot return a result.
         self._post_process_gpu_paused = False
+        # Which initiator (whole-card residency or the reclaim ladder) holds the current pause, so only its
+        # restore path clears it; None while the lane is not paused. See :class:`PauseOwner`.
+        self._post_process_pause_owner: PauseOwner | None = None
         self._post_process_gpu_pause_count = 0
         self._post_process_gpu_restore_count = 0
         # Marks the *next* post-processing-lane rebuild as an intentional whole-card pause/restore cycle, so
         # its completion is not counted as a crash recovery (mirrors ``_safety_replacement_intentional``).
         self._post_process_replacement_intentional = False
+        # The dedicated VAE lane (the disaggregated pipeline's VAE-encode/decode stage) mirrors the
+        # post-processing lane's whole-card off-GPU handling: its permanent CUDA context is real device-wide
+        # VRAM only reclaimed by the process exiting, so a whole-card model stops the lane outright rather
+        # than merely unloading its models. In-flight VAE stages are re-dispatched from held state by the
+        # disaggregation orchestrator (it owns per-stage recovery), so no parent-side known-lost set is kept.
+        self._vae_lane_gpu_paused = False
+        self._vae_lane_pause_owner: PauseOwner | None = None
+        self._vae_lane_gpu_pause_count = 0
+        self._vae_lane_gpu_restore_count = 0
+        # Marks the *next* VAE-lane rebuild as an intentional whole-card pause/restore cycle (mirrors
+        # ``_post_process_replacement_intentional``), so its completion is not counted as a crash recovery.
+        self._vae_lane_replacement_intentional = False
+        # The dedicated component lane (the disaggregated pipeline's text-encode service) mirrors the VAE
+        # lane's whole-card off-GPU handling: its permanent CUDA context and resident text encoders are
+        # real device-wide VRAM only reclaimed by the process exiting, so a whole-card model stops the lane
+        # outright rather than leaving its context resident. The lane serves no jobs, so no in-flight work is
+        # accounted; disaggregation consumers that lose the producer fall back to loading their own copies,
+        # and dispatch demotes to monolithic while the lane is down (its liveness gates disagg eligibility).
+        self._component_gpu_paused = False
+        self._component_pause_owner: PauseOwner | None = None
+        self._component_gpu_pause_count = 0
+        self._component_gpu_restore_count = 0
+        # Marks the *next* component-lane rebuild as an intentional whole-card pause/restore cycle (mirrors
+        # ``_vae_lane_replacement_intentional``), so its completion is not counted as a crash recovery.
+        self._component_lane_replacement_intentional = False
         self._recently_recovered = False
         self._hung_processes_detected = False
         self._hung_processes_detected_time = 0.0
@@ -409,8 +498,24 @@ class ProcessLifecycleManager:
         """The self-audited record of lifecycle actions taken on child processes (read-only)."""
         return self._action_ledger
 
+    _VRAM_MATERIALIZING_PROCESS_TYPES = (
+        HordeProcessType.INFERENCE,
+        HordeProcessType.SAFETY,
+        HordeProcessType.POST_PROCESS,
+        HordeProcessType.VAE_LANE,
+        HordeProcessType.COMPONENT,
+    )
+    """GPU-context process types whose spawn is a VRAM-materializing event for LIFO reclaim ranking."""
+
     def _register_owned(self, process_info: HordeProcessInfo) -> None:
-        """Record a just-started child in the action ledger and the owned-PID registry."""
+        """Record a just-started child in the action ledger and the owned-PID registry.
+
+        A GPU-context process's spawn is also a VRAM-materializing event (its CUDA context forms on the card),
+        so its monotonic materialization stamp is set here for the reclaim ladder's LIFO ranking; a model that
+        later reports LOADED_IN_VRAM restamps it. The download process is not a GPU context and is skipped.
+        """
+        if process_info.process_type in self._VRAM_MATERIALIZING_PROCESS_TYPES:
+            process_info.vram_materialized_monotonic = time.monotonic()
         self._action_ledger.record(
             LedgerEventType.PROCESS_SPAWNED,
             process_id=process_info.process_id,
@@ -516,6 +621,7 @@ class ProcessLifecycleManager:
                     "amd_gpu": self._amd_gpu,
                     "directml": self._directml,
                     "dry_run_skip_safety": bridge_data.dry_run_skip_safety,
+                    "comfy_smart_memory": bridge_data.comfy_smart_memory,
                 },
             )
 
@@ -535,7 +641,12 @@ class ProcessLifecycleManager:
             self.num_processes_launched += 1
 
     def post_process_lane_enabled(self) -> bool:
-        """Whether the dedicated post-processing lane should be running."""
+        """Whether the dedicated post-processing lane should be running.
+
+        Pipeline disaggregation runs its VAE stages on the dedicated VAE lane (see
+        :meth:`start_vae_lane_processes`), not this lane, so the post-processing lane follows its own
+        configuration flag and is not forced on by disaggregation.
+        """
         return self._runtime_config.bridge_data.post_processing_lane_enabled
 
     def _post_process_card(self) -> CardRuntime:
@@ -591,6 +702,7 @@ class ProcessLifecycleManager:
                 "amd_gpu": self._amd_gpu,
                 "directml": self._directml,
                 "dry_run_skip_post_processing": bridge_data.dry_run_skip_post_processing,
+                "comfy_smart_memory": bridge_data.comfy_smart_memory,
             },
         )
 
@@ -623,6 +735,15 @@ class ProcessLifecycleManager:
     def _initiate_post_process_replacement(self) -> None:
         """Flag the post-processing lane for replacement so the control loop's state machine restarts it."""
         self._post_process_processes_should_be_replaced = True
+
+    def _initiate_component_replacement(self) -> None:
+        """Flag the component lane for replacement so the control loop's state machine restarts it.
+
+        Set when the lane is found dead (``_reap_if_crashed``). Consumers that lose the producer fall back to
+        loading their own copies, so a lane crash degrades sharing rather than faulting jobs; respawning
+        restores the dedup.
+        """
+        self._component_processes_should_be_replaced = True
 
     def take_post_process_results_known_lost(self) -> set[GenerationID]:
         """Return and clear the jobs whose post-processing result was lost to a lane replacement.
@@ -685,9 +806,399 @@ class ProcessLifecycleManager:
         """Whether the dedicated post-processing lane is flagged for replacement."""
         return self._post_process_processes_should_be_replaced
 
+    def _component_lane_enabled(self) -> bool:
+        """Whether the dedicated text-encode service should run.
+
+        Gated on pipeline disaggregation being enabled: the service is the encode stage of the
+        disaggregated pipeline (it produces CONDITIONING for the UNet-only samplers), so it is spawned
+        exactly when disaggregation is on.
+        """
+        return self._runtime_config.bridge_data.enable_pipeline_disaggregation
+
+    def start_component_processes(self) -> None:
+        """Start the dedicated text-encode service, if disaggregation is enabled and it is not running."""
+        if not self._component_lane_enabled():
+            return
+
+        # While a whole-card model holds the card the lane is deliberately kept off-GPU: this per-tick start
+        # hook must not resurrect it until the residency restores and clears the pause.
+        if self._component_gpu_paused:
+            return
+
+        if self._process_map.num_component_processes() > 0:
+            return
+
+        bridge_data = self._runtime_config.bridge_data
+        pid = self._allocate_inference_pid()
+        pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
+        lane_card = self._post_process_card()
+
+        process = self._new_process(
+            target=self._entry_points.component_entry_point,
+            args=(
+                pid,
+                self._process_message_queue,
+                child_pipe_connection,
+                self._disk_lock,
+                self.num_processes_launched,
+            ),
+            kwargs={
+                "device_index": lane_card.device_index,
+                "accelerator_kind": lane_card.mask_kind,
+                "amd_gpu": self._amd_gpu,
+                "directml": self._directml,
+                "horde_model_names": list(bridge_data.image_models_to_load),
+                "dry_run_skip_component_lane": bridge_data.dry_run_skip_inference,
+                "comfy_smart_memory": bridge_data.comfy_smart_memory,
+            },
+        )
+        process.start()
+
+        self._process_map[pid] = HordeProcessInfo(
+            mp_process=process,
+            pipe_connection=pipe_connection,
+            process_id=pid,
+            process_type=HordeProcessType.COMPONENT,
+            last_process_state=HordeProcessState.PROCESS_STARTING,
+            process_launch_identifier=self.num_processes_launched,
+            device_index=lane_card.device_index,
+        )
+        self._register_owned(self._process_map[pid])
+
+        logger.info(f"Started component lane (id: {pid}, device_index: {lane_card.device_index})")
+        self.num_processes_launched += 1
+
+    def end_component_processes(self) -> None:
+        """End the dedicated component lane process (its publications are withdrawn as it exits)."""
+        for process_info in self._process_map.get_stoppable_component_processes():
+            process_info.end_intended = True
+            process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
+            self._process_map.on_process_ending(process_id=process_info.process_id)
+            self._forget_owned(process_info)
+            logger.info(f"Ended component lane {process_info.process_id}")
+
+    def _replace_all_component_process(self) -> None:
+        """Replace the component lane across control-loop ticks (mirrors the post-processing state machine).
+
+        Enter the ending phase (unconditionally, covering a lane that died while still PROCESS_STARTING), wait
+        for the old process to drain out of the map, then start a fresh one. Unlike the post-processing lane
+        there are no in-flight job results to account for: the lane serves no jobs, and consumers that lose a
+        producer fall back to loading their own copies.
+        """
+        if not self._component_processes_should_be_replaced:
+            return
+
+        if not self._component_processes_ending:
+            self._component_processes_ending = True
+            if self._process_map.num_loaded_component_processes() > 0:
+                self.end_component_processes()
+            return
+
+        if self._process_map.num_loaded_component_processes() == 0 and self._process_map.num_component_processes() > 0:
+            self._process_map.delete_component_processes()
+
+        if (
+            self._component_processes_ending
+            and self._process_map.num_loaded_component_processes() == 0
+            and self._process_map.num_component_processes() == 0
+        ):
+            self.start_component_processes()
+            self._component_processes_ending = False
+            self._component_processes_should_be_replaced = False
+            if self._component_lane_replacement_intentional:
+                # A deliberate whole-card pause (or its restore), not a lane crash: keep it out of the
+                # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
+                self._component_lane_replacement_intentional = False
+            else:
+                self._num_process_recoveries += 1
+
+    def _initiate_component_replacement(self) -> None:
+        """Flag the component lane for replacement so the control loop's state machine restarts it."""
+        self._component_processes_should_be_replaced = True
+
+    def component_lane_enabled(self) -> bool:
+        """Whether the dedicated component (text-encode) lane should run (public view of the config gate)."""
+        return self._component_lane_enabled()
+
+    def component_lane_card_index(self) -> int:
+        """Return the device index the dedicated component lane is (or would be) pinned to."""
+        return self._post_process_card().device_index
+
+    @property
+    def is_component_gpu_paused(self) -> bool:
+        """Whether the dedicated component lane is being held off-GPU for a whole-card job."""
+        return self._component_gpu_paused
+
+    @property
+    def component_pause_owner(self) -> PauseOwner | None:
+        """Which initiator holds the component lane's off-GPU pause (None when it is not paused)."""
+        return self._component_pause_owner
+
+    @property
+    def component_gpu_pause_count(self) -> int:
+        """How many whole-card residency component-lane off-GPU pauses this manager initiated."""
+        return self._component_gpu_pause_count
+
+    @property
+    def component_gpu_restore_count(self) -> int:
+        """How many whole-card residency component-lane restores this manager initiated."""
+        return self._component_gpu_restore_count
+
+    def pause_component_off_gpu(self, *, owner: PauseOwner) -> bool:
+        """Stop the dedicated component lane so its CUDA context and text encoders free for a whole-card model.
+
+        A no-op (returns False) when the lane is not enabled or is already paused. Otherwise records ``owner``
+        as the pause holder (so only its restore path clears it), sets the override (which suppresses the
+        per-tick restart in :meth:`start_component_processes`) and triggers the lane replacement state machine
+        to end the running process; the intentional flag keeps that teardown out of the crash-recovery count.
+        It stays stopped until :meth:`restore_component_off_gpu` is called by the same owner. The lane serves no
+        jobs, so nothing in flight is stranded: while it is down, disaggregation dispatch demotes to monolithic
+        (its liveness gates eligibility) rather than faulting.
+
+        Args:
+            owner: The subsystem initiating the pause; only this owner's restore path clears it.
+
+        Returns:
+            True if a pause was initiated, False if it was already paused or the lane is not enabled.
+        """
+        if not self._component_lane_enabled() or self._component_gpu_paused:
+            return False
+        self._component_gpu_paused = True
+        self._component_pause_owner = owner
+        self._component_gpu_pause_count += 1
+        if self._process_map.num_component_processes() > 0:
+            self._component_lane_replacement_intentional = True
+            self._initiate_component_replacement()
+        logger.info(
+            "Whole-card residency: stopping the component lane to free its VRAM context for the heavy model.",
+        )
+        return True
+
+    def restore_component_off_gpu(self, *, owner: PauseOwner) -> bool:
+        """Restart the dedicated component lane after its pausing owner has released the device.
+
+        A no-op (returns False) when the lane is not currently paused, or when ``owner`` is not the initiator
+        that holds the pause (a foreign owner must not lift another's hold). Otherwise clears the override and
+        starts the lane directly, for the same reason :meth:`restore_vae_lane_off_gpu` does: the replacement
+        state machine consumed its flag during the pause (its final start call was suppressed by the pause
+        gate), and the bring-up callers are one-shot latches, so without this the lane would stay down for the
+        rest of the session and disaggregation would remain demoted to monolithic.
+
+        Args:
+            owner: The subsystem requesting the restore; it must match the owner that initiated the pause.
+
+        Returns:
+            True if a restore was initiated, False if it was not paused or is held by a different owner.
+        """
+        if not self._component_gpu_paused or self._component_pause_owner is not owner:
+            return False
+        self._component_gpu_paused = False
+        self._component_pause_owner = None
+        self._component_gpu_restore_count += 1
+        logger.info("Whole-card residency complete: restarting the component lane.")
+        self.start_component_processes()
+        return True
+
     @post_process_processes_should_be_replaced.setter
     def post_process_processes_should_be_replaced(self, value: bool) -> None:
         self._post_process_processes_should_be_replaced = value
+
+    def vae_lane_enabled(self) -> bool:
+        """Whether the dedicated VAE lane should run.
+
+        Gated on pipeline disaggregation being enabled: the lane is the VAE-encode/decode stage of the
+        disaggregated pipeline (it produces the source LATENT for img2img and decodes the sampler's LATENT
+        to final images), so it is spawned exactly when disaggregation is on.
+        """
+        return self._runtime_config.bridge_data.enable_pipeline_disaggregation
+
+    def vae_lane_card_index(self) -> int:
+        """Return the device index the dedicated VAE lane is (or would be) pinned to."""
+        return self._post_process_card().device_index
+
+    def start_vae_lane_processes(self) -> None:
+        """Start the dedicated VAE lane, if disaggregation is enabled and it is not already running."""
+        if not self.vae_lane_enabled():
+            return
+
+        # While a whole-card model holds the card the lane is deliberately kept off-GPU: this per-tick start
+        # hook must not resurrect it until the residency restores and clears the pause.
+        if self._vae_lane_gpu_paused:
+            return
+
+        if self._process_map.num_vae_lane_processes() > 0:
+            return
+
+        bridge_data = self._runtime_config.bridge_data
+        pid = self._allocate_inference_pid()
+        pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
+        lane_card = self._post_process_card()
+
+        process = self._new_process(
+            target=self._entry_points.vae_lane_entry_point,
+            args=(
+                pid,
+                self._process_message_queue,
+                child_pipe_connection,
+                self._disk_lock,
+                self.num_processes_launched,
+            ),
+            kwargs={
+                "device_index": lane_card.device_index,
+                "accelerator_kind": lane_card.mask_kind,
+                "amd_gpu": self._amd_gpu,
+                "directml": self._directml,
+                "dry_run_skip_vae_lane": bridge_data.dry_run_skip_inference,
+                "comfy_smart_memory": bridge_data.comfy_smart_memory,
+            },
+        )
+        process.start()
+
+        self._process_map[pid] = HordeProcessInfo(
+            mp_process=process,
+            pipe_connection=pipe_connection,
+            process_id=pid,
+            process_type=HordeProcessType.VAE_LANE,
+            last_process_state=HordeProcessState.PROCESS_STARTING,
+            process_launch_identifier=self.num_processes_launched,
+            device_index=lane_card.device_index,
+        )
+        self._register_owned(self._process_map[pid])
+
+        logger.info(f"Started VAE lane (id: {pid}, device_index: {lane_card.device_index})")
+        self.num_processes_launched += 1
+
+    def end_vae_lane_processes(self) -> None:
+        """End any dedicated VAE lane processes."""
+        for process_info in self._process_map.get_stoppable_vae_lane_processes():
+            process_info.end_intended = True
+            process_info.safe_send_message(HordeControlMessage(control_flag=HordeControlFlag.END_PROCESS))
+            self._process_map.on_process_ending(process_id=process_info.process_id)
+            self._forget_owned(process_info)
+            logger.info(f"Ended VAE lane {process_info.process_id}")
+
+    def _initiate_vae_lane_replacement(self) -> None:
+        """Flag the VAE lane for replacement so the control loop's state machine restarts it."""
+        self._vae_lane_processes_should_be_replaced = True
+
+    def _replace_all_vae_lane_process(self) -> None:
+        """Replace the dedicated VAE lane across control-loop ticks (mirrors the post-processing state machine).
+
+        Enter the ending phase (unconditionally, covering a lane that died while still PROCESS_STARTING), wait
+        for the old process to drain out of the map, then start a fresh one. Unlike the post-processing lane
+        no parent-side known-lost set is drained: in-flight VAE stages are held by the disaggregation
+        orchestrator, which re-dispatches an orphaned stage from held state once the replacement lane appears.
+        """
+        if not self._vae_lane_processes_should_be_replaced:
+            return
+
+        if not self._vae_lane_processes_ending:
+            self._vae_lane_processes_ending = True
+            if self._process_map.num_loaded_vae_lane_processes() > 0:
+                self.end_vae_lane_processes()
+            return
+
+        if self._process_map.num_loaded_vae_lane_processes() == 0 and self._process_map.num_vae_lane_processes() > 0:
+            self._process_map.delete_vae_lane_processes()
+
+        if (
+            self._vae_lane_processes_ending
+            and self._process_map.num_loaded_vae_lane_processes() == 0
+            and self._process_map.num_vae_lane_processes() == 0
+        ):
+            self.start_vae_lane_processes()
+            self._vae_lane_processes_ending = False
+            self._vae_lane_processes_should_be_replaced = False
+            if self._vae_lane_replacement_intentional:
+                # A deliberate whole-card pause (or its restore), not a lane crash: keep it out of the
+                # recovery count so a burst of whole-card jobs cycling the lane is not read as a crash loop.
+                self._vae_lane_replacement_intentional = False
+            else:
+                self._num_process_recoveries += 1
+
+    @property
+    def vae_lane_processes_should_be_replaced(self) -> bool:
+        """Whether the dedicated VAE lane is flagged for replacement."""
+        return self._vae_lane_processes_should_be_replaced
+
+    @vae_lane_processes_should_be_replaced.setter
+    def vae_lane_processes_should_be_replaced(self, value: bool) -> None:
+        self._vae_lane_processes_should_be_replaced = value
+
+    @property
+    def is_vae_lane_gpu_paused(self) -> bool:
+        """Whether the dedicated VAE lane is being held off-GPU for a whole-card job."""
+        return self._vae_lane_gpu_paused
+
+    @property
+    def vae_lane_pause_owner(self) -> PauseOwner | None:
+        """Which initiator holds the VAE lane's off-GPU pause (None when it is not paused)."""
+        return self._vae_lane_pause_owner
+
+    @property
+    def vae_lane_gpu_pause_count(self) -> int:
+        """How many whole-card residency VAE-lane off-GPU pauses this manager initiated."""
+        return self._vae_lane_gpu_pause_count
+
+    @property
+    def vae_lane_gpu_restore_count(self) -> int:
+        """How many whole-card residency VAE-lane restores this manager initiated."""
+        return self._vae_lane_gpu_restore_count
+
+    def pause_vae_lane_off_gpu(self, *, owner: PauseOwner) -> bool:
+        """Stop the dedicated VAE lane so its CUDA context and models free for a whole-card model.
+
+        A no-op (returns False) when the lane is not enabled or is already paused. Otherwise records ``owner``
+        as the pause holder (so only its restore path clears it), sets the override (which suppresses the
+        per-tick restart in :meth:`start_vae_lane_processes`) and triggers the lane replacement state machine to
+        end the running process; the intentional flag keeps that teardown out of the crash-recovery count. Like
+        the post-processing lane it stays stopped until :meth:`restore_vae_lane_off_gpu` is called by the same
+        owner. Any VAE stage in flight on the lane is re-dispatched from held state by the disaggregation
+        orchestrator once a replacement lane appears.
+
+        Args:
+            owner: The subsystem initiating the pause; only this owner's restore path clears it.
+
+        Returns:
+            True if a pause was initiated, False if it was already paused or the lane is not enabled.
+        """
+        if not self.vae_lane_enabled() or self._vae_lane_gpu_paused:
+            return False
+        self._vae_lane_gpu_paused = True
+        self._vae_lane_pause_owner = owner
+        self._vae_lane_gpu_pause_count += 1
+        if self._process_map.num_vae_lane_processes() > 0:
+            self._vae_lane_replacement_intentional = True
+            self._initiate_vae_lane_replacement()
+        logger.info(
+            "Whole-card residency: stopping the VAE lane to free its VRAM context for the heavy model.",
+        )
+        return True
+
+    def restore_vae_lane_off_gpu(self, *, owner: PauseOwner) -> bool:
+        """Restart the dedicated VAE lane after its pausing owner has released the device.
+
+        A no-op (returns False) when the lane is not currently paused, or when ``owner`` is not the initiator
+        that holds the pause (a foreign owner must not lift another's hold). Otherwise clears the override and
+        starts the lane directly, for the same reason :meth:`restore_post_process_off_gpu` does: the replacement
+        state machine consumed its flag during the pause (its final start call was suppressed by the pause
+        gate), and the bring-up callers are one-shot latches, so without this the lane would stay down for the
+        rest of the session and every VAE stage would queue against a lane that never returns.
+
+        Args:
+            owner: The subsystem requesting the restore; it must match the owner that initiated the pause.
+
+        Returns:
+            True if a restore was initiated, False if it was not paused or is held by a different owner.
+        """
+        if not self._vae_lane_gpu_paused or self._vae_lane_pause_owner is not owner:
+            return False
+        self._vae_lane_gpu_paused = False
+        self._vae_lane_pause_owner = None
+        self._vae_lane_gpu_restore_count += 1
+        logger.info("Whole-card residency complete: restarting the VAE lane.")
+        self.start_vae_lane_processes()
+        return True
 
     def start_download_process(self) -> None:
         """Start the singleton background download process, if not already running.
@@ -901,6 +1412,12 @@ class ProcessLifecycleManager:
         # models live in the same on-disk cache); starting it here covers every bring-up path and is a
         # no-op when the lane is disabled or already running.
         self.start_post_process_processes()
+        # The component lane is the disaggregated pipeline's text-encode service; it rides the same bring-up
+        # and is a no-op unless pipeline disaggregation is enabled.
+        self.start_component_processes()
+        # The VAE lane is the disaggregated pipeline's VAE-encode/decode stage; likewise a no-op unless
+        # pipeline disaggregation is enabled.
+        self.start_vae_lane_processes()
 
         num_processes_to_start = self._max_inference_processes - self._process_map.num_inference_processes()
 
@@ -971,7 +1488,7 @@ class ProcessLifecycleManager:
                 # An alchemist-only worker (no image models configured, e.g. a CPU install) must not
                 # treat an empty image-model database as a fatal error in the child.
                 "expect_image_models": bool(card.config.image_models_to_load),
-                "shared_components_endpoint": self._shared_components_endpoint_for(pid),
+                "comfy_smart_memory": bridge_data.comfy_smart_memory,
             },
         )
         process.start()
@@ -988,14 +1505,6 @@ class ProcessLifecycleManager:
         self._register_owned(process_info)
         self.num_processes_launched += 1
         return process_info
-
-    def _shared_components_endpoint_for(self, pid: int) -> object | None:
-        """The component-sharing endpoint to hand a spawning child, or None when sharing is off."""
-        if self._shared_component_bus is None:
-            return None
-        from horde_worker_regen.utils.shared_components_bridge import endpoint_for
-
-        return endpoint_for(self._shared_component_bus, pid)
 
     def _allocate_inference_pid(self) -> int:
         """Return the lowest inference process id not currently in use.
@@ -1295,6 +1804,17 @@ class ProcessLifecycleManager:
         return self._post_process_gpu_paused
 
     @property
+    def post_process_pause_owner(self) -> PauseOwner | None:
+        """Which initiator holds the post-processing lane's off-GPU pause (None when it is not paused).
+
+        The liveness floor for pending post-processing work reads this: a residency-owned pause has a live
+        restore path (the residency completion loop), so waiting for it is safe, but a reclaim-ladder-owned
+        pause must not suppress the patience clock, since its restore is not guaranteed within the window (a
+        card stuck saturated may never recover) and a stranded job must age out to the raw-image fallback.
+        """
+        return self._post_process_pause_owner
+
+    @property
     def post_process_gpu_pause_count(self) -> int:
         """How many whole-card residency post-processing-lane off-GPU pauses this manager initiated."""
         return self._post_process_gpu_pause_count
@@ -1304,16 +1824,20 @@ class ProcessLifecycleManager:
         """How many whole-card residency post-processing-lane restores this manager initiated."""
         return self._post_process_gpu_restore_count
 
-    def pause_post_process_off_gpu(self) -> bool:
+    def pause_post_process_off_gpu(self, *, owner: PauseOwner) -> bool:
         """Stop the dedicated post-processing lane so its CUDA context and models free for a whole-card model.
 
-        A no-op (returns False) when the lane is not enabled or is already paused. Otherwise sets the override
-        (which suppresses the per-tick restart in :meth:`start_post_process_processes`) and triggers the lane
-        replacement state machine to end the running process; the intentional flag keeps that teardown out of
-        the crash-recovery count. Unlike safety, the lane does not come back cpu_only (post-processing on CPU
-        is impractically slow): it stays stopped until :meth:`restore_post_process_off_gpu` clears the pause.
-        Any post-processing job in flight on the lane is recorded known-lost so the recovery coordinator
-        requeues it (bounded), then reports a no-image fault if the lane cannot return a result.
+        A no-op (returns False) when the lane is not enabled or is already paused. Otherwise records ``owner``
+        as the pause holder (so only its restore path clears it), sets the override (which suppresses the
+        per-tick restart in :meth:`start_post_process_processes`) and triggers the lane replacement state
+        machine to end the running process; the intentional flag keeps that teardown out of the crash-recovery
+        count. Unlike safety, the lane does not come back cpu_only (post-processing on CPU is impractically
+        slow): it stays stopped until :meth:`restore_post_process_off_gpu` is called by the same owner. Any
+        post-processing job in flight on the lane is recorded known-lost so the recovery coordinator requeues it
+        (bounded), then reports a no-image fault if the lane cannot return a result.
+
+        Args:
+            owner: The subsystem initiating the pause; only this owner's restore path clears it.
 
         Returns:
             True if a pause was initiated, False if it was already paused or the lane is not enabled.
@@ -1321,6 +1845,7 @@ class ProcessLifecycleManager:
         if not self.post_process_lane_enabled() or self._post_process_gpu_paused:
             return False
         self._post_process_gpu_paused = True
+        self._post_process_pause_owner = owner
         self._post_process_gpu_pause_count += 1
         if self._process_map.num_post_process_processes() > 0:
             self._post_process_replacement_intentional = True
@@ -1330,22 +1855,27 @@ class ProcessLifecycleManager:
         )
         return True
 
-    def restore_post_process_off_gpu(self) -> bool:
-        """Restart the dedicated post-processing lane after a whole-card job has released the device.
+    def restore_post_process_off_gpu(self, *, owner: PauseOwner) -> bool:
+        """Restart the dedicated post-processing lane after its pausing owner has released the device.
 
-        A no-op (returns False) when the lane is not currently paused. Clears the override and starts the
-        lane directly: no recurring hook exists to bring it back otherwise. The bring-up callers
+        A no-op (returns False) when the lane is not currently paused, or when ``owner`` is not the initiator
+        that holds the pause (a foreign owner must not lift another's hold). Otherwise clears the override and
+        starts the lane directly: no recurring hook exists to bring it back otherwise. The bring-up callers
         (:meth:`start_inference_processes` via the download coordinator) are one-shot latches, and the
-        replacement state machine consumed its flag during the pause, when its final start call was
-        suppressed by the pause gate, so without this call the lane would stay down for the rest of the
-        session and every post-processing job would queue against a lane that never returns.
+        replacement state machine consumed its flag during the pause, when its final start call was suppressed
+        by the pause gate, so without this call the lane would stay down for the rest of the session and every
+        post-processing job would queue against a lane that never returns.
+
+        Args:
+            owner: The subsystem requesting the restore; it must match the owner that initiated the pause.
 
         Returns:
-            True if a restore was initiated, False if it was not paused.
+            True if a restore was initiated, False if it was not paused or is held by a different owner.
         """
-        if not self._post_process_gpu_paused:
+        if not self._post_process_gpu_paused or self._post_process_pause_owner is not owner:
             return False
         self._post_process_gpu_paused = False
+        self._post_process_pause_owner = None
         self._post_process_gpu_restore_count += 1
         logger.info("Whole-card residency complete: restarting the post-processing lane.")
         self.start_post_process_processes()
@@ -1397,6 +1927,12 @@ class ProcessLifecycleManager:
         elif process_info.process_type == HordeProcessType.POST_PROCESS:
             self._initiate_post_process_replacement()
             self._replace_all_post_process_process()
+        elif process_info.process_type == HordeProcessType.COMPONENT:
+            self._initiate_component_replacement()
+            self._replace_all_component_process()
+        elif process_info.process_type == HordeProcessType.VAE_LANE:
+            self._initiate_vae_lane_replacement()
+            self._replace_all_vae_lane_process()
         elif process_info.process_type == HordeProcessType.INFERENCE:
             self._replace_inference_process(process_info)
         return True
@@ -1561,9 +2097,9 @@ class ProcessLifecycleManager:
         return len(recent)
 
     def reset_recovery_counter(self) -> None:
-        """Zero the cumulative process-recovery counter at a benchmark level boundary.
+        """Zero the cumulative recovery/slowdown counters at a benchmark level boundary.
 
-        The warm benchmark worker reuses one process pool across levels. The counter is otherwise
+        The warm benchmark worker reuses one process pool across levels. These counters are otherwise
         only ever incremented, so without this every level after the first genuine recovery would
         inherit that level's count and read as having recovered itself. This mirrors
         ``WorkerRunMetrics.reset`` (which clears the per-level crash-event list); the slot-recovery
@@ -1571,6 +2107,8 @@ class ProcessLifecycleManager:
         spanning levels is still caught.
         """
         self._num_process_recoveries = 0
+        self._num_slowdown_events = 0
+        self._paging_victim_replacements = 0
 
     def _record_start_failure(self, process_info: HordeProcessInfo) -> int:
         """Track consecutive replacements that never advanced past PROCESS_STARTING; return the streak.
@@ -1701,6 +2239,7 @@ class ProcessLifecycleManager:
         *,
         intentional_reclaim: bool = False,
         intentional_reason: str | None = None,
+        resource_fault_reason: str | None = None,
     ) -> None:
         """Replace an inference process (because it crashed, hung, timed out, or by deliberate request).
 
@@ -1723,6 +2262,11 @@ class ProcessLifecycleManager:
                 "crashed or hung" both pollutes the recovery diagnostics and feeds a
                 phantom crash into the recovery count and crash-loop breaker. Ignored if
                 ``intentional_reclaim`` is also set.
+            resource_fault_reason: When set, this is a hang recovery whose cause is a VRAM-resource
+                condition (the paged-slowdown watchdog), so the in-flight job is faulted as a resource
+                failure. That routes it to the bounded degraded/isolated retry (which clears the device for
+                it) rather than a plain re-dispatch onto another over-committed slot. Unlike the intentional
+                paths this still takes the full crash/recovery bookkeeping (it *is* a recovery).
         """
         bridge_data = self._runtime_config.bridge_data
         logger.debug(f"Replacing {process_info}")
@@ -1788,6 +2332,8 @@ class ProcessLifecycleManager:
                 process_info=process_info,
                 process_timeout=bridge_data.process_timeout,
                 retryable=not (aux_download_stall and not aux_stall_retryable),
+                is_resource_failure=resource_fault_reason is not None,
+                fault_reason=resource_fault_reason,
             )
 
         if intentional_reclaim or intentional_reason is not None:
@@ -2058,6 +2604,100 @@ class ProcessLifecycleManager:
                     f"({ratio:.1f}x ~{expected:.0f}s); not yet a concern.",
                 )
 
+    def _replace_if_paged_and_slow(
+        self,
+        process_info: HordeProcessInfo,
+        paging_victims: dict[int, float],
+        now: float,
+    ) -> bool:
+        """Replace a crawling sampler as the last reclaim rung once a card is wedged over the paging cliff.
+
+        The silence-based hang watchdog cannot see this failure mode: when WDDM demotes a card's VRAM to
+        system memory, the sampling job keeps emitting steps at seconds-per-iteration pace, so every step
+        refreshes the heartbeat and the silence timeout never trips. The card is effectively lost for minutes
+        while the job limps to completion. This kill is the terminal rung of the reclaim ladder, reached only
+        after every softer rung has failed, and it gates on device-level truth rather than per-PID attribution:
+
+        - The device has been continuously SATURATED (device-free below the hard floor) for at least
+          :data:`SATURATION_KILL_MIN_SECONDS`.
+        - The verified reclaim ladder has exhausted itself on that card without relieving it
+          (``saturation_unresolved``): idle-model unload, cache release, lane pause, and safety off-GPU all ran
+          and the card is still over the cliff.
+        - This slot is crawling: its per-step floor tripped (steps each running several times their expected
+          pace) or its whole-job elapsed grade reached WARN.
+
+        The per-PID PDH paging-victim map is deliberately NOT a gate. The measured LRU physics make it
+        structurally unsatisfiable here: WDDM demotes the least-recently-touched allocator, so the process that
+        goes slow (the active sampler) and the process whose shared memory grows (the idle squatter) are
+        usually different pids, and requiring the slow slot's own pid to appear in the victim set almost never
+        held. The map is retained only as a logging hint. Because the ladder is exhausted and the card is still
+        SATURATED, the crawling sampler is the last thing left to give the card back. The killed job faults as a
+        resource fault, so it earns the single degraded, isolated retry (``RETRY_DEGRADED``) that clears the
+        card for it rather than a plain re-dispatch onto another over-committed slot. The crawl signals reset at
+        the next job boundary, so one replacement per (slot, job) is guaranteed; the recovery debounce in
+        :meth:`replace_hung_processes` further prevents re-entry while the fresh slot spins up. Returns True when
+        the slot was replaced.
+        """
+        if process_info.process_type != HordeProcessType.INFERENCE:
+            return False
+        # Confine to a slot that is actually sampling. The crawl signals are only cleared on the next job's
+        # dispatch, so a slot that finished a slow job and is now idle can still carry them; without this guard,
+        # saturation lingering into that gap would reap a healthy idle slot.
+        if process_info.last_process_state != HordeProcessState.INFERENCE_STARTING:
+            return False
+
+        device_index = process_info.device_index
+        saturated_seconds = self._device_saturation_duration_provider(device_index)
+        if saturated_seconds < SATURATION_KILL_MIN_SECONDS:
+            return False
+        if not self._saturation_unresolved_provider(device_index):
+            return False
+
+        crawling = (
+            process_info.current_job_per_step_floor_tripped
+            or process_info.current_job_slowdown_level >= SLOWDOWN_WARN_LEVEL
+        )
+        if not crawling:
+            return False
+
+        os_pid = process_info.os_pid
+        expected = process_info.current_job_expected_sampling_seconds
+        first_step_at = process_info.current_first_step_at
+        ratio = (now - first_step_at) / expected if (first_step_at is not None and expected) else float("nan")
+        model = process_info.loaded_horde_model_name
+        job_id = str(process_info.last_job_referenced.id_) if process_info.last_job_referenced is not None else None
+        # PDH per-PID attribution is hint-only now: surface the slot's shared figure if it happens to appear,
+        # but never gate on it.
+        shared_hint_mb = paging_victims.get(os_pid) if os_pid is not None else None
+
+        reason = (
+            f"device {device_index} SATURATED {saturated_seconds:.0f}s with the reclaim ladder exhausted and "
+            f"this slot crawling ({ratio:.1f}x expected sampling time); replacing to reclaim the card"
+        )
+        logger.warning(
+            f"Inference slot {process_info.process_id} (pid {os_pid}, model {model}) is the last reclaim rung: "
+            f"device {device_index} has been SATURATED for {saturated_seconds:.0f}s, every softer reclaim rung "
+            f"is exhausted, and the slot is crawling at {ratio:.1f}x its expected sampling time. Replacing it to "
+            "reclaim the card."
+            + (f" (shared-VRAM hint {shared_hint_mb:.0f}MB)" if shared_hint_mb is not None else ""),
+        )
+        self._action_ledger.record(
+            LedgerEventType.TIMEOUT_DETECTED,
+            process_id=process_info.process_id,
+            os_pid=os_pid,
+            launch_identifier=process_info.process_launch_identifier,
+            job_id=job_id,
+            reason=reason,
+            detail={
+                "slowdown_ratio": round(ratio, 2),
+                "saturated_seconds": round(saturated_seconds, 1),
+                "per_step_floor_tripped": process_info.current_job_per_step_floor_tripped,
+            },
+        )
+        self._paging_victim_replacements += 1
+        self._replace_inference_process(process_info, resource_fault_reason=reason)
+        return True
+
     def _effective_inference_step_timeout(self, bridge_data: reGenBridgeData, process_info: HordeProcessInfo) -> int:
         """Per-step hang timeout for a slot, widened when it is doing legitimate heartbeat-silent heavy work.
 
@@ -2192,7 +2832,16 @@ class ProcessLifecycleManager:
         if not isinstance(stuck_step_limit, int) or isinstance(stuck_step_limit, bool):
             stuck_step_limit = None
 
+        # The parent's freshest WDDM paging attribution (os_pid -> shared MB), empty when there is no
+        # current verdict. Read once so every slot is judged against the same snapshot this tick.
+        paging_victims = self._wddm_paging_victims_provider(WDDM_PAGING_VICTIM_MAX_AGE_SECONDS)
+
         for process_info in list(self._process_map.values()):
+            if self._replace_if_paged_and_slow(process_info, paging_victims, now):
+                any_replaced = True
+                self._recently_recovered = True
+                threading.Thread(target=timed_unset_recently_recovered).start()
+                continue
             if self._process_map.is_stuck_on_inference(
                 process_info.process_id,
                 self._effective_inference_step_timeout(bridge_data, process_info),

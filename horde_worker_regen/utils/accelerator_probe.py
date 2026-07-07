@@ -12,14 +12,24 @@ data. The subprocess pays the torch cost and frees it on exit, leaving the calle
 backend-agnostic: the subprocess uses the same hordelib helper, so it reports whatever backend ComfyUI
 supports (CUDA/ROCm, Intel XPU, Apple MPS, DirectML, CPU), not just NVIDIA.
 
-Beyond the inventory, the subprocess also measures two VRAM figures the streaming forecast needs: the
-*first/sole* process's context cost (the one-time CUDA runtime allocation plus one context), and the
-*marginal* cost of each additional sibling context. The marginal is measured directly by bringing up a
-second context-holding process and reading the device-wide used delta, so the forecast can size
-``free_after_model_evict`` from the real per-process cost instead of charging the whole one-time-inclusive
-overhead per process (which over-counts badly on a big card and is what wedged a 24GB worker). The delta is
-only visible cross-process where the platform reports true device-wide VRAM; Linux does, Windows WDDM does
-not, so there the marginal reads 0 and the worker falls back to the conservative overhead-per-context sizing.
+Beyond the inventory, the subprocess also measures two VRAM figures the streaming forecast needs, which
+correspond to two distinct terms of the device's VRAM decomposition (device baseline / per-process
+marginal overhead / model weights / activation peaks; see ``scheduling/context_overhead_model``):
+
+- the *first/sole* process's context cost: the one-time, device-wide CUDA runtime allocation plus one
+  context (and any fixed device baseline the reading happens to include). This is paid once per device and
+  sizes ``free_if_alone``; it is never the cost of an additional context; and
+- the *marginal* cost of each additional sibling context: measured directly by bringing up a second
+  context-holding process and reading the device-wide used *delta*. Because the one-time runtime and the
+  device baseline are already counted in the first figure, the delta isolates term (2) alone, so the
+  forecast can size ``free_after_model_evict`` from the real per-context cost instead of charging the whole
+  one-time-inclusive overhead per process (which over-counts badly on a big card and is what wedged a 24GB
+  worker).
+
+The delta is only visible cross-process where the platform reports true device-wide VRAM; Linux does,
+Windows WDDM does not, so there the marginal reads 0 and the worker seeds a conservative
+per-additional-context constant (``resource_budget._SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB``) rather than
+re-charging the first-context overhead per context.
 """
 
 from __future__ import annotations
@@ -184,8 +194,9 @@ class ProbedAccelerator(BaseModel):
     """Approx. VRAM (MB) each *additional* sibling process's context costs once the first has paid the shared
     one-time runtime cost, measured by bringing up a second context and taking the device-wide used delta.
     On one GPU this is several times smaller than ``runtime_overhead_mb``. Sizes free-after-model-evict.
-    0 when it could not be measured (single-context backends, probe failure), where the worker falls back to
-    the conservative ``runtime_overhead_mb`` per context."""
+    0 when it could not be measured (single-context backends, probe failure), where the worker seeds a
+    conservative per-additional-context constant (``resource_budget._SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB``)
+    rather than re-charging the first-context ``runtime_overhead_mb`` against every context."""
 
 
 def probe_accelerators(*, timeout_seconds: float = 120.0) -> list[ProbedAccelerator]:

@@ -62,6 +62,7 @@ class WorkerRecoveryCoordinator:
         bridge_data_provider: Callable[[], reGenBridgeData],
         max_inference_processes_provider: Callable[[], int],
         abort_callback: Callable[[], None],
+        release_disaggregated_job: Callable[[GenerationID], None] = lambda _job_id: None,
         recovery_supervisor: RecoverySupervisor | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -80,6 +81,10 @@ class WorkerRecoveryCoordinator:
             bridge_data_provider: Return the current live bridge data.
             max_inference_processes_provider: Return the provisioned inference-process count.
             abort_callback: Abort the worker promptly.
+            release_disaggregated_job: Tell the disaggregation orchestrator to drop any state it holds for a
+                job, called whenever a job leaves the tracker by a watchdog/give-up path outside the
+                orchestrator's own flow. Idempotent and a no-op for a job the orchestrator does not hold, so it
+                is safe to call for every released job.
             recovery_supervisor: Optional recovery policy object for tests.
             clock: Wall-clock provider for grace windows and rolling recovery counts.
         """
@@ -95,6 +100,7 @@ class WorkerRecoveryCoordinator:
         self._bridge_data_provider = bridge_data_provider
         self._max_inference_processes_provider = max_inference_processes_provider
         self._abort_callback = abort_callback
+        self._release_disaggregated_job = release_disaggregated_job
         self._clock = clock
 
         self.recovery_supervisor = recovery_supervisor or RecoverySupervisor()
@@ -171,6 +177,12 @@ class WorkerRecoveryCoordinator:
                 and process_info.current_inference_started_at is not None
             ):
                 return True
+            # A disaggregated job pins its sampler across the encode window (no START_INFERENCE is sent, so
+            # the slot reads idle while the encode service produces conditioning). The reservation is the
+            # ownership record for that window, so a pinned slot referencing this job owns it and it must not
+            # be punted as orphaned.
+            if self._process_map.is_reserved_for_disaggregation(process_info.process_id):
+                return True
         return False
 
     def reconcile_orphaned_in_progress_jobs(self) -> None:
@@ -208,6 +220,10 @@ class WorkerRecoveryCoordinator:
                 retryable=True,
                 scheduling_fault=True,
             )
+            # The punt removed the job from the tracker; a disaggregated job the orchestrator is still holding
+            # (its pinned sampler was id-reuse-replaced, so it read as unowned) must be released too, or its
+            # pin/reservation/ledger leaks and a re-registration under the same id is silently dropped.
+            self._release_disaggregated_job(job_id)
             del self.orphan_in_progress_since[job_id]
             self.orphan_punt_history.append(now)
 
@@ -578,6 +594,9 @@ class WorkerRecoveryCoordinator:
             for job in list(self._job_tracker.jobs_pending_inference):
                 if job not in self._job_tracker.jobs_in_progress:
                     self._job_tracker.handle_job_fault_now(job, retryable=False)
+                    # Release any disaggregation state so a give-up never strands a held pin/ledger entry.
+                    if job.id_ is not None:
+                        self._release_disaggregated_job(job.id_)
                     faulted += 1
         if not self.is_safety_capacity_available():
             stuck_safety = list(self._job_tracker.jobs_pending_safety_check) + list(
@@ -585,6 +604,8 @@ class WorkerRecoveryCoordinator:
             )
             for job_info in stuck_safety:
                 self._job_tracker.handle_job_fault_now(job_info.sdk_api_job_info, retryable=False)
+                if job_info.sdk_api_job_info.id_ is not None:
+                    self._release_disaggregated_job(job_info.sdk_api_job_info.id_)
                 faulted += 1
         if faulted > 0:
             if structural_queue_wedge and self.is_inference_capacity_available():

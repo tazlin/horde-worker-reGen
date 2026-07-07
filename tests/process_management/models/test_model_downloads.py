@@ -266,6 +266,8 @@ class TestManagerDownloadHandling:
         manager._download_coordinator.download_wait_started = time.time()
         manager._process_lifecycle = Mock(download_process_info=None)
         manager._process_lifecycle._num_process_recoveries = 0
+        manager._process_lifecycle._num_slowdown_events = 0
+        manager._process_lifecycle._paging_victim_replacements = 0
         manager._download_coordinator._process_lifecycle = manager._process_lifecycle
         return manager  # type: ignore[return-value]
 

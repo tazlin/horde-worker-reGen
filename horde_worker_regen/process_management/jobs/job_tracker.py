@@ -65,6 +65,14 @@ class JobStage(enum.Enum):
     """Popped and waiting for (or undergoing dispatch to) an inference process."""
     INFERENCE_IN_PROGRESS = auto()
     """Sent to an inference process which has not yet returned a result."""
+    DISAGGREGATION_DECODING = auto()
+    """A disaggregated job whose sampling finished; its latent is being decoded (and post-processed) on the
+    image lane while the sampler slot has been released for the next job.
+
+    Deliberately not counted in ``jobs_in_progress`` (the inference concurrency cap), so the freed sampler is
+    schedulable again, yet the job is still tracked and in-flight: the disaggregation orchestrator holds its
+    decode state and hands off the images (or a fault) on completion. Unlike ``DETACHED`` this is a durable
+    stage a job legitimately occupies across many loop iterations while the decode runs."""
     DETACHED = auto()
     """Tracked but not in any queue; a transient hand-off state."""
     PENDING_POST_PROCESSING = auto()
@@ -109,6 +117,16 @@ _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
     JobStage.INFERENCE_IN_PROGRESS: frozenset(
         {
             JobStage.PENDING_INFERENCE,
+            JobStage.DISAGGREGATION_DECODING,
+            JobStage.DETACHED,
+            JobStage.PENDING_POST_PROCESSING,
+            JobStage.PENDING_SAFETY_CHECK,
+            JobStage.PENDING_SUBMIT,
+        },
+    ),
+    JobStage.DISAGGREGATION_DECODING: frozenset(
+        {
+            JobStage.PENDING_INFERENCE,
             JobStage.DETACHED,
             JobStage.PENDING_POST_PROCESSING,
             JobStage.PENDING_SAFETY_CHECK,
@@ -147,6 +165,7 @@ _ALLOWED_TRANSITIONS: dict[JobStage, frozenset[JobStage]] = {
 _QUEUED_STAGES: tuple[JobStage, ...] = (
     JobStage.PENDING_INFERENCE,
     JobStage.INFERENCE_IN_PROGRESS,
+    JobStage.DISAGGREGATION_DECODING,
     JobStage.PENDING_POST_PROCESSING,
     JobStage.POST_PROCESSING,
     JobStage.PENDING_SAFETY_CHECK,
@@ -209,6 +228,13 @@ class TrackedJob:
 
     Keys this model's over-budget fault streak per card so a model unservable on a small card can still be
     advertised and run on a larger one. None on single-GPU keeps the streak worker-wide, exactly as before."""
+    disaggregation_declined: bool = False
+    """Set when this job was pulled back out of the disaggregated pipeline to run monolithically instead.
+
+    Latched when the orchestrator re-routes a job whose disaggregated stage kept failing resource-class (device
+    out-of-memory) past the defer window. While set, the disaggregation-eligibility predicate treats the job as
+    monolithic (so it is charged its full footprint and never re-claimed into the pipeline). Cleared naturally
+    when the job leaves the tracker. See :meth:`requeue_disaggregated_for_monolithic`."""
     chain_context: ChainExecutionContext | None = None
     """The chain-stage state for this job's unit of work, or None for jobs registered outside the pop path.
 
@@ -818,6 +844,44 @@ class JobTracker:
             del self._jobs[tracked.job_id]
             return True
         return self._set_stage(tracked, JobStage.PENDING_INFERENCE)
+
+    def mark_disaggregation_decoding(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Move a disaggregated job from inference to the decoding stage, freeing its sampler slot.
+
+        Called the instant the sampler returns its latent (``SampleSliceResult``): the job leaves the
+        inference concurrency cap (``jobs_in_progress`` counts only ``INFERENCE_IN_PROGRESS``) so the freed
+        sampler is schedulable again, while the job stays tracked and in-flight through the image lane's
+        decode. Returns False if the job is not currently in ``INFERENCE_IN_PROGRESS``.
+        """
+        tracked = self._tracked_for(job)
+        if tracked is None or tracked.stage != JobStage.INFERENCE_IN_PROGRESS:
+            return False
+        return self._set_stage(tracked, JobStage.DISAGGREGATION_DECODING)
+
+    def requeue_disaggregated_for_monolithic(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Return an in-flight disaggregated job to ``PENDING_INFERENCE`` for a monolithic re-dispatch.
+
+        Called when the disaggregation orchestrator re-routes a job whose stage kept failing resource-class
+        (device out-of-memory) past the defer window: the job is still owned/tracked (its sampler pin already
+        released) and must run whole instead. Latches :attr:`TrackedJob.disaggregation_declined` so the
+        scheduler's eligibility predicate keeps it monolithic on the re-claim, then moves it back to the
+        pending-inference queue. Valid only from ``INFERENCE_IN_PROGRESS`` or ``DISAGGREGATION_DECODING``, and
+        only for a formally popped job (one with a queue position to return to); returns False otherwise.
+        """
+        tracked = self._tracked_for(job)
+        if tracked is None:
+            return False
+        if tracked.stage not in (JobStage.INFERENCE_IN_PROGRESS, JobStage.DISAGGREGATION_DECODING):
+            return False
+        if tracked.time_popped is None:
+            return False
+        tracked.disaggregation_declined = True
+        return self._set_stage(tracked, JobStage.PENDING_INFERENCE)
+
+    def is_disaggregation_declined(self, job: ImageGenerateJobPopResponse) -> bool:
+        """Whether this job was re-routed out of the disaggregated pipeline to run monolithically (a peek)."""
+        tracked = self._tracked_for(job)
+        return tracked is not None and tracked.disaggregation_declined
 
     async def drop_pending_inference(self, job: ImageGenerateJobPopResponse) -> bool:
         """Drop a job from the pending inference queue (it remains tracked, detached)."""

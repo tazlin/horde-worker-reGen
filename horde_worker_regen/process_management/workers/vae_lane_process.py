@@ -1,13 +1,14 @@
-"""The dedicated post-processing process.
+"""The dedicated VAE lane process (the disaggregated pipeline's VAE-encode/decode stage).
 
-This process keeps the post-processing models (ESRGAN upscalers, GFPGAN/CodeFormer face-fixers)
-resident and runs the post-processing phase of image jobs off the inference processes, so a job's
-upscale/face-fix does not contend for VRAM with a fresh generation on the same slot and the models
-are not reloaded per job. It also serves the graph-backed alchemy forms (upscale/facefix/
-strip_background) that would otherwise run on an inference process.
+Under pipeline disaggregation a job's source image is VAE-encoded to a start LATENT (img2img/remix
+front-end) and its sampled LATENT is VAE-decoded (and post-processed) to final images in this process,
+which loads only the VAE. VAE stages are critical-path for every disaggregated job, so they get a lane
+that post-processing work can never block, and whose co-residency charge (the tiled-decode spike) is
+honest because nothing else is resident in its context.
 
-It owns a hordelib backend (for the post-processing graphs) but never loads an image-generation
-checkpoint: its only entry points are the per-operation ``post_process`` calls.
+It owns a hordelib backend (for the VAE stages and the decode's optional post-processing graphs) but
+never loads an image-generation checkpoint: its only entry points are the per-stage ``vae_encode``/
+``decode`` calls and the post-processing graphs a decode's requested upscale/face-fix runs.
 """
 
 from __future__ import annotations
@@ -31,21 +32,23 @@ from loguru import logger
 
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
-    AlchemyFormSpec,
-    HordeAlchemyControlMessage,
-    HordeAlchemyResultMessage,
     HordeControlFlag,
     HordeControlMessage,
     HordeHeartbeatType,
     HordeImageResult,
     HordePostProcessControlMessage,
-    HordePostProcessResultMessage,
     HordeProcessState,
+    HordeVaeDecodeControlMessage,
+    HordeVaeDecodeResultMessage,
+    HordeVaeEncodeControlMessage,
+    HordeVaeEncodeResultMessage,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
-from horde_worker_regen.utils.oom_signature import is_out_of_memory_text
+from horde_worker_regen.utils.oom_signature import is_out_of_memory_text, is_resource_class_exception
 
 if TYPE_CHECKING:
+    from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
+    from horde_sdk.generation_parameters.image import ImageGenerationParameters
     from hordelib.api import HordeLib, SharedModelManager
 else:
 
@@ -74,12 +77,12 @@ def _sort_facefixers_last(post_processing: list[str]) -> list[str]:
     return sorted(post_processing, key=_key)
 
 
-class HordePostProcessProcess(HordeProcess):
-    """The dedicated post-processing process."""
+class HordeVaeLaneProcess(HordeProcess):
+    """The dedicated VAE lane: VAE-encodes/decodes disaggregated stages, loading only the VAE."""
 
     _horde: HordeLib
     _shared_model_manager: SharedModelManager
-    _dry_run_skip_post_processing: bool
+    _dry_run: bool
 
     def __init__(
         self,
@@ -90,9 +93,9 @@ class HordePostProcessProcess(HordeProcess):
         process_launch_identifier: int,
         *,
         device_index: int = 0,
-        dry_run_skip_post_processing: bool = False,
+        dry_run: bool = False,
     ) -> None:
-        """Initialise the post-processing process.
+        """Initialise the VAE lane process.
 
         Args:
             process_id (int): The ID of the process (not the OS PID).
@@ -101,8 +104,8 @@ class HordePostProcessProcess(HordeProcess):
             disk_lock (Lock): The lock used when accessing the disk.
             process_launch_identifier (int): The unique identifier for this launch.
             device_index (int, optional): The stable index of the GPU this process is pinned to. Defaults to 0.
-            dry_run_skip_post_processing (bool, optional): Skip real post-processing and echo the input
-                images back. Defaults to False.
+            dry_run (bool, optional): Skip the hordelib backend and return plausible stand-in latent/image
+                bytes (used by tests and the dry-run worker). Defaults to False.
         """
         super().__init__(
             process_id=process_id,
@@ -113,13 +116,13 @@ class HordePostProcessProcess(HordeProcess):
             device_index=device_index,
         )
 
-        self.process_type = HordeProcessType.POST_PROCESS
-        self._dry_run_skip_post_processing = dry_run_skip_post_processing
+        self.process_type = HordeProcessType.VAE_LANE
+        self._dry_run = dry_run
         # This process holds a CUDA context, so its periodic report should sample VRAM (like inference)
         # and unlike the CPU-only safety process, so the parent's per-card free-VRAM view stays fresh.
         self._periodic_report_includes_vram = True
 
-        if dry_run_skip_post_processing:
+        if dry_run:
             logger.info("Dry-run mode: skipping HordeLib/SharedModelManager initialisation")
             self._horde = None  # type: ignore[assignment]
             self._shared_model_manager = None  # type: ignore[assignment]
@@ -132,7 +135,7 @@ class HordePostProcessProcess(HordeProcess):
                 sys.exit(1)
 
             try:
-                logger.info("Initialising HordeLib for post-processing")
+                logger.info("Initialising HordeLib for the VAE lane")
                 with logger.catch(reraise=True):
                     self._horde = HordeLib(aggressive_unloading=False)
                     self._shared_model_manager = SharedModelManager(do_not_load_model_mangers=True)
@@ -151,7 +154,7 @@ class HordePostProcessProcess(HordeProcess):
                 lora_reference_backups=False,
             )
 
-        logger.info("HordePostProcessProcess initialised")
+        logger.info("HordeVaeLaneProcess initialised")
         self.send_process_state_change_message(
             process_state=HordeProcessState.WAITING_FOR_JOB,
             info="Waiting for job",
@@ -199,14 +202,14 @@ class HordePostProcessProcess(HordeProcess):
         return processed_images
 
     def _reclaim_own_vram_for_retry(self) -> None:
-        """Evict this lane's own resident post-processing models and cached pool before a retry.
+        """Evict this lane's own resident VAE/post-processing models and cached pool before a retry.
 
-        hordelib's node-level tiling has already tried to fit the chain within the currently committed
+        hordelib's node-level tiling has already tried to fit the stage within the currently committed
         VRAM, so merely emptying the cache would not free room; only unloading the lane's retained models
-        gives a retried chain a clean allocator. This recovers the case where a chain OOMs because a prior
-        chain's pool is still resident, not because the chain genuinely exceeds the card.
+        gives a retried stage a clean allocator. This recovers the case where a stage OOMs because a prior
+        stage's pool is still resident, not because the stage genuinely exceeds the card.
         """
-        if self._dry_run_skip_post_processing:
+        if self._dry_run:
             return
         self._horde.backend.free_vram()
         self.clear_gc_and_torch_cache()
@@ -225,128 +228,11 @@ class HordePostProcessProcess(HordeProcess):
             if not is_out_of_memory_text(f"{type(first_error).__name__}: {first_error}"):
                 raise
             logger.warning(
-                f"Post-processing hit CUDA out-of-memory for {context}; reclaiming lane VRAM and retrying "
+                f"VAE lane hit CUDA out-of-memory for {context}; reclaiming lane VRAM and retrying "
                 f"once before faulting: {type(first_error).__name__} {first_error}",
             )
             self._reclaim_own_vram_for_retry()
             return run()
-
-    def _run_post_processing(self, message: HordePostProcessControlMessage) -> None:
-        """Run an image job's post-processing phase and return the processed images."""
-        self.send_process_state_change_message(
-            process_state=HordeProcessState.POST_PROCESSING,
-            info=f"Post-processing job {message.job_id}",
-        )
-        self.send_memory_report_message(include_vram=True)
-
-        time_start = time.time()
-        state = GENERATION_STATE.ok
-        job_image_results: list[HordeImageResult] | None
-
-        if self._dry_run_skip_post_processing:
-            job_image_results = [HordeImageResult(image_bytes=image_bytes) for image_bytes in message.images_bytes]
-        else:
-            try:
-                job_image_results = self._run_with_oom_retry(
-                    lambda: self._post_process_all_images(message),
-                    context=f"job {message.job_id}",
-                )
-            except Exception as e:
-                logger.error(f"Post-processing failed for job {message.job_id}: {type(e).__name__} {e}")
-                state = GENERATION_STATE.faulted
-                job_image_results = None
-
-        self.process_message_queue.put(
-            HordePostProcessResultMessage(
-                process_id=self.process_id,
-                process_launch_identifier=self.process_launch_identifier,
-                info=f"Post-processing for job {message.job_id}",
-                time_elapsed=time.time() - time_start,
-                job_id=message.job_id,
-                job_image_results=job_image_results,
-                state=state,
-            ),
-        )
-
-        process_state = (
-            HordeProcessState.POST_PROCESSING_COMPLETE
-            if state == GENERATION_STATE.ok
-            else HordeProcessState.POST_PROCESSING_FAILED
-        )
-        self.send_process_state_change_message(process_state=process_state, info=f"Finished job {message.job_id}")
-        self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
-
-    def _run_alchemy_form_bytes(self, form: AlchemyFormSpec) -> bytes:
-        """Run a single graph-backed alchemy form and return its WebP-encoded result bytes.
-
-        Raises on an unknown form or a graph that yields no image, so the caller's OOM retry and fault
-        handling see a clean exception. Encoding matches the legacy alchemist (WebP quality 95) so the main
-        process can upload the result to R2 without re-encoding.
-        """
-        from hordelib.api import classify_post_processor
-
-        if classify_post_processor(form.form) is None:
-            raise ValueError(f"Unknown alchemy form for post-processing process: {form.form}")
-
-        source_image = PIL.Image.open(io.BytesIO(form.source_image_bytes))
-        result = self._horde.post_process(
-            {
-                "model": form.form,
-                "source_image": source_image,
-            },
-        )
-        if result.image is None:
-            raise RuntimeError("Alchemy form produced no image")
-
-        buffer = io.BytesIO()
-        result.image.save(buffer, format="WebP", quality=95, method=6)
-        return buffer.getvalue()
-
-    def _run_graph_alchemy(self, form: AlchemyFormSpec) -> None:
-        """Run a graph-backed alchemy form (upscale/facefix/strip_background) and report the result.
-
-        The result image is WebP-encoded (quality 95, matching the legacy alchemist) so the main process
-        can upload it to R2 without re-encoding.
-        """
-        self.send_process_state_change_message(
-            process_state=HordeProcessState.ALCHEMY_STARTING,
-            info=f"Starting alchemy form {form.form} ({form.form_id})",
-        )
-
-        time_start = time.time()
-        state = GENERATION_STATE.faulted
-        image_bytes: bytes | None = None
-
-        try:
-            image_bytes = self._run_with_oom_retry(
-                lambda: self._run_alchemy_form_bytes(form),
-                context=f"alchemy form {form.form} ({form.form_id})",
-            )
-            state = GENERATION_STATE.ok
-        except Exception as e:
-            logger.error(f"Alchemy form {form.form} ({form.form_id}) failed: {type(e).__name__} {e}")
-
-        self.process_message_queue.put(
-            HordeAlchemyResultMessage(
-                process_id=self.process_id,
-                process_launch_identifier=self.process_launch_identifier,
-                info=f"Alchemy form {form.form} ({form.form_id})",
-                time_elapsed=time.time() - time_start,
-                form_id=form.form_id,
-                form=form.form,
-                state=state,
-                image_bytes=image_bytes,
-            ),
-        )
-
-        process_state = (
-            HordeProcessState.ALCHEMY_COMPLETE if state == GENERATION_STATE.ok else HordeProcessState.ALCHEMY_FAILED
-        )
-        self.send_process_state_change_message(
-            process_state=process_state,
-            info=f"Finished alchemy form {form.form} ({form.form_id})",
-        )
-        self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
 
     @staticmethod
     def clear_gc_and_torch_cache() -> None:
@@ -358,14 +244,14 @@ class HordePostProcessProcess(HordeProcess):
 
     @logger.catch(reraise=True)
     def unload_models_from_vram(self) -> None:
-        """Unload post-processing modules from VRAM and report the refreshed memory sample."""
-        if not self._dry_run_skip_post_processing:
+        """Unload VAE/post-processing modules from VRAM and report the refreshed memory sample."""
+        if not self._dry_run:
             self._horde.backend.free_vram()
             self.clear_gc_and_torch_cache()
 
         self.send_process_state_change_message(
             process_state=HordeProcessState.UNLOADED_MODEL_FROM_VRAM,
-            info="Unloaded post-processing models from VRAM",
+            info="Unloaded VAE lane models from VRAM",
         )
         self.send_memory_report_message(include_vram=True)
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
@@ -375,28 +261,145 @@ class HordePostProcessProcess(HordeProcess):
         """Release the torch allocator's cached free blocks without unloading models, then report memory.
 
         Empties the caching allocator's reserved-but-unused device blocks so the reservation returns to
-        the card while the resident post-processing modules stay loaded, then reports the refreshed memory
-        sample. Deliberately emits no model state change: nothing was unloaded.
+        the card while the resident VAE/post-processing modules stay loaded, then reports the refreshed
+        memory sample. Deliberately emits no model state change: nothing was unloaded.
         """
         logger.debug("Releasing allocator cache (resident modules stay loaded)")
-        if not self._dry_run_skip_post_processing:
+        if not self._dry_run:
             self.clear_gc_and_torch_cache()
         self.send_memory_report_message(include_vram=True)
 
     @logger.catch(reraise=True)
     def unload_models_from_ram(self) -> None:
-        """Unload post-processing modules from RAM/VRAM and report the refreshed memory sample."""
-        if not self._dry_run_skip_post_processing:
+        """Unload VAE/post-processing modules from RAM/VRAM and report the refreshed memory sample."""
+        if not self._dry_run:
             self._horde.backend.free_ram()
             self.clear_gc_and_torch_cache()
 
         self.send_process_state_change_message(
             process_state=HordeProcessState.UNLOADED_MODEL_FROM_RAM,
-            info="Unloaded post-processing models from RAM",
+            info="Unloaded VAE lane models from RAM",
         )
         self.send_memory_report_message(include_vram=True)
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
 
+    def _job_generation_parameters(
+        self,
+        sdk_api_job_info: ImageGenerateJobPopResponse,
+    ) -> ImageGenerationParameters:
+        """Convert an API job into hordelib generation parameters (shared by the VAE stages)."""
+        from horde_sdk.worker.dispatch.ai_horde.image.convert import (
+            convert_image_job_pop_response_to_parameters,
+        )
+
+        from horde_worker_regen.reference_helper import ensure_offline_reference_manager
+
+        return convert_image_job_pop_response_to_parameters(
+            api_response=sdk_api_job_info,
+            model_reference_manager=ensure_offline_reference_manager(),
+        ).generation_parameters
+
+    def _run_vae_encode(self, message: HordeVaeEncodeControlMessage) -> None:
+        """VAE-encode a job's source image to a LATENT (img2img/remix front-end), loading only the VAE."""
+        self.send_process_state_change_message(HordeProcessState.POST_PROCESSING, info=f"VAE-encode {message.job_id}")
+        time_start = time.time()
+        state = GENERATION_STATE.ok
+        fault_is_resource_class = False
+        fault_reason: str | None = None
+        latent_bytes: bytes | None = None
+        try:
+            if self._dry_run:
+                # No backend in dry-run: return an opaque LATENT stand-in. Nothing deserializes it (a
+                # dry-run sampler skips sampling entirely), so the fake pipeline still flows end to end.
+                latent_bytes = b"dry-run-source-latent"
+            else:
+                params = self._job_generation_parameters(message.sdk_api_job_info)
+                latent_bytes = self._run_with_oom_retry(
+                    lambda: self._horde.vae_encode_stage(params),
+                    context=f"vae-encode job {message.job_id}",
+                )
+        except Exception as e:  # noqa: BLE001 - a stage fault is reported, never crashes the lane
+            logger.error(f"VAE-encode failed for job {message.job_id}: {type(e).__name__} {e}")
+            state = GENERATION_STATE.faulted
+            fault_is_resource_class = is_resource_class_exception(e)
+            fault_reason = f"{type(e).__name__}: {e}"
+
+        self.process_message_queue.put(
+            HordeVaeEncodeResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"VAE-encode for job {message.job_id}",
+                time_elapsed=time.time() - time_start,
+                job_id=message.job_id,
+                latent_bytes=latent_bytes,
+                state=state,
+                fault_is_resource_class=fault_is_resource_class,
+                fault_reason=fault_reason,
+            ),
+        )
+        self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
+
+    def _run_vae_decode(self, message: HordeVaeDecodeControlMessage) -> None:
+        """Decode a LATENT to images (loading only the VAE), then run any requested post-processing."""
+        self.send_process_state_change_message(HordeProcessState.POST_PROCESSING, info=f"VAE-decode {message.job_id}")
+        time_start = time.time()
+        state = GENERATION_STATE.ok
+        fault_is_resource_class = False
+        fault_reason: str | None = None
+        job_image_results: list[HordeImageResult] | None = None
+        try:
+            if self._dry_run:
+                # No backend in dry-run: synthesize one valid PNG per requested iteration so the fake
+                # pipeline hands real image bytes to the downstream safety/submit flow.
+                from horde_worker_regen.process_management.simulation._dummy_images import make_dummy_png_bytes
+
+                n_iter = message.sdk_api_job_info.payload.n_iter or 1
+                job_image_results = [HordeImageResult(image_bytes=make_dummy_png_bytes()) for _ in range(n_iter)]
+            else:
+                params = self._job_generation_parameters(message.sdk_api_job_info)
+
+                def _decode_and_pp() -> list[HordeImageResult]:
+                    results, _faults = self._horde.decode_stage(params, latent_bytes=message.latent_bytes)
+                    images = [
+                        HordeImageResult(image_bytes=r.rawpng.getvalue(), generation_faults=r.faults)
+                        for r in results
+                        if r.rawpng is not None
+                    ]
+                    if message.post_processing:
+                        pp_message = HordePostProcessControlMessage(
+                            job_id=message.job_id,
+                            images_bytes=[image_result.image_bytes for image_result in images],
+                            post_processing=message.post_processing,
+                        )
+                        return self._post_process_all_images(pp_message)
+                    return images
+
+                job_image_results = self._run_with_oom_retry(
+                    _decode_and_pp,
+                    context=f"vae-decode job {message.job_id}",
+                )
+        except Exception as e:  # noqa: BLE001 - a stage fault is reported, never crashes the lane
+            logger.error(f"VAE-decode failed for job {message.job_id}: {type(e).__name__} {e}")
+            state = GENERATION_STATE.faulted
+            fault_is_resource_class = is_resource_class_exception(e)
+            fault_reason = f"{type(e).__name__}: {e}"
+
+        self.process_message_queue.put(
+            HordeVaeDecodeResultMessage(
+                process_id=self.process_id,
+                process_launch_identifier=self.process_launch_identifier,
+                info=f"VAE-decode for job {message.job_id}",
+                time_elapsed=time.time() - time_start,
+                job_id=message.job_id,
+                job_image_results=job_image_results,
+                state=state,
+                fault_is_resource_class=fault_is_resource_class,
+                fault_reason=fault_reason,
+            ),
+        )
+        self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
+
+    @override
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
         if message.control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
             self.unload_models_from_vram()
@@ -410,38 +413,19 @@ class HordePostProcessProcess(HordeProcess):
             self.release_allocator_cache()
             return
 
-        if isinstance(message, HordePostProcessControlMessage):
-            if message.control_flag != HordeControlFlag.START_POST_PROCESS:
-                raise ValueError(f"Expected {HordeControlFlag.START_POST_PROCESS}, got {message.control_flag}")
-            self._run_post_processing(message)
+        if isinstance(message, HordeVaeEncodeControlMessage):
+            self._run_vae_encode(message)
             return
 
-        if isinstance(message, HordeAlchemyControlMessage):
-            if message.control_flag != HordeControlFlag.START_ALCHEMY:
-                raise ValueError(f"Expected {HordeControlFlag.START_ALCHEMY}, got {message.control_flag}")
-            if self._dry_run_skip_post_processing:
-                self.process_message_queue.put(
-                    HordeAlchemyResultMessage(
-                        process_id=self.process_id,
-                        process_launch_identifier=self.process_launch_identifier,
-                        info="Dry-run alchemy form",
-                        time_elapsed=0.0,
-                        form_id=message.form.form_id,
-                        form=message.form.form,
-                        state=GENERATION_STATE.ok,
-                        image_bytes=message.form.source_image_bytes,
-                    ),
-                )
-                self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
-                return
-            self._run_graph_alchemy(message.form)
+        if isinstance(message, HordeVaeDecodeControlMessage):
+            self._run_vae_decode(message)
             return
 
-        raise TypeError(f"Expected a post-process or alchemy control message, got {type(message)}")
+        raise TypeError(f"Expected a VAE encode/decode control message, got {type(message)}")
 
     @override
     def cleanup_for_exit(self) -> None:
-        if not self._dry_run_skip_post_processing:
+        if not self._dry_run:
             self._horde.backend.free_ram()
             self.clear_gc_and_torch_cache()
         return

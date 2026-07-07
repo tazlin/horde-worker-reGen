@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeAuxModelStateChangeMessage,
     HordeDownloadAvailabilityMessage,
     HordeDownloadMetricsMessage,
+    HordeHeartbeatType,
     HordeInferenceResultMessage,
     HordeJobMetricsMessage,
     HordeModelStateChangeMessage,
@@ -32,16 +34,27 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
     HordeProcessStateChangeMessage,
     HordeSafetyResultMessage,
+    HordeSampleResultMessage,
+    HordeTextEncodeResultMessage,
+    HordeVaeDecodeResultMessage,
+    HordeVaeEncodeResultMessage,
     ModelLoadState,
 )
 from horde_worker_regen.process_management.jobs.failure_classification import is_resource_failure
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.jobs.job_tracker import InferenceFailureResolution, JobTracker
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    FootprintKey,
+    FootprintStage,
+    LearnedFootprintStore,
+    ResolutionBucket,
+)
 from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
 from horde_worker_regen.process_management.workers.download_process import DOWNLOAD_PROCESS_ID
 from horde_worker_regen.telemetry_spans import (
@@ -52,6 +65,14 @@ from horde_worker_regen.telemetry_spans import (
 )
 
 _excludes_for_job_dump = {"source_image", "source_mask", "extra_source_images", "r2_upload"}
+
+_STAGE_RESULT_MESSAGE_TYPES = (
+    HordeTextEncodeResultMessage,
+    HordeSampleResultMessage,
+    HordeVaeEncodeResultMessage,
+    HordeVaeDecodeResultMessage,
+)
+"""The disaggregated-stage result messages routed to the orchestrator's stage-result handler."""
 
 _INFERENCE_ACTIVE_STATES = frozenset(
     {
@@ -129,6 +150,15 @@ class MessageDispatcher:
     _on_download_availability: Callable[[HordeDownloadAvailabilityMessage], None] | None = None
     _on_model_load_failure: Callable[[int, str], None] | None = None
     """Invoked as ``(process_id, horde_model_name)`` when a child reports it failed to load a model."""
+    _on_inference_step: Callable[[int], None] | None = None
+    """Invoked as ``(process_id)`` on each INFERENCE_STEP heartbeat, so the parent's per-step floor can grade
+    the slot's sampling pace. Registered by the parent; None leaves the detector idle (standalone tests)."""
+    _on_stage_result: Callable[[HordeProcessMessage], Awaitable[None]] | None = None
+    """Invoked with a disaggregated-stage result (text-encode/sample/vae-encode/vae-decode), registered
+    by the parent's disaggregation orchestrator; it dispatches by concrete message type."""
+    _footprint_store: LearnedFootprintStore | None = None
+    """Optional learned-footprint store observed on each memory report. Shadow-only: peaks are recorded
+    but feed no decision. None (the default) disables observation entirely."""
 
     _last_deadlock_detected_time: float = 0.0
     _in_deadlock: bool = False
@@ -218,6 +248,14 @@ class MessageDispatcher:
         """Register the callback invoked when a child process reports an alchemy form result."""
         self._on_alchemy_result = handler
 
+    def set_stage_result_handler(self, handler: Callable[[HordeProcessMessage], Awaitable[None]]) -> None:
+        """Register the callback invoked when a disaggregated stage reports its result.
+
+        Receives any of the stage result messages (text-encode/sample/vae-encode/vae-decode); the
+        registered orchestrator dispatches by concrete type and advances the job's DAG.
+        """
+        self._on_stage_result = handler
+
     def set_metrics_handlers(
         self,
         *,
@@ -242,6 +280,21 @@ class MessageDispatcher:
         quarantine a deterministically-unloadable model instead of churning the process pool.
         """
         self._on_model_load_failure = handler
+
+    def set_inference_step_observer(self, handler: Callable[[int], None]) -> None:
+        """Register the callback invoked with ``(process_id)`` on each INFERENCE_STEP heartbeat.
+
+        Lets the parent's per-step floor grade a slot's sampling pace beat by beat, off the child hot path.
+        """
+        self._on_inference_step = handler
+
+    def set_footprint_store(self, store: LearnedFootprintStore) -> None:
+        """Register the learned-footprint store to observe measured peaks into (shadow-only).
+
+        Once set, each memory report cleanly attributable to a running inference job records its peak
+        into the store. The store feeds no decision path; this is measurement for the future arbiter.
+        """
+        self._footprint_store = store
 
     async def receive_and_handle_process_messages(self) -> None:
         """Receive and handle any messages from the child processes."""
@@ -300,6 +353,15 @@ class MessageDispatcher:
                 )
                 continue
 
+            # Adopt the child's self-reported pid (the real interpreter's os.getpid()) as the authoritative
+            # os_pid, overriding the parent's spawn-handle guess, so per-PID telemetry addresses the process
+            # that actually holds the GPU context even when a launcher stub sits between them. An older child
+            # that does not carry the field reports None and keeps the handle-derived value.
+            self._process_map.reconcile_reported_os_pid(
+                message.process_id,
+                getattr(message, "reported_os_pid", None),
+            )
+
             if isinstance(message, HordeProcessHeartbeatMessage):
                 self._handle_heartbeat(message)
             else:
@@ -347,6 +409,12 @@ class MessageDispatcher:
                     self._on_alchemy_result(message)
                 else:
                     logger.error(f"Received alchemy result with no handler registered: {message.form_id}")
+            elif isinstance(message, _STAGE_RESULT_MESSAGE_TYPES):
+                self._record_completed_job(message.process_id)
+                if self._on_stage_result is not None:
+                    await self._on_stage_result(message)
+                else:
+                    logger.error(f"Received {type(message).__name__} with no stage-result handler registered")
 
     def _should_ignore_retired_launch_message(self, message: HordeProcessMessage) -> bool:
         """Return true when a message belongs to an intentionally retired launch."""
@@ -364,6 +432,7 @@ class MessageDispatcher:
                 HordeSafetyResultMessage,
                 HordeAlchemyResultMessage,
                 HordePostProcessResultMessage,
+                *_STAGE_RESULT_MESSAGE_TYPES,
             ),
         ):
             logger.warning(
@@ -433,6 +502,11 @@ class MessageDispatcher:
             nonadvancing_step_repeats=message.nonadvancing_step_repeats,
         )
 
+        # Grade the slot's sampling pace beat by beat (the per-step floor). Runs after on_heartbeat so the
+        # freshly-updated inter-beat delta and step count are what the detector reads.
+        if message.heartbeat_type == HordeHeartbeatType.INFERENCE_STEP and self._on_inference_step is not None:
+            self._on_inference_step(message.process_id)
+
         in_progress_job_info = self._process_map[message.process_id].last_job_referenced
 
         if message.process_warning is not None and (
@@ -459,7 +533,64 @@ class MessageDispatcher:
             total_vram_mb=message.vram_total_mb,
             open_fds=message.open_fds,
             fd_soft_limit=message.fd_soft_limit,
+            process_reserved_mb=message.process_reserved_mb,
+            process_allocated_mb=message.process_allocated_mb,
+            process_peak_reserved_mb=message.process_peak_reserved_mb,
+            process_aimdo_mb=message.process_aimdo_mb,
+            report_sampled_at=message.sampled_at,
         )
+        self._observe_footprint_peak(message)
+
+    def _observe_footprint_peak(self, message: HordeProcessMemoryMessage) -> None:
+        """Record a reported VRAM peak into the learned-footprint store, if cleanly attributable.
+
+        The measured peaks recorded here raise admission pricing of sampling work (the scheduler reads the
+        same store when pricing a job's sampling peak). Only the unambiguous case is wired here: a monolithic
+        inference process whose single tracked job is genuinely in progress, whose model baseline is known, and
+        whose peak reading is positive. The disaggregated case is observed by the orchestrator, not here.
+        Such a report's peak is attributed to the SAMPLE stage (the dominant activation term of a whole
+        monolithic job). Reports from the disaggregated lanes (VAE/text-encode/post-process), from idle or
+        between-job inference slots, or with an unknown baseline are left unattributed rather than guessed:
+        the parent cannot reliably bind those peaks to one stage/job at this seam.
+        """
+        store = self._footprint_store
+        if store is None:
+            return
+
+        peak_mb = message.process_peak_reserved_mb
+        if peak_mb is None or peak_mb <= 0:
+            return
+
+        process_info = self._process_map.get(message.process_id)
+        if process_info is None or process_info.process_type is not HordeProcessType.INFERENCE:
+            return
+
+        model_name = process_info.loaded_horde_model_name
+        job = process_info.last_job_referenced
+        if model_name is None or job is None:
+            return
+
+        # Bind the peak to a genuinely-running job: the slot's referenced job must be in progress, which
+        # ties the peak-since-last-report to that job's sampling rather than to a merely-preloaded slot.
+        if job not in self._job_tracker.jobs_in_progress:
+            return
+
+        baseline = self._model_metadata.get_baseline(model_name)
+        if baseline is None:
+            return
+
+        width = job.payload.width
+        height = job.payload.height
+        if width is None or height is None:
+            return
+
+        key = FootprintKey(
+            model_baseline=str(baseline),
+            resolution_bucket=ResolutionBucket.from_dimensions(width, height, job.payload.n_iter or 1),
+            platform=sys.platform,
+            stage=FootprintStage.SAMPLE,
+        )
+        store.observe_peak(key, float(peak_mb))
 
     def _handle_process_state_change(self, message: HordeProcessStateChangeMessage) -> None:
         """Handle a process state change message."""
@@ -511,21 +642,7 @@ class MessageDispatcher:
             self._state.torch_build_cpu_only_reason = message.info
 
         if message.process_state == HordeProcessState.INFERENCE_STARTING:
-            loaded_model_name = self._process_map[message.process_id].loaded_horde_model_name
-            if loaded_model_name is None:
-                raise ValueError(
-                    f"Process {message.process_id} has no model loaded, but is starting inference",
-                )
-            batch_amount = self._process_map[message.process_id].batch_amount
-            if batch_amount is None:
-                raise ValueError(
-                    f"Process {message.process_id} has batch_amount, but is starting inference",
-                )
-            self._horde_model_map.update_entry(
-                horde_model_name=loaded_model_name,
-                load_state=ModelLoadState.IN_USE,
-                process_id=message.process_id,
-            )
+            self._handle_inference_starting(message.process_id)
 
         if (
             message.process_state == HordeProcessState.UNLOADED_MODEL_FROM_RAM
@@ -538,6 +655,39 @@ class MessageDispatcher:
 
         if message.process_state == HordeProcessState.WAITING_FOR_JOB:
             self._reap_lost_inference_result(message.process_id, previous_state=previous_state)
+
+    def _handle_inference_starting(self, process_id: int) -> None:
+        """Apply the whole-job inference bookkeeping when an INFERENCE process reports it is sampling.
+
+        The parent-tracked model residency and batch invariant belong to whole-job inference on an INFERENCE
+        process. The disaggregated stage lanes reuse busy states to mark themselves working (the encode
+        service reports ``INFERENCE_STARTING``, the image lane ``POST_PROCESSING``) but hold no parent-tracked
+        model on that process, so they carry none of this bookkeeping; applying it would fault on their absent
+        model. A disaggregated sample stage runs on an INFERENCE process and keeps the loaded-model invariant
+        (its UNet is resident), but it batches per-slice and reports no matching model-load transition to flip
+        an ``IN_USE`` mark back, so the whole-job batch guard and the model-map ``IN_USE`` update (which assume
+        a whole job) are skipped for a pinned sampler. The reservation is that sampler's marker and is still
+        held when it reports ``INFERENCE_STARTING`` (it is released only on the sample result).
+        """
+        process_info = self._process_map[process_id]
+        if process_info.process_type != HordeProcessType.INFERENCE:
+            return
+        loaded_model_name = process_info.loaded_horde_model_name
+        if loaded_model_name is None:
+            raise ValueError(
+                f"Process {process_id} has no model loaded, but is starting inference",
+            )
+        if self._process_map.is_reserved_for_disaggregation(process_id):
+            return
+        if process_info.batch_amount is None:
+            raise ValueError(
+                f"Process {process_id} is starting inference without a batch amount",
+            )
+        self._horde_model_map.update_entry(
+            horde_model_name=loaded_model_name,
+            load_state=ModelLoadState.IN_USE,
+            process_id=process_id,
+        )
 
     def _reap_lost_inference_result(self, process_id: int, *, previous_state: HordeProcessState) -> None:
         """Release a job left in progress after its slot returned to idle without a result.
@@ -566,6 +716,12 @@ class MessageDispatcher:
             return
         process_info = self._process_map.get(process_id)
         if process_info is None:
+            return
+        # Only a whole-job INFERENCE slot can lose an inference result here. A disaggregated stage lane
+        # (the encode service reports INFERENCE_STARTING, then WAITING_FOR_JOB) would otherwise trip this
+        # inference-active-to-idle check though it holds no whole-job result; the orchestrator owns its
+        # stage results, so this reap does not apply to it.
+        if process_info.process_type != HordeProcessType.INFERENCE:
             return
         job = process_info.last_job_referenced
         if job is None or job not in self._job_tracker.jobs_in_progress:
@@ -674,6 +830,10 @@ class MessageDispatcher:
                 or message.horde_model_state == ModelLoadState.LOADED_IN_RAM
             ):
                 if message.horde_model_state == ModelLoadState.LOADED_IN_VRAM:
+                    # Stamp the VRAM-materialization time so the reclaim ladder can rank this idle resident by
+                    # recency (LIFO): the driver demotes the least-recently-touched allocator, so the newest
+                    # resident is reclaimed first.
+                    self._process_map.note_vram_materialized(message.process_id)
                     loaded_message = (
                         f"Process {message.process_id} just finished inference, and has "
                         f"{message.horde_model_name} in VRAM."
@@ -695,8 +855,31 @@ class MessageDispatcher:
                 f"<fg #7b7d7d>Process {message.process_id} unloaded model {message.horde_model_name}</>",
             )
 
-    async def _handle_inference_result(self, message: HordeInferenceResultMessage) -> None:
-        """Handle an inference job result message."""
+    async def handle_synthetic_inference_result(self, message: HordeInferenceResultMessage) -> None:
+        """Route a parent-synthesized inference result through the same completion path as a child's.
+
+        The disaggregation orchestrator assembles a :class:`HordeInferenceResultMessage` from a job whose
+        stages ran across the encode service, samplers, and image lane, then hands it here so its images (or
+        its fault) flow into the identical safety/submit path a monolithic child result takes. The images are
+        already VAE-decoded and post-processed by the image lane's decode stage, so the post-processing lane
+        is bypassed (``post_processing_already_applied``): re-queuing for post-processing would run the
+        upscaler/face-fixer a second time on an already-processed image.
+        """
+        await self._handle_inference_result(message, post_processing_already_applied=True)
+
+    async def _handle_inference_result(
+        self,
+        message: HordeInferenceResultMessage,
+        *,
+        post_processing_already_applied: bool = False,
+    ) -> None:
+        """Handle an inference job result message.
+
+        ``post_processing_already_applied`` is set for a parent-synthesized disaggregated completion whose
+        images the image lane already post-processed: the in-progress release tolerates the job's
+        disaggregation-decoding stage (it never sat in ``INFERENCE_IN_PROGRESS`` at completion), and the
+        post-processing lane is bypassed so the images route straight to safety.
+        """
         # A result (success, fault, or even one for a job we no longer track) means the slot is no longer
         # sampling, so retire its in-flight timestamps first: before the graded-slowdown monitor can read
         # them against a finished job, and before any early-return below. A dropped result (job gone from
@@ -730,7 +913,11 @@ class MessageDispatcher:
             await self._handle_faulted_inference_result(message, job_info)
             return
 
-        if not await self._job_tracker.release_in_progress(message.sdk_api_job_info):
+        released = await self._job_tracker.release_in_progress(message.sdk_api_job_info)
+        # A disaggregated completion never sits in INFERENCE_IN_PROGRESS at this point: the sampler slot was
+        # released (and the job moved to the disaggregation-decoding stage) the moment sampling finished, so a
+        # failed release is expected there and not an error.
+        if not released and not post_processing_already_applied:
             logger.error(
                 f"Job {message.sdk_api_job_info.id_} not found in jobs_in_progress. "
                 "Did it fault? "
@@ -770,7 +957,7 @@ class MessageDispatcher:
         jobs_completed_counter.add(1)
 
         requested_post_processing = job_info.sdk_api_job_info.payload.post_processing
-        if requested_post_processing:
+        if requested_post_processing and not post_processing_already_applied:
             if self._runtime_config.bridge_data.post_processing_lane_enabled:
                 await self._job_tracker.queue_for_post_processing(job_info)
                 return
