@@ -43,6 +43,10 @@ _HANG_DETECT_TIMEOUT_SECONDS = 45.0 * _SPAWN_SLOWDOWN
 _SAVE_OUR_SHIP_TIMEOUT_SECONDS = 60.0 * _SPAWN_SLOWDOWN
 
 
+# Every scenario spawns real OS child processes through the harness, so the module is opt-in via -m slow.
+pytestmark = pytest.mark.slow
+
+
 @pytest.mark.e2e
 async def test_oom_fault_is_retried_and_pipeline_continues() -> None:
     """A one-off out-of-memory fault must be given a degraded retry (not lost) and the pipeline must flow.

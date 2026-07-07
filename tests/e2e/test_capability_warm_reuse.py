@@ -23,6 +23,11 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+# The warm session boots a real worker and spawns real OS child processes, so the module is opt-in via
+# -m slow.
+pytestmark = pytest.mark.slow
+
+
 @pytest.mark.e2e
 async def test_warm_session_runs_probes_without_per_check_rampup(
     record_probe_timing: Callable[[str, str], None],

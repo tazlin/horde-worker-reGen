@@ -319,6 +319,11 @@ def _assert_clean_canary_result(
         assert "FINALIZED" in record.stage_timestamps
 
 
+# Each case boots a real worker manager and spawns real OS child processes through the harness, so the whole
+# module is opt-in via -m slow (skipped in a default sweep).
+pytestmark = pytest.mark.slow
+
+
 @pytest.mark.e2e
 @pytest.mark.parametrize("case_name", sorted(_CANARY_CASES))
 async def test_representative_worker_lifecycle_canaries(case_name: str) -> None:

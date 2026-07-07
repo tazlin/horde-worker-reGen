@@ -67,6 +67,10 @@ def _seed_ledger(manager: multiprocessing.managers.SyncManager, total_mb: float)
     return ledger
 
 
+# Every scenario spawns real OS child processes through the harness, so the module is opt-in via -m slow.
+pytestmark = pytest.mark.slow
+
+
 @pytest.mark.e2e
 async def test_post_processing_ages_out_to_fault_on_overcommitted_card() -> None:
     """With the budget gate on, the unfittable chain is never dispatched; it is faulted without images.

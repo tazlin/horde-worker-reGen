@@ -61,5 +61,9 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
-      - name: Run unit tests
+      # The default sweep skips the opt-in `slow` band (real subprocess spawns) so it stays fast; the
+      # separate step below runs that band so CI coverage of the full-lifecycle tests is not lost.
+      - name: Run unit tests (fast sweep)
         run: uv run pytest
+      - name: Run slow tests (real subprocess spawns)
+        run: uv run pytest -m slow

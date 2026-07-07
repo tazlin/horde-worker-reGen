@@ -140,6 +140,7 @@ dev = [
     "types-regex",
     "tach>=0.34.0",
     "debugpy>=1.8.21",
+    "pytest-timeout>=2.4.0",
 ]
 
 docs = [
@@ -272,6 +273,10 @@ convention = "google"
 addopts = "-p pytest_asyncio"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# Per-test ceiling (pytest-timeout), far above any legitimate test: a test that spawns real child
+# processes can otherwise deadlock and pin the whole suite indefinitely. On trip it dumps all thread
+# tracebacks, converting a silent hang into a named, diagnosable failure.
+timeout = 900
 # Scope collection to our own tests. A bare `pytest` from the repo root would
 # otherwise recurse into vendored dirs (e.g. the uv cache, now in the peered
 # <worker>-data sibling, or .venv) and try to import the bundled test suites of
@@ -281,5 +286,6 @@ testpaths = ["tests"]
 norecursedirs = ["bin", ".venv", "build", "dist", "*.egg-info"]
 markers = [
     "e2e: full-lifecycle tests that spawn real child processes (slower than unit tests)",
-    "gpu: needs a real CUDA/accelerator device; auto-skipped when none is present (so CI stays GPU-free)",
+    "gpu: needs a real CUDA/accelerator device and boots real workers (minutes each); opt-in via -m gpu, skipped otherwise, and skipped even then when no device is present",
+    "slow: spawns real OS subprocesses or runs multi-second workloads; opt-in via -m slow, skipped otherwise so a default `pytest` sweep stays fast",
 ]

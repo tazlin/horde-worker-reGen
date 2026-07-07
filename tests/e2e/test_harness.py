@@ -21,6 +21,9 @@ from horde_worker_regen.process_management.simulation._canned_scenarios import (
     make_simple_scenario,
 )
 
+# Every scenario spawns real OS child processes through the harness, so the module is opt-in via -m slow.
+pytestmark = pytest.mark.slow
+
 
 @pytest.mark.e2e
 async def test_full_lifecycle_fake_processes_no_api() -> None:

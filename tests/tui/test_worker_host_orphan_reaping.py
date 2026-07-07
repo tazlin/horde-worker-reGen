@@ -26,6 +26,10 @@ import pytest
 from horde_worker_regen.process_management.lifecycle.owned_process_registry import OwnedProcessRegistry
 from tests.tui import _host_stop_workers
 
+# These spawn real OS process trees (a host, its worker, and a grandchild) to assert OS-level reaping, so
+# the module is opt-in via -m slow (skipped in a default sweep).
+pytestmark = pytest.mark.slow
+
 
 def _wait_for(predicate: Callable[[], bool], *, timeout: float = 20.0, interval: float = 0.1) -> bool:
     """Poll ``predicate`` until it is true or the timeout elapses; returns whether it became true."""

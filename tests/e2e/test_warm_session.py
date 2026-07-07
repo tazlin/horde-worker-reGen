@@ -7,7 +7,9 @@ import pytest
 from horde_worker_regen.harness import WarmHarnessSession
 from horde_worker_regen.process_management.simulation._canned_scenarios import make_alchemy_scenario, make_canned_job
 
-pytestmark = pytest.mark.e2e
+# Each test boots a real worker reused across levels, spawning real OS child processes, so the module is
+# opt-in via -m slow.
+pytestmark = [pytest.mark.e2e, pytest.mark.slow]
 
 
 async def test_warm_session_reuses_one_worker_across_levels() -> None:

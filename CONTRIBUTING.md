@@ -21,6 +21,13 @@
 
 * See the [haidra python style guide](docs/haidra-assets/docs/meta/python.md) for more details on code style and best practices.
 
+## Testing
+
+* Run the suite with `uv run pytest`. The default sweep is fast because two bands are **opt-in** and skipped unless you ask for them:
+    * `-m slow` runs the tests that spawn real OS subprocesses (the end-to-end worker-lifecycle family) or take multiple seconds. Run this before pushing a change that touches the worker lifecycle.
+    * `-m gpu` runs the tests that need a real accelerator; they auto-skip when no CUDA device is present.
+* `-m "slow or gpu"` runs both opt-in bands at once. CI runs the fast sweep and the `slow` band as separate steps, so the full-lifecycle coverage is exercised on every push.
+
 ## Pull Requests
 
 * We welcome community contributions to horde_worker_reGen! If you have an idea for a new feature, bug fix, or improvement, please feel free to submit a pull request.

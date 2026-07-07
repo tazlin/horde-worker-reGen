@@ -113,18 +113,30 @@ uv run pyrefly check
 prek run --all-files
 
 # Tests
-uv run pytest                       # full suite (asyncio_mode = auto)
-uv run pytest -m "not e2e"          # skip the slower full-lifecycle tests
+uv run pytest                       # default sweep: fast; the opt-in `slow` and `gpu` bands are skipped
+uv run pytest -m slow               # the slow band: real subprocess spawns / multi-second workloads
+uv run pytest -m "slow or gpu"      # both opt-in bands at once (gpu still needs a real device)
 uv run pytest tests/process_management/
 ```
 
 - Tests live in `tests/`. `tests/process_management/` is grouped by process-manager subsystem and builds a testable manager via
   `make_testable_process_manager()`; `tests/e2e/` exercises the dry-run/fake flow end to end (marked
   `e2e`). `tests/process_management/testing/test_chaos.py` drives the fault-injection harness.
+- **Marker contract.** Two bands are opt-in and skipped by a bare `pytest` so the default sweep finishes in
+  minutes rather than tens of minutes:
+    - `@pytest.mark.slow`: the test spawns real OS subprocesses (the `tests/e2e` harness family, the tui
+      worker-host/launcher tests that boot a real worker) or runs a multi-second workload. On Windows each
+      spawned child pays a full process spawn plus package import, which is what makes the band expensive.
+      Run it with `-m slow`. CI runs it as a dedicated step so its coverage is not lost.
+    - `@pytest.mark.gpu`: the test needs a real accelerator and boots real workers (minutes each). Run it
+      with `-m gpu`; even then it **auto-skips** when no CUDA device is present, so CI and GPU-less dev boxes
+      stay green.
+  - Both bands skip only when the `-m` expression does not name them, so `-m "not slow"` and `-m slow`
+    both behave as written. The day-to-day flow is: bare `pytest` while iterating, `-m slow` before pushing
+    a change that touches the worker lifecycle, `-m gpu` on a GPU box.
 - Most pipeline tests run **without a GPU or network** using dry-run mode (`CannedJobSource` +
   `fake_worker_processes`); see [Architecture → Dry-run mode](docs/explanation/architecture.md#dry-run-mode)
-  and `harness.py`. The few tests that need a real accelerator are marked `@pytest.mark.gpu` and
-  **auto-skip** at collection time when no CUDA device is present, so CI and GPU-less dev boxes stay green.
+  and `harness.py`.
 - `AI_HORDE_TESTING=1` is read at runtime to suppress side effects (e.g. action-ledger file mirroring)
   during tests/harness runs.
 - `prek` (not `pre-commit`) runs the hooks; the pinned `ruff`/`pyrefly` versions in

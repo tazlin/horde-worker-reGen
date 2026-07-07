@@ -98,6 +98,7 @@ _ORDER_PHASES_LAST: tuple[_OrderPhase, ...] = (
     _OrderPhase("analysis", packages=frozenset({"analysis"})),
     _OrderPhase("benchmark", packages=frozenset({"benchmark"})),
     _OrderPhase("e2e", markers=frozenset({"e2e"}), packages=frozenset({"e2e"})),
+    _OrderPhase("slow", markers=frozenset({"slow"})),
     _OrderPhase("gpu", markers=frozenset({"gpu"})),
 )
 
@@ -148,18 +149,44 @@ def _run_order_rank(item: pytest.Item) -> int:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip ``gpu``-marked tests when no CUDA device is present and sort tests fastest-first.
+    """Skip ``gpu``- and ``slow``-marked tests unless explicitly requested, and sort tests fastest-first.
 
-    GPU tests should only run if its possible (torch on the box) *or* if the user has explicitly requested it
-    (e.g. via `pytest -m gpu`). The run order is defined by ``_ORDER_PHASES_FIRST`` / ``_ORDER_PHASES_LAST``;
-    the sort is stable, so tests sharing a phase keep their collection order (siblings in a namespace stay
-    together).
+    GPU tests are opt-in on every box: each boots real worker processes with multi-minute warm-ups, so a bare
+    ``pytest`` run must never pay for them implicitly just because a CUDA device happens to be present. They
+    run only when the ``-m`` expression names ``gpu``, and even then a box with no CUDA device skips them
+    rather than failing at device initialisation.
+
+    ``slow`` tests follow the same opt-in contract for the same reason: each spawns real OS subprocesses (or
+    runs a multi-second workload), which on Windows pays a full per-child spawn and package import. A default
+    ``pytest`` sweep therefore skips them and finishes in minutes; ``-m slow`` runs them (and ``-m "slow or
+    gpu"`` runs both bands). Naming a marker in the ``-m`` expression, even negated as in ``-m "not slow"``,
+    leaves that band to pytest's own marker filtering rather than this blanket skip.
+
+    The run order is defined by ``_ORDER_PHASES_FIRST`` / ``_ORDER_PHASES_LAST``; the sort is stable, so tests
+    sharing a phase keep their collection order (siblings in a namespace stay together).
     """
-    if not _cuda_device_present() and "gpu" not in (config.getoption("-m") or ""):
+    m_expression = config.getoption("-m") or ""
+
+    if "gpu" not in m_expression:
+        skip_gpu = pytest.mark.skip(
+            reason="gpu tests are opt-in: request them with -m gpu (real worker boots, minutes each)",
+        )
+        for item in items:
+            if item.get_closest_marker("gpu"):
+                item.add_marker(skip_gpu)
+    elif not _cuda_device_present():
         skip_gpu = pytest.mark.skip(reason="no CUDA device available (run on a GPU box to exercise @pytest.mark.gpu)")
         for item in items:
             if item.get_closest_marker("gpu"):
                 item.add_marker(skip_gpu)
+
+    if "slow" not in m_expression:
+        skip_slow = pytest.mark.skip(
+            reason="slow tests are opt-in: request them with -m slow (real subprocess spawns / multi-second work)",
+        )
+        for item in items:
+            if item.get_closest_marker("slow"):
+                item.add_marker(skip_slow)
 
     items.sort(key=_run_order_rank)
 

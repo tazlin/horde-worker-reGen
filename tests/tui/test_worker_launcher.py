@@ -382,7 +382,9 @@ def test_stop_clears_snapshot() -> None:
     assert supervisor.status is SupervisorStatus.STOPPED
 
 
+# Unlike the fast in-process state-machine tests above, this one spawns the real fake worker subprocess.
 @pytest.mark.e2e
+@pytest.mark.slow
 def test_fake_worker_spawns_streams_and_pauses() -> None:
     """End-to-end: spawn the real fake worker, receive snapshots, pause it, and stop cleanly."""
     supervisor = WorkerSupervisor(

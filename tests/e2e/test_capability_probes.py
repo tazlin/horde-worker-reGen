@@ -20,6 +20,11 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+# Each probe boots a real worker and spawns real OS child processes through the harness, so the module is
+# opt-in via -m slow.
+pytestmark = pytest.mark.slow
+
+
 @pytest.mark.e2e
 @pytest.mark.parametrize("probe", LIGHT_PROBES, ids=lambda probe: probe.capability.slug)
 async def test_capability_probe_fake(probe: CapabilityProbe, record_probe_timing: Callable[[str, str], None]) -> None:
