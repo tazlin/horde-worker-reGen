@@ -1,15 +1,12 @@
 """Reproduction and fix for the over-budget *unservable-model* crash storm that triggered server maintenance.
 
 Failure mode:
-    On a 16 GB card a Flux.1-Schnell fp8 (Compact) head job whose predicted peak exceeds achievable free
-    VRAM is best-effort *admitted over budget* (``inference_scheduler`` admit path). It loads onto a
-    near-full device (``Free VRAM: 52 MB``); during sampling its weights spill to system RAM, so a step
-    takes ~83 s ("Job slowdown detected ... 83.77 s/it", 4.0x expected). The ``inference_step_timeout``
-    watchdog kills the "stuck" slot (``TIMEOUT_DETECTED ... stuck mid inference``). Because the job was
-    ``admitted_over_budget`` the kill is classified ``resource/OOM`` and requeued for a degraded/isolated
-    retry. *Isolating the job does not shrink Flux's footprint*, so it re-thrashes, is killed again,
-    faulted, and dropped. This recurs every ~2-3 min; the steady drop stream trips the horde server's
-    "dropping too many jobs" guard, which forced the worker into maintenance.
+    A job tagged ``admitted_over_budget`` loads onto a near-full device; during sampling its weights can spill
+    to system RAM, so a step makes no useful progress and the ``inference_step_timeout`` watchdog kills the
+    slot. Because the job was ``admitted_over_budget`` the kill is classified ``resource/OOM`` and requeued for
+    a degraded/isolated retry. Isolating the job does not shrink a model that the device genuinely cannot run,
+    so it can re-thrash, be killed again, faulted, and dropped. A steady drop stream trips the horde server's
+    "dropping too many jobs" guard, which forces the worker into maintenance.
 
 What the earlier over-budget handling did and did not cover:
     An earlier layer added the isolated/degraded retry classification and a 90 s first-step grace, and
@@ -61,8 +58,8 @@ _UNSERVABLE_MODEL = "Flux.1-Schnell fp8 (Compact)"
 async def _terminal_overbudget_fault(job_tracker: JobTracker, model: str) -> InferenceFailureResolution:
     """Pop a job for ``model``, admit it over budget, and fault its slot terminally (retry policy 1).
 
-    Mirrors one turn of the live storm: a best-effort over-budget admit whose slot is killed and, with no
-    attempts left, faulted. The ``admitted_over_budget`` tag (not an explicit resource signal) is what
+    Mirrors one turn of the storm: an over-budget tagged job whose slot is killed and, with no attempts left,
+    faulted. The ``admitted_over_budget`` tag (not an explicit resource signal) is what
     classifies the kill as a resource fault, exactly as the lifecycle's hung-slot replacement does.
     """
     job = make_job_pop_response(model=model)

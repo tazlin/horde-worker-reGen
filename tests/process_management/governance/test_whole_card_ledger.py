@@ -218,6 +218,10 @@ class TestWholeCardResidencyMachine:
     def test_teardown_complete_requires_target_and_safety_then_live_fit_or_backstop(self) -> None:
         """The readiness query mirrors the scheduler's structural teardown gate."""
         machine = WholeCardResidencyMachine()
+        # A measured marginal is pinned so the teardown target is sole residency (1): with an unmeasured
+        # marginal the forecast now seeds a small per-context constant, under which a second 13GB-model
+        # context would nominally fit and the target would read 2. The gate mechanics under test are the
+        # sole-residency ones, so the marginal is fixed to a value the card-filling weights do not admit twice.
         forecast = StreamForecast(
             weights_mb=13_000.0,
             reserve_mb=1_500.0,
@@ -226,6 +230,7 @@ class TestWholeCardResidencyMachine:
             free_after_model_evict_mb=10_000.0,
             total_vram_mb=16_000.0,
             per_process_overhead_mb=1_000.0,
+            marginal_process_overhead_mb=600.0,
         )
         assert not machine.teardown_complete(
             forecast,

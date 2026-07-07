@@ -145,9 +145,9 @@ class TestMarginalBreakdown:
     """The breakdown reports which signal produced the chosen marginal, for the forecast diagnostics."""
 
     def test_unmeasured(self) -> None:
-        """Nothing measured: chosen is None and the source says so."""
+        """Nothing measured: chosen is None and the source is ``seeded`` (the forecast applies the seed)."""
         breakdown = ContextOverheadModel().marginal_breakdown(config_override_mb=None)
-        assert breakdown == MarginalOverheadBreakdown(None, None, None, "unmeasured")
+        assert breakdown == MarginalOverheadBreakdown(None, None, None, "seeded")
 
     def test_probe_only(self) -> None:
         """Only a probe (no idle reading yet): the probe is reported as the source and value."""

@@ -22,7 +22,7 @@ The blind spot:
     plus one sibling). A moderate-weight SDXL job fits under that two-context ceiling, so it reads
     "not weight-dominant" and the teardown remedy is suppressed, even though there are *four* live contexts,
     not two, and model eviction provably cannot free enough. With no structural remedy the head is deferred
-    every tick until the starvation backstop force-admits it onto a card whose contexts already consume most
+    every tick until the old starvation backstop admits it onto a card whose contexts already consume most
     of the VRAM, and it OOMs (the "no images were produced" fault). The two-context assumption underestimates
     contention whenever more than two inference processes are live.
 
@@ -62,6 +62,10 @@ def _sdxl_four_process_forecast() -> StreamForecast:
         free_after_model_evict_mb=_FREE_AFTER_MODEL_EVICT_MB,
         total_vram_mb=_DEVICE_TOTAL_VRAM_MB,
         per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+        # This soak reproduction is the unmeasured-marginal (WDDM) host where each context was charged the
+        # full first-context overhead; pin the marginal to it so max_resident stays the observed three (an
+        # unmeasured marginal now seeds a small constant, which would size more contexts than the soak saw).
+        marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
     )
 
 
@@ -86,7 +90,7 @@ class TestMultiProcessOvercommitForecast:
 
         The weight-dominant gates miss it: ``_weights_dominant`` (and so ``needs_exclusive_residency`` and
         ``requires_sibling_teardown``) judge the moderate-weight SDXL "not card-filling" under the fixed
-        two-context ceiling, so no structural remedy fires from them and the head would be force-admitted into
+        two-context ceiling, so no structural remedy fires from them and the head would be admitted into
         an OOM. The topology-aware ``needs_process_count_reduction`` catches it: the live four contexts
         squeeze the bounded weights off the card, but the model co-resides once the process count is reduced.
         """
@@ -114,13 +118,13 @@ class TestMultiProcessOvercommitForecast:
 
 
 class TestSchedulerActuatesProcessReduction:
-    """The admission gate must act on ``needs_process_count_reduction``: reduce processes, not force-admit.
+    """The admission gate must act on ``needs_process_count_reduction``: reduce processes, then admit.
 
     Drives the *real* forecast end to end through the scheduler. The 16 GB scaffolding's small per-process
     overhead means a *heavy* checkpoint is what squeezes its weights off the card with four contexts live --
     the same forecast condition (``needs_process_count_reduction``) the soak's SDXL hit via large contexts on
     a 24 GB card. The behavioral point is identical: the gate stops a sibling process so the weights fit,
-    rather than deferring until the starvation backstop force-admits the head into an OOM.
+    rather than deferring until the old starvation backstop admits the head into an OOM.
     """
 
     async def test_context_overcommit_head_reduces_process_count_then_defers(
@@ -147,6 +151,11 @@ class TestSchedulerActuatesProcessReduction:
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 10000.0 + 600)
 
         scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=4)
+        # This reproduces the unmeasured-marginal (WDDM) host: pin the per-context marginal to the
+        # first-context overhead so the four live contexts squeeze the weights off the card as observed. An
+        # unmeasured marginal now seeds a small constant, under which the model-evicted floor would hold the
+        # weights and the process-count-reduction path would not fire.
+        scheduler.set_measured_marginal_overhead_mb(1288.0)
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=3)
         # Prevent the real psutil RAM reading from spuriously tripping the RAM danger floor gate
         # when system available memory is low (common in large combined test runs). Pin total RAM too so the
@@ -165,7 +174,7 @@ class TestSchedulerActuatesProcessReduction:
 
         admitted = scheduler.preload_models()
 
-        assert admitted is False, "the head must defer while the card is cleared, not force-admit into an OOM"
+        assert admitted is False, "the head must defer while the card is cleared, not admit into an OOM"
         # The remedy: a sibling process is stopped down to the fitting count (3), not all the way to one. The
         # shrink is tagged with the whole-card model so it spares the head's holder while reducing the contexts.
         scheduler._process_lifecycle.scale_inference_processes.assert_called_once_with(

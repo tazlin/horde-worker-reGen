@@ -142,6 +142,11 @@ def _forecast_16gb(
         free_after_model_evict_mb=_CARD16_FREE_AFTER_EVICT_MB,
         total_vram_mb=float(_CARD16_TOTAL_MB),
         per_process_overhead_mb=float(_CARD16_PPO_MB),
+        # These 16GB verdicts were pinned on the unmeasured-marginal host, where each context is charged the
+        # full first-context overhead. An unmeasured marginal now seeds a small constant, so the marginal is
+        # pinned to the per-process overhead to hold the post-process-lane fit verdict the grant tests reason
+        # about.
+        marginal_process_overhead_mb=float(_CARD16_PPO_MB),
         wants_whole_card=wants_whole_card,
     )
 

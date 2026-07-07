@@ -1,15 +1,10 @@
-"""Reproduction and fix for the over-budget "best-effort admit" crash storm.
+"""Crash classification for jobs that carry the over-budget admission tag.
 
 Failure mode:
-    On a device whose free VRAM cannot satisfy the budget's (deliberately conservative) estimate for a
-    heavy head-of-queue model, the scheduler force-admits the job best-effort rather than wedge the
-    queue. The over-committed slot then crashes natively or thrashes so badly its first step makes no
-    progress, and the watchdog kills it. The kill clears the in-progress set, so the next scheduling
-    cycle force-admits the *same* job onto another slot and kills it too. Classifying that crash as an
-    ordinary (non-resource) failure means each attempt is a plain re-dispatch onto another equally
-    over-committed slot, so a single unservable job costs several process recoveries before it is finally
-    faulted. Repeated across such jobs this is a sustained recovery/fault storm where process recoveries
-    climb at roughly ``max_inference_attempts`` per faulted job.
+    A job carrying ``admitted_over_budget`` can still crash natively or thrash so badly its first step makes
+    no progress, and the watchdog kills its slot. Classifying that crash as an ordinary non-resource failure
+    means each attempt is a plain re-dispatch onto another equally constrained slot, so a single unserviceable
+    job costs several process recoveries before it is finally faulted.
 
 What this module pins:
     The worker-logic half of the cascade, which is deterministic and needs no GPU. The native crash /
@@ -28,22 +23,14 @@ from __future__ import annotations
 
 import pytest
 
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import (
     InferenceFailureResolution,
     JobStage,
     JobTracker,
 )
-from horde_worker_regen.process_management.resources import resource_budget
 from tests.process_management.conftest import make_job_pop_response, make_mock_process_info
-from tests.process_management.regressions.test_budget_starvation_wedge_repro import (
-    _ACHIEVABLE_FREE_VRAM_MB,
-    _HEAD_MODEL,
-    _HEAVY_SDXL_PREDICTED_VRAM_MB,
-    _VRAM_RESERVE_MB,
-    _build_wedged_scheduler,
-    _enqueue_head_jobs,
-)
+from tests.process_management.regressions.test_budget_starvation_wedge_repro import _HEAD_MODEL
 
 
 async def _pop_and_start(job_tracker: JobTracker, model: str = _HEAD_MODEL) -> object:
@@ -77,7 +64,7 @@ class TestSlotCrashRetryClassification:
     async def test_overbudget_admit_crash_takes_isolated_degraded_retry(self, job_tracker: JobTracker) -> None:
         """THE FIX: a crash on a job admitted against the budget is a resource failure -> isolated retry.
 
-        The scheduler tagged this job ``admitted_over_budget`` when it force-admitted it. Its slot crash
+        The scheduler tagged this job ``admitted_over_budget`` when it admitted it. Its slot crash
         therefore routes to the bounded degraded/isolated retry (which clears the device and runs the job
         alone) rather than a plain re-dispatch onto another over-committed slot that would only kill a
         second process. This is what breaks the amplification: the over-committed job no longer takes a
@@ -120,37 +107,3 @@ class TestSlotCrashRetryClassification:
 
         assert dispatches == attempts
         assert job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT  # type: ignore[union-attr]
-
-
-class TestSchedulerTagsOverBudgetAdmit:
-    """The scheduler must record the over-budget admission so the crash path can route it correctly."""
-
-    async def test_best_effort_admit_tags_job_over_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When the head can only be admitted best-effort, the scheduler tags it ``admitted_over_budget``.
-
-        Drives the real budget gate with a prediction that cannot fit the device's achievable free-VRAM
-        floor. The head must still be admitted (a preload is issued) and, crucially, must be tagged so a
-        later crash of its over-committed slot takes the isolated degraded retry rather than a plain
-        re-dispatch.
-        """
-        monkeypatch.setattr(
-            resource_budget,
-            "predict_job_sampling_vram_mb",
-            lambda job, baseline: _HEAVY_SDXL_PREDICTED_VRAM_MB,
-        )
-        monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 1000.0)
-
-        scheduler, _process_map, job_tracker, proc_sd15, proc_sdxl = _build_wedged_scheduler(
-            free_vram_mb=_ACHIEVABLE_FREE_VRAM_MB,
-        )
-        monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 64000.0)
-        await _enqueue_head_jobs(job_tracker)
-        head_job = job_tracker.jobs_pending_inference[0]
-
-        assert _HEAVY_SDXL_PREDICTED_VRAM_MB + _VRAM_RESERVE_MB > _ACHIEVABLE_FREE_VRAM_MB  # genuinely unfittable
-
-        admitted = any(scheduler.preload_models() for _ in range(20))
-
-        assert admitted is True
-        assert HordeControlFlag.PRELOAD_MODEL in {proc_sd15.last_control_flag, proc_sdxl.last_control_flag}
-        assert job_tracker.is_admitted_over_budget(head_job) is True

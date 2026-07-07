@@ -64,6 +64,7 @@ from horde_worker_regen.process_management.simulation.fake_worker_processes impo
     start_fake_inference_process,
     start_fake_post_process_process,
     start_fake_safety_process,
+    start_fake_vae_lane_process,
 )
 from horde_worker_regen.process_management.simulation.fault_injection import FaultProfile
 from horde_worker_regen.process_management.simulation.sim_vram import SimVramLedger
@@ -589,6 +590,7 @@ def build_harness_process_manager(config: HarnessConfig) -> tuple[HordeWorkerPro
             inference_entry_point=inference_entry_point,
             safety_entry_point=safety_entry_point,
             post_process_entry_point=post_process_entry_point,
+            vae_lane_entry_point=start_fake_vae_lane_process,
             download_entry_point=download_entry_point,
         )
 
@@ -1146,6 +1148,7 @@ class WarmHarnessSession:
                 inference_entry_point=start_fake_inference_process,
                 safety_entry_point=start_fake_safety_process,
                 post_process_entry_point=start_fake_post_process_process,
+                vae_lane_entry_point=start_fake_vae_lane_process,
             )
         system_resources = _build_harness_system_resources() if self._process_mode != "real" else None
         # Inject a minimal reference covering every level's models in all modes (mirrors

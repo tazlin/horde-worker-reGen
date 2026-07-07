@@ -327,16 +327,13 @@ class TestContextReductionSizingFloor:
             return 5
 
         scheduler._max_coresident_for_peak_mb = record_sizing  # type: ignore[method-assign]
-        result = scheduler._apply_vram_verdict(
-            make_job_pop_response(_RESIDENT_SDXL),
-            process_info,
-            None,
+        vram_verdict = Mock(fits=False, predicted_mb=8258.0, reserve_mb=4096.0, reason=Mock(return_value="over"))
+        scheduler._context_reduction_demand(
+            vram_verdict,
             Mock(is_card_demanding=False),
             is_head_blocker=True,
             target_device_index=None,
-            no_live_resource_consumer=False,
         )
-        assert result is not None
         return captured[0] if captured else None
 
     def test_sizing_uses_streaming_floor_when_total_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -545,6 +542,10 @@ class TestInitialEstablishUsesWholeCardAwareShrink:
             free_after_model_evict_mb=_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB,
             total_vram_mb=_DEVICE_TOTAL_VRAM_MB,
             per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+            # Unmeasured-marginal (WDDM) host: the per-context cost is the full first-context overhead, which
+            # is what makes this heavy Flux need sole residency. An unmeasured marginal now seeds a small
+            # constant, so it is pinned here to keep the whole-card teardown target under test.
+            marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
             wants_whole_card=True,
         )
         assert forecast.max_resident_processes() == 1
@@ -605,6 +606,10 @@ class TestPrestagedHeadProgressesWithRamOnlyModel:
             free_after_model_evict_mb=_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB,
             total_vram_mb=_DEVICE_TOTAL_VRAM_MB,
             per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+            # Unmeasured-marginal (WDDM) host: the per-context cost is the full first-context overhead, which
+            # is what makes this heavy Flux need sole residency. An unmeasured marginal now seeds a small
+            # constant, so it is pinned here to keep the whole-card teardown target under test.
+            marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
             wants_whole_card=True,
         )
         scheduler._whole_card_forecast = forecast
@@ -666,6 +671,10 @@ class TestPrestagedHeadProgressesWithRamOnlyModel:
             free_after_model_evict_mb=_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB,
             total_vram_mb=_DEVICE_TOTAL_VRAM_MB,
             per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+            # Unmeasured-marginal (WDDM) host: the per-context cost is the full first-context overhead, which
+            # is what makes this heavy Flux need sole residency. An unmeasured marginal now seeds a small
+            # constant, so it is pinned here to keep the whole-card teardown target under test.
+            marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
             wants_whole_card=True,
         )
         scheduler._whole_card_forecast = forecast
@@ -728,6 +737,10 @@ class TestFullDeadlockScenario:
             free_after_model_evict_mb=_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB,
             total_vram_mb=_DEVICE_TOTAL_VRAM_MB,
             per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+            # Unmeasured-marginal (WDDM) host: the per-context cost is the full first-context overhead, which
+            # is what makes this heavy Flux need sole residency. An unmeasured marginal now seeds a small
+            # constant, so it is pinned here to keep the whole-card teardown target under test.
+            marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
             wants_whole_card=True,
         )
         scheduler._whole_card_forecast = forecast

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+
 from horde_worker_regen.process_management.jobs.job_popper import _select_models_for_pop
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from tests.process_management.conftest import (
     make_mock_bridge_data,
     make_mock_job,
+    make_mock_model_reference_record,
     make_mock_process_info,
+    make_test_card_runtimes,
+    make_test_model_metadata,
     track_popped_job_async,
 )
 
@@ -402,3 +407,66 @@ class TestSelectModelsForPopCombinations:
         assert "model_1" in result
         assert "model_3" in result
         assert "model_4" in result
+
+
+class TestModelServiceabilityFiltering:
+    """Model serviceability filters the offered model set before popping."""
+
+    def test_unserviceable_model_excluded_from_offer(self) -> None:
+        """A model whose minimum footprint exceeds the scoped card is not offered."""
+        sdxl = "sdxl_model"
+        sd15 = "sd15_model"
+        bridge_data = make_mock_bridge_data(image_models_to_load=[sdxl, sd15])
+        reference = {
+            sdxl: make_mock_model_reference_record(
+                sdxl,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            ),
+            sd15: make_mock_model_reference_record(
+                sd15,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_1,
+            ),
+        }
+        metadata = make_test_model_metadata(reference)
+        card_runtimes = make_test_card_runtimes(config=bridge_data, total_vram_mb=8192.0)
+
+        result = _select_models_for_pop(
+            bridge_data,
+            ProcessMap({}),
+            JobTracker(),
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
+            card_runtimes=card_runtimes,
+            model_metadata=metadata,
+            admission_baseline_provider=lambda _device: 1024.0,
+            serviceability_logged=set(),
+        )
+
+        assert result == {sd15}
+
+    def test_fitting_model_is_never_excluded_from_offer(self) -> None:
+        """A model whose minimum footprint fits the card remains in the offer."""
+        sdxl = "sdxl_model"
+        bridge_data = make_mock_bridge_data(image_models_to_load=[sdxl])
+        reference = {
+            sdxl: make_mock_model_reference_record(
+                sdxl,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            ),
+        }
+        metadata = make_test_model_metadata(reference)
+        card_runtimes = make_test_card_runtimes(config=bridge_data, total_vram_mb=24576.0)
+
+        result = _select_models_for_pop(
+            bridge_data,
+            ProcessMap({}),
+            JobTracker(),
+            max_inference_processes=2,
+            last_pop_had_no_jobs=False,
+            card_runtimes=card_runtimes,
+            model_metadata=metadata,
+            admission_baseline_provider=lambda _device: 1024.0,
+            serviceability_logged=set(),
+        )
+
+        assert result == {sdxl}

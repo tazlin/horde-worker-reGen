@@ -1,9 +1,26 @@
 """Per-context VRAM overhead measurement model.
 
-A torch/CUDA inference process holds a fixed VRAM cost (the one-time device-wide runtime plus one
-context) before any model loads, and each additional sibling context adds a marginal cost. The streaming
-forecast needs both figures to size the free VRAM achievable under sole residency and after evicting
-sibling *models* without multiplying the one-time cost by the process count.
+The accounting contract this model exists to enforce: device VRAM used decomposes into four terms that
+must never be conflated when admitting concurrent work onto one card.
+
+1. **Device baseline** (shared, per-device): the VRAM the OS/desktop/other applications hold. It is
+   attributable to no worker process and enters the arithmetic exactly *once*, at device level (it is
+   already reflected in the measured device-wide free figure). It must never be charged per process.
+2. **Per-process marginal fixed overhead** (per additional context): the CUDA context plus import-time
+   allocations, roughly 200-300MB on a 24GB CUDA card. It persists after a model unloads and is purgeable
+   only by the process exiting. The *first/sole* context additionally pays the one-time, device-wide CUDA
+   runtime allocation; that one-time cost is paid once and shared, so ``per_process_overhead_mb`` (the
+   first-context figure) sizes sole residency while each *additional* sibling context costs only the
+   marginal above.
+3. **Unloadable model weights** (per resident model): reclaimed by evicting the model.
+4. **Transient per-job activation peaks** (per running job): present only while a job samples/decodes.
+
+A torch/CUDA inference process therefore holds term (2) before any model loads, and the streaming forecast
+needs both the first-context figure and the marginal to size the free VRAM achievable under sole residency
+and after evicting sibling *models* without multiplying the one-time cost (or the device baseline) by the
+process count. A device-wide *used* reading conflates (1) with (2)+(3)+(4), so it is only ever a source for
+the free-VRAM computation, never a per-process charge: charging an idle process's device-wide reading as
+its own overhead would fold the whole device baseline into a single context.
 
 This model owns those measurements and the derivations over them; it performs no orchestration and holds
 no collaborator references, so the scheduler feeds it plain numbers (free/used VRAM and process counts it
@@ -34,10 +51,20 @@ class MarginalOverheadBreakdown:
     """The marginal derived from the (invalidation-corrected) measured idle residency (MB), or None when no
     usable idle reading exists."""
     chosen_mb: float | None
-    """The marginal the forecast will use (MB), or None when nothing is measured and the forecast falls back to
-    charging the full first-context overhead per additional context."""
+    """The measured marginal the forecast will use (MB), or None when nothing was measured.
+
+    None does NOT mean the forecast charges the full first-context overhead per additional context: the
+    forecast seeds a conservative per-additional-context constant instead (see
+    ``resource_budget._SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB``). It stays None here so measurement-gated policy
+    (e.g. whether a whole-card teardown demand rests on a *measured* per-context cost) can tell an actual
+    measurement from the seed."""
     source: str
-    """Which signal produced ``chosen_mb``: ``probe``, ``idle_floor``, or ``unmeasured``."""
+    """Which signal produced ``chosen_mb``: ``probe``, ``idle_floor``, or ``seeded``.
+
+    ``seeded`` means neither the probe nor an idle-residency reading measured the marginal, so the downstream
+    forecast prices additional contexts with the seeded conservative constant rather than any measured value.
+    It is named ``seeded`` (not ``unmeasured``) so the forecast log reflects honestly that a deliberate seed,
+    not the first-context overhead, is what is charged per extra context."""
 
 
 class ContextOverheadModel:
@@ -177,7 +204,9 @@ class ContextOverheadModel:
         already been corrected down before it reaches this point.
 
         Returns None for ``chosen_mb`` only when nothing is measurable (no probe delta and no usable idle
-        reading), in which case the forecast conservatively reuses the first-context overhead per context.
+        reading), tagged ``source='seeded'``: the forecast then prices additional contexts with a conservative
+        seeded constant (never the first-context overhead), so None here is a measurement absence, not a
+        directive to charge the full overhead per context.
 
         Args:
             config_override_mb (float | None): The coerced ``vram_per_process_overhead_mb`` config value (it
@@ -200,7 +229,7 @@ class ContextOverheadModel:
             (value, source) for value, source in ((probe, "probe"), (idle_floor, "idle_floor")) if value is not None
         ]
         if not candidates:
-            return MarginalOverheadBreakdown(probe, idle_floor, None, "unmeasured")
+            return MarginalOverheadBreakdown(probe, idle_floor, None, "seeded")
         chosen, source = max(candidates, key=lambda candidate: candidate[0])
         return MarginalOverheadBreakdown(probe, idle_floor, chosen, source)
 

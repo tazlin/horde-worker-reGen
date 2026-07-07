@@ -11,11 +11,9 @@ from horde_worker_regen.process_management.scheduling.governance import (
     AdmissionResult,
     PreloadSlotSnapshot,
     RamReclaimOutcome,
-    VramReclaimOutcome,
     card_preload_order,
     compute_preload_disallowed_processes,
     decide_ram_reclaim_outcome,
-    decide_vram_reclaim_outcome,
     preload_concurrency_blocked,
     select_head_room_process_id,
 )
@@ -150,94 +148,6 @@ class TestCardPreloadOrder:
             card_busy_counts={0: 1, 1: 0, 2: 2},
         )
         assert order == [2, 1, 0]
-
-
-class TestVramReclaimOutcome:
-    """The VRAM escalation policy resolves an exhausted reclaim pass."""
-
-    def test_progress_defers(self) -> None:
-        """Freed room is worth waiting for."""
-        outcome = decide_vram_reclaim_outcome(
-            freed=True,
-            is_head_blocker=True,
-            no_live_resource_consumer=True,
-            model_unservable=False,
-            context_reduction_demanded=False,
-            whole_card_warranted=False,
-        )
-        assert outcome is VramReclaimOutcome.DEFER
-
-    def test_non_head_defers(self) -> None:
-        """Only the head-of-queue blocker may escalate past reclamation."""
-        outcome = decide_vram_reclaim_outcome(
-            freed=False,
-            is_head_blocker=False,
-            no_live_resource_consumer=True,
-            model_unservable=False,
-            context_reduction_demanded=False,
-            whole_card_warranted=False,
-        )
-        assert outcome is VramReclaimOutcome.DEFER
-
-    def test_live_consumer_defers(self) -> None:
-        """A live job holding the device always wins over an escalation."""
-        outcome = decide_vram_reclaim_outcome(
-            freed=False,
-            is_head_blocker=True,
-            no_live_resource_consumer=False,
-            model_unservable=False,
-            context_reduction_demanded=False,
-            whole_card_warranted=False,
-        )
-        assert outcome is VramReclaimOutcome.DEFER
-
-    def test_breaker_tripped_model_is_held(self) -> None:
-        """A model that keeps faulting over the budget is held, not admitted."""
-        outcome = decide_vram_reclaim_outcome(
-            freed=False,
-            is_head_blocker=True,
-            no_live_resource_consumer=True,
-            model_unservable=True,
-            context_reduction_demanded=False,
-            whole_card_warranted=False,
-        )
-        assert outcome is VramReclaimOutcome.HOLD_UNSERVABLE
-
-    def test_warranted_context_reduction_wins_over_admit(self) -> None:
-        """When contexts are the over-commit and the figures are trusted, reduce rather than admit."""
-        outcome = decide_vram_reclaim_outcome(
-            freed=False,
-            is_head_blocker=True,
-            no_live_resource_consumer=True,
-            model_unservable=False,
-            context_reduction_demanded=True,
-            whole_card_warranted=True,
-        )
-        assert outcome is VramReclaimOutcome.REDUCE_CONTEXTS
-
-    def test_unwarranted_reduction_is_declined_into_an_admit(self) -> None:
-        """A reduction demand resting on untrusted overhead figures is declined; the head still admits."""
-        outcome = decide_vram_reclaim_outcome(
-            freed=False,
-            is_head_blocker=True,
-            no_live_resource_consumer=True,
-            model_unservable=False,
-            context_reduction_demanded=True,
-            whole_card_warranted=False,
-        )
-        assert outcome is VramReclaimOutcome.ADMIT_DECLINING_REDUCTION
-
-    def test_exhausted_head_on_idle_device_admits_best_effort(self) -> None:
-        """The final rung: nothing to reclaim, nothing live, admit the head over-budget."""
-        outcome = decide_vram_reclaim_outcome(
-            freed=False,
-            is_head_blocker=True,
-            no_live_resource_consumer=True,
-            model_unservable=False,
-            context_reduction_demanded=False,
-            whole_card_warranted=False,
-        )
-        assert outcome is VramReclaimOutcome.BEST_EFFORT_ADMIT
 
 
 class TestRamReclaimOutcome:

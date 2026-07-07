@@ -1,24 +1,24 @@
-"""Tests for budget-gated VRAM retention across jobs.
+"""Tests for governed VRAM retention across jobs.
 
 hordelib evicts a job's model from VRAM after every run so sibling GPU instances never collectively
 over-commit. That eviction forces a RAM->VRAM reload on the next job, the dominant non-sampling cost on
-small jobs. :meth:`InferenceScheduler._should_keep_model_resident` decides when to suppress that eviction
-for one dispatch, under gates that cannot over-commit the card even when the driver's free-VRAM figure
-lies (a WDDM driver in demand-paging keeps reporting generous free VRAM while the card is saturated):
+small jobs (a same-model successor on the same process re-uploads weights that were still on the card).
+:meth:`InferenceScheduler._should_keep_model_resident` decides when to suppress that eviction for one
+dispatch. Because eviction is now on-demand and *proven* (the device-free governor reads truthful NVML
+device-free and the verified reclaim ladder takes residents back rung by rung, each free confirmed at the
+device level), retention no longer has to be preemptively stingy:
 
-- **Sole residency**: no other process on the card may hold a VRAM-resident model, judged from the
-  parent's model-map bookkeeping rather than device telemetry. Retention only extends the card's single
-  resident across consecutive jobs; it never creates a second resident.
+- **Card healthy**: the device-free governor's committed state for the card is HEALTHY. A PRESSURE or
+  SATURATED card is one the ladder is or may soon be reclaiming from, so it is handed no new resident.
 - **Static fit**: the card's reported total VRAM (a constant the driver cannot misreport) must absorb the
-  job's sampling peak plus the reserve.
-- **Measured veto**: the measured-free check can still deny, never solely grant. The job's own weights
-  are credited back only when the dispatching process already holds this model in VRAM, since only then
-  was the reading taken with the weights occupying the card.
+  job's sampling peak plus the reserve, after charging sibling CUDA contexts and the job's own
+  post-processing that share the card while the weights are held.
 
-No queue lookahead gates the grant: the pop cycle refills the queue immediately after a dispatch drains
-it, so a same-model successor is almost never visible at the dispatch instant even when one arrives
-milliseconds later. Reclaim is instead just-in-time via the per-dispatch VRAM sweep and the
-under-pressure eviction.
+The measured admission floor is deliberately not re-checked in this seam (that is the admission/dispatch
+gate's job; retaining already-materialized weights adds zero new bytes), and sole residency is not
+required: a second idle resident is safe because it is a first-class reclaim-ladder candidate. Eviction is
+just-in-time: a cross-model preload that no longer fits because idle residents hold the card defers while
+the ladder evicts them.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.scheduling import inference_scheduler as inference_scheduler_module
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
@@ -45,7 +46,6 @@ from tests.process_management.scheduling.test_inference_scheduling import _make_
 
 _MODEL = "WAI-NSFW-illustrious-SDXL"
 _OTHER_MODEL = "CyberRealistic Pony"
-_AMPLE_FREE_VRAM_MB = 12000.0
 _TOTAL_VRAM_MB = 16376
 _PROCESS_ID = 2
 _SIBLING_PROCESS_ID = 3
@@ -61,24 +61,21 @@ def _dispatch_process(model_name: str | None = _MODEL):  # noqa: ANN202
 def _budget_on_scheduler(
     job_tracker: JobTracker,
     *,
-    free_vram_mb: float | None = _AMPLE_FREE_VRAM_MB,
     process_map: ProcessMap | None = None,
     horde_model_map: HordeModelMap | None = None,
 ) -> InferenceScheduler:
-    """A scheduler with the VRAM budget active and a controllable measured-free-VRAM reading."""
+    """A scheduler with the VRAM budget active and the governor unsampled (defaults to HEALTHY)."""
     bridge_data = make_mock_bridge_data(
         enable_vram_budget=True,
         vram_reserve_mb=2048,
         ram_reserve_mb=4096,
     )
-    scheduler = _make_inference_scheduler(
+    return _make_inference_scheduler(
         job_tracker=job_tracker,
         bridge_data=bridge_data,
         process_map=process_map if process_map is not None else ProcessMap({_PROCESS_ID: _dispatch_process()}),
         horde_model_map=horde_model_map,
     )
-    scheduler._measured_free_vram_mb = Mock(return_value=free_vram_mb)  # type: ignore[method-assign]
-    return scheduler
 
 
 def _map_with_model_on_process(
@@ -91,8 +88,12 @@ def _map_with_model_on_process(
     return model_map
 
 
-async def test_retains_when_budget_fits_without_queue_lookahead() -> None:
-    """An empty pending queue does not block retention: the successor is popped after dispatch."""
+async def test_retains_when_healthy_and_budget_fits_without_queue_lookahead() -> None:
+    """A healthy card with a fitting budget retains, even with an empty pending queue.
+
+    The pop cycle refills the queue after a dispatch drains it, so requiring a visible same-model
+    successor would make retention structurally unreachable.
+    """
     job_tracker = JobTracker()
     dispatched = make_job_pop_response(model=_MODEL)
     await track_popped_job_async(job_tracker, dispatched)
@@ -102,6 +103,60 @@ async def test_retains_when_budget_fits_without_queue_lookahead() -> None:
 
     assert (
         scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+
+
+async def test_retains_even_when_another_process_holds_a_resident_model() -> None:
+    """Sole residency is no longer required: a sibling resident does not deny retention on a healthy card.
+
+    A second idle resident is safe under the governed policy because it is a first-class reclaim-ladder
+    candidate that the verified ladder takes back on demand; the old WDDM-driven sole-residency denial is
+    superseded.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+    model_map = _map_with_model_on_process(_OTHER_MODEL, _SIBLING_PROCESS_ID)
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map, horde_model_map=model_map)
+    # Price the sibling's CUDA context so the static gate is decided on fit, not on an unmeasured charge.
+    scheduler._overhead.set_marginal_overhead_mb(1354.0)
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+
+
+async def test_no_retain_when_governor_reports_pressure() -> None:
+    """A PRESSURE card denies retention: the reclaim ladder may soon reclaim, so it gains no new resident."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    scheduler.set_governor_state(0, GovernorState.PRESSURE)
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    )
+
+
+async def test_no_retain_when_governor_reports_saturated() -> None:
+    """A SATURATED card denies retention: the ladder is running, so it gains no new resident to evict."""
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    scheduler = _budget_on_scheduler(job_tracker)
+    scheduler.set_governor_state(0, GovernorState.SATURATED)
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
     )
 
 
@@ -116,21 +171,6 @@ async def test_no_retain_when_budget_inactive() -> None:
         job_tracker=job_tracker,
         process_map=ProcessMap({_PROCESS_ID: _dispatch_process()}),
     )
-    scheduler._measured_free_vram_mb = Mock(return_value=_AMPLE_FREE_VRAM_MB)  # type: ignore[method-assign]
-    process_info = scheduler._process_map[_PROCESS_ID]
-
-    assert (
-        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
-    )
-
-
-async def test_no_retain_when_free_vram_unmeasured() -> None:
-    """A cold start with no VRAM telemetry must not assume headroom; retention is evidence-gated."""
-    job_tracker = JobTracker()
-    dispatched = make_job_pop_response(model=_MODEL)
-    await track_popped_job_async(job_tracker, dispatched)
-
-    scheduler = _budget_on_scheduler(job_tracker, free_vram_mb=None)
     process_info = scheduler._process_map[_PROCESS_ID]
 
     assert (
@@ -152,116 +192,6 @@ async def test_no_retain_when_total_vram_unreported() -> None:
     )
 
 
-async def test_no_retain_when_another_process_holds_a_resident_model() -> None:
-    """A VRAM-resident model on any sibling denies retention outright, regardless of measured free.
-
-    This is the WDDM guard: a driver in demand-paging reports generous free VRAM while the card is
-    saturated, so co-residency questions are answered by the parent's own bookkeeping. Retention must
-    never create a second resident model on the card.
-    """
-    job_tracker = JobTracker()
-    dispatched = make_job_pop_response(model=_MODEL)
-    await track_popped_job_async(job_tracker, dispatched)
-
-    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
-    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
-    model_map = _map_with_model_on_process(_OTHER_MODEL, _SIBLING_PROCESS_ID)
-    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map, horde_model_map=model_map)
-    process_info = scheduler._process_map[_PROCESS_ID]
-
-    assert (
-        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
-    )
-
-
-async def test_stale_resident_entry_for_dead_process_does_not_block() -> None:
-    """A model-map entry whose process no longer exists is staleness, not residency."""
-    job_tracker = JobTracker()
-    dispatched = make_job_pop_response(model=_MODEL)
-    await track_popped_job_async(job_tracker, dispatched)
-
-    model_map = _map_with_model_on_process(_OTHER_MODEL, 99)  # process 99 is not in the map
-    scheduler = _budget_on_scheduler(job_tracker, horde_model_map=model_map)
-    process_info = scheduler._process_map[_PROCESS_ID]
-
-    assert (
-        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
-    )
-
-
-async def test_credits_weights_when_model_resident_on_this_process(monkeypatch) -> None:  # noqa: ANN001
-    """A model already in VRAM on the dispatching process gets its weights credited back into free.
-
-    The free reading was taken with the weights occupying the card; asking the footprint to also fit
-    inside the remainder would charge the weights twice and deny retention on any busy card. The credit
-    is clamped to the card total so a stale reading can never grant against more VRAM than exists.
-    """
-    job_tracker = JobTracker()
-    dispatched = make_job_pop_response(model=_MODEL)
-    await track_popped_job_async(job_tracker, dispatched)
-
-    model_map = _map_with_model_on_process(_MODEL, _PROCESS_ID)
-    scheduler = _budget_on_scheduler(job_tracker, free_vram_mb=3000.0, horde_model_map=model_map)
-    monkeypatch.setattr(inference_scheduler_module, "predict_job_weight_mb", lambda job, baseline: 5000.0)
-    seen_free: list[float] = []
-
-    def record_check(job, baseline, free_vram_mb, committed_reserve_mb=0.0):  # noqa: ANN001, ANN202
-        seen_free.append(free_vram_mb)
-        return Mock(fits=True, predicted_mb=None, reserve_mb=0.0)
-
-    scheduler._vram_budget.check_job = record_check  # type: ignore[method-assign]
-    process_info = scheduler._process_map[_PROCESS_ID]
-
-    assert (
-        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
-    )
-    # First check is the static (total-based) gate; the second is the measured gate with the credit.
-    assert seen_free == [float(_TOTAL_VRAM_MB), 8000.0]
-
-
-async def test_no_credit_when_model_resident_on_other_process(monkeypatch) -> None:  # noqa: ANN001
-    """A copy resident on a different process denies retention before any credit question arises."""
-    job_tracker = JobTracker()
-    dispatched = make_job_pop_response(model=_MODEL)
-    await track_popped_job_async(job_tracker, dispatched)
-
-    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_MODEL)
-    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
-    model_map = _map_with_model_on_process(_MODEL, _SIBLING_PROCESS_ID)
-    scheduler = _budget_on_scheduler(
-        job_tracker, free_vram_mb=3000.0, process_map=process_map, horde_model_map=model_map
-    )
-    process_info = scheduler._process_map[_PROCESS_ID]
-
-    assert (
-        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
-    )
-
-
-async def test_no_credit_when_model_only_in_ram(monkeypatch) -> None:  # noqa: ANN001
-    """A RAM-only (preloaded) model occupies no VRAM, so its weights must not be credited."""
-    job_tracker = JobTracker()
-    dispatched = make_job_pop_response(model=_MODEL)
-    await track_popped_job_async(job_tracker, dispatched)
-
-    model_map = _map_with_model_on_process(_MODEL, _PROCESS_ID, load_state=ModelLoadState.LOADED_IN_RAM)
-    scheduler = _budget_on_scheduler(job_tracker, free_vram_mb=3000.0, horde_model_map=model_map)
-    monkeypatch.setattr(inference_scheduler_module, "predict_job_weight_mb", lambda job, baseline: 5000.0)
-    seen_free: list[float] = []
-
-    def record_check(job, baseline, free_vram_mb, committed_reserve_mb=0.0):  # noqa: ANN001, ANN202
-        seen_free.append(free_vram_mb)
-        return Mock(fits=len(seen_free) == 1, predicted_mb=None, reserve_mb=0.0)
-
-    scheduler._vram_budget.check_job = record_check  # type: ignore[method-assign]
-    process_info = scheduler._process_map[_PROCESS_ID]
-
-    assert (
-        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
-    )
-    assert seen_free == [float(_TOTAL_VRAM_MB), 3000.0]
-
-
 async def test_sibling_context_overhead_is_charged_against_the_static_fit(monkeypatch) -> None:  # noqa: ANN001
     """Live sibling GPU processes cost a context each, and the static gate must charge them.
 
@@ -280,7 +210,7 @@ async def test_sibling_context_overhead_is_charged_against_the_static_fit(monkey
     scheduler._overhead.set_marginal_overhead_mb(1354.0)
     seen_free: list[float] = []
 
-    def record_check(job, baseline, free_vram_mb, committed_reserve_mb=0.0):  # noqa: ANN001, ANN202
+    def record_check(job, baseline, free_vram_mb, committed_reserve_mb=0.0, *, disaggregated=False):  # noqa: ANN001, ANN202
         seen_free.append(free_vram_mb)
         return Mock(fits=True, predicted_mb=None, reserve_mb=0.0)
 
@@ -290,7 +220,7 @@ async def test_sibling_context_overhead_is_charged_against_the_static_fit(monkey
     assert (
         scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
     )
-    assert seen_free[0] == float(_TOTAL_VRAM_MB) - 1354.0
+    assert seen_free == [float(_TOTAL_VRAM_MB) - 1354.0]
 
 
 async def test_no_retain_when_context_overhead_unmeasured_with_siblings() -> None:
@@ -327,7 +257,7 @@ async def test_jobs_own_post_processing_peak_is_charged_against_the_static_fit(m
     )
     seen_free: list[float] = []
 
-    def record_check(job, baseline, free_vram_mb, committed_reserve_mb=0.0):  # noqa: ANN001, ANN202
+    def record_check(job, baseline, free_vram_mb, committed_reserve_mb=0.0, *, disaggregated=False):  # noqa: ANN001, ANN202
         seen_free.append(free_vram_mb)
         return Mock(fits=True, predicted_mb=None, reserve_mb=0.0)
 
@@ -373,17 +303,22 @@ async def test_no_retain_while_wddm_paging_active() -> None:
 
 
 async def test_wddm_paging_rising_edge_reclaims_idle_vram_once() -> None:
-    """The paging verdict's rising edge runs one idle-VRAM sweep, excluding the paging process itself."""
+    """The paging verdict's rising edge reclaims idle residents (LIFO) once per edge, NOT protecting the flag.
+
+    Under WDDM the driver demotes the least-recently-touched allocator, so the PDH-flagged process is usually
+    the idle newcomer, not the active sampler. The reworked sweep therefore evicts the flagged idle resident
+    rather than protecting it, routed through the same reclaim actuator the governor's ladder uses.
+    """
     job_tracker = JobTracker()
     scheduler = _budget_on_scheduler(job_tracker)
     paging_process = scheduler._process_map[_PROCESS_ID]
-    sweeps: list[int] = []
+    unloaded: list[int] = []
 
-    def record_sweep(process_with_model, **kwargs):  # noqa: ANN001, ANN003, ANN202
-        sweeps.append(process_with_model.process_id)
+    def record_unload(process_id, device_index=None):  # noqa: ANN001, ANN202
+        unloaded.append(process_id)
         return True
 
-    scheduler.unload_models_from_vram = record_sweep  # type: ignore[method-assign]
+    scheduler.unload_idle_model = record_unload  # type: ignore[method-assign]
 
     paging_pid = paging_process.os_pid
     assert paging_pid is not None
@@ -392,8 +327,69 @@ async def test_wddm_paging_rising_edge_reclaims_idle_vram_once() -> None:
     scheduler.note_wddm_paging({}, active=False)
     scheduler.note_wddm_paging({paging_pid: 900.0}, active=True)
 
-    # One sweep per rising edge (not per tick), each excluding the paging process.
-    assert sweeps == [_PROCESS_ID, _PROCESS_ID]
+    # One reclaim per rising edge (not per tick); the PDH-flagged idle resident is a target, not protected.
+    assert unloaded == [_PROCESS_ID, _PROCESS_ID]
+
+
+async def test_same_model_redispatch_leaves_the_map_residency_intact() -> None:
+    """Granting retention for a model already VRAM-resident on the process does not regress the map to RAM.
+
+    The retention decision only sets the defer-unload flag; the parent's model-map entry keeps its
+    LOADED_IN_VRAM state, which is what lets the child skip the RAM->VRAM re-transfer on the next same-model
+    job (its cache still holds the weights).
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    model_map = _map_with_model_on_process(_MODEL, _PROCESS_ID)
+    scheduler = _budget_on_scheduler(job_tracker, horde_model_map=model_map)
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+    entry = scheduler._horde_model_map.root[_MODEL]
+    assert entry.process_id == _PROCESS_ID
+    assert entry.horde_model_load_state is ModelLoadState.LOADED_IN_VRAM
+
+
+async def test_idle_retained_resident_is_evicted_on_demand_for_a_cross_model_head(monkeypatch) -> None:  # noqa: ANN001
+    """A retained idle resident is a reclaim-ladder candidate the head-of-queue eviction targets.
+
+    Process A holds model X in VRAM (retained under the healthy policy) while idle; the head job wants a
+    different model Y on process B. The card cannot hold both, so the eviction routed through the
+    single-owner reclaim path targets A, and once A's copy is freed the room it held is no longer a ladder
+    candidate (available for Y).
+    """
+    process_a = make_mock_process_info(1, model_name=_MODEL)
+    process_a.total_vram_mb = _TOTAL_VRAM_MB
+    requester_b = make_mock_process_info(2, model_name=None)
+    requester_b.total_vram_mb = _TOTAL_VRAM_MB
+    process_map = ProcessMap({1: process_a, 2: requester_b})
+    model_map = _map_with_model_on_process(_MODEL, 1)
+
+    scheduler = _make_inference_scheduler(
+        process_map=process_map,
+        horde_model_map=model_map,
+        job_tracker=JobTracker(),
+        bridge_data=make_mock_bridge_data(enable_vram_budget=True, max_threads=2),
+        max_concurrent=2,
+        max_inference=2,
+    )
+    monkeypatch.setattr(scheduler, "get_next_n_models", lambda n: [_OTHER_MODEL])
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+    assert 1 in {resident.process_id for resident in candidates.idle_residents}
+
+    freed = scheduler.unload_models_from_vram(requester_b, under_pressure=True, for_head_of_queue=True)
+    assert freed is True
+    assert process_a.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+
+    # Simulate the child reporting the model gone: the freed room is no longer an idle-resident candidate.
+    process_a.loaded_horde_model_name = None
+    remaining = scheduler.build_reclaim_ladder_candidates(None)
+    assert 1 not in {resident.process_id for resident in remaining.idle_residents}
 
 
 def test_inference_control_message_defaults_to_eviction() -> None:

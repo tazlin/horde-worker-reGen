@@ -1,14 +1,11 @@
-"""RAM-cache preservation around the VRAM over-budget best-effort admit.
+"""RAM-cache preservation around a foreign-pressure over-budget admit.
 
-A best-effort VRAM admit historically evicted an idle resident model from system RAM unconditionally,
-on the reasoning that a heavy head loads its checkpoint through RAM first. On a host with ample RAM
-headroom that eviction buys nothing: the incoming load fits without it, and the only effect is
-destroying a sibling's warm RAM cache so the next job for that model reloads its checkpoint from disk.
-On a busy multi-model worker the VRAM budget can route ordinary heads through the best-effort admit
-many times an hour, so the unconditional purge turns the RAM cache into a disk-reload treadmill (and
-the allocator-stuck slots it leaves behind are then recycled, compounding the churn).
+A foreign-pressure admit can tag a job over budget while it still physically fits the truthful device-free
+reading. On a host with ample RAM headroom, evicting an idle resident model from system RAM buys nothing:
+the incoming load fits without it, and the only effect is destroying a sibling's warm RAM cache so the next
+job for that model reloads its checkpoint from disk.
 
-The contract pinned here: the terminal admit consults the RAM budget and reclaims idle RAM residents
+The contract pinned here: the over-budget path consults the RAM budget and reclaims idle RAM residents
 only when the incoming load does not fit measured available memory. The pressure paths (the RAM
 verdict's own reclaim, and the RAM governor's eviction under the danger floor) are unchanged.
 
@@ -25,8 +22,13 @@ from horde_worker_regen.process_management.ipc.messages import HordeControlFlag
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap, ModelLoadState
-from horde_worker_regen.process_management.resources.resource_budget import BudgetVerdict, StreamForecast
-from horde_worker_regen.process_management.scheduling.inference_scheduler import VramGateResult
+from horde_worker_regen.process_management.resources.resource_budget import BudgetVerdict
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    DeviceVramState,
+    MeasuredVramSnapshot,
+    VramArbiter,
+)
+from horde_worker_regen.process_management.scheduling.inference_scheduler import _WholeCardDemandOutcome
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -49,10 +51,10 @@ def _resident_in_ram(horde_model_map: HordeModelMap, model: str, process_id: int
 
 
 async def _overbudget_admit_setup():  # noqa: ANN202
-    """Build a scheduler mid over-budget admit: head deferred by VRAM, sibling holding a warm RAM cache.
+    """Build a scheduler for foreign-pressure admission with a sibling holding a warm RAM cache.
 
     The sibling's VRAM copy is already unloaded (``last_control_flag`` reflects the earlier gentle
-    reclaim), so both reclaim passes free nothing and the verdict reaches the best-effort admit rung.
+    reclaim), so the RAM-cache decision is isolated to the over-budget path.
     """
     available = make_mock_process_info(1, model_name=None)
     sibling = make_mock_process_info(2, model_name=_SIBLING_MODEL)
@@ -77,32 +79,38 @@ async def _overbudget_admit_setup():  # noqa: ANN202
     return scheduler, job, sibling
 
 
-def _apply_verdict(scheduler, job) -> VramGateResult:  # noqa: ANN001
-    """Run the VRAM verdict for the head as an idle-device head blocker."""
+def _drive_overbudget_admit(scheduler, job) -> bool:  # noqa: ANN001
+    """Admit the idle-device head through the over-budget path and return the admission outcome.
+
+    The whole-card state machine is short-circuited to the ordinary path, and the arbiter cycle is crafted
+    so the worker's own committed load fits capacity while the candidate also physically fits measured
+    device-free VRAM net of the noise buffer. That is the foreign-pressure path whose RAM-reclaim gating is
+    under test.
+    """
     available = scheduler._process_map[1]
-    forecast = StreamForecast(
-        weights_mb=4900.0,
-        reserve_mb=2048.0,
-        free_now_mb=10162.0,
-        free_if_alone_mb=20801.0,
-        free_after_model_evict_mb=13819.0,
-        total_vram_mb=24074.0,
-        per_process_overhead_mb=3273.0,
-        marginal_process_overhead_mb=1746.0,
+    scheduler._decide_whole_card_demand = Mock(return_value=_WholeCardDemandOutcome.FALL_THROUGH)
+    scheduler._vram_budget.check_job = Mock(
+        return_value=BudgetVerdict(fits=False, predicted_mb=5000.0, available_mb=5000.0, reserve_mb=2048.0),
     )
-    return scheduler._apply_vram_verdict(
-        job,
-        available,
-        None,
-        forecast,
-        is_head_blocker=True,
-        target_device_index=None,
-        no_live_resource_consumer=True,
+    # committed 20000 fits capacity ((24000 - 1000 - 512) = 22488), so the shortfall is foreign; the candidate
+    # (~8315 MB for this SDXL head) physically fits the truthful device-free reading net of the noise buffer
+    # (16000 - 512 = 15488), so the admit takes the foreign-pressure fit-into-reality path.
+    state = DeviceVramState(
+        total_vram_mb=24000.0,
+        baseline_mb=1000.0,
+        committed_vram_mb=20000.0,
+        planned_unmaterialized_mb=0.0,
+        committed_is_stale=False,
+        device_free_mb=16000.0,
     )
+    arbiter = VramArbiter()
+    arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: state}))
+    scheduler._vram_arbiter = arbiter
+    return scheduler._admit_preload_under_budget(job, available, is_head_blocker=True)
 
 
 class TestOverbudgetAdmitRamPurgeGating:
-    """The terminal admit's RAM reclaim runs only when the load does not fit available RAM."""
+    """The over-budget admit's RAM reclaim runs only when the load does not fit available RAM."""
 
     async def test_admit_with_ram_headroom_preserves_sibling_ram_cache(self) -> None:
         """With the RAM budget fitting the head, the admit must not evict the sibling's RAM copy."""
@@ -111,9 +119,7 @@ class TestOverbudgetAdmitRamPurgeGating:
             return_value=BudgetVerdict(fits=True, predicted_mb=8000.0, available_mb=30000.0, reserve_mb=4096.0),
         )
 
-        result = _apply_verdict(scheduler, job)
-
-        assert result is VramGateResult.ADMIT_OVER_BUDGET
+        assert _drive_overbudget_admit(scheduler, job) is True
         assert sibling.loaded_horde_model_name == _SIBLING_MODEL
         assert sibling.last_control_flag != HordeControlFlag.UNLOAD_MODELS_FROM_RAM
 
@@ -124,9 +130,7 @@ class TestOverbudgetAdmitRamPurgeGating:
             return_value=BudgetVerdict(fits=False, predicted_mb=8000.0, available_mb=3000.0, reserve_mb=4096.0),
         )
 
-        result = _apply_verdict(scheduler, job)
-
-        assert result is VramGateResult.ADMIT_OVER_BUDGET
+        assert _drive_overbudget_admit(scheduler, job) is True
         assert sibling.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_RAM
 
 

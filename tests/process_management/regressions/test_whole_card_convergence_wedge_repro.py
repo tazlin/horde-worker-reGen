@@ -145,6 +145,11 @@ def _flux_whole_card_forecast(*, free_now_mb: float) -> StreamForecast:
         free_after_model_evict_mb=_DEVICE_TOTAL_VRAM_MB - _PER_PROCESS_OVERHEAD_MB,
         total_vram_mb=_DEVICE_TOTAL_VRAM_MB,
         per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
+        # This scenario's budget target of two (Flux plus one idle context) is what fixes the convergence
+        # depth under test. The per-additional-context marginal is pinned to the per-process overhead so the
+        # target is that fixed two: an unmeasured marginal now seeds a small constant, under which this roomy
+        # 24GB card would size many more idle contexts and there would be nothing to converge.
+        marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
         wants_whole_card=True,
     )
 

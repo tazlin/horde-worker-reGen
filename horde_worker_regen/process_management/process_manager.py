@@ -58,8 +58,12 @@ from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import (
+    GENERATION_STATE,
     AlchemyFormSpec,
+    HordeImageResult,
+    HordeInferenceResultMessage,
     HordeProcessState,
+    HordeStageModelMixin,
 )
 from horde_worker_regen.process_management.ipc.supervisor_channel import (
     PENDING_JOBS_IN_SNAPSHOT,
@@ -123,13 +127,28 @@ from horde_worker_regen.process_management.models.lora_disk_guard import (
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.resources.device_free_governor import (
+    DeviceFreeGovernor,
+    GovernorState,
+)
 from horde_worker_regen.process_management.resources.device_info import TorchDeviceInfo, TorchDeviceMap
 from horde_worker_regen.process_management.resources.duty_cycle import DutyCycleSummary, summarize_duty_cycle
+from horde_worker_regen.process_management.resources.reclaim_ladder import (
+    VerifiedReclaimLadder,
+    build_reclaim_ladder,
+)
 from horde_worker_regen.process_management.resources.resource_budget import (
     CommittedReserveLedger,
     is_model_locally_unservable_for,
 )
 from horde_worker_regen.process_management.resources.run_metrics import RunMetricsSnapshot, WorkerRunMetrics
+from horde_worker_regen.process_management.resources.vram_arbiter import VramArbiter
+from horde_worker_regen.process_management.resources.vram_attribution import (
+    _REPORT_STALENESS_SECONDS,
+    DriftObservation,
+    VramAttributionReconciler,
+)
+from horde_worker_regen.process_management.resources.vram_footprints import LearnedFootprintStore
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from horde_worker_regen.process_management.scheduling.performance_model import (
     PERF_MODEL_FILENAME,
@@ -145,6 +164,10 @@ from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyA
 from horde_worker_regen.process_management.scheduling.workload_flow import FlowCoordinator, WorkloadKind
 from horde_worker_regen.process_management.simulation._canned_scenarios import CannedAlchemySource, CannedJobSource
 from horde_worker_regen.process_management.worker_entry_points import ProcessEntryPoints
+from horde_worker_regen.process_management.workers.disaggregation_orchestrator import (
+    DisaggregatedFault,
+    DisaggregationOrchestrator,
+)
 from horde_worker_regen.process_management.workers.post_process_orchestrator import PostProcessOrchestrator
 from horde_worker_regen.process_management.workers.safety_orchestrator import SafetyOrchestrator
 from horde_worker_regen.reporting.kudos_logger import KudosLogger
@@ -550,6 +573,12 @@ if sys.version_info[:2] == (3, 10):
     _async_client_exceptions = (asyncio.exceptions.TimeoutError, aiohttp.client_exceptions.ClientError, OSError)
 
 _caught_signal = False
+
+_DISAGGREGATION_V1_BASELINES: frozenset[str] = frozenset({"stable_diffusion_1", "stable_diffusion_xl"})
+"""Baselines whose disaggregated pipeline is validated for v1: SD1.5 and SDXL only.
+
+Resolved from the worker's loaded model reference (never guessed from the model name). Any other family
+(SD2, Cascade, Flux, Qwen, Z-Image) stays on the monolithic path, whose whole-job VRAM charges apply."""
 
 
 class HordeWorkerProcessManager:
@@ -966,6 +995,18 @@ class HordeWorkerProcessManager:
             entry_points=process_entry_points,
             owned_registry=self._owned_registry,
             action_ledger=self._action_ledger,
+            # Lazy: the scheduler is constructed after this manager, so bind through self at call time.
+            wddm_paging_victims_provider=lambda max_age: self._inference_scheduler.wddm_paging_victim_shared_mb_by_pid(
+                max_age,
+            ),
+            # The last-rung kill's device-level gates: how long a card has been continuously SATURATED and
+            # whether the verified reclaim ladder has exhausted itself on it. Bound lazily through self.
+            device_saturation_duration_provider=lambda device_index: self._device_saturation_duration_seconds(
+                device_index,
+            ),
+            saturation_unresolved_provider=lambda device_index: self._reclaim_ladder.is_saturation_unresolved(
+                device_index,
+            ),
         )
 
         self._download_coordinator = ModelDownloadCoordinator(
@@ -1006,6 +1047,46 @@ class HordeWorkerProcessManager:
         self._wddm_paging_monitor = WddmPagingMonitor()
         self._last_wddm_sample_timestamp = 0.0
         self._wddm_elevated_streak = 0
+        # The device-free governor: a debounced read of NVML device-level free VRAM per card, the only
+        # truthful proximity-to-cliff signal under WDDM (per-process reads lie once the driver demotes an
+        # allocator to system memory). PRESSURE holds new VRAM growth; SATURATED runs reclaim. Sampled on
+        # the same monitor tick that drives the WDDM paging verdict. No-ops on hosts without NVML (the free
+        # read returns None, so no card is ever governed).
+        self._device_free_governor = DeviceFreeGovernor()
+        self._governor_states_by_device: dict[int, GovernorState] = {}
+        self._last_device_free_mb_by_device: dict[int, float] = {}
+        # The single-owner verified reclaim ladder: when the governor calls a card SATURATED it issues one
+        # pressure-relief rung per tick (newest idle model -> idle allocator caches -> older idle models ->
+        # lane pauses -> safety off GPU), then verifies the realized NVML device-free gain against the rung's
+        # promise before escalating. All process actions run through the scheduler (which owns lifecycle); this
+        # holds only the cross-tick verification state.
+        self._reclaim_ladder = VerifiedReclaimLadder()
+        # Monotonic time each card most recently entered continuous SATURATION (device-free below the hard
+        # floor), or absent when the card is not currently saturated. The last-rung kill reads its duration.
+        self._saturated_since_by_device: dict[int, float] = {}
+        # The per-step floor: a fast crawl detector. On INFERENCE_STEP heartbeats the parent compares each
+        # slot's observed per-step time to its expected per-step time; two consecutive steps each at or above
+        # the floor multiple, while the card is at PRESSURE or SATURATED, force the reclaim ladder to run this
+        # cycle without waiting for the whole-job elapsed-ratio rungs. Count of such triggers (run metrics)
+        # and the per-card force latch the governor tick consumes.
+        self._per_step_floor_triggers = 0
+        self._per_step_floor_latch_by_device: dict[int, bool] = {}
+        # Observational per-device VRAM attribution: reconcile the committed-VRAM ledger (each live GPU
+        # process's context + reserved) against the parent-side NVML device-total-used reading and a captured
+        # baseline. On WDDM this ledger arithmetic is the only early overcommit/paging signal (the driver
+        # silently spills to host RAM without failing an allocation or showing pressure). Strictly
+        # measurement + visibility here; it feeds no admission decision. Per-card so a multi-GPU host tracks
+        # each device independently.
+        self._vram_attribution_reconcilers: dict[int, VramAttributionReconciler] = {}
+        self._last_vram_attribution_time = 0.0
+        self._last_committed_vram_mb_by_device: dict[int, float] = {}
+        self._last_vram_drift_mb_by_device: dict[int, float | None] = {}
+        # The reconciler's captured shared-device baseline per card, exposed for the ledger-driven admission
+        # identity (capacity = total - baseline - noise). Populated alongside the committed/drift figures.
+        self._last_baseline_estimate_mb_by_device: dict[int, float | None] = {}
+        # Count of under-pressure idle-model unloads the physical-overcommit trigger has issued per card, for
+        # calibration visibility (run metrics). Not read by scheduling.
+        self._measured_unloads_issued_by_device: dict[int, int] = {}
         self._last_duty_cycle_log_time = 0.0
         self._last_no_jobs_seconds_at_duty_log = 0.0
         # Anchor for the periodic slot-duty attribution line: the scheduler's cumulative slot-second
@@ -1022,12 +1103,19 @@ class HordeWorkerProcessManager:
         # the model is unit-tested directly.
         self._performance_model = self._build_performance_model()
 
+        # Learned VRAM footprints: the parent observes measured device-memory peaks per (baseline,
+        # resolution, platform, stage) so the future VRAM arbiter has a measured prior that only ever
+        # raises the static per-model seed. Populated from memory reports; feeds no decision path yet.
+        self._learned_footprint_store = LearnedFootprintStore()
+        self._message_dispatcher.set_footprint_store(self._learned_footprint_store)
+
         self._message_dispatcher.set_metrics_handlers(
             on_job_metrics=self._on_job_metrics,
             on_download_metrics=self._run_metrics.on_download_metrics,
         )
         self._message_dispatcher.set_download_availability_handler(self._download_coordinator.on_download_availability)
         self._message_dispatcher.set_model_load_failure_handler(self._on_model_load_failure)
+        self._message_dispatcher.set_inference_step_observer(self._observe_inference_step)
         self._job_tracker.set_finalize_observer(self._on_job_finalized)
         self._process_lifecycle.set_process_recovery_observer(self._record_process_crash)
 
@@ -1055,6 +1143,11 @@ class HordeWorkerProcessManager:
             process_lifecycle=self._process_lifecycle,
         )
 
+        # The single VRAM arbiter is constructed before the scheduler and orchestrators so the same instance
+        # can be injected into each. It prices every device-memory request beside the live decision and records
+        # divergence; no live decision consults it and it issues no actuation.
+        self._vram_arbiter = VramArbiter()
+
         self._inference_scheduler = InferenceScheduler(
             state=self._state,
             process_map=self._process_map,
@@ -1079,6 +1172,15 @@ class HordeWorkerProcessManager:
         # Attribute between-jobs reload/respawn churn (model swaps, VRAM evictions, process cycles) into
         # the run metrics so the periodic duty-cycle line can name it alongside the per-job phase gaps.
         self._inference_scheduler.set_churn_observer(self._run_metrics.record_churn)
+        # The ledger-driven admission identity's baseline term is the reconciler's measured shared-device
+        # baseline, captured in the drift cadence on the manager. Feed it to the scheduler so its measured
+        # admission overlay sizes real capacity as ``total - baseline - noise`` per card.
+        self._inference_scheduler.set_admission_baseline_provider(self.latest_baseline_estimate_mb)
+        self._inference_scheduler.set_vram_arbiter(self._vram_arbiter)
+        # Share the single learned-footprint store (the dispatcher observes into it, the scheduler prices
+        # admission sampling peaks from it) so every observed peak and every priced estimate reference the same
+        # watermarks.
+        self._inference_scheduler.set_footprint_store(self._learned_footprint_store)
 
         self._post_process_orchestrator = PostProcessOrchestrator(
             process_map=self._process_map,
@@ -1100,6 +1202,35 @@ class HordeWorkerProcessManager:
                 )
             ),
         )
+        self._post_process_orchestrator.set_vram_arbiter(self._vram_arbiter)
+
+        # Disaggregated jobs whose decode completed; drained each loop into the safety pipeline (the
+        # orchestrator's completion callback is sync, but safety routing is async).
+        self._disaggregated_completions: list[
+            tuple[HordeJobInfo, list[HordeImageResult], GENERATION_STATE, DisaggregatedFault | None]
+        ] = []
+        self._disaggregation_orchestrator = DisaggregationOrchestrator(
+            find_encode_service=self._process_map.get_component_process,
+            find_sampler=self._process_map.get_process_by_horde_model_name,
+            find_image_lane=self._process_map.get_first_available_vae_lane_process,
+            loader_identity=self._disaggregation_loader_identity,
+            on_images_ready=self._on_disaggregated_images_ready,
+            find_process_by_id=self._process_map.get,
+            reserve_sampler_process=self._process_map.reserve_for_disaggregation,
+            release_sampler_process=self._process_map.release_disaggregation_reservation,
+            on_sampling_complete=self._on_disaggregation_sampling_complete,
+            reroute_monolithic=self._reroute_disaggregated_job_monolithic,
+            estimate_sampling_peak_mb=self._inference_scheduler.estimate_disaggregated_sampling_peak_mb,
+            estimate_decode_spike_mb=self._inference_scheduler.estimate_disaggregated_decode_spike_mb,
+            observe_sampling_peak=self._inference_scheduler.observe_disaggregated_sampling_peak,
+        )
+        self._disaggregation_orchestrator.set_vram_arbiter(self._vram_arbiter)
+        self._message_dispatcher.set_stage_result_handler(self._disaggregation_orchestrator.handle_stage_result)
+        self._inference_scheduler.set_disaggregation_hooks(
+            is_disaggregatable=self._is_disaggregatable_sdk_job,
+            is_disaggregation_class_eligible=self._disaggregation_class_eligible,
+            register_disaggregated=self._register_disaggregated_job,
+        )
 
         self._recovery_coordinator = WorkerRecoveryCoordinator(
             state=self._state,
@@ -1114,6 +1245,7 @@ class HordeWorkerProcessManager:
             bridge_data_provider=lambda: self.bridge_data,
             max_inference_processes_provider=lambda: self.max_inference_processes,
             abort_callback=lambda: self._abort(),
+            release_disaggregated_job=self._disaggregation_orchestrator.release_job,
         )
 
         self._job_submitter = JobSubmitter(
@@ -1141,6 +1273,7 @@ class HordeWorkerProcessManager:
             card_runtimes=self._card_runtimes,
             model_metadata=self._model_metadata,
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
+            admission_baseline_provider=self.latest_baseline_estimate_mb,
         )
 
         # Tracks the live spell and session totals of every pop/scheduling governor, fed once per control-loop
@@ -1525,6 +1658,196 @@ class HordeWorkerProcessManager:
         """Dispatch the next job pending post-processing to the dedicated lane, if any."""
         await self._post_process_orchestrator.start_post_processing()
 
+    def _disaggregation_loader_identity(self, job_info: HordeJobInfo) -> HordeStageModelMixin:
+        """Build the model-identity fields a disaggregated stage loads a subset of, from a job."""
+        sdk_job = job_info.sdk_api_job_info
+        loras = sdk_job.payload.loras
+        return HordeStageModelMixin(
+            horde_model_name=sdk_job.model or "",
+            will_load_loras=bool(loras),
+            seamless_tiling_enabled=bool(sdk_job.payload.tiling),
+        )
+
+    def _on_disaggregated_images_ready(
+        self,
+        job_info: HordeJobInfo,
+        images: list[HordeImageResult],
+        state: GENERATION_STATE,
+        fault: DisaggregatedFault | None,
+    ) -> None:
+        """Queue a completed disaggregated job's images for routing into the safety pipeline.
+
+        Called synchronously from the orchestrator; the async safety hand-off runs in the control loop
+        (:meth:`drive_disaggregation`) so decode completion never blocks the orchestrator. ``fault`` carries
+        the reason and faulting process id when the job faulted (None on success), so the synthetic result
+        the parent builds is not blank and does not misattribute the process.
+        """
+        self._disaggregated_completions.append((job_info, images, state, fault))
+
+    def _on_disaggregation_sampling_complete(self, job_info: HordeJobInfo) -> None:
+        """Free the sampler slot the instant a disaggregated job's sampling finishes.
+
+        Moves the job out of the inference concurrency cap into the decoding stage (it stays in-flight
+        through the image lane's decode), so the scheduler can admit the next job onto the released sampler.
+        """
+        self._job_tracker.mark_disaggregation_decoding(job_info.sdk_api_job_info)
+
+    def _reroute_disaggregated_job_monolithic(self, job_info: HordeJobInfo) -> None:
+        """Return a disaggregated job to the monolithic inference path (the orchestrator has released it).
+
+        Called synchronously by the orchestrator when a job's stage kept failing resource-class (device
+        out-of-memory) past the defer window: the job is still owned/tracked, so it is moved back to the
+        pending-inference queue (latched so the re-claim runs monolithic) rather than being faulted. The
+        scheduler then preloads and dispatches it via START_INFERENCE on the next cycle.
+        """
+        sdk_job = job_info.sdk_api_job_info
+        if not self._job_tracker.requeue_disaggregated_for_monolithic(sdk_job):
+            logger.error(
+                f"Disaggregation re-route could not return job {sdk_job.id_} to the monolithic queue; it is not "
+                "in a re-routable stage (it may have already completed or faulted).",
+            )
+            return
+        logger.opt(ansi=True).warning(
+            f"<fg #f0beff>Job {str(sdk_job.id_)[:8]} re-routed to the monolithic inference path after its "
+            "disaggregated stage could not clear device pressure within the defer window.</>",
+        )
+
+    def _disaggregation_class_eligible(self, sdk_job: ImageGenerateJobPopResponse) -> bool:
+        """Whether ``sdk_job`` belongs to the class of jobs that run disaggregated (stable, no liveness).
+
+        Class membership is a property of the job and the worker config alone: pipeline disaggregation is
+        enabled; the job is txt2img/img2img/remix with no control_type; its model's baseline is an SD1.5 or
+        SDXL family (the only v1-validated families, resolved from the loaded model reference, never guessed
+        from the name); and the job has not been re-routed out of the pipeline. It deliberately does not
+        consult live role processes or transient residency state, so residency forecasting charges a job that
+        will run disaggregated its sampler-only footprint even during a whole-card window when the lane is
+        paused: were this coupled to liveness, the forecast would flip to the monolithic footprint mid-window
+        and re-demand whole-card residency, a self-reinforcing loop that starves the encode lane.
+        """
+        if not self.bridge_data.enable_pipeline_disaggregation:
+            return False
+        if sdk_job.source_processing not in ("txt2img", "img2img", "remix"):
+            return False
+        if sdk_job.payload.control_type:
+            return False
+        if sdk_job.model is None:
+            return False
+        # A job re-routed to the monolithic path (its disaggregated stage kept failing resource-class past the
+        # defer window) is monolithic in every respect from then on: charged its full footprint and never
+        # re-claimed into the pipeline.
+        if self._job_tracker.is_disaggregation_declined(sdk_job):
+            return False
+        baseline = self._model_metadata.get_baseline(sdk_job.model)
+        return baseline is not None and str(baseline) in _DISAGGREGATION_V1_BASELINES
+
+    def _disaggregation_roles_live(self) -> bool:
+        """Whether both role processes the disaggregated pipeline needs are live and healthy.
+
+        Requires the encode-service (component) process and the VAE lane (the image lane). Liveness, not
+        idle-availability: a lane busy decoding the previous job is exactly the pipelined state, and the
+        orchestrator queues this job's decode until the lane frees. Requiring the lane idle here would demote
+        every job to monolithic the moment the pipeline started overlapping, defeating disaggregation. The
+        dedicated post-processing lane is NOT required: VAE stages run on the VAE lane, not on it.
+        """
+        if self._process_map.num_loaded_component_processes() < 1:
+            return False
+        return self._process_map.num_loaded_vae_lane_processes() >= 1
+
+    def _is_disaggregatable_sdk_job(self, sdk_job: ImageGenerateJobPopResponse) -> bool:
+        """Whether ``sdk_job`` should be dispatched down the disaggregated pipeline right now.
+
+        The dispatch-time predicate: the job is class-eligible AND both role processes are live AND no card is
+        currently holding a whole-card residency. Any failure leaves the job monolithic (its full-footprint
+        charges then apply automatically because it takes the normal path); that is the fallback, so there is
+        no re-queue-on-stall. A role dying after a job is claimed is backstopped by the orchestrator's
+        per-stage patience, not here. While a genuinely-heavy model holds a whole-card residency, new jobs
+        route monolithic rather than dispatching encodes into a card reserved for that model.
+        """
+        if not self._disaggregation_class_eligible(sdk_job):
+            return False
+        if not self._disaggregation_roles_live():
+            return False
+        return not self._inference_scheduler.is_whole_card_residency_active()
+
+    async def _register_disaggregated_job(
+        self,
+        sdk_job: ImageGenerateJobPopResponse,
+        sampler_process: HordeProcessInfo,
+    ) -> bool:
+        """Register a scheduled job with the orchestrator, pinned to the process chosen as its sampler.
+
+        Called from the scheduler at the dispatch seam in place of START_INFERENCE. Returns False when the
+        job's result-carrying info is not available (so the scheduler falls back to a monolithic dispatch).
+        """
+        job_info = await self._job_tracker.get_job_info(sdk_job)
+        if job_info is None:
+            return False
+        if self._disaggregation_orchestrator.has_job(job_info):
+            return True
+        self._disaggregation_orchestrator.register(
+            job_info,
+            needs_source_latent=sdk_job.source_processing in ("img2img", "remix"),
+            pinned_sampler_process_id=sampler_process.process_id,
+            pinned_sampler_launch_identifier=sampler_process.process_launch_identifier,
+        )
+        return True
+
+    async def drive_disaggregation(self) -> None:
+        """Advance the disaggregated pipeline: (re)dispatch stages and route completions.
+
+        Jobs enter the pipeline through the scheduler's dispatch seam (:meth:`_register_disaggregated_job`),
+        not here, so this only advances already-claimed jobs. The orchestrator's ``tick`` dispatches each
+        job's next stage to an available role process (and re-dispatches stages orphaned by a retired
+        process); completed jobs are routed into the safety pipeline the same way a monolithic inference
+        result is, so the downstream flow is unchanged.
+        """
+        # A crashed stage process is reaped from the map by the lifecycle recovery but never sends its
+        # result; an id-reusing replacement occupies the same slot id under a new launch. Reconcile against the
+        # live (id, launch) pairs so the orchestrator re-dispatches the orphaned stage from held state and
+        # detects a replacement as a retirement rather than mistaking it for the live process.
+        alive_launches = {
+            (process_id, process_info.process_launch_identifier)
+            for process_id, process_info in self._process_map.items()
+        }
+        self._disaggregation_orchestrator.reconcile_retired_processes(alive_launches)
+        self._disaggregation_orchestrator.tick()
+        if not self._disaggregated_completions:
+            return
+        completions = self._disaggregated_completions
+        self._disaggregated_completions = []
+        lane = self._process_map.get_first_available_vae_lane_process()
+        lane_pid = lane.process_id if lane is not None else 0
+        for job_info, images, state, fault in completions:
+            if fault is None:
+                info = ""
+                process_id = lane_pid
+            else:
+                info = self._format_disaggregated_fault_info(job_info, fault.reason)
+                # The orchestrator names the faulting child (or the pinned sampler for a parent-side fault);
+                # fall back to the image lane only when it could not, never to a wrong default like safety.
+                process_id = fault.faulted_process_id if fault.faulted_process_id is not None else lane_pid
+            result = HordeInferenceResultMessage(
+                process_id=process_id,
+                process_launch_identifier=0,
+                info=info,
+                state=state,
+                job_image_results=images if images else None,
+                sdk_api_job_info=job_info.sdk_api_job_info,
+            )
+            await self._message_dispatcher.handle_synthetic_inference_result(result)
+
+    @staticmethod
+    def _format_disaggregated_fault_info(job_info: HordeJobInfo, reason: str) -> str:
+        """Format a faulted disaggregated job's ``info`` in the monolithic ``Model: ... Error: ...`` shape.
+
+        The synthetic result's ``info`` is the parent's only fault signal: the resource-failure classifier
+        reads it for the out-of-memory markers and the log-analysis detectors read the model name off the
+        ``Model: <name>. Error: <reason>`` shape a real inference fault uses. Matching that shape here keeps a
+        disaggregated stage fault visible to both, where a blank ``info`` was invisible.
+        """
+        model = job_info.sdk_api_job_info.model or ""
+        return f"Disaggregated pipeline faulted. Model: {model}. Error: {reason}"
+
     _user_info_failed = False
     """Whether the API request to fetch user info failed."""
     _user_info_failed_reason: str | None = None
@@ -1841,6 +2164,379 @@ class HordeWorkerProcessManager:
             active=self._wddm_elevated_streak >= self._WDDM_PAGING_CONSECUTIVE_SAMPLES,
         )
 
+    def _read_device_free_total_mb(self, device_index: int) -> tuple[float, float] | None:
+        """Return device ``index``'s ``(free_mb, total_mb)`` via NVML, torch-free, or None when unavailable.
+
+        Read from the parent (outside any CUDA workload) via NVML directly (never torch), so the figure is the
+        device-wide truth and the orchestrator stays torch-free. On Windows/WDDM the device-level free figure
+        is the only signal that does not lie once the driver demotes an over-commit to system memory. None off
+        NVIDIA / when NVML is unavailable, so the governor simply governs no card on those hosts.
+        """
+        try:
+            from hordelib.utils.nvml import get_device_memory_mb
+        except Exception as e:  # noqa: BLE001 - "no NVML" is an expected environment, not a crash
+            logger.debug(f"NVML device-free read unavailable (import failed): {e}")
+            return None
+        memory = get_device_memory_mb(device_index)
+        if memory is None:
+            return None
+        return float(memory.free_mb), float(memory.total_mb)
+
+    def _evaluate_device_free_governor(self) -> None:
+        """Sample NVML device free/total per driven card, debounce the governor, and act on its state.
+
+        This is the device-free governor's tick, sharing the monitor cadence that drives the WDDM paging
+        verdict. For each card the parent already drives, it reads the truthful device-level free VRAM, folds
+        it through the per-device debounced state machine, and records the state for the arbiter snapshot and
+        the run metrics. On a card at PRESSURE it holds new VRAM growth in the scheduler (no new model brought
+        to VRAM on a process that does not already hold it, no safety GPU restore, no paused-lane restart);
+        in-flight sampling is untouched. On a card at SATURATED it clears the hold's precedence and drives one
+        reclaim pass so the card gets room back on the same tick it crossed the cliff. HEALTHY lifts the hold.
+        A card with no NVML free reading is left ungoverned (the read returns None).
+        """
+        device_indices = {process_info.device_index for process_info in self._process_map.values()}
+        for device_index in sorted(device_indices):
+            reading = self._read_device_free_total_mb(device_index)
+            if reading is None:
+                continue
+            device_free_mb, total_mb = reading
+            sample = self._device_free_governor.observe(
+                device_index,
+                device_free_mb=device_free_mb,
+                total_vram_mb=total_mb if total_mb > 0 else None,
+            )
+            self._governor_states_by_device[device_index] = sample.state
+            self._last_device_free_mb_by_device[device_index] = device_free_mb
+
+            if sample.transitioned:
+                logger.warning(
+                    f"Device-free governor on device {device_index}: {sample.previous_state.value} -> "
+                    f"{sample.state.value} (free {device_free_mb:.0f}MB; soft floor {sample.soft_floor_mb:.0f}MB, "
+                    f"hard floor {sample.hard_floor_mb:.0f}MB of total {total_mb:.0f}MB)",
+                )
+
+            hold_growth = sample.state in (GovernorState.PRESSURE, GovernorState.SATURATED)
+            self._inference_scheduler.set_vram_growth_hold(device_index, hold_growth)
+            self._inference_scheduler.set_governor_state(device_index, sample.state)
+
+            # Track continuous SATURATION so the last-rung kill can require it has held for a bounded time.
+            if sample.state == GovernorState.SATURATED:
+                self._saturated_since_by_device.setdefault(device_index, time.monotonic())
+            else:
+                self._saturated_since_by_device.pop(device_index, None)
+
+            # The per-step floor forces the ladder to run even under PRESSURE (before full saturation) when a
+            # slot is crawling: the latch is set on the crawling heartbeat and consumed here. It clears when the
+            # card recovers to HEALTHY, so the ladder returns to being SATURATED-driven.
+            if sample.state == GovernorState.HEALTHY:
+                self._per_step_floor_latch_by_device.pop(device_index, None)
+            forced_by_per_step_floor = self._per_step_floor_latch_by_device.get(device_index, False) and (
+                sample.state in (GovernorState.PRESSURE, GovernorState.SATURATED)
+            )
+
+            # Drive the single-owner verified reclaim ladder every governed tick: while SATURATED (or forced by
+            # the per-step floor) it issues and verifies one rung per sample; once the card recovers the call
+            # clears the episode. The ladder is scoped to the card the governor sampled.
+            self._reclaim_ladder.on_tick(
+                device_index,
+                saturated=sample.state == GovernorState.SATURATED or forced_by_per_step_floor,
+                healthy=sample.state == GovernorState.HEALTHY,
+                device_free_mb=device_free_mb,
+                actuator=self._inference_scheduler,
+                ladder_builder=lambda dev=device_index: build_reclaim_ladder(
+                    self._inference_scheduler.build_reclaim_ladder_candidates(dev),
+                ),
+            )
+
+    def latest_device_free_mb(self, device_index: int = 0) -> float | None:
+        """Return the last NVML device-level free VRAM (MB) the governor sampled for a card (calibration)."""
+        return self._last_device_free_mb_by_device.get(device_index)
+
+    def _device_saturation_duration_seconds(self, device_index: int) -> float:
+        """Return how long a card has been continuously SATURATED (seconds), or 0.0 when it is not.
+
+        The last-rung kill's clock: the governor tick stamps the monotonic instant a card enters continuous
+        SATURATION and clears it the moment the card leaves that state, so a card that briefly dipped and
+        recovered never accrues time toward the kill horizon.
+        """
+        since = self._saturated_since_by_device.get(device_index)
+        return (time.monotonic() - since) if since is not None else 0.0
+
+    _PER_STEP_FLOOR_RATIO = 3.0
+    """Multiple of a slot's expected per-step time at or above which one sampling step counts as crawling.
+
+    A demand-paged step runs at system-memory bandwidth, measured at 3x-13x its healthy pace with nothing
+    between on the reference card; a legitimately heavy job crawls uniformly near its own expected pace. Three
+    times expected cleanly separates the two: a genuinely slow-but-honest job sits below it, a paged one well
+    above."""
+
+    _PER_STEP_FLOOR_CONSECUTIVE_STEPS = 2
+    """Consecutive steps each at or above the floor multiple before the slot is judged crawling.
+
+    Two consecutive slow steps rule out a lone stalled iteration (a transient the job samples through) while
+    still detecting a genuine crawl within seconds, far sooner than the whole-job elapsed-ratio grade."""
+
+    def _observe_inference_step(self, process_id: int) -> None:
+        """Fold one INFERENCE_STEP heartbeat into the per-step floor crawl detector (parent side).
+
+        Compares the slot's observed per-step time (the interval since its previous beat) against its expected
+        per-step time (the performance model's expected sampling seconds divided by the job's payload steps).
+        The first step of a job is skipped: its inter-beat gap includes the one-time cold load/encode work.
+        Guards every division and returns without guessing when any term is unavailable (no expected time on a
+        cold start, no payload steps). Two consecutive steps at or above the floor multiple mark the slot
+        crawling; when the card is also at PRESSURE or SATURATED that forces the reclaim ladder to run this
+        cycle (via a per-card latch the governor tick consumes) and counts a trigger. A step back under the
+        floor clears the crawl, so a slot that recovers in place (the squatter freed) is no longer a kill
+        candidate.
+        """
+        process_info = self._process_map.get(process_id)
+        if process_info is None or process_info.process_type != HordeProcessType.INFERENCE:
+            return
+        job = process_info.last_job_referenced
+        expected_total = process_info.current_job_expected_sampling_seconds
+        if job is None or expected_total is None or expected_total <= 0:
+            return
+        steps = job.payload.ddim_steps
+        if not isinstance(steps, int) or steps <= 0:
+            return
+        # Skip the first sampling step of the job (its inter-beat gap includes cold load/encode work).
+        if process_info.heartbeats_inference_steps <= 1:
+            process_info.consecutive_slow_per_steps = 0
+            return
+        expected_per_step_seconds = expected_total / steps
+        observed_per_step_seconds = process_info.last_heartbeat_delta
+        if expected_per_step_seconds <= 0 or observed_per_step_seconds <= 0:
+            return
+
+        if observed_per_step_seconds >= self._PER_STEP_FLOOR_RATIO * expected_per_step_seconds:
+            process_info.consecutive_slow_per_steps += 1
+        else:
+            # A step back at healthy pace: the slot recovered in place, so clear the crawl signal.
+            process_info.consecutive_slow_per_steps = 0
+            process_info.current_job_per_step_floor_tripped = False
+            return
+
+        if process_info.consecutive_slow_per_steps < self._PER_STEP_FLOOR_CONSECUTIVE_STEPS:
+            return
+
+        newly_tripped = not process_info.current_job_per_step_floor_tripped
+        process_info.current_job_per_step_floor_tripped = True
+
+        device_index = process_info.device_index
+        governor_state = self._governor_states_by_device.get(device_index, GovernorState.HEALTHY)
+        if governor_state not in (GovernorState.PRESSURE, GovernorState.SATURATED):
+            return
+
+        self._per_step_floor_latch_by_device[device_index] = True
+        if newly_tripped:
+            self._per_step_floor_triggers += 1
+            logger.warning(
+                f"Per-step floor tripped on process {process_id} (device {device_index}, "
+                f"{governor_state.value}): {process_info.consecutive_slow_per_steps} consecutive steps at "
+                f">= {self._PER_STEP_FLOOR_RATIO:.0f}x expected per-step time "
+                f"(~{observed_per_step_seconds:.1f}s vs ~{expected_per_step_seconds:.1f}s); forcing reclaim.",
+            )
+
+    _VRAM_ATTRIBUTION_INTERVAL_SECONDS = 5.0
+    """Seconds between committed-VRAM ledger reconciliations (coarse: this is drift telemetry, not a gate)."""
+
+    def _read_device_used_mb(self, device_index: int) -> float | None:
+        """Return device ``index``'s device-wide used VRAM (MB) via NVML, torch-free, or None when unavailable.
+
+        NVML device-total-used is the only truthful device-wide figure on Windows/WDDM, where ``mem_get_info``
+        is a per-process view; it is read here from the *parent* (outside any CUDA workload) so the number is
+        not a per-process artefact, and via NVML directly (never torch) so the orchestrator stays torch-free.
+        None off NVIDIA / when NVML is unavailable, so the reconciliation degrades rather than raising.
+        """
+        try:
+            from hordelib.utils.nvml import get_device_memory_mb
+        except Exception as e:  # noqa: BLE001 - "no NVML" is an expected environment, not a crash
+            logger.debug(f"NVML device-used read unavailable (import failed): {e}")
+            return None
+        memory = get_device_memory_mb(device_index)
+        if memory is None:
+            return None
+        return float(memory.used_mb)
+
+    def _evaluate_vram_attribution_drift(self) -> None:
+        """Reconcile the committed-VRAM ledger against device-used VRAM per card, warning on persistent drift.
+
+        Observational only: sums each live GPU process's ``context_constant + process_reserved_mb +
+        process_aimdo_mb`` (the two memory terms disjoint: torch allocator plus the engine's direct-IO pool,
+        which is inert and 0 in the current embedding) into the committed ledger, captures the device baseline
+        at quiet moments, and reconciles both against the
+        parent-side NVML device-used reading. A persistent positive drift means the device holds VRAM the
+        worker's own ledger plus baseline cannot account for, which on WDDM is the only early
+        overcommit/paging signal that exists (the driver spills silently to host RAM). Rate-limited to one
+        warning per card per interval. When any ledger contributor's memory report has aged past the staleness
+        bound the ledger is incomparable to the device anchor, so reconciliation is skipped for that card
+        (logged at debug): staleness-aware reconciliation prevents both false drift alarms and false
+        confidence. Degrades to recording committed-vs-capacity when no device-used source exists on this
+        host; never feeds admission.
+        """
+        now = time.time()
+        if now - self._last_vram_attribution_time < self._VRAM_ATTRIBUTION_INTERVAL_SECONDS:
+            return
+        self._last_vram_attribution_time = now
+
+        context_constant_mb = self._inference_scheduler.resolved_context_constant_mb()
+        device_indices = {process_info.device_index for process_info in self._process_map.values()}
+        for device_index in sorted(device_indices):
+            reconciler = self._vram_attribution_reconcilers.setdefault(device_index, VramAttributionReconciler())
+            committed_mb = self._process_map.committed_vram_mb(
+                context_constant_mb=context_constant_mb,
+                device_index=device_index,
+            )
+            oldest_report_age = self._process_map.oldest_committed_report_age_seconds(
+                now=now,
+                device_index=device_index,
+            )
+            committed_is_stale = oldest_report_age is not None and oldest_report_age > _REPORT_STALENESS_SECONDS
+            device_used_mb = self._read_device_used_mb(device_index)
+            any_model_resident = any(
+                process_info.device_index == device_index and process_info.loaded_horde_model_name is not None
+                for process_info in self._process_map.values()
+            )
+            reconciler.note_baseline(device_used_mb, any_model_resident=any_model_resident)
+            observation = reconciler.observe(
+                device_used_mb=device_used_mb,
+                committed_vram_mb=committed_mb,
+                committed_is_stale=committed_is_stale,
+            )
+
+            self._last_committed_vram_mb_by_device[device_index] = committed_mb
+            self._last_vram_drift_mb_by_device[device_index] = observation.drift_mb
+            self._last_baseline_estimate_mb_by_device[device_index] = reconciler.baseline_estimate_mb
+
+            # Pressure-driven unload: when the worker's own committed footprint plus the shared baseline
+            # physically over-commits the card (streak-confirmed on fresh reports), reclaim one idle resident
+            # model. Keyed on the PHYSICAL ceiling, not the admission ceiling: legitimate transient sampling
+            # peaks routinely exceed the admission ceiling and must not evict anything, so only a genuine
+            # over-subscription of device VRAM (the leading edge of a WDDM host-RAM spill) reclaims.
+            total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+            pressure = reconciler.observe_physical_pressure(
+                committed_vram_mb=committed_mb,
+                total_vram_mb=total_vram_mb,
+                committed_is_stale=committed_is_stale,
+            )
+            if pressure.should_unload:
+                reclaimed = self._inference_scheduler.reclaim_one_idle_model_under_pressure(
+                    device_index=device_index,
+                )
+                if reclaimed:
+                    self._measured_unloads_issued_by_device[device_index] = (
+                        self._measured_unloads_issued_by_device.get(device_index, 0) + 1
+                    )
+                logger.warning(
+                    f"VRAM physical overcommit on device {device_index}: committed {committed_mb:.0f}MB + "
+                    f"baseline {reconciler.baseline_estimate_mb:.0f}MB exceeds total {total_vram_mb:.0f}MB "
+                    f"({pressure.consecutive_over_ceiling} consecutive). "
+                    f"{'Reclaimed an idle resident model.' if reclaimed else 'No idle resident model to reclaim.'}",
+                )
+
+            if committed_is_stale:
+                logger.debug(
+                    f"Skipping VRAM attribution drift on device {device_index}: a ledger contributor's memory "
+                    f"report is stale ({oldest_report_age:.0f}s > {_REPORT_STALENESS_SECONDS:.0f}s), so the "
+                    f"committed ledger is incomparable to the device anchor.",
+                )
+            elif observation.should_warn:
+                logger.warning(
+                    f"VRAM attribution drift on device {device_index}: "
+                    f"{self._format_vram_attribution_snapshot(device_index, observation, context_constant_mb, now)}",
+                )
+
+    def _format_vram_attribution_snapshot(
+        self,
+        device_index: int,
+        observation: DriftObservation,
+        context_constant_mb: float,
+        now: float,
+    ) -> str:
+        """Build the full attribution snapshot for a drift warning: per-process charges plus device figures.
+
+        Each process's memory-report age (how long since it last sampled) is surfaced alongside its charge so
+        a warning that fires just under the staleness bound shows how fresh the ledger it was computed from is.
+        """
+        parts: list[str] = []
+        for process_id, process_info in sorted(self._process_map.items()):
+            if process_info.device_index != device_index or process_info.process_reserved_mb is None:
+                continue
+            peak = process_info.process_peak_reserved_mb if process_info.process_peak_reserved_mb is not None else 0
+            aimdo = process_info.process_aimdo_mb if process_info.process_aimdo_mb is not None else 0
+            age = f"{now - process_info.report_sampled_at:.0f}s" if process_info.report_sampled_at is not None else "?"
+            parts.append(
+                f"#{process_id}({process_info.process_type.name.lower()}): "
+                f"reserved={process_info.process_reserved_mb}MB aimdo={aimdo}MB peak={peak}MB "
+                f"ctx={context_constant_mb:.0f}MB age={age}",
+            )
+        anchor = f"{observation.baseline_estimate_mb:.0f}" if observation.baseline_estimate_mb is not None else "?"
+        used = f"{observation.device_used_mb:.0f}" if observation.device_used_mb is not None else "?"
+        drift = f"{observation.drift_mb:.0f}" if observation.drift_mb is not None else "?"
+        return (
+            f"processes=[{', '.join(parts) if parts else 'none'}] baseline_anchor={anchor}MB "
+            f"committed={observation.committed_vram_mb:.0f}MB device_used={used}MB drift={drift}MB "
+            f"(WDDM: ledger drift is the only early overcommit/paging signal)"
+        )
+
+    def _begin_vram_arbiter_cycle(self) -> None:
+        """Freeze the cycle's device VRAM measurement into the single arbiter before governance runs.
+
+        Assembled once per control-loop iteration from figures the parent already holds (the scheduler's
+        ledger-and-headroom terms plus the disaggregation orchestrator's in-flight sampling peaks), so the
+        arbiter prices every gated and advisory consult this cycle against one coherent picture without a
+        fresh NVML read.
+        """
+        active_sampling_peaks_total_mb = self._disaggregation_orchestrator.active_sampling_peaks_total_mb()
+        reclaim_unresolved_by_device = {
+            device_index: self._reclaim_ladder.is_saturation_unresolved(device_index)
+            for device_index in self._governor_states_by_device
+        }
+        snapshot = self._inference_scheduler.build_vram_arbiter_snapshot(
+            active_sampling_peaks_total_mb=active_sampling_peaks_total_mb,
+            governor_states=self._governor_states_by_device,
+            device_free_mb_by_device=self._last_device_free_mb_by_device,
+            reclaim_unresolved_by_device=reclaim_unresolved_by_device,
+        )
+        self._vram_arbiter.begin_cycle(snapshot)
+
+    def latest_committed_vram_mb(self, device_index: int = 0) -> float | None:
+        """Return the last observed committed-VRAM ledger sum (MB) for a card, or None if not yet reconciled.
+
+        Visibility accessor for the session harness's VRAM trace / calibration; not consumed by scheduling.
+        """
+        return self._last_committed_vram_mb_by_device.get(device_index)
+
+    def latest_vram_attribution_drift_mb(self, device_index: int = 0) -> float | None:
+        """Return the last observed attribution drift (MB) for a card, or None when uncomputed/not reconciled.
+
+        Visibility accessor for the session harness's VRAM trace / calibration; not consumed by scheduling.
+        """
+        return self._last_vram_drift_mb_by_device.get(device_index)
+
+    def latest_baseline_estimate_mb(self, device_index: int | None = 0) -> float | None:
+        """Return the reconciler's last captured shared-device baseline (MB) for a card, or None if uncaptured.
+
+        The baseline (OS/desktop/other apps' VRAM the worker attributes to no process) the ledger-driven
+        admission identity subtracts from the device total to form real capacity. Mirrors
+        :meth:`latest_committed_vram_mb`; provided to the scheduler as its admission baseline source. A None
+        device index (the scheduler's single-GPU / worker-wide key) maps to the lowest card (index 0), where
+        the single-GPU drift cadence stores its baseline.
+        """
+        return self._last_baseline_estimate_mb_by_device.get(device_index if device_index is not None else 0)
+
+    def latest_admission_denials(self, device_index: int = 0) -> int:
+        """Return the count of measured-floor admission denials for a card this run (calibration visibility)."""
+        return self._inference_scheduler.latest_admission_denials(device_index=device_index)
+
+    def latest_measured_unloads_issued(self, device_index: int = 0) -> int:
+        """Return the count of physical-overcommit pressure unloads issued for a card this run."""
+        return self._measured_unloads_issued_by_device.get(device_index, 0)
+
+    def latest_admission_headroom_mb(self, device_index: int = 0) -> float | None:
+        """Return the last observed measured-floor admission headroom (MB) for a card, or None when unapplied."""
+        return self._inference_scheduler.latest_admission_headroom_mb(device_index=device_index)
+
     async def _control_loop_tick(self) -> bool:
         """Run a single iteration of the process control loop.
 
@@ -1861,6 +2557,8 @@ class HordeWorkerProcessManager:
 
             await self.receive_and_handle_process_messages()
             self._evaluate_wddm_paging()
+            self._evaluate_device_free_governor()
+            self._evaluate_vram_attribution_drift()
             self._download_coordinator.maybe_start_safety_processes()
             self._download_coordinator.maybe_start_inference_processes()
             # A child may have just reported a CPU-only torch build (image generation disabled); collapse the
@@ -1878,6 +2576,9 @@ class HordeWorkerProcessManager:
 
             if len(self._job_tracker.jobs_pending_post_processing) > 0:
                 await self.start_post_processing()
+
+            if self.bridge_data.enable_pipeline_disaggregation:
+                await self.drive_disaggregation()
 
             free_process_or_model_loaded = self.is_free_inference_process_available() or self.is_any_model_preloaded()
 
@@ -1906,6 +2607,7 @@ class HordeWorkerProcessManager:
             # forever (the hold keeps the queue empty, and an empty queue would keep the tick from ever
             # running). Placed after the housekeeping above so the governor snapshots the same process-map
             # and pause state a scheduling cycle would.
+            self._begin_vram_arbiter_cycle()
             self._inference_scheduler.run_governance_tick()
 
             if free_process_or_model_loaded and len(self._job_tracker.jobs_pending_inference) > 0:
@@ -1919,6 +2621,8 @@ class HordeWorkerProcessManager:
                 await self._sleep(self._loop_interval / 2)
             self._process_lifecycle._replace_all_safety_process()
             self._process_lifecycle._replace_all_post_process_process()
+            self._process_lifecycle._replace_all_component_process()
+            self._process_lifecycle._replace_all_vae_lane_process()
 
             # Backstop the per-slot recovery: punt any job left in-progress with no owning live slot
             # before it can wedge the head of the queue.
@@ -1961,6 +2665,7 @@ class HordeWorkerProcessManager:
                 ):
                     self._process_lifecycle.end_safety_processes()
                     self._process_lifecycle.end_post_process_processes()
+                    self._process_lifecycle.end_component_processes()
 
             if self.is_time_for_shutdown():
                 return False
@@ -2237,10 +2942,26 @@ class HordeWorkerProcessManager:
         return self._run_metrics.snapshot(
             num_process_recoveries=self._process_lifecycle._num_process_recoveries,
             num_job_slowdowns=self._job_submitter.num_job_slowdowns,
+            job_slowdown_events=self._process_lifecycle._num_slowdown_events,
+            paging_victim_replacements=self._process_lifecycle._paging_victim_replacements,
             time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
             disk_min_free_bytes=self._disk_monitor.min_free_bytes,
             phase=phase,
             process_state_summary=process_state_summary,
+            committed_vram_mb=self.latest_committed_vram_mb(),
+            vram_attribution_drift_mb=self.latest_vram_attribution_drift_mb(),
+            admission_denials=self.latest_admission_denials(),
+            measured_unloads_issued=self.latest_measured_unloads_issued(),
+            admission_headroom_mb=self.latest_admission_headroom_mb(),
+            admission_foreign_pressure_defers=self._vram_arbiter.admission_foreign_pressure_defers,
+            starvation_diagnostics=self._vram_arbiter.starvation_diagnostics,
+            device_free_mb=self.latest_device_free_mb(),
+            governor_pressure_events=self._device_free_governor.total_pressure_events(),
+            governor_saturation_events=self._device_free_governor.total_saturation_events(),
+            ladder_rungs_issued=self._reclaim_ladder.rungs_issued,
+            ladder_verified_frees_mb=self._reclaim_ladder.verified_frees_mb,
+            ladder_verification_shortfalls=self._reclaim_ladder.verification_shortfalls,
+            per_step_floor_triggers=self._per_step_floor_triggers,
         )
 
     def describe_run_phase(self) -> tuple[str, str]:
@@ -3655,6 +4376,8 @@ class HordeWorkerProcessManager:
         run_metrics = self._run_metrics.snapshot(
             num_process_recoveries=self._process_lifecycle._num_process_recoveries,
             num_job_slowdowns=self._job_submitter.num_job_slowdowns,
+            job_slowdown_events=self._process_lifecycle._num_slowdown_events,
+            paging_victim_replacements=self._process_lifecycle._paging_victim_replacements,
             time_spent_no_jobs_available=self._job_popper.time_spent_no_jobs_available,
             disk_min_free_bytes=self._disk_monitor.min_free_bytes,
         )

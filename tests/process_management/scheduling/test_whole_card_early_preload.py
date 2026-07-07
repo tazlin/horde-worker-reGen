@@ -529,3 +529,53 @@ class TestPrestagedHeadWaitsForSoleResidency:
         assert started is True
         assert flux_holder.last_control_flag == HordeControlFlag.START_INFERENCE
         assert flux_head in job_tracker.jobs_in_progress
+
+
+class TestDisaggregationClassSuppressesWholeCardDemand:
+    """A disaggregation-class job's sampler-only footprint co-resides by design and never claims the card."""
+
+    def test_disagg_class_job_yields_no_whole_card_demand_even_with_lane_paused(self) -> None:
+        """A disagg-class SDXL head returns FALL_THROUGH from the whole-card decision (no exclusive demand).
+
+        The decision is made on class-eligibility, not liveness, so it holds even when the disaggregation role
+        processes are absent/paused (as in this scheduler, which has no component or image lane): a forecast
+        that would otherwise demand the whole card must not, or the paused-lane window would re-demand the card
+        and starve the encode lane.
+        """
+        from horde_worker_regen.process_management.scheduling.inference_scheduler import _WholeCardDemandOutcome
+
+        scheduler, _process_map, _job_tracker, _busy, idle = _build_overlap_scheduler(free_mb=2000.0)
+        scheduler._is_disaggregation_class_eligible = lambda _job: True  # type: ignore[method-assign]
+
+        sdxl_head = make_job_pop_response(_RESIDENT_SDXL)
+        # The forecast is irrelevant: class-eligibility short-circuits the decision before it is consulted.
+        outcome = scheduler._decide_whole_card_demand(
+            sdxl_head,
+            idle[0],
+            cast(Any, Mock()),
+            _SDXL_BASELINE,
+            is_head_blocker=True,
+            target_device_index=None,
+        )
+        assert outcome is _WholeCardDemandOutcome.FALL_THROUGH
+
+    def test_non_disagg_class_job_is_not_short_circuited(self) -> None:
+        """A job that is not disaggregation-class still runs the normal whole-card demand evaluation."""
+        scheduler, _process_map, _job_tracker, _busy, idle = _build_overlap_scheduler(free_mb=2000.0)
+        scheduler._is_disaggregation_class_eligible = lambda _job: False  # type: ignore[method-assign]
+
+        # A forecast with no residency demand yields FALL_THROUGH via the normal path, proving the guard did
+        # not swallow the evaluation: the outcome comes from residency_demanded, not the class short-circuit.
+        sdxl_head = make_job_pop_response(_RESIDENT_SDXL)
+        forecast = scheduler._forecast_streaming(sdxl_head, _SDXL_BASELINE)
+        outcome = scheduler._decide_whole_card_demand(
+            sdxl_head,
+            idle[0],
+            forecast,
+            _SDXL_BASELINE,
+            is_head_blocker=True,
+            target_device_index=None,
+        )
+        from horde_worker_regen.process_management.scheduling.inference_scheduler import _WholeCardDemandOutcome
+
+        assert isinstance(outcome, _WholeCardDemandOutcome)

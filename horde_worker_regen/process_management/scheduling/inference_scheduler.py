@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import enum
+import sys
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
 import psutil
@@ -13,6 +14,7 @@ from horde_model_reference.model_reference_records import ImageGenerationModelRe
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
+from horde_worker_regen.compute_mode import is_cpu_only_install
 from horde_worker_regen.consts import KNOWN_SLOW_WORKFLOWS, VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
@@ -28,17 +30,40 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
     ModelLoadState,
 )
-from horde_worker_regen.process_management.jobs.job_models import LineSkip, NextJobAndProcess
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo, LineSkip, NextJobAndProcess
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
-from horde_worker_regen.process_management.lifecycle.process_lifecycle import ProcessLifecycleManager
+from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
 from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
+from horde_worker_regen.process_management.resources.admission_identity import (
+    AdmissionVerdict,
+    admission_noise_buffer_mb,
+    evaluate_admission,
+)
+from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.resources.model_serviceability import (
+    ModelServiceabilityVerdict,
+    assess_model_serviceability,
+    model_footprint_figures_for_baseline,
+)
+from horde_worker_regen.process_management.resources.reclaim_ladder import (
+    CacheReleaseTarget,
+    IdleResidentModel,
+    LadderCandidates,
+    LaneReclaimCandidate,
+    ReclaimRung,
+    ReclaimRungKind,
+    VerifiedReclaimLadder,
+    build_reclaim_ladder,
+)
 from horde_worker_regen.process_management.resources.resource_budget import (
+    _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
+    BudgetVerdict,
     CommittedReserveLedger,
     RamBudget,
     RamPressureVerdict,
@@ -49,12 +74,31 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     effective_inference_reserve_mb,
     forecast_weight_streaming,
     is_model_locally_unservable_for,
+    platform_context_constant_mb,
+    predict_job_decode_spike_mb,
     predict_job_footprint_mb,
     predict_job_post_processing_vram_mb,
+    predict_job_sampler_only_vram_mb,
     predict_job_sampling_vram_mb,
     predict_job_weight_mb,
 )
 from horde_worker_regen.process_management.resources.run_metrics import ChurnKind
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    ActuatorCommand,
+    DeviceVramState,
+    MeasuredVramSnapshot,
+    VramArbiter,
+    VramDisposition,
+    VramRequest,
+    VramRequestKind,
+)
+from horde_worker_regen.process_management.resources.vram_attribution import _REPORT_STALENESS_SECONDS
+from horde_worker_regen.process_management.resources.vram_footprints import (
+    FootprintKey,
+    FootprintStage,
+    LearnedFootprintStore,
+    ResolutionBucket,
+)
 from horde_worker_regen.process_management.scheduling.context_overhead_model import ContextOverheadModel
 from horde_worker_regen.process_management.scheduling.governance import (
     AdmissionDecision,
@@ -78,8 +122,6 @@ from horde_worker_regen.process_management.scheduling.governance import (
     SetPopHold,
     StopTrackingShedCard,
     StopTrackingWorkerShed,
-    VramGateResult,
-    VramReclaimOutcome,
     WholeCardResidency,
     WholeCardResidencyMachine,
     WorkerProcessShedState,
@@ -89,7 +131,6 @@ from horde_worker_regen.process_management.scheduling.governance import (
     decide_process_reduction,
     decide_ram_reclaim_outcome,
     decide_shed_card_restore,
-    decide_vram_reclaim_outcome,
     max_coresident_for_peak,
     preload_concurrency_blocked,
     select_head_room_process_id,
@@ -97,13 +138,17 @@ from horde_worker_regen.process_management.scheduling.governance import (
 from horde_worker_regen.process_management.scheduling.model_affinity import affinity_active
 from horde_worker_regen.process_management.scheduling.performance_model import PerformanceModel, signature_from_job
 from horde_worker_regen.process_management.scheduling.slot_duty import SlotDutyAccumulator, SlotDutyBucket
-from horde_worker_regen.process_management.scheduling.workload_flow import POST_PROCESS_RESERVE_FLOW
+from horde_worker_regen.process_management.scheduling.workload_flow import (
+    POST_PROCESS_RESERVE_FLOW,
+    PRELOAD_ADMISSION_FLOW,
+)
 from horde_worker_regen.telemetry_spans import span_preload_model
 from horde_worker_regen.utils.config_coercion import config_number
 from horde_worker_regen.utils.job_utils import (
     get_single_job_magnitude as _get_single_job_effective_megapixelsteps,
 )
 from horde_worker_regen.utils.job_utils import line_skip_candidate_emps_limit
+from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
 
 
 @dataclass(frozen=True)
@@ -164,13 +209,36 @@ or a changed reason still logs immediately, so no distinct information is lost."
 _LINE_SKIP_REJECTION_LOG_MAX_KEYS = 256
 """Cap on remembered (candidate, reason) throttle keys before stale ones are pruned."""
 
-_HEAD_STARVATION_FORCE_ADMIT_SECONDS = 15.0
-"""How long the head-of-queue job may be budget-deferred onto an otherwise-idle device before it is
-force-admitted best-effort. Deliberately under the recovery supervisor's
-``_MIN_STRUCTURAL_QUEUE_WEDGE_SECONDS`` (20s) so a self-inflicted budget-defer wedge resolves by
-admitting one head onto an idle card, rather than tripping a save-our-ship soft reset that respawns
-every pool and faults the whole backlog. Only runs while no live job holds the device, so it never
-re-introduces the multi-process over-commit the budget guards against."""
+_RELEASE_CACHE_MIN_RECLAIMABLE_MB = 256.0
+"""Minimum reclaimable allocator cache (MB) a GPU process must hold to qualify as a RELEASE_CACHE target.
+
+A RELEASE_CACHE actuation runs ``torch.cuda.empty_cache`` on the lane, which returns only the allocator's
+reserved-but-unallocated blocks (``process_reserved_mb - process_allocated_mb``); a process whose reservation
+is its resident weights or components (a component/VAE/post-process lane holding encoders, allocated close to
+reserved) has no such cache, so asking it to release frees nothing. Requiring this measured margin keeps a
+resident-weight lane out of the release-target set so the escalation ladder does not emit a rung that can
+never yield, which would otherwise keep the ladder non-empty forever and defer a head that reclaim can
+never actually relieve."""
+
+_SAFETY_GPU_LOAD_CHARGE_MB = 3044.0
+"""The device VRAM (MB) charged when the safety process is loaded onto the GPU, for the arbiter's SAFETY_LOAD
+gate. A documented seed matching the measured reserved footprint of the on-GPU safety context (DeepDanbooru,
+CLIP, and the aesthetic head plus their CUDA context); the worker holds no learned safety footprint, so this
+static figure prices the safety load rather than a per-run watermark. Deliberately conservative: erring high
+keeps safety off-GPU one more cycle rather than restoring it onto a card it would over-commit."""
+
+_SAFETY_PLACEMENT_PAUSE_STREAK = 2
+"""Consecutive control cycles the safety charge must fail to fit beside the largest learned solo sampling peak
+before the runtime safety-placement policy moves safety off the GPU. Small but greater than one so a single
+transient reading (a stale watermark, a momentary over-commit as a model loads) does not evict safety; paired
+with :data:`_SAFETY_PLACEMENT_RESTORE_STREAK` it forms the hysteresis band that keeps the policy from flapping
+the safety process on and off the card every cycle."""
+
+_SAFETY_PLACEMENT_RESTORE_STREAK = 5
+"""Consecutive control cycles the safety charge must fit beside the largest learned solo sampling peak *with a
+proportional margin* before the runtime safety-placement policy restores safety to the GPU. Deliberately larger
+than :data:`_SAFETY_PLACEMENT_PAUSE_STREAK` (evict quickly on real pressure, readmit slowly and only once the
+card has proven durable headroom) so the readmit does not immediately re-trip the evict on the next heavy job."""
 
 _DISPATCH_STALL_MIN_SECONDS = 10.0
 """How long the head must be continuously undispatched before the dispatch-stall diagnostic speaks.
@@ -210,8 +278,8 @@ churn and more resets. Covers the respawn window; bounded so a genuine post-rest
 the supervisor."""
 
 _HEAVY_HEAD_LOAD_GRACE_SECONDS = 120.0
-"""How long after a heavy head is admitted best-effort (the over-budget exclusive path, taken when a
-model streams even with the whole card to itself, e.g. an fp16 checkpoint on a small device) the recovery
+"""How long after a heavy head is admitted on the over-budget classification path (for example under
+foreign-pressure fit-into-reality, when a model streams even with the whole card to itself) the recovery
 supervisor keeps ignoring a queue wedge. Such a head bypasses the whole-card branch, so it is not covered
 by ``_WHOLE_CARD_ESTABLISH_GRACE_SECONDS``, yet its multi-gigabyte load equally holds the queue and must
 not be mistaken for a structural wedge that faults the never-run backlog. Bounded so a head that genuinely
@@ -283,9 +351,6 @@ class _WholeCardDemandOutcome(enum.Enum):
     DEFER = enum.auto()
     """The reservation is mid-teardown (idle siblings stopping, safety cycling off-GPU, freed VRAM
     draining); defer this cycle and re-evaluate against the reduced topology next tick."""
-    TERMINAL_ADMIT = enum.auto()
-    """Teardown is structurally exhausted yet the activation-inclusive peak still overflows even sole
-    residency; admit best-effort onto the cleared card under the over-budget step grace."""
 
 
 class _PreloadJobOutcome(enum.Enum):
@@ -299,12 +364,33 @@ class _PreloadJobOutcome(enum.Enum):
     """A preload was issued for this job; the pass is done and reports success."""
 
 
+@dataclass
+class _PreloadActuation:
+    """The head-preload context a described actuation needs when the adapter runs a deferred verdict.
+
+    An EVICT_IDLE_MODEL or REDUCE_LIVE_CONTEXTS command targets the card on behalf of the specific head being
+    adjudicated: the eviction spares the head's own target slot, and the reduction establishes whole-card
+    residency for the head's job at the depth the verdict's rejected peak sized. The adapter records this for
+    the current head immediately before running the verdict's commands and clears it once they have run.
+    """
+
+    job: ImageGenerateJobPopResponse
+    available_process: HordeProcessInfo
+    forecast: StreamForecast
+    max_resident: int | None
+
+
 def _preload_outcome_from_admission(decision: AdmissionDecision) -> _PreloadJobOutcome:
     """Map the public admission decision vocabulary onto the scheduler pass control enum."""
     match decision:
-        case AdmissionDecision.ADMIT | AdmissionDecision.PRESTAGE | AdmissionDecision.TERMINAL_ADMIT:
+        case AdmissionDecision.ADMIT | AdmissionDecision.PRESTAGE:
             return _PreloadJobOutcome.PRELOAD_SENT
-        case AdmissionDecision.NEXT_JOB | AdmissionDecision.QUARANTINED | AdmissionDecision.ALREADY_LOADED:
+        case (
+            AdmissionDecision.NEXT_JOB
+            | AdmissionDecision.QUARANTINED
+            | AdmissionDecision.UNSERVICEABLE
+            | AdmissionDecision.ALREADY_LOADED
+        ):
             return _PreloadJobOutcome.NEXT_JOB
         case _:
             return _PreloadJobOutcome.STOP_PASS
@@ -407,6 +493,69 @@ class InferenceScheduler:
         # WorkerRunMetrics.record_churn. None in unit tests that drive the scheduler directly.
         self._churn_observer: Callable[[ChurnKind], None] | None = None
 
+        # The ledger-driven admission overlay. The baseline provider yields the reconciler's measured
+        # shared-device baseline (MB) per card, wired by the manager (None until wired, and in standalone unit
+        # tests: the overlay then reads baseline 0, so capacity is the raw total and the measured gate matches
+        # the predictive gate). The per-card counters/headroom feed run-metrics calibration visibility.
+        self._admission_baseline_provider: Callable[[int | None], float | None] | None = None
+        self._admission_denials_by_device: dict[int, int] = {}
+        self._admission_headroom_mb_by_device: dict[int, float | None] = {}
+        # The device-free governor's growth hold per card, set each tick by the parent. True while a card is at
+        # PRESSURE or SATURATED (device-level free VRAM below the soft floor): the scheduler must not grow the
+        # card's VRAM footprint (no new model brought to VRAM on a process that does not already hold it, no
+        # safety GPU restore, no paused-lane restart). In-flight sampling is never touched by this hold; it is
+        # a truthful WDDM-cliff brake, orthogonal to the ledger admission gate. Empty (no hold) in standalone
+        # unit tests, where the parent never wires the governor.
+        self._vram_growth_hold_by_device: dict[int, bool] = {}
+        # The device-free governor's committed state per card, pushed each governor tick by the parent alongside
+        # the growth hold. Retention reads the STATE (not the derived hold boolean): weights only stay resident
+        # while the card is HEALTHY, since a PRESSURE or SATURATED card is one the verified reclaim ladder is or
+        # may soon be taking residents back from. Empty (defaults to HEALTHY) in standalone unit tests, where the
+        # parent never wires the governor.
+        self._governor_states_by_device: dict[int, GovernorState] = {}
+        # Count of verified reclaim-ladder shortfalls the engine reported (a rung freed less than half its
+        # promised device memory). Recorded here as a calibration counter: at reclaim time the freed figure is
+        # not a footprint peak and no complete (baseline, resolution, stage) key is reconstructable, so the
+        # raise-only footprint store does not apply and the signal is kept as a count. Calibration visibility.
+        self._reclaim_calibration_events = 0
+        # The single VRAM arbiter, injected by the manager. It is the live authority for the gated
+        # preload/overlap/disaggregation/post-processing seams, pricing each demand against the cycle-frozen
+        # measurement. None until wired (and in standalone unit tests), where those seams fall back to their
+        # measured floors.
+        self._vram_arbiter: VramArbiter | None = None
+        # The head-preload context the current deferred verdict's actuations act on, set immediately before the
+        # adapter runs a verdict's commands and cleared once they have. None outside that window.
+        self._preload_actuation: _PreloadActuation | None = None
+
+        # The learned-footprint store, injected by the manager (one shared instance, the same the message
+        # dispatcher observes into). Admission pricing of a job's sampling peak reads it so a measured
+        # activation high-water raises the static per-model seed the predictor returns; a static seed
+        # systematically undershoots the reserved peak (calibration saw ~11GB against a 6158MB seed). None
+        # until wired (and in standalone unit tests), where every estimate falls back to the static seed.
+        self._footprint_store: LearnedFootprintStore | None = None
+
+        # Pipeline-disaggregation hooks, wired by the manager via set_disaggregation_hooks. The predicate
+        # decides whether a job takes the disaggregated path (so its verdicts charge the UNet-only sampler
+        # figure); the router registers an eligible job with the orchestrator, pinned to the process it was
+        # scheduled onto, in place of the monolithic START_INFERENCE. Defaults keep the scheduler on the pure
+        # monolithic path (every job disaggregated=False) for unit tests that drive it alone.
+        self._is_disaggregatable_job: Callable[[ImageGenerateJobPopResponse], bool] = lambda _job: False
+        # The stable class-eligibility predicate (no liveness/residency coupling): forecasting and VRAM
+        # charging use this, so a job that *will* run disaggregated is always priced sampler-only, even during
+        # a whole-card window when the lane is transiently paused. Defaults monolithic for standalone tests.
+        self._is_disaggregation_class_eligible: Callable[[ImageGenerateJobPopResponse], bool] = lambda _job: False
+        self._register_disaggregated_job: (
+            Callable[[ImageGenerateJobPopResponse, HordeProcessInfo], Awaitable[bool]] | None
+        ) = None
+
+        # Runtime safety-placement policy hysteresis (see _reconcile_runtime_safety_placement). ``wants_off``
+        # latches the policy's current verdict; the two streaks count consecutive cycles the safety charge did
+        # not fit (drives the latch on) or fit with margin (drives it off), so a card oscillating around the
+        # fit boundary does not flap the safety process on and off GPU every cycle.
+        self._safety_placement_miss_streak = 0
+        self._safety_placement_fit_streak = 0
+        self._safety_placement_wants_off = False
+
         self._preload_delay_notified = False
         self._model_recently_missing = False
         self._model_recently_missing_time = 0.0
@@ -449,20 +598,20 @@ class InferenceScheduler:
         # multi-tick bookkeeping (shed cards, draining processes), exposed under the historical attribute
         # names through the _ram_pressure_shed_cards / _processes_draining_for_ram properties.
         self._governor = ResourceGovernor(host=self)
-        # When a heavy head was last admitted best-effort off the whole-card path (the over-budget exclusive
-        # branch, for a model that streams even alone). Its load equally holds the queue, so this bounds a
-        # wedge grace that the whole-card establishment grace does not cover. 0.0 when none is loading.
+        # When a heavy head was last admitted through the foreign-pressure physical-fit branch. Its load
+        # equally holds the queue, so this bounds a wedge grace that the whole-card establishment grace does
+        # not cover. 0.0 when none is loading.
         self._heavy_head_admitted_at: float = 0.0
         # When an idle inference slot was last deliberately cycled to reclaim allocator-retained RAM
         # (_replace_stale_ram_unload_process). The respawn + the next head's preload leave the queue
         # briefly unservable through no fault of the pool, so this bounds a wedge grace covering that
         # deliberate window. 0.0 when no reclaim cycle is in flight. See _RAM_RECLAIM_CYCLE_GRACE_SECONDS.
         self._ram_reclaim_cycle_at: float = 0.0
-        # Head-of-queue starvation backstop. Tracks the id of the job currently at the head of the queue
-        # and when it first became budget-deferred onto an idle device, so a head that the budget gate
-        # cannot fit (reclamation structurally exhausted) is force-admitted before the sustained-wedge
-        # window trips the recovery supervisor. Reset when the head changes, a job dispatches, or a live
-        # job takes the device. See _HEAD_STARVATION_FORCE_ADMIT_SECONDS.
+        # Head-of-queue starvation clock. Tracks the id of the job currently at the head of the queue and
+        # when it first became budget-deferred onto an idle device. It only feeds
+        # the arbiter's starvation diagnostic (a warning naming the arithmetic once a head is deferred past
+        # the diagnostic horizon with reclaim exhausted). Reset when the head changes, a job dispatches, or a
+        # live job takes the device.
         self._head_starvation_job_id: str | None = None
         self._head_starvation_since: float = 0.0
 
@@ -477,6 +626,13 @@ class InferenceScheduler:
         # worker's own children). While set, retention is denied; the rising edge triggers an idle-VRAM
         # reclaim. Always False on hosts without the telemetry.
         self._wddm_paging_active: bool = False
+        # The parent's most recent WDDM paging attribution: the child PIDs whose VRAM the driver demoted to
+        # system memory, mapped to their shared (system-backed) GPU MB, plus a monotonic stamp of when it was
+        # recorded. Refreshed on every active verdict (not just the rising edge) so the paged-slowdown
+        # watchdog reads a current victim set, and cleared the moment paging clears. See
+        # :meth:`wddm_paging_victim_shared_mb_by_pid`.
+        self._wddm_paging_victims_shared_mb_by_pid: dict[int, float] = {}
+        self._wddm_paging_victims_updated_monotonic: float = 0.0
         # Edge-log throttle for the post-processing/sampling time-slice hold on dispatch.
         self._pp_mutex_hold_logged: bool = False
 
@@ -495,6 +651,66 @@ class InferenceScheduler:
     def set_churn_observer(self, observer: Callable[[ChurnKind], None]) -> None:
         """Register the sink for between-jobs reload/respawn events (see :data:`ChurnKind`)."""
         self._churn_observer = observer
+
+    def set_admission_baseline_provider(self, provider: Callable[[int | None], float | None]) -> None:
+        """Register the source of the measured shared-device baseline (MB) per card for the admission overlay.
+
+        The manager's :meth:`ProcessManager.latest_baseline_estimate_mb`; called with a device index (None for
+        the single-GPU / worker-wide case). Until wired (and in standalone unit tests) the overlay reads a
+        baseline of 0, so capacity is the raw device total and the measured gate never denies what the
+        predictive gate admits.
+        """
+        self._admission_baseline_provider = provider
+
+    def latest_admission_denials(self, *, device_index: int | None = None) -> int:
+        """Return the count of measured-floor admission denials on a card this run (calibration visibility)."""
+        return self._admission_denials_by_device.get(device_index if device_index is not None else 0, 0)
+
+    def latest_admission_headroom_mb(self, *, device_index: int | None = None) -> float | None:
+        """Return the last measured-floor admission headroom (MB) on a card, or None when the floor was unapplied."""
+        return self._admission_headroom_mb_by_device.get(device_index if device_index is not None else 0)
+
+    def set_disaggregation_hooks(
+        self,
+        *,
+        is_disaggregatable: Callable[[ImageGenerateJobPopResponse], bool],
+        is_disaggregation_class_eligible: Callable[[ImageGenerateJobPopResponse], bool],
+        register_disaggregated: Callable[[ImageGenerateJobPopResponse, HordeProcessInfo], Awaitable[bool]],
+    ) -> None:
+        """Wire the pipeline-disaggregation predicates and router (see the ``_is_disaggregatable_job`` attr).
+
+        ``is_disaggregatable`` is the dispatch-time predicate (class-eligible AND role processes live AND no
+        whole-card residency held): at the dispatch seam an eligible job is routed to ``register_disaggregated``
+        (which pins the process the scheduler chose as its sampler) instead of being sent monolithic inference.
+        ``is_disaggregation_class_eligible`` is the stable class predicate used by residency forecasting and
+        VRAM charging, so a job that will run disaggregated is priced sampler-only regardless of transient lane
+        state (a whole-card window pauses the lane without flipping the forecast to the monolithic footprint).
+        """
+        self._is_disaggregatable_job = is_disaggregatable
+        self._is_disaggregation_class_eligible = is_disaggregation_class_eligible
+        self._register_disaggregated_job = register_disaggregated
+
+    def _disaggregation_sibling_charge_mb(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        *,
+        device_index: int | None,
+    ) -> float:
+        """The image lane's concurrent VAE-decode spike (MB) to charge against co-residency when disaggregating.
+
+        Prefers the job's *bounded* tiled-decode activation (``predict_job_decode_spike_mb``): the lane
+        decodes the previous job's latent while this one samples, so only that decode working set (not the
+        lane's whole allocator-guard quota) is the concurrent commitment. Charging the full quota over-commits
+        the card and denies a second sampler it can physically hold, collapsing the pipeline. Falls back to the
+        full lane quota when the pinned hordelib does not yet expose the decode-spike figure (conservative:
+        safe but not optimally packed).
+        """
+        decode_spike_mb = predict_job_decode_spike_mb(job, str(baseline) if baseline is not None else None)
+        if decode_spike_mb is not None:
+            return decode_spike_mb
+        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        return effective_post_process_vram_quota_mb(total_vram_mb)
 
     def latest_preload_admission(self) -> LatestPreloadAdmission | None:
         """Return the most recent preload-admission decision, for the supervisor snapshot."""
@@ -668,11 +884,10 @@ class InferenceScheduler:
     def _is_model_locally_unservable(self, model: str | None, *, device_index: int | None = None) -> bool:
         """Return whether ``model`` is held back as locally unservable on a card (the shared breaker policy).
 
-        Delegates to :func:`is_model_locally_unservable_for` so the scheduler's best-effort-admit gate and
-        the popper's model selection apply one identical policy: a model held back here is neither
-        best-effort-admitted nor popped, so the worker stops force-admitting and dropping a model the
-        device genuinely cannot run. ``device_index`` scopes the streak to the card the admit targets on a
-        multi-GPU host; None is the single-GPU / worker-wide reading.
+        Delegates to :func:`is_model_locally_unservable_for` so dispatch and the popper's model selection
+        apply one identical policy: a model held back here is neither dispatched nor popped, so the worker
+        stops dropping a model the device genuinely cannot run. ``device_index`` scopes the streak to the card
+        the admit targets on a multi-GPU host; None is the single-GPU / worker-wide reading.
         """
         return is_model_locally_unservable_for(
             self._runtime_config.bridge_data,
@@ -682,23 +897,23 @@ class InferenceScheduler:
         )
 
     def _log_overbudget_admit(self, job: ImageGenerateJobPopResponse) -> None:
-        """Log a best-effort over-budget admit with the residency/measurement picture (live diagnostics).
+        """Log a foreign-pressure physical-fit admit with the residency/measurement picture.
 
-        Captures, in one greppable line, the model admitted against the budget, whether it runs
-        exclusively, its prior over-budget fault streak, and the per-slot residency + device-wide free
-        VRAM at admit time (the over-commit signature: e.g. another slot resident while this loads).
+        Captures, in one greppable line, the model admitted outside the worker's own admission capacity
+        because it physically fits the device-free read, whether it runs exclusively, its prior over-budget
+        fault streak, and the per-slot residency plus device-wide free VRAM at admit time.
         """
         exclusive = self._job_tracker.is_admitted_exclusive(job)
         fault_count = self._job_tracker.get_model_overbudget_fault_count(job.model)
         logger.opt(ansi=True).warning(
             f"<fg #f0beff>VRAM budget cannot fit head-of-queue model {job.model} even after reclaiming all idle "
-            f"VRAM/RAM, and no live job holds the device; admitting it best-effort "
+            f"VRAM/RAM, but it physically fits measured device-free VRAM; admitting it "
             f"({'exclusive' if exclusive else 'shared'}, prior_overbudget_faults={fault_count}) rather than "
             f"wedging the queue. {self._process_map.residency_snapshot()}</>",
         )
 
     def _mark_overbudget_admit(self, job: ImageGenerateJobPopResponse, forecast: StreamForecast | None) -> None:
-        """Tag ``job`` as an over-budget best-effort admit, opening the heavy-head load grace on first admit.
+        """Tag ``job`` as an over-budget physical-fit admit, opening the heavy-head load grace on first admit.
 
         Records the load-grace start the first time the job is admitted (so its multi-gigabyte load is not
         mistaken for a structural wedge; see :meth:`heavy_head_load_grace_active`). When over-budget
@@ -829,6 +1044,16 @@ class InferenceScheduler:
         """
         return self._overhead.marginal_mb(config_override_mb=self._config_overhead_override_mb())
 
+    def resolved_context_constant_mb(self) -> float:
+        """Return the per-process CUDA-context VRAM charge (MB) for the committed-VRAM attribution ledger.
+
+        The measured per-additional-context marginal when the overhead model has one, else the platform seed
+        (243 MB Windows / 144 MB Linux / the generic fallback), resolved by
+        :func:`platform_context_constant_mb`. Consumed by the observational committed-VRAM ledger and drift
+        reconciliation, not by admission.
+        """
+        return platform_context_constant_mb(self._marginal_process_overhead_mb())
+
     def _whole_card_residency_enabled(self) -> bool:
         """Whether preventative whole-card exclusive residency is on (config, tolerant of mocked config)."""
         enabled = self._runtime_config.bridge_data.whole_card_exclusive_residency
@@ -852,7 +1077,7 @@ class InferenceScheduler:
         physically co-resides with room to spare. Engaging a whole-card residency off that phantom reserves the
         card for a model that never needed it (and, held through the cooldown, can then starve a later head of a
         different model). So the caller falls through to the ordinary model-eviction path instead, whose
-        terminal admit still gates on real free VRAM, rather than reserving the device on an unmeasured guess.
+        admission still gates on real free VRAM, rather than reserving the device on an unmeasured guess.
         """
         if forecast.is_card_demanding:
             return True
@@ -1048,6 +1273,12 @@ class InferenceScheduler:
         # whose conservative weight seed happens to fit co-resident still claims sole residency on intent,
         # rather than co-residing and thrashing as Z-Image did.
         wants_whole_card = self._model_size_tier(job.model) >= _ModelSizeTier.EXTRA_LARGE
+        # A disaggregated job's sampler holds only the UNet, so its forecast charges the sampler-only figure
+        # (keeping two samplers co-resident where the whole-job charge collapses them), and the image lane's
+        # concurrent decode spike is charged as a sibling context. Class-eligibility (not the liveness-coupled
+        # dispatch predicate) is used so a job that will run disaggregated is charged sampler-only even during a
+        # whole-card window when the lane is transiently paused.
+        disaggregated = self._is_disaggregation_class_eligible(job)
         return forecast_weight_streaming(
             job,
             str(baseline) if baseline is not None else None,
@@ -1060,6 +1291,12 @@ class InferenceScheduler:
             committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
             marginal_process_overhead_mb=self._marginal_process_overhead_mb(),
             wants_whole_card=wants_whole_card,
+            disaggregated=disaggregated,
+            disaggregation_sibling_charge_mb=(
+                self._disaggregation_sibling_charge_mb(job, baseline, device_index=device_index)
+                if disaggregated
+                else 0.0
+            ),
         )
 
     def _residency_should_pause_safety(self, device_index: int | None) -> bool:
@@ -1089,6 +1326,199 @@ class InferenceScheduler:
             return False
         return self._process_lifecycle.pause_safety_on_gpu()
 
+    def _arbiter_admits_safety_gpu_load(self, device_index: int | None) -> bool:
+        """Whether the safety process may (re)load onto the GPU now, the VRAM arbiter deciding the memory question.
+
+        Charges :data:`_SAFETY_GPU_LOAD_CHARGE_MB` against the card's measured admission floor as a
+        :attr:`VramRequestKind.SAFETY_LOAD`: a FITS verdict admits, a DEFER or DENY keeps safety off-GPU this
+        cycle so the load re-asks. An unwired or cold arbiter admits, matching the
+        every-gate-admits-on-missing-telemetry contract. No actuations run here (reclaim is single-owner, driven
+        only by the preload path).
+        """
+        arbiter = self._vram_arbiter
+        if arbiter is None or not arbiter.has_cycle:
+            return True
+        verdict = arbiter.evaluate(
+            VramRequest(
+                kind=VramRequestKind.SAFETY_LOAD,
+                job_label="safety_load",
+                baseline=None,
+                device_index=device_index,
+                candidate_delta_mb=_SAFETY_GPU_LOAD_CHARGE_MB,
+            ),
+        )
+        return verdict.admits
+
+    def _restore_deferred_safety_gpu_load(self) -> None:
+        """Bring a safety-load-gate-deferred safety process back on-GPU once the card has room to hold it.
+
+        The safety-load gate can keep safety off-GPU when the card is momentarily over-committed as a whole-card
+        residency drains; this per-tick reconciler re-asks the arbiter so a deferred safety load is not stranded
+        off-GPU for the rest of the session. It never fights the residency machinery: it acts only when no held
+        whole-card residency still requires safety off its card (and never mid safety backlog, to avoid churn),
+        then restores on a FITS verdict and leaves safety off for the next re-ask on a DEFER. Only the
+        recurring residency-drain restore is gated this way; the initial cold-start safety load onto the GPU (at
+        worker bring-up, before any heavy residency pressure) is not gated and always proceeds.
+        """
+        if not self._whole_card_safety_off_gpu_enabled():
+            return
+        if not self._process_lifecycle.is_safety_gpu_paused:
+            return
+        if self._has_safety_backlog():
+            return
+        # The runtime safety-placement policy is the other owner of the safety process's on/off-GPU state; while
+        # it holds safety off (the charge does not fit beside the largest sampling peak) this residency-drain
+        # restore must not fight it back on-GPU. The placement reconcile performs its own restore once the card
+        # proves durable headroom.
+        if self._safety_placement_wants_off:
+            return
+        if any(self._residency_should_pause_safety(device_index) for device_index, _ in self._held_residencies()):
+            return
+        safety_card = min(self._card_runtimes) if self._card_runtimes else None
+        if self._arbiter_admits_safety_gpu_load(safety_card):
+            self._process_lifecycle.restore_safety_on_gpu()
+
+    def _runtime_safety_placement_enabled(self) -> bool:
+        """Whether the runtime safety-placement policy may act (safety configured on-GPU on a real device).
+
+        The policy can only ever degrade the operator's placement (GPU to CPU), never promote it, so it is inert
+        unless ``safety_on_gpu`` grants the maximum permission. On a CPU-only install safety is always off-GPU
+        already, so there is nothing to place.
+        """
+        return bool(self._runtime_config.bridge_data.safety_on_gpu) and not is_cpu_only_install()
+
+    def _largest_active_sampling_peak_mb(self) -> float | None:
+        """The largest learned solo sampling peak (MB) among jobs in progress or queued for inference.
+
+        Each job's static sampling-peak seed is raised by any learned SAMPLE-stage watermark for its footprint
+        before the maximum is taken, so the policy prices the heaviest activation peak the device is committed
+        to from measured high-waters, not a seed the hardware has already overshot. Returns None when no job can
+        be priced (nothing sampling), in which case the safety charge trivially fits.
+        """
+        peaks: list[float] = []
+        seen: set[int] = set()
+        for job in (*self._job_tracker.jobs_in_progress, *self._job_tracker.jobs_pending_inference):
+            if id(job) in seen:
+                continue
+            seen.add(id(job))
+            if job.model is None:
+                continue
+            baseline = self._model_metadata.get_baseline(job.model)
+            static_peak_mb = predict_job_sampling_vram_mb(job, baseline)
+            if static_peak_mb is None:
+                continue
+            peaks.append(
+                self._learned_sampling_peak_mb(
+                    job,
+                    baseline,
+                    static_seed_mb=static_peak_mb,
+                    stage=FootprintStage.SAMPLE,
+                ),
+            )
+        if not peaks:
+            return None
+        return max(peaks)
+
+    def _safety_fits_beside_largest_sampling_peak(
+        self,
+        device_index: int | None,
+        *,
+        require_margin: bool,
+    ) -> bool:
+        """Whether the safety charge fits on the card beside the largest active sampling peak, as arithmetic.
+
+        Structural fit over (device total, largest learned sampling peak, proportional noise buffer, the static
+        safety charge): ``total - peak - noise - safety_charge >= 0``. No constant is tuned to a card size; the
+        noise buffer scales with the device total. With ``require_margin`` an extra proportional buffer must
+        also clear, so the restore side of the hysteresis demands durable headroom rather than a bare fit. When
+        the device total is unknown or nothing is sampling, the charge trivially fits (the policy never forces
+        safety off on missing telemetry, matching the every-gate-admits-on-missing-measurement contract).
+        """
+        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        if total_vram_mb is None or total_vram_mb <= 0:
+            return True
+        peak_mb = self._largest_active_sampling_peak_mb()
+        if peak_mb is None:
+            return True
+        noise_mb = admission_noise_buffer_mb(total_vram_mb)
+        margin_mb = admission_noise_buffer_mb(total_vram_mb) if require_margin else 0.0
+        return (total_vram_mb - peak_mb - noise_mb - _SAFETY_GPU_LOAD_CHARGE_MB - margin_mb) >= 0.0
+
+    def _reconcile_runtime_safety_placement(self) -> None:
+        """Keep safety off the GPU whenever its charge cannot fit beside the largest active sampling peak.
+
+        A scheduler-owned per-cycle policy that generalises the whole-card safety-off lever to the ordinary
+        case: on a card too tight to hold the safety context beside the heaviest sampling activation it is
+        committed to, safety cycles to a CPU-only process so its CUDA context stops competing for the card. The
+        operator's ``safety_on_gpu`` remains the maximum permission (False leaves safety off forever); this
+        policy can only degrade GPU to CPU, never promote.
+
+        Hysteresis (:data:`_SAFETY_PLACEMENT_PAUSE_STREAK` / :data:`_SAFETY_PLACEMENT_RESTORE_STREAK`) guards
+        against flapping: the latch turns on only after several consecutive non-fitting cycles and off only
+        after more consecutive fitting-with-margin cycles, so a card oscillating around the fit boundary does
+        not thrash the safety process on and off the GPU every cycle. Actuation is skipped while a safety check
+        is pending or active (no mid-backlog churn); the restore is additionally withheld while a whole-card
+        residency still needs safety off its card, so this policy and the residency machinery never fight.
+        """
+        if not self._runtime_safety_placement_enabled():
+            self._safety_placement_miss_streak = 0
+            self._safety_placement_fit_streak = 0
+            self._safety_placement_wants_off = False
+            return
+        if self._has_safety_backlog():
+            return
+
+        safety_card = min(self._card_runtimes) if self._card_runtimes else None
+        fits = self._safety_fits_beside_largest_sampling_peak(safety_card, require_margin=False)
+        fits_with_margin = self._safety_fits_beside_largest_sampling_peak(safety_card, require_margin=True)
+        if fits_with_margin:
+            self._safety_placement_fit_streak += 1
+            self._safety_placement_miss_streak = 0
+        elif not fits:
+            self._safety_placement_miss_streak += 1
+            self._safety_placement_fit_streak = 0
+        else:
+            # Fits, but only within the margin deadband: neither confirms the latch either way, so hold both
+            # streaks so a job hovering on the boundary neither evicts nor readmits safety.
+            return
+
+        if not self._safety_placement_wants_off:
+            if self._safety_placement_miss_streak >= _SAFETY_PLACEMENT_PAUSE_STREAK:
+                self._safety_placement_wants_off = True
+        elif self._safety_placement_fit_streak >= _SAFETY_PLACEMENT_RESTORE_STREAK:
+            self._safety_placement_wants_off = False
+
+        if self._safety_placement_wants_off:
+            if not self._process_lifecycle.is_safety_gpu_paused:
+                peak_mb = self._largest_active_sampling_peak_mb()
+                total_mb = self._process_map.get_reported_total_vram_mb(device_index=safety_card)
+                if self._process_lifecycle.pause_safety_on_gpu():
+                    logger.info(
+                        f"Runtime safety placement: moving safety off-GPU. Its "
+                        f"~{_SAFETY_GPU_LOAD_CHARGE_MB / 1024:.1f}GB context does not fit beside the largest "
+                        f"active sampling peak (~{(peak_mb or 0.0) / 1024:.1f}GB) on a "
+                        f"~{(total_mb or 0.0) / 1024:.0f}GB card after "
+                        f"{self._safety_placement_miss_streak} consecutive cycles.",
+                    )
+            return
+
+        # The policy no longer wants safety off; restore it unless a whole-card residency still needs it off
+        # that card, and only when the arbiter agrees the card can hold the load now.
+        if not self._process_lifecycle.is_safety_gpu_paused:
+            return
+        if any(self._residency_should_pause_safety(device_index) for device_index, _ in self._held_residencies()):
+            return
+        # A safety GPU restore grows the card's committed footprint; withhold it while the device-free governor
+        # holds growth (device-level free below the soft floor), the same brake the preload path honors.
+        if self.is_vram_growth_held(safety_card):
+            return
+        if self._arbiter_admits_safety_gpu_load(safety_card) and self._process_lifecycle.restore_safety_on_gpu():
+            logger.info(
+                f"Runtime safety placement: restoring safety to the GPU after "
+                f"{self._safety_placement_fit_streak} consecutive cycles of durable headroom beside the "
+                f"largest active sampling peak.",
+            )
+
     def _residency_should_pause_post_process(self, device_index: int | None) -> bool:
         """Whether a whole-card residency on this card should also stop the dedicated post-processing lane.
 
@@ -1103,6 +1533,36 @@ class InferenceScheduler:
         if device_index is None or not self._card_runtimes:
             return True
         return device_index == self._process_lifecycle.post_process_lane_card_index()
+
+    def _residency_should_pause_vae_lane(self, device_index: int | None) -> bool:
+        """Whether a whole-card residency on this card should also stop the dedicated VAE lane.
+
+        Mirrors :meth:`_residency_should_pause_post_process`: the lane's permanent CUDA context is real
+        device-wide VRAM a sibling teardown cannot reclaim, so on a card too tight to host a whole-card model
+        beside it the lane must vacate the card exactly as safety and the post-processing lane do. Requires
+        the lane to be enabled and to sit on the residency's card; the worker-wide key (``None``, single-GPU)
+        always qualifies.
+        """
+        if not self._process_lifecycle.vae_lane_enabled():
+            return False
+        if device_index is None or not self._card_runtimes:
+            return True
+        return device_index == self._process_lifecycle.vae_lane_card_index()
+
+    def _residency_should_pause_component_lane(self, device_index: int | None) -> bool:
+        """Whether a whole-card residency on this card should also stop the dedicated component lane.
+
+        Mirrors :meth:`_residency_should_pause_vae_lane`: the component lane's permanent CUDA context and its
+        resident text encoders are real device-wide VRAM a sibling teardown cannot reclaim, so on a card too
+        tight to host a whole-card model beside it the lane must vacate the card exactly as safety, the
+        post-processing lane, and the VAE lane do. Requires the lane to be enabled and to sit on the
+        residency's card; the worker-wide key (``None``, single-GPU) always qualifies.
+        """
+        if not self._process_lifecycle.component_lane_enabled():
+            return False
+        if device_index is None or not self._card_runtimes:
+            return True
+        return device_index == self._process_lifecycle.component_lane_card_index()
 
     def _has_post_process_backlog(self) -> bool:
         """Return whether a post-processing job is pending or actively on the lane.
@@ -1169,7 +1629,7 @@ class InferenceScheduler:
         self._disable_post_processing_for_whole_card(model_name, forecast)
         if self._process_lifecycle.is_post_process_gpu_paused or self._has_post_process_backlog():
             return False
-        return self._process_lifecycle.pause_post_process_off_gpu()
+        return self._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
 
     def _establish_whole_card_residency(
         self,
@@ -1221,6 +1681,18 @@ class InferenceScheduler:
             model_name=job.model,
             forecast=forecast,
         )
+        # The disaggregated pipeline's VAE lane holds an equivalent bare CUDA context; stop it off-GPU on the
+        # residency's card so the heavy model's weights are not tipped into host-RAM streaming by it. Disagg
+        # dispatch is already suppressed while a residency is active, so the lane is idle here. A no-op unless
+        # disaggregation is enabled and the lane sits on this card.
+        if self._residency_should_pause_vae_lane(device_index):
+            self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD)
+        # The disaggregated pipeline's component (text-encode) lane holds an equivalent bare CUDA context plus
+        # resident encoders; stop it off-GPU on the residency's card for the same reason as the VAE lane.
+        # Stopping it also drops the lane out of the disaggregation liveness predicate, so new jobs route
+        # monolithic while the residency holds. A no-op unless disaggregation is enabled and the lane sits here.
+        if self._residency_should_pause_component_lane(device_index):
+            self._process_lifecycle.pause_component_off_gpu(owner=PauseOwner.WHOLE_CARD)
 
         if announce or after < current or safety_paused or post_process_paused:
             safety_note = " and moving safety off-GPU" if safety_paused else ""
@@ -1504,6 +1976,8 @@ class InferenceScheduler:
                 and not self._post_process_context_fits_with_residency(forecast, device_index=device_index)
             ),
             post_process_cleared=self._process_map.num_post_process_processes(device_index=device_index) == 0,
+            component_lane_pause_required=self._residency_should_pause_component_lane(device_index),
+            component_lane_cleared=self._process_map.num_component_processes(device_index=device_index) == 0,
             weights_fit_live=self._whole_card_weights_fit_live(forecast, device_index=device_index),
             drain_backstop_elapsed=self._whole_card_drain_backstop_elapsed(device_index),
         )
@@ -1725,25 +2199,45 @@ class InferenceScheduler:
             safety_restored = (
                 self._process_lifecycle.restore_safety_on_gpu()
                 if self._residency_should_pause_safety(device_index)
+                and self._arbiter_admits_safety_gpu_load(device_index)
                 else False
             )
             post_process_restored = (
-                self._process_lifecycle.restore_post_process_off_gpu()
+                self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
                 if self._residency_should_pause_post_process(device_index)
                 and not self._state.post_processing_disabled_by_breaker
                 else False
             )
+            vae_lane_restored = (
+                self._process_lifecycle.restore_vae_lane_off_gpu(owner=PauseOwner.WHOLE_CARD)
+                if self._residency_should_pause_vae_lane(device_index)
+                else False
+            )
+            component_lane_restored = (
+                self._process_lifecycle.restore_component_off_gpu(owner=PauseOwner.WHOLE_CARD)
+                if self._residency_should_pause_component_lane(device_index)
+                else False
+            )
             ceiling = self._residency_restore_ceiling(device_index)
             current = self._process_map.num_loaded_inference_processes(device_index=device_index)
-            if current >= ceiling and not safety_restored and not post_process_restored:
+            if (
+                current >= ceiling
+                and not safety_restored
+                and not post_process_restored
+                and not vae_lane_restored
+                and not component_lane_restored
+            ):
                 continue
             after = self._process_lifecycle.scale_inference_processes(ceiling, device_index=device_index)
             self._reconcile_worker_shed_to_pool()
             safety_note = " and restoring safety to the GPU" if safety_restored else ""
             post_process_note = " and restarting the post-processing lane" if post_process_restored else ""
+            vae_lane_note = " and restarting the VAE lane" if vae_lane_restored else ""
+            component_lane_note = " and restarting the component lane" if component_lane_restored else ""
             logger.opt(ansi=True).info(
                 f"<fg #7b7d7d>Whole-card residency for {model} complete; restoring inference processes "
-                f"({current} -> {after} of {ceiling}){safety_note}{post_process_note}.</>",
+                f"({current} -> {after} of {ceiling})"
+                f"{safety_note}{post_process_note}{vae_lane_note}{component_lane_note}.</>",
             )
 
     def _reconcile_worker_shed_to_pool(self) -> None:
@@ -2026,24 +2520,6 @@ class InferenceScheduler:
         """
         hold = self._slot_duty_current_hold
         return self._slot_duty.totals(), self._slot_duty.capacity, str(hold) if hold is not None else None
-
-    def _log_head_starvation_force_admit(self, job: ImageGenerateJobPopResponse) -> None:
-        """Announce a head-of-queue force-admit, with the residency snapshot for the post-mortem."""
-        logger.opt(ansi=True).warning(
-            f"<fg #ff8c69>Head-of-queue {job.model} was budget-deferred on an idle device for "
-            f"{self._head_starved_seconds(job):.0f}s (reclamation exhausted); force-admitting it best-effort "
-            f"to break the wedge before the recovery supervisor soft-resets the pools and faults the backlog. "
-            f"{self._process_map.residency_snapshot()}</>",
-        )
-
-    def _log_whole_card_terminal_admit(self, job: ImageGenerateJobPopResponse) -> None:
-        """Announce a whole-card head admitted best-effort after its teardown was structurally exhausted."""
-        logger.opt(ansi=True).warning(
-            f"<fg #ff8c69>Whole-card head {job.model} reached its target sole residency but its activation "
-            f"peak still overflows the card; admitting it best-effort to load onto the cleared device (it will "
-            f"sample slowly under the over-budget step grace) rather than wedge the queue until save-our-ship. "
-            f"{self._process_map.residency_snapshot()}</>",
-        )
 
     def _measured_free_vram_mb(self, *, device_index: int | None = None) -> float | None:
         """Return the most conservative measured free VRAM (MB), or None when not yet reported.
@@ -2463,6 +2939,690 @@ class InferenceScheduler:
         del device_index
         return self._reserve_ledger.total_vram_mb()
 
+    def _admission_baseline_mb(self, device_index: int | None) -> float:
+        """Return the measured shared-device baseline (MB) for a card, or 0.0 when none is available.
+
+        Falls back to 0.0 (raw-total capacity) whenever no provider is wired or none has been captured yet,
+        so a cold start or a standalone unit test degrades to a capacity of the whole device total and the
+        measured overlay never denies what the predictive gate admits.
+        """
+        if self._admission_baseline_provider is None:
+            return 0.0
+        baseline = self._admission_baseline_provider(device_index)
+        return baseline if baseline is not None else 0.0
+
+    def _admission_capacity_mb(self, device_index: int | None = None) -> tuple[float | None, float]:
+        """Return ``(total - baseline, noise_buffer)`` (MB): the shared admission capacity notion for a card.
+
+        The single source of the device total (net of the measured shared baseline) and the noise buffer that
+        both the ledger-driven measured gate and the concurrent-sampling headroom gate size against, so the
+        two price capacity identically. The buffer scales with device capacity above a floor (see
+        :func:`admission_noise_buffer_mb`). ``total - baseline`` is None at cold start (no reported total),
+        where both gates fall back to admitting and the buffer is its floor.
+        """
+        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        if total_vram_mb is None:
+            return None, admission_noise_buffer_mb(None)
+        return total_vram_mb - self._admission_baseline_mb(device_index), admission_noise_buffer_mb(total_vram_mb)
+
+    def _committed_process_reserved_by_pid(self, device_index: int | None) -> dict[int, float]:
+        """Return the live GPU processes' measured allocator reservation (MB) keyed by process id, for a card.
+
+        The snapshot the planned-reserve overlay decays each entry against (a planned charge shrinks as its
+        target's reservation materialises). Keyed by :attr:`HordeProcessInfo.process_id`, matching the id the
+        planned entries are registered under.
+        """
+        reserved_by_pid: dict[int, float] = {}
+        for process_info in self._process_map.values():
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_reserved_mb is None:
+                continue
+            reserved_by_pid[process_info.process_id] = float(process_info.process_reserved_mb)
+        return reserved_by_pid
+
+    def _in_flight_admitted_planned_units(self) -> set[str]:
+        """Return the loading-process ids (as ledger units) whose admitted VRAM has not yet materialised.
+
+        The authoritative in-flight-admitted set, derived from the model map rather than any parallel registry
+        so it cannot leak: a model is counted while its load state is ``LOADING`` or ``LOADED_IN_RAM``, since a
+        just-admitted preload sits in ``LOADED_IN_RAM`` before its allocator reservation grows, and two loads
+        admitted the same cycle must both keep their planned charge until then (the double-admit guard). Once
+        the model is ``IN_USE`` or its process finishes, faults, or dies, that unit stops appearing here and the
+        next :meth:`CommittedReserveLedger.reconcile_planned` drops its planned charge by omission.
+
+        ``LOADED_IN_RAM`` is overloaded: it is both the pre-materialisation state of a fresh preload and the
+        state a resident model returns to when it is evicted from VRAM back to system RAM, so this set alone
+        cannot tell a materialised-then-evicted anchor apart from one still in flight. The ledger closes that
+        gap directly: :meth:`CommittedReserveLedger.effective_planned_vram_mb` consumes each anchor
+        monotonically, so an anchor whose reservation has already grown stays consumed regardless of the load
+        state it later revisits. Keyed by process id to match the unit :meth:`_send_preload` registers each
+        grant under.
+        """
+        units: set[str] = set()
+        for model_info in self._horde_model_map.root.values():
+            if model_info.process_id is None:
+                continue
+            if model_info.horde_model_load_state in (ModelLoadState.LOADING, ModelLoadState.LOADED_IN_RAM):
+                units.add(str(model_info.process_id))
+        return units
+
+    def _measured_admission_verdict(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: str | None,
+        *,
+        candidate_delta_mb: float | None,
+        device_index: int | None = None,
+    ) -> AdmissionVerdict:
+        """Assemble the ledger-driven admission identity's terms and evaluate it for ``job`` on a card.
+
+        The measured floor is the committed-VRAM ledger (context + allocator-reserved per live GPU process,
+        baseline-exclusive), used only while every contributor's report is fresh; the planned overlay is the
+        shared reserve ledger's not-yet-materialised charges, decayed per target; the candidate delta is the
+        job's marginal predicted cost net of any resident credit (passed in by the caller). Capacity is
+        ``(total - baseline) - noise`` from :meth:`_admission_capacity_mb`. A cold start (no known total)
+        relaxes the verdict to ``fits=True``; a stale ledger drops the measured floor but still tests the
+        planned overlay, so stacked unmaterialized admissions can deny before any child report.
+
+        ``candidate_delta_mb`` of None (no burden estimate) is treated as a zero marginal charge: an
+        unpriceable candidate must not be denied by the measured overlay, matching the predictive gate's
+        admit-on-unknown-cost contract.
+        """
+        total_minus_baseline_mb, noise_buffer_mb = self._admission_capacity_mb(device_index)
+        baseline_mb = self._admission_baseline_mb(device_index)
+        # _admission_capacity_mb already netted the baseline out of the total; reconstruct the raw total so the
+        # identity keeps its ``total - baseline`` form (and its reason() reads honestly) rather than passing a
+        # pre-netted total with a zero baseline.
+        total_vram_mb = None if total_minus_baseline_mb is None else total_minus_baseline_mb + baseline_mb
+        committed_mb = self._process_map.committed_vram_mb(
+            context_constant_mb=self.resolved_context_constant_mb(),
+            device_index=device_index,
+        )
+        oldest_report_age = self._process_map.oldest_committed_report_age_seconds(
+            now=time.time(),
+            device_index=device_index,
+        )
+        committed_is_stale = oldest_report_age is not None and oldest_report_age > _REPORT_STALENESS_SECONDS
+        # Self-heal the planned overlay from live loading state before reading it, so a preload whose process
+        # has since finished, faulted, or died no longer inflates the demand (omission is the release). The
+        # rebuild is idempotent, so running it here (the single place the measured state is assembled) is safe
+        # even though this verdict is evaluated at several admission sites per scheduling cycle.
+        self._reserve_ledger.reconcile_planned(PRELOAD_ADMISSION_FLOW, self._in_flight_admitted_planned_units())
+        planned_mb = self._reserve_ledger.effective_planned_vram_mb(
+            self._committed_process_reserved_by_pid(device_index),
+        )
+        verdict = evaluate_admission(
+            measured_committed_mb=committed_mb,
+            planned_unmaterialized_mb=planned_mb,
+            candidate_delta_mb=candidate_delta_mb if candidate_delta_mb is not None else 0.0,
+            total_vram_mb=total_vram_mb,
+            baseline_mb=baseline_mb,
+            noise_buffer_mb=noise_buffer_mb,
+            committed_is_stale=committed_is_stale,
+        )
+        if verdict.used_measured_floor:
+            self._admission_headroom_mb_by_device[device_index if device_index is not None else 0] = (
+                verdict.headroom_mb
+            )
+        return verdict
+
+    def _measured_admission_candidate_delta_mb(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: str | None,
+        *,
+        process_id: int | None,
+        disaggregated: bool,
+    ) -> float | None:
+        """Return the candidate job's marginal predicted VRAM (MB) for the measured overlay, net of resident credit.
+
+        The gross charge is the sampler-only figure for a disaggregation-class job, else the whole-job sampling
+        peak, matching how the predictive gate prices the same job, then raised by any learned watermark for the
+        job's (baseline, resolution, platform) footprint at the matching stage (SAMPLE_ISOLATED for the
+        disaggregated sampler-only figure, SAMPLE for the whole-job peak) so the measured floor is never priced
+        below a peak the hardware has already demonstrated. When the job's model is already resident in
+        its target process its weights are already in the measured committed floor, so they are credited out
+        (the same resident-credit reasoning the retention gate applies) to avoid re-charging them. None (no
+        estimate) propagates so the overlay treats the candidate as a zero marginal, never denying on an
+        unpriceable cost.
+        """
+        static_gross_mb = (
+            predict_job_sampler_only_vram_mb(job, baseline)
+            if disaggregated
+            else predict_job_sampling_vram_mb(job, baseline)
+        )
+        if static_gross_mb is None:
+            return None
+        gross_mb = self._learned_sampling_peak_mb(
+            job,
+            baseline,
+            static_seed_mb=static_gross_mb,
+            stage=FootprintStage.SAMPLE_ISOLATED if disaggregated else FootprintStage.SAMPLE,
+        )
+        resident_credit_mb = 0.0
+        if job.model is not None and process_id is not None:
+            model_info = self._horde_model_map.root.get(job.model)
+            already_resident_here = (
+                model_info is not None
+                and model_info.process_id == process_id
+                and model_info.horde_model_load_state in (ModelLoadState.LOADED_IN_VRAM, ModelLoadState.IN_USE)
+            )
+            if already_resident_here:
+                resident_credit_mb = predict_job_weight_mb(job, baseline) or 0.0
+        return max(0.0, gross_mb - resident_credit_mb)
+
+    def _measured_admission_admits(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: str | None,
+        *,
+        device_index: int | None,
+        process_id: int | None,
+        disaggregated: bool,
+        log_context: str,
+    ) -> bool:
+        """Return whether the ledger-driven admission identity admits ``job``, logging (and counting) a denial.
+
+        Combined with the predictive gate at each admission site as ``admit = predictive AND measured``. A
+        cold start (no known total) returns True. A stale committed ledger drops the measured floor but still
+        tests the parent's planned overlay, so a stacked-admission over-commit denies even before the first
+        child report. Any denial (measured-floor or degraded stale) logs the full identity and increments the
+        per-card denial counter for calibration.
+        """
+        candidate_delta_mb = self._measured_admission_candidate_delta_mb(
+            job,
+            baseline,
+            process_id=process_id,
+            disaggregated=disaggregated,
+        )
+        verdict = self._measured_admission_verdict(
+            job,
+            baseline,
+            candidate_delta_mb=candidate_delta_mb,
+            device_index=device_index,
+        )
+        if not verdict.fits:
+            self._admission_denials_by_device[device_index if device_index is not None else 0] = (
+                self._admission_denials_by_device.get(device_index if device_index is not None else 0, 0) + 1
+            )
+            logger.opt(ansi=True).warning(
+                f"<fg #f0beff>Measured VRAM floor denies {log_context} of {job.model}: {verdict.reason()}. "
+                "The measured committed ledger over-commits the card even where free-VRAM telemetry reads "
+                "healthy (WDDM would silently spill to host RAM).</>",
+            )
+        return verdict.fits
+
+    def set_vram_arbiter(self, arbiter: VramArbiter) -> None:
+        """Inject the single VRAM arbiter: the preload-admission authority and the observational overlay elsewhere."""
+        self._vram_arbiter = arbiter
+
+    def set_footprint_store(self, store: LearnedFootprintStore) -> None:
+        """Inject the shared learned-footprint store the message dispatcher also observes into.
+
+        Admission pricing of a job's sampling peak consults it so a measured activation high-water raises the
+        static per-model seed; one instance is shared across the parent so every observed peak and every priced
+        estimate reference the same watermarks.
+        """
+        self._footprint_store = store
+
+    def _sampling_footprint_key(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: str | None,
+        *,
+        stage: FootprintStage,
+    ) -> FootprintKey | None:
+        """Build the footprint key for ``job`` at ``stage``, or None when it cannot be keyed.
+
+        The key is (baseline, resolution bucket by the job's maximum dimension, host platform, stage). The stage
+        distinguishes a whole-job monolithic peak (:attr:`FootprintStage.SAMPLE`) from a disaggregated UNet-only
+        sampler peak (:attr:`FootprintStage.SAMPLE_ISOLATED`): the two are physically different quantities and,
+        since watermarks are raise-only, must not share a key. A None baseline or an absent width/height cannot
+        be attributed to a footprint population, so it returns None and the caller keeps the static seed.
+        """
+        if baseline is None:
+            return None
+        width = job.payload.width
+        height = job.payload.height
+        if width is None or height is None:
+            return None
+        return FootprintKey(
+            model_baseline=str(baseline),
+            resolution_bucket=ResolutionBucket.from_dimensions(width, height, job.payload.n_iter or 1),
+            platform=sys.platform,
+            stage=stage,
+        )
+
+    def _learned_sampling_peak_mb(
+        self,
+        job: ImageGenerateJobPopResponse,
+        baseline: str | None,
+        *,
+        static_seed_mb: float,
+        stage: FootprintStage,
+    ) -> float:
+        """Raise a static sampling-peak seed by any learned watermark for this job's ``stage`` footprint key.
+
+        The static predictor stays the seed; the learned overlay can only ever RAISE it (a cold key, a None
+        baseline, or an unkeyable job returns the seed unchanged). This is the single seam admission pricing of
+        sampling work routes through so a measured activation peak is never undershot. Callers pricing whole-job
+        sampling pass :attr:`FootprintStage.SAMPLE`; callers pricing a disaggregated UNet-only sampler pass
+        :attr:`FootprintStage.SAMPLE_ISOLATED` so a monolithic whole-job watermark never over-prices it.
+        """
+        store = self._footprint_store
+        if store is None:
+            return static_seed_mb
+        key = self._sampling_footprint_key(job, baseline, stage=stage)
+        if key is None:
+            return static_seed_mb
+        return store.estimate_mb(key, static_seed_mb=static_seed_mb)
+
+    def observe_disaggregated_sampling_peak(self, job_info: HordeJobInfo, peak_reserved_mb: float) -> None:
+        """Fold a disaggregated sampler's measured peak into the store under this job's SAMPLE_ISOLATED key.
+
+        The message dispatcher observes the monolithic case under :attr:`FootprintStage.SAMPLE`, but a
+        disaggregated UNet-only sampler's peak arrives through the orchestrator (which alone binds the pinned
+        sampler process to the job's stage), so this is the seam that closes that gap. It records under
+        :attr:`FootprintStage.SAMPLE_ISOLATED`, a distinct key from the monolithic whole-job peak: mixed
+        operation is designed (a stage fault re-routes a disaggregated job monolithic), so a single monolithic
+        peak must not raise the isolated-sampler estimate and forfeit the second concurrent sampler. The peak
+        figure is the pinned sampler process's latest reported ``process_peak_reserved_mb`` at sample completion:
+        it is the allocator high-water since the process's previous memory report, so it can lag the true
+        sampling peak by up to one report interval, but it is the best-attributable reading at this seam.
+        Raise-only semantics apply (a non-positive reading is ignored by the store); a store-less, unkeyable, or
+        model-less job is a no-op.
+        """
+        store = self._footprint_store
+        if store is None:
+            return
+        job = job_info.sdk_api_job_info
+        if job.model is None:
+            return
+        key = self._sampling_footprint_key(
+            job,
+            self._model_metadata.get_baseline(job.model),
+            stage=FootprintStage.SAMPLE_ISOLATED,
+        )
+        if key is None:
+            return
+        store.observe_peak(key, peak_reserved_mb)
+
+    def _gpu_process_activity_ids(self, device_index: int | None) -> tuple[frozenset[int], frozenset[int]]:
+        """Return the idle and busy GPU-process ids on a card, for the arbiter's release-cache targeting.
+
+        A RELEASE_CACHE target is an idle GPU process that plausibly still holds *reclaimable* allocator
+        cache: its measured reservation exceeds its in-use allocation by at least
+        ``_RELEASE_CACHE_MIN_RECLAIMABLE_MB``, so an ``empty_cache`` could return that reserved-but-unallocated
+        margin to the card. A process whose reservation is its resident footprint (a component/VAE/post-process
+        lane holding encoders or a still-loaded model, where allocated tracks reserved) has no such margin and
+        is not a target: asking it to release frees nothing, and emitting a rung that can never yield would keep
+        the escalation ladder non-empty forever. An idle process that still holds a horde model is an eviction
+        candidate (a distinct ladder rung), not a cache-release target, so it is left out here to keep the two
+        remedies separate. A busy process is never a target. When the in-use allocation has not yet been
+        reported the reclaimable margin cannot be measured, so the process is not targeted rather than assumed
+        to hold cache.
+        """
+        cache_bearing = (
+            HordeProcessType.INFERENCE,
+            HordeProcessType.POST_PROCESS,
+            HordeProcessType.VAE_LANE,
+            HordeProcessType.COMPONENT,
+        )
+        idle: set[int] = set()
+        busy: set[int] = set()
+        for process_info in self._process_map.values():
+            if process_info.process_type not in cache_bearing:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.is_process_busy():
+                busy.add(process_info.process_id)
+                continue
+            if process_info.loaded_horde_model_name is not None:
+                continue
+            reserved_mb = process_info.process_reserved_mb
+            allocated_mb = process_info.process_allocated_mb
+            if reserved_mb is None or allocated_mb is None:
+                continue
+            if reserved_mb - allocated_mb >= _RELEASE_CACHE_MIN_RECLAIMABLE_MB:
+                idle.add(process_info.process_id)
+        return frozenset(idle), frozenset(busy)
+
+    def build_vram_arbiter_device_state(
+        self,
+        device_index: int | None,
+        *,
+        active_sampling_peaks_total_mb: float = 0.0,
+        governor_state: GovernorState | None = None,
+        device_free_mb: float | None = None,
+        reclaim_unresolved: bool = False,
+    ) -> DeviceVramState:
+        """Assemble the frozen per-device VRAM measurement the arbiter prices this cycle's requests against.
+
+        Sourced entirely from figures the scheduler already holds: the ledger-driven admission identity's
+        terms (committed floor, planned overlay, baseline, per-process reservations, staleness) and the
+        concurrent-sampling headroom's terms (fixed and marginal context overhead, the live context counts,
+        the operator reserve, the lane decode spike). No NVML read and no torch import; the measurement is
+        the parent's already-reconciled state.
+        """
+        raw_total_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        baseline_mb = self._admission_baseline_mb(device_index)
+        committed_mb = self._process_map.committed_vram_mb(
+            context_constant_mb=self.resolved_context_constant_mb(),
+            device_index=device_index,
+        )
+        oldest_report_age = self._process_map.oldest_committed_report_age_seconds(
+            now=time.time(),
+            device_index=device_index,
+        )
+        committed_is_stale = oldest_report_age is not None and oldest_report_age > _REPORT_STALENESS_SECONDS
+        self._reserve_ledger.reconcile_planned(PRELOAD_ADMISSION_FLOW, self._in_flight_admitted_planned_units())
+        per_process_reserved = self._committed_process_reserved_by_pid(device_index)
+        planned_mb = self._reserve_ledger.effective_planned_vram_mb(per_process_reserved)
+
+        override_mb = self._config_overhead_override_mb()
+        per_process_mb = self._overhead.per_process_mb(config_override_mb=override_mb)
+        marginal_mb = self._overhead.marginal_mb(config_override_mb=override_mb)
+        if marginal_mb is None or marginal_mb <= 0:
+            marginal_mb = _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
+        bridge_data = self._runtime_config.bridge_data
+        safety_contexts = (
+            1 if bridge_data.safety_on_gpu is True and not self._process_lifecycle.is_safety_gpu_paused else 0
+        )
+        post_process_contexts = (
+            0
+            if self._process_lifecycle.is_post_process_gpu_paused
+            else self._process_map.num_post_process_processes(device_index=device_index)
+        )
+        vae_lane_contexts = (
+            0
+            if self._process_lifecycle.is_vae_lane_gpu_paused
+            else self._process_map.num_vae_lane_processes(device_index=device_index)
+        )
+        idle_process_ids, busy_process_ids = self._gpu_process_activity_ids(device_index)
+        return DeviceVramState(
+            total_vram_mb=raw_total_mb,
+            baseline_mb=baseline_mb,
+            committed_vram_mb=committed_mb,
+            planned_unmaterialized_mb=planned_mb,
+            committed_is_stale=committed_is_stale,
+            noise_buffer_mb=admission_noise_buffer_mb(raw_total_mb),
+            per_process_reserved_mb=per_process_reserved,
+            idle_process_ids=idle_process_ids,
+            busy_process_ids=busy_process_ids,
+            num_loaded_inference_processes=self._process_map.num_loaded_inference_processes(
+                device_index=device_index,
+            ),
+            safety_context_count=safety_contexts,
+            post_process_context_count=post_process_contexts,
+            vae_lane_context_count=vae_lane_contexts,
+            per_process_overhead_mb=per_process_mb,
+            marginal_mb=marginal_mb,
+            vram_reserve_mb=self._vram_budget.reserve_mb,
+            vae_lane_decode_spike_mb=self._vae_lane_decode_spike_charge_mb(device_index=device_index),
+            active_sampling_peaks_total_mb=active_sampling_peaks_total_mb,
+            governor_state=governor_state,
+            device_free_mb=device_free_mb,
+            reclaim_unresolved=reclaim_unresolved,
+        )
+
+    def build_vram_arbiter_snapshot(
+        self,
+        *,
+        active_sampling_peaks_total_mb: float = 0.0,
+        governor_states: Mapping[int, GovernorState] | None = None,
+        device_free_mb_by_device: Mapping[int, float] | None = None,
+        reclaim_unresolved_by_device: Mapping[int, bool] | None = None,
+    ) -> MeasuredVramSnapshot:
+        """Build the whole-worker frozen snapshot for one cycle, one entry per driven card.
+
+        The single-GPU/worker-wide reading (device index None) is stored under card 0, matching how the
+        scheduler keys its per-card admission counters, so a None-keyed request resolves to it. The parent
+        supplies ``governor_states`` (the device-free governor's committed state per card), the truthful NVML
+        ``device_free_mb_by_device`` reading, and ``reclaim_unresolved_by_device`` (whether the verified
+        reclaim ladder has exhausted itself while SATURATED per card) so each device state carries the
+        foreign-pressure admission inputs; a missing map leaves the corresponding field unset.
+        """
+        device_indices = {process_info.device_index for process_info in self._process_map.values()}
+        if not device_indices:
+            device_indices = {0}
+        devices: dict[int, DeviceVramState] = {}
+        for device_index in sorted(device_indices):
+            governor_state = governor_states.get(device_index) if governor_states is not None else None
+            device_free_mb = (
+                device_free_mb_by_device.get(device_index) if device_free_mb_by_device is not None else None
+            )
+            reclaim_unresolved = (
+                reclaim_unresolved_by_device.get(device_index, False)
+                if reclaim_unresolved_by_device is not None
+                else False
+            )
+            devices[device_index] = self.build_vram_arbiter_device_state(
+                device_index if self._multi_gpu_routing_active else None,
+                active_sampling_peaks_total_mb=active_sampling_peaks_total_mb,
+                governor_state=governor_state,
+                device_free_mb=device_free_mb,
+                reclaim_unresolved=reclaim_unresolved,
+            )
+        return MeasuredVramSnapshot(devices=devices)
+
+    def _overlap_memory_verdict(
+        self,
+        candidate_job: ImageGenerateJobPopResponse,
+        *,
+        target_device_index: int | None,
+    ) -> bool | None:
+        """The arbiter's answer to ``candidate_job``'s overlap memory demand: admits, withholds, or unpriced.
+
+        Prices the candidate's marginal device cost against the cycle-frozen admission floor as a
+        :attr:`VramRequestKind.MONOLITHIC_DISPATCH`: True when a FITS verdict admits, False when a DEFER or
+        DENY withholds. Returns None when the demand cannot be priced at all (the arbiter is unwired,
+        no cycle snapshot is frozen, or the candidate is model-less): the caller then relaxes the memory answer
+        to admit, matching the predictive gate's admit-on-missing-telemetry contract, without treating the
+        absence of telemetry as positive confirmation of room. A disaggregation-class candidate is priced with
+        its sampler-only delta (``disaggregated``), so the concurrent decode spike the sampling gate already
+        reserves is never double-counted here. No actuations run: the arbiter verdict's actuations are ignored
+        because reclaim stays single-owner (the preload path drives it).
+        """
+        arbiter = self._vram_arbiter
+        if arbiter is None or not arbiter.has_cycle or candidate_job.model is None:
+            return None
+        baseline = self._model_metadata.get_baseline(candidate_job.model)
+        resident_model_info = self._horde_model_map.root.get(candidate_job.model)
+        resident_pid = resident_model_info.process_id if resident_model_info is not None else None
+        request = VramRequest(
+            kind=VramRequestKind.MONOLITHIC_DISPATCH,
+            job_label=str(candidate_job.model),
+            baseline=baseline,
+            device_index=target_device_index,
+            target_process_id=resident_pid,
+            candidate_delta_mb=self._measured_admission_candidate_delta_mb(
+                candidate_job,
+                baseline,
+                process_id=resident_pid,
+                disaggregated=self._is_disaggregation_class_eligible(candidate_job),
+            ),
+        )
+        return arbiter.evaluate(request).admits
+
+    def _concurrent_overlap_allowed(
+        self,
+        candidate_job: ImageGenerateJobPopResponse,
+        *,
+        target_device_index: int | None = None,
+    ) -> bool:
+        """Whether ``candidate_job`` may start while other jobs are already sampling, the arbiter deciding memory.
+
+        The concurrency cap (``max_threads``) only counts in-flight jobs; it does not look at what those jobs
+        are, how far along they are, or how much the card can hold. This gate adds both missing dimensions: a
+        temporal/structural guard that keeps a newcomer off a running job's memory-hungry startup beat, and the
+        VRAM arbiter's authoritative answer to whether the card can hold the overlap at all.
+
+        The non-memory guards run first and can decline overlap on their own:
+            * The first job (nothing in flight) always starts: with no overlap there is no memory question.
+            * An extra-large (whole-card tier) model neither joins a busy card nor shares one, whatever the
+              card's headroom; that contract is the tier's, not the card's.
+            * A newcomer must let the running job make size-appropriate sampling headway (none for light+light,
+              a startup beat when a memory-hungry pairing has room, the strictest headway behind a batch) before
+              it joins, so two loads and activation peaks do not stack into a step-timeout teardown.
+
+        The memory question is then the arbiter's: a :attr:`VramRequestKind.MONOLITHIC_DISPATCH` verdict that
+        FITS admits the overlap, a DEFER or DENY withholds it this cycle and the dispatch re-asks
+        naturally on the next scheduling pass. This seam runs no actuations on a DEFER (reclaim is single-owner,
+        driven only by the preload path); a cold start or an unwired arbiter relaxes the memory answer to admit.
+
+        The headway relaxation is driven by positive confirmation only: a heavy pairing's headway drops to the
+        startup-beat constant (and a batch is bounded by the strictest headway rather than a hard block) only
+        when the arbiter has actually confirmed room this cycle. A cold start (no cycle) keeps the strict
+        headway fractions, since the admit-on-missing-telemetry relaxation is not evidence the card has room.
+
+        A blocked job is not dropped: it keeps its queue position and dispatches once the in-flight job(s)
+        progress or finish and the card has room.
+
+        Args:
+            candidate_job: The job being considered for dispatch.
+            target_device_index: On a multi-GPU host, the card this candidate would run on; the headway check
+                then considers only jobs already sampling on that same card (jobs on other cards do not contend
+                for its VRAM or sampler), and the arbiter prices the demand against that card. ``None`` (and
+                every single-GPU call) keeps the worker-wide comparison.
+        """
+        if self._multi_gpu_routing_active and target_device_index is not None:
+            in_progress_jobs: tuple[ImageGenerateJobPopResponse, ...] | list[ImageGenerateJobPopResponse] = (
+                self._jobs_in_progress_on_card(target_device_index)
+            )
+        else:
+            in_progress_jobs = self._job_tracker.jobs_in_progress
+        if not in_progress_jobs:
+            return True
+
+        candidate_tier = self._model_size_tier(candidate_job.model)
+        if candidate_tier >= _ModelSizeTier.EXTRA_LARGE:
+            return False
+
+        # The memory question is the arbiter's, resolved once and only when a rule needs it. ``memory_ample``
+        # is the arbiter's positive confirmation of room (a real cycle that admits), which relaxes the headway;
+        # ``memory_admits`` is the veto, which withholds only when a real cycle denies and relaxes to admit when
+        # the demand could not be priced. A cold start therefore keeps the strict headway yet admits on memory.
+        memory_verdict_cache: bool | None = None
+        memory_evaluated = False
+
+        def memory_verdict() -> bool | None:
+            nonlocal memory_verdict_cache, memory_evaluated
+            if not memory_evaluated:
+                memory_verdict_cache = self._overlap_memory_verdict(
+                    candidate_job,
+                    target_device_index=target_device_index,
+                )
+                memory_evaluated = True
+            return memory_verdict_cache
+
+        def memory_admits() -> bool:
+            return memory_verdict() is not False
+
+        def memory_ample() -> bool:
+            return memory_verdict() is True
+
+        candidate_batched = self._job_batch_amount(candidate_job) > 1
+        if candidate_batched and not memory_ample():
+            return False
+
+        for job in in_progress_jobs:
+            running_tier = self._model_size_tier(job.model)
+            if running_tier >= _ModelSizeTier.EXTRA_LARGE:
+                return False
+
+            if candidate_batched or self._job_batch_amount(job) > 1:
+                # A batch multiplies the activation peak, so without confirmed room it keeps the hard block;
+                # with room it is bounded instead by the strictest headway (never the startup-beat relaxation,
+                # which is sized for single jobs).
+                if not memory_ample():
+                    return False
+                required_headway = _OVERLAP_HEADWAY_BOTH_HEAVY
+            else:
+                required_headway = self._required_overlap_headway(running_tier, candidate_tier)
+                if required_headway > 0.0 and memory_ample():
+                    required_headway = _OVERLAP_HEADWAY_AMPLE_VRAM
+
+            if required_headway <= 0.0:
+                continue
+            if self._in_flight_progress_fraction(job) < required_headway:
+                return False
+
+        return memory_admits()
+
+    def set_vram_growth_hold(self, device_index: int, active: bool) -> None:
+        """Set or clear the device-free governor's growth hold for a card (parent control loop only).
+
+        While ``active`` the scheduler withholds every action that would grow the card's VRAM footprint: a new
+        model preload onto a process that does not already hold it, a safety GPU restore, and a paused-lane
+        restart. In-flight sampling is untouched. Called each governor tick, so the hold tracks the card's
+        live proximity-to-cliff state.
+        """
+        self._vram_growth_hold_by_device[device_index] = active
+
+    def is_vram_growth_held(self, device_index: int | None) -> bool:
+        """Whether the device-free governor is holding new VRAM growth on a card (default card 0 for None).
+
+        The single-GPU/worker-wide key (None) maps to card 0, matching the arbiter snapshot and admission
+        counters. False for any card the governor has not yet sampled (no hold), so a host without NVML never
+        holds growth.
+        """
+        return self._vram_growth_hold_by_device.get(device_index if device_index is not None else 0, False)
+
+    def set_governor_state(self, device_index: int, state: GovernorState) -> None:
+        """Record the device-free governor's committed state for a card (parent control loop only).
+
+        Pushed each governor tick alongside :meth:`set_vram_growth_hold`. Retention reads this state (not the
+        derived hold) so a resident is only kept while the card is HEALTHY.
+        """
+        self._governor_states_by_device[device_index] = state
+
+    def governor_state(self, device_index: int | None) -> GovernorState:
+        """Return the device-free governor's committed state for a card (default card 0 for None).
+
+        The single-GPU/worker-wide key (None) maps to card 0, matching the growth hold and the arbiter snapshot.
+        HEALTHY for any card the governor has not yet sampled, so a host without NVML never denies retention on
+        governor grounds.
+        """
+        return self._governor_states_by_device.get(
+            device_index if device_index is not None else 0, GovernorState.HEALTHY
+        )
+
+    def reclaim_one_idle_model_under_pressure(self, *, device_index: int | None = None) -> bool:
+        """Reclaim idle resident VRAM under a physical-overcommit pressure signal (no specific loading candidate).
+
+        The no-candidate counterpart of the WDDM-paging rising-edge reclaim: one under-pressure sweep of idle
+        resident models on the card, reusing :meth:`unload_models_from_vram`'s target selection and its existing
+        protections (busy, in-progress, queued-lookahead, lane, and pinned processes are all skipped). The
+        anchor passed is a process to protect (a busy inference process if one exists, else any inference
+        process on the card); the sweep evicts the coldest eligible idle resident, never a live model. Returns
+        True when an unload was issued.
+        """
+        anchor = self._pressure_reclaim_anchor(device_index=device_index)
+        if anchor is None:
+            return False
+        return self.unload_models_from_vram(anchor, under_pressure=True, device_index=device_index)
+
+    def _pressure_reclaim_anchor(self, *, device_index: int | None) -> HordeProcessInfo | None:
+        """Pick the process to protect for a no-candidate pressure reclaim: a busy inference process, else any.
+
+        The reclaim sweep excludes its anchor, so anchoring on a busy inference process keeps a live job's
+        model safe while the sweep evicts the coldest idle resident. Falls back to any inference process on the
+        card (its own model is still protected by the in-progress guard) and to None when the card has none.
+        """
+        fallback: HordeProcessInfo | None = None
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if fallback is None:
+                fallback = process_info
+            if process_info.is_process_busy():
+                return process_info
+        return fallback
+
     def _max_jobs_in_progress_allowed(
         self,
         *,
@@ -2599,124 +3759,6 @@ class InferenceScheduler:
             if running_process is not None and running_process.device_index == device_index:
                 on_card.append(job)
         return on_card
-
-    def _concurrent_overlap_allowed(
-        self,
-        candidate_job: ImageGenerateJobPopResponse,
-        *,
-        target_device_index: int | None = None,
-    ) -> bool:
-        """Whether ``candidate_job`` may start while other jobs are already sampling.
-
-        The concurrency cap (``max_threads``) only counts in-flight jobs; it does not look at what those
-        jobs are or how far along they are. That lets two heavy SDXL jobs (plus a speculatively-staged
-        third) stack their weight loads and activation peaks on the card at once, thrashing a sampler
-        into a step-timeout teardown. This gate adds the missing dimension: a new overlap is admitted
-        only when the in-flight work can tolerate it.
-
-        Rules, scaled by model size and measured headroom:
-            * The first job (nothing in flight) always starts.
-            * An extra-large candidate never joins a busy card, and an extra-large job in flight never
-              shares it: the whole-card tier's contract is independent of how roomy the card is.
-            * A batched candidate or a batched job in flight blocks overlap on a tight card; when the
-              device's measured free VRAM absorbs the candidate's full predicted peak plus reserve
-              (:meth:`_overlap_headroom_ample`), the batch instead imposes the strictest headway.
-            * Otherwise the running job must have made size-appropriate headway: none for light+light,
-              modest when one side is heavy, considerable for two heavy jobs. With ample measured
-              headroom the heavy fractions relax to a small constant, since the over-subscription they
-              guard against cannot occur when the newcomer's whole peak fits free VRAM now.
-
-        A blocked job is not dropped; it keeps its queue position and dispatches once the in-flight
-        job(s) progress or finish.
-
-        Args:
-            candidate_job: The job being considered for dispatch.
-            target_device_index: On a multi-GPU host, the card this candidate would run on; the headway
-                check then considers only jobs already sampling on that same card (jobs on other cards do
-                not contend for its VRAM or sampler). ``None`` (and every single-GPU call) keeps the
-                worker-wide comparison, byte-identical to before.
-        """
-        if self._multi_gpu_routing_active and target_device_index is not None:
-            in_progress_jobs: tuple[ImageGenerateJobPopResponse, ...] | list[ImageGenerateJobPopResponse] = (
-                self._jobs_in_progress_on_card(target_device_index)
-            )
-        else:
-            in_progress_jobs = self._job_tracker.jobs_in_progress
-        if not in_progress_jobs:
-            return True
-
-        candidate_tier = self._model_size_tier(candidate_job.model)
-        if candidate_tier >= _ModelSizeTier.EXTRA_LARGE:
-            return False
-
-        # Resolved once per call (it reads the live VRAM measurement) and only when a rule needs it.
-        headroom_ample: bool | None = None
-
-        def ample() -> bool:
-            nonlocal headroom_ample
-            if headroom_ample is None:
-                headroom_ample = self._overlap_headroom_ample(candidate_job, device_index=target_device_index)
-            return headroom_ample
-
-        candidate_batched = self._job_batch_amount(candidate_job) > 1
-        if candidate_batched and not ample():
-            return False
-
-        for job in in_progress_jobs:
-            running_tier = self._model_size_tier(job.model)
-            if running_tier >= _ModelSizeTier.EXTRA_LARGE:
-                return False
-
-            if candidate_batched or self._job_batch_amount(job) > 1:
-                # A batch multiplies the activation peak, so on a tight card it keeps the hard block;
-                # with measured room for the newcomer's whole peak the batch is bounded instead by the
-                # strictest headway (never the ample relaxation, which is sized for single jobs).
-                if not ample():
-                    return False
-                required_headway = _OVERLAP_HEADWAY_BOTH_HEAVY
-            else:
-                required_headway = self._required_overlap_headway(running_tier, candidate_tier)
-                if required_headway > 0.0 and ample():
-                    required_headway = _OVERLAP_HEADWAY_AMPLE_VRAM
-
-            if required_headway <= 0.0:
-                continue
-            if self._in_flight_progress_fraction(job) < required_headway:
-                return False
-
-        return True
-
-    def _overlap_headroom_ample(
-        self,
-        candidate_job: ImageGenerateJobPopResponse,
-        *,
-        device_index: int | None = None,
-    ) -> bool:
-        """Whether the device's live free VRAM absorbs ``candidate_job``'s full predicted sampling peak.
-
-        The overlap gate's strict headway fractions guard against a newcomer's weight load and
-        activation peak over-subscribing a card that cannot host both samplers; this predicate is the
-        measurement that decides whether that hazard exists at all. It reuses the VRAM budget's own
-        verdict (predicted sampling peak + configured reserve against measured free, net of committed
-        reserves), so the overlap gate and the admission gate price a job identically. The check is
-        deliberately conservative in the candidate's favor: dispatch requires the candidate's model to
-        be resident already, so its weights are on the card and the prediction double-counts them as
-        margin. No measurement (cold start) or an inactive budget reads as tight, keeping the strict
-        gate wherever the relaxation cannot be justified by data.
-        """
-        if candidate_job.model is None or not self._budget_active():
-            return False
-        free_vram_mb = self._measured_free_vram_mb(device_index=device_index)
-        if free_vram_mb is None:
-            return False
-        baseline = self._model_metadata.get_baseline(candidate_job.model)
-        verdict = self._vram_budget.check_job(
-            candidate_job,
-            baseline,
-            free_vram_mb,
-            committed_reserve_mb=self._committed_vram_reserve_mb(device_index=device_index),
-        )
-        return verdict.fits
 
     def _expire_stale_model_map_entries(self) -> list[str]:
         """Expire model-map entries whose owning process can no longer be loading that model."""
@@ -2896,6 +3938,27 @@ class InferenceScheduler:
                 last_job_referenced=job,
             )
 
+            # Record the grant into the planned overlay the moment the load is admitted, so a second admission
+            # in this same scheduling cycle (before the per-cycle reconcile runs) sees this charge and cannot
+            # over-admit against the same measured floor. The charge is the candidate delta actually priced for
+            # this preload (sampler-only or whole-job, net of any resident credit); the admit-time reservation
+            # baseline is the target's reserved right now, so the charge decays one-for-one as this process's
+            # own reservation materialises the load. The per-cycle reconcile then prunes it once the process
+            # leaves the loading set (finished, faulted, or dead), with no explicit release on those paths.
+            planned_charge_mb = self._measured_admission_candidate_delta_mb(
+                job,
+                model_baseline,
+                process_id=available_process.process_id,
+                disaggregated=self._is_disaggregation_class_eligible(job),
+            )
+            self._reserve_ledger.set_planned(
+                PRELOAD_ADMISSION_FLOW,
+                str(available_process.process_id),
+                vram_mb=planned_charge_mb if planned_charge_mb is not None else 0.0,
+                target_process_id=available_process.process_id,
+                reserved_at_admit_mb=float(available_process.process_reserved_mb or 0),
+            )
+
         return True
 
     def _decide_whole_card_demand(
@@ -2925,6 +3988,14 @@ class InferenceScheduler:
         ahead of a deeper-queue job, so a non-head heavy job returns ``FALL_THROUGH`` and defers via the
         ordinary verdict until it becomes the head. See :class:`_WholeCardDemandOutcome` for each result.
         """
+        # A disaggregation-class job never demands exclusive device residency: it runs as a UNet-only sampler
+        # whose sampler-only footprint co-resides with the encode lane and other samplers by design. Coupled
+        # with sampler-only charging in the forecast, this breaks the loop where a whole-card window (which
+        # pauses the lane) would otherwise flip the job to its monolithic footprint and re-demand the card,
+        # starving the encode lane. Decided on class-eligibility, not liveness, so the contract holds even
+        # while the lane is transiently paused.
+        if self._is_disaggregation_class_eligible(job):
+            return _WholeCardDemandOutcome.FALL_THROUGH
         # A model needs the teardown path either because it is weight-dominant (needs sole residency) or
         # because the live sibling process contexts have squeezed its bounded weights off the card though it
         # co-resides once the process count is reduced. Both are served by the same machinery: establish
@@ -2988,222 +4059,19 @@ class InferenceScheduler:
             # Still tearing down idle siblings, cycling safety off-GPU, or waiting for their freed VRAM to
             # drain: defer and let a later tick re-evaluate against the reduced topology.
             return _WholeCardDemandOutcome.DEFER
-        # Teardown is structurally exhausted (already at the target process count, safety settled) yet the
-        # activation-inclusive peak still overflows even sole residency, so co-residency can never be reached.
-        # The weights DO fit alone, so admit best-effort onto the now-cleared card under the over-budget step
-        # grace instead of deferring every tick until the supervisor soft-resets.
-        return _WholeCardDemandOutcome.TERMINAL_ADMIT
-
-    def _apply_resource_verdicts(
-        self,
-        job: ImageGenerateJobPopResponse,
-        available_process: HordeProcessInfo,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
-        forecast: StreamForecast,
-        *,
-        is_head_blocker: bool,
-        target_device_index: int | None,
-        no_live_resource_consumer: bool,
-    ) -> bool:
-        """Apply the VRAM then RAM budget verdicts for a preload, reclaiming or admitting as needed.
-
-        Returns True to proceed with the preload (the resources fit, or a head was admitted best-effort
-        after reclamation was exhausted), False to defer this cycle. When a resource does not fit, idle
-        residents are reclaimed (overriding residency under pressure, escalating for the head of the queue);
-        a head on an otherwise-idle device whose shortfall no reclaim can close is admitted best-effort and
-        tagged over-budget rather than wedging the queue. The VRAM-not-fits path may instead reduce the live
-        process count when the contexts (not the resident models) are the over-commit.
-        """
-        if job.model is None:
-            raise ValueError(f"job.model is None ({job})")
-
-        vram_result = self._apply_vram_verdict(
-            job,
-            available_process,
-            baseline,
-            forecast,
-            is_head_blocker=is_head_blocker,
-            target_device_index=target_device_index,
-            no_live_resource_consumer=no_live_resource_consumer,
-        )
-        if vram_result is VramGateResult.DEFER:
-            return False
-        if vram_result is VramGateResult.ADMIT_OVER_BUDGET:
-            # The best-effort admit already reclaimed system RAM (a heavy head loads its checkpoint
-            # through RAM first) and deliberately bypasses the marginal RAM verdict: the whole point of
-            # the admit is that the estimates reject a head the device must nevertheless host.
-            return True
-        return self._apply_ram_verdict(
-            job,
-            baseline,
-            is_head_blocker=is_head_blocker,
-            no_live_resource_consumer=no_live_resource_consumer,
-        )
-
-    def _apply_vram_verdict(
-        self,
-        job: ImageGenerateJobPopResponse,
-        available_process: HordeProcessInfo,
-        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
-        forecast: StreamForecast,
-        *,
-        is_head_blocker: bool,
-        target_device_index: int | None,
-        no_live_resource_consumer: bool,
-    ) -> VramGateResult:
-        """Apply the VRAM budget verdict for a preload: reclaim, reduce contexts, or best-effort admit.
-
-        When the predicted peak fits, answers ``FITS`` immediately (the caller proceeds to the RAM gate).
-        Otherwise runs the reclaim attempts (gentle eviction, escalated for the head of the queue) and
-        dispatches on
-        [`decide_vram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_vram_reclaim_outcome],
-        which holds the escalation policy: defer while reclaim makes progress or a live job holds the
-        device, hold a breaker-tripped model, reduce the live context count when contexts are the
-        over-commit, or admit the head best-effort (tagged over-budget) rather than wedge the queue.
-        """
-        if job.model is None:
-            raise ValueError(f"job.model is None ({job})")
-
-        vram_verdict = self._vram_budget.check_job(
-            job,
-            baseline,
-            self._measured_free_vram_mb(device_index=target_device_index),
-            committed_reserve_mb=self._committed_vram_reserve_mb(device_index=target_device_index),
-        )
-        if vram_verdict.fits:
-            self._vram_budget_defer_notified = False
-            return VramGateResult.FITS
-
-        if not self._vram_budget_defer_notified:
-            logger.opt(ansi=True).warning(
-                f"<fg #f0beff>VRAM budget deferring preload of {job.model}: {vram_verdict.reason()}. "
-                "Reclaiming idle VRAM.</>",
-            )
-            self._vram_budget_defer_notified = True
-        freed = self.unload_models_from_vram(
-            available_process,
-            under_pressure=True,
-            device_index=target_device_index,
-        )
-        if not freed and is_head_blocker:
-            # Gentle reclaim found nothing to free because every idle resident copy is another queued
-            # job's model. The head of the queue must still make progress, so escalate and reclaim one of
-            # them to give the head room.
-            freed = self.unload_models_from_vram(
-                available_process,
-                under_pressure=True,
-                for_head_of_queue=True,
-                device_index=target_device_index,
-            )
-
-        # Before evicting every resident model and admitting the head exclusively, check whether the live
-        # process *contexts* are the over-commit rather than the resident models. The weight-based teardown
-        # gates leave a moderate head co-resident because its weights fit after a model eviction, but its
-        # activation peak does not fit while this many contexts are live (the threads>1 regime, where each
-        # extra context retains VRAM the allocator never returns). When more inference contexts are live
-        # than the head's weights-plus-reserve can co-reside with (``max_resident_processes``, sized from
-        # the measured per-context cost), reducing the process count is the structural remedy: it returns a
-        # context's retained VRAM so the head and a sibling model co-reside and pipeline. The depth is
-        # sized from the verdict's own rejected peak so the reduction fires exactly when admission would
-        # reject; a demand resting on untrusted (unmeasured-fallback) overhead figures is declined.
-        max_resident = None
-        if vram_verdict.predicted_mb is not None:
-            # The teardown depth is a *structural* (load-feasibility) judgment, so it keys on the honest
-            # streaming floor, not the operator's configured margin. ``vram_reserve_mb`` is a
-            # co-residency/activation margin that paces admission; folding it into the context budget as
-            # well charges it twice and manufactures whole-card collapses for ordinary models whose peak
-            # physically co-resides with the full process pool. With the honest floor, only a genuinely
-            # card-filling peak (a whole-card-class model) can push the co-resident count below the live
-            # pool and demand reduction.
-            total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=target_device_index)
-            structural_reserve_mb = (
-                effective_inference_reserve_mb(total_vram_mb, 0.0)
-                if total_vram_mb is not None
-                else vram_verdict.reserve_mb
-            )
-            max_resident = self._max_coresident_for_peak_mb(
-                vram_verdict.predicted_mb,
-                structural_reserve_mb,
-                device_index=target_device_index,
-            )
-        context_reduction_demanded = (
-            self._whole_card_residency_enabled()
-            and is_head_blocker
-            and max_resident is not None
-            and self._process_map.num_loaded_inference_processes(device_index=target_device_index) > max_resident
-        )
-
-        outcome = decide_vram_reclaim_outcome(
-            freed=freed,
-            is_head_blocker=is_head_blocker,
-            no_live_resource_consumer=no_live_resource_consumer,
-            model_unservable=self._is_model_locally_unservable(job.model, device_index=target_device_index),
-            context_reduction_demanded=context_reduction_demanded,
-            whole_card_warranted=self._whole_card_warranted(forecast),
-        )
-
-        if outcome is VramReclaimOutcome.DEFER:
-            # Reclamation made progress, the job is not the head blocker, or a live job holds the device:
-            # wait for the freed room (or the live job's completion) rather than over-committing.
-            return VramGateResult.DEFER
-
-        if outcome is VramReclaimOutcome.HOLD_UNSERVABLE:
-            # Circuit-breaker: a model the device genuinely cannot run faults every over-budget attempt no
-            # matter how it is isolated. Once its consecutive-fault streak crosses the configured threshold
-            # it is held back (not admitted here, not popped in the popper) for a cooldown, so the worker
-            # stops dropping jobs faster than the horde server tolerates and is never forced into
-            # maintenance.
-            if not self._unservable_admit_notified.get(job.model, False):
-                logger.opt(ansi=True).warning(
-                    f"<fg #ff8c69>Model {job.model} keeps faulting over the VRAM budget; held "
-                    f"back as locally unservable and not admitted. "
-                    f"{self._process_map.residency_snapshot()}</>",
-                )
-                self._unservable_admit_notified[job.model] = True
-            return VramGateResult.DEFER
-        self._unservable_admit_notified.pop(job.model, None)
-
-        if outcome is VramReclaimOutcome.REDUCE_CONTEXTS:
-            first_time = not self._job_tracker.is_admitted_exclusive(job)
-            self._job_tracker.mark_admitted_exclusive(job)
-            self._establish_whole_card_residency(
-                job,
-                forecast,
-                announce=first_time,
-                target_override=max_resident,
-                device_index=target_device_index,
-            )
-            self.unload_models_from_vram(
-                available_process,
-                under_pressure=True,
-                for_head_of_queue=True,
-                device_index=target_device_index,
-            )
-            return VramGateResult.DEFER
-
-        if outcome is VramReclaimOutcome.ADMIT_DECLINING_REDUCTION:
-            self._log_whole_card_declined(job, forecast)
-
-        # Best-effort admit: reclamation is exhausted (the predicted peak + reserve exceeds achievable free
-        # VRAM even with every idle resident copy evicted) and nothing live holds the device. The burden
-        # estimate is a deliberately conservative single-resident-peak figure, but a large combined
-        # checkpoint is streamed through VRAM component-by-component by the backend, so its true peak is
-        # well under the summed estimate. Give the head the device rather than deferring it forever (which
-        # would wedge the queue and fault the head anyway), after reclaiming system RAM from idle residents
-        # when the host actually lacks the room (a heavy head loads its checkpoint through RAM first). Tag
-        # it so a crash/hang of its over-committed slot is classified as a resource failure (earning the
-        # bounded, isolated retry) instead of a plain re-dispatch.
-        self._reclaim_ram_for_overbudget_admit(job, baseline)
-        self._mark_overbudget_admit(job, forecast)
-        self._log_overbudget_admit(job)
-        return VramGateResult.ADMIT_OVER_BUDGET
+        # Teardown is structurally exhausted (already at the target process count, safety settled). The card is
+        # now cleared to sole residency, so the head's weights are priced against a drained card: fall through
+        # to the measured arbiter evaluation, which admits when the weights fit the cleared card (the
+        # activation peak is the sampling gate's concern, not preload admission) and denies when even the
+        # cleared card cannot hold them (an unserviceable model the offering seam should have excluded).
+        return _WholeCardDemandOutcome.FALL_THROUGH
 
     def _reclaim_ram_for_overbudget_admit(
         self,
         job: ImageGenerateJobPopResponse,
         baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
     ) -> None:
-        """Reclaim idle system RAM ahead of a best-effort over-budget load, only when the host is short.
+        """Reclaim idle system RAM ahead of an over-budget classified load, only when the host is short.
 
         A heavy head loads its checkpoint through system RAM before it reaches the device, so an admit on
         a RAM-tight host must first evict an idle resident copy. On a host with ample available RAM that
@@ -3285,24 +4153,25 @@ class InferenceScheduler:
         *,
         is_head_blocker: bool,
     ) -> bool:
-        """Return whether ``job`` may be admitted for preload under the active VRAM/RAM budget.
+        """Return whether ``job`` may be admitted for preload, with the VRAM arbiter as the deciding authority.
 
-        True means proceed to send the preload; False means defer this cycle. Performs the residency,
-        reclamation, and best-effort-admit side effects the verdict requires. The decision is: forecast
-        weight streaming, resolve a whole-card residency demand (which may pre-stage, defer, or terminally
-        admit the head), apply the head-of-queue starvation backstop, then fall to the ordinary VRAM/RAM
-        verdict. Every decision below is scoped to the card this preload would land on (None keeps the
-        worker-wide reading on a single-GPU host, so the path is byte-identical there).
+        True means proceed to send the preload; False means defer this cycle. The whole-card residency state
+        machine is consulted first (pre-stage, defer, or fall through once its teardown has cleared the card to
+        sole residency). Otherwise the arbiter prices the preload against the frozen cycle measurement: a FITS
+        admits and runs the RAM verdict, and a DEFER (or the structural-impossibility DENY) runs the described
+        pressure-relief actuations so the over-commit is relieved before the request re-asks next cycle. There
+        is no overcommit-admit path: a head that never becomes admittable while the device is idle is rerouted by the
+        structural-queue-wedge recovery supervisor. Every decision is scoped to the card this preload would land
+        on (None keeps the worker-wide reading on a single-GPU host).
         """
         if job.model is None:
             raise ValueError(f"job.model is None ({job})")
 
         baseline = self._model_metadata.get_baseline(job.model)
         target_device_index = available_process.device_index if self._multi_gpu_routing_active else None
-        # A single model loaded onto an otherwise-idle GPU cannot reintroduce the multi-process over-commit
-        # the budget guards against; the over-commit case is several *concurrent* resident models. So when no
-        # job is in-flight (holding this card), a starved head may be admitted best-effort rather than
-        # deferred forever.
+        # A head waiting behind live work is queued, not starved. With no live job holding this card, the
+        # starved-seconds value feeds the arbiter diagnostic and the RAM branch can still decide that exhausted
+        # system-RAM reclaim should proceed.
         if target_device_index is None:
             no_live_resource_consumer = len(self._job_tracker.jobs_in_progress) == 0
         else:
@@ -3310,8 +4179,7 @@ class InferenceScheduler:
 
         forecast = self._forecast_streaming(job, baseline, device_index=target_device_index)
         # Trace the forecast for every budget-gated load so the logs show the residency dynamics, not just the
-        # action taken. Unchanged observations are coalesced by _log_stream_forecast; decision or headroom
-        # changes still log immediately.
+        # action taken. Unchanged observations are coalesced by _log_stream_forecast.
         self._log_stream_forecast(job, forecast)
 
         whole_card = self._decide_whole_card_demand(
@@ -3328,34 +4196,527 @@ class InferenceScheduler:
             # A RAM-only pre-stage of a whole-card head: the VRAM budget deliberately does not fit it
             # co-resident (that is *why* it gets the whole card), so skip the verdict and send the preload.
             return True
-        if whole_card is _WholeCardDemandOutcome.TERMINAL_ADMIT:
-            self._log_whole_card_terminal_admit(job)
-            self._mark_overbudget_admit(job, forecast)
-            return True
 
-        # Head-of-queue starvation backstop (see _HEAD_STARVATION_FORCE_ADMIT_SECONDS): once the head has been
-        # budget-deferred on an otherwise-idle device past the wedge horizon, stop deferring and admit it
-        # best-effort. Reclamation is structurally exhausted by then, so continuing to defer only wedges the
-        # queue until the recovery supervisor soft-resets every pool and faults the whole backlog: strictly
-        # worse than loading one head onto an idle card. This rescues a plain over-budget head that the
-        # verdicts keep rejecting (e.g. a head failing the RAM budget against allocator-stranded idle RAM).
-        force_admit_starved_head = (
-            is_head_blocker and self._head_starved_seconds(job) >= _HEAD_STARVATION_FORCE_ADMIT_SECONDS
-        )
-        if force_admit_starved_head:
-            self._log_head_starvation_force_admit(job)
-            self._mark_overbudget_admit(job, forecast)
-            return True
+        arbiter = self._ensure_preload_arbiter()
 
-        return self._apply_resource_verdicts(
+        # Price the predictive verdict once: it sources the candidate delta and the rejected peak the
+        # context-reduction remedy is sized from.
+        vram_verdict = self._vram_budget.check_job(
             job,
-            available_process,
             baseline,
+            self._measured_free_vram_mb(device_index=target_device_index),
+            committed_reserve_mb=self._committed_vram_reserve_mb(device_index=target_device_index),
+            disaggregated=self._is_disaggregation_class_eligible(job),
+        )
+        max_resident, can_reduce_live_contexts = self._context_reduction_demand(
+            vram_verdict,
             forecast,
             is_head_blocker=is_head_blocker,
             target_device_index=target_device_index,
-            no_live_resource_consumer=no_live_resource_consumer,
         )
+        has_reclaimable_idle_model = self._has_reclaimable_idle_model(
+            available_process,
+            for_head_of_queue=is_head_blocker,
+            device_index=target_device_index,
+        )
+        request = self._build_preload_request(
+            job,
+            available_process,
+            baseline,
+            target_device_index=target_device_index,
+            is_head_blocker=is_head_blocker,
+            has_reclaimable_idle_model=has_reclaimable_idle_model,
+            can_reduce_live_contexts=can_reduce_live_contexts,
+        )
+        verdict = arbiter.evaluate(request)
+
+        if verdict.disposition is VramDisposition.FITS:
+            self._vram_budget_defer_notified = False
+            if verdict.foreign_pressure_admit:
+                # The candidate does not fit the worker's own admission capacity but physically fits the
+                # truthful device-free reading despite foreign load: admit into reality. It loads through
+                # system RAM (reclaim ahead when the host is short), runs under the heavy-head grace, and
+                # honors the over-budget exclusive mode. This bypasses the marginal RAM verdict, whose reclaim
+                # is handled here.
+                self._reclaim_ram_for_overbudget_admit(job, baseline)
+                self._mark_overbudget_admit(job, forecast)
+                self._log_overbudget_admit(job)
+                return True
+            # An ordinary within-capacity fit: the model still loads through system RAM, so the marginal RAM
+            # verdict runs.
+            return self._apply_ram_verdict(
+                job,
+                baseline,
+                is_head_blocker=is_head_blocker,
+                no_live_resource_consumer=no_live_resource_consumer,
+            )
+
+        # DEFER (or the structural-impossibility DENY, treated identically): run the described pressure-relief
+        # commands so the over-commit is relieved, then defer. There is no overcommit admit: a head that never
+        # becomes admittable while the device is idle is rerouted by the structural-queue-wedge recovery
+        # supervisor, and the arbiter emits a starvation diagnostic naming the arithmetic before then.
+        # Completion is observed via the next cycle's frozen snapshot; the actuations are never awaited inline.
+        if not self._vram_budget_defer_notified and not vram_verdict.fits:
+            logger.opt(ansi=True).warning(
+                f"<fg #f0beff>VRAM arbiter deferring preload of {job.model}: {verdict.reason}. "
+                "Reclaiming idle VRAM.</>",
+            )
+            self._vram_budget_defer_notified = True
+        self._preload_actuation = _PreloadActuation(
+            job=job,
+            available_process=available_process,
+            forecast=forecast,
+            max_resident=max_resident,
+        )
+        try:
+            self._execute_preload_actuations(
+                verdict.required_actuations,
+                device_index=target_device_index,
+                for_head_of_queue=is_head_blocker,
+            )
+        finally:
+            self._preload_actuation = None
+        return False
+
+    def _ensure_preload_arbiter(self) -> VramArbiter:
+        """Return the preload-admission arbiter, priming a private one with the current measurement if unwired.
+
+        In the running worker the manager injects the shared arbiter and freezes its cycle once per
+        control-loop iteration, so this returns that instance with the tick's snapshot intact. A scheduler
+        exercised on its own (no manager tick, no injected cycle) gets a private arbiter primed with a
+        freshly-built snapshot, so admission stays fully governed rather than falling to an ungoverned path.
+        """
+        arbiter = self._vram_arbiter
+        if arbiter is None:
+            arbiter = VramArbiter()
+            self._vram_arbiter = arbiter
+        if not arbiter.has_cycle:
+            arbiter.begin_cycle(self.build_vram_arbiter_snapshot())
+        return arbiter
+
+    def _build_preload_request(
+        self,
+        job: ImageGenerateJobPopResponse,
+        available_process: HordeProcessInfo,
+        baseline: KNOWN_IMAGE_GENERATION_BASELINE | str | None,
+        *,
+        target_device_index: int | None,
+        is_head_blocker: bool,
+        has_reclaimable_idle_model: bool,
+        can_reduce_live_contexts: bool,
+    ) -> VramRequest:
+        """Assemble the arbiter request for one preload, priced identically to the measured admission overlay."""
+        return VramRequest(
+            kind=VramRequestKind.PRELOAD,
+            job_label=str(job.model),
+            baseline=baseline,
+            device_index=target_device_index,
+            target_process_id=available_process.process_id,
+            candidate_delta_mb=self._measured_admission_candidate_delta_mb(
+                job,
+                baseline,
+                process_id=available_process.process_id,
+                disaggregated=self._is_disaggregation_class_eligible(job),
+            ),
+            is_head_of_queue=is_head_blocker,
+            starved_seconds=self._head_starved_seconds(job),
+            has_reclaimable_idle_model=has_reclaimable_idle_model,
+            can_reduce_live_contexts=can_reduce_live_contexts,
+        )
+
+    def _context_reduction_demand(
+        self,
+        vram_verdict: BudgetVerdict,
+        forecast: StreamForecast,
+        *,
+        is_head_blocker: bool,
+        target_device_index: int | None,
+    ) -> tuple[int | None, bool]:
+        """Return the head's context-reduction target and whether reducing live contexts is a warranted remedy.
+
+        A moderate head's weights fit after a model eviction but its activation peak does not while this many
+        contexts are live (each extra context retains VRAM the allocator never returns). Reducing the live
+        inference-process count to the largest that still seats the rejected peak plus its structural reserve
+        is the remedy. The depth keys on the honest streaming floor, not the operator's configured margin, so
+        only a genuinely card-filling peak pushes the co-resident count below the live pool; a demand resting
+        on untrusted (unmeasured-fallback) overhead figures is not warranted.
+        """
+        max_resident: int | None = None
+        if vram_verdict.predicted_mb is not None:
+            total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=target_device_index)
+            structural_reserve_mb = (
+                effective_inference_reserve_mb(total_vram_mb, 0.0)
+                if total_vram_mb is not None
+                else vram_verdict.reserve_mb
+            )
+            max_resident = self._max_coresident_for_peak_mb(
+                vram_verdict.predicted_mb,
+                structural_reserve_mb,
+                device_index=target_device_index,
+            )
+        context_reduction_demanded = (
+            self._whole_card_residency_enabled()
+            and is_head_blocker
+            and max_resident is not None
+            and self._process_map.num_loaded_inference_processes(device_index=target_device_index) > max_resident
+        )
+        can_reduce = context_reduction_demanded and self._whole_card_warranted(forecast)
+        return max_resident, can_reduce
+
+    def _has_reclaimable_idle_model(
+        self,
+        process_with_model: HordeProcessInfo,
+        *,
+        for_head_of_queue: bool,
+        device_index: int | None,
+    ) -> bool:
+        """Return whether an idle resident model could be evicted on the card to reclaim VRAM for this head.
+
+        A read-only mirror of the eviction targeting :meth:`unload_models_from_vram` performs under pressure:
+        a post-processing lane not already unloading, or an inference process holding a model that is not in
+        progress, not spared by the queued-lookahead or residency guards (both of which the head escalation
+        overrides), and not already unloading. It excludes the head's own target slot and never counts an
+        in-progress model. When this is False, and no idle cache and no warranted context reduction remain,
+        reclamation is structurally exhausted for this head.
+        """
+        wanted_models = self._compute_wanted_models()
+        next_n_models = list(self.get_next_n_models(self._max_inference_processes))
+        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
+        for process_info in self._process_map.values():
+            if process_info.process_id == process_with_model.process_id:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_type == HordeProcessType.POST_PROCESS:
+                if process_info.is_process_busy():
+                    continue
+                if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+                    continue
+                return True
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if process_info.loaded_horde_model_name is None:
+                continue
+            # The single-model unload guard (skip when only one model is configured) applies only when the
+            # reclaim is not under pressure; every preload reclaim here is under pressure, so it never spares.
+            if process_info.loaded_horde_model_name in in_progress_models:
+                continue
+            if (
+                process_info.loaded_horde_model_name in next_n_models
+                and not for_head_of_queue
+                and self._coresident_lookahead_affordable(
+                    process_info.loaded_horde_model_name,
+                    device_index=device_index,
+                )
+            ):
+                continue
+            if not for_head_of_queue and self._residency_protects_from_unload(
+                process_info.loaded_horde_model_name,
+                wanted_models,
+                vram=True,
+                under_pressure=True,
+            ):
+                continue
+            if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+                continue
+            return True
+        return False
+
+    def _execute_preload_actuations(
+        self,
+        commands: tuple[ActuatorCommand, ...],
+        *,
+        device_index: int | None,
+        for_head_of_queue: bool,
+    ) -> None:
+        """Run the pressure-relief commands a deferred preload verdict described, at most once each this cycle.
+
+        RELEASE_CACHE returns an idle lane's cached allocator reservation to the card; EVICT_IDLE_MODEL frees
+        an idle resident model's weights; REDUCE_LIVE_CONTEXTS collapses the live inference-process count so a
+        retained per-context reservation returns; CYCLE_SAFETY_OFF_GPU frees the safety context. The arbiter
+        guarantees RELEASE_CACHE targets only idle lanes, so a busy lane is never asked to release its cache.
+
+        The command dispatch is routed through :meth:`VerifiedReclaimLadder.execute_arbiter_commands` so this
+        DEFER path and the governor's SATURATED verified ladder share one reclaim execution surface (the
+        single-owner rule): the two triggers can never become two mechanisms evicting the same card by
+        different rules.
+        """
+        VerifiedReclaimLadder.execute_arbiter_commands(
+            commands,
+            self,
+            device_index=device_index,
+            for_head_of_queue=for_head_of_queue,
+        )
+
+    def release_cache(self, process_id: int) -> bool:
+        """Return an idle lane's cached allocator reservation to the device (:class:`VramActuator`)."""
+        return self.release_allocator_cache(process_id)
+
+    def evict_idle_model(self, device_index: int | None, *, for_head_of_queue: bool) -> bool:
+        """Evict an idle resident model on the card to reclaim its weights (:class:`VramActuator`).
+
+        The head being admitted keeps its own target slot: the eviction protects that process and never
+        touches a live in-progress model.
+        """
+        actuation = self._preload_actuation
+        anchor = (
+            actuation.available_process
+            if actuation is not None
+            else self._pressure_reclaim_anchor(device_index=device_index)
+        )
+        if anchor is None:
+            return False
+        return self.unload_models_from_vram(
+            anchor,
+            under_pressure=True,
+            for_head_of_queue=for_head_of_queue,
+            device_index=device_index,
+        )
+
+    def reduce_live_contexts(self, device_index: int | None) -> bool:
+        """Reduce the live inference-context count for the current head (:class:`VramActuator`).
+
+        Establishes whole-card residency for the head at the depth the rejected peak sized, then evicts the
+        idle residents on the other processes so their contexts' retained VRAM returns to the card. A no-op
+        when no head-preload context is recorded.
+        """
+        actuation = self._preload_actuation
+        if actuation is None:
+            return False
+        first_time = not self._job_tracker.is_admitted_exclusive(actuation.job)
+        self._job_tracker.mark_admitted_exclusive(actuation.job)
+        self._establish_whole_card_residency(
+            actuation.job,
+            actuation.forecast,
+            announce=first_time,
+            target_override=actuation.max_resident,
+            device_index=device_index,
+        )
+        self.unload_models_from_vram(
+            actuation.available_process,
+            under_pressure=True,
+            for_head_of_queue=True,
+            device_index=device_index,
+        )
+        return True
+
+    def cycle_safety_off_gpu(self, device_index: int | None) -> bool:
+        """Cycle the safety model off the GPU to reclaim its context (:class:`VramActuator`)."""
+        return self._pause_safety_for_residency_if_idle(device_index)
+
+    def build_reclaim_ladder_candidates(self, device_index: int | None) -> LadderCandidates:
+        """Assemble the idle-filtered inputs the verified reclaim ladder orders into rungs for a card.
+
+        Every actively-sampling process is excluded, so a busy tenant can never become a rung. Idle inference
+        processes still holding a model (and not serving an in-progress job) are unload candidates, ranked by
+        recency via their last model-state report. The reclaimable-cache targets reuse the arbiter's
+        release-cache selection (idle processes whose reservation exceeds allocation by the release threshold,
+        holding no model). Lane and safety candidates are included only while their context is on the GPU, in
+        the fixed pause order the ladder escalates through. Promised-free figures are the tenants' measured
+        reservations where known, so verification compares realized frees against measured expectations.
+        """
+        now_monotonic = time.monotonic()
+        now_wall = time.time()
+        in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
+        idle_residents: list[IdleResidentModel] = []
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.is_process_busy() or process_info.loaded_horde_model_name is None:
+                continue
+            if process_info.loaded_horde_model_name in in_progress_models:
+                continue
+            footprint_mb = float(process_info.process_reserved_mb) if process_info.process_reserved_mb else 0.0
+            idle_residents.append(
+                IdleResidentModel(
+                    process_id=process_info.process_id,
+                    tenant_label=process_info.loaded_horde_model_name,
+                    materialized_monotonic=self._reclaim_recency_key(process_info, now_monotonic, now_wall),
+                    footprint_mb=footprint_mb,
+                ),
+            )
+
+        idle_cache_ids, _busy = self._gpu_process_activity_ids(device_index)
+        cache_targets: list[CacheReleaseTarget] = []
+        for process_id in idle_cache_ids:
+            process_info = self._process_map.get(process_id)
+            if process_info is None or process_info.process_reserved_mb is None:
+                continue
+            reclaimable_mb = float(process_info.process_reserved_mb) - float(process_info.process_allocated_mb or 0)
+            cache_targets.append(
+                CacheReleaseTarget(
+                    process_id=process_id,
+                    tenant_label=f"{process_info.process_type.name.lower()}#{process_id}",
+                    materialized_monotonic=self._reclaim_recency_key(process_info, now_monotonic, now_wall),
+                    reclaimable_mb=reclaimable_mb,
+                ),
+            )
+
+        lanes = self._reclaim_lane_candidates(device_index)
+        safety = self._reclaim_safety_candidate(device_index)
+        return LadderCandidates(
+            device_index=device_index,
+            idle_residents=tuple(idle_residents),
+            cache_targets=tuple(cache_targets),
+            lanes=lanes,
+            safety=safety,
+        )
+
+    @staticmethod
+    def _reclaim_recency_key(process_info: HordeProcessInfo, now_monotonic: float, now_wall: float) -> float:
+        """Return a monotonic-scale recency key for LIFO reclaim ranking of a process.
+
+        Prefers the dedicated ``vram_materialized_monotonic`` stamp (set when the parent observed the process
+        materialize VRAM). When that is unset (an older child, or a process that has not materialized since
+        start) it falls back to the report-time proxy, mapped onto the monotonic timeline
+        (``now_monotonic - (now_wall - last_received_timestamp)``) so stamped and unstamped processes remain
+        comparable in one ranking rather than one scale sorting entirely above the other.
+        """
+        if process_info.vram_materialized_monotonic is not None:
+            return process_info.vram_materialized_monotonic
+        return now_monotonic - (now_wall - process_info.last_received_timestamp)
+
+    def _reclaim_lane_candidates(self, device_index: int | None) -> tuple[LaneReclaimCandidate, ...]:
+        """Build the lane-pause rungs in fixed escalation order for lanes currently on the GPU."""
+        lifecycle = self._process_lifecycle
+        lanes: list[LaneReclaimCandidate] = []
+        if (
+            not lifecycle.is_post_process_gpu_paused
+            and self._process_map.num_post_process_processes(device_index=device_index) > 0
+        ):
+            lanes.append(
+                LaneReclaimCandidate(
+                    kind=ReclaimRungKind.PAUSE_PP_LANE,
+                    tenant_label="post-processing lane",
+                    promised_mb=self._reserved_mb_for_type(HordeProcessType.POST_PROCESS, device_index),
+                ),
+            )
+        if (
+            lifecycle.vae_lane_enabled()
+            and not lifecycle.is_vae_lane_gpu_paused
+            and self._process_map.num_vae_lane_processes(device_index=device_index) > 0
+        ):
+            lanes.append(
+                LaneReclaimCandidate(
+                    kind=ReclaimRungKind.PAUSE_VAE_LANE,
+                    tenant_label="VAE lane",
+                    promised_mb=self._reserved_mb_for_type(HordeProcessType.VAE_LANE, device_index),
+                ),
+            )
+        if (
+            lifecycle.component_lane_enabled()
+            and not lifecycle.is_component_gpu_paused
+            and self._process_map.num_component_processes(device_index=device_index) > 0
+        ):
+            lanes.append(
+                LaneReclaimCandidate(
+                    kind=ReclaimRungKind.PAUSE_COMPONENT_LANE,
+                    tenant_label="component lane",
+                    promised_mb=self._reserved_mb_for_type(HordeProcessType.COMPONENT, device_index),
+                ),
+            )
+        return tuple(lanes)
+
+    def _reclaim_safety_candidate(self, device_index: int | None) -> LaneReclaimCandidate | None:
+        """Build the safety-off-GPU rung when safety is configured on-GPU and not already paused."""
+        if not self._runtime_config.bridge_data.safety_on_gpu or self._process_lifecycle.is_safety_gpu_paused:
+            return None
+        reserved_mb = self._reserved_mb_for_type(HordeProcessType.SAFETY, device_index)
+        return LaneReclaimCandidate(
+            kind=ReclaimRungKind.SAFETY_OFF_GPU,
+            tenant_label="safety",
+            promised_mb=reserved_mb if reserved_mb > 0 else _SAFETY_GPU_LOAD_CHARGE_MB,
+        )
+
+    def _reserved_mb_for_type(self, process_type: HordeProcessType, device_index: int | None) -> float:
+        """Sum the measured device reservation (MB) of a process type's live processes on a card."""
+        total_mb = 0.0
+        for process_info in self._process_map.values():
+            if process_info.process_type != process_type:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_reserved_mb is not None:
+                total_mb += float(process_info.process_reserved_mb)
+        return total_mb
+
+    def unload_idle_model(self, process_id: int, device_index: int | None = None) -> bool:
+        """Unload one idle process's resident model from VRAM to RAM (reclaim-ladder actuator).
+
+        Targets a single named process rather than sweeping the card, so the verified ladder controls exactly
+        which resident it gives back and in what order. Never touches an actively-sampling process, and treats
+        a process already unloading (or without a resident model) as a no-op so the engine does not open a
+        verification window on a rung that frees nothing.
+        """
+        process_info = self._process_map.get(process_id)
+        if process_info is None or process_info.loaded_horde_model_name is None:
+            return False
+        if process_info.is_process_busy():
+            return False
+        if process_info.last_control_flag == HordeControlFlag.UNLOAD_MODELS_FROM_VRAM:
+            return False
+        model_name = process_info.loaded_horde_model_name
+        if not process_info.safe_send_message(
+            HordeControlModelMessage(
+                control_flag=HordeControlFlag.UNLOAD_MODELS_FROM_VRAM,
+                horde_model_name=model_name,
+            ),
+        ):
+            return False
+        process_info.last_job_referenced = None
+        process_info.last_control_flag = HordeControlFlag.UNLOAD_MODELS_FROM_VRAM
+        self._record_churn("vram_eviction")
+        logger.info(f"Reclaim ladder: unloading model {model_name} from VRAM on idle process {process_id}")
+        return True
+
+    def release_idle_cache(self, process_id: int) -> bool:
+        """Release an idle process's reclaimable allocator cache back to the card (reclaim-ladder actuator)."""
+        return self.release_allocator_cache(process_id)
+
+    def pause_post_process_lane(self, device_index: int | None) -> bool:
+        """Pause the post-processing lane off the GPU to reclaim its context (reclaim-ladder actuator)."""
+        return self._process_lifecycle.pause_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+
+    def pause_vae_lane(self, device_index: int | None) -> bool:
+        """Pause the VAE lane off the GPU to reclaim its context (reclaim-ladder actuator)."""
+        return self._process_lifecycle.pause_vae_lane_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+
+    def pause_component_lane(self, device_index: int | None) -> bool:
+        """Pause the component lane off the GPU to reclaim its context (reclaim-ladder actuator)."""
+        return self._process_lifecycle.pause_component_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+
+    def safety_off_gpu(self, device_index: int | None) -> bool:
+        """Move the on-GPU safety context off the card to reclaim it (reclaim-ladder actuator).
+
+        Unlike the lane pauses, the ladder does not restore safety when the episode ends: the runtime
+        safety-placement policy owns safety's on/off-GPU state and re-promotes it once the card demonstrably
+        fits its context beside the largest active sampling peak, so a ladder-cycled safety pause has a live,
+        independent restore path and is never stranded.
+        """
+        return self._process_lifecycle.pause_safety_on_gpu()
+
+    def restore_post_process_lane(self, device_index: int | None) -> bool:
+        """Restart a ladder-paused post-processing lane once the card has recovered (reclaim-ladder actuator)."""
+        return self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+
+    def restore_vae_lane(self, device_index: int | None) -> bool:
+        """Restart a ladder-paused VAE lane once the card has recovered (reclaim-ladder actuator)."""
+        return self._process_lifecycle.restore_vae_lane_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+
+    def restore_component_lane(self, device_index: int | None) -> bool:
+        """Restart a ladder-paused component lane once the card has recovered (reclaim-ladder actuator)."""
+        return self._process_lifecycle.restore_component_off_gpu(owner=PauseOwner.RECLAIM_LADDER)
+
+    def record_calibration_event(self, rung: ReclaimRung, *, promised_mb: float, realized_mb: float) -> None:
+        """Record a verified reclaim shortfall as a calibration counter (reclaim-ladder actuator).
+
+        The freed figure is not a footprint peak and no complete footprint key is reconstructable at reclaim
+        time, so the raise-only footprint store does not apply; the signal is kept as a count for calibration
+        visibility that a rung's promised free over-stated what the hardware returned.
+        """
+        self._reclaim_calibration_events += 1
 
     def preload_models(self) -> bool:
         """Preload models that are likely to be used soon.
@@ -3369,6 +4730,8 @@ class InferenceScheduler:
             True if a model was preloaded, False otherwise.
         """
         self._restore_siblings_after_whole_card()
+        self._reconcile_runtime_safety_placement()
+        self._restore_deferred_safety_gpu_load()
         self._converge_whole_card_residency()
         self._expire_stale_model_map_entries()
 
@@ -3452,7 +4815,7 @@ class InferenceScheduler:
         """Run one pending job through the preload admission pipeline.
 
         The gates, in order: quarantine (faults the job), already-resident, the absolute RAM danger
-        floor, the exclusive-job hold, target selection (with the starved-head fallback), the
+        floor, the exclusive-job hold, target selection, the
         cycle-on-model-change replacement, the per-device load serialization gate, and the VRAM/RAM
         budget admission. The returned :class:`_PreloadJobOutcome` tells the pass whether to consider the
         next pending job, stop for this cycle, or record that a preload was issued.
@@ -3460,6 +4823,15 @@ class InferenceScheduler:
         bridge_data = self._runtime_config.bridge_data
         if job.model is None:
             raise ValueError(f"job.model is None ({job})")
+
+        if (unserviceable_reason := self._unserviceable_job_reason(job)) is not None:
+            if job not in self._job_tracker.jobs_in_progress:
+                self._fault_unserviceable_job(job, unserviceable_reason)
+            return self._preload_outcome(
+                AdmissionDecision.UNSERVICEABLE,
+                job=job,
+                reason=unserviceable_reason,
+            )
 
         # A model quarantined for repeatedly failing to load must never be preloaded again: doing so only
         # re-arms the crash/recovery loop it was quarantined to stop. Fault the job so the horde reissues
@@ -3479,8 +4851,7 @@ class InferenceScheduler:
 
         # Absolute system-RAM floor (degrade, never crash): loading a new model routes its weights through
         # system RAM first, so admitting one while the host is already below its danger floor is the OS
-        # OOM kill, not progress. This gates every admit path (best-effort, head-starvation force-admit,
-        # and whole-card-terminal all sit below this point), independent of the marginal RAM budget, which
+        # OOM kill, not progress. This gates every preload path independent of the marginal RAM budget, which
         # can pass on a job's small estimate while the whole host is on the edge (resident weights + the
         # safety process + other apps). The governor's tick has already degraded the host this cycle;
         # this only defers the load. Gated on the budget being active (the same switch the rest of the
@@ -3544,6 +4915,20 @@ class InferenceScheduler:
         if available_process is None:
             return self._preload_outcome(
                 AdmissionDecision.NO_TARGET, job=job, reason="no idle inference slot available"
+            )
+
+        # Device-free governor growth hold: while the target card's device-level free VRAM sits below the
+        # soft floor (PRESSURE or SATURATED), bringing this model to a slot that does not already hold it
+        # would grow a footprint already near the WDDM paging cliff. Defer until the card recovers. A job
+        # already in progress is exempt: its preload is part of live work, not new speculative growth, and
+        # withholding it would wedge a job the card is already committed to.
+        growth_hold_device = available_process.device_index if self._multi_gpu_routing_active else 0
+        if self.is_vram_growth_held(growth_hold_device) and job not in self._job_tracker.jobs_in_progress:
+            return self._preload_outcome(
+                AdmissionDecision.DEFER_VRAM_GROWTH_HOLD,
+                job=job,
+                process=available_process,
+                reason="device-free governor holding VRAM growth (device near paging cliff)",
             )
 
         if (
@@ -3697,6 +5082,64 @@ class InferenceScheduler:
             self._card_runtimes,
             baseline=baseline_value,
             weight_mb=weight_mb,
+        )
+
+    def _baseline_value_for_job(self, job: ImageGenerateJobPopResponse) -> str | None:
+        """Return the job model's baseline value, or None when metadata is unavailable."""
+        if job.model is None:
+            return None
+        baseline = self._model_metadata.get_baseline(job.model)
+        return baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
+
+    def _model_serviceability_verdicts(
+        self,
+        job: ImageGenerateJobPopResponse,
+    ) -> list[tuple[CardRuntime, ModelServiceabilityVerdict]]:
+        """Return per-serving-card serviceability verdicts for ``job``.
+
+        The check abstains when the runtime card map or model footprint is unknown. It considers only cards
+        whose effective config serves the model, matching the offer and placement surfaces.
+        """
+        if job.model is None or not self._card_runtimes:
+            return []
+        baseline = self._baseline_value_for_job(job)
+        figures = model_footprint_figures_for_baseline(baseline)
+        if figures is None:
+            return []
+        verdicts: list[tuple[CardRuntime, ModelServiceabilityVerdict]] = []
+        for card in self._card_runtimes.values():
+            if job.model not in set(card.config.image_models_to_load):
+                continue
+            baseline_mb = self._admission_baseline_mb(card.device_index)
+            verdicts.append(
+                (
+                    card,
+                    assess_model_serviceability(
+                        total_vram_mb=card.total_vram_mb,
+                        baseline_mb=baseline_mb,
+                        noise_buffer_mb=None,
+                        figures=figures,
+                    ),
+                ),
+            )
+        return verdicts
+
+    def _unserviceable_job_reason(self, job: ImageGenerateJobPopResponse) -> str | None:
+        """Return a fault reason when no serving card can ever host this job's model minimum."""
+        verdicts = self._model_serviceability_verdicts(job)
+        if not verdicts or any(verdict.serviceable for _, verdict in verdicts):
+            return None
+        arithmetic = "; ".join(f"device {card.device_index}: {verdict.reason()}" for card, verdict in verdicts)
+        return f"model minimum footprint cannot fit any serving card; {arithmetic}"
+
+    def _fault_unserviceable_job(self, job: ImageGenerateJobPopResponse, reason: str) -> None:
+        """Fault an unserviceable queued job before any child process touches VRAM for it."""
+        logger.warning(f"Faulting unserviceable job {job.id_} for model {job.model}: {reason}")
+        self._job_tracker.handle_job_fault_now(
+            job,
+            is_resource_failure=True,
+            retryable=False,
+            fault_reason=reason,
         )
 
     def _card_inference_load(self, device_index: int) -> int:
@@ -3971,6 +5414,11 @@ class InferenceScheduler:
         if next_job.model is None:
             raise ValueError(f"next_job.model is None ({next_job})")
 
+        if (unserviceable_reason := self._unserviceable_job_reason(next_job)) is not None:
+            if not information_only:
+                self._fault_unserviceable_job(next_job, unserviceable_reason)
+            return None
+
         process_with_model = self._resident_process_for_job(next_job)
         line_skip: LineSkip | None = None
 
@@ -4153,34 +5601,40 @@ class InferenceScheduler:
 
         hordelib evicts the model from VRAM after every job so sibling GPU instances never collectively
         over-commit; that eviction forces a RAM->VRAM reload on the next job, which is the dominant
-        non-sampling cost on small jobs. Retention suppresses that eviction for one job, but only under
-        conditions that cannot over-commit the card even when the driver's free-VRAM figure lies:
+        non-sampling cost on small jobs (a same-model successor on the same process pays it for weights that
+        were still on the card). Retention suppresses that eviction for one job. Because eviction is now both
+        on-demand and *proven* (the device-free governor reads truthful NVML device-free, and the verified
+        reclaim ladder takes residents back rung by rung with each free confirmed at the device level),
+        retention no longer has to be preemptively stingy: weights stay resident while the card is healthy,
+        and the ladder reclaims them the instant any overcommit picture appears. The grant needs only:
 
-        - **Sole residency**: no other process on this card may hold a VRAM-resident model. Retention
-          only ever extends the card's single resident across consecutive jobs; it never creates a
-          second resident. This is judged from the parent's own model-map bookkeeping, not from device
-          telemetry, because a WDDM driver in demand-paging keeps reporting generous free VRAM while the
-          card is actually saturated: the one regime the measurement cannot be trusted in is exactly the
-          one this gate exists to prevent.
+        - **Card healthy**: the device-free governor's committed state for this card is HEALTHY. A PRESSURE
+          or SATURATED card is one the ladder is or may soon be reclaiming from, so it is handed no new
+          resident to evict. This state is derived from the one figure a WDDM driver cannot misreport under
+          demand-paging (NVML device-free), so it holds precisely in the regime measured free VRAM lies.
         - **Static fit**: the card's reported total VRAM must absorb this job's sampling peak plus the
-          configured reserve (and any committed in-flight reserves). The total is a constant the driver
-          cannot misreport under pressure, so a model too large to hold at all is refused regardless of
-          what "free" claims.
-        - **Measured veto**: the measured-free budget check can still deny (never solely grant). The
-          job's own weights are credited back only when this process already holds this model in VRAM,
-          since only then was the reading taken with the weights occupying the card.
+          configured reserve (and any committed in-flight reserves), after charging the sibling CUDA contexts
+          and the job's own post-processing that share the card while the weights are held. The total is a
+          constant the driver cannot misreport under pressure, so a model too large to hold at all is refused
+          regardless of what "free" claims.
 
-        No queue lookahead gates the grant. The pop cycle refills the queue immediately *after* a
-        dispatch drains it, so at the dispatch instant a same-model successor is almost never visible in
-        the pending set even when one arrives milliseconds later; requiring one makes retention
-        structurally unreachable. Eviction is instead just-in-time: the per-dispatch VRAM sweep reclaims
-        an idle retained copy the moment a different process needs the card, and the under-pressure
-        reclaim overrides retention outright, so an unused hold costs only the interval until the next
-        dispatch.
+        The measured admission floor is deliberately *not* re-checked here: it is the admission/dispatch
+        gate's job, and retaining already-materialized weights adds zero new bytes to the card, so a measured
+        veto in this seam only reintroduces the never-fires problem via committed-figure noise. Nor is sole
+        residency required: the governor plus the verified ladder make a second idle resident safe (it is a
+        first-class ladder reclaim candidate), so retention may keep weights warm even while a sibling holds
+        its own resident model.
 
-        A missing budget, unreported total, or unmeasured VRAM yields False: retention is granted on
-        evidence, never assumed. Even when granted, hordelib's force-load overflow guard remains the
-        hard backstop, so a wrong call degrades to a reload rather than an OOM.
+        No queue lookahead gates the grant. The pop cycle refills the queue immediately *after* a dispatch
+        drains it, so at the dispatch instant a same-model successor is almost never visible in the pending
+        set even when one arrives milliseconds later; requiring one makes retention structurally unreachable.
+        Eviction is instead just-in-time: a cross-model preload that no longer fits because idle residents
+        hold the card defers while the ladder evicts them, and the under-pressure reclaim overrides retention
+        outright, so an unused hold costs only the interval until the next dispatch.
+
+        A missing budget, unreported total, or unpriceable sibling overhead yields False: retention is granted
+        on evidence, never assumed. Even when granted, hordelib's force-load overflow guard remains the hard
+        backstop, so a wrong call degrades to a reload rather than an OOM.
         """
         model = dispatched_job.model
         if model is None:
@@ -4191,16 +5645,17 @@ class InferenceScheduler:
             # The driver is already demand-paging the worker's allocations; holding weights across jobs
             # in that regime can only deepen it.
             return False
-        if self._other_process_holds_vram_resident_model(
-            process_id=process_with_model.process_id,
-            device_index=device_index,
-        ):
+        governor_state = self.governor_state(device_index)
+        if governor_state is not GovernorState.HEALTHY:
+            self._log_retention_decision(
+                model,
+                process_with_model,
+                granted=False,
+                reason=f"governor: card {governor_state.value} (the reclaim ladder holds priority over new residents)",
+            )
             return False
         total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
         if total_vram_mb is None:
-            return False
-        free_vram_mb = self._measured_free_vram_mb(device_index=device_index)
-        if free_vram_mb is None:
             return False
         baseline = self._model_metadata.get_baseline(model)
         committed_reserve_mb = self._committed_vram_reserve_mb(device_index=device_index)
@@ -4224,44 +5679,19 @@ class InferenceScheduler:
             baseline,
             static_available_mb,
             committed_reserve_mb=committed_reserve_mb,
+            disaggregated=self._is_disaggregation_class_eligible(dispatched_job),
         )
-        if not static_verdict.fits:
-            self._log_retention_decision(
-                model,
-                process_with_model,
-                granted=False,
-                reason=(
-                    f"static: peak {static_verdict.predicted_mb} + reserve exceeds "
-                    f"{static_available_mb:.0f}MB (total {total_vram_mb:.0f}MB minus sibling contexts "
-                    "and the job's own post-processing)"
-                ),
-            )
-            return False
-        resident_credit_mb = 0.0
-        model_info = self._horde_model_map.root.get(model)
-        already_resident_here = (
-            model_info is not None
-            and model_info.process_id == process_with_model.process_id
-            and model_info.horde_model_load_state in (ModelLoadState.LOADED_IN_VRAM, ModelLoadState.IN_USE)
-        )
-        if already_resident_here:
-            resident_credit_mb = predict_job_weight_mb(dispatched_job, baseline) or 0.0
-        verdict = self._vram_budget.check_job(
-            dispatched_job,
-            baseline,
-            min(free_vram_mb + resident_credit_mb, total_vram_mb),
-            committed_reserve_mb=committed_reserve_mb,
-        )
+        granted = static_verdict.fits
         self._log_retention_decision(
             model,
             process_with_model,
-            granted=verdict.fits,
+            granted=granted,
             reason=(
-                f"measured: free={free_vram_mb:.0f}MB, credit={resident_credit_mb:.0f}MB, "
-                f"predicted={verdict.predicted_mb}, reserve={verdict.reserve_mb}"
+                f"static: peak {static_verdict.predicted_mb} + reserve vs {static_available_mb:.0f}MB "
+                f"(total {total_vram_mb:.0f}MB minus sibling contexts and the job's own post-processing)"
             ),
         )
-        return verdict.fits
+        return granted
 
     def _log_retention_decision(
         self,
@@ -4406,16 +5836,97 @@ class InferenceScheduler:
         )
 
     def max_in_progress_sampling_peak_mb(self) -> float | None:
-        """The largest predicted sampling peak (MB) among jobs currently in progress, or None when idle."""
-        peaks = [
-            peak
-            for job in self._job_tracker.jobs_in_progress
-            if job.model is not None
-            and (peak := predict_job_sampling_vram_mb(job, self._model_metadata.get_baseline(job.model))) is not None
-        ]
+        """The largest sampling peak (MB) among jobs currently in progress, or None when idle.
+
+        Each job's static sampling peak is raised by any learned SAMPLE-stage watermark for its footprint before
+        the maximum is taken, so the post-processing co-residency gate this feeds prices in-flight sampling from
+        measured activation high-waters, not a seed the hardware has already overshot.
+        """
+        peaks: list[float] = []
+        for job in self._job_tracker.jobs_in_progress:
+            if job.model is None:
+                continue
+            baseline = self._model_metadata.get_baseline(job.model)
+            static_peak_mb = predict_job_sampling_vram_mb(job, baseline)
+            if static_peak_mb is None:
+                continue
+            peaks.append(
+                self._learned_sampling_peak_mb(
+                    job,
+                    baseline,
+                    static_seed_mb=static_peak_mb,
+                    stage=FootprintStage.SAMPLE,
+                ),
+            )
         if not peaks:
             return None
         return max(peaks)
+
+    def estimate_disaggregated_sampling_peak_mb(self, job_info: HordeJobInfo) -> float | None:
+        """Return a disaggregated job's estimated sampling-phase peak VRAM (MB), or None when unavailable.
+
+        Injected into the disaggregation orchestrator's concurrent-sampling gate. Charges the whole-job
+        sampling peak (:func:`predict_job_sampling_vram_mb`, weights plus the per-step activation working set),
+        a deliberately conservative monolithic bound for v1 rather than the leaner sampler-only figure: the gate
+        arbitrates whether two activation peaks may over-commit the card, and erring high there defers a second
+        sampler that would otherwise drive the device into WDDM demand-paging. The static figure is the seed of a
+        learned SAMPLE_ISOLATED-stage estimate (the disaggregated UNet-only sampler's own key, distinct from the
+        monolithic whole-job SAMPLE key), so a measured isolated-sampler high-water for this (baseline,
+        resolution, platform) raises the booked peak above the seed and never below it. None (no model, or no
+        estimate) leaves the gate to admit, so a missing estimate never wedges the pipeline.
+        """
+        job = job_info.sdk_api_job_info
+        if job.model is None:
+            return None
+        baseline = self._model_metadata.get_baseline(job.model)
+        static_peak_mb = predict_job_sampling_vram_mb(job, baseline)
+        if static_peak_mb is None:
+            return None
+        return self._learned_sampling_peak_mb(
+            job,
+            baseline,
+            static_seed_mb=static_peak_mb,
+            stage=FootprintStage.SAMPLE_ISOLATED,
+        )
+
+    def estimate_disaggregated_decode_spike_mb(self, job_info: HordeJobInfo) -> float | None:
+        """Return a disaggregated job's bundled VAE-decode-plus-post-processing spike (MB), or None if unsizable.
+
+        Injected into the disaggregation orchestrator's decode gate. The bounded tiled-decode activation working
+        set (:func:`predict_job_decode_spike_mb`, the same figure the lane co-residency charge derives from) is
+        the concurrent device commitment a decode adds while a sibling samples. None (no model, or a pinned
+        hordelib that predates the decode-spike figure) prices the decode as unpriced, so the gate then only
+        withholds a decode onto an already over-committed card rather than charging a phantom cost.
+        """
+        job = job_info.sdk_api_job_info
+        if job.model is None:
+            return None
+        baseline = self._model_metadata.get_baseline(job.model)
+        return predict_job_decode_spike_mb(job, str(baseline) if baseline is not None else None)
+
+    def _vae_lane_decode_spike_charge_mb(self, *, device_index: int | None) -> float:
+        """The VAE lane's concurrent decode spike (MB) to reserve out of sampling headroom, 0 when off-card.
+
+        Under disaggregation the image lane VAE-decodes the previous job's latent while a sampler runs, so that
+        bounded tiled-decode activation is a real concurrent device commitment that must not be handed to a
+        second sampler. Charged only while the lane is enabled and on the GPU; sized from an in-flight job's
+        bounded decode-spike estimate (via :meth:`_disaggregation_sibling_charge_mb`, which itself falls back to
+        the conservative full lane quota when the pinned hordelib predates the decode-spike figure). Zero when
+        no in-flight job can size it, so the headroom is never charged a phantom lane spike.
+        """
+        if not self._process_lifecycle.vae_lane_enabled() or self._process_lifecycle.is_vae_lane_gpu_paused:
+            return 0.0
+        if self._process_map.num_vae_lane_processes(device_index=device_index) <= 0:
+            return 0.0
+        for job in self._job_tracker.jobs_in_progress:
+            if job.model is None:
+                continue
+            return self._disaggregation_sibling_charge_mb(
+                job,
+                self._model_metadata.get_baseline(job.model),
+                device_index=device_index,
+            )
+        return 0.0
 
     def _should_defer_dispatch_for_post_processing(self, next_job: ImageGenerateJobPopResponse) -> bool:
         """Whether this dispatch must wait for an in-flight post-processing chain to release the card.
@@ -4438,7 +5949,18 @@ class InferenceScheduler:
             return False
         if next_job.model is None:
             return False
-        sampling_peak_mb = predict_job_sampling_vram_mb(next_job, self._model_metadata.get_baseline(next_job.model))
+        baseline = self._model_metadata.get_baseline(next_job.model)
+        static_peak_mb = predict_job_sampling_vram_mb(next_job, baseline)
+        sampling_peak_mb = (
+            self._learned_sampling_peak_mb(
+                next_job,
+                baseline,
+                static_seed_mb=static_peak_mb,
+                stage=FootprintStage.SAMPLE,
+            )
+            if static_peak_mb is not None
+            else None
+        )
         affordable = self.pp_sampling_coresidency_affordable(
             sampling_peak_mb=sampling_peak_mb,
             pp_reserve_mb=pp_committed_mb,
@@ -4460,13 +5982,27 @@ class InferenceScheduler:
         ``elevated_shared_mb_by_pid`` names the worker child PIDs whose shared (system-backed) GPU usage
         crossed the paging threshold: measured attribution that the *worker's own* allocations were
         demoted out of dedicated VRAM. While active, retention is denied outright (holding weights in a
-        regime the driver is already paging can only deepen it). The rising edge additionally runs one
-        under-pressure sweep of idle resident models, excluding the paging process itself (its model is
-        the one in use; evicting it mid-job would trade paging for a fault), so the card gets room back
-        without waiting for the next dispatch.
+        regime the driver is already paging can only deepen it). The rising edge additionally reclaims idle
+        resident VRAM, routed through the same LIFO reclaim policy the governor's ladder uses (newest idle
+        resident first).
+
+        The PDH-flagged process is deliberately NOT protected. The old sweep spared it on the assumption its
+        model was the one in use, but under WDDM the driver demotes the least-recently-touched allocator, so
+        the flagged process is usually the idle newcomer that just materialized weights, not the active
+        sampler. Protecting it therefore spared exactly the squatter that should be evicted first. Immunity is
+        instead structural: the reclaim ladder's candidate assembly excludes every actively-sampling process,
+        so a busy slot is never swept whatever PDH flagged, and the newest idle resident (the likeliest
+        squatter) is the first eviction target.
         """
         was_active = self._wddm_paging_active
         self._wddm_paging_active = active
+        # Persist the victim set on every active verdict so recency tracks the latest sample, and clear it
+        # the instant paging clears so a stale set cannot outlive the pressure that produced it.
+        if active:
+            self._wddm_paging_victims_shared_mb_by_pid = dict(elevated_shared_mb_by_pid)
+            self._wddm_paging_victims_updated_monotonic = time.monotonic()
+        else:
+            self._wddm_paging_victims_shared_mb_by_pid = {}
         if not active or was_active:
             return
 
@@ -4476,38 +6012,33 @@ class InferenceScheduler:
         logger.warning(
             "WDDM demand-paging detected on worker processes "
             f"({detail}); the driver demoted their VRAM allocations to system memory. "
-            "Denying model retention and reclaiming idle resident VRAM.",
+            "Denying model retention and reclaiming idle resident VRAM (newest idle resident first).",
         )
 
-        paging_process: HordeProcessInfo | None = None
-        for process_info in self._process_map.values():
-            if process_info.os_pid in elevated_shared_mb_by_pid:
-                paging_process = process_info
-                if process_info.is_process_busy():
-                    break
-        if paging_process is not None:
-            self.unload_models_from_vram(paging_process, under_pressure=True)
+        # Reclaim idle resident models in LIFO order through the single reclaim policy: build the ordered
+        # ladder and issue each idle-model unload rung via the same actuator the governor's ladder uses. A
+        # busy process is never a candidate, so an actively-sampling slot is untouched.
+        ladder = build_reclaim_ladder(self.build_reclaim_ladder_candidates(None))
+        for rung in ladder:
+            if rung.kind is ReclaimRungKind.UNLOAD_IDLE_MODEL and rung.target_process_id is not None:
+                self.unload_idle_model(rung.target_process_id, rung.device_index)
 
-    def _other_process_holds_vram_resident_model(self, *, process_id: int, device_index: int | None) -> bool:
-        """Whether any process other than ``process_id`` holds a VRAM-resident model on this card.
+    def wddm_paging_victim_shared_mb_by_pid(self, max_age_seconds: float) -> dict[int, float]:
+        """Return the fresh WDDM paging-victim map (os_pid -> shared MB), or empty when none is current.
 
-        Read from the parent's model-map bookkeeping (child model-state reports), never from device
-        telemetry: a WDDM driver in demand-paging reports generous free VRAM while the card is actually
-        saturated, so residency questions must be answered by what the parent knows it placed there. A
-        map entry whose process is gone is stale, not residency.
+        The map names the worker child PIDs whose VRAM the driver most recently demoted to system memory
+        and by how much (their shared, system-backed GPU MB). It is returned only while it is younger than
+        ``max_age_seconds``; a stale or absent verdict yields an empty map, so a caller can never act on a
+        paging episode that has already cleared or whose telemetry has stopped arriving. The per-PID
+        figures are diagnostic hints only: the counter is unreliable sample-to-sample and the demoted PID
+        is usually the idle newcomer rather than the slow sampler, so no reclaim or kill decision gates on
+        membership in this map.
         """
-        for info in self._horde_model_map.root.values():
-            if info.process_id == process_id:
-                continue
-            if info.horde_model_load_state not in (ModelLoadState.LOADED_IN_VRAM, ModelLoadState.IN_USE):
-                continue
-            holder = self._process_map.get(info.process_id)
-            if holder is None:
-                continue
-            if device_index is not None and holder.device_index != device_index:
-                continue
-            return True
-        return False
+        if not self._wddm_paging_victims_shared_mb_by_pid:
+            return {}
+        if (time.monotonic() - self._wddm_paging_victims_updated_monotonic) > max_age_seconds:
+            return {}
+        return dict(self._wddm_paging_victims_shared_mb_by_pid)
 
     def _log_job_dispatch_details(self, next_job: ImageGenerateJobPopResponse) -> None:
         """Log the model, conditioning extras, and the resolution/steps/sampler line for a dispatching job.
@@ -4571,6 +6102,54 @@ class InferenceScheduler:
 
         logger.debug(f"All Batch IDs: {next_job.ids}")
 
+    async def _dispatch_disaggregated(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+        *,
+        dispatched_device_index: int | None,
+        degraded_dispatch: bool,
+    ) -> bool:
+        """Register a disaggregation-eligible job with the orchestrator, pinned to its scheduled process.
+
+        Replaces the monolithic START_INFERENCE at this seam: the orchestrator reserves ``process_with_model``
+        as the job's sampler (so the scheduler cannot double-book it), and this applies the same job-progress
+        marking a monolithic dispatch does, so concurrency accounting and the orphaned-job watchdog see the
+        job as owned. Returns False when the router declines (a role went unhealthy), so the caller falls back
+        to a monolithic dispatch.
+        """
+        assert self._register_disaggregated_job is not None
+        model = next_job.model
+        if model is None:
+            return False
+        registered = await self._register_disaggregated_job(next_job, process_with_model)
+        if not registered:
+            return False
+
+        await self._job_tracker.mark_inference_started(next_job, device_index=dispatched_device_index)
+        # The pinned process references this job so the orphaned-job watchdog credits it as owned across the
+        # whole encode-and-sample window (the reservation, not a START_INFERENCE flag, is that ownership
+        # record: see WorkerRecoveryCoordinator.inference_slot_owns_job). No sampling-timing stamp is set here;
+        # the sampler reports its own INFERENCE_STARTING when the sample stage runs.
+        process_with_model.last_job_referenced = next_job
+        process_with_model.loaded_horde_model_name = model
+        process_with_model.loaded_horde_model_baseline = self._model_metadata.get_baseline(model)
+        if degraded_dispatch:
+            self._job_tracker.clear_degraded_dispatch(next_job)
+        self._process_lifecycle.action_ledger.record(
+            LedgerEventType.INFERENCE_DISPATCHED,
+            process_id=process_with_model.process_id,
+            os_pid=process_with_model.os_pid,
+            launch_identifier=process_with_model.process_launch_identifier,
+            job_id=str(next_job.id_) if next_job.id_ is not None else None,
+            detail={"model": model, "disaggregated": True},
+        )
+        logger.opt(ansi=True).info(
+            f"<fg #f0beff>Job {str(next_job.id_)[:8]} routed to the disaggregated pipeline; sampler pinned "
+            f"to process {process_with_model.process_id}.</>",
+        )
+        return True
+
     async def _dispatch_inference_message(
         self,
         next_job: ImageGenerateJobPopResponse,
@@ -4585,9 +6164,32 @@ class InferenceScheduler:
         On a successful send, marks the job started, stamps the slot's in-flight timing for the
         graded-slowdown monitor, records the dispatch in the action ledger, and advances the process state.
         On a failed send, faults the job so the horde reissues it.
+
+        A disaggregation-eligible job is not sent monolithic inference here: this is the single admission
+        point, so the scheduler has already preloaded its model onto ``process_with_model`` exactly as for a
+        monolithic job, and instead of START_INFERENCE the job is registered with the orchestrator pinned to
+        that process as its sampler. All the in-flight/job-progress marking a monolithic dispatch performs is
+        applied identically (so the process cannot be double-booked), minus the sampling-timing stamps, which
+        the sampler reports itself when the sample stage runs.
         """
         if next_job.model is None:
             raise ValueError(f"next_job.model is None ({next_job})")
+
+        # A disaggregation-eligible job is registered with the orchestrator (its sampler pinned to
+        # process_with_model) instead of being sent monolithic inference. If registration is declined (a role
+        # went unhealthy between the eligibility check and here) the dispatch falls through to the monolithic
+        # path so the job still runs whole rather than being dropped.
+        if (
+            self._register_disaggregated_job is not None
+            and self._is_disaggregatable_job(next_job)
+            and await self._dispatch_disaggregated(
+                next_job,
+                process_with_model,
+                dispatched_device_index=dispatched_device_index,
+                degraded_dispatch=degraded_dispatch,
+            )
+        ):
+            return
 
         bridge_data = self._runtime_config.bridge_data
         if process_with_model.safe_send_message(
@@ -4618,6 +6220,8 @@ class InferenceScheduler:
             process_with_model.current_first_step_at = None
             process_with_model.current_job_expected_sampling_seconds = expected_seconds
             process_with_model.current_job_slowdown_level = 0
+            process_with_model.consecutive_slow_per_steps = 0
+            process_with_model.current_job_per_step_floor_tripped = False
 
             if degraded_dispatch:
                 self._job_tracker.clear_degraded_dispatch(next_job)
@@ -4877,6 +6481,24 @@ class InferenceScheduler:
             unloaded_any = True
             self._record_churn("vram_eviction")
         return unloaded_any
+
+    def release_allocator_cache(self, process_id: int) -> bool:
+        """Ask one process to release its torch allocator cache without unloading its models.
+
+        The cache-only reclaim actuator: an arbiter RELEASE_CACHE command and the post-stage lane policy
+        both land here, returning an allocator's reserved-but-unused device blocks to the card without
+        evicting any resident model. Mirrors the safe-send path of the unload senders. Returns True if
+        the flag was delivered, False if the process is absent or the send failed.
+        """
+        process_info = self._process_map.get(process_id)
+        if process_info is None:
+            return False
+        delivered = process_info.safe_send_message(
+            HordeControlMessage(control_flag=HordeControlFlag.RELEASE_ALLOCATOR_CACHE),
+        )
+        if delivered:
+            logger.debug(f"Asked process {process_id} to release its allocator cache")
+        return delivered
 
     def unload_models_from_vram(
         self,

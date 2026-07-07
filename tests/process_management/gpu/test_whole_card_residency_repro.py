@@ -25,11 +25,17 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier, model_size_tier
 from horde_worker_regen.process_management.resources import resource_budget
+from horde_worker_regen.process_management.resources.admission_identity import admission_noise_buffer_mb
 from horde_worker_regen.process_management.resources.resource_budget import (
     StreamForecast,
     effective_inference_reserve_mb,
     forecast_weight_streaming,
     predict_job_weight_mb,
+)
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    DeviceVramState,
+    MeasuredVramSnapshot,
+    VramArbiter,
 )
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
@@ -160,6 +166,9 @@ class TestStreamForecastClassification:
         *live* process count means once siblings are stopped the same model re-forecasts as co-resident.
         """
         job = make_job_pop_response(_FLUX_MODEL)
+        # Unmeasured-marginal (WDDM) host: each context charged the full first-context overhead, which is what
+        # forces the four-context teardown here. An unmeasured marginal now seeds a small constant, so it is
+        # pinned to the per-process overhead to reproduce the over-count under test.
         before = forecast_weight_streaming(
             job,
             "flux_1",
@@ -168,6 +177,7 @@ class TestStreamForecastClassification:
             per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
             num_inference_processes=4,
             configured_reserve_floor_mb=float(_VRAM_RESERVE_MB),
+            marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
         )
         assert before.requires_sibling_teardown is True
         # The reserve is the activation working set (peak ~14000 - weights 11500 = 2500 MB), not the flat
@@ -182,6 +192,7 @@ class TestStreamForecastClassification:
             per_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
             num_inference_processes=1,
             configured_reserve_floor_mb=float(_VRAM_RESERVE_MB),
+            marginal_process_overhead_mb=_PER_PROCESS_OVERHEAD_MB,
         )
         assert after.requires_sibling_teardown is False
         assert after.fits_coresident is True
@@ -219,6 +230,10 @@ class TestStreamForecastClassification:
             "per_process_overhead_mb": _PER_PROCESS_OVERHEAD_MB,
             "num_inference_processes": 2,
             "configured_reserve_floor_mb": float(_VRAM_RESERVE_MB),
+            # Unmeasured-marginal host: extra contexts (here the safety context) are charged the full
+            # first-context overhead, so the safety context lowers achievable-free by exactly that. Pinned
+            # because an unmeasured marginal now seeds a smaller constant.
+            "marginal_process_overhead_mb": _PER_PROCESS_OVERHEAD_MB,
         }
         without_safety = forecast_weight_streaming(job, "flux_1", num_extra_resident_contexts=0, **kwargs)
         with_safety = forecast_weight_streaming(job, "flux_1", num_extra_resident_contexts=1, **kwargs)
@@ -367,6 +382,10 @@ class TestWholeCardSiblingTeardown:
         )
 
         scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=4)
+        # Unmeasured-marginal (WDDM) host: the sibling contexts each cost the full first-context overhead,
+        # which is what over-commits the card here. Pin the marginal to it since an unmeasured marginal now
+        # seeds a smaller constant that would not force the teardown.
+        scheduler.set_measured_marginal_overhead_mb(_PER_PROCESS_OVERHEAD_MB)
         # Stub the lifecycle scaler so the test asserts the call and returns an int the scheduler can log.
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=1)
 
@@ -457,6 +476,9 @@ class TestWholeCardSiblingTeardown:
         safety_on_gpu config.
         """
         scheduler, process_map, _job_tracker = _build_context_overcommit_scheduler(num_processes=1)
+        # The safety context is charged at the per-additional-context marginal; pin it to the per-process
+        # overhead (the unmeasured-marginal host this scenario models) so pausing safety frees exactly that.
+        scheduler.set_measured_marginal_overhead_mb(_PER_PROCESS_OVERHEAD_MB)
         process_map[0] = make_mock_process_info(
             0,
             model_name=None,
@@ -895,25 +917,32 @@ def _sole_residency_scheduler(
 
 
 class TestWholeCardTerminalAdmit:
-    """The wedge: a whole-card model at its target sole residency that still cannot fit co-resident.
+    """A whole-card model at its target sole residency that could not fit co-resident, now admitted not wedged.
 
     Reproduces a Flux.1-Schnell fp8 head with ``post_processing: False``: the scheduler tears the pool down to
-    its target of one process for the heavy head, but the sampling-phase peak (~15273 MB) exceeds even the
-    sole-residency capacity (~15087 MB), so the forecast keeps returning ``requires_sibling_teardown`` with no
-    sibling left to stop. Such a head must be admitted best-effort and loaded onto the cleared card (where it
-    runs slowly under the over-budget step grace) rather than deferred every tick until the queue wedges and
-    save-our-ship soft-resets the pools at the 120 s establish grace.
+    its target of one process for the heavy head, and once teardown is structurally exhausted and the card has
+    drained the whole-card demand falls through to the ordinary measured arbiter evaluation. On a cleared card
+    the weights are priced against a drained device, so the head admits (rather than deferring every tick until
+    the queue wedges and save-our-ship soft-resets at the 120 s establish grace). The load is protected from
+    wedge misdiagnosis by the whole-card establishment grace, not the over-budget heavy-head grace, so an
+    ordinary within-capacity fit sets no over-budget marker. When a realistic baseline consumes the card the
+    identity instead says no while the truthful device-free reading still physically holds the weights, and the
+    admit takes the foreign-pressure fit-into-reality path, which does set the over-budget marker.
     """
 
     async def test_flux_at_target_residency_is_admitted_not_wedged_forever(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """At one live process the head must be admitted, not deferred forever without ever preloading.
+        """At one live process the cleared card admits the head on the ordinary within-capacity fit path.
 
         Wedge geometry: weights 11500 + sampling peak 15218 -> reserve 3718, so weights + reserve (15218)
         exceed even ``free_if_alone`` (15087). ``fits_alone`` (weights + 2048 floor) is True, so this is a
         whole-card model (not streams-unavoidably); ``fits_coresident`` can never flip, even at one process.
+        With the fixture baseline near zero the measured admission capacity comfortably holds the 11500 weights,
+        so the admit is an ordinary fit: it sets no over-budget marker. Exclusive is still marked (the whole-card
+        residency establishment marks it), and the establishment grace, not the heavy-head grace, protects the
+        multi-gigabyte load from wedge misdiagnosis.
         """
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 15218.0)
@@ -930,12 +959,58 @@ class TestWholeCardTerminalAdmit:
 
         admitted = any(scheduler.preload_models() for _ in range(30))
 
-        # The fix: teardown is structurally exhausted and the card has drained, so the head loads best-effort
-        # under the over-budget step grace instead of deferring until the recovery supervisor soft-resets.
+        # Teardown is structurally exhausted and the card has drained, so the head loads on the ordinary fit
+        # path instead of deferring until the recovery supervisor soft-resets.
         assert admitted is True, "head must be admitted, not deferred until save-our-ship"
+        assert proc.last_control_flag == HordeControlFlag.PRELOAD_MODEL
+        # An ordinary within-capacity fit sets no over-budget marker; the establishment grace covers the load.
+        assert job_tracker.is_admitted_over_budget(head_job) is False
+        assert scheduler.whole_card_residency_grace_active() is True
+        # The whole-card residency establishment still marks the head exclusive, independent of the admit path.
+        assert job_tracker.is_admitted_exclusive(head_job) is True
+
+    async def test_flux_admit_under_foreign_pressure_marks_over_budget_and_exclusive(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A realistic baseline makes the identity say no, but device-free holds the weights: foreign-pressure admit.
+
+        Same wedge geometry, but the arbiter cycle carries a realistic shared-device baseline that pushes the
+        committed-plus-candidate demand past the ledger capacity, while the truthful device-free reading still
+        physically holds the 11500 MB weights net of the noise buffer. The admit therefore takes the
+        foreign-pressure fit-into-reality path, which reclaims RAM ahead, opens the heavy-head grace, and marks
+        the head over-budget (and exclusive under the configured over-budget exclusive mode).
+        """
+        monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: _FLUX_WEIGHTS_MB)
+        monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 15218.0)
+
+        scheduler, job_tracker, proc = _sole_residency_scheduler(free_mb=15007.0)
+        head_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
+        await track_popped_job_async(job_tracker, head_job)
+
+        # Freeze an arbiter cycle where the ledger identity denies (committed 13000 + weights 11500 exceed
+        # capacity (16375 - 1500 baseline - 819 noise) = 14056), yet the weights physically fit the truthful
+        # device-free reading (15007 - 819 = 14188 >= 11500): the foreign-pressure fit-into-reality path.
+        state = DeviceVramState(
+            total_vram_mb=float(_DEVICE_TOTAL_VRAM_MB),
+            baseline_mb=1500.0,
+            committed_vram_mb=13000.0,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+            noise_buffer_mb=admission_noise_buffer_mb(float(_DEVICE_TOTAL_VRAM_MB)),
+            device_free_mb=15007.0,
+        )
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: state}))
+        scheduler._vram_arbiter = arbiter
+
+        admitted = any(scheduler.preload_models() for _ in range(30))
+
+        assert admitted is True
         assert proc.last_control_flag == HordeControlFlag.PRELOAD_MODEL
         assert job_tracker.is_admitted_over_budget(head_job) is True
         assert job_tracker.is_admitted_exclusive(head_job) is True
+        assert scheduler.heavy_head_load_grace_active() is True
 
     async def test_undrained_card_defers_no_premature_admit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Drain guard: at target residency but the card not yet drained, the head still defers (no OOM load).
@@ -959,7 +1034,7 @@ class TestWholeCardTerminalAdmit:
         assert job_tracker.is_admitted_over_budget(head_job) is False
 
     def test_teardown_exhausted_requires_target_safety_and_drain(self) -> None:
-        """The terminal-admit gate fires only at-target AND safety-settled AND the card drained."""
+        """The whole-card load gate fires only at-target AND safety-settled AND the card drained."""
         drained = StreamForecast(
             weights_mb=_FLUX_WEIGHTS_MB,
             reserve_mb=3718.0,

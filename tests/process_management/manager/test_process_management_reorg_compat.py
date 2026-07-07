@@ -7,6 +7,7 @@ from pathlib import Path
 
 EXPECTED_TOP_LEVEL_FILES = {
     "__init__.py",
+    "fd_limits.py",
     "main_entry_point.py",
     "process_manager.py",
     "worker_entry_points.py",

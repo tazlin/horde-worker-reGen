@@ -48,6 +48,10 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     is_model_locally_unservable_for,
     predict_job_weight_mb,
 )
+from horde_worker_regen.process_management.resources.model_serviceability import (
+    assess_model_serviceability,
+    model_footprint_figures_for_baseline,
+)
 from horde_worker_regen.process_management.scheduling.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
     PopThrottler,
@@ -96,6 +100,9 @@ def _select_models_for_pop(
     model_availability: ModelAvailability | None = None,
     configured_models: set[str] | None = None,
     card_runtimes: dict[int, CardRuntime] | None = None,
+    model_metadata: ModelMetadata | None = None,
+    admission_baseline_provider: Callable[[int | None], float | None] | None = None,
+    serviceability_logged: set[str] | None = None,
 ) -> set[str] | None:
     """Choose which models to include in a pop request.
 
@@ -112,6 +119,11 @@ def _select_models_for_pop(
         card_runtimes: The per-card runtime plan. On a multi-GPU host a model is held back as unservable only
             when it is unservable on *every* card that serves it (so a model fine on a big card keeps being
             advertised); when None or single-card the worker-wide streak decides, as before.
+        model_metadata: Loaded model reference metadata for baseline lookups. When unavailable,
+            serviceability abstains.
+        admission_baseline_provider: Source of the shared device baseline (MB) per card. A missing baseline
+            reads as zero so a quiet baseline that has not yet been captured does not falsely de-list models.
+        serviceability_logged: Mutable set of log keys already emitted for serviceability exclusions.
 
     Returns:
         A set of model names, or ``None`` if no models are eligible (caller should skip the pop).
@@ -192,6 +204,16 @@ def _select_models_for_pop(
         logger.debug(f"Not popping models held back as locally unservable: {sorted(held_back)}")
         models = models.difference(held_back)
 
+    serviceability_held_back = _serviceability_held_back_models(
+        models,
+        card_runtimes=card_runtimes,
+        model_metadata=model_metadata,
+        admission_baseline_provider=admission_baseline_provider,
+        serviceability_logged=serviceability_logged,
+    )
+    if serviceability_held_back:
+        models = models.difference(serviceability_held_back)
+
     if bridge_data.custom_models is not None and len(bridge_data.custom_models) > 0:
         logger.debug("Custom models are enabled, adding them to the list of models to pop")
         custom_model_names = {model["name"] for model in bridge_data.custom_models}
@@ -213,6 +235,67 @@ def _select_models_for_pop(
         return None
 
     return models
+
+
+def _baseline_value_for_model(model_metadata: ModelMetadata | None, model_name: str) -> str | None:
+    """Return a model's baseline value, or None when metadata is unavailable."""
+    if model_metadata is None:
+        return None
+    baseline = model_metadata.get_baseline(model_name)
+    return baseline.value if isinstance(baseline, KNOWN_IMAGE_GENERATION_BASELINE) else baseline
+
+
+def _serviceability_held_back_models(
+    models: set[str],
+    *,
+    card_runtimes: dict[int, CardRuntime] | None,
+    model_metadata: ModelMetadata | None,
+    admission_baseline_provider: Callable[[int | None], float | None] | None,
+    serviceability_logged: set[str] | None,
+) -> set[str]:
+    """Return models whose minimum footprint cannot fit any card in this pop scope."""
+    if model_metadata is None or card_runtimes is None or len(card_runtimes) == 0:
+        return set()
+
+    held_back: set[str] = set()
+    for model in models:
+        serving_cards = [
+            card for card in card_runtimes.values() if model in set(card.config.image_models_to_load)
+        ]
+        if not serving_cards:
+            continue
+        baseline = _baseline_value_for_model(model_metadata, model)
+        figures = model_footprint_figures_for_baseline(baseline)
+        verdicts = []
+        for card in serving_cards:
+            baseline_mb = (
+                admission_baseline_provider(card.device_index)
+                if admission_baseline_provider is not None
+                else None
+            )
+            verdicts.append(
+                assess_model_serviceability(
+                    total_vram_mb=card.total_vram_mb,
+                    baseline_mb=0.0 if baseline_mb is None else baseline_mb,
+                    noise_buffer_mb=None,
+                    figures=figures,
+                ),
+            )
+        if any(verdict.serviceable for verdict in verdicts):
+            continue
+        held_back.add(model)
+        if serviceability_logged is None:
+            continue
+        key = f"{model}:{','.join(str(card.device_index) for card in serving_cards)}"
+        if key in serviceability_logged:
+            continue
+        serviceability_logged.add(key)
+        arithmetic = "; ".join(
+            f"device {card.device_index}: {verdict.reason()}"
+            for card, verdict in zip(serving_cards, verdicts, strict=True)
+        )
+        logger.info(f"Not offering unserviceable model {model}: {arithmetic}")
+    return held_back
 
 
 class JobPopper:
@@ -258,6 +341,7 @@ class JobPopper:
         card_runtimes: dict[int, CardRuntime] | None = None,
         model_metadata: ModelMetadata | None = None,
         whole_card_residency_active: Callable[[], bool] | None = None,
+        admission_baseline_provider: Callable[[int | None], float | None] | None = None,
     ) -> None:
         """Initialize with all required dependencies for job popping.
 
@@ -274,6 +358,10 @@ class JobPopper:
         `whole_card_residency_active` is queried by the large-model re-entry cooldown to know whether a
         whole-card residency lease is still held; it defaults to "never held" so a worker wired without it
         (and the tests) behaves as if no lease is ever active.
+
+        `admission_baseline_provider` supplies the shared device baseline for model serviceability offer
+        shaping. A missing provider or uncaptured baseline reads as zero and only defers the exclusion until
+        the arithmetic is known.
         """
         self._state = state
         self._process_map = process_map
@@ -283,6 +371,8 @@ class JobPopper:
         self._api_sessions = api_sessions
         self._card_runtimes = card_runtimes if card_runtimes is not None else {}
         self._model_metadata = model_metadata
+        self._admission_baseline_provider = admission_baseline_provider
+        self._serviceability_exclusion_logged: set[str] = set()
         self._whole_card_residency_active = (
             whole_card_residency_active if whole_card_residency_active is not None else (lambda: False)
         )
@@ -876,6 +966,7 @@ class JobPopper:
         # any card can run (the worker then routes each job to an eligible card); single-GPU advertises the
         # global config unchanged.
         advertised = self._advertised_capabilities()
+        advertised_card_runtimes = self._card_runtimes
 
         # Adaptive targeting: when the local queue is lopsided away from one card (most held work is servable
         # only by other cards), scope THIS pop to the under-fed card's capabilities so the horde returns work
@@ -883,7 +974,8 @@ class JobPopper:
         if advertised is not None:
             under_fed = self._targeted_under_fed_card(bridge_data)
             if under_fed is not None:
-                advertised = advertised_capabilities({under_fed: self._card_runtimes[under_fed]})
+                advertised_card_runtimes = {under_fed: self._card_runtimes[under_fed]}
+                advertised = advertised_capabilities(advertised_card_runtimes)
                 logger.debug(
                     f"Adaptive pop: local queue is lopsided away from card {under_fed}; scoping this pop to "
                     "its capabilities.",
@@ -897,7 +989,10 @@ class JobPopper:
             last_pop_had_no_jobs=self._state.last_pop_no_jobs_available,
             model_availability=self._model_availability,
             configured_models=set(advertised.models) if advertised is not None else None,
-            card_runtimes=self._card_runtimes if self._multi_gpu_advertise else None,
+            card_runtimes=advertised_card_runtimes,
+            model_metadata=self._model_metadata,
+            admission_baseline_provider=self._admission_baseline_provider,
+            serviceability_logged=self._serviceability_exclusion_logged,
         )
         if models is None:
             return

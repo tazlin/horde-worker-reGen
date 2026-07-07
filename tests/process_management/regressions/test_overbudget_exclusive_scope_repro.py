@@ -1,12 +1,12 @@
-"""Exclusivity scope for over-budget best-effort admits.
+"""Exclusivity scope for over-budget classified admits.
 
-An over-budget best-effort admit exists to un-wedge the head of the queue when the VRAM budget cannot fit
-it even after reclaiming every idle resident copy. Running that admit with the device to itself
+An over-budget classified admit can still happen when the candidate physically fits the truthful device state
+under foreign pressure. Running that admit with the device to itself
 (``overbudget_exclusive_mode``) protects a genuinely card-dominating model from a concurrent sibling load
 pushing its weights into host-RAM streaming. That protection is wasted on a card-light model: a moderate
-checkpoint (an SDXL on a high-VRAM card) can reach the force-admit path purely through reserve arithmetic
-on a device whose free VRAM is depressed by retained sibling contexts, and it samples correctly alongside
-a sibling. Marking such an admit exclusive suppresses every other preload and caps dispatch at one job
+checkpoint (an SDXL on a high-VRAM card) can reach the over-budget classification while it still physically
+fits the card, and it samples correctly alongside a sibling. Marking such an admit exclusive suppresses every
+other preload and caps dispatch at one job
 from admit through completion, serializing a multi-thread card for the full duration of an ordinary job.
 
 The contract pinned here (``StreamForecast.admit_requires_isolation``): exclusivity attaches to an

@@ -8,7 +8,7 @@ therefore sits far below what the streaming forecast predicts is reclaimable, be
 matmul holder that never allocates a model's worth of cache. The gap between forecast-optimism and
 reclaim-reality is harmless at ``max_threads=1`` (only one or two contexts) but at ``max_threads=2`` the
 extra contexts make it large enough that every head-of-queue model fails its activation-reserve check,
-finds nothing left to evict, and is force-admitted *exclusive*, evicting every resident model. The next
+finds nothing left to evict, and is admitted *exclusive*, evicting every resident model. The next
 job then reloads from cold, so the worker churns full reloads and duty cycle collapses below the
 ``max_threads=1`` baseline instead of rising.
 
@@ -188,7 +188,7 @@ class TestNoEvictAllThrash:
         """A budget-deferred SDXL head on a context-pinned idle card must not evict every resident model.
 
         With four idle contexts pinning device-free, the head's weights-plus-reserve does not fit, gentle
-        reclaim frees nothing the device returns, and the current scheduler force-admits the head exclusive
+        reclaim frees nothing the device returns, and the scheduler admits the head exclusive
         -- which evicts the very models the next jobs reuse. The desired remedy is a process-count
         reduction (stop an idle sibling so a context's VRAM returns), leaving the other resident models in
         place for the pipeline.
@@ -210,7 +210,7 @@ class TestNoEvictAllThrash:
 
         # The head must not have been admitted by evicting every resident model exclusively.
         assert scheduler._job_tracker.is_admitted_over_budget(head_job) is False, (
-            "the head was force-admitted over-budget (the evict-all thrash) instead of reducing contexts"
+            "the head was admitted over budget (the evict-all thrash) instead of reducing contexts"
         )
 
     def test_max_threads_one_two_contexts_no_spurious_teardown(self) -> None:

@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources import resource_budget
+from horde_worker_regen.process_management.scheduling import inference_scheduler as _sched_mod
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -99,54 +100,56 @@ async def _enqueue_head_jobs(job_tracker: JobTracker, count: int = 2) -> None:
 class TestBudgetStarvationWedge:
     """The active variable is the VRAM budget verdict for the head job; everything else is held fixed."""
 
-    async def test_unfittable_head_is_admitted_best_effort_not_deferred_forever(
+    async def test_unfittable_head_defers_after_reclaim_is_exhausted(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A head whose predicted peak + reserve exceeds the free-VRAM floor must not defer forever.
+        """A head the measured floor cannot seat stays queued after reclaim is exhausted.
 
-        If nothing ever admits the preload, the queue wedges and the head is faulted. Instead the budget must
-        first attempt reclamation and, once that is exhausted while no live job holds the device, admit the
-        head best-effort so the queue makes progress. Loading one model onto an otherwise-idle GPU cannot
-        reintroduce the multi-process over-commit the budget exists to prevent.
+        The arbiter first describes reclamation, evicting the idle residents. Once the ladder is exhausted and
+        the arithmetic still does not fit, the preload continues to defer instead of loading into proven
+        over-commit. The structural queue-deadlock detector below is the reroute mechanism for that wedged
+        state.
         """
         monkeypatch.setattr(
             resource_budget,
             "predict_job_sampling_vram_mb",
             lambda job, baseline: _HEAVY_SDXL_PREDICTED_VRAM_MB,
         )
-        # RAM is irrelevant to this VRAM-bound case, but the best-effort VRAM admit skips the RAM gate
-        # entirely; pin a fittable RAM picture so the test is unambiguous either way.
+        # RAM is irrelevant to this VRAM-bound case; pin a fittable RAM picture so the test is unambiguous.
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 1000.0)
 
         scheduler, _process_map, job_tracker, proc_sd15, proc_sdxl = _build_wedged_scheduler(
             free_vram_mb=_ACHIEVABLE_FREE_VRAM_MB,
         )
+        # The two idle residents commit a fresh allocator reservation that over-commits the card, so the
+        # measured floor denies the head and describes evicting them. Once both are unloading, the ladder is
+        # empty and the head still defers because the arithmetic still does not fit.
+        for proc in (proc_sd15, proc_sdxl):
+            proc.process_reserved_mb = 8500
+            proc.report_sampled_at = time.time()
         monkeypatch.setattr(scheduler, "_measured_available_ram_mb", lambda: 64000.0)
         await _enqueue_head_jobs(job_tracker)
 
         # Sanity: the threshold is genuinely unreachable on this device.
         assert _HEAVY_SDXL_PREDICTED_VRAM_MB + _VRAM_RESERVE_MB > _ACHIEVABLE_FREE_VRAM_MB
 
-        preloaded_any = False
         reclaimed_first = False
         for _ in range(20):
-            if scheduler.preload_models():
-                preloaded_any = True
-                break
-            # Until the head is admitted, the budget should be attempting reclamation, not idling.
+            assert scheduler.preload_models() is False
+            # Until the head is rerouted, the budget should be attempting reclamation, not idling.
             if HordeControlFlag.UNLOAD_MODELS_FROM_VRAM in {
                 proc_sd15.last_control_flag,
                 proc_sdxl.last_control_flag,
             }:
                 reclaimed_first = True
 
-        assert reclaimed_first is True, "the budget should attempt to reclaim idle VRAM before best-effort admit"
-        assert preloaded_any is True, "head must eventually be admitted best-effort rather than starved forever"
-        assert HordeControlFlag.PRELOAD_MODEL in {
+        assert reclaimed_first is True, "the budget should attempt to reclaim idle VRAM before continued deferral"
+        assert HordeControlFlag.PRELOAD_MODEL not in {
             proc_sd15.last_control_flag,
             proc_sdxl.last_control_flag,
         }
+        assert all(job_tracker.is_admitted_over_budget(job) is False for job in job_tracker.jobs_pending_inference)
 
     async def test_fittable_head_dispatches_isolating_the_budget_as_cause(
         self,
@@ -159,6 +162,9 @@ class TestBudgetStarvationWedge:
         """
         fittable_vram = _ACHIEVABLE_FREE_VRAM_MB - _VRAM_RESERVE_MB - 100.0
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: fittable_vram)
+        # The arbiter prices the candidate from the scheduler-bound predictor, so the fittable peak must reach
+        # it too: with no idle resident committing the card, this candidate clears the measured floor.
+        monkeypatch.setattr(_sched_mod, "predict_job_sampling_vram_mb", lambda job, baseline: fittable_vram)
         monkeypatch.setattr(resource_budget, "predict_job_ram_mb", lambda job, baseline: 1000.0)
 
         scheduler, _process_map, job_tracker, proc_sd15, proc_sdxl = _build_wedged_scheduler(

@@ -39,6 +39,7 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.resources.vram_arbiter import DeviceVramState, MeasuredVramSnapshot
 from horde_worker_regen.process_management.simulation.pp_load import (
     AVERAGE_CARD,
     CONTENTION_SLOWDOWN_FACTOR,
@@ -136,6 +137,7 @@ class LaneLoadSimulator:
         """
         self.scenario = scenario
         self.model = PostProcessLoadModel()
+        self._vram_reserve_mb = float(vram_reserve_mb)
         self.now_s = 0.0
         self.reclaim_requests = 0
         self.thrashed_dispatches = 0
@@ -170,8 +172,22 @@ class LaneLoadSimulator:
 
     def _publish_card_state(self) -> None:
         free_mb = self.scenario.card.free_at(self.now_s)
-        self.lane.total_vram_mb = int(self.scenario.card.total_vram_mb)
-        self.lane.vram_usage_mb = int(self.scenario.card.total_vram_mb - free_mb)
+        total_mb = float(self.scenario.card.total_vram_mb)
+        self.lane.total_vram_mb = int(total_mb)
+        self.lane.vram_usage_mb = int(total_mb - free_mb)
+        # The lane's memory admission is the VRAM arbiter's; freeze a cycle whose measured floor reproduces the
+        # card's occupancy. Folding the configured reserve into the baseline (with a zeroed noise buffer) makes
+        # the arbiter's admission boundary "chain peak + reserve <= free", the exact figure the lane's headroom
+        # decision uses, so the scenario's fittable/unfittable classification carries through the flipped gate.
+        state = DeviceVramState(
+            total_vram_mb=total_mb,
+            baseline_mb=self._vram_reserve_mb,
+            committed_vram_mb=total_mb - free_mb,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+            noise_buffer_mb=0.0,
+        )
+        self.pm._vram_arbiter.begin_cycle(MeasuredVramSnapshot(devices={self.lane.device_index or 0: state}))
 
     def _enqueue(self, job_class: PostProcessJobClass) -> None:
         shape = JOB_SHAPES[job_class]

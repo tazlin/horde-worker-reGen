@@ -1,7 +1,7 @@
 """Reproduction and semantic validation of the resident-footprint under-count over-commit.
 
 A worker on a 24 GB card popped a heavy multi-component checkpoint (a Qwen-Image fp8 job, batch 2) at the
-head of the queue while a sibling process held a large model resident. The scheduler force-admitted the head
+head of the queue while a sibling process held a large model resident. The scheduler admitted the head
 *shared* (not isolated) once reclamation was exhausted, and when it finally sampled the device was full: the
 sampler raised ``torch.OutOfMemoryError`` with ~190 MB free. The fault was correctly classified as a resource
 failure and requeued for a degraded, isolated retry, so the *classification* backstop worked; the defect is on
@@ -26,8 +26,8 @@ guard that it, and the forecast built on it, keep the isolating verdict). ``flux
 support seed; the Flux cases are the green contrast that shows the same verdict for a checkpoint that was
 never mis-seeded.
 
-The isolation verdict under test is :attr:`admit_requires_isolation`, which is what tags the over-budget
-force-admit exclusive so concurrent sibling staging and dispatch are suppressed while the head loads and
+The isolation verdict under test is :attr:`admit_requires_isolation`, which tags over-budget admission
+exclusive so concurrent sibling staging and dispatch are suppressed while the head loads and
 samples. That exclusivity, not the co-resident-context *depth* (:meth:`max_resident_processes`, which by
 design keeps cheap idle contexts on a roomy card since the overlap gate already bars co-sampling), is what
 would have kept the sibling off the card during the Qwen sample.
@@ -280,11 +280,11 @@ class TestCoResidencyIsolationContract:
 
 
 class TestOverBudgetAdmitExclusivityTracksIsolation:
-    """The over-budget force-admit tags the head exclusive iff the forecast says isolate.
+    """The over-budget admission tag is exclusive iff the forecast says isolate.
 
     This is the wiring that turned the Qwen head's mis-classification into the out-of-memory sample: when
-    reclamation is exhausted and no live job holds the device, the head is admitted best-effort rather than
-    wedging the queue, and :meth:`_mark_overbudget_admit` decides shared vs exclusive purely on
+    the head is admitted on an over-budget classification path, :meth:`_mark_overbudget_admit` decides shared
+    vs exclusive purely on
     :attr:`admit_requires_isolation`. Exclusive suppresses concurrent sibling staging and dispatch; shared
     leaves the sibling free to fill the card under the loading head. The observed admit logged *shared*.
     """
@@ -292,7 +292,7 @@ class TestOverBudgetAdmitExclusivityTracksIsolation:
     async def test_undercounted_head_is_admitted_shared(self) -> None:
         """The reproduced fault path: an under-counted card-filling head is admitted shared, not isolated.
 
-        With the forecast reading phantom co-residency room, the best-effort admit does not tag the head
+        With the forecast reading phantom co-residency room, the over-budget classification does not tag the head
         exclusive, so the concurrency gate keeps a sibling co-resident, the condition under which the head's
         sample ran the device out of memory.
         """
@@ -314,7 +314,7 @@ class TestOverBudgetAdmitExclusivityTracksIsolation:
     async def test_isolation_required_head_is_admitted_exclusive(self) -> None:
         """With an accurate footprint the same admit is tagged exclusive, keeping the sibling off the card.
 
-        The corrected behavior the seed fix produces: a card-filling head force-admitted over budget is
+        The corrected behavior the seed fix produces: a card-filling head admitted over budget is
         isolated, so no sibling is staged and dispatched beside it while it loads and samples.
         """
         scheduler, _process_map, job_tracker = _build_context_overcommit_scheduler(num_processes=2)

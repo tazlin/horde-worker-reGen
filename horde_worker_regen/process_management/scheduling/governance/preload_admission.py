@@ -4,7 +4,7 @@ The scheduler's preload loop walks the pending queue and decides, per job, wheth
 onto an inference slot. The judgment calls in that pipeline live here as pure functions: which slots a
 preload may not displace, whether the per-device load serialization gate blocks this cycle, which slot to
 free for a starved head, in which order eligible cards should receive a fresh load, and what the
-escalating VRAM/RAM reclamation resolves to once its reclaim attempts have run. The scheduler keeps the
+system-RAM reclamation resolves to once its reclaim attempts have run. The scheduler keeps the
 measurement (budget verdicts, live process state) and the actions (evictions, process cycling); the
 policy that turns those readings into an outcome is testable here without either.
 
@@ -16,8 +16,7 @@ Critical public members:
 * [`preload_concurrency_blocked`]
   [horde_worker_regen.process_management.scheduling.governance.preload_admission.preload_concurrency_blocked]:
   the per-device model-load serialization gate.
-* ``decide_vram_reclaim_outcome`` / ``decide_ram_reclaim_outcome``: what an exhausted reclamation pass
-  resolves to (defer, hold, reduce contexts, or best-effort admit).
+* ``decide_ram_reclaim_outcome``: what an exhausted system-RAM reclamation pass resolves to.
 """
 
 from __future__ import annotations
@@ -38,12 +37,9 @@ __all__ = [
     "PreloadSlotSnapshot",
     "ReclamationExecutor",
     "RamReclaimOutcome",
-    "VramGateResult",
-    "VramReclaimOutcome",
     "card_preload_order",
     "compute_preload_disallowed_processes",
     "decide_ram_reclaim_outcome",
-    "decide_vram_reclaim_outcome",
     "preload_concurrency_blocked",
     "select_head_room_process_id",
 ]
@@ -60,10 +56,16 @@ class AdmissionDecision(StrEnum):
     """Stop the preload pass for this scheduling cycle."""
     QUARANTINED = auto()
     """The model is quarantined and the job should be faulted/reissued before continuing."""
+    UNSERVICEABLE = auto()
+    """The model's minimum device footprint cannot fit any serving card, so the job is faulted for reissue."""
     ALREADY_LOADED = auto()
     """The model is already resident or loading, so no preload is needed."""
     DEFER_RAM_PRESSURE = auto()
     """The absolute host-RAM floor blocks a new preload this cycle."""
+    DEFER_VRAM_GROWTH_HOLD = auto()
+    """The device-free governor is holding new VRAM growth on the target card this cycle: device-level free
+    VRAM is below the soft floor, so bringing another model to the card would grow a footprint already near
+    the WDDM paging cliff. Deferred until the card recovers (foreign pressure eases, or reclaim frees room)."""
     EXCLUSIVE_IN_PROGRESS = auto()
     """An exclusive over-budget job is in progress and suppresses unrelated staging."""
     NO_TARGET = auto()
@@ -76,8 +78,6 @@ class AdmissionDecision(StrEnum):
     """The resource budget or reclamation ladder deferred the preload."""
     PRESTAGE = auto()
     """A whole-card head should be pre-staged into RAM before it samples."""
-    TERMINAL_ADMIT = auto()
-    """A whole-card head should be admitted best-effort after teardown is exhausted."""
 
 
 @dataclass(frozen=True)
@@ -225,60 +225,6 @@ def card_preload_order(
         return (already_serves, card_busy_counts.get(device_index, 0))
 
     return sorted(eligible_card_indices, key=_placement_key)
-
-
-class VramGateResult(StrEnum):
-    """The VRAM gate's answer for one preload attempt."""
-
-    FITS = auto()
-    """The predicted peak fits measured free VRAM: proceed to the RAM gate."""
-    DEFER = auto()
-    """Does not fit and reclaim is the answer this tick: defer the preload."""
-    ADMIT_OVER_BUDGET = auto()
-    """Admitted best-effort past an exhausted reclamation: skip the RAM gate (its reclaim already ran)."""
-
-
-class VramReclaimOutcome(StrEnum):
-    """What an exhausted VRAM reclamation pass resolves to for the job that could not fit."""
-
-    DEFER = auto()
-    """Wait: something was freed, the job is not the head blocker, or a live job still holds the device."""
-    HOLD_UNSERVABLE = auto()
-    """The model keeps faulting over the budget (circuit breaker): hold it back, do not admit."""
-    REDUCE_CONTEXTS = auto()
-    """Live process contexts are the over-commit: establish a whole-card reduction and defer."""
-    ADMIT_DECLINING_REDUCTION = auto()
-    """A reduction was demanded on untrusted overhead figures: decline it and admit best-effort instead."""
-    BEST_EFFORT_ADMIT = auto()
-    """Reclamation is structurally exhausted and nothing live holds the device: admit over-budget."""
-
-
-def decide_vram_reclaim_outcome(
-    *,
-    freed: bool,
-    is_head_blocker: bool,
-    no_live_resource_consumer: bool,
-    model_unservable: bool,
-    context_reduction_demanded: bool,
-    whole_card_warranted: bool,
-) -> VramReclaimOutcome:
-    """Return what the VRAM branch does after its reclaim attempts have run.
-
-    The escalation policy in one place: a preload whose predicted peak does not fit defers while reclaim
-    makes progress or a live job holds the device; only a head-of-queue blocker on an otherwise-idle
-    device may go further, and then in order of preference: hold a breaker-tripped model, reduce the live
-    context count when contexts (not models) are the over-commit and the overhead figures warrant it, or
-    admit the head best-effort rather than wedge the queue.
-    """
-    if freed or not is_head_blocker or not no_live_resource_consumer:
-        return VramReclaimOutcome.DEFER
-    if model_unservable:
-        return VramReclaimOutcome.HOLD_UNSERVABLE
-    if context_reduction_demanded and whole_card_warranted:
-        return VramReclaimOutcome.REDUCE_CONTEXTS
-    if context_reduction_demanded:
-        return VramReclaimOutcome.ADMIT_DECLINING_REDUCTION
-    return VramReclaimOutcome.BEST_EFFORT_ADMIT
 
 
 class RamReclaimOutcome(StrEnum):

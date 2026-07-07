@@ -45,6 +45,15 @@ POST_PROCESS_RESERVE_FLOW = "image_post_processing"
 """Committed-reserve ledger flow name for image jobs active on the dedicated post-processing lane."""
 
 
+PRELOAD_ADMISSION_FLOW = "preload_admission"
+"""Committed-reserve ledger flow name for the *planned* (admitted, not-yet-materialised) VRAM of preloads.
+
+Each admitted preload registers its charged candidate delta as a planned entry under this flow keyed by the
+loading process id, so a second admission in the same window sees the first's charge before its VRAM lands in
+the measured floor. The entries are pruned each scheduling cycle from live loading state (see
+``InferenceScheduler._in_flight_admitted_planned_units``); this flow name is that overlay's namespace."""
+
+
 _WORKLOAD_CAPABILITIES: dict[WorkloadKind, WorkerCapability] = {
     WorkloadKind.IMAGE_GENERATION: WorkerCapability.IMAGE_GEN,
     WorkloadKind.ALCHEMY: WorkerCapability.ALCHEMY_GRAPH | WorkerCapability.ALCHEMY_CLIP,

@@ -13,13 +13,8 @@ tests pin the stage transitions that carry it:
 - the exclusive job's own preload passes the hold (the exemption in ``_attempt_preload_for_job``), so
   the job that owns the device can always stage its weights onto it.
 
-Separately, exclusivity has three entry points (`InferenceScheduler._mark_overbudget_admit` callers):
-the ordinary VRAM-verdict best-effort admit, the head-starvation force-admit, and the whole-card
-terminal admit. The footprint scoping (exclusive only when the forecast's ``is_card_demanding`` holds)
-must apply at all three, since the starvation backstop is the most common route for a card-light head
-on a device whose free VRAM is depressed by retained sibling contexts. The admit log line is also
-pinned here: it reports the *decided* isolation, the signal triage tooling and operators read, not the
-configured mode.
+The direct over-budget tag and log contract is also pinned here: it reports the decided isolation, the signal
+triage tooling and operators read, not the configured mode.
 """
 
 from __future__ import annotations
@@ -35,7 +30,6 @@ from horde_worker_regen.process_management.jobs.job_tracker import (
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.resource_budget import StreamForecast
 from horde_worker_regen.process_management.scheduling.governance.preload_admission import AdmissionDecision
-from horde_worker_regen.process_management.scheduling.inference_scheduler import _WholeCardDemandOutcome
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -176,75 +170,6 @@ class TestExclusivePreloadGate:
 
         assert scheduler._last_preload_admission is not None
         assert scheduler._last_preload_admission.decision is not AdmissionDecision.EXCLUSIVE_IN_PROGRESS
-
-
-class TestExclusivityEntryPoints:
-    """Footprint scoping applies at every path that can tag an admit exclusive."""
-
-    async def _admit(
-        self,
-        job_tracker: JobTracker,
-        *,
-        model: str,
-        forecast: StreamForecast,
-        whole_card: _WholeCardDemandOutcome,
-        starved_seconds: float,
-    ) -> bool:
-        """Drive ``_admit_preload_under_budget`` with the residency decision and starvation age pinned."""
-        scheduler = _make_scheduler(job_tracker)
-        job = make_job_pop_response(model=model)
-        await job_tracker.record_popped_job(job)
-        scheduler._forecast_streaming = Mock(return_value=forecast)
-        scheduler._decide_whole_card_demand = Mock(return_value=whole_card)
-        scheduler._head_starved_seconds = Mock(return_value=starved_seconds)
-        self._last_job = job
-        return scheduler._admit_preload_under_budget(job, scheduler._process_map[1], is_head_blocker=True)
-
-    async def test_starved_card_light_head_is_admitted_shared(self, job_tracker: JobTracker) -> None:
-        """The head-starvation force-admit of a card-light model does not isolate the device.
-
-        This backstop fires for an ordinary head parked by reserve arithmetic on a device whose free
-        VRAM is depressed by retained sibling contexts; isolating that admit caps a multi-thread card
-        at one job for the head's whole lifetime with nothing to protect.
-        """
-        admitted = await self._admit(
-            job_tracker,
-            model=_CARD_LIGHT_MODEL,
-            forecast=_forecast(weights_mb=4900.0),
-            whole_card=_WholeCardDemandOutcome.FALL_THROUGH,
-            starved_seconds=20.0,
-        )
-
-        assert admitted is True
-        assert job_tracker.is_admitted_over_budget(self._last_job) is True
-        assert job_tracker.is_admitted_exclusive(self._last_job) is False
-
-    async def test_starved_card_demanding_head_is_admitted_exclusive(self, job_tracker: JobTracker) -> None:
-        """CONTROL: the backstop isolates a card-dominating model on a card too small for a sibling."""
-        admitted = await self._admit(
-            job_tracker,
-            model=_CARD_DEMANDING_MODEL,
-            forecast=_tight_card_demanding_forecast(),
-            whole_card=_WholeCardDemandOutcome.FALL_THROUGH,
-            starved_seconds=20.0,
-        )
-
-        assert admitted is True
-        assert job_tracker.is_admitted_exclusive(self._last_job) is True
-
-    async def test_whole_card_terminal_admit_carries_the_forecast(self, job_tracker: JobTracker) -> None:
-        """The whole-card terminal admit tags an isolation-warranting model from its own forecast."""
-        admitted = await self._admit(
-            job_tracker,
-            model=_CARD_DEMANDING_MODEL,
-            forecast=_tight_card_demanding_forecast(),
-            whole_card=_WholeCardDemandOutcome.TERMINAL_ADMIT,
-            starved_seconds=0.0,
-        )
-
-        assert admitted is True
-        assert job_tracker.is_admitted_over_budget(self._last_job) is True
-        assert job_tracker.is_admitted_exclusive(self._last_job) is True
 
 
 class TestOverbudgetAdmitLogContract:

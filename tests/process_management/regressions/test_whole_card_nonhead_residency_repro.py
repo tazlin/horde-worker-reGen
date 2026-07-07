@@ -22,6 +22,7 @@ behind a non-head residency is attributed to that residency rather than mistaken
 
 from __future__ import annotations
 
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -115,6 +116,11 @@ def _resident(pid: int, model: str | None, state: HordeProcessState) -> HordePro
     proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
     # Leave only ~2GB free so co-residence is impossible and Flux's forecast needs the whole card.
     proc.vram_usage_mb = _DEVICE_TOTAL_VRAM_MB - 2000
+    if model is not None:
+        # A fresh committed reservation matching the held card, so the arbiter's measured floor denies a
+        # non-head candidate against the resident's footprint rather than relaxing to admit on a cold ledger.
+        proc.process_reserved_mb = 16000
+        proc.report_sampled_at = time.time()
     return proc
 
 

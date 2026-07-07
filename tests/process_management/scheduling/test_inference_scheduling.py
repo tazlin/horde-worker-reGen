@@ -6,20 +6,25 @@ import time
 from unittest.mock import Mock
 
 import pytest
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+from horde_sdk.ai_horde_api import GENERATION_STATE
 from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse, LorasPayloadEntry
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.ipc.messages import (
     HordeControlFlag,
     HordeProcessState,
     ModelInfo,
     ModelLoadState,
 )
-from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.lru_cache import LRUCache
+from horde_worker_regen.process_management.models.model_metadata import ModelMetadata
+from horde_worker_regen.process_management.scheduling.governance import AdmissionDecision
 from horde_worker_regen.process_management.scheduling.inference_scheduler import (
     _PRELOAD_FIRST_REPORT_GRACE_SECONDS,
     _RESIDENCY_GRACE_SECONDS,
@@ -28,7 +33,9 @@ from horde_worker_regen.process_management.scheduling.inference_scheduler import
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
+    make_mock_model_reference_record,
     make_mock_process_info,
+    make_test_card_runtimes,
     make_test_model_metadata,
     make_test_runtime_config,
     mark_job_in_progress_async,
@@ -45,6 +52,8 @@ def _make_inference_scheduler(
     bridge_data: Mock | None = None,
     max_concurrent: int = 1,
     max_inference: int = 2,
+    card_runtimes: dict[int, CardRuntime] | None = None,
+    model_metadata: ModelMetadata | None = None,
 ) -> InferenceScheduler:
     """Build an InferenceScheduler with mostly-mocked dependencies."""
     if state is None:
@@ -72,10 +81,11 @@ def _make_inference_scheduler(
             aux_download_deadline_for_dispatch=Mock(return_value=120.0),
         ),
         runtime_config=make_test_runtime_config(bridge_data=bridge_data),
-        model_metadata=make_test_model_metadata(),
+        model_metadata=model_metadata if model_metadata is not None else make_test_model_metadata(),
         max_concurrent_inference_processes=max_concurrent,
         max_inference_processes=max_inference,
         lru=LRUCache(max_inference),
+        card_runtimes=card_runtimes,
     )
 
 
@@ -104,6 +114,79 @@ class TestSchedulerDiagnosticThrottle:
         assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("old",)) is None
 
         assert scheduler._scheduler_diagnostic_suppressed_count("diagnostic", ("new",)) == 1
+
+
+class TestModelServiceabilityAdmission:
+    """Scheduler guards stale model offers before child VRAM work starts."""
+
+    async def test_unserviceable_late_arrival_faults_before_preload(self) -> None:
+        """A stale SDXL job on an 8GB card is faulted without sending a child preload."""
+        model = "sdxl_model"
+        bridge_data = make_mock_bridge_data(image_models_to_load=[model])
+        reference = {
+            model: make_mock_model_reference_record(
+                model,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            ),
+        }
+        metadata = make_test_model_metadata(reference)
+        process_map = ProcessMap({0: make_mock_process_info(0, model_name=None)})
+        scheduler = _make_inference_scheduler(
+            bridge_data=bridge_data,
+            model_metadata=metadata,
+            process_map=process_map,
+            card_runtimes=make_test_card_runtimes(config=bridge_data, total_vram_mb=8192.0),
+        )
+        scheduler.set_admission_baseline_provider(lambda _device: 1024.0)
+        job = make_job_pop_response(model)
+        assert job.id_ is not None
+        await track_popped_job_async(scheduler._job_tracker, job)
+
+        outcome = scheduler._attempt_preload_for_job(job, head_job=job, loaded_models=set())
+
+        assert outcome.name == "NEXT_JOB"
+        latest = scheduler.latest_preload_admission()
+        assert latest is not None
+        assert latest.decision is AdmissionDecision.UNSERVICEABLE
+        # The doomed job is faulted terminally through the existing fault machinery before any child preload:
+        # its stage moves to PENDING_SUBMIT and the tracked job info carries the faulted generation state.
+        assert scheduler._job_tracker.get_stage(job.id_) is JobStage.PENDING_SUBMIT
+        assert scheduler._job_tracker.jobs_lookup[job].state is GENERATION_STATE.faulted
+        assert (
+            "model minimum footprint cannot fit any serving card" in scheduler._job_tracker.job_faults[job.id_][0].ref
+        )
+        assert all(not process.pipe_connection.send.called for process in scheduler._process_map.values())
+
+
+class TestWddmPagingVictimAccessor:
+    """The paging-victim accessor exposes a fresh victim map and ages a stale one out."""
+
+    def test_active_verdict_exposes_victim_shared_mb_map(self) -> None:
+        """An active verdict makes the per-PID shared-MB map readable while it is fresh."""
+        scheduler = _make_inference_scheduler()
+
+        scheduler.note_wddm_paging({100001: 512.0, 100002: 300.0}, active=True)
+
+        assert scheduler.wddm_paging_victim_shared_mb_by_pid(5.0) == {100001: 512.0, 100002: 300.0}
+
+    def test_stale_verdict_ages_out_to_empty(self) -> None:
+        """A verdict older than the freshness window yields no victims, so a caller cannot act on it."""
+        scheduler = _make_inference_scheduler()
+        scheduler.note_wddm_paging({100001: 512.0}, active=True)
+
+        # Backdate the recording stamp past any sane freshness window.
+        scheduler._wddm_paging_victims_updated_monotonic -= 100.0
+
+        assert scheduler.wddm_paging_victim_shared_mb_by_pid(5.0) == {}
+
+    def test_cleared_verdict_yields_no_victims(self) -> None:
+        """When paging clears (active=False), the victim map is emptied immediately."""
+        scheduler = _make_inference_scheduler()
+        scheduler.note_wddm_paging({100001: 512.0}, active=True)
+
+        scheduler.note_wddm_paging({}, active=False)
+
+        assert scheduler.wddm_paging_victim_shared_mb_by_pid(5.0) == {}
 
 
 class TestLineSkipRejectionLogThrottle:
@@ -929,6 +1012,11 @@ class TestHeadOfQueueMakeRoom:
         """A model-less preload slot, a slot holding a *queued* model, and a non-resident head job."""
         target = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         holder = make_mock_process_info(1, model_name="queued_b", state=HordeProcessState.WAITING_FOR_JOB)
+        # A fresh committed reservation that over-commits the card, so the arbiter's measured floor denies the
+        # head and describes evicting this idle resident (another queued job's model).
+        holder.total_vram_mb = 16000
+        holder.process_reserved_mb = 16000
+        holder.report_sampled_at = time.time()
         process_map = ProcessMap({0: target, 1: holder})
 
         job_tracker = JobTracker()
@@ -963,7 +1051,12 @@ class TestHeadOfQueueMakeRoom:
         sched._budget_active = Mock(return_value=True)  # type: ignore[method-assign]
         sched._measured_free_vram_mb = Mock(return_value=1000.0)  # type: ignore[method-assign]
         sched._vram_budget = Mock()
-        sched._vram_budget.check_job.return_value = Mock(fits=False, reason=Mock(return_value="does not fit"))
+        sched._vram_budget.check_job.return_value = Mock(
+            fits=False,
+            predicted_mb=None,
+            reserve_mb=2000.0,
+            reason=Mock(return_value="does not fit"),
+        )
 
         sched.preload_models()
 

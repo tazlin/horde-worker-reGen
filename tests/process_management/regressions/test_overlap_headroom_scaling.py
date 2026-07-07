@@ -1,22 +1,17 @@
-"""Headroom-aware scaling of the concurrent-overlap gate.
+"""Headroom-aware scaling of the concurrent-overlap gate, now decided by the VRAM arbiter.
 
 The overlap gate exists to stop stacked weight loads and activation peaks from thrashing a sampler
-into a step-timeout teardown. Its headway fractions were sized for the tight-VRAM case, but applied
-unconditionally they also price a high-VRAM card as if it were tight: on an all-SDXL queue (every
-model HEAVY tier) a second thread may only join at 75% progress, and any batched job blocks overlap
-outright, so a two-thread worker converges to ~one effective thread regardless of how much free VRAM
-the card actually has.
+into a step-timeout teardown. It runs two guards. A temporal/structural guard keeps a newcomer off a
+running job's memory-hungry startup beat: an extra-large (whole-card tier) model neither joins a busy
+card nor shares one, and a heavy pairing (or a batch) must let the running job make size-appropriate
+headway first. The memory guard is the VRAM arbiter's: it prices the candidate's marginal device cost
+against the cycle-frozen admission floor and answers whether the card can hold the overlap at all.
 
-The scaling pinned here keeps the gate but conditions its strictness on measurement
-(`InferenceScheduler._overlap_headroom_ample`): when the device's live free VRAM absorbs the
-candidate's full predicted sampling peak plus the configured reserve, the heavy-pair headway drops to
-a small constant, and a batched job imposes the strictest headway instead of a hard block. The test is
-deliberately conservative in the candidate's favor: dispatch requires the candidate's model to already
-be resident, so its weights are on the card and the prediction double-counts them as margin.
-
-What never relaxes: an extra-large (whole-card tier) model neither joins a busy card nor shares one,
-whatever the headroom; that contract is the tier's, not the card's. And with no measurement (cold
-start, budget disabled, partial config) the gate keeps its strict fractions.
+When the arbiter admits, a heavy pairing's headway relaxes to a small startup-beat constant, since the
+over-subscription the strict fractions guard against cannot occur on a card judged able to hold the
+newcomer. When the arbiter withholds (the measured floor is over-committed), the overlap is denied for
+the cycle whatever the headway. With no cycle snapshot (cold start, arbiter unwired) the memory answer
+relaxes to admit and only the temporal guard applies.
 """
 
 from __future__ import annotations
@@ -26,6 +21,11 @@ import pytest
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.model_sizing import ModelSizeTier
+from horde_worker_regen.process_management.resources.vram_arbiter import (
+    DeviceVramState,
+    MeasuredVramSnapshot,
+    VramArbiter,
+)
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
@@ -37,9 +37,34 @@ _HEAVY_A = "sdxl_alpha"
 _HEAVY_B = "sdxl_beta"
 _EXTRA_LARGE = "flux_like"
 
-_TIERS = {
-    _HEAVY_A: ModelSizeTier.EXTRA_LARGE,  # overridden per test where needed
-}
+
+def _fitting_state() -> DeviceVramState:
+    """A device state with ample capacity, so the arbiter admits any candidate's memory demand."""
+    return DeviceVramState(
+        total_vram_mb=100000.0,
+        baseline_mb=0.0,
+        committed_vram_mb=0.0,
+        planned_unmaterialized_mb=0.0,
+        committed_is_stale=False,
+    )
+
+
+def _over_committed_state() -> DeviceVramState:
+    """A device state whose committed floor already fills the card, so the arbiter withholds any candidate."""
+    return DeviceVramState(
+        total_vram_mb=16000.0,
+        baseline_mb=0.0,
+        committed_vram_mb=16000.0,
+        planned_unmaterialized_mb=0.0,
+        committed_is_stale=False,
+    )
+
+
+def _install_cycle(scheduler, state: DeviceVramState) -> None:  # noqa: ANN001
+    """Freeze a crafted arbiter cycle on the scheduler so its overlap memory question is deterministic."""
+    arbiter = VramArbiter()
+    arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: state}))
+    scheduler._vram_arbiter = arbiter
 
 
 def _make_overlap_scheduler(  # noqa: ANN202
@@ -47,9 +72,9 @@ def _make_overlap_scheduler(  # noqa: ANN202
     monkeypatch: pytest.MonkeyPatch,
     *,
     tiers: dict[str, ModelSizeTier],
-    ample: bool,
+    memory_admits: bool,
 ):
-    """A two-slot scheduler with pinned model tiers and a pinned headroom verdict."""
+    """A two-slot scheduler with pinned model tiers and a crafted arbiter cycle for the memory question."""
     process_map = ProcessMap({1: make_mock_process_info(1), 2: make_mock_process_info(2)})
     scheduler = _make_inference_scheduler(
         process_map=process_map,
@@ -63,11 +88,7 @@ def _make_overlap_scheduler(  # noqa: ANN202
         "_model_size_tier",
         lambda name: tiers.get(name or "", ModelSizeTier.LIGHT),
     )
-    monkeypatch.setattr(
-        scheduler,
-        "_overlap_headroom_ample",
-        lambda job, device_index=None: ample,
-    )
+    _install_cycle(scheduler, _fitting_state() if memory_admits else _over_committed_state())
     return scheduler
 
 
@@ -94,7 +115,7 @@ class TestHeavyPairHeadwayScalesWithHeadroom:
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """CONTROL: without ample headroom, a second heavy job still waits for 75% progress."""
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, ample=False)
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=False)
         await _running(job_tracker, _HEAVY_A)
         _pin_progress(monkeypatch, scheduler, 0.5)
 
@@ -104,7 +125,7 @@ class TestHeavyPairHeadwayScalesWithHeadroom:
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """With the candidate's full peak fitting measured free VRAM, modest progress suffices."""
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, ample=True)
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
         await _running(job_tracker, _HEAVY_A)
         _pin_progress(monkeypatch, scheduler, 0.2)
 
@@ -114,7 +135,7 @@ class TestHeavyPairHeadwayScalesWithHeadroom:
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Even with headroom, the running job keeps a small headway for its memory-hungry startup."""
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, ample=True)
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
         await _running(job_tracker, _HEAVY_A)
         _pin_progress(monkeypatch, scheduler, 0.05)
 
@@ -128,7 +149,7 @@ class TestBatchBlockIsBoundedByHeadroom:
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """CONTROL: a batched in-flight job on a tight card keeps the hard block, at any progress."""
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, ample=False)
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=False)
         await _running(job_tracker, _HEAVY_A, n_iter=4)
         _pin_progress(monkeypatch, scheduler, 0.9)
 
@@ -138,7 +159,7 @@ class TestBatchBlockIsBoundedByHeadroom:
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """With ample headroom, a batched in-flight job imposes the strictest headway, not a wall."""
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, ample=True)
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
         await _running(job_tracker, _HEAVY_A, n_iter=4)
         _pin_progress(monkeypatch, scheduler, 0.8)
 
@@ -148,7 +169,7 @@ class TestBatchBlockIsBoundedByHeadroom:
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The batch's headway stays the strictest tier; headroom does not shrink it further."""
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, ample=True)
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
         await _running(job_tracker, _HEAVY_A, n_iter=4)
         _pin_progress(monkeypatch, scheduler, 0.5)
 
@@ -158,7 +179,7 @@ class TestBatchBlockIsBoundedByHeadroom:
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A batched candidate may join late once its whole batched peak fits free VRAM."""
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, ample=True)
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
         await _running(job_tracker, _HEAVY_A)
         _pin_progress(monkeypatch, scheduler, 0.8)
 
@@ -168,7 +189,7 @@ class TestBatchBlockIsBoundedByHeadroom:
         self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """CONTROL: a batched candidate on a tight card never joins a busy card."""
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, ample=False)
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=False)
         await _running(job_tracker, _HEAVY_A)
         _pin_progress(monkeypatch, scheduler, 0.9)
 
@@ -183,7 +204,7 @@ class TestExtraLargeContractNeverRelaxes:
     ) -> None:
         """An extra-large in-flight job shares with no one, at any progress, on any card."""
         tiers = {_EXTRA_LARGE: ModelSizeTier.EXTRA_LARGE, _HEAVY_B: ModelSizeTier.HEAVY}
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, ample=True)
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, memory_admits=True)
         await _running(job_tracker, _EXTRA_LARGE)
         _pin_progress(monkeypatch, scheduler, 0.95)
 
@@ -194,57 +215,64 @@ class TestExtraLargeContractNeverRelaxes:
     ) -> None:
         """An extra-large candidate never joins a busy card, whatever the headroom."""
         tiers = {_EXTRA_LARGE: ModelSizeTier.EXTRA_LARGE, _HEAVY_A: ModelSizeTier.HEAVY}
-        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, ample=True)
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=tiers, memory_admits=True)
         await _running(job_tracker, _HEAVY_A)
         _pin_progress(monkeypatch, scheduler, 0.95)
 
         assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_EXTRA_LARGE)) is False
 
 
-class TestHeadroomVerdict:
-    """The headroom predicate is measurement-gated: no reading or an inactive budget reads as tight."""
+class TestMemoryQuestionIsTheArbiter:
+    """The overlap gate's memory question is now the VRAM arbiter's authoritative verdict."""
 
-    def _scheduler(self, job_tracker: JobTracker):  # noqa: ANN202
-        return _make_inference_scheduler(
-            process_map=ProcessMap({1: make_mock_process_info(1)}),
-            job_tracker=job_tracker,
-            bridge_data=make_mock_bridge_data(max_threads=2),
-            max_concurrent=2,
-            max_inference=2,
-        )
+    async def test_overlap_denied_under_measured_over_commit(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Even with the running job well past its headway, an over-committed floor withholds the overlap."""
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=False)
+        await _running(job_tracker, _HEAVY_A)
+        _pin_progress(monkeypatch, scheduler, 0.95)
 
-    def test_no_vram_reading_is_not_ample(self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Cold start (no process has reported VRAM) keeps the strict gate."""
-        scheduler = self._scheduler(job_tracker)
-        monkeypatch.setattr(scheduler, "_budget_active", lambda: True)
-        monkeypatch.setattr(scheduler, "_measured_free_vram_mb", lambda device_index=None: None)
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is False
 
-        assert scheduler._overlap_headroom_ample(make_job_pop_response(model=_HEAVY_B)) is False
+    async def test_overlap_allowed_within_capacity(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With capacity for the newcomer and the running job past the startup beat, the overlap admits."""
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
+        await _running(job_tracker, _HEAVY_A)
+        _pin_progress(monkeypatch, scheduler, 0.95)
 
-    def test_inactive_budget_is_not_ample(self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch) -> None:
-        """With the VRAM budget disabled there is no trusted reserve to measure against."""
-        scheduler = self._scheduler(job_tracker)
-        monkeypatch.setattr(scheduler, "_budget_active", lambda: False)
-        monkeypatch.setattr(scheduler, "_measured_free_vram_mb", lambda device_index=None: 20000.0)
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is True
 
-        assert scheduler._overlap_headroom_ample(make_job_pop_response(model=_HEAVY_B)) is False
+    async def test_cold_start_relaxes_memory_to_admit(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no cycle snapshot the memory answer relaxes to admit; only the temporal guard remains."""
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
+        scheduler._vram_arbiter = None  # unwired: the memory question relaxes to admit
+        await _running(job_tracker, _HEAVY_A)
+        _pin_progress(monkeypatch, scheduler, 0.95)
 
-    def test_fitting_verdict_is_ample(self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A candidate whose predicted peak plus reserve fits measured free VRAM reads as ample."""
-        scheduler = self._scheduler(job_tracker)
-        monkeypatch.setattr(scheduler, "_budget_active", lambda: True)
-        monkeypatch.setattr(scheduler, "_measured_free_vram_mb", lambda device_index=None: 20000.0)
-        scheduler._vram_budget.set_reserve_mb(2048.0)
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is True
 
-        job = make_job_pop_response(model="AlbedoBase XL (SDXL)", width=1024, height=1024)
-        assert scheduler._overlap_headroom_ample(job) is True
+    async def test_disagg_candidate_priced_with_sampler_only_delta(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A disaggregation-class candidate is priced disaggregated, so the decode spike is not double-charged."""
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
+        await _running(job_tracker, _HEAVY_A)
+        _pin_progress(monkeypatch, scheduler, 0.95)
+        monkeypatch.setattr(scheduler, "_is_disaggregation_class_eligible", lambda job: True)
 
-    def test_short_verdict_is_not_ample(self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch) -> None:
-        """CONTROL: the same candidate against a nearly-full card reads as tight."""
-        scheduler = self._scheduler(job_tracker)
-        monkeypatch.setattr(scheduler, "_budget_active", lambda: True)
-        monkeypatch.setattr(scheduler, "_measured_free_vram_mb", lambda device_index=None: 1500.0)
-        scheduler._vram_budget.set_reserve_mb(2048.0)
+        seen: list[bool] = []
 
-        job = make_job_pop_response(model="AlbedoBase XL (SDXL)", width=1024, height=1024)
-        assert scheduler._overlap_headroom_ample(job) is False
+        def _record_delta(job, baseline, *, process_id, disaggregated):  # noqa: ANN001, ANN202
+            seen.append(disaggregated)
+            return 0.0
+
+        monkeypatch.setattr(scheduler, "_measured_admission_candidate_delta_mb", _record_delta)
+
+        scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B))
+
+        assert seen == [True]

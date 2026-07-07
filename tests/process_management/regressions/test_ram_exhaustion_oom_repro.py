@@ -7,12 +7,12 @@ admission flow refuses a preload that the *absolute* available RAM says will tri
 and nothing structurally reduces the worker's resident footprint when the host is already on the edge.
 
 These tests cover the gap: when host RAM falls below a danger floor, every admission path (including
-force-admit and whole-card terminal) must defer rather than load into a near-certain kill. The worker
+over-budget and whole-card paths) must defer rather than load into a near-certain kill. The worker
 should also shed idle resident processes to shrink its footprint and pause pops to stop adding pressure,
 recovering gracefully instead of crash-looping under sustained RAM exhaustion.
 
 * **Hard-refuse admit-into-OOM**: when absolute available RAM is below the danger floor, the best-effort
-  and head-starvation force-admit paths must defer the preload rather than send it into a near-certain
+  and head-starvation paths must defer the preload rather than send it into a near-certain
   OS kill, even for a starved head with no live job.
 * **Throttle pops under pressure**: sustained critical RAM engages the worker-initiated self-throttle so
   intake stops adding pressure and the host can recover.
@@ -176,52 +176,50 @@ class TestBestEffortRamAdmitRefusesIntoOOM:
         assert not _no_preload_sent(process_map), "a PRELOAD_MODEL should reach the device when RAM is healthy"
 
 
-class TestHeadStarvationForceAdmitHonorsRamFloor:
-    """The 15 s head-starvation backstop must not bypass the absolute RAM floor into an OOM.
+class TestHeadStarvationDiagnosticHonorsRamFloor:
+    """The head-starvation clock must not bypass the absolute RAM floor into an OOM.
 
-    ``_HEAD_STARVATION_FORCE_ADMIT_SECONDS`` exists to rescue a head the *VRAM* verdict keeps rejecting on an
-    idle card. It must not become a tunnel that force-loads a head onto a host that is out of *RAM*: that is
-    the kill, not a rescue. A starved head on a RAM-exhausted host should keep deferring (while the governor
-    sheds and throttles), not be force-admitted.
+    The clock feeds diagnostics for an idle-device head the VRAM verdict keeps rejecting. It must not become
+    a tunnel that sends a head onto a host that is out of RAM. A starved head on a RAM-exhausted host should
+    keep deferring while the governor sheds and throttles.
     """
 
     async def test_starved_head_still_deferred_under_critical_ram(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Even past the starvation horizon, a head is not force-admitted when RAM is critically low."""
+        """Even past the starvation horizon, a head is not admitted when RAM is critically low."""
         scheduler, process_map = _ram_pressured_scheduler(monkeypatch)
         head_job = make_job_pop_response(_HEAVY_MODEL)
         await track_popped_job_async(scheduler._job_tracker, head_job)
 
-        # Drive the head past the force-admit horizon: the starvation timer reads as long-expired.
+        # Drive the head past the old preload horizon: the starvation timer reads as long-expired.
         monkeypatch.setattr(scheduler, "_head_starved_seconds", lambda job: 999.0)
 
         admitted = scheduler.preload_models()
 
-        assert admitted is False, "the starvation backstop must not force a head into an out-of-RAM host"
-        assert _no_preload_sent(process_map), "no PRELOAD_MODEL may be force-sent under critical RAM"
+        assert admitted is False, "the starvation diagnostic must not send a head into an out-of-RAM host"
+        assert _no_preload_sent(process_map), "no PRELOAD_MODEL may be sent under critical RAM"
 
 
-class TestWholeCardTerminalAdmitHonorsRamFloor:
-    """A whole-card model bypasses the RAM check entirely: a second, distinct route into the OOM.
+class TestWholeCardAdmitHonorsRamFloor:
+    """A whole-card model must still honor the RAM floor before loading.
 
     A weight-dominant head (whole-card exclusive-residency path) whose teardown is structurally exhausted is
-    admitted "best-effort to load onto the cleared device" via ``whole_card_terminal``, a branch that
-    short-circuits *before* the RAM verdict, so the RAM floor never even runs. On a host with critically-low
-    RAM that route loads a multi-GB checkpoint into an OOM.
+    still a multi-GB checkpoint load through system RAM. On a host with critically-low RAM, that route must
+    defer instead of loading into a near-certain OOM.
 
     The RAM floor must gate this path too: a whole-card head whose weights load through an out-of-RAM host
-    must defer, not terminal-admit into the kill.
+    must defer.
     """
 
-    async def test_whole_card_terminal_admit_deferred_under_critical_ram(
+    async def test_whole_card_admit_deferred_under_critical_ram(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A weight-dominant (whole-card) head is not terminal-admitted when the host is out of RAM."""
+        """A weight-dominant whole-card head is not admitted when the host is out of RAM."""
         scheduler, process_map = _ram_pressured_scheduler(monkeypatch)
         # Force the whole-card path: weights heavy enough to leave no room for a sibling model at sole residency
         # (so the model genuinely needs the card, not merely co-resides) yet that still fit the measured free VRAM
-        # now, so with a single process the teardown is immediately exhausted and the head reaches
-        # whole_card_terminal (the "admit best-effort onto the cleared device" branch), which skips the RAM verdict.
+        # now, so with a single process the teardown is immediately exhausted and the head reaches the
+        # whole-card load path.
         monkeypatch.setattr(resource_budget, "predict_job_weight_mb", lambda job, baseline: 8000.0)
         monkeypatch.setattr(resource_budget, "predict_job_sampling_vram_mb", lambda job, baseline: 8000.0)
         scheduler._process_lifecycle.scale_inference_processes = Mock(return_value=1)
@@ -234,8 +232,8 @@ class TestWholeCardTerminalAdmitHonorsRamFloor:
 
         admitted = scheduler.preload_models()
 
-        assert admitted is False, "a whole-card head must not terminal-admit into an out-of-RAM host"
-        assert _no_preload_sent(process_map), "the whole-card terminal path must also honor the RAM floor"
+        assert admitted is False, "a whole-card head must not load into an out-of-RAM host"
+        assert _no_preload_sent(process_map), "the whole-card load path must also honor the RAM floor"
 
 
 class TestMemoryPressureThrottlesPops:
