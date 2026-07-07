@@ -1234,6 +1234,11 @@ class HordeInferenceProcess(HordeProcess):
 
             self.clear_gc_and_torch_cache()
 
+        # Emit a fresh VRAM report now that the cache has been emptied: the allocator's reservation just fell,
+        # so the parent's committed-VRAM ledger must see the release promptly rather than at the next periodic
+        # report up to a report interval later, keeping committed tracking device truth after an unload.
+        self.send_memory_report_message(include_vram=True)
+
         if self._active_model_name is not None:
             self.on_horde_model_state_change(
                 process_state=HordeProcessState.UNLOADED_MODEL_FROM_VRAM,

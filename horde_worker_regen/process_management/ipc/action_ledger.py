@@ -43,6 +43,8 @@ class LedgerEventType(enum.StrEnum):
     RECOVERY_ABANDONED = "recovery_abandoned"
     ORPHAN_REAPED = "orphan_reaped"
     GOVERNANCE_RESET = "governance_reset"
+    POP_PAUSE_ARMED = "pop_pause_armed"
+    POP_PAUSE_LAPSED = "pop_pause_lapsed"
 
 
 class LedgerEvent(BaseModel):

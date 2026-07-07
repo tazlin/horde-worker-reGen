@@ -1187,16 +1187,23 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             logger.debug(f"Deleting VAE lane process {process_info.process_id} from process map")
             self.retire_process(process_info, "VAE lane replacement")
 
-    def get_process_by_horde_model_name(self, horde_model_name: str) -> HordeProcessInfo | None:
-        """Return an unreserved process that has the given horde model loaded, or None if there is none.
+    def get_process_by_horde_model_name(
+        self,
+        horde_model_name: str,
+        *,
+        include_reserved: bool = False,
+    ) -> HordeProcessInfo | None:
+        """Return a process that has the given horde model loaded, or None if there is none.
 
-        A process pinned as an in-flight disaggregated job's sampler is skipped: dispatch selection and the
-        orchestrator's crash re-resolution both use this, and neither may steal a sampler already booked for
-        another job.
+        A process pinned as an in-flight disaggregated job's sampler is skipped by default: dispatch selection
+        and the orchestrator's crash re-resolution both use this, and neither may steal a sampler already booked
+        for another job. ``include_reserved=True`` includes pinned lanes, for residency and pricing queries that
+        must know a model's weights are resident even on a lane no job may be dispatched onto yet (the caller
+        must not then dispatch onto the returned process without its own can-accept-job check).
         """
         for p in self.values():
-            if p.loaded_horde_model_name == horde_model_name and not self.is_reserved_for_disaggregation(
-                p.process_id,
+            if p.loaded_horde_model_name == horde_model_name and (
+                include_reserved or not self.is_reserved_for_disaggregation(p.process_id)
             ):
                 return p
         return None
@@ -1206,21 +1213,23 @@ class ProcessMap(dict[int, HordeProcessInfo]):
         horde_model_name: str,
         *,
         allowed_cards: set[int] | None = None,
+        include_reserved: bool = False,
     ) -> list[HordeProcessInfo]:
         """Return every process that has the given horde model loaded (a model may be resident on >1 card).
 
         On a multi-GPU host the same model can be loaded on processes pinned to different cards, so this
         returns all such processes rather than the first. ``allowed_cards``, when given, restricts the result
         to processes whose pinned ``device_index`` is in that set (the dispatch router passes the job's
-        eligible cards). Single-GPU callers get a one- or zero-element list mirroring
-        :meth:`get_process_by_horde_model_name`.
+        eligible cards). Pinned disaggregation-sampler lanes are excluded by default and included only for
+        residency/pricing queries via ``include_reserved=True``. Single-GPU callers get a one- or zero-element
+        list mirroring :meth:`get_process_by_horde_model_name`.
         """
         return [
             p
             for p in self.values()
             if p.loaded_horde_model_name == horde_model_name
             and (allowed_cards is None or p.device_index in allowed_cards)
-            and not self.is_reserved_for_disaggregation(p.process_id)
+            and (include_reserved or not self.is_reserved_for_disaggregation(p.process_id))
         ]
 
     def num_busy_processes(self) -> int:

@@ -157,10 +157,11 @@ accepted: now what?* This is split into a pure **policy** object and the
 manager-side **actions**:
 
 - [`RecoverySupervisor`][horde_worker_regen.process_management.lifecycle.recovery_supervisor.RecoverySupervisor]
-  is the policy. It tracks how long the worker has been wedged and returns a
+  is the policy. It tracks how long the worker has been wedged, whether its
+  rebuilt pool has become ready, and returns a
   [`RecoveryAction`][horde_worker_regen.process_management.lifecycle.recovery_supervisor.RecoveryAction].
-  Keeping it pure (it takes a wedge boolean and a clock) makes the escalation
-  timing unit-testable with a fake clock.
+  Keeping it pure (it takes a wedge boolean, a pool-ready boolean, and a clock)
+  makes the escalation timing unit-testable with a fake clock.
 - [`WorkerRecoveryCoordinator`][horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator.WorkerRecoveryCoordinator]
   owns the wedge **assessment** and the **actions**; `HordeWorkerProcessManager` calls it directly from the control loop. `assess_wedge()` decides the worker is wedged only on definitive signals: every
   inference slot quarantined, the safety pool crash-looping with no healthy
@@ -189,6 +190,24 @@ The escalation, in order:
    cannot be restored, SOS escalates through abort so the worker process exits
    non-zero after killing its children; the TUI supervisor then relaunches it via
    the normal unexpected-exit path.
+
+   Give-up is **readiness-gated**, not fixed-age. A soft reset rebuilds the pool,
+   and the replacement children spend real time booting (importing torch) before
+   any lane can accept a job. Faulting during that boot window drops jobs the
+   just-rebuilt pool was about to run. So the escalation clock does not advance
+   while the pool is still booting: give-up fires only once an inference lane has
+   reached an accepting state (`is_inference_pool_ready()`, the same accepting-state
+   fact whose absence the queue-deadlock detector reports as "some processes are
+   starting. Waiting.") *and* the wedge has then persisted for a further grace. A
+   pool whose children never come up is bounded by a boot allowance so give-up is
+   still reachable. Give-up is also **latched once per cycle** (repeat wedged ticks
+   are no-ops, so the ledger is not spammed), and its `recovery_abandoned` ledger
+   record is written only when the pass actually did something (faulted at least
+   one job, or made a terminal abort decision), never a `jobs_faulted=0` no-op. If
+   a wedge persists over a ready pool past the first give-up, a **bounded
+   continuation** permits exactly one more soft-reset cycle after a cool-down; a
+   second give-up is then flagged terminal and abandons ship deliberately rather
+   than faulting jobs on every tick forever.
 
 With `exit_on_unhandled_faults` set, the worker exits instead of limping; SOS is
 the default-on alternative that prioritises continued operation.
@@ -234,7 +253,13 @@ is an append-only, self-audited record of the lifecycle actions the parent takes
 on its children: when each slot was spawned (and its OS pid), when inference was
 dispatched, when a held semaphore was released on its behalf, when a timeout
 fired and why a slot was replaced. When a child hangs or crashes, this ordered
-account is the single most useful diagnostic.
+account is the single most useful diagnostic. It also records worker-level pop
+governance transitions: the shared self-throttle pop-pause is ledgered when armed
+(`POP_PAUSE_ARMED`) and when it lapses (`POP_PAUSE_LAPSED`), each carrying the
+[`PopPauseOwner`][horde_worker_regen.process_management.config.worker_state.PopPauseOwner]
+that set the deadline, the duration, and the numeric context (the measured free
+and floor MB for a RAM-pressure pause), so an operator can attribute a pop-pause
+spell to the backstop that caused it.
 
 It keeps a bounded in-memory ring (always on, cheap, queried for the timeout
 diagnostics dump) and optionally mirrors each event to a size-rotated JSONL file

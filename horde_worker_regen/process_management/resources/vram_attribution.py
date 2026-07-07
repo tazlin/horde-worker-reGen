@@ -49,6 +49,22 @@ Mirrors :data:`_DRIFT_CONSECUTIVE_OBSERVATIONS`: a single transient reading (a s
 before the allocator settled) must not trigger an eviction, so the physical condition
 ``committed + baseline > total`` has to hold across this many consecutive fresh observations first."""
 
+_LEDGER_PHANTOM_TOLERANCE_MB = 2048.0
+"""Margin (MB) by which the committed ledger must exceed the device-used truth to be judged a phantom.
+
+The committed ledger sums each lane's ``memory_reserved()``, a per-process figure that can detach upward from
+device reality: an unloaded model's allocator cache the torch caching allocator has not returned, or a
+reservation the WDDM driver already demoted to host RAM, both keep counting against ``committed`` while the
+physical pages are free. Since the worker cannot hold more device VRAM than the device itself reports used,
+``committed`` exceeding ``device_used`` by more than this margin is arithmetically impossible for a truthful
+ledger and marks a phantom over-count. Sized well above ordinary sampling/report skew so a genuine, briefly
+under-reported real over-commit is never misclassified as a phantom."""
+
+_RECALIBRATE_INTERVAL_SECONDS = 30.0
+"""Minimum seconds between committed-ledger recalibration signals, so a persistent phantom asks the lanes to
+release their allocator cache and re-report periodically rather than every attribution tick while the fresh
+reports are still settling back to device truth."""
+
 _REPORT_STALENESS_SECONDS = 15.0
 """Report age (seconds) beyond which a ledger contributor is treated as an UNKNOWN, incomparable tenant.
 
@@ -103,9 +119,24 @@ class PhysicalPressureObservation:
     consecutive_over_ceiling: int
     """How many consecutive fresh observations the physical over-commit has now held (0 when it did not)."""
     should_unload: bool
-    """Whether the caller should issue one under-pressure idle-model unload for this observation."""
+    """Whether the caller should issue one under-pressure idle-model unload for this observation.
+
+    Only set for a *corroborated* over-commit (the device-used truth also shows the card near full, or no
+    device-used reading was available); a phantom over-commit signals :attr:`should_recalibrate` instead."""
+    ledger_phantom: bool
+    """True when the committed over-commit is contradicted by the device-used truth (``committed`` exceeds
+    ``device_used`` beyond the phantom tolerance): a bookkeeping over-count no eviction can cure."""
+    should_recalibrate: bool
+    """Whether the caller should recalibrate the committed ledger to device truth this observation.
+
+    Set for a streak-confirmed, rate-limited phantom over-commit: the correct response is to have the idle
+    lanes release their allocator cache and re-report so ``committed`` converges back to device reality, NOT
+    to evict a model (there is nothing real to evict) and NOT to latch suppressed (which would wedge admission
+    on the phantom forever)."""
     committed_vram_mb: float
     """The worker's committed-VRAM ledger sum (MB) at this observation."""
+    device_used_mb: float | None
+    """The device-wide used VRAM (MB) truth reconciled against, or None when no source was available."""
     baseline_estimate_mb: float | None
     """The captured device baseline (MB), or None until captured (then the check is uncomputable)."""
     total_vram_mb: float | None
@@ -146,6 +177,13 @@ class VramAttributionReconciler:
         # Once a pressure unload is issued, suppress re-issuing until the physical over-commit clears (measured
         # committed drops back below the ceiling), so a single sustained over-commit reclaims once, not every tick.
         self._pressure_suppressed = False
+        # A phantom over-commit (committed exceeds device-used truth) drives recalibration, not eviction; it
+        # carries its own confirming streak and rate-limit so a transient reading does not fire and a persistent
+        # one recalibrates periodically rather than every tick.
+        self._ledger_phantom_tolerance_mb = _LEDGER_PHANTOM_TOLERANCE_MB
+        self._recalibrate_interval_seconds = _RECALIBRATE_INTERVAL_SECONDS
+        self._phantom_consecutive = 0
+        self._last_recalibrate_time: float | None = None
         # None until the first warning fires, so the rate-limit never suppresses the very first warning
         # (a fixed 0.0 would gate it out whenever the clock reads below the interval, e.g. under a test clock).
         self._last_warn_time: float | None = None
@@ -241,61 +279,107 @@ class VramAttributionReconciler:
         *,
         committed_vram_mb: float,
         total_vram_mb: float | None,
+        device_used_mb: float | None = None,
         committed_is_stale: bool = False,
+        now: float | None = None,
     ) -> PhysicalPressureObservation:
-        """Decide whether the worker has physically over-committed the card and one idle unload should fire.
+        """Decide whether the worker has physically over-committed the card, and how to relieve it.
 
         The trigger is ``committed_vram_mb + baseline_estimate_mb > total_vram_mb`` (the *physical* ceiling,
         NOT the lower admission ceiling): only a genuine over-subscription of device VRAM warrants evicting an
         idle resident model, so transient sampling peaks that exceed the admission ceiling but stay within the
         physical total never fire. The over-commit must hold across
         :data:`_PHYSICAL_PRESSURE_CONSECUTIVE_OBSERVATIONS` consecutive fresh observations (a single transient
-        reading does not fire), and once an unload is signalled it is suppressed until the physical over-commit
-        clears (measured committed drops back below the ceiling), so a sustained over-commit reclaims once
-        rather than every tick.
+        reading does not fire).
 
-        Uncomputable inputs (a stale committed ledger, no captured baseline, or an unknown total) reset the
-        streak and signal no unload: the check degrades safely exactly as the drift reconciliation does.
+        The response branches on whether the device-used truth corroborates the ledger, because the committed
+        ledger sums each lane's ``memory_reserved()`` and that per-process figure can detach *upward* from
+        device reality (an unloaded model's allocator cache the caching allocator has not returned, or a
+        reservation the WDDM driver already spilled to host RAM). The worker cannot hold more device VRAM than
+        the device reports used, so:
+
+        * When ``committed`` exceeds ``device_used`` beyond :data:`_LEDGER_PHANTOM_TOLERANCE_MB` the over-commit
+          is a **phantom**: eviction cannot cure it (there is nothing real to evict) and latching suppressed
+          would wedge admission on the phantom forever. This signals :attr:`should_recalibrate` (streak-confirmed
+          and rate-limited) so the caller has the idle lanes release their allocator cache and re-report, driving
+          ``committed`` back to device truth. It never latches suppressed.
+        * Otherwise the over-commit is **corroborated** (or ``device_used`` is unavailable, so the ledger is
+          trusted): this signals :attr:`should_unload` once per sustained over-commit, suppressed until the
+          measured committed drops back below the ceiling, exactly as before.
+
+        Uncomputable inputs (a stale committed ledger, no captured baseline, or an unknown total) reset every
+        streak and signal no action: the check degrades safely exactly as the drift reconciliation does.
 
         Args:
             committed_vram_mb: The worker's committed-VRAM ledger sum (MB) at this observation.
             total_vram_mb: Device total VRAM (MB), or None when unknown.
+            device_used_mb: The device-wide used VRAM (MB) truth (parent-side NVML), or None when unavailable.
             committed_is_stale: True when a ledger contributor's report has aged past the staleness bound.
+            now: Optional time override (epoch seconds) for the recalibration rate-limit comparison.
         """
+        current = time.time() if now is None else now
         baseline = self._baseline_estimate_mb
         if committed_is_stale or total_vram_mb is None or baseline is None:
             self._pressure_consecutive_over_ceiling = 0
+            self._phantom_consecutive = 0
             return PhysicalPressureObservation(
                 over_physical_ceiling=False,
                 consecutive_over_ceiling=0,
                 should_unload=False,
+                ledger_phantom=False,
+                should_recalibrate=False,
                 committed_vram_mb=committed_vram_mb,
+                device_used_mb=device_used_mb,
                 baseline_estimate_mb=baseline,
                 total_vram_mb=total_vram_mb,
             )
 
         over_ceiling = (committed_vram_mb + baseline) > total_vram_mb
-        if over_ceiling:
+        phantom = (
+            over_ceiling
+            and device_used_mb is not None
+            and committed_vram_mb > device_used_mb + self._ledger_phantom_tolerance_mb
+        )
+
+        should_unload = False
+        should_recalibrate = False
+
+        if phantom:
+            # The ledger claims an over-commit the device does not corroborate. Do not evict (nothing real is
+            # held) and do not suppress: recalibrate the ledger back to device truth, rate-limited so the
+            # freshly re-reported reservations get a chance to settle between signals.
+            self._pressure_consecutive_over_ceiling = 0
+            self._pressure_suppressed = False
+            self._phantom_consecutive += 1
+            if self._phantom_consecutive >= self._pressure_consecutive_required and (
+                self._last_recalibrate_time is None
+                or (current - self._last_recalibrate_time) >= self._recalibrate_interval_seconds
+            ):
+                should_recalibrate = True
+                self._last_recalibrate_time = current
+        elif over_ceiling:
+            self._phantom_consecutive = 0
             self._pressure_consecutive_over_ceiling += 1
+            if (
+                self._pressure_consecutive_over_ceiling >= self._pressure_consecutive_required
+                and not self._pressure_suppressed
+            ):
+                should_unload = True
+                self._pressure_suppressed = True
         else:
+            self._phantom_consecutive = 0
             self._pressure_consecutive_over_ceiling = 0
             # The physical over-commit has cleared, so a future over-commit is again eligible to unload.
             self._pressure_suppressed = False
-
-        should_unload = False
-        if (
-            over_ceiling
-            and self._pressure_consecutive_over_ceiling >= self._pressure_consecutive_required
-            and not self._pressure_suppressed
-        ):
-            should_unload = True
-            self._pressure_suppressed = True
 
         return PhysicalPressureObservation(
             over_physical_ceiling=over_ceiling,
             consecutive_over_ceiling=self._pressure_consecutive_over_ceiling,
             should_unload=should_unload,
+            ledger_phantom=phantom,
+            should_recalibrate=should_recalibrate,
             committed_vram_mb=committed_vram_mb,
+            device_used_mb=device_used_mb,
             baseline_estimate_mb=baseline,
             total_vram_mb=total_vram_mb,
         )

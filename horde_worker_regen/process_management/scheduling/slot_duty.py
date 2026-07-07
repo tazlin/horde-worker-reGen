@@ -52,6 +52,11 @@ class SlotDutyBucket(StrEnum):
     """The overlap gate held the candidate until the in-flight work made enough progress."""
     WHOLE_CARD_CONVERGENCE = "whole_card_convergence"
     """A whole-card head waited for the pool to converge to sole residency."""
+    DISAGG_PIN_WAIT = "disagg_pin_wait"
+    """The next job's model was resident only on a disaggregation-pinned sampler lane; the head waited for
+    that pin to release rather than fund a second copy that could not fit beside the pinned residents."""
+    DEGRADED_ISOLATION_PENDING = "degraded_isolation_pending"
+    """The next job needed a degraded/isolated dispatch and waited for the card to clear of other work."""
     UNEXPLAINED = "unexplained"
     """No gate claimed the empty slot: the scheduler-stall-shaped case worth reporting."""
 

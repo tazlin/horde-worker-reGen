@@ -17,7 +17,7 @@ from loguru import logger
 from horde_worker_regen.compute_mode import is_cpu_only_install
 from horde_worker_regen.consts import KNOWN_SLOW_WORKFLOWS, VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
 from horde_worker_regen.process_management.gpu.gpu_eligibility import eligible_card_indices_for
 from horde_worker_regen.process_management.ipc.action_ledger import LedgerEventType
@@ -562,6 +562,11 @@ class InferenceScheduler:
         self._register_disaggregated_job: (
             Callable[[ImageGenerateJobPopResponse, HordeProcessInfo], Awaitable[bool]] | None
         ) = None
+        # Read-only disaggregation diagnostics for the dispatch-stall classifier: the job pinning a given
+        # process as its sampler, and the current in-flight sampling peaks. Defaults (no owner, empty peaks)
+        # keep the classifier's disaggregation branch inert for standalone tests that never wire them.
+        self._disaggregation_pin_owner: Callable[[int], str | None] = lambda _pid: None
+        self._disaggregation_sampling_peaks: Callable[[], dict[str, float]] = dict
 
         # Runtime safety-placement policy hysteresis (see _reconcile_runtime_safety_placement). ``wants_off``
         # latches the policy's current verdict; the two streaks count consecutive cycles the safety charge did
@@ -697,6 +702,8 @@ class InferenceScheduler:
         is_disaggregatable: Callable[[ImageGenerateJobPopResponse], bool],
         is_disaggregation_class_eligible: Callable[[ImageGenerateJobPopResponse], bool],
         register_disaggregated: Callable[[ImageGenerateJobPopResponse, HordeProcessInfo], Awaitable[bool]],
+        pin_owner: Callable[[int], str | None] | None = None,
+        sampling_peaks: Callable[[], dict[str, float]] | None = None,
     ) -> None:
         """Wire the pipeline-disaggregation predicates and router (see the ``_is_disaggregatable_job`` attr).
 
@@ -706,10 +713,18 @@ class InferenceScheduler:
         ``is_disaggregation_class_eligible`` is the stable class predicate used by residency forecasting and
         VRAM charging, so a job that will run disaggregated is priced sampler-only regardless of transient lane
         state (a whole-card window pauses the lane without flipping the forecast to the monolithic footprint).
+
+        ``pin_owner`` maps a process id to the job pinning it as its sampler, and ``sampling_peaks`` returns the
+        in-flight sampling peaks; both are read-only, used only by the dispatch-stall classifier to name a head
+        held behind a pinned sampler lane. They are optional so standalone tests need not wire the orchestrator.
         """
         self._is_disaggregatable_job = is_disaggregatable
         self._is_disaggregation_class_eligible = is_disaggregation_class_eligible
         self._register_disaggregated_job = register_disaggregated
+        if pin_owner is not None:
+            self._disaggregation_pin_owner = pin_owner
+        if sampling_peaks is not None:
+            self._disaggregation_sampling_peaks = sampling_peaks
 
     def _disaggregation_sibling_charge_mb(
         self,
@@ -2440,6 +2455,25 @@ class InferenceScheduler:
         if process is None:
             if head.model is not None and self._horde_model_map.is_model_loading(head.model):
                 return SlotDutyBucket.MODEL_LOADING, "its model is loading (a preload is in progress)"
+            # The head's model can be resident only on a disaggregation-pinned sampler lane, which the dispatch
+            # query excludes. That is not a budget defer: the head is deliberately held for the pin to release
+            # (rather than funding a second copy), so name the pin, the job holding it, and the in-flight
+            # sampling that keeps the card busy, instead of reporting a generic not-resident preload defer.
+            pinned_lane = self._pinned_lane_resident_for_job(head)
+            if pinned_lane is not None:
+                owner = self._disaggregation_pin_owner(pinned_lane.process_id)
+                owner_text = f" holding disaggregated job {owner[:8]}" if owner else ""
+                peaks = self._disaggregation_sampling_peaks()
+                peaks_text = (
+                    f"; {len(peaks)} sampling(s) in flight totalling {sum(peaks.values()):.0f} MB"
+                    if peaks
+                    else "; no sampling currently in flight"
+                )
+                return SlotDutyBucket.DISAGG_PIN_WAIT, (
+                    f"its model is resident only on process {pinned_lane.process_id}, pinned as a disaggregation "
+                    f"sampler{owner_text}; the head waits for that pin to release and dispatch onto the resident "
+                    f"lane rather than fund a second copy that cannot fit beside the pinned residents{peaks_text}"
+                )
             # A whole-card residency held for a *different* model reserves the card and tore its siblings down,
             # so a head of another model cannot load until that residency restores. Name it: otherwise this
             # reads as a generic VRAM-budget defer (the card looks idle with ample free VRAM) when the real
@@ -2522,6 +2556,15 @@ class InferenceScheduler:
             return SlotDutyBucket.WHOLE_CARD_CONVERGENCE, (
                 f"its model is resident and idle on process {process.process_id}, but its whole-card residency "
                 f"has not yet converged to sole residency (siblings still tearing down or the device draining)"
+            )
+
+        # A head whose next dispatch must run degraded (isolated) waits for the card to clear of other work
+        # rather than share it. Named here so the isolation wait does not read as an unexplained scheduler
+        # stall once the concurrency gates above have not claimed it.
+        if self._job_tracker.is_degraded_dispatch_pending(head):
+            return SlotDutyBucket.DEGRADED_ISOLATION_PENDING, (
+                f"its model is resident and idle on process {process.process_id}, but its next dispatch must run "
+                f"degraded/isolated and is waiting for the card to clear of other work"
             )
 
         return SlotDutyBucket.UNEXPLAINED, (
@@ -2780,13 +2823,41 @@ class InferenceScheduler:
             match action:
                 case SetPopHold(active=hold_active):
                     self._state.ram_pressure_pop_hold = hold_active
-                case PausePops(until_time=until_time, pause_seconds=pause_seconds, reason=reason):
+                case PausePops(
+                    until_time=until_time,
+                    pause_seconds=pause_seconds,
+                    reason=reason,
+                    available_mb=available_mb,
+                    floor_mb=floor_mb,
+                ):
+                    prior_owner = self._state.self_throttle_pause_owner
+                    pause_reason = f"host RAM pressure: {reason}"
                     self._state.self_throttle_paused = True
                     self._state.self_throttle_paused_until = until_time
+                    self._state.self_throttle_pause_owner = PopPauseOwner.RAM_PRESSURE
+                    self._state.self_throttle_pause_reason = pause_reason
+                    self._process_lifecycle.action_ledger.record(
+                        LedgerEventType.POP_PAUSE_ARMED,
+                        reason=pause_reason,
+                        detail={
+                            "owner": PopPauseOwner.RAM_PRESSURE.value,
+                            "duration_seconds": round(pause_seconds, 1),
+                            "available_ram_mb": round(available_mb, 1) if available_mb is not None else None,
+                            "floor_ram_mb": round(floor_mb, 1) if floor_mb is not None else None,
+                        },
+                    )
+                    # A still-standing pause from a different backstop is only superseded here when this
+                    # RAM deadline is the later one (the decision layer emits PausePops only then), so name
+                    # the transition rather than silently relabelling the shared deadline.
+                    takeover = (
+                        f" (superseding a standing {prior_owner.value} pause)"
+                        if prior_owner is not None and prior_owner is not PopPauseOwner.RAM_PRESSURE
+                        else ""
+                    )
                     logger.opt(ansi=True).warning(
                         f"<fg #ff8c69>System RAM below the danger floor ({reason}); pausing job pops for "
-                        f"{pause_seconds:.0f}s and shedding idle footprint so the host is not driven into "
-                        "an OS OOM kill. In-flight jobs finish; pops resume once RAM recovers.</>",
+                        f"{pause_seconds:.0f}s{takeover} and shedding idle footprint so the host is not driven "
+                        "into an OS OOM kill. In-flight jobs finish; pops resume once RAM recovers.</>",
                     )
                 case EvictIdleModels():
                     # Unload an idle resident model; when none remains to unload, the footprint left on the
@@ -3757,6 +3828,41 @@ class InferenceScheduler:
         if anchor is None:
             return False
         return self.unload_models_from_vram(anchor, under_pressure=True, device_index=device_index)
+
+    def recalibrate_committed_ledger(self, *, device_index: int | None = None) -> int:
+        """Recalibrate the committed-VRAM ledger to device truth by releasing every idle lane's allocator cache.
+
+        The committed ledger sums each lane's ``memory_reserved()``. That per-process figure can detach upward
+        from device reality: an unloaded model's blocks the torch caching allocator has not returned, or a
+        reservation the WDDM driver already spilled to host RAM, both keep counting against committed while the
+        physical pages are free. Such a phantom over-count cannot be cured by evicting a model (there is nothing
+        resident to evict) and would otherwise defer every admission forever on a figure the card does not hold.
+
+        Emptying an idle lane's allocator cache returns those blocks and prompts a fresh memory report, so the
+        parent's ``process_reserved_mb`` (hence committed) converges back to device truth. A busy (actively
+        sampling) lane is skipped: its reservation is live, and its cache returns through the ordinary post-stage
+        path. Terminal (ending/ended) lanes and lanes that have never reported a reservation are skipped too.
+        Returns how many lanes were asked to release.
+
+        Args:
+            device_index: When given, recalibrate only lanes pinned to that card; when None, every card.
+        """
+        lanes_asked = 0
+        for process_info in self._process_map.values():
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.process_reserved_mb is None:
+                continue
+            if process_info.last_process_state in (
+                HordeProcessState.PROCESS_ENDING,
+                HordeProcessState.PROCESS_ENDED,
+            ):
+                continue
+            if process_info.is_process_busy():
+                continue
+            if self.release_allocator_cache(process_info.process_id):
+                lanes_asked += 1
+        return lanes_asked
 
     def _pressure_reclaim_anchor(self, *, device_index: int | None) -> HordeProcessInfo | None:
         """Pick the process to protect for a no-candidate pressure reclaim: a busy inference process, else any.
@@ -5382,23 +5488,53 @@ class InferenceScheduler:
         pool = ready or candidates
         return min(pool, key=lambda p: self._card_inference_load(p.device_index))
 
-    def _resident_process_for_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
+    def _resident_process_for_job(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        include_reserved: bool = False,
+    ) -> HordeProcessInfo | None:
         """The resident process to dispatch ``job`` to, honoring per-card eligibility on a multi-GPU host.
 
         Single-GPU: identical to :meth:`ProcessMap.get_process_by_horde_model_name` (the first resident
         process), so the dispatch path is byte-identical. Multi-GPU: restrict to processes pinned to cards
         eligible for this job, then apply the sticky-then-least-loaded policy. Returns None when the model is
         resident only on cards that cannot serve this particular job, or is not resident anywhere.
+
+        Pinned disaggregation-sampler lanes are excluded by default (a dispatch may never land on a pinned
+        lane). ``include_reserved=True`` includes them, for the residency and pricing queries that must see a
+        model's weights even where they sit on a lane no job may be dispatched onto yet.
         """
         if job.model is None:
             return None
         if not self._multi_gpu_routing_active:
-            return self._process_map.get_process_by_horde_model_name(job.model)
+            return self._process_map.get_process_by_horde_model_name(job.model, include_reserved=include_reserved)
         allowed = self._eligible_card_indices(job)
-        candidates = self._process_map.get_processes_by_horde_model_name(job.model, allowed_cards=allowed)
+        candidates = self._process_map.get_processes_by_horde_model_name(
+            job.model,
+            allowed_cards=allowed,
+            include_reserved=include_reserved,
+        )
         if not candidates:
             return None
         return self._pick_best_resident_process(candidates)
+
+    def _pinned_lane_resident_for_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
+        """The disaggregation-pinned lane holding ``job``'s model when that is the only resident copy, else None.
+
+        The dispatch query (:meth:`_resident_process_for_job`) excludes pinned lanes, so a job whose model is
+        resident only on a pinned sampler lane reads as not-resident and would otherwise be priced a fresh
+        preload that cannot fit beside the pinned residents. This names that case: an unreserved resident copy
+        does not exist, but a pinned lane holds the model. The head then holds for the pin to release (dispatch
+        onto the resident lane, priced as resident) instead of funding a second copy; a job is never dispatched
+        onto the returned pinned lane.
+        """
+        if self._resident_process_for_job(job) is not None:
+            return None
+        resident = self._resident_process_for_job(job, include_reserved=True)
+        if resident is not None and self._process_map.is_reserved_for_disaggregation(resident.process_id):
+            return resident
+        return None
 
     def _select_preload_process(
         self,
@@ -5722,12 +5858,19 @@ class InferenceScheduler:
             if next_job.model is None:
                 raise ValueError(f"next_job.model is None ({next_job})")
 
-            # The head's model is not resident. If it is forecast to load (a preload is already on the
-            # way), let a later already-resident job bypass it so the GPU is not idle while the head
-            # loads; this reduces churn versus evicting to run the head right now. If it is NOT forecast
-            # to load, do not bypass: fall through so the head is the one that gets a process (and the
-            # budget gate makes room for it), rather than being starved behind perpetual bypassers.
-            if self._is_model_forecast_to_load(next_job.model):
+            # The head's model may be resident only on a disaggregation-pinned sampler lane, which the dispatch
+            # query excludes so no job is ever dispatched onto a pinned lane. That copy becomes dispatchable when
+            # the pin releases (its disaggregated job's sampling finishes), so the head must wait for it rather
+            # than fund a second copy that cannot fit beside the pinned residents.
+            pinned_resident = self._pinned_lane_resident_for_job(next_job)
+
+            # The head's model is not resident on any dispatchable process. If it is forecast to load (a preload
+            # is already on the way), or its only resident copy is on a pinned lane it is waiting to reuse, let a
+            # later already-resident job bypass it so the GPU is not idle while the head waits; this reduces
+            # churn versus evicting to run the head right now. If it is NOT forecast to load and not pin-waiting,
+            # do not bypass: fall through so the head is the one that gets a process (and the budget gate makes
+            # room for it), rather than being starved behind perpetual bypassers.
+            if pinned_resident is not None or self._is_model_forecast_to_load(next_job.model):
                 for candidate_job in next_n_jobs:
                     if candidate_job.model is None or candidate_job.model == next_job.model:
                         continue
@@ -5739,6 +5882,13 @@ class InferenceScheduler:
                         break
 
             if process_with_model is None:
+                if pinned_resident is not None:
+                    # The head's only resident copy is on a disaggregation-pinned sampler lane. Never fund a
+                    # fresh preload (it cannot fit beside the pinned residents and would wedge the card); hold
+                    # the head's queue position until the pin releases and the resident lane becomes
+                    # dispatchable, then it dispatches onto that lane priced as already resident.
+                    return None
+
                 next_job_model = next_job.model
                 if next_job_model is None:
                     raise ValueError(f"next_job.model is None ({next_job})")

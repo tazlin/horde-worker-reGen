@@ -195,8 +195,11 @@ slot attribution (capacity 2): sampling 61%, overlap_headway 17%, no_local_work 
 the pop-governor registry names). Every other bucket is a scheduler gate, derived by the same
 classification that explains a parked head
 ([`InferenceScheduler._classify_dispatch_stall`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler._classify_dispatch_stall]),
-so the attribution line and the `Inference dispatch stalled` text never name different causes.
-`unexplained` growing is itself a finding: an empty slot with queued work that no gate claims is the
+so the attribution line and the `Inference dispatch stalled` text never name different causes. Gate buckets
+include the disaggregation-specific causes: `disagg_pin_wait` (the head's model is resident only on a
+disaggregation-pinned sampler lane, so the head waits for that pin to release rather than fund a second copy)
+and `degraded_isolation_pending` (the head must run isolated and waits for the card to clear). `unexplained`
+growing is itself a finding: an empty slot with queued work that no gate claims is the
 scheduler-bug-shaped case. The cumulative totals also ride every stats sample (`slot_duty_totals`),
 so `horde-log duty` reports the same breakdown per session offline, alongside a **concurrency
 occupancy** line (share of wall at each in-flight count) computed from the samples' `jobs_in_progress`,

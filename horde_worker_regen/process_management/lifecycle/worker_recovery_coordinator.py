@@ -10,7 +10,7 @@ from loguru import logger
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
-from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
 from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag
@@ -152,6 +152,18 @@ class WorkerRecoveryCoordinator:
             for process_info in self._process_map.values()
         )
 
+    def is_inference_pool_ready(self) -> bool:
+        """Return whether the inference pool has reached an accepting state (a lane can take a job).
+
+        The readiness signal the save-our-ship give-up clock gates on. Keyed on ``can_accept_job()`` (a lane
+        in WAITING_FOR_JOB / PRELOADED_MODEL / INFERENCE_COMPLETE), the accepting state whose absence the
+        deadlock detector's starting-aware guard reads as ``num_starting_processes() > 0`` ("some processes
+        are starting. Waiting."). A just-rebuilt pool whose replacement children are still importing torch is
+        alive (the processes exist) but not ready (no lane accepts yet), so this is False through the boot
+        window and give-up is held off until the pool can actually serve the work it would otherwise fault.
+        """
+        return self._process_map.num_available_inference_processes() > 0
+
     def is_inference_pool_unrecoverable(self) -> bool:
         """Return whether every inference slot is crash-loop quarantined."""
         return len(self._process_lifecycle.quarantined_inference_slots) >= self.max_inference_processes
@@ -242,8 +254,19 @@ class WorkerRecoveryCoordinator:
         until = self._clock() + self.SAFETY_SOFT_PAUSE_SECONDS
         if self._state.self_throttle_paused and self._state.self_throttle_paused_until >= until:
             return
+        pause_reason = f"safety could not check a result ({reason})"
         self._state.self_throttle_paused = True
         self._state.self_throttle_paused_until = until
+        self._state.self_throttle_pause_owner = PopPauseOwner.SAFETY
+        self._state.self_throttle_pause_reason = pause_reason
+        self._action_ledger.record(
+            LedgerEventType.POP_PAUSE_ARMED,
+            reason=pause_reason,
+            detail={
+                "owner": PopPauseOwner.SAFETY.value,
+                "duration_seconds": round(self.SAFETY_SOFT_PAUSE_SECONDS, 1),
+            },
+        )
         logger.warning(
             f"Soft-pausing job pops for {self.SAFETY_SOFT_PAUSE_SECONDS:.0f}s: safety could not check a "
             f"result ({reason}). In-flight checked jobs still submit; pops resume automatically once safety "
@@ -479,7 +502,10 @@ class WorkerRecoveryCoordinator:
                 self.episode_saw_unrecoverable_pool = False
             else:
                 is_wedged = True
-        action = self.recovery_supervisor.evaluate(is_wedged=is_wedged)
+        action = self.recovery_supervisor.evaluate(
+            is_wedged=is_wedged,
+            pool_ready=self.is_inference_pool_ready(),
+        )
         if self.recovery_supervisor.is_in_episode:
             if self.episode_progress_baseline is None:
                 self.episode_progress_baseline = self._job_tracker.total_num_completed_jobs
@@ -490,7 +516,7 @@ class WorkerRecoveryCoordinator:
             self.perform_soft_reset()
             self.limp_by_active = True
         elif action is RecoveryAction.GIVE_UP:
-            self.give_up_on_wedged_jobs()
+            self.give_up_on_wedged_jobs(terminal=self.recovery_supervisor.give_up_is_terminal)
         elif self.limp_by_active and not self.recovery_supervisor.is_in_episode:
             self.limp_by_active = False
             self._runtime_config.set_effective_max_threads(self.bridge_data.max_threads)
@@ -584,8 +610,15 @@ class WorkerRecoveryCoordinator:
         self.healthy_hold_since = None
         self.governance_reset_at = None
 
-    def give_up_on_wedged_jobs(self) -> None:
-        """Fault unservable jobs and abort when no pool can recover."""
+    def give_up_on_wedged_jobs(self, *, terminal: bool = False) -> None:
+        """Fault unservable jobs and abort when no pool can recover.
+
+        Args:
+            terminal: Whether the supervisor flagged this give-up as the deliberate abandon-ship escalation
+                (a wedge that outlived a fresh soft-reset cycle). A terminal give-up aborts even when the
+                pool momentarily looks recoverable, so a persistent wedge over a live-but-idle pool cannot
+                spin forever.
+        """
         faulted = 0
         structural_queue_wedge = self._message_dispatcher.get_deadlock_snapshot().indicates_structural_wedge()
         if self._inference_scheduler.ram_reclaim_cycle_grace_active():
@@ -623,12 +656,17 @@ class WorkerRecoveryCoordinator:
             or self.episode_saw_unrecoverable_pool
             or not self.is_inference_capacity_available()
         )
-        self._action_ledger.record(
-            LedgerEventType.RECOVERY_ABANDONED,
-            reason="save-our-ship: soft resets could not restore a working pool",
-            detail={"jobs_faulted": faulted, "structurally_broken": structurally_broken},
-        )
-        if structurally_broken and not self._state.shutting_down:
+        should_abort = (structurally_broken or terminal) and not self._state.shutting_down
+        # Record only when the give-up actually did something: it faulted at least one job, or it is a
+        # terminal abort decision. A no-op tick (nothing pending, pool not structurally broken, not terminal)
+        # leaves no ledger entry, so a latched give-up cannot spam RECOVERY_ABANDONED with jobs_faulted=0.
+        if faulted > 0 or should_abort:
+            self._action_ledger.record(
+                LedgerEventType.RECOVERY_ABANDONED,
+                reason="save-our-ship: soft resets could not restore a working pool",
+                detail={"jobs_faulted": faulted, "structurally_broken": structurally_broken, "terminal": terminal},
+            )
+        if should_abort:
             logger.critical(
                 "Save-our-ship: the worker cannot restore a working process pool after repeated soft "
                 "resets; abandoning ship (the last resort) rather than spinning indefinitely.",

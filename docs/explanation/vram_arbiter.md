@@ -229,6 +229,17 @@ protected, so its staged weights are spared), and the dispatch re-asks each pass
 arbiter next verdicts `FITS` on the governor's verified device-free reading. Can't-fit-ever jobs are already
 excluded by model serviceability, so this gate only ever holds a can't-fit-now dispatch.
 
+**Pinned-lane residency.** A disaggregated job's sampler lane is pinned (reserved out of the availability
+pool) from the moment it is scheduled until its sampling finishes, and while pinned it is excluded from the
+dispatch selection so no job is ever dispatched onto it. A monolithic head whose model is resident *only* on
+such a pinned lane must therefore not read as not-resident and fund a fresh second copy that cannot fit beside
+the pinned residents. Residency and pricing queries include pinned lanes (the dispatch query still excludes
+them), so the head is priced as already resident and held for the pin to release rather than preloaded afresh;
+when the pin releases, the lane returns to the availability pool and the head dispatches onto that resident
+copy, priced through the `candidate_already_resident` no-op admit. The dispatch-stall classifier names this
+wait (the pin, the disaggregated job holding it, and the in-flight sampling peaks) rather than reporting a
+generic budget defer.
+
 A held dispatch is not mistaken for a wedge. The job stays queued with its model resident and never enters
 in-progress, so the clocks that time the preloaded-to-inference-started transition have nothing to reap: the
 stale-entry expiry only touches a `LOADING` entry (not a resident one), the resident-cleanup spares any model
@@ -242,7 +253,15 @@ supervisor exists to reroute, identical to a never-admittable preload.
 **Disaggregated sampling.** The orchestrator's concurrent-sampling gate admits a first-of-kind sampling on an
 empty ledger, then defers to the arbiter's `DISAGG_SAMPLE` verdict for every later sampling. It passes the
 live in-flight sampling total with the request so a peak booked earlier in the same tick is counted before
-the cycle snapshot is next refrozen.
+the cycle snapshot is next refrozen. The gate may serialise samplers but must never deadlock: a deferral is
+healthy backpressure only while a sampling is verifiably in flight (a ledger entry whose owner is still
+sampling, whose sample was dispatched to a live process launch, and whose process reports busy on the device).
+When no sampling is verifiably in flight, the deferral escalates within a tick, not at the sanity bound: the
+provably-stale peaks (owner gone, dispatch launch dead, or an idle sampler whose result was lost past a short
+grace) are cleared so the sample re-admits, because a candidate that fits alone on an idle card must always
+run. A far larger sanity bound is the last resort for a ledger that looks live yet yields no system-wide
+sampling progress for its whole window. The one protection never relaxed is the second-concurrent-sampler
+memory check itself: two peaks that do not co-fit are never admitted together.
 
 **Disaggregated encode and decode.** A stage dispatch targets a process already resident on the card, so it
 is not a new admission and is never withheld. The concurrent-sampling gate downstream is the pipeline's real

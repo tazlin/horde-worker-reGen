@@ -17,7 +17,9 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessState,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from horde_worker_regen.process_management.resources.resource_budget import (
     _LINUX_CONTEXT_CONSTANT_MB,
     _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB,
@@ -25,6 +27,8 @@ from horde_worker_regen.process_management.resources.resource_budget import (
     platform_context_constant_mb,
 )
 from horde_worker_regen.process_management.resources.vram_attribution import (
+    _LEDGER_PHANTOM_TOLERANCE_MB,
+    _RECALIBRATE_INTERVAL_SECONDS,
     _REPORT_STALENESS_SECONDS,
     DriftObservation,
     VramAttributionReconciler,
@@ -411,6 +415,362 @@ class TestPhysicalPressureTrigger:
             total_vram_mb=16375.0,
         )
         assert no_baseline.should_unload is False
+
+
+class TestPhantomOvercommitRecalibration:
+    """A committed over-commit the device-used truth contradicts recalibrates the ledger, never wedges on it.
+
+    Reconstructs the structural wedge: the committed ledger read ~21926MB while the card physically held ~1288MB
+    (device nearly empty, model map empty, lanes idle). The over-commit is a phantom (stale allocator-cache
+    reservation no eviction can cure); the correct response is to recalibrate the ledger to device truth and
+    never latch the pressure path suppressed.
+    """
+
+    def _reconciler(self) -> VramAttributionReconciler:
+        reconciler = VramAttributionReconciler()
+        reconciler.note_baseline(1499.0, any_model_resident=False)
+        return reconciler
+
+    def test_phantom_signals_recalibrate_not_unload(self) -> None:
+        """Committed 21926 while device holds only 1288 is a phantom: recalibrate (after the streak), never evict."""
+        reconciler = self._reconciler()
+        first = reconciler.observe_physical_pressure(
+            committed_vram_mb=21926.0,
+            total_vram_mb=16375.0,
+            device_used_mb=1288.0,
+            now=0.0,
+        )
+        assert first.over_physical_ceiling is True
+        assert first.ledger_phantom is True
+        assert first.should_unload is False
+        assert first.should_recalibrate is False  # one transient reading is not enough
+        second = reconciler.observe_physical_pressure(
+            committed_vram_mb=21926.0,
+            total_vram_mb=16375.0,
+            device_used_mb=1288.0,
+            now=1.0,
+        )
+        assert second.should_recalibrate is True
+        assert second.should_unload is False
+
+    def test_phantom_never_latches_suppressed(self) -> None:
+        """A persistent phantom recalibrates once per interval forever; it never suppresses (the wedge fix).
+
+        The old pressure path latched ``_pressure_suppressed`` on a figure committed could not drop below,
+        wedging admission permanently. A phantom must instead stay eligible to recalibrate.
+        """
+        reconciler = self._reconciler()
+        reconciler.observe_physical_pressure(
+            committed_vram_mb=21926.0,
+            total_vram_mb=16375.0,
+            device_used_mb=1288.0,
+            now=0.0,
+        )
+        fired = reconciler.observe_physical_pressure(
+            committed_vram_mb=21926.0,
+            total_vram_mb=16375.0,
+            device_used_mb=1288.0,
+            now=1.0,
+        )
+        assert fired.should_recalibrate is True
+        within_interval = reconciler.observe_physical_pressure(
+            committed_vram_mb=21926.0,
+            total_vram_mb=16375.0,
+            device_used_mb=1288.0,
+            now=5.0,
+        )
+        assert within_interval.ledger_phantom is True
+        assert within_interval.should_recalibrate is False  # rate-limited, not suppressed
+        after_interval = reconciler.observe_physical_pressure(
+            committed_vram_mb=21926.0,
+            total_vram_mb=16375.0,
+            device_used_mb=1288.0,
+            now=_RECALIBRATE_INTERVAL_SECONDS + 2.0,
+        )
+        assert after_interval.should_recalibrate is True  # still eligible: never wedged
+
+    def test_recalibration_clears_once_committed_tracks_truth(self) -> None:
+        """Once the recalibrated lanes re-report and committed falls below the ceiling, the phantom clears."""
+        reconciler = self._reconciler()
+        reconciler.observe_physical_pressure(
+            committed_vram_mb=21926.0,
+            total_vram_mb=16375.0,
+            device_used_mb=1288.0,
+            now=0.0,
+        )
+        reconciler.observe_physical_pressure(
+            committed_vram_mb=21926.0,
+            total_vram_mb=16375.0,
+            device_used_mb=1288.0,
+            now=1.0,
+        )
+        # Lanes released their cache and re-reported: committed now matches device truth, under the ceiling.
+        cleared = reconciler.observe_physical_pressure(
+            committed_vram_mb=1500.0,
+            total_vram_mb=16375.0,
+            device_used_mb=1288.0,
+            now=2.0,
+        )
+        assert cleared.over_physical_ceiling is False
+        assert cleared.ledger_phantom is False
+        assert cleared.should_recalibrate is False
+        assert cleared.should_unload is False
+
+    def test_corroborated_overcommit_still_unloads(self) -> None:
+        """A real over-commit the device-used truth corroborates evicts as before, never recalibrates.
+
+        committed 15000 + baseline 1499 = 16499 > 16375, and device_used 16200 corroborates the card is
+        genuinely near full, so this is not a phantom: the idle-model reclaim path fires.
+        """
+        reconciler = self._reconciler()
+        reconciler.observe_physical_pressure(
+            committed_vram_mb=15000.0,
+            total_vram_mb=16375.0,
+            device_used_mb=16200.0,
+            now=0.0,
+        )
+        second = reconciler.observe_physical_pressure(
+            committed_vram_mb=15000.0,
+            total_vram_mb=16375.0,
+            device_used_mb=16200.0,
+            now=1.0,
+        )
+        assert second.ledger_phantom is False
+        assert second.should_unload is True
+        assert second.should_recalibrate is False
+
+    def test_missing_device_used_trusts_ledger_and_unloads(self) -> None:
+        """With no device-used reading the ledger is trusted (legacy behaviour): the unload path, not recalibrate."""
+        reconciler = self._reconciler()
+        reconciler.observe_physical_pressure(
+            committed_vram_mb=15000.0,
+            total_vram_mb=16375.0,
+            device_used_mb=None,
+            now=0.0,
+        )
+        second = reconciler.observe_physical_pressure(
+            committed_vram_mb=15000.0,
+            total_vram_mb=16375.0,
+            device_used_mb=None,
+            now=1.0,
+        )
+        assert second.should_unload is True
+        assert second.should_recalibrate is False
+        assert second.ledger_phantom is False
+
+    def test_phantom_tolerance_boundary(self) -> None:
+        """A committed sum within the phantom tolerance of device-used is corroborated, not a phantom."""
+        reconciler = self._reconciler()
+        # committed just over the physical ceiling but within tolerance of device_used: corroborated.
+        device_used = 16000.0
+        committed = device_used + _LEDGER_PHANTOM_TOLERANCE_MB - 1.0
+        reconciler.observe_physical_pressure(
+            committed_vram_mb=committed,
+            total_vram_mb=16375.0,
+            device_used_mb=device_used,
+            now=0.0,
+        )
+        second = reconciler.observe_physical_pressure(
+            committed_vram_mb=committed,
+            total_vram_mb=16375.0,
+            device_used_mb=device_used,
+            now=1.0,
+        )
+        assert second.ledger_phantom is False
+        assert second.should_unload is True
+
+
+class TestCommittedLedgerHygiene:
+    """The committed ledger charges each reporting process once and drops a replaced incarnation's charge."""
+
+    def test_reporting_process_charged_once_no_context_double_count(self) -> None:
+        """``memory_reserved`` excludes the CUDA context, so a reporting lane is charged ctx + reserved exactly once.
+
+        Pins the no-double-charge invariant the audit established: the context constant is additive to reserved
+        (which does not already contain it), never folded in twice.
+        """
+        info = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)
+        info.process_reserved_mb = 6000
+        info.process_aimdo_mb = None
+        process_map = ProcessMap({0: info})
+        assert process_map.committed_vram_mb(context_constant_mb=243.0) == 6243.0
+
+    def test_process_replacement_drops_old_incarnation_charge(self) -> None:
+        """``on_process_ending`` (retire/replace) clears the reserved figure so the dead charge leaves at once.
+
+        Rebuild hygiene: a soft reset that replaces a lane must not carry the old incarnation's footprint into the
+        new one's charge. The fresh incarnation re-enters the ledger only when it re-reports a reservation.
+        """
+        info = make_mock_process_info(0, state=HordeProcessState.WAITING_FOR_JOB)
+        info.process_reserved_mb = 6000
+        info.report_sampled_at = time.time()
+        process_map = ProcessMap({0: info})
+        assert process_map.committed_vram_mb(context_constant_mb=243.0) == 6243.0
+        process_map.on_process_ending(0)
+        assert process_map.committed_vram_mb(context_constant_mb=243.0) == 0.0
+        assert process_map.oldest_committed_report_age_seconds(now=time.time()) is None
+
+
+class TestSchedulerLedgerRecalibration:
+    """``recalibrate_committed_ledger`` asks only idle, reporting, live lanes to release their allocator cache."""
+
+    def _reporting_lane(
+        self,
+        process_id: int,
+        *,
+        reserved_mb: int | None,
+        state: HordeProcessState,
+    ) -> HordeProcessInfo:
+        info = make_mock_process_info(process_id, model_name=None, state=state)
+        info.process_reserved_mb = reserved_mb  # type: ignore[attr-defined]
+        return info
+
+    def test_releases_cache_on_idle_reporting_lanes_only(self) -> None:
+        """Busy, terminal, and never-reported lanes are skipped; each idle reporting lane is asked exactly once."""
+        pm = make_testable_process_manager()
+        scheduler = pm._inference_scheduler
+        asked: list[int] = []
+        scheduler.release_allocator_cache = Mock(  # type: ignore[attr-defined]
+            side_effect=lambda pid: asked.append(pid) or True,
+        )
+        pm._process_map.clear()
+        pm._process_map[1] = self._reporting_lane(1, reserved_mb=5000, state=HordeProcessState.WAITING_FOR_JOB)  # type: ignore[index]
+        pm._process_map[2] = self._reporting_lane(2, reserved_mb=6000, state=HordeProcessState.INFERENCE_STARTING)  # type: ignore[index]
+        pm._process_map[3] = self._reporting_lane(3, reserved_mb=None, state=HordeProcessState.WAITING_FOR_JOB)  # type: ignore[index]
+        pm._process_map[4] = self._reporting_lane(4, reserved_mb=4000, state=HordeProcessState.PROCESS_ENDED)  # type: ignore[index]
+
+        acted = scheduler.recalibrate_committed_ledger(device_index=0)
+
+        assert asked == [1]  # only the idle, reporting, live lane
+        assert acted == 1
+
+    def test_device_index_scopes_recalibration(self) -> None:
+        """Only lanes pinned to the named card are asked to release."""
+        pm = make_testable_process_manager()
+        scheduler = pm._inference_scheduler
+        asked: list[int] = []
+        scheduler.release_allocator_cache = Mock(  # type: ignore[attr-defined]
+            side_effect=lambda pid: asked.append(pid) or True,
+        )
+        card0 = self._reporting_lane(1, reserved_mb=5000, state=HordeProcessState.WAITING_FOR_JOB)
+        card1 = make_mock_process_info(2, model_name=None, state=HordeProcessState.WAITING_FOR_JOB, device_index=1)
+        card1.process_reserved_mb = 5000
+        pm._process_map.clear()
+        pm._process_map[1] = card0  # type: ignore[index]
+        pm._process_map[2] = card1  # type: ignore[index]
+
+        acted = scheduler.recalibrate_committed_ledger(device_index=1)
+
+        assert asked == [2]
+        assert acted == 1
+
+
+class TestManagerPhantomRecalibration:
+    """The manager routes a device-contradicted committed over-commit to recalibration, never an eviction/wedge."""
+
+    def _phantom_contributor(self, process_id: int, *, reserved_mb: int) -> object:
+        info = make_mock_process_info(process_id, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        info.process_reserved_mb = reserved_mb  # type: ignore[attr-defined]
+        info.report_sampled_at = time.time()  # type: ignore[attr-defined]
+        return info
+
+    def _prime_baseline(self, pm: HordeWorkerProcessManager) -> None:
+        quiet = make_mock_process_info(0, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
+        quiet.process_reserved_mb = None
+        pm._process_map.clear()
+        pm._process_map[0] = quiet  # type: ignore[index]
+        pm._read_device_used_mb = Mock(return_value=1499.0)  # type: ignore[attr-defined]
+        pm._last_vram_attribution_time = 0.0
+        pm._evaluate_vram_attribution_drift()
+
+    def test_phantom_overcommit_recalibrates_and_does_not_evict(self) -> None:
+        """Episode-2 shape: empty map, idle lane, committed ~21926 but device ~1288 -> recalibrate, never evict."""
+        pm = make_testable_process_manager()
+        pm._inference_scheduler.resolved_context_constant_mb = Mock(return_value=243.0)  # type: ignore[attr-defined]
+        reclaim = Mock(return_value=True)
+        pm._inference_scheduler.reclaim_one_idle_model_under_pressure = reclaim  # type: ignore[attr-defined]
+        recalibrate = Mock(return_value=1)
+        pm._inference_scheduler.recalibrate_committed_ledger = recalibrate  # type: ignore[attr-defined]
+        pm._process_map.get_reported_total_vram_mb = Mock(return_value=16375.0)  # type: ignore[attr-defined]
+
+        self._prime_baseline(pm)
+
+        def phantom_tick() -> None:
+            # committed = 243 ctx + 21683 reserved = 21926, while the device physically holds ~1288 (phantom).
+            pm._process_map[0] = self._phantom_contributor(0, reserved_mb=21926 - 243)  # type: ignore[index]
+            pm._read_device_used_mb = Mock(return_value=1288.0)  # type: ignore[attr-defined]
+            pm._last_vram_attribution_time = 0.0
+            pm._evaluate_vram_attribution_drift()
+
+        phantom_tick()
+        assert recalibrate.call_count == 0  # one transient reading is not enough
+        phantom_tick()
+        assert recalibrate.call_count == 1  # streak confirmed: recalibrate the ledger
+        assert reclaim.call_count == 0  # never evicts a (nonexistent) idle resident model
+
+    def test_recalibrated_ledger_recovers_below_ceiling(self) -> None:
+        """After the lanes re-report their released cache, committed falls to truth and the pressure path is quiet."""
+        pm = make_testable_process_manager()
+        pm._inference_scheduler.resolved_context_constant_mb = Mock(return_value=243.0)  # type: ignore[attr-defined]
+        reclaim = Mock(return_value=True)
+        pm._inference_scheduler.reclaim_one_idle_model_under_pressure = reclaim  # type: ignore[attr-defined]
+        recalibrate = Mock(return_value=1)
+        pm._inference_scheduler.recalibrate_committed_ledger = recalibrate  # type: ignore[attr-defined]
+        pm._process_map.get_reported_total_vram_mb = Mock(return_value=16375.0)  # type: ignore[attr-defined]
+
+        self._prime_baseline(pm)
+
+        for _ in range(2):
+            pm._process_map[0] = self._phantom_contributor(0, reserved_mb=21926 - 243)  # type: ignore[index]
+            pm._read_device_used_mb = Mock(return_value=1288.0)  # type: ignore[attr-defined]
+            pm._last_vram_attribution_time = 0.0
+            pm._evaluate_vram_attribution_drift()
+        assert recalibrate.call_count == 1
+
+        # The recalibrated lane re-reports its true (near-zero) reservation: committed tracks device truth.
+        pm._process_map[0] = self._phantom_contributor(0, reserved_mb=30)  # type: ignore[index]
+        pm._read_device_used_mb = Mock(return_value=1288.0)  # type: ignore[attr-defined]
+        pm._last_vram_attribution_time = 0.0
+        pm._evaluate_vram_attribution_drift()
+
+        assert pm.latest_committed_vram_mb(0) == 273.0  # 243 ctx + 30 reserved: below any ceiling
+        assert reclaim.call_count == 0
+
+    def test_liveness_matrix_bookkeeping_never_permanently_denies(self) -> None:
+        """Across lane/report/residency variations, a device-contradicted committed high never wedges admission.
+
+        The invariant: whenever the committed ledger reads materially above the device-used truth, the manager
+        recalibrates (and never latches suppressed), so a fits-alone candidate can never be permanently denied by
+        bookkeeping alone. Each row is a distinct committed-vs-device shape.
+        """
+        # (reserved_mb reported by the single idle lane, device_used_mb) rows: all genuine physical over-commits
+        # (committed + captured baseline > total) that are also phantoms (committed far above device-used truth),
+        # across a spread of stale-reserved magnitudes. The captured baseline drops to the low device-used, so the
+        # reserved figure carries the whole over-commit.
+        rows = [
+            (21683, 1288),  # the incident: ~21926 committed vs ~1288 device
+            (18000, 1500),  # a smaller phantom, device near baseline
+            (16500, 1000),  # just over the ceiling once the baseline drops to device-used
+            (30000, 900),  # an extreme over-count
+        ]
+        for reserved_mb, device_used in rows:
+            pm = make_testable_process_manager()
+            pm._inference_scheduler.resolved_context_constant_mb = Mock(return_value=243.0)  # type: ignore[attr-defined]
+            reclaim = Mock(return_value=True)
+            pm._inference_scheduler.reclaim_one_idle_model_under_pressure = reclaim  # type: ignore[attr-defined]
+            recalibrate = Mock(return_value=1)
+            pm._inference_scheduler.recalibrate_committed_ledger = recalibrate  # type: ignore[attr-defined]
+            pm._process_map.get_reported_total_vram_mb = Mock(return_value=16375.0)  # type: ignore[attr-defined]
+            self._prime_baseline(pm)
+
+            for _ in range(2):
+                pm._process_map[0] = self._phantom_contributor(0, reserved_mb=reserved_mb)  # type: ignore[index]
+                pm._read_device_used_mb = Mock(return_value=float(device_used))  # type: ignore[attr-defined]
+                pm._last_vram_attribution_time = 0.0
+                pm._evaluate_vram_attribution_drift()
+
+            assert recalibrate.call_count >= 1, f"row reserved={reserved_mb} did not recalibrate"
+            assert reclaim.call_count == 0, f"row reserved={reserved_mb} wrongly evicted"
 
 
 class TestManagerPhysicalPressureUnload:

@@ -30,6 +30,7 @@ from horde_worker_regen.process_management.resources.vram_arbiter import (
 )
 from horde_worker_regen.process_management.workers.disaggregation_orchestrator import (
     _RESOURCE_DEFER_SECONDS,
+    _SAMPLING_LIVENESS_GRACE_SECONDS,
     _STAGE_PATIENCE_SECONDS,
     DisaggregatedFault,
     DisaggregationOrchestrator,
@@ -46,15 +47,27 @@ class _FakeProcess:
 
     Carries a ``process_launch_identifier`` so the launch-aware dispatch/pin tracking can be exercised: an
     id-reusing replacement is modelled by swapping in a fake with the same ``process_id`` but a new launch.
+    ``busy`` models the device-state the liveness escalation corroborates against: a running sampler reports
+    busy (the default), an idle/finished one reports not-busy.
     """
 
-    def __init__(self, process_id: int, *, process_launch_identifier: int = 0) -> None:
+    def __init__(
+        self,
+        process_id: int,
+        *,
+        process_launch_identifier: int = 0,
+        busy: bool = True,
+    ) -> None:
         self.process_id = process_id
         self.process_launch_identifier = process_launch_identifier
+        self.busy = busy
         self.sent: list[object] = []
         # Read by the sample-completion observation seam (the pinned sampler's latest reported peak). None here
         # leaves nothing to observe, matching an off-GPU or not-yet-reported sampler.
         self.process_peak_reserved_mb: int | None = None
+
+    def is_process_busy(self) -> bool:
+        return self.busy
 
     def safe_send_message(self, message: object) -> bool:
         self.sent.append(message)
@@ -442,27 +455,25 @@ def test_release_job_clears_all_held_state_and_is_a_noop_for_unknown_jobs() -> N
 
 
 @pytest.mark.asyncio
-async def test_gate_deferral_clears_a_stale_ledger_entry_and_dispatches_past_the_bound() -> None:
-    """A leaked ledger peak (dead dispatch target) is cleared once deferral passes the sanity bound.
+async def test_gate_deferral_clears_a_stale_ledger_entry_promptly_and_dispatches() -> None:
+    """A leaked ledger peak (no live sampling behind it) is cleared at once, not at the sanity bound.
 
-    A gate deferral is healthy backpressure and must not age a job. But a peak left in the ledger for a
-    sampling that never returns would defer a ready sample forever. Past the sanity bound with no system-wide
-    sample result, the provably-dead entry is cleared and the job dispatches.
+    A gate deferral is healthy backpressure only while a sampling is genuinely in flight. A peak left in the
+    ledger for a sampling that never returns has no live sampler behind it, so the fast liveness escalation
+    reclaims it within a tick (seconds, not the 180s sanity bound) and the job dispatches, because a candidate
+    that fits alone on an idle card must always run.
     """
     h = _make_harness(estimate_sampling_peak_mb=_PeakStub(default_mb=8260.0), sampling_headroom_mb=15000.0)
-    # A leaked ledger entry whose owning job the orchestrator no longer holds (dead target).
+    # A leaked ledger entry whose owning job the orchestrator no longer holds (no live sampling behind it).
     h.orchestrator._active_sampling_peaks["ghost-job"] = 8260.0
 
     job = _job()
     await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
-    h.orchestrator.tick()  # 8260 (ghost) + 8260 (job) > 15000: gate-deferred
-    assert len(h.sampler.sent) == 0
+    h.orchestrator.tick()  # 8260 (ghost) + 8260 (job) > 15000: gate-deferred, but the ghost is not live sampling
+    assert len(h.sampler.sent) == 0  # deferred this tick
+    assert h.orchestrator._active_sampling_peaks == {}  # the ghost peak was cleared at once, no 180s wait
 
-    # Past the sanity bound with no sample result anywhere: the stale entry is cleared, then the job dispatches.
-    h.virtual_now[0] = 181.0
-    h.orchestrator.tick()  # escalation clears the ghost peak
-    assert h.orchestrator._active_sampling_peaks == {}
-    h.orchestrator.tick()  # clean ledger now admits the job
+    h.orchestrator.tick()  # clean ledger now admits the job on the very next tick
     assert len(h.sampler.sent) == 1
     assert h.completed == []  # dispatched, not faulted
 
@@ -983,3 +994,133 @@ async def test_decode_dispatches_even_when_demand_tops_the_physical_total() -> N
     h.orchestrator.tick()
     assert len(h.image_lane.sent) == 1  # decode dispatched despite 10000+8000 > 16000
     assert h.rerouted == []  # nothing sampled is ever thrown away over memory pressure
+
+
+# --------------------------------------------------------------------------------------------------------- #
+#  Part 1 liveness: the concurrent-sampling gate may serialize samplers but must never deadlock.             #
+#  When no sampling is verifiably in flight, a gate-deferred sample escalates to admission within a tick;    #
+#  when one genuinely is, the deferral is bounded by that sampling's completion. The cells below sweep the   #
+#  matrix (peaks co-fit or not; first sampling live / finished / crashed / leaked; one lane or two).         #
+# --------------------------------------------------------------------------------------------------------- #
+
+
+async def _first_sampling_second_deferred(h: SimpleNamespace, job_a: HordeJobInfo, job_b: HordeJobInfo) -> None:
+    """Bring both jobs to SAMPLING and tick once: job A is booked-sampling, job B gate-deferred behind its peak."""
+    await _bring_to_sampling(h, job_a, pinned_pid=_SAMPLER_PID)
+    await _bring_to_sampling(h, job_b, pinned_pid=_SAMPLER_PID_2)
+    h.orchestrator.tick()
+    assert len(h.sampler.sent) == 1  # job A admitted (empty ledger admits the first)
+    assert len(h.sampler2.sent) == 0  # job B gate-deferred behind A's ledgered peak
+
+
+@pytest.mark.asyncio
+async def test_liveness_peaks_cofit_admits_both_at_once() -> None:
+    """Cell (peaks co-fit): both samplers admit immediately; no deferral and no escalation are involved."""
+    h = _make_harness(estimate_sampling_peak_mb=_PeakStub(default_mb=7000.0), sampling_headroom_mb=15000.0)
+    job_a, job_b = _job(), _job()
+    await _bring_to_sampling(h, job_a, pinned_pid=_SAMPLER_PID)
+    await _bring_to_sampling(h, job_b, pinned_pid=_SAMPLER_PID_2)
+    h.orchestrator.tick()
+    assert len(h.sampler.sent) == 1
+    assert len(h.sampler2.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_liveness_genuine_first_bounds_the_deferral_then_admits_on_completion() -> None:
+    """Cell (peaks don't co-fit, first genuinely sampling): the second waits, then admits on the first's result.
+
+    A busy first sampler is verifiably in flight, so the deferral is healthy backpressure bounded by that
+    job's completion: it is never escalated early, and the second admits the moment the first frees headroom.
+    """
+    h = _make_harness(estimate_sampling_peak_mb=_PeakStub(default_mb=8260.0), sampling_headroom_mb=15000.0)
+    job_a, job_b = _job(), _job()
+    await _first_sampling_second_deferred(h, job_a, job_b)
+
+    h.virtual_now[0] = _SAMPLING_LIVENESS_GRACE_SECONDS + 10.0
+    h.orchestrator.tick()
+    assert len(h.sampler2.sent) == 0  # a live sampling genuinely holds the headroom: correctly still deferred
+
+    await h.orchestrator.handle_stage_result(_sample_ok(job_a.sdk_api_job_info.id_, _SAMPLER_PID))
+    h.orchestrator.tick()
+    assert len(h.sampler2.sent) == 1  # bounded by the first's completion, the second admits
+
+
+@pytest.mark.asyncio
+async def test_liveness_leaked_ledger_no_owner_escalates_within_a_tick() -> None:
+    """Cell (pin/peak leaked, one lane): a ledger peak whose job is gone escalates the head within a tick.
+
+    Models a job that faulted out of the pipeline without releasing its peak: nothing is sampling behind it,
+    so the fast escalation reclaims the headroom at once rather than waiting on the 180s sanity bound.
+    """
+    h = _make_harness(estimate_sampling_peak_mb=_PeakStub(default_mb=8260.0), sampling_headroom_mb=15000.0)
+    h.orchestrator._active_sampling_peaks["leaked-job"] = 8260.0
+    job = _job()
+    await _bring_to_sampling(h, job, pinned_pid=_SAMPLER_PID)
+
+    h.orchestrator.tick()  # 8260 leaked + 8260 candidate > 15000: deferred, but the leak is not live sampling
+    assert h.orchestrator._active_sampling_peaks == {}  # cleared at once
+    h.orchestrator.tick()
+    assert len(h.sampler.sent) == 1  # admitted within a tick
+    assert h.completed == []  # dispatched, not faulted
+
+
+@pytest.mark.asyncio
+async def test_liveness_crashed_first_sampler_launch_dead_escalates_the_second() -> None:
+    """Cell (two lanes, first sampler crashed): the second escalates within a tick, not at the sanity bound."""
+    h = _make_harness(estimate_sampling_peak_mb=_PeakStub(default_mb=8260.0), sampling_headroom_mb=15000.0)
+    job_a, job_b = _job(), _job()
+    await _first_sampling_second_deferred(h, job_a, job_b)
+
+    h.by_id.pop(_SAMPLER_PID)  # the in-flight first sampler vanished: its peak is backed by no live launch
+
+    h.orchestrator.tick()  # the fast escalation clears A's dead-launch peak
+    assert h.orchestrator._active_sampling_peaks == {}
+    h.orchestrator.tick()  # the clean ledger admits job B
+    assert len(h.sampler2.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_liveness_hostile_idle_sampler_that_never_returns_admits_not_faults() -> None:
+    """Hostile self-infliction: a live-launch first sampler goes idle and never returns its result.
+
+    Under a launch-only staleness check this entry is never cleared (its launch stays live) and the deferred
+    second job would age into the patience fault: a wedge that faults a job for another's lost result. The
+    device-state corroboration deems the idle sampler's lingering peak stale past the grace, so the second is
+    admitted (not faulted) instead.
+    """
+    h = _make_harness(estimate_sampling_peak_mb=_PeakStub(default_mb=8260.0), sampling_headroom_mb=15000.0)
+    job_a, job_b = _job(), _job()
+    await _first_sampling_second_deferred(h, job_a, job_b)
+
+    h.sampler.busy = False  # A's sample finished but its result never reached the orchestrator (launch still live)
+
+    # Within the grace the just-idle reading is not yet trusted (filters the post-dispatch transition window).
+    h.virtual_now[0] = _SAMPLING_LIVENESS_GRACE_SECONDS - 1.0
+    h.orchestrator.tick()
+    assert len(h.sampler2.sent) == 0
+
+    # Past the grace the lingering peak is provably stale: the second is admitted, and job B is never faulted.
+    h.virtual_now[0] = _SAMPLING_LIVENESS_GRACE_SECONDS + 1.0
+    h.orchestrator.tick()  # clears the stale peak
+    h.orchestrator.tick()  # admits job B
+    assert len(h.sampler2.sent) == 1
+    assert h.completed == []
+
+
+@pytest.mark.asyncio
+async def test_liveness_just_dispatched_sampler_is_not_reclaimed_within_the_grace() -> None:
+    """Protective: a sample dispatched this tick (child not yet busy) is never mistaken for a stale one.
+
+    Without the grace the second sampler would be admitted alongside a genuinely-just-dispatched first,
+    over-committing the card with two non-fitting peaks. The gate keeps the second deferred until the grace.
+    """
+    h = _make_harness(estimate_sampling_peak_mb=_PeakStub(default_mb=8260.0), sampling_headroom_mb=15000.0)
+    job_a, job_b = _job(), _job()
+    await _bring_to_sampling(h, job_a, pinned_pid=_SAMPLER_PID)
+    await _bring_to_sampling(h, job_b, pinned_pid=_SAMPLER_PID_2)
+    h.sampler.busy = False  # models the window before the child flips to a busy state after dispatch
+
+    h.orchestrator.tick()  # job A dispatched this tick, job B deferred
+    assert len(h.sampler.sent) == 1
+    assert len(h.sampler2.sent) == 0  # NOT admitted: two non-fitting peaks must never co-run
+    assert h.orchestrator._active_sampling_peaks  # A's peak retained (not judged stale within the grace)

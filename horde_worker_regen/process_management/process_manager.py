@@ -52,9 +52,9 @@ from horde_worker_regen.process_management._internal._aliased_types import Proce
 from horde_worker_regen.process_management.config.bridge_data_reloader import BridgeDataReloader
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_identity import lookup_worker_by_name
-from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
-from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger, LedgerEventType
 from horde_worker_regen.process_management.ipc.api_sessions import ApiSessions
 from horde_worker_regen.process_management.ipc.message_dispatcher import MessageDispatcher
 from horde_worker_regen.process_management.ipc.messages import (
@@ -1288,6 +1288,8 @@ class HordeWorkerProcessManager:
             is_disaggregatable=self._is_disaggregatable_sdk_job,
             is_disaggregation_class_eligible=self._disaggregation_class_eligible,
             register_disaggregated=self._register_disaggregated_job,
+            pin_owner=self._disaggregation_orchestrator.pinned_job_id_for_process,
+            sampling_peaks=self._disaggregation_orchestrator.active_sampling_peaks_snapshot,
         )
 
         self._recovery_coordinator = WorkerRecoveryCoordinator(
@@ -1542,11 +1544,23 @@ class HordeWorkerProcessManager:
         the horde forces it into maintenance for "dropping too many jobs". Auto-resumes after the cooldown.
         """
         now = time.time()
+        # The reset is unified across all three arming backstops: whichever owner set the standing deadline,
+        # the pause lapses here once it elapses, and the resume log/ledger name that owner.
         if self._state.self_throttle_paused:
             if now >= self._state.self_throttle_paused_until:
+                owner = self._state.self_throttle_pause_owner
+                lapsed_reason = self._state.self_throttle_pause_reason
+                owner_label = owner.value if owner is not None else "self_throttle"
                 self._state.self_throttle_paused = False
                 self._state.self_throttle_paused_until = 0.0
-                logger.info("Self-throttle cooldown elapsed; resuming job pops.")
+                self._state.self_throttle_pause_owner = None
+                self._state.self_throttle_pause_reason = ""
+                self._action_ledger.record(
+                    LedgerEventType.POP_PAUSE_LAPSED,
+                    reason=lapsed_reason,
+                    detail={"owner": owner_label},
+                )
+                logger.info(f"Self-throttle cooldown elapsed ({owner_label}); resuming job pops.")
             return
 
         threshold = self.bridge_data.self_maintenance_fault_threshold
@@ -1557,12 +1571,24 @@ class HordeWorkerProcessManager:
         if recent < threshold:
             return
         cooldown = self.bridge_data.self_maintenance_cooldown_seconds
+        pause_reason = f"{recent} resource/OOM faults in the last {window:.0f}s (threshold {threshold})"
         self._state.self_throttle_paused = True
         self._state.self_throttle_paused_until = now + cooldown
+        self._state.self_throttle_pause_owner = PopPauseOwner.FAULT_THROTTLE
+        self._state.self_throttle_pause_reason = pause_reason
+        self._action_ledger.record(
+            LedgerEventType.POP_PAUSE_ARMED,
+            reason=pause_reason,
+            detail={
+                "owner": PopPauseOwner.FAULT_THROTTLE.value,
+                "duration_seconds": round(cooldown, 1),
+                "recent_faults": recent,
+                "threshold": threshold,
+            },
+        )
         logger.warning(
-            f"Self-throttle engaged: {recent} resource/OOM faults in the last {window:.0f}s (threshold "
-            f"{threshold}); pausing job pops locally for {cooldown:.0f}s so the horde does not force the "
-            "worker into maintenance. In-flight jobs will finish.",
+            f"Self-throttle engaged: {pause_reason}; pausing job pops locally for {cooldown:.0f}s so the "
+            "horde does not force the worker into maintenance. In-flight jobs will finish.",
         )
 
     def _apply_post_processing_fault_breaker(self) -> None:
@@ -2511,9 +2537,24 @@ class HordeWorkerProcessManager:
             pressure = reconciler.observe_physical_pressure(
                 committed_vram_mb=committed_mb,
                 total_vram_mb=total_vram_mb,
+                device_used_mb=device_used_mb,
                 committed_is_stale=committed_is_stale,
             )
-            if pressure.should_unload:
+            if pressure.should_recalibrate:
+                # A phantom over-commit: the committed ledger reads far above the device-used truth, so no
+                # eviction can relieve it. Recalibrate by having the idle lanes return their allocator cache and
+                # re-report, driving committed back to reality. Never suppresses, so admission cannot wedge on a
+                # bookkeeping figure the card does not actually hold.
+                lanes_asked = self._inference_scheduler.recalibrate_committed_ledger(device_index=device_index)
+                overcount = committed_mb - (device_used_mb if device_used_mb is not None else 0.0)
+                logger.warning(
+                    f"VRAM committed-ledger phantom on device {device_index}: committed {committed_mb:.0f}MB "
+                    f"over-counts device-used {device_used_mb:.0f}MB by ~{overcount:.0f}MB "
+                    f"(baseline {reconciler.baseline_estimate_mb:.0f}MB, total {total_vram_mb:.0f}MB); the "
+                    f"over-commit is a stale allocator-cache reservation no eviction can cure. Asked "
+                    f"{lanes_asked} idle lane(s) to release their allocator cache and re-report to recalibrate.",
+                )
+            elif pressure.should_unload:
                 reclaimed = self._inference_scheduler.reclaim_one_idle_model_under_pressure(
                     device_index=device_index,
                 )
@@ -3785,14 +3826,22 @@ class HordeWorkerProcessManager:
                 why="Inference and safety are held; the GPU is not committed.",
             )
 
-        # Self-throttle (worker-initiated, auto-resuming)
+        # Self-throttle (worker-initiated, auto-resuming); the summary names the backstop that armed it.
         if self._state.self_throttle_paused:
             remaining = max(0.0, self._state.self_throttle_paused_until - time.time())
             why = "The worker is backing off before the horde forces maintenance."
             if remaining > 0:
                 why += f" Resumes in ~{self._format_remaining_seconds(remaining)}."
+            pause_owner = self._state.self_throttle_pause_owner
+            throttle_summary = "Self-throttled."
+            if pause_owner is not None:
+                throttle_summary = {
+                    PopPauseOwner.FAULT_THROTTLE: "Self-throttled after resource faults.",
+                    PopPauseOwner.RAM_PRESSURE: "Self-throttled under host RAM pressure.",
+                    PopPauseOwner.SAFETY: "Self-throttled: safety could not check a result.",
+                }.get(pause_owner, "Self-throttled.")
             return OrchestrationIntentSnapshot(
-                summary="Self-throttled after resource faults.",
+                summary=throttle_summary,
                 why=why,
             )
 
@@ -4229,12 +4278,18 @@ class HordeWorkerProcessManager:
 
         self_throttle = bool(self._state.self_throttle_paused)
         throttle_remaining = (self._state.self_throttle_paused_until - now) if self_throttle else None
+        throttle_reason: str | None = None
+        if self_throttle:
+            owner = self._state.self_throttle_pause_owner
+            owner_label = owner.value if owner is not None else "self_throttle"
+            specific = self._state.self_throttle_pause_reason
+            throttle_reason = f"{owner_label}: {specific}" if specific else f"paused by {owner_label}"
         readings.append(
             PopGovernorReading(
                 name="self_throttle_pause",
                 label="Self-throttle pause",
                 active=self_throttle,
-                reason="paused itself after resource/OOM faults to avoid dropping jobs" if self_throttle else None,
+                reason=throttle_reason,
                 expected_remaining_seconds=max(0.0, throttle_remaining) if throttle_remaining is not None else None,
             ),
         )

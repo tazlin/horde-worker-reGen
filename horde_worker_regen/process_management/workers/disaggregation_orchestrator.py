@@ -74,18 +74,30 @@ the stage is deferred and retried while the pressure clears rather than forfeiti
 pressure does not clear within this window (the fault recurs, or the stage stays undispatchable past it), the
 job is re-routed to the monolithic path instead of retrying forever. Sized to the stage patience window."""
 
+_SAMPLING_LIVENESS_GRACE_SECONDS = 5.0
+"""How long a ledgered sample whose sampler reports idle on the device is tolerated before it counts as stale.
+
+A sample booked into :data:`_active_sampling_peaks` is normally backed by a running sampler (its process
+reports busy from preload through the sampling steps). If that process instead reports idle (finished, or never
+started) while its ledger entry lingers, the sample result was lost or never produced, so the entry is holding
+device headroom nothing is using. This grace filters the brief window between dispatching the sample and the
+child reporting it busy, so a just-dispatched sample is never mistaken for a stalled one; past it, an idle
+sampler's ledger entry is provably not live sampling and is cleared by the fast escalation."""
+
 _GATE_DEFER_SANITY_SECONDS = 180.0
 """How long a sample may be held by the concurrent-sampling gate before a lack of system-wide sampling
-progress is treated as a stall rather than healthy backpressure.
+progress is treated as a stall rather than healthy backpressure, when the fast liveness escalation cannot fire.
 
 A gate deferral is normally healthy: a ready sample waits for an in-flight sampling to free device headroom,
-and must never age toward a fault. But the ledger the gate reads (:data:`_active_sampling_peaks`) can be
-left holding a peak for a sampling that never returns (an id-reusing replacement the crash reconcile missed,
-a leaked entry), and a job would then beg for dispatch forever behind headroom nothing is actually using.
-This bound (comfortably above the longest healthy single sample) caps that: once a job has been gate-deferred
-this long AND no sample result has arrived anywhere in the same window, the ledger cannot be reflecting live
-sampling, so its provably-dead entries are cleared and the job is either re-admitted or aged into the normal
-patience machinery. No combination of a leaked ledger and deferral can hold a job indefinitely."""
+and must never age toward a fault. The primary release is the fast liveness escalation
+(:meth:`_handle_gate_deferral`): the moment no sampling is verifiably in flight (every ledger entry's owner is
+gone, its sample's dispatch launch is dead, or its sampler reports idle past the liveness grace) the stale
+peaks are cleared and the sample re-admits within a tick. This far larger bound is the last resort for the case
+the fast path cannot judge stale: the ledger entry's owner is present, its dispatch launch is live, and its
+sampler still reports busy, yet no sample result has arrived anywhere in the whole window. That is either a
+genuinely long sample or a sampler wedged busy; once this bound elapses the provably-dead entries are cleared
+and the job is re-admitted or aged into the normal patience machinery, so no ledger state can hold a job
+indefinitely."""
 
 
 class _DispatchOutcome(StrEnum):
@@ -162,6 +174,12 @@ class _DisaggJobState:
     Set on the first gate deferral and cleared the moment the job dispatches (or its stage changes), so it
     measures an unbroken deferral run. Anchors the :data:`_GATE_DEFER_SANITY_SECONDS` stall bound that keeps a
     leaked or stale sampling ledger from deferring the job forever."""
+    sample_dispatched_at: float | None = None
+    """When this job's in-flight sample was dispatched (booked into :data:`_active_sampling_peaks`).
+
+    Set when the sample is admitted and cleared when its peak is released, so it spans exactly the interval a
+    ledger entry exists for this job. The fast liveness escalation reads it to grace the brief post-dispatch
+    window before the sampler reports busy, so a just-dispatched sample is never judged an idle (stale) one."""
     resource_defer_started_at: float | None = None
     """When the current stage first hit a resource-class (device out-of-memory) fault; anchors the defer window.
 
@@ -280,6 +298,21 @@ class DisaggregationOrchestrator:
     def active_sampling_peaks_total_mb(self) -> float:
         """Return the summed in-flight sampling peaks (MB), so the cycle snapshot can charge them once."""
         return sum(self._active_sampling_peaks.values())
+
+    def active_sampling_peaks_snapshot(self) -> dict[str, float]:
+        """Return a copy of the in-flight sampling peaks (MB) keyed by job id, for stall diagnostics."""
+        return dict(self._active_sampling_peaks)
+
+    def pinned_job_id_for_process(self, process_id: int) -> str | None:
+        """Return the job id whose sampler is pinned to ``process_id``, or None if no job pins it.
+
+        Lets the dispatch-stall classifier attribute a monolithic head whose model is resident only on a
+        pinned sampler lane to the disaggregated job holding that lane.
+        """
+        for key, state in self._jobs.items():
+            if state.pinned_sampler is not None and state.pinned_sampler[0] == process_id:
+                return key
+        return None
 
     # -- registration ------------------------------------------------------------------------------
 
@@ -445,50 +478,59 @@ class DisaggregationOrchestrator:
                     self._fault_and_finish(state, reason=f"no role process for stage {state.stage}")
 
     def _handle_gate_deferral(self, state: _DisaggJobState, now: float) -> None:
-        """Track a gate-deferred sample as healthy backpressure, but never let it be deferred forever.
+        """Serialize samplers on genuine backpressure, but escalate a deferral no live sampling justifies.
 
-        A sample the concurrent-sampling gate declines is normally healthy: a live sampler is waiting on device
-        headroom another in-flight sampling holds, so it must not age toward the patience fault. But if the
-        deferral runs past :data:`_GATE_DEFER_SANITY_SECONDS` while *no* sample result has arrived anywhere in
-        the same window, the ledger the gate reads cannot be reflecting live sampling (its peaks are leaked or
-        stale), so the healthy assumption no longer holds and the stall is broken.
+        The concurrent-sampling gate may serialize samplers, it must never deadlock. A sample it declines is
+        healthy backpressure only while a sampling is genuinely in flight to free the headroom it waits on; the
+        deferral is then bounded by that job's completion and must not age toward the patience fault. The primary
+        escalation is the fast liveness path: the moment no sampling is verifiably in flight (every ledger entry
+        is provably not live sampling per :meth:`_sampling_ledger_entry_is_stale`) the stale peaks are cleared so
+        the sample re-admits within a tick, because a candidate that fits alone on an idle card must always run.
+        Only when a live-looking ledger yields no system-wide progress for the whole :data:`_GATE_DEFER_SANITY_SECONDS`
+        window does the far larger sanity bound act as a last resort.
         """
         if state.gate_deferred_since is None:
             state.gate_deferred_since = now
-        escalating = (
+        # Fast liveness escalation: reclaim any headroom no verifiably-live sampling is using. Safe every tick,
+        # because a genuinely running sampler (its owner present, its sample dispatched to a live launch, its
+        # process reporting busy) is never judged stale, so the gate's protection (never a second non-fitting
+        # concurrent sampler) is intact.
+        if not self._sampling_verifiably_in_flight(now):
+            self._break_gate_deferral_stall(state, now, escalation="no live sampling in flight")
+            return
+        # A genuine sampling is in flight. The sanity bound is the last resort for a ledger that looks live yet
+        # yields no system-wide progress for its whole window; short of it, this is healthy backpressure.
+        escalating_on_sanity = (
             now - state.gate_deferred_since > _GATE_DEFER_SANITY_SECONDS
             and now - self._last_sample_result_at > _GATE_DEFER_SANITY_SECONDS
         )
-        if not escalating:
-            # Healthy backpressure: keep it clear of the no-role patience clock and leave the resource-defer
-            # machinery untouched (a gate deferral is not a device-pressure fault, so it must not consume the
-            # one-defer budget).
+        if not escalating_on_sanity:
+            # Healthy backpressure bounded by the in-flight sampling's completion: keep it clear of the no-role
+            # patience clock and leave the resource-defer machinery untouched (a gate deferral is not a
+            # device-pressure fault, so it must not consume the one-defer budget).
             state.first_stalled_at = None
             return
-        self._break_gate_deferral_stall(state, now)
+        self._break_gate_deferral_stall(state, now, escalation="sanity bound with no sampling progress")
 
-    def _break_gate_deferral_stall(self, state: _DisaggJobState, now: float) -> None:
+    def _break_gate_deferral_stall(self, state: _DisaggJobState, now: float, *, escalation: str) -> None:
         """Clear provably-stale sampling-ledger peaks, then re-admit or age the job that was stuck behind them.
 
-        Reached only once a gate deferral has run past the sanity bound with no system-wide sampling progress.
-        Every ledger entry whose owning job is gone, or whose dispatch target is no longer the live launch (per
-        the launch-aware retirement check), is a peak reserving headroom nothing is using: those are cleared.
-        If that empties the ledger the gate re-admits the job on the next tick. If entries remain for live
-        sampling processes the ledger is not the problem, so the job is aged through ``first_stalled_at`` and
-        the normal patience fault/reroute machinery applies rather than deferring forever.
+        Every ledger entry that is not verifiably live sampling (its owning job is gone, its sample's dispatch
+        launch is dead, or its sampler reports idle past the liveness grace) is a peak reserving headroom nothing
+        is using: those are cleared. If that empties the ledger the gate re-admits the job on the next tick. If
+        entries remain for live sampling processes the ledger is not the problem, so the job is aged through
+        ``first_stalled_at`` and the normal patience fault/reroute machinery applies rather than deferring forever.
         """
         stale_before = dict(self._active_sampling_peaks)
         for ledger_key in list(self._active_sampling_peaks):
-            owner = self._jobs.get(ledger_key)
-            if owner is None or not self._dispatch_target_alive(owner):
+            if self._sampling_ledger_entry_is_stale(self._jobs.get(ledger_key), now):
                 self._active_sampling_peaks.pop(ledger_key, None)
 
         if not self._active_sampling_peaks:
             if stale_before:
                 logger.warning(
-                    f"Disaggregation: sample for {self._key(state.job_info)} was gate-deferred past "
-                    f"{_GATE_DEFER_SANITY_SECONDS:.0f}s with no sample result system-wide; cleared the stale "
-                    f"sampling ledger {stale_before} and will re-admit it.",
+                    f"Disaggregation: sample for {self._key(state.job_info)} was gate-deferred ({escalation}); "
+                    f"cleared the stale sampling ledger {stale_before} and will re-admit it.",
                 )
             # Reset the deferral anchor so the next tick re-attempts dispatch against the now-clean ledger.
             state.gate_deferred_since = None
@@ -498,21 +540,49 @@ class DisaggregationOrchestrator:
         # or reroutes rather than deferring forever.
         if state.first_stalled_at is None:
             logger.warning(
-                f"Disaggregation: sample for {self._key(state.job_info)} was gate-deferred past "
-                f"{_GATE_DEFER_SANITY_SECONDS:.0f}s with no sample result system-wide, but the sampling ledger "
-                f"{self._active_sampling_peaks} still references live samplers; aging it into the patience path.",
+                f"Disaggregation: sample for {self._key(state.job_info)} was gate-deferred ({escalation}), but "
+                f"the sampling ledger {self._active_sampling_peaks} still references live samplers; aging it "
+                "into the patience path.",
             )
             state.first_stalled_at = now
         elif now - state.first_stalled_at > _STAGE_PATIENCE_SECONDS:
-            self._fault_and_finish(state, reason="gate-deferred past the sanity bound with no sampling progress")
+            self._fault_and_finish(state, reason="gate-deferred with no sampling progress")
 
-    def _dispatch_target_alive(self, state: _DisaggJobState) -> bool:
-        """Whether the job's current dispatch target is still the exact live launch it was sent to."""
-        if state.dispatched_to is None:
-            return False
-        pid, launch = state.dispatched_to
+    def _sampling_verifiably_in_flight(self, now: float) -> bool:
+        """Whether any ledgered sample is backed by a genuinely running sampler.
+
+        True when at least one ledger entry is not stale (its owner is present and sampling, its sample was
+        dispatched to a live launch, and its sampler reports busy on the device). When this is False the whole
+        ledger is holding headroom no live sampling is using, so a gate deferral behind it can be escalated at
+        once rather than waiting on the sanity bound.
+        """
+        return any(
+            not self._sampling_ledger_entry_is_stale(self._jobs.get(ledger_key), now)
+            for ledger_key in self._active_sampling_peaks
+        )
+
+    def _sampling_ledger_entry_is_stale(self, owner: _DisaggJobState | None, now: float) -> bool:
+        """Whether a sampling-ledger entry is not backed by a verifiably-live sampling.
+
+        Stale when the owning job is gone, is no longer in the sampling stage, has no dispatch target, or its
+        sample was dispatched to a launch that is no longer live (a crash or an id-reusing replacement). It is
+        also stale when the launch is live but its process reports idle (not busy) past the liveness grace: a
+        running sampler reports busy from preload through its steps, so an idle sampler whose entry lingers has
+        lost or never produced its result. The grace covers only the brief post-dispatch window before the child
+        reports busy, so a just-dispatched sample is never mistaken for a stalled one.
+        """
+        if owner is None or owner.stage != DisaggJobStage.SAMPLING or owner.dispatched_to is None:
+            return True
+        pid, launch = owner.dispatched_to
         process = self._find_process_by_id(pid)
-        return process is not None and process.process_launch_identifier == launch
+        if process is None or process.process_launch_identifier != launch:
+            return True
+        if process.is_process_busy():
+            return False
+        # Launch is live but the device shows this sampler idle: stale only once past the grace, so a sample
+        # dispatched this tick (child not yet reporting busy) is not reclaimed out from under a live sampling.
+        dispatched_at = owner.sample_dispatched_at
+        return dispatched_at is not None and now - dispatched_at > _SAMPLING_LIVENESS_GRACE_SECONDS
 
     def _try_dispatch(self, state: _DisaggJobState) -> _DispatchOutcome:
         """Dispatch the job's current stage to a role process; report whether it sent, stalled, or was gated."""
@@ -597,6 +667,7 @@ class DisaggregationOrchestrator:
         # A missing estimate books 0.0 (its presence still makes the ledger non-empty, so the gate arbitrates
         # subsequent samplings, but it reserves no headroom, per "never wedge on a missing estimate").
         self._active_sampling_peaks[self._key(state.job_info)] = peak_mb if peak_mb is not None else 0.0
+        state.sample_dispatched_at = self._clock()
         return _DispatchOutcome.DISPATCHED
 
     def _admit_concurrent_sampling(self, peak_mb: float | None) -> bool:
@@ -678,6 +749,7 @@ class DisaggregationOrchestrator:
     def _release_sampling_peak(self, state: _DisaggJobState) -> None:
         """Drop a job's in-flight sampling peak from the ledger (idempotent), returning its headroom."""
         self._active_sampling_peaks.pop(self._key(state.job_info), None)
+        state.sample_dispatched_at = None
 
     def _resolve_sampler(self, state: _DisaggJobState, horde_model_name: str) -> HordeProcessInfo | None:
         """Resolve the process to sample on: the pin normally, a re-resolution after the pin was cleared.

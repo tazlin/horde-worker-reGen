@@ -793,6 +793,27 @@ bound (3x the report interval) as an UNKNOWN, incomparable tenant: it skips the
 drift computation for that card rather than raising a false alarm or a false
 all-clear against a ledger it can no longer trust.
 
+A committed figure can also detach from device truth while its reports stay perfectly
+fresh. The ledger sums each lane's `torch.cuda.memory_reserved()`, which counts an
+unloaded model's cached-but-unreturned blocks and reservations the WDDM driver has
+already spilled to host RAM, so a card that is physically near-empty can still carry a
+multi-GB committed sum long after its models left VRAM. The staleness guard does not
+catch this (the reports are current), so the physical-overcommit check reconciles
+against device truth before it acts. Because the worker cannot hold more device VRAM
+than the card reports used, a committed sum that exceeds the parent-side NVML
+device-used reading by more than a tolerance is a **phantom**: an accounting figure no
+eviction can reduce (there is nothing resident to evict). The worker treats that as a
+calibration event, not a reason to go quiet. Rather than unloading a model that is not
+there and latching suppressed on a figure that can never fall (which would defer every
+admission forever), it asks each idle lane to release its allocator cache and re-report,
+driving committed back to device reality; the unload path fires only for a *corroborated*
+over-commit the device-used reading also shows. The unload path itself now emits a fresh
+memory report the moment it empties its cache, so a real eviction's release lands in the
+ledger at once rather than at the next interval report. The invariant is that committed,
+as admission sees it, tracks NVML device-level truth within a stated tolerance; when the
+two diverge persistently the worker recalibrates or escalates and never wedges admission
+on its own bookkeeping.
+
 ### Per-context overhead and the effective idle floor
 
 The job-burden prediction above is *per job*. Sizing residency across several processes that share one
@@ -908,6 +929,22 @@ This makes every governor visible the same way:
 
 The grep-friendly boundary format is the contract between the worker and the log/duty tooling; the regexes live
 in [`governor_signatures`][horde_worker_regen.analysis.governor_signatures].
+
+### Self-throttle pause ownership
+
+The `self_throttle_pause` governor is a single shared pop-pause deadline
+([`WorkerState.self_throttle_paused`][horde_worker_regen.process_management.config.worker_state.WorkerState] with
+`self_throttle_paused_until`), but three independent backstops arm it: the resource/OOM-fault self-maintenance
+throttle, the host-RAM-pressure governor, and the safety soft-pause. There is one effective deadline, and
+whichever site sets the later one holds the pause; no site shortens a deadline it does not own, so a short
+RAM-pressure reading arriving under a longer fault throttle leaves the fault throttle's deadline (and its
+attribution) standing. The subsystem that set the standing deadline is recorded as the pause's
+[`PopPauseOwner`][horde_worker_regen.process_management.config.worker_state.PopPauseOwner] alongside a truthful,
+owner-specific reason (the RAM-pressure reason carries the measured free and floor MB it acted on). That owner
+and reason are what the governor reading reports, what the resume log line names when the pause lapses, and what
+the action ledger records: an arm event ([`POP_PAUSE_ARMED`][horde_worker_regen.process_management.ipc.action_ledger.LedgerEventType])
+carrying the owner, duration, and numeric context, and a matching `POP_PAUSE_LAPSED` when it clears. An
+overlapping arm that supersedes a different owner's still-standing pause names the transition it made.
 
 ## Alchemy backpressure
 

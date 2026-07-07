@@ -248,6 +248,8 @@ def decide_degrade_response(snapshot: HostMemorySnapshot) -> list[GovernanceActi
                 until_time=until,
                 pause_seconds=RAM_PRESSURE_PAUSE_SECONDS,
                 reason=snapshot.verdict.reason(),
+                available_mb=snapshot.verdict.available_mb,
+                floor_mb=snapshot.verdict.floor_mb,
             ),
         )
     actions.append(EvictIdleModels())

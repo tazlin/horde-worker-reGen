@@ -42,6 +42,10 @@ class PausePops:
     """The pause length, for the announcement."""
     reason: str
     """A short human-readable pressure reason, for the announcement."""
+    available_mb: float | None = None
+    """Measured available system RAM (MB) that triggered the pause, or None when no telemetry existed."""
+    floor_mb: float | None = None
+    """The absolute available-RAM danger floor (MB) the reading was under, for the arm ledger record."""
 
 
 @dataclass(frozen=True)
