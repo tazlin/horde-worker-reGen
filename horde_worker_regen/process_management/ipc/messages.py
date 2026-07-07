@@ -532,6 +532,17 @@ class HordeControlMessage(BaseModel):
     """The control flag signaling the child process to perform an action."""
 
 
+class UnsupportedControlMessageError(TypeError):
+    """A control message arrived at a process whose dispatch contract does not include it.
+
+    Raised by a child's control dispatch when the message type or flag is not one that process handles: a
+    parent-side routing error, not a child-side execution failure. The base receive loop drops such a
+    message loudly and keeps the process alive, because no handler ran and no state was disturbed. An
+    exception escaping a *supported* handler mid-action remains terminal: the process state is then
+    genuinely unknown.
+    """
+
+
 class HordeControlModelMessage(HordeControlMessage):
     """Control messages that are sent from the main process to the child processes that involve models."""
 

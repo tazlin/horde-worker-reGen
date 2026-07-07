@@ -32,7 +32,10 @@ from horde_worker_regen.process_management.ipc.messages import (
 )
 from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo, LineSkip, NextJobAndProcess
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
-from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
+from horde_worker_regen.process_management.lifecycle.horde_process import (
+    ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES,
+    HordeProcessType,
+)
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -3841,7 +3844,9 @@ class InferenceScheduler:
         Emptying an idle lane's allocator cache returns those blocks and prompts a fresh memory report, so the
         parent's ``process_reserved_mb`` (hence committed) converges back to device truth. A busy (actively
         sampling) lane is skipped: its reservation is live, and its cache returns through the ordinary post-stage
-        path. Terminal (ending/ended) lanes and lanes that have never reported a reservation are skipped too.
+        path. Terminal (ending/ended) lanes and lanes that have never reported a reservation are skipped too, as
+        is any process whose dispatch contract does not include ``RELEASE_ALLOCATOR_CACHE`` (the fan-out targets
+        only :data:`ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES`, so a routing-incapable process is never asked).
         Returns how many lanes were asked to release.
 
         Args:
@@ -3849,6 +3854,8 @@ class InferenceScheduler:
         """
         lanes_asked = 0
         for process_info in self._process_map.values():
+            if process_info.process_type not in ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES:
+                continue
             if device_index is not None and process_info.device_index != device_index:
                 continue
             if process_info.process_reserved_mb is None:

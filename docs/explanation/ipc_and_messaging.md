@@ -49,6 +49,16 @@ parent's job span in logfire.
 > the pipe itself identifies the recipient. The launch identifier lives on the
 > child→parent status messages (see below).
 
+Each process type implements a dispatch contract: the subset of message types and control flags it handles.
+A message outside that contract is a parent-side routing error, and the child's dispatch raises
+`UnsupportedControlMessageError`; the base receive loop drops such a message loudly and keeps the process
+alive, because no handler ran and no state was disturbed. An exception escaping a *supported* handler
+mid-action remains terminal (the child ends itself and the parent recovers a fresh process), since the
+process state is then genuinely unknown. Every GPU-context-bearing process type (inference, safety,
+post-process, component, VAE lane) handles `RELEASE_ALLOCATOR_CACHE`; a sender that fans that flag across
+the process map (the committed-ledger recalibration) filters on `ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES`
+so a routing-incapable process is never asked.
+
 ### Status messages (child → parent)
 
 | Message                           | Sent when…                                   | Key fields                                                                            |

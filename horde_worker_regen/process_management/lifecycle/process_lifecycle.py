@@ -1957,10 +1957,24 @@ class ProcessLifecycleManager:
             return False
 
         exit_code = process_info.mp_process.exitcode
-        logger.error(
-            f"{process_info} exited unexpectedly (exitcode={exit_code}) while "
-            f"{process_info.last_process_state.name}; recovering",
+        ended_itself = exit_code == 0 and process_info.last_process_state in (
+            HordeProcessState.PROCESS_ENDING,
+            HordeProcessState.PROCESS_ENDED,
         )
+        if ended_itself:
+            # A clean exit the parent never asked for: the child hit a terminal condition and chose its own
+            # graceful shutdown. Naming it as such (rather than "exited unexpectedly") points the operator at
+            # the child's log, where the terminating error was recorded, instead of implying a hard crash.
+            logger.error(
+                f"{process_info} ended itself without a parent request (exitcode=0) while "
+                f"{process_info.last_process_state.name}; the terminating error is in the child's own log; "
+                f"recovering",
+            )
+        else:
+            logger.error(
+                f"{process_info} exited unexpectedly (exitcode={exit_code}) while "
+                f"{process_info.last_process_state.name}; recovering",
+            )
         if process_info.process_type == HordeProcessType.SAFETY:
             self._initiate_safety_replacement()
             self._replace_all_safety_process()

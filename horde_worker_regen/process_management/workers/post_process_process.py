@@ -41,6 +41,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordePostProcessControlMessage,
     HordePostProcessResultMessage,
     HordeProcessState,
+    UnsupportedControlMessageError,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
 from horde_worker_regen.utils.oom_signature import is_out_of_memory_text
@@ -412,13 +413,17 @@ class HordePostProcessProcess(HordeProcess):
 
         if isinstance(message, HordePostProcessControlMessage):
             if message.control_flag != HordeControlFlag.START_POST_PROCESS:
-                raise ValueError(f"Expected {HordeControlFlag.START_POST_PROCESS}, got {message.control_flag}")
+                raise UnsupportedControlMessageError(
+                    f"Expected {HordeControlFlag.START_POST_PROCESS}, got {message.control_flag}",
+                )
             self._run_post_processing(message)
             return
 
         if isinstance(message, HordeAlchemyControlMessage):
             if message.control_flag != HordeControlFlag.START_ALCHEMY:
-                raise ValueError(f"Expected {HordeControlFlag.START_ALCHEMY}, got {message.control_flag}")
+                raise UnsupportedControlMessageError(
+                    f"Expected {HordeControlFlag.START_ALCHEMY}, got {message.control_flag}",
+                )
             if self._dry_run_skip_post_processing:
                 self.process_message_queue.put(
                     HordeAlchemyResultMessage(
@@ -437,7 +442,9 @@ class HordePostProcessProcess(HordeProcess):
             self._run_graph_alchemy(message.form)
             return
 
-        raise TypeError(f"Expected a post-process or alchemy control message, got {type(message)}")
+        raise UnsupportedControlMessageError(
+            f"Expected a post-process or alchemy control message, got {type(message)}",
+        )
 
     @override
     def cleanup_for_exit(self) -> None:

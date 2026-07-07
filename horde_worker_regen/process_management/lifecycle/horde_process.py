@@ -32,6 +32,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessMemoryMessage,
     HordeProcessState,
     HordeProcessStateChangeMessage,
+    UnsupportedControlMessageError,
 )
 
 
@@ -59,6 +60,22 @@ class HordeProcessType(enum.Enum):
     pauses/restores off-GPU during whole-card windows, reports ``POST_PROCESSING`` state), but distinct from
     ``POST_PROCESS`` so a busy post-processing lane can never block a critical-path VAE stage and its
     co-residency charge (the tiled-decode spike) stays honest. See ``workers/vae_lane_process.py``."""
+
+
+ALLOCATOR_CACHE_CAPABLE_PROCESS_TYPES: frozenset[HordeProcessType] = frozenset(
+    {
+        HordeProcessType.INFERENCE,
+        HordeProcessType.SAFETY,
+        HordeProcessType.POST_PROCESS,
+        HordeProcessType.COMPONENT,
+        HordeProcessType.VAE_LANE,
+    },
+)
+"""Process types whose control dispatch implements ``RELEASE_ALLOCATOR_CACHE``.
+
+A sender that fans the flag out across the process map (rather than targeting one known lane) must filter
+on this set: a control flag delivered outside its receiver's dispatch contract is a routing error the
+receiver drops instead of acting on, so the send accomplishes nothing and pollutes the child's log."""
 
 
 class WorkerCapability(enum.Flag):
@@ -497,9 +514,15 @@ class HordeProcess(abc.ABC):
 
             try:
                 self._receive_and_handle_control_message(message)
+            except UnsupportedControlMessageError as e:
+                # A routing error on the parent's side: no handler ran, so this process's state is intact.
+                # Dropping the message keeps the process alive; ending it would convert a sender bug into a
+                # crash-restart loop for a healthy child.
+                logger.error(f"Dropped a control message this process does not support: {e}")
             except Exception as e:
                 logger.error(f"Failed to handle control message: {type(e).__name__} {e}")
-                # This is a terminal error, so we should exit
+                # A supported handler failed mid-action, so the process state is unknown: exit and let the
+                # parent recover a fresh process.
                 self._end_process = True
 
     def worker_cycle(self) -> None:

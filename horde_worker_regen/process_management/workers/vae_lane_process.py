@@ -42,6 +42,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeVaeDecodeResultMessage,
     HordeVaeEncodeControlMessage,
     HordeVaeEncodeResultMessage,
+    UnsupportedControlMessageError,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess, HordeProcessType
 from horde_worker_regen.utils.oom_signature import is_out_of_memory_text, is_resource_class_exception
@@ -421,7 +422,7 @@ class HordeVaeLaneProcess(HordeProcess):
             self._run_vae_decode(message)
             return
 
-        raise TypeError(f"Expected a VAE encode/decode control message, got {type(message)}")
+        raise UnsupportedControlMessageError(f"Expected a VAE encode/decode control message, got {type(message)}")
 
     @override
     def cleanup_for_exit(self) -> None:

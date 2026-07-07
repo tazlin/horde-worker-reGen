@@ -6,6 +6,7 @@ in the (comfy-loaded) inference processes.
 """
 
 import enum
+import gc
 import time
 from enum import auto
 from io import BytesIO
@@ -41,6 +42,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeSafetyControlMessage,
     HordeSafetyEvaluation,
     HordeSafetyResultMessage,
+    UnsupportedControlMessageError,
 )
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcess
 
@@ -492,11 +494,35 @@ class HordeSafetyProcess(HordeProcess):
         )
         self.send_process_state_change_message(HordeProcessState.WAITING_FOR_JOB, "Waiting for job")
 
+    @logger.catch(reraise=True)
+    def release_allocator_cache(self) -> None:
+        """Release the torch allocator's cached free blocks without unloading models, then report memory.
+
+        The GPU-resident safety models are a committed-VRAM ledger tenant like any other GPU lane, so the
+        ledger's recalibration fan-out asks this process to return reserved-but-unused allocator blocks the
+        same way it asks the inference and lane processes. The resident safety models stay loaded. When the
+        safety models run on CPU there is no device allocator to trim, so only a fresh RAM report is sent.
+        """
+        if self._safety_device == "cpu":
+            self.send_memory_report_message(include_vram=False)
+            return
+        gc.collect()
+        from hordelib.api import clear_accelerator_cache
+
+        clear_accelerator_cache()
+        self.send_memory_report_message(include_vram=True)
+
     @override
     def _receive_and_handle_control_message(self, message: HordeControlMessage) -> None:
+        if message.control_flag == HordeControlFlag.RELEASE_ALLOCATOR_CACHE:
+            self.release_allocator_cache()
+            return
+
         if isinstance(message, HordeAlchemyControlMessage):
             if message.control_flag != HordeControlFlag.START_ALCHEMY:
-                raise ValueError(f"Expected {HordeControlFlag.START_ALCHEMY}, got {message.control_flag}")
+                raise UnsupportedControlMessageError(
+                    f"Expected {HordeControlFlag.START_ALCHEMY}, got {message.control_flag}",
+                )
             if self._dry_run_skip_safety:
                 logger.info(f"Dry-run: skipping alchemy form {message.form.form} ({message.form.form_id})")
                 self.process_message_queue.put(
@@ -517,10 +543,12 @@ class HordeSafetyProcess(HordeProcess):
             return
 
         if not isinstance(message, HordeSafetyControlMessage):
-            raise TypeError(f"Expected {HordeSafetyControlMessage}, got {type(message)}")
+            raise UnsupportedControlMessageError(f"Expected {HordeSafetyControlMessage}, got {type(message)}")
 
         if message.control_flag != HordeControlFlag.EVALUATE_SAFETY:
-            raise ValueError(f"Expected {HordeControlFlag.EVALUATE_SAFETY}, got {message.control_flag}")
+            raise UnsupportedControlMessageError(
+                f"Expected {HordeControlFlag.EVALUATE_SAFETY}, got {message.control_flag}",
+            )
 
         if self._dry_run_skip_safety:
             logger.info(f"Dry-run: skipping safety evaluation for job {message.job_id}")
