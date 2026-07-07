@@ -109,6 +109,21 @@ faster safety stage or longer deadline raises the tolerated backlog; a slower on
 tightens it. The practical effect is that throughput settles at the slowest pipeline
 stage's rate rather than at the rate the GPU produces images.
 
+The gate is **hysteretic**, so it does not thrash. It engages the moment the backlog
+reaches the cap, then stays engaged until the backlog drains **below half the cap**
+(`_SAFETY_BACKLOG_RELEASE_FRACTION`), rather than releasing the instant a single job
+clears. Without the gap, a backlog sitting at the cap would re-admit one job on every
+safety completion and re-engage on the next inference completion, popping the worker in
+and out of backpressure each tick and never letting the slow stage make headway. The
+same latched verdict is read by the pop gate, the fast-pop ("hungry") path, and the
+orchestration-intent readback, so all three agree within a tick. Each withheld pop
+records a `safety_backlog` reason in `last_pop_skipped_reasons` (surfaced in the
+dashboard and support bundle) and a throttled `WARN` naming the depth, the self-tuned
+cap, and the oldest waiting safety job. The contract is a bound, not a fault: intake
+stops and resumes, and nothing is aborted. On a box where safety runs on CPU behind
+two GPU producers this is what keeps the in-flight backlog from climbing without limit
+until jobs age out.
+
 ## Model stickiness
 
 When the worker has more configured models than inference processes, every new

@@ -599,6 +599,67 @@ class TestPostInferenceBackpressure:
         assert popper._is_hungry(popper._runtime_config.bridge_data) is False
 
 
+class _FakeBacklogTracker:
+    """A minimal stand-in exposing only the two safety-backlog lists the backpressure gate reads."""
+
+    def __init__(self) -> None:
+        self.jobs_pending_safety_check: list[object] = []
+        self.jobs_being_safety_checked: list[object] = []
+
+    def set_backlog(self, depth: int) -> None:
+        """Set the pending-safety backlog to exactly ``depth`` placeholder entries."""
+        self.jobs_pending_safety_check = [object() for _ in range(depth)]
+        self.jobs_being_safety_checked = []
+
+
+class TestBackpressureReleaseHysteresis:
+    """The backpressure gate engages at the cap and releases only below a lower bound (hysteresis)."""
+
+    def _popper_with_fixed_cap(self, cap: int) -> JobPopper:
+        popper = _make_popper()
+        popper._job_tracker = _FakeBacklogTracker()  # pyrefly: ignore - a stub stands in for the job tracker
+        popper._max_safe_safety_backlog = lambda: cap  # pyrefly: ignore - fixing the cap isolates the hysteresis
+        return popper
+
+    def test_engages_at_cap_and_holds_until_lower_bound(self) -> None:
+        """Once engaged at the cap the gate stays engaged until the backlog drains below half the cap."""
+        popper = self._popper_with_fixed_cap(4)  # release bound = 4 * 0.5 = 2
+        tracker = popper._job_tracker
+
+        tracker.set_backlog(4)
+        assert popper._is_post_inference_backlogged() is True  # engage at cap
+
+        tracker.set_backlog(3)
+        assert popper._is_post_inference_backlogged() is True  # above the lower bound: still engaged
+
+        tracker.set_backlog(2)
+        assert popper._is_post_inference_backlogged() is False  # at/below the lower bound: released
+
+    def test_released_gate_does_not_reengage_until_cap_again(self) -> None:
+        """After release, a backlog between the bounds does not re-engage until it reaches the cap again."""
+        popper = self._popper_with_fixed_cap(4)
+        tracker = popper._job_tracker
+
+        tracker.set_backlog(4)
+        assert popper._is_post_inference_backlogged() is True
+        tracker.set_backlog(1)
+        assert popper._is_post_inference_backlogged() is False  # released
+
+        tracker.set_backlog(3)  # between bounds, but coming from released state
+        assert popper._is_post_inference_backlogged() is False
+        tracker.set_backlog(4)  # back at the cap
+        assert popper._is_post_inference_backlogged() is True
+
+    def test_small_backlog_is_a_noop(self) -> None:
+        """A backlog that never reaches the cap never engages the gate."""
+        popper = self._popper_with_fixed_cap(4)
+        tracker = popper._job_tracker
+
+        for depth in (0, 1, 2, 3, 3, 2, 1, 0):
+            tracker.set_backlog(depth)
+            assert popper._is_post_inference_backlogged() is False
+
+
 class TestHandleConsecutiveFailures:
     """Tests for _handle_consecutive_failures directly."""
 

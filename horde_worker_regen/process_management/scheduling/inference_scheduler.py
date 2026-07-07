@@ -570,6 +570,12 @@ class InferenceScheduler:
         self._safety_placement_miss_streak = 0
         self._safety_placement_fit_streak = 0
         self._safety_placement_wants_off = False
+        # Lifetime counts of runtime safety-placement policy actuations, for the run-metrics readback: a
+        # demotion moves safety off-GPU (its charge did not fit beside the sampler), a promotion restores it
+        # once the chosen card's measured free proved durable room. These count only policy-initiated moves,
+        # not the whole-card residency's own safety pauses (which the lifecycle manager counts separately).
+        self._safety_placement_demotions = 0
+        self._safety_placement_promotions = 0
 
         self._preload_delay_notified = False
         self._model_recently_missing = False
@@ -1318,14 +1324,15 @@ class InferenceScheduler:
         """Whether a whole-card residency on this card should also move the single safety process off-GPU.
 
         Requires safety configured-and-on-GPU (:meth:`_whole_card_safety_off_gpu_enabled`) and that this is
-        the card the one safety process is pinned to, i.e. the lowest-index driven card. A residency on a
-        non-safety card never disturbs safety. The worker-wide key (``None``, single-GPU) always qualifies.
+        the card the one safety process is pinned to (:meth:`_safety_gpu_card`, headroom-chosen, not a fixed
+        index). A residency on a non-safety card never disturbs safety. The worker-wide key (``None``,
+        single-GPU) always qualifies.
         """
         if not self._whole_card_safety_off_gpu_enabled():
             return False
         if device_index is None or not self._card_runtimes:
             return True
-        return device_index == min(self._card_runtimes)
+        return device_index == self._safety_gpu_card()
 
     def _has_safety_backlog(self) -> bool:
         """Return whether safety has work that should not be interrupted by residency churn."""
@@ -1389,9 +1396,78 @@ class InferenceScheduler:
             return
         if any(self._residency_should_pause_safety(device_index) for device_index, _ in self._held_residencies()):
             return
-        safety_card = min(self._card_runtimes) if self._card_runtimes else None
+        safety_card = self._safety_gpu_card()
         if self._arbiter_admits_safety_gpu_load(safety_card):
             self._process_lifecycle.restore_safety_on_gpu()
+
+    def _choose_safety_gpu_card(self) -> int | None:
+        """Return the driven card safety should be placed on: the one with the most verified headroom.
+
+        The single placement identity, consumed both at spawn (pushed to the lifecycle manager, which pins the
+        safety process there) and when the runtime placement policy re-promotes safety onto the GPU, so the
+        two never disagree about which card safety lands on. Headroom per card is its truthful measured
+        device-free VRAM when reported (that figure already nets out whatever is resident and sampling on the
+        card right now); absent a measured reading it falls back to the card total less the largest active
+        sampling peak (the modeled expected peak). The card with the greatest headroom wins, ties resolving to
+        the lowest index so the choice is stable. On a single-GPU host this is the one card, and with no
+        headroom evidence at all it is the lowest-index card, both byte-identical to the historical fixed pin.
+        """
+        if not self._card_runtimes:
+            return None
+        modeled_peak_mb = self._largest_active_sampling_peak_mb() or 0.0
+        best_index: int | None = None
+        best_headroom_mb = float("-inf")
+        for device_index in sorted(self._card_runtimes):
+            measured_free_mb = self._measured_free_vram_mb(device_index=device_index)
+            if measured_free_mb is not None:
+                headroom_mb = measured_free_mb
+            else:
+                total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+                if total_vram_mb is None:
+                    continue
+                headroom_mb = total_vram_mb - modeled_peak_mb
+            if headroom_mb > best_headroom_mb:
+                best_headroom_mb = headroom_mb
+                best_index = device_index
+        return best_index if best_index is not None else min(self._card_runtimes)
+
+    def _safety_gpu_card(self) -> int | None:
+        """Return the card safety currently occupies, or the card it would be placed on when off-GPU.
+
+        When safety is on-GPU this is the card it is physically pinned to (from the lifecycle manager), so
+        residency and fit checks reason about the real card. When safety is off-GPU it is the headroom-aware
+        candidate (:meth:`_choose_safety_gpu_card`) it would land on at the next re-promotion. None on a
+        host with no driven cards.
+        """
+        if not self._card_runtimes:
+            return None
+        current_card = self._process_lifecycle.safety_gpu_card_index()
+        if current_card is not None and current_card in self._card_runtimes:
+            return current_card
+        return self._choose_safety_gpu_card()
+
+    def _safety_restore_headroom_fits(self, device_index: int | None) -> bool:
+        """Whether the chosen card's *measured* free VRAM now holds safety's context plus a proportional buffer.
+
+        The demotion side prices a modeled worst-case peak (device total less the largest learned sampling
+        peak), which under sustained load is always populated, so a modeled restore predicate is unsatisfiable
+        while the card keeps sampling: that is the defect this replaces. The restore side instead reads the
+        card's truthful measured device-free between allocation peaks. The governor's NVML-derived figure
+        already nets out whatever is resident and sampling right now, so a card that genuinely has room to
+        reabsorb safety's context reports it directly, and a card that stays busy under load never accrues the
+        restore streak (CPU placement remaining the correct steady state, with pop backpressure carrying the
+        load). Additionally requires the device-free governor to be HEALTHY on the card, so a card hovering at
+        the paging cliff never readmits safety. Missing telemetry (no measured free) does not restore: the
+        policy promotes only on positive, measured evidence.
+        """
+        measured_free_mb = self._measured_free_vram_mb(device_index=device_index)
+        if measured_free_mb is None:
+            return False
+        if self.governor_state(device_index) is not GovernorState.HEALTHY:
+            return False
+        total_vram_mb = self._process_map.get_reported_total_vram_mb(device_index=device_index)
+        buffer_mb = admission_noise_buffer_mb(total_vram_mb)
+        return (measured_free_mb - _SAFETY_GPU_LOAD_CHARGE_MB - buffer_mb) >= 0.0
 
     def _runtime_safety_placement_enabled(self) -> bool:
         """Whether the runtime safety-placement policy may act (safety configured on-GPU on a real device).
@@ -1460,21 +1536,42 @@ class InferenceScheduler:
         return (total_vram_mb - peak_mb - noise_mb - _SAFETY_GPU_LOAD_CHARGE_MB - margin_mb) >= 0.0
 
     def _reconcile_runtime_safety_placement(self) -> None:
-        """Keep safety off the GPU whenever its charge cannot fit beside the largest active sampling peak.
+        """Keep safety off the GPU while its charge cannot fit, and re-promote it once a card proves room.
 
         A scheduler-owned per-cycle policy that generalises the whole-card safety-off lever to the ordinary
         case: on a card too tight to hold the safety context beside the heaviest sampling activation it is
         committed to, safety cycles to a CPU-only process so its CUDA context stops competing for the card. The
         operator's ``safety_on_gpu`` remains the maximum permission (False leaves safety off forever); this
-        policy can only degrade GPU to CPU, never promote.
+        policy can only degrade GPU to CPU and back, never beyond the operator's grant.
+
+        The two sides read different signals so the re-promotion is satisfiable under sustained load. Demotion
+        prices a *modeled* worst case: the charge must fail to fit beside the largest learned sampling peak
+        (:meth:`_safety_fits_beside_largest_sampling_peak`), a predictive eviction that acts before the card
+        reaches the paging cliff. Re-promotion instead reads the chosen card's *measured* device-free between
+        allocation peaks (:meth:`_safety_restore_headroom_fits`): the modeled peak is always populated while
+        jobs flow, so a modeled restore predicate could never be satisfied under load, whereas the measured
+        free rises whenever the card genuinely has room. On a box where no card can host safety beside its
+        sampler the measured streak never accrues and CPU placement is the correct steady state, with pop
+        backpressure carrying the load.
 
         Hysteresis (:data:`_SAFETY_PLACEMENT_PAUSE_STREAK` / :data:`_SAFETY_PLACEMENT_RESTORE_STREAK`) guards
-        against flapping: the latch turns on only after several consecutive non-fitting cycles and off only
-        after more consecutive fitting-with-margin cycles, so a card oscillating around the fit boundary does
-        not thrash the safety process on and off the GPU every cycle. Actuation is skipped while a safety check
-        is pending or active (no mid-backlog churn); the restore is additionally withheld while a whole-card
-        residency still needs safety off its card, so this policy and the residency machinery never fight.
+        against flapping: the off-latch turns on only after several consecutive modeled-non-fit cycles and off
+        only after a longer run of measured-headroom cycles, with a deadband (modeled fit but measured room not
+        yet proven) that advances neither streak. The asymmetric streaks double as a demote-again cooldown: a
+        promotion resets the miss streak, so at least :data:`_SAFETY_PLACEMENT_PAUSE_STREAK` fresh non-fit
+        cycles must pass before safety can be evicted again. Actuation is skipped while a safety check is
+        pending or active (no mid-backlog churn); the restore is additionally withheld while a whole-card
+        residency still needs safety off its card and while the device-free governor holds growth, so this
+        policy fights neither the residency machinery nor the cliff brake. The card safety is placed on is the
+        headroom-aware choice (:meth:`_choose_safety_gpu_card`), pushed to the lifecycle manager so spawn and
+        re-promotion agree.
         """
+        # Push the headroom-aware placement choice to the lifecycle manager every cycle so any safety
+        # (re)spawn (this policy's re-promotion, a residency restore, or a crash rebuild) pins to the current
+        # best card. Single-GPU keeps the historical fixed pin (None), so its spawn path is byte-identical.
+        if len(self._card_runtimes) > 1:
+            self._process_lifecycle.set_desired_safety_card(self._choose_safety_gpu_card())
+
         if not self._runtime_safety_placement_enabled():
             self._safety_placement_miss_streak = 0
             self._safety_placement_fit_streak = 0
@@ -1483,18 +1580,19 @@ class InferenceScheduler:
         if self._has_safety_backlog():
             return
 
-        safety_card = min(self._card_runtimes) if self._card_runtimes else None
-        fits = self._safety_fits_beside_largest_sampling_peak(safety_card, require_margin=False)
-        fits_with_margin = self._safety_fits_beside_largest_sampling_peak(safety_card, require_margin=True)
-        if fits_with_margin:
+        safety_card = self._safety_gpu_card()
+        modeled_fits = self._safety_fits_beside_largest_sampling_peak(safety_card, require_margin=False)
+        measured_headroom_fits = self._safety_restore_headroom_fits(safety_card)
+        if measured_headroom_fits:
             self._safety_placement_fit_streak += 1
             self._safety_placement_miss_streak = 0
-        elif not fits:
+        elif not modeled_fits:
             self._safety_placement_miss_streak += 1
             self._safety_placement_fit_streak = 0
         else:
-            # Fits, but only within the margin deadband: neither confirms the latch either way, so hold both
-            # streaks so a job hovering on the boundary neither evicts nor readmits safety.
+            # Deadband: the modeled charge fits beside the peak but the card's measured free has not yet proven
+            # durable room to reabsorb safety. Advance neither streak so a card on the boundary neither evicts
+            # nor readmits safety.
             return
 
         if not self._safety_placement_wants_off:
@@ -1508,6 +1606,7 @@ class InferenceScheduler:
                 peak_mb = self._largest_active_sampling_peak_mb()
                 total_mb = self._process_map.get_reported_total_vram_mb(device_index=safety_card)
                 if self._process_lifecycle.pause_safety_on_gpu():
+                    self._safety_placement_demotions += 1
                     logger.info(
                         f"Runtime safety placement: moving safety off-GPU. Its "
                         f"~{_SAFETY_GPU_LOAD_CHARGE_MB / 1024:.1f}GB context does not fit beside the largest "
@@ -1528,10 +1627,11 @@ class InferenceScheduler:
         if self.is_vram_growth_held(safety_card):
             return
         if self._arbiter_admits_safety_gpu_load(safety_card) and self._process_lifecycle.restore_safety_on_gpu():
+            self._safety_placement_promotions += 1
             logger.info(
-                f"Runtime safety placement: restoring safety to the GPU after "
-                f"{self._safety_placement_fit_streak} consecutive cycles of durable headroom beside the "
-                f"largest active sampling peak.",
+                f"Runtime safety placement: restoring safety to card {safety_card} after "
+                f"{self._safety_placement_fit_streak} consecutive cycles of measured device-free headroom for "
+                f"its ~{_SAFETY_GPU_LOAD_CHARGE_MB / 1024:.1f}GB context.",
             )
 
     def _residency_should_pause_post_process(self, device_index: int | None) -> bool:
@@ -6432,6 +6532,18 @@ class InferenceScheduler:
     def latest_dispatch_reconciliation_released_by_natural_free(self) -> int:
         """Return the count of held dispatches released by the card recovering on its own (calibration)."""
         return self._dispatch_reconciliation_released_by_natural_free
+
+    def latest_safety_placement_demotions(self) -> int:
+        """Return how many times the runtime safety-placement policy moved safety off-GPU this run."""
+        return self._safety_placement_demotions
+
+    def latest_safety_placement_promotions(self) -> int:
+        """Return how many times the runtime safety-placement policy restored safety to the GPU this run."""
+        return self._safety_placement_promotions
+
+    def latest_safety_placement_card(self) -> int | None:
+        """Return the card the safety process currently occupies, or None when safety is off-GPU (on CPU)."""
+        return self._process_lifecycle.safety_gpu_card_index()
 
     async def start_inference(self) -> bool:
         """Start inference for the next job in jobs_pending_inference, if possible.

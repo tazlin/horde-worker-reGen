@@ -312,6 +312,19 @@ class RunMetricsSnapshot(BaseModel):
     """Count of held dispatches released because the card freed on its own this run (a sibling finished or
     foreign pressure abated), without this gate having emitted an eviction for the held job. Calibration
     visibility only."""
+    safety_placement_demotions: int = 0
+    """Count of runtime safety-placement policy moves of the safety process off-GPU to CPU this run: the safety
+    context did not fit beside the largest active sampling peak on its card for the consecutive-cycle streak.
+    Distinct from the whole-card residency's own safety pauses. Calibration visibility only."""
+    safety_placement_promotions: int = 0
+    """Count of runtime safety-placement policy restores of the safety process back onto the GPU this run: the
+    chosen card's measured device-free proved durable room for the safety context for the consecutive-cycle
+    streak. Its counterpart to the demotions; a demotion with no matching promotion is CPU safety as the
+    steady state under sustained load. Calibration visibility only."""
+    safety_placement_card: int | None = None
+    """The driven card the safety process currently occupies, or None when safety is off-GPU (running on CPU).
+    On a box too tight to host safety beside its sampler this settles at None, with pop backpressure bounding
+    intake to CPU-safety throughput. Calibration visibility only."""
 
 
 class WorkerRunMetrics:
@@ -669,6 +682,9 @@ class WorkerRunMetrics:
         dispatch_reconciliation_hold_seconds: float = 0.0,
         dispatch_reconciliation_released_by_reclaim: int = 0,
         dispatch_reconciliation_released_by_natural_free: int = 0,
+        safety_placement_demotions: int = 0,
+        safety_placement_promotions: int = 0,
+        safety_placement_card: int | None = None,
     ) -> RunMetricsSnapshot:
         """Return an immutable snapshot of everything observed so far.
 
@@ -709,4 +725,7 @@ class WorkerRunMetrics:
             dispatch_reconciliation_hold_seconds=dispatch_reconciliation_hold_seconds,
             dispatch_reconciliation_released_by_reclaim=dispatch_reconciliation_released_by_reclaim,
             dispatch_reconciliation_released_by_natural_free=dispatch_reconciliation_released_by_natural_free,
+            safety_placement_demotions=safety_placement_demotions,
+            safety_placement_promotions=safety_placement_promotions,
+            safety_placement_card=safety_placement_card,
         )

@@ -42,9 +42,13 @@ def _make_snapshot() -> WorkerStateSnapshot:
     return WorkerStateSnapshot(config=config, processes=[process], num_jobs_submitted=7)
 
 
-def test_protocol_version_is_v15() -> None:
-    """Scheduler-governance diagnostics ride supervisor protocol v15."""
-    assert SUPERVISOR_PROTOCOL_VERSION == 15
+def test_protocol_version_pinned() -> None:
+    """The supervisor protocol version is pinned so schema changes force a conscious bump here too.
+
+    The TUI refuses mismatched connections, so an incompatible snapshot/command change must bump
+    ``SUPERVISOR_PROTOCOL_VERSION`` and update this literal in the same change.
+    """
+    assert SUPERVISOR_PROTOCOL_VERSION == 17
 
 
 def test_stats_fields_survive_json_roundtrip() -> None:

@@ -44,13 +44,13 @@ from horde_worker_regen.process_management.models.feature_readiness import (
 )
 from horde_worker_regen.process_management.models.model_availability import ModelAvailability
 from horde_worker_regen.process_management.models.model_sizing import is_extra_large_model
-from horde_worker_regen.process_management.resources.resource_budget import (
-    is_model_locally_unservable_for,
-    predict_job_weight_mb,
-)
 from horde_worker_regen.process_management.resources.model_serviceability import (
     assess_model_serviceability,
     model_footprint_figures_for_baseline,
+)
+from horde_worker_regen.process_management.resources.resource_budget import (
+    is_model_locally_unservable_for,
+    predict_job_weight_mb,
 )
 from horde_worker_regen.process_management.scheduling.pop_throttler import (
     CONSECUTIVE_FAILED_JOBS_WAIT_SECONDS,
@@ -88,6 +88,16 @@ admitted now still clears with margin before its deadline."""
 _MIN_POST_INFERENCE_BACKLOG = 2
 """Always allow at least this much post-inference backlog per safety process, so a balanced pipeline
 still overlaps inference with safety instead of running them strictly one-at-a-time."""
+_SAFETY_BACKLOG_RELEASE_FRACTION = 0.5
+"""Fraction of the self-tuning backlog cap the backlog must drain below before intake resumes.
+
+The engage bound and the release bound differ (hysteresis): backpressure engages when the backlog reaches
+the cap, then stays engaged until the backlog has drained to half the cap, rather than releasing the instant
+one job clears. Without the gap, a backlog sitting at the cap would re-admit one job on every safety
+completion and re-engage on the next inference completion, popping the worker in and out of backpressure each
+tick (thrash) and defeating the purpose of letting the slow stage catch up. Half the cap gives the safety
+stage a full margin to work down before more inference work is admitted, and because it is a fraction of the
+same deadline-derived cap it tracks that cap as measured safety speed and the horde ttl move."""
 
 
 def _select_models_for_pop(
@@ -259,9 +269,7 @@ def _serviceability_held_back_models(
 
     held_back: set[str] = set()
     for model in models:
-        serving_cards = [
-            card for card in card_runtimes.values() if model in set(card.config.image_models_to_load)
-        ]
+        serving_cards = [card for card in card_runtimes.values() if model in set(card.config.image_models_to_load)]
         if not serving_cards:
             continue
         baseline = _baseline_value_for_model(model_metadata, model)
@@ -269,9 +277,7 @@ def _serviceability_held_back_models(
         verdicts = []
         for card in serving_cards:
             baseline_mb = (
-                admission_baseline_provider(card.device_index)
-                if admission_baseline_provider is not None
-                else None
+                admission_baseline_provider(card.device_index) if admission_baseline_provider is not None else None
             )
             verdicts.append(
                 assess_model_serviceability(
@@ -642,6 +648,14 @@ class JobPopper:
     _safety_backlog_log_time: float = 0.0
     """Monotonic-ish wall-clock of the last safety-backlog backpressure log (throttle state)."""
 
+    _safety_backpressure_engaged: bool = False
+    """Whether safety-backlog backpressure is currently withholding pops (the hysteresis latch state).
+
+    Engaged when the backlog reaches the cap, cleared only once it drains below the release bound (see
+    :data:`_SAFETY_BACKLOG_RELEASE_FRACTION`). Holding this state between ticks is what makes the gate
+    hysteretic rather than a bare threshold, so the worker does not flap in and out of backpressure while
+    the backlog hovers near the cap."""
+
     def _max_safe_safety_backlog(self) -> int:
         """How many jobs may wait for safety before a newly popped job would risk aging out.
 
@@ -667,11 +681,22 @@ class JobPopper:
         (or in) safety against a deadline-derived cap lets the worker stop popping before the backlog ages
         jobs out, throttling intake to the pipeline's slowest stage instead of spiralling into
         forced maintenance.
+
+        Hysteretic: the gate engages when the backlog reaches the cap and stays engaged until the backlog
+        drains below :data:`_SAFETY_BACKLOG_RELEASE_FRACTION` of that cap, so intake resumes only once the
+        slow stage has made real headway rather than the instant a single job clears. The latch is
+        deterministic in the current backlog, so the several read sites that call this each tick (the pop
+        gate, the hungry check, the orchestration-intent readback) all observe the same verdict.
         """
         backlog = len(self._job_tracker.jobs_pending_safety_check) + len(self._job_tracker.jobs_being_safety_checked)
-        if backlog == 0:
-            return False
-        return backlog >= self._max_safe_safety_backlog()
+        cap = self._max_safe_safety_backlog()
+        if self._safety_backpressure_engaged:
+            if backlog <= cap * _SAFETY_BACKLOG_RELEASE_FRACTION:
+                self._safety_backpressure_engaged = False
+            return self._safety_backpressure_engaged
+        if backlog > 0 and backlog >= cap:
+            self._safety_backpressure_engaged = True
+        return self._safety_backpressure_engaged
 
     @property
     def _lora_disk_permits(self) -> bool:

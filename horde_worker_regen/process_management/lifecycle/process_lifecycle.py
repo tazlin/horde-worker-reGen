@@ -363,6 +363,16 @@ class ProcessLifecycleManager:
         self._safety_gpu_paused = False
         self._safety_gpu_pause_count = 0
         self._safety_gpu_restore_count = 0
+        # The driven card the safety process should be pinned to when it (re)spawns on-GPU, chosen by the
+        # scheduler's headroom-aware placement identity and pushed here each control cycle. None (the default
+        # and the only value on a single-GPU host) means "the lowest-index driven card", byte-identical to the
+        # historical fixed pin. The re-promotion path respawns through the same bring-up, so honouring this at
+        # spawn is all that is needed for both first bring-up and every restore to land on the chosen card.
+        self._desired_safety_card: int | None = None
+        # The device the currently-running on-GPU safety process is pinned to, recorded at its last spawn.
+        # None whenever safety came up cpu_only. Read as the truthful "which card is safety on" signal so a
+        # whole-card residency on a different card never needlessly evicts safety from a card it does not share.
+        self._safety_pinned_card: int | None = None
         # Marks the *next* safety-pool rebuild as an intentional whole-card pause/restore cycle, so its
         # completion is not counted as a crash recovery and does not feed the safety crash-loop breaker.
         # Without this, repeated whole-card jobs cycling safety off/on read as a safety crash loop and trip
@@ -601,9 +611,17 @@ class ProcessLifecycleManager:
             # device, the safety process must come up off-GPU so it does not re-take a CUDA context.
             cpu_only = is_cpu_only_install() or (not bridge_data.safety_on_gpu) or self._safety_gpu_paused
 
-            # When the safety model runs on-GPU it lives on the first configured card; its mask_kind is None
-            # on a default single-GPU host (so no pin, byte-identical) and set on a masked multi-GPU host.
-            first_card = self._card_runtimes[min(self._card_runtimes)]
+            # When the safety model runs on-GPU it lives on the scheduler-chosen card (the driven card with the
+            # most verified headroom net of its expected sampling peak); its mask_kind is None on a default
+            # single-GPU host (so no pin, byte-identical) and set on a masked multi-GPU host. Absent a chosen
+            # card (single-GPU, or before the scheduler has placed one) this is the lowest-index driven card,
+            # the historical fixed pin.
+            desired_card = self._desired_safety_card
+            if desired_card is not None and desired_card in self._card_runtimes:
+                safety_card = self._card_runtimes[desired_card]
+            else:
+                safety_card = self._card_runtimes[min(self._card_runtimes)]
+            self._safety_pinned_card = None if cpu_only else safety_card.device_index
 
             process = self._new_process(
                 target=self._entry_points.safety_entry_point,
@@ -616,8 +634,8 @@ class ProcessLifecycleManager:
                     cpu_only,
                 ),
                 kwargs={
-                    "device_index": first_card.device_index,
-                    "accelerator_kind": first_card.mask_kind,
+                    "device_index": safety_card.device_index,
+                    "accelerator_kind": safety_card.mask_kind,
                     "amd_gpu": self._amd_gpu,
                     "directml": self._directml,
                     "dry_run_skip_safety": bridge_data.dry_run_skip_safety,
@@ -1759,6 +1777,28 @@ class ProcessLifecycleManager:
     def safety_gpu_restore_count(self) -> int:
         """How many whole-card residency safety-on-GPU restores this lifecycle manager initiated."""
         return self._safety_gpu_restore_count
+
+    def set_desired_safety_card(self, device_index: int | None) -> None:
+        """Record the driven card the safety process should pin to when it next (re)spawns on-GPU.
+
+        Pushed by the scheduler's headroom-aware placement identity each control cycle. Takes effect only at
+        the next safety bring-up (spawn or the re-promotion respawn), never migrating a live process; a value
+        that is not a driven card index (or None) falls back to the lowest-index card at spawn time.
+
+        Args:
+            device_index: The chosen card's stable index, or None for the lowest-index default.
+        """
+        self._desired_safety_card = device_index
+
+    def safety_gpu_card_index(self) -> int | None:
+        """Return the device the on-GPU safety process occupies, or None when safety is off-GPU.
+
+        Truthful "which card is safety on" signal: None while safety is paused off-GPU (residency or the
+        runtime placement policy) or came up cpu_only, else the card it was pinned to at its last spawn.
+        """
+        if self._safety_gpu_paused:
+            return None
+        return self._safety_pinned_card
 
     def pause_safety_on_gpu(self) -> bool:
         """Move the safety process off-GPU (cpu_only) so its CUDA context frees for a whole-card model.

@@ -2973,6 +2973,9 @@ class HordeWorkerProcessManager:
             dispatch_reconciliation_released_by_natural_free=(
                 self._inference_scheduler.latest_dispatch_reconciliation_released_by_natural_free()
             ),
+            safety_placement_demotions=self._inference_scheduler.latest_safety_placement_demotions(),
+            safety_placement_promotions=self._inference_scheduler.latest_safety_placement_promotions(),
+            safety_placement_card=self._inference_scheduler.latest_safety_placement_card(),
         )
 
     def describe_run_phase(self) -> tuple[str, str]:
