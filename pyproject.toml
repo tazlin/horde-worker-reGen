@@ -28,13 +28,11 @@ dependencies = [
     "certifi",
     "horde_sdk~=0.26.0",
     "horde_safety~=0.3.0",
-    # Requires horde-engine (hordelib) 3.2.11+: in addition to the 3.2.5+ feature set (torchvision range,
-    # no hard torchaudio dep, optional-feature extras + capability registry consumed by
-    # horde_worker_regen/capabilities.py), 3.2.11 adds the torch-free VRAM-planning helpers
-    # (hordelib.vram_planning.compute_inference_reserve_mb / compute_weight_budget_mb) and the runtime
-    # weight-streaming telemetry (get_loaded_weights_offloaded_mb) the worker's streaming forecast and
-    # whole-card exclusive residency depend on.
-    "horde_engine[layerdiffuse,upscale-extra]>=5.0.1,<6.0.0",
+    # Requires horde-engine (hordelib) 6.0.0+: the process VRAM telemetry the memory reporter depends on
+    # (hordelib.api.get_process_vram_stats, hordelib.utils.torch_memory.offthread_vram_sampling_ready)
+    # and the disaggregated stage execution surface (hordelib.execution.stage_payloads plus the
+    # HordeLib encode_text_stage / sample_stage / vae_encode_stage / decode_stage entry points).
+    "horde_engine[layerdiffuse,upscale-extra]>=6.0.0,<7.0.0",
     "horde_model_reference>=7.0.2,<8.0.0",
     "python-dotenv",
     "ruamel.yaml",
