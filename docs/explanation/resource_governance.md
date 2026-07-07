@@ -101,13 +101,12 @@ soft reset's limp-by concurrency notch and unconditional pool churn to a pool th
 
 Remedies are expressed as inert command objects
 ([`GovernanceAction`][horde_worker_regen.process_management.scheduling.governance.actions]) and policy
-outcomes as enums (for example
-[`VramReclaimOutcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.VramReclaimOutcome]).
+outcomes as enums such as
+[`RamReclaimOutcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.RamReclaimOutcome].
 This buys three things:
 
-- **Testability**: the escalation policy that decides between deferring a preload, holding a
-  breaker-tripped model, reducing the live context count, and best-effort-admitting a starved head is a
-  pure function of six booleans, and is tested as one.
+- **Testability**: target exclusion, load serialization, card ordering, and system-RAM reclaim outcomes are
+  pure functions tested with plain value inputs.
 - **One execution site per side effect**: every RAM remedy executes through the scheduler's single
   action dispatcher, so there is exactly one place a remedy's log line, bookkeeping, and measured
   result live.
@@ -119,7 +118,7 @@ This buys three things:
 The preload loop walks the pending queue and, per job, runs a sequence of named gates. The pass uses
 [`AdmissionDecision`][horde_worker_regen.process_management.scheduling.governance.preload_admission.AdmissionDecision]
 as its shared vocabulary (continue, stop, admit, defer by RAM pressure/concurrency/budget, pre-stage,
-terminal admit). The scheduler keeps a tiny private adapter from those decisions to pass control, while
+unserviceable). The scheduler keeps a tiny private adapter from those decisions to pass control, while
 the judgment calls live as pure functions in
 [`preload_admission`][horde_worker_regen.process_management.scheduling.governance.preload_admission]:
 
@@ -134,17 +133,16 @@ the judgment calls live as pure functions in
    a card already serving the model first, then the least-loaded card).
 3. **Load serialization**: whether another checkpoint may load on this device right now
    ([`preload_concurrency_blocked`][horde_worker_regen.process_management.scheduling.governance.preload_admission.preload_concurrency_blocked]).
-4. **Budget verdicts**: the VRAM gate answers with an explicit
-   [`VramGateResult`][horde_worker_regen.process_management.scheduling.governance.preload_admission.VramGateResult]
-   (fits / defer / admitted over budget), so an over-budget admit visibly bypasses the RAM gate. Before
-   admitting, it reclaims idle system RAM only when the RAM budget judges the incoming load short of
-   available memory: a heavy head does route its checkpoint through RAM first, but purging a sibling's
-   warm RAM copy on a host with ample headroom only converts that sibling's next job into a disk
-   reload. When a verdict rejects, the scheduler runs the reclaim attempts and
-   the pure outcome deciders
-   ([`decide_vram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_vram_reclaim_outcome],
-   [`decide_ram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_ram_reclaim_outcome])
-   resolve what the exhausted pass means. Same-tick reclaim side effects stay behind the
+4. **Budget verdicts**: VRAM admission is owned by
+   [`VramArbiter`][horde_worker_regen.process_management.resources.vram_arbiter.VramArbiter]. A non-fitting
+   request defers while verified reclaim can still make progress, and a foreign-pressure request admits only
+   when it physically fits measured device-free VRAM net of the noise buffer. Before admitting, the scheduler
+   reclaims idle system RAM only when the RAM budget judges the incoming load short of available memory: a
+   heavy head does route its checkpoint through RAM first, but purging a sibling's warm RAM copy on a host
+   with ample headroom only converts that sibling's next job into a disk reload. When RAM reclaim has run,
+   [`decide_ram_reclaim_outcome`][horde_worker_regen.process_management.scheduling.governance.preload_admission.decide_ram_reclaim_outcome]
+   resolves whether to wait for the reclaimed memory to show up or proceed. Same-tick reclaim side effects
+   stay behind the
    [`ReclamationExecutor`][horde_worker_regen.process_management.scheduling.governance.preload_admission.ReclamationExecutor]
    protocol, implemented by the scheduler because it owns live process state and logging.
 

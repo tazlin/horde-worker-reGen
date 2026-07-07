@@ -8,6 +8,7 @@ nav:
     - process_lifecycle.md
     - process_lanes_and_chaining.md
     - performance_and_backpressure.md
+    - vram_arbiter.md
     - duty-cycle.md
     - compute_backends.md
     - shutdown_and_faults.md

@@ -362,33 +362,54 @@ non-sampling time on small jobs and shows up as the `vram_transfer` loss in the
 [duty-cycle report](duty-cycle.md). It is paid even when the very next job uses the *same* model on the
 *same* process.
 
-The scheduler suppresses that eviction for one dispatch only under gates that cannot over-commit the
-card even when the driver's free-VRAM figure lies. A WDDM driver in demand-paging keeps reporting
-generous free VRAM while the card is actually saturated, so the gates lean on the parent's own
-bookkeeping and on constants rather than trusting the measurement:
+The scheduler suppresses that eviction for one dispatch under a governed live gate. Because eviction is now
+both on-demand and *proven* (the [device-free governor](vram_arbiter.md) reads the truthful NVML device-free
+figure, and the verified reclaim ladder takes residents back rung by rung with each free confirmed at the
+device level), retention no longer has to be preemptively stingy. It grants when both hold:
 
-- **Sole residency**: no other process on the card may hold a VRAM-resident model (judged from the
-  model map, which the children keep honest by reporting where the weights actually ended up after each
-  job). Retention only ever extends the card's single resident across consecutive jobs; it never
-  creates a second resident.
-- **Static fit**: the card's reported *total* VRAM (a constant the driver cannot misreport under
-  pressure) must absorb the job's sampling peak plus the configured reserve and any committed reserves.
-- **Measured veto**: the [VRAM budget](#the-vram-and-ram-budget) check against measured free VRAM can
-  still deny, never solely grant. The job's own weights are credited back into the reading only when
-  the dispatching process already holds this model in VRAM; only then was the reading taken with the
-  weights occupying the card, and demanding the footprint also fit inside the *remainder* would charge
-  them twice.
+- **Card healthy**: the device-free governor's committed state for the card is `HEALTHY`. A `PRESSURE` or
+  `SATURATED` card is one the ladder is or may soon be reclaiming from, so it is handed no new resident. This
+  reads the one figure a WDDM driver cannot misreport under demand-paging (NVML device-free), so it holds
+  precisely in the regime where measured free VRAM lies.
+- **Static fit**: the card's reported *total* VRAM (a constant the driver cannot misreport under pressure)
+  must absorb the job's sampling peak plus the configured reserve and any committed reserves, after charging
+  the sibling CUDA contexts and the job's own post-processing that share the card while the weights are held.
+
+The [VRAM budget](#the-vram-and-ram-budget) measured-free check is deliberately *not* re-applied in this
+seam: it is the admission/dispatch gate's job, and retaining already-materialized weights adds no new bytes
+to the card, so a measured veto here only reintroduces the never-fires problem via committed-figure noise.
+Nor is sole residency required: a second idle resident is safe because it is a first-class candidate of the
+verified reclaim ladder, so retention may keep weights warm even while a sibling holds its own resident
+model.
 
 No queue lookahead gates the grant. The pop cycle refills the queue immediately *after* a dispatch drains
 it, so at the dispatch instant a same-model successor is almost never visible in the pending set even
 when one arrives milliseconds later; conditioning retention on seeing one makes it structurally
-unreachable. Reclaim is instead just-in-time, by the parties that can actually see the demand: the
-per-dispatch VRAM sweep takes back an idle retained copy the moment a different process needs the card,
-and the under-pressure reclaim overrides retention outright. An unused hold therefore costs only the
-interval until the next dispatch. The sweep spares the resident copy of a model still in the queue
-lookahead, but only when the card can statically afford that copy alongside the head-of-queue job's
-sampling peak; on a card where they cannot coexist, keeping the copy warm would force silent driver
-demand-paging during sampling, which costs far more than the one reload the protection saves.
+unreachable. Reclaim is instead just-in-time, by the parties that can actually see the demand: a cross-model
+preload that no longer fits because idle retained residents hold the card defers while the ladder evicts
+them (the head-of-queue reclaim targets the idle resident, newest-idle-first), and the under-pressure
+reclaim overrides retention outright. An unused hold therefore costs only the interval until the next
+dispatch. The sweep spares the resident copy of a model still in the queue lookahead, but only when the card
+can statically afford that copy alongside the head-of-queue job's sampling peak; on a card where they cannot
+coexist, keeping the copy warm would force silent driver demand-paging during sampling, which costs far more
+than the one reload the protection saves.
+
+Underneath the scheduler's retention lever sits ComfyUI's own model management, and it has the final say on
+whether weights actually stay on the card. ComfyUI's *smart memory* keeps a just-used model resident in VRAM
+across executions; disabling it (`--disable-smart-memory`) makes ComfyUI aggressively offload every model to
+RAM the instant an execution finishes. That offload runs below the worker's `defer_vram_unload` request, so
+with smart memory off a same-model back-to-back job re-uploads the full UNet, CLIP, and VAE (three RAM→VRAM
+transfers) even when both the worker's retention and the parent model map agree the model is still resident:
+the retention lever is silently defeated one layer down. Cross-job residency (`comfy_smart_memory: true`)
+lets a same-model successor pay zero re-upload, and the parent retains the authority to undo it: the
+device-free governor reads truthful NVML device-free, and the verified reclaim ladder forces an actual VRAM
+free on any idle child (ComfyUI's own `free_memory` honors a full-card reclaim request regardless of the
+smart-memory setting). It nonetheless ships **off** by default: residency is not yet reconciled at dispatch
+time, so on a tight card a sampling peak landing beside an idle sibling's resident weights overcommits the
+device faster than the ladder's tick-paced eviction can clear it, and the driver demotes VRAM to system
+memory, a card-wide slowdown that costs more than the re-uploads residency saves. Until dispatch evicts
+conflicting residents before the peak materializes, per-job offloading remains the safe default; the field
+exists for cards whose headroom comfortably exceeds one sampling peak plus one resident model.
 
 The support processes are additionally held to allocator-enforced VRAM quotas on CUDA hosts: the
 dedicated post-processing lane and the on-GPU safety process cap their own caching allocators. The parent
@@ -424,10 +445,141 @@ retention outright while active and triggers one under-pressure sweep of idle re
 rising edge. The telemetry is WDDM-level and vendor-neutral; on Linux, or any host where the counters
 are unavailable, the monitor simply collects nothing and the verdict stays off.
 
+### The truthful signal hierarchy and the device-free governor
+
+Not every "free VRAM" number is the same number, and under WDDM they disagree exactly when it matters.
+The per-process view (`mem_get_info` inside a child, or the per-PID shared-segment counters above) is
+unreliable near the ceiling: the driver demotes the *least-recently-touched* allocator to system memory,
+so the process that goes slow and the process whose memory was demoted are usually **different** process
+ids, and the per-PID shared magnitude read for a given process varies run to run for the same physical
+state. The one figure that stays truthful throughout is the **NVML device-level** used/free total, read
+from the torch-free parent (outside any CUDA workload). Throughput does not degrade gradually as that
+figure falls; it falls off a hard cliff the instant device-free reaches roughly zero, then plateaus, so
+the depth of an over-commit past saturation barely matters. The whole defense is therefore to keep
+device-free from ever reaching zero.
+
+The **device-free governor** turns that one truthful figure into a small hysteretic state machine, sampled
+once per monitor tick per card:
+
+- **HEALTHY** — device-free is above the *soft floor* (`max(1024MB, 2x` the proportional admission noise
+  buffer`)`); nothing to do.
+- **PRESSURE** — device-free is below the soft floor. The scheduler **holds new VRAM growth**: no new model
+  is brought to VRAM on a process that does not already hold it, no safety process is restored to the GPU,
+  and no paused lane is restarted. Work already sampling is left alone, because it is not the active sampler
+  the driver demotes. Held preloads simply re-ask on later cycles and proceed once the card recovers.
+- **SATURATED** — device-free is below the *hard floor* (`max(256MB, 0.5x` the noise buffer`)`). The card is
+  at or past the cliff, so a reclaim pass runs immediately on the same tick.
+
+The floors scale with card capacity through the same proportional noise buffer admission uses, so a large
+card keeps proportional headroom and a small card is never starved below an absolute floor. State changes
+are debounced over two consecutive samples: NVML is stable, but the confirm removes any chance a lone
+transient (an allocator mid-materialisation, a foreign app's momentary spike) flips the state, at a cost of
+one tick of latency. The governor's latest device-free reading and its PRESSURE/SATURATED transition counts
+are surfaced on the run-metrics snapshot (`device_free_mb`, `governor_pressure_events`,
+`governor_saturation_events`), and its committed per-card state is carried into the VRAM arbiter's device
+snapshot so admission can see the same truth. On any host without NVML the free read returns nothing and no
+card is ever governed.
+
+### The verified LIFO reclaim ladder
+
+When the governor calls a card SATURATED, a single parent-side engine owns the reclaim so there are never
+two mechanisms evicting the same card by different rules. It differs from a naive "unload something" in two
+ways that the WDDM physics demand.
+
+It reclaims **LIFO** (most-recently-materialized tenant first). The driver demotes the least-recently-touched
+allocator, so the newest idle resident is both the likeliest squatter and the cheapest to give back (its
+weights are still warm in RAM). The rung order is fixed: unload the newest idle resident model, then release
+the reclaimable allocator caches on idle processes (reserved-minus-allocated at or above the release
+threshold), then evict the older idle residents, then pause the post-processing, VAE, and component lanes in
+turn, then move safety off the GPU. An **actively-sampling process is never a rung**: it is the one process
+the driver did not demote, and tearing it down would trade a slow job for a faulted one. Both the candidate
+assembly and the targeted unload refuse a busy process, so immunity holds at two layers.
+
+It **verifies**. A real release shows up in NVML device-used within a sample or two, so after issuing a rung
+the engine watches the next one or two governor samples and compares the realized device-free gain against
+the rung's promised figure (the tenant's measured reservation). A rung that yields less than half its promise
+is logged against the tenant it named, recorded as a calibration event, and the engine escalates to the next
+rung rather than trusting the estimate. One rung is issued per tick; a rung whose target has already gone
+away frees nothing and is skipped immediately. When the whole ladder is exhausted and the card is still
+SATURATED, the episode is marked **unresolved**: nothing the worker can give back relieved the card, the
+signal a later, harder rung reads. The rung count, cumulative verified frees, and shortfall count are
+surfaced on the run-metrics snapshot (`ladder_rungs_issued`, `ladder_verified_frees_mb`,
+`ladder_verification_shortfalls`). The arbiter's deferred-preload actuations run through this same engine, so
+the governor's SATURATED ladder and the arbiter's per-cycle DEFER ladder share one reclaim execution surface.
+
+The verification window is **wider for teardown-class rungs**. A model unload or cache release frees its memory
+synchronously as the actuator returns, but a lane pause and a safety off-GPU cycle free their memory only once
+the *process has exited*, which takes longer than one governor sample: a lane pause has been measured returning
+almost none of its promised context one sample later, then the full figure a sample or two after that. Teardown
+rungs are therefore given one extra verification sample before a shortfall is declared, so the engine does not
+falsely grade a pause that is still tearing down as short and escalate past a rung that is in fact working.
+
+It also **restores what it paused**. A paused lane, unlike safety, has no independent mechanism to bring it
+back (the runtime safety-placement policy re-promotes safety on its own; a lane stays down until something
+restarts it). Each lane pause is therefore tagged with an **owner** so the whole-card residency and the reclaim
+ladder can never clear each other's hold: the residency's completion loop restores only residency-owned pauses,
+and the ladder restores only ladder-owned pauses. When a card's saturation episode ends and it returns fully
+**HEALTHY** (the pauses are held through the intermediate PRESSURE band, since restarting a lane's CUDA context
+while the card is still tight would risk re-crossing the cliff), the ladder **unwinds** its own pauses in
+reverse rung order (LIFO): the last lane stopped is the first restarted. Safety is excluded from the unwind on
+purpose, because the placement policy already owns its restore.
+
+That ownership closes a liveness gap. Pending post-processing work behind an off-GPU lane suppresses its
+patience clock only for a **residency-owned** pause, which has a bounded, self-restoring hold. A **ladder-owned**
+pause offers no such guarantee (a card stuck saturated may never recover to HEALTHY, so the lane may never come
+back), so a job stranded behind one runs the normal admission-patience countdown and, if the lane has not
+returned within the window, takes the existing raw-image fallback (faulted without images so the horde reissues
+it) rather than sitting in `PENDING_POST_PROCESSING` forever and wedging the drain.
+
+### The per-step floor: fast crawl detection
+
+The whole-job elapsed-ratio [grading](#performance-model-scoring) is slow to fire: a job only reaches its
+WARN rung once its *total* elapsed sampling time is a large multiple of expected, which for a long job is
+minutes. The per-step floor detects a crawl within seconds instead. On each `INFERENCE_STEP` heartbeat the
+parent compares the slot's observed per-step time (the interval since its previous beat) against its expected
+per-step time (the performance model's expected sampling seconds divided by the job's payload steps, with
+every division guarded and the detector skipping rather than guessing when a term is missing). A demand-paged
+step runs at system-memory bandwidth, measured at 3x-13x its healthy pace with nothing between on the
+reference card, while a legitimately heavy job crawls uniformly near its own expected pace; three times
+expected cleanly separates them. Two consecutive steps at or above that floor, with the card's governor at
+PRESSURE or SATURATED, mark the slot crawling and force the reclaim ladder to run this cycle without waiting
+for the elapsed-ratio rungs. The first step of a job is skipped (its inter-beat gap includes the one-time
+cold load/encode work), and a single step back at healthy pace clears the crawl, so a slot that recovers in
+place the instant a squatter frees is no longer flagged. The trigger count is surfaced on the run-metrics
+snapshot (`per_step_floor_triggers`); the elapsed-ratio grade stays as telemetry alongside it.
+
+### The kill as the last reclaim rung
+
+The hung-process watchdog reaps a slot on **heartbeat silence**: a job that stops emitting progress past its
+step timeout is torn down and requeued. That detector is blind to a specific, expensive failure. When the
+driver demotes a sampling process's VRAM to system memory, the job does not go silent: it keeps emitting
+steps, each one crawling at system-memory bandwidth. Every step refreshes the heartbeat, so the silence
+timeout never trips, and the card is effectively lost for minutes while the job limps to completion.
+
+Replacing that slot is the **terminal rung of the reclaim ladder**, reached only after every softer rung has
+failed, and it gates on device-level truth rather than per-PID attribution. Three conditions must all hold:
+the card has been continuously SATURATED (device-free below the hard floor) for at least the kill horizon;
+the verified reclaim ladder has exhausted itself on that card without relieving it (its idle-model unloads,
+cache releases, lane pauses, and safety off-GPU all ran and the card is still over the cliff); and the slot
+is crawling (its per-step floor tripped, or its whole-job elapsed grade reached WARN). Only then is the
+crawling sampler the last thing left to give the card back.
+
+The per-PID PDH paging-victim map is deliberately **not** a gate here. The measured LRU physics make it
+structurally unsatisfiable: WDDM demotes the least-recently-touched allocator, so the process that goes slow
+(the active sampler) and the process whose shared memory grows (the idle squatter) are usually different
+pids. Requiring the slow slot's own pid to appear in the victim set almost never held. The map is retained
+only as a logging hint. The killed job faults as a **resource** failure, so it earns the single degraded,
+isolated retry that clears the card for it rather than a plain re-dispatch onto another over-committed slot.
+The crawl signals reset at the next job boundary, so each job is acted on at most once. The count of such
+last-rung replacements is surfaced on the run-metrics snapshot (`paging_victim_replacements`, the counter's
+name retained), alongside the in-flight WARN-slow grading count (`job_slowdown_events`). This is a
+Windows/WDDM path: where NVML device-free is unavailable no card is governed, so the SATURATION gate never
+holds and the kill never fires.
+
 When granted, the dispatch carries a "keep resident after" hint to the engine, which skips the post-job
 VRAM cleanup so the following same-model job samples immediately with no reload. Retention is granted on
-evidence, never assumed: a disabled budget or unmeasured VRAM falls back to eviction, and even a granted
-retention is a soft hold. The engine's force-load overflow guard and the worker's under-pressure
+evidence, never assumed: a disabled budget, an unreported card total, or a card the governor has not
+graded `HEALTHY` all fall back to eviction, and even a granted retention is a soft hold. The engine's force-load overflow guard and the worker's under-pressure
 reclaim can still evict it, so a wrong call degrades to a reload rather than an out-of-memory. This is the
 mechanism that lets a sticky or homogeneous workload realise back-to-back sampling on its hot model
 without paying the [structural reload](duty-cycle.md#the-structural-ceiling-on-vram-constrained-cards)
@@ -589,10 +741,22 @@ overhead probing is a hordelib-side follow-up.)
 > cost), so feeding it back would over-throttle a multi-model worker. A true
 > marginal per-job measurement is a hordelib-side follow-up.
 
-To keep measurements fresh, inference processes emit an interval-driven memory
+To keep measurements fresh, GPU-bearing processes emit an interval-driven memory
 report (every `_memory_report_interval`, 5 s) in addition to the event-driven
 reports at model load/unload, and a dead process's stale VRAM figure is cleared on
-recovery so it cannot be counted as either used or free.
+recovery so it cannot be counted as either used or free. That interval report runs
+on a dedicated reporter thread, not the main loop: the main loop is blocked for the
+entire duration of a GPU operation (a 20-150 s sample), so a main-loop report would
+only ever be an idle-boundary snapshot taken after post-job cleanup, with the
+multi-GB mid-job working set systematically invisible. The thread reads only
+allocator/`mem_get_info` statistics (safe cross-thread once the device context is
+initialised) and never touches compute state; it withholds the VRAM read until the
+main thread has initialised the device, so it never triggers a device init off the
+main thread. Each report carries the wall-clock instant it was sampled, and the
+attribution reconciler treats a contributor whose report has aged past a staleness
+bound (3x the report interval) as an UNKNOWN, incomparable tenant: it skips the
+drift computation for that card rather than raising a false alarm or a false
+all-clear against a ledger it can no longer trust.
 
 ### Per-context overhead and the effective idle floor
 
