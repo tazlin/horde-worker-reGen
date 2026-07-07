@@ -367,8 +367,8 @@ def _maintenance_detail(
         )
     if snapshot.self_throttle_paused:
         return (
-            "The worker paused itself: too many resource/OOM faults recently, so it backed off to avoid the "
-            "horde forcing maintenance. It will resume automatically after a cooldown. In-flight jobs finish."
+            "The worker paused itself: to avoid using too many system resources. It will resume popping "
+            "automatically once jobs make some progress."
         )
     return "Not popping new jobs (locally paused). In-flight jobs will finish."
 
