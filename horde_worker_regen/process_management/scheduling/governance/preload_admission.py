@@ -213,16 +213,21 @@ def card_preload_order(
     *,
     cards_already_serving_model: set[int],
     card_busy_counts: Mapping[int, int],
+    card_free_vram_mb: Mapping[int, float | None] | None = None,
 ) -> list[int]:
     """Return the eligible cards in placement preference order for a fresh model load.
 
     The same sticky-then-least-loaded policy dispatch uses: a card already holding this model first
-    (avoid a duplicate copy), then the card running the fewest inference jobs (balance fresh loads).
+    (avoid a duplicate copy), then the card running the fewest inference jobs (balance fresh loads). When
+    those are tied, prefer the card with the largest measured free VRAM so a safety/post-processing context on
+    one otherwise-idle card does not attract a preload that another otherwise-equal card could admit.
     """
 
-    def _placement_key(device_index: int) -> tuple[int, int]:
+    def _placement_key(device_index: int) -> tuple[int, int, float, int]:
         already_serves = 0 if device_index in cards_already_serving_model else 1
-        return (already_serves, card_busy_counts.get(device_index, 0))
+        free_vram_mb = card_free_vram_mb.get(device_index) if card_free_vram_mb is not None else None
+        free_vram_rank = -free_vram_mb if free_vram_mb is not None else float("inf")
+        return (already_serves, card_busy_counts.get(device_index, 0), free_vram_rank, device_index)
 
     return sorted(eligible_card_indices, key=_placement_key)
 

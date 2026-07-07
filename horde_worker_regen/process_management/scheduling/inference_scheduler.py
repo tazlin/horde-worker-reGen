@@ -5428,6 +5428,9 @@ class InferenceScheduler:
             eligible,
             cards_already_serving_model=cards_already_serving_model,
             card_busy_counts={device_index: self._card_inference_load(device_index) for device_index in eligible},
+            card_free_vram_mb={
+                device_index: self._measured_free_vram_mb(device_index=device_index) for device_index in eligible
+            },
         )
         for device_index in placement_order:
             candidate = self._process_map.get_first_available_inference_process(

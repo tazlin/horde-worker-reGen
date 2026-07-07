@@ -130,7 +130,9 @@ the judgment calls live as pure functions in
    deliberately overrides them while still never displacing live work.
 2. **Placement**: on a multi-GPU host, which card receives a fresh load
    ([`card_preload_order`][horde_worker_regen.process_management.scheduling.governance.preload_admission.card_preload_order]:
-   a card already serving the model first, then the least-loaded card).
+   a card already serving the model first, then the least-loaded card, then the card with the most measured
+   free VRAM). The final tie-break keeps an otherwise-idle card that is carrying safety or post-processing
+   context from winning a preload that another equally idle card can seat with more headroom.
 3. **Load serialization**: whether another checkpoint may load on this device right now
    ([`preload_concurrency_blocked`][horde_worker_regen.process_management.scheduling.governance.preload_admission.preload_concurrency_blocked]).
 4. **Budget verdicts**: VRAM admission is owned by

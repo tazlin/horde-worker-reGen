@@ -138,7 +138,7 @@ class TestHeadRoomSelection:
 
 
 class TestCardPreloadOrder:
-    """A fresh load goes to a card already serving the model, then the least-loaded card."""
+    """A fresh load goes to a sticky card, then the least-loaded, roomiest card."""
 
     def test_serving_card_first_then_least_loaded(self) -> None:
         """The sticky-then-least-loaded placement policy."""
@@ -148,6 +148,16 @@ class TestCardPreloadOrder:
             card_busy_counts={0: 1, 1: 0, 2: 2},
         )
         assert order == [2, 1, 0]
+
+    def test_measured_free_vram_breaks_equal_load_ties(self) -> None:
+        """When cards are equally loaded, prefer the card with more measured free VRAM."""
+        order = card_preload_order(
+            {0, 1},
+            cards_already_serving_model=set(),
+            card_busy_counts={0: 0, 1: 0},
+            card_free_vram_mb={0: 5224.0, 1: 7934.0},
+        )
+        assert order == [1, 0]
 
 
 class TestRamReclaimOutcome:

@@ -148,11 +148,11 @@ governance is driven separately, every control-loop iteration via `run_governanc
 depend on this queue-gated cycle running; see
 [Resource governance](resource_governance.md#the-governor-tick).) One cycle:
 
-1. **`preload_models()`**: for the first pending job whose model isn't loaded anywhere, pick an
-   available process (`ProcessMap.get_first_available_inference_process`), send `PRELOAD_MODEL`, mark
-   the model `LOADING` in `HordeModelMap`. The preload is subject to the [VRAM and RAM
-   budget](performance_and_backpressure.md#the-vram-and-ram-budget); concurrent-preload limits differ
-   under `very_fast_disk_mode`.
+1. **`preload_models()`**: for the first pending job whose model is not already loading or resident, pick an
+   available inference process, send `PRELOAD_MODEL`, and mark the model `LOADING` in `HordeModelMap`. On a
+   multi-GPU host the target card is chosen by model stickiness, per-card inference load, and measured free
+   VRAM. The preload is subject to the [VRAM and RAM budget](performance_and_backpressure.md#the-vram-and-ram-budget);
+   concurrent-preload limits differ under `very_fast_disk_mode`.
 2. **Look-ahead**: `get_next_job_and_process(information_only=True)` peeks at the next runnable job to
    decide heavy-model/batch blocking. This method is called _twice_ per cycle (peek, then launch) and
    must agree with itself; line-skip decisions (a small job jumping ahead of one blocked on a LoRA

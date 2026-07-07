@@ -203,6 +203,20 @@ def _empty_slot(process_id: int, *, device_index: int) -> Mock:
     )
 
 
+def _empty_slot_with_vram(
+    process_id: int,
+    *,
+    device_index: int,
+    total_vram_mb: int,
+    vram_usage_mb: int,
+) -> Mock:
+    """An idle inference process with a recent device-free VRAM report."""
+    process = _empty_slot(process_id, device_index=device_index)
+    process.total_vram_mb = total_vram_mb
+    process.vram_usage_mb = vram_usage_mb
+    return process
+
+
 class TestPreloadCardPlacement:
     """A5.4: a fresh preload picks which eligible card to load onto (sticky, then least-loaded)."""
 
@@ -253,6 +267,25 @@ class TestPreloadCardPlacement:
         chosen = scheduler._select_preload_process(job, [])
         assert chosen is not None
         assert chosen.device_index == 0
+
+    def test_equal_load_prefers_card_with_more_measured_free_vram(self) -> None:
+        """A safety/post-process context on card 0 should not attract a tied fresh preload."""
+        process_map = ProcessMap(
+            {
+                1: _empty_slot_with_vram(1, device_index=0, total_vram_mb=7786, vram_usage_mb=2564),
+                2: _empty_slot_with_vram(2, device_index=1, total_vram_mb=8107, vram_usage_mb=173),
+            },
+        )
+        scheduler = _make_scheduler(
+            process_map=process_map,
+            card_runtimes=_two_cards(card0_max_pixels=5_000_000, card1_max_pixels=5_000_000),
+        )
+        job = make_job_pop_response(model="stable_diffusion", width=512, height=512)
+
+        chosen = scheduler._select_preload_process(job, [])
+
+        assert chosen is not None
+        assert chosen.device_index == 1
 
     def test_never_places_on_an_ineligible_card(self) -> None:
         """A card whose resolution limit excludes the job is never chosen, even when it is the only idle one."""
