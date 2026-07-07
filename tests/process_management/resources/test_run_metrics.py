@@ -216,12 +216,16 @@ class TestAggregates:
         snapshot = metrics.snapshot(
             num_process_recoveries=1,
             num_job_slowdowns=2,
+            job_slowdown_events=4,
+            paging_victim_replacements=3,
             time_spent_no_jobs_available=3.5,
             disk_min_free_bytes={"C:/": 123},
         )
         assert snapshot.process_crash_events[0].process_id == 1
         assert snapshot.num_process_recoveries == 1
         assert snapshot.num_job_slowdowns == 2
+        assert snapshot.job_slowdown_events == 4
+        assert snapshot.paging_victim_replacements == 3
         assert snapshot.time_spent_no_jobs_available == 3.5
         assert snapshot.disk_min_free_bytes == {"C:/": 123}
 

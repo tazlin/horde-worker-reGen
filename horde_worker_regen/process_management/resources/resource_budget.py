@@ -20,6 +20,7 @@ which already gates graph-alchemy forms the same way.
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -28,6 +29,8 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from hordelib.feature_impact import FEATURE_KIND, BurdenEstimate
 
     from horde_worker_regen.bridge_data.data_model import reGenBridgeData
@@ -138,6 +141,70 @@ design: an SDXL checkpoint (~5GB) is well under this fraction of a 24GB card (co
 small card (where it genuinely contends), which is exactly when a teardown is and is not appropriate."""
 
 
+_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB = 384.0
+"""Conservative per-additional-context marginal VRAM (MB) seeded when no measurement is available.
+
+The device VRAM a torch/CUDA process holds decomposes into four terms that must be accounted separately:
+
+1. device baseline: OS/desktop/other applications' VRAM, shared, attributable to no worker process;
+2. per-process marginal fixed overhead: the CUDA context plus import-time allocations (~200-300MB on a
+   24GB CUDA card), which persists after a model unloads and is reclaimed only by the process exiting;
+3. unloadable model weights; and
+4. transient per-job activation peaks.
+
+Only term (2) is what an *additional* sibling context costs. The one-time, device-wide CUDA runtime
+allocation is paid once by the first/sole context and shared, so it must never be re-charged per extra
+context. When neither the startup probe nor a clean idle-residency reading has measured the marginal,
+the forecast seeds it with this constant rather than reusing ``per_process_overhead_mb`` (the
+first/sole-context figure, roughly 1300MB, which bundles the device baseline and the one-time runtime
+and would therefore double-count the baseline against every extra context, manufacturing a multi-GB
+phantom shortfall that wedges high-VRAM workers). The value is set deliberately a little above the
+measured range (roughly 200-300MB) so an unmeasured host errs toward reserving slightly more than one
+extra context truly needs, never less. ``per_process_overhead_mb`` is still charged exactly once per
+device (it sizes ``free_if_alone``); this seed only ever prices the *additional* contexts."""
+
+
+_WIN32_CONTEXT_CONSTANT_MB = 243.0
+"""Fixed CUDA-context VRAM (MB) a torch process holds on Windows/WDDM, excluding its allocator reservation.
+
+Established by a cross-platform probe (std 0, fork vs spawn identical): a child's device footprint is exactly
+``context_constant + torch.cuda.memory_reserved()``. Used as the per-process context charge in the committed-
+VRAM ledger when no measured marginal is available. Windows reads higher than Linux (WDDM's driver model)."""
+
+_LINUX_CONTEXT_CONSTANT_MB = 144.0
+"""Fixed CUDA-context VRAM (MB) a torch process holds on native Linux, excluding its allocator reservation.
+
+The Linux counterpart to :data:`_WIN32_CONTEXT_CONSTANT_MB`, established by the same probe (std 0)."""
+
+
+def platform_context_constant_mb(
+    measured_marginal_mb: float | None = None,
+    *,
+    platform: str | None = None,
+) -> float:
+    """Return the per-process CUDA-context VRAM charge (MB) for the committed-VRAM ledger.
+
+    Resolution order: a *measured* per-additional-context marginal (the probe's second-context delta or the
+    idle-residency derivation, resolved by :class:`ContextOverheadModel`) wins when available (> 0); otherwise
+    the platform-specific probed seed (:data:`_WIN32_CONTEXT_CONSTANT_MB` on Windows,
+    :data:`_LINUX_CONTEXT_CONSTANT_MB` on Linux); otherwise the generic
+    :data:`_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB` for an unknown platform. This is the context term the ledger
+    adds to each live GPU process's ``process_reserved_mb`` to get its full device footprint.
+
+    Args:
+        measured_marginal_mb: A measured per-additional-context marginal (MB), or None/<=0 when unmeasured.
+        platform: The platform string to resolve seeds against; defaults to :data:`sys.platform`.
+    """
+    if measured_marginal_mb is not None and measured_marginal_mb > 0:
+        return float(measured_marginal_mb)
+    resolved_platform = sys.platform if platform is None else platform
+    if resolved_platform == "win32":
+        return _WIN32_CONTEXT_CONSTANT_MB
+    if resolved_platform.startswith("linux"):
+        return _LINUX_CONTEXT_CONSTANT_MB
+    return _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
+
+
 _CORESIDENT_SIBLING_MODEL_FLOOR_MB = 5000.0
 """Free VRAM (MB), beyond a model's own weights + bounded floor at sole residency, that must remain for the
 card to count as having room for *another full model* to co-reside. Sized to a representative full checkpoint
@@ -213,8 +280,10 @@ class StreamForecast:
     Sizes ``free_after_model_evict`` (and the partial-teardown depth) as ``per_process_overhead + (contexts-1)
     * marginal`` rather than ``contexts * per_process_overhead``. The latter multiplies the one-time runtime
     cost by the process count, manufacturing a multi-GB phantom shortfall that flips a co-residable model into
-    falsely demanding sibling-process teardown. None (or a non-positive value) falls back to
-    ``per_process_overhead_mb`` so a directly-constructed forecast keeps its prior, conservative behavior."""
+    falsely demanding sibling-process teardown. None (or a non-positive value) falls back to the seeded
+    :data:`_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB` (a conservative bound on one additional context, well below
+    the first-context overhead), so an unmeasured host never re-charges the one-time runtime cost per extra
+    context."""
     wants_whole_card: bool = False
     """The baseline is declared to want sole residency regardless of how its weight estimate happens to fit.
 
@@ -257,16 +326,20 @@ class StreamForecast:
 
     @property
     def _effective_marginal_overhead_mb(self) -> float:
-        """The per-additional-context VRAM cost, falling back to the (larger) first-context overhead when unset.
+        """The per-additional-context VRAM cost, seeding a conservative constant when none was measured.
 
-        Defaulting to ``per_process_overhead_mb`` reproduces the prior ``contexts * per_process_overhead``
-        sizing exactly, so a directly-constructed forecast that does not supply a marginal keeps its old,
-        conservative behavior.
+        A measured marginal (the probe's second-context delta or the idle-floor derivation, resolved
+        upstream and passed in as ``marginal_process_overhead_mb``) wins. When none was measured the
+        fallback is the seeded :data:`_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB`, NOT ``per_process_overhead_mb``:
+        the first/sole-context figure bundles the device baseline and the one-time CUDA runtime, so charging
+        it per additional context double-counts the baseline and over-states the contexts' combined cost.
+        ``per_process_overhead_mb`` is charged once per device (it sizes ``free_if_alone``); every additional
+        context is priced by this marginal.
         """
         marginal = self.marginal_process_overhead_mb
         if marginal is not None and marginal > 0:
             return marginal
-        return self.per_process_overhead_mb
+        return _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
 
     def _fits(self, free_mb: float | None, reserve_mb: float) -> bool:
         """Whether the weights plus ``reserve_mb`` fit within ``free_mb`` (None capacity admits)."""
@@ -436,7 +509,7 @@ class StreamForecast:
         (and therefore
         ``needs_exclusive_residency`` / ``requires_sibling_teardown``) miss it: their self-plus-one-sibling
         ceiling judges the moderate weights "not card-filling", so no teardown is triggered and the head is
-        deferred until the starvation backstop force-admits it into an OOM.
+        deferred until the old starvation backstop admitted it into an OOM.
 
         Keyed on the *bounded weight* footprint (``_fits_weights``), not the activation-inclusive peak, so a
         transient activation spike whose weights still fit after model eviction is left co-resident rather than
@@ -478,7 +551,7 @@ class StreamForecast:
 
     @property
     def admit_requires_isolation(self) -> bool:
-        """Whether a best-effort over-budget admit of this model must run with the device to itself.
+        """Whether an over-budget classified admit of this model must run with the device to itself.
 
         Isolation protects a heavy checkpoint from a concurrent sibling load pushing its weights into
         host-RAM streaming; that hazard needs both a footprint that dominates the card
@@ -710,6 +783,8 @@ def forecast_weight_streaming(
     committed_reserve_mb: float = 0.0,
     marginal_process_overhead_mb: float | None = None,
     wants_whole_card: bool = False,
+    disaggregated: bool = False,
+    disaggregation_sibling_charge_mb: float = 0.0,
 ) -> StreamForecast:
     """Return a :class:`StreamForecast` for loading ``job``'s model given the device's measured state.
 
@@ -726,11 +801,12 @@ def forecast_weight_streaming(
     ``per_process_overhead_mb`` is the cost of the *first/sole* context (the one-time, device-wide CUDA
     runtime/kernel allocation plus one context), the figure a single fresh process measures. Every *additional*
     sibling context costs only ``marginal_process_overhead_mb`` because the runtime is loaded once per device
-    and shared. Sizing ``free_after_model_evict`` as ``contexts * per_process_overhead`` (the old behavior,
-    preserved when ``marginal`` is None) multiplies that one-time cost by the process count and manufactures a
-    multi-GB phantom shortfall, which flips a co-residable model into falsely demanding a sibling-process
-    teardown. ``free_if_alone`` keeps the full first-context overhead (the surviving process still pays the
-    one-time cost).
+    and shared. Sizing ``free_after_model_evict`` as ``contexts * per_process_overhead`` multiplies that
+    one-time cost by the process count and manufactures a multi-GB phantom shortfall, which flips a
+    co-residable model into falsely demanding a sibling-process teardown. When the marginal was not measured,
+    the seeded :data:`_SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB` prices the additional contexts (a conservative
+    bound well below the first-context cost), never the full overhead. ``free_if_alone`` keeps the full
+    first-context overhead (the surviving process still pays the one-time cost).
 
     ``num_extra_resident_contexts`` is the count of *non-inference* processes that also hold a CUDA context
     on the card (the safety process when ``safety_on_gpu`` is set). Their contexts are real device-wide
@@ -742,9 +818,27 @@ def forecast_weight_streaming(
     ``EXTRA_LARGE`` tier: Cascade/Flux/Qwen/Z-Image), so a conservative weight seed that happens to fit
     co-resident does not stop it claiming the card. It only biases the residency verdict; ``fits_alone`` still
     governs whether sole residency is even achievable. Never raises.
+
+    ``disaggregated`` marks a job that runs on the pipeline-disaggregation path: its sampler process holds
+    only the UNet (core diffusion weights plus sampling activation), not the support weights or the VAE
+    decode spike the whole-job estimate bakes in. Both the persistent-footprint and activation-inclusive
+    charges then key on :func:`predict_job_sampler_only_vram_mb` (the ~6.6GB SDXL sampler figure that keeps
+    two samplers co-resident on a 16GB card, where the ~16GB whole-job charge collapses them to one).
+    ``disaggregation_sibling_charge_mb`` is the image lane's concurrent VAE-decode spike (the caller passes
+    :func:`effective_post_process_vram_quota_mb`), charged against the siblings-present achievable-free
+    figure so a second sampler is not admitted into VRAM the lane's decode is about to claim.
     """
-    weights_mb = predict_job_weight_mb(job, baseline)
-    footprint_mb = predict_job_footprint_mb(job, baseline)
+    if disaggregated:
+        # The sampler holds only the UNet: core weights plus sampling activation, with the text encoders,
+        # VAE, and decode spike running in the encode service and image lane. That combined sampler figure
+        # is the persistent footprint AND the peak here, so it drives both the weight-fit and co-resident
+        # tests without the whole-job support/decode weight that would collapse two samplers into one.
+        sampler_charge_mb = predict_job_sampler_only_vram_mb(job, baseline)
+        weights_mb = sampler_charge_mb
+        footprint_mb = sampler_charge_mb
+    else:
+        weights_mb = predict_job_weight_mb(job, baseline)
+        footprint_mb = predict_job_footprint_mb(job, baseline)
     # The weight-fit floor is ComfyUI's *own* streaming threshold (``minimum_inference_memory``), NOT the
     # operator's configured ``vram_reserve_mb``. That configured figure is a sampling / co-residency safety
     # margin (how much headroom to keep free while a model samples beside siblings), not a statement about
@@ -774,7 +868,10 @@ def forecast_weight_streaming(
     # moderate model (an SDXL job that merely requests a 4x upscaler) into falsely reading as weight-dominant
     # and claiming the whole card. Post-processing runs on the dedicated lane, whose resident context is
     # charged via ``num_extra_resident_contexts``.
-    peak_mb = predict_job_sampling_vram_mb(job, baseline)
+    # A disaggregated sampler's activation is already folded into its sampler-only charge (the peak is that
+    # charge), so the whole-job sampling peak is not read for it: doing so would re-add the support/decode
+    # activation the sampler process never holds.
+    peak_mb = weights_mb if disaggregated else predict_job_sampling_vram_mb(job, baseline)
     activation_working_set_mb = 0.0
     if peak_mb is not None and weights_mb is not None:
         activation_working_set_mb = max(0.0, peak_mb - weights_mb)
@@ -787,10 +884,13 @@ def forecast_weight_streaming(
     # it is the co-residency headroom the operator wants preserved while a model samples beside siblings.
     reserve_mb = max(base_reserve_mb, activation_working_set_mb, configured_floor_mb) + max(0.0, committed_reserve_mb)
     overhead = max(0.0, per_process_overhead_mb)
-    # The first context pays the one-time CUDA runtime cost; each additional context costs only the marginal.
-    # Default the marginal to the full overhead so an unsupplied marginal reproduces the old contexts*overhead.
+    # The first context pays the one-time, device-wide CUDA runtime cost; each additional context costs only
+    # the marginal. When the marginal was not measured (probe or idle-floor both absent upstream), seed it
+    # with the conservative per-additional-context constant rather than the full first-context overhead: the
+    # latter re-charges the one-time runtime and the device baseline against every extra context, a phantom
+    # multi-GB shortfall. ``overhead`` is still charged once (it sizes free_if_alone below).
     marginal = (
-        overhead
+        _SEEDED_MARGINAL_CONTEXT_OVERHEAD_MB
         if marginal_process_overhead_mb is None or marginal_process_overhead_mb <= 0
         else float(
             marginal_process_overhead_mb,
@@ -811,7 +911,15 @@ def forecast_weight_streaming(
         # process's context costs the full first-context overhead (it pays the shared one-time runtime cost);
         # every other inference and safety context costs only the marginal.
         additional_contexts = (process_count - 1) + extra_contexts
-        free_after_model_evict_mb = max(0.0, float(total_vram_mb) - overhead - marginal * additional_contexts)
+        # Under disaggregation the image lane VAE-decodes the previous job while this one samples, so its
+        # decode spike is a real, concurrent device commitment idle inference siblings cannot reclaim. Charge
+        # it here (against the siblings-present figure the co-resident test reads) so a second sampler is not
+        # admitted into VRAM the lane's decode is about to take. Left at 0 off the disaggregation path.
+        lane_spike_mb = max(0.0, disaggregation_sibling_charge_mb) if disaggregated else 0.0
+        free_after_model_evict_mb = max(
+            0.0,
+            float(total_vram_mb) - overhead - marginal * additional_contexts - lane_spike_mb,
+        )
     return StreamForecast(
         weights_mb=weights_mb,
         footprint_mb=footprint_mb,
@@ -938,6 +1046,53 @@ def predict_job_sampling_vram_mb(job: ImageGenerateJobPopResponse, baseline: str
     return max(candidates) if candidates else None
 
 
+def predict_job_sampler_only_vram_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
+    """Return a job's predicted VRAM (MB) for a UNet-only (disaggregated) sampler process, or None.
+
+    Under pipeline disaggregation the text encoders and VAE run in other processes, so a sampler holds
+    only the core diffusion weights plus sampling activation, not the support weights or the decode spike
+    baked into the whole-job ``vram_sampling_mb``. This charges ``BurdenEstimate.vram_sampler_only_mb``,
+    which is what keeps two disaggregated samplers co-resident where the whole-job charge collapses them
+    (measured: an SDXL sampler pins ~6.6GB, two fit a 16GB card; a whole SDXL job pins ~16GB, two do not).
+
+    Falls back to the whole-job sampling figure when the pinned hordelib predates the split (never below
+    the full charge), so an older engine keeps its conservative behavior. Never raises.
+    """
+    burden = _estimate_job_burden(job, baseline)
+    if burden is None:
+        return _baseline_load_peak_mb(baseline)
+    sampler_only_mb = getattr(burden, "vram_sampler_only_mb", 0) or 0
+    if sampler_only_mb <= 0:
+        # Older hordelib without the disaggregation split: fall back to the whole-job sampling charge.
+        return predict_job_sampling_vram_mb(job, baseline)
+    return float(sampler_only_mb)
+
+
+def predict_job_decode_spike_mb(job: ImageGenerateJobPopResponse, baseline: str | None) -> float | None:
+    """Return the disaggregated image lane's VAE tiled-decode activation spike (MB), or None when unavailable.
+
+    Under pipeline disaggregation the image lane VAE-decodes the previous job's latent while a sampler runs,
+    so the coresidency verdict must reserve that *bounded* concurrent decode activation, not the lane's whole
+    allocator-guard quota. Charging the full quota (up to ~8GB on a 16GB card) against coresidency denies a
+    second sampler the card physically holds: two SDXL samplers (~6.2GB each) plus a ~2.5GB decode spike were
+    measured co-resident at ~14.9GB, whereas two samplers plus the ~8GB quota over-commit the card and
+    collapse the pipeline back to one sampler, which is exactly the collapse disaggregation exists to prevent.
+
+    Sourced from ``BurdenEstimate.vram_decode_spike_mb`` via the same access idiom as
+    :func:`predict_job_sampler_only_vram_mb` reads ``vram_sampler_only_mb`` (``getattr`` with a default, so a
+    pinned hordelib that predates the field stays statically analyzable and does not fault). Returns None when
+    the field is absent or non-positive, so the caller falls back to the conservative full-quota lane charge:
+    an older engine is then safe, just not optimally packed. Never raises.
+    """
+    burden = _estimate_job_burden(job, baseline)
+    if burden is None:
+        return None
+    decode_spike_mb = getattr(burden, "vram_decode_spike_mb", None)
+    if decode_spike_mb is None or decode_spike_mb <= 0:
+        return None
+    return float(decode_spike_mb)
+
+
 def _baseline_load_peak_mb(baseline: str | None) -> float | None:
     """Return hordelib's recommended-VRAM load peak (MB) for ``baseline``, or None when unavailable.
 
@@ -1020,6 +1175,32 @@ def _estimate_job_burden(job: ImageGenerateJobPopResponse, baseline: str | None)
         return None
 
 
+@dataclass
+class _PlannedReserve:
+    """A planned (admitted, not-yet-materialised) VRAM charge that decays as its target's reservation fills.
+
+    Held separately from the ledger's flat committed entries because it carries the extra state the
+    double-count guard needs: which process the charge will land on, that process's measured allocator
+    reservation at admit time, and a high-water mark of the growth observed since, so the outstanding planned
+    share can be computed against the target's current reservation (see
+    :meth:`CommittedReserveLedger.effective_planned_vram_mb`).
+
+    Consumption is monotonic: the outstanding share is measured against the greatest reserved-growth ever
+    seen for this entry, never the instantaneous growth. Once the load has materialised, a later collapse of
+    the target's reservation (an eviction that frees the VRAM back to the card) cannot resurrect the charge,
+    because a materialised anchor's job is already done.
+    """
+
+    vram_mb: float
+    """The planned VRAM charge (MB) at admit time."""
+    target_process_id: int
+    """The process the charge will materialise on."""
+    reserved_at_admit_mb: float
+    """The target's measured allocator reservation (MB) when the charge was admitted."""
+    materialized_watermark_mb: float = 0.0
+    """The greatest reserved-growth (MB) past admit ever observed for this entry; ratchets up, never down."""
+
+
 class CommittedReserveLedger:
     """A single accounting of VRAM/RAM committed by in-flight work across every workload flow.
 
@@ -1045,6 +1226,7 @@ class CommittedReserveLedger:
         """Initialize an empty ledger."""
         self._vram_mb: dict[tuple[str, str], float] = {}
         self._ram_mb: dict[tuple[str, str], float] = {}
+        self._planned: dict[tuple[str, str], _PlannedReserve] = {}
 
     def set(self, flow: str, unit: str, *, vram_mb: float = 0.0, ram_mb: float = 0.0) -> None:
         """Register (or refresh) the committed VRAM/RAM for one unit of work.
@@ -1055,10 +1237,94 @@ class CommittedReserveLedger:
         self._vram_mb[(flow, unit)] = max(0.0, vram_mb)
         self._ram_mb[(flow, unit)] = max(0.0, ram_mb)
 
+    def set_planned(
+        self,
+        flow: str,
+        unit: str,
+        *,
+        vram_mb: float,
+        target_process_id: int,
+        reserved_at_admit_mb: float,
+    ) -> None:
+        """Register a *planned* (admitted but not-yet-materialised) VRAM charge for the ledger-driven identity.
+
+        Distinct from :meth:`set`: a planned charge is a load the admission identity has admitted whose
+        allocation the measured committed floor does not yet reflect, and it *decays* as the target process's
+        own measured allocator reservation grows past what it held when the charge was admitted (see
+        :meth:`effective_planned_vram_mb`). This decay is the double-count guard that lets the measured floor
+        and the planned overlay be summed without charging the same load twice: while the load materialises it
+        is briefly counted once here and once in the (now higher) measured reservation, and the planned share
+        shrinks to zero exactly as the measured share fills in. Consumption is monotonic, so once the load has
+        materialised the charge stays consumed even if the target's reservation is later evicted back down;
+        re-registering the same unit (a genuinely new admission) resets the watermark and charges in full again.
+
+        Args:
+            flow: The workload flow namespace (so a flow can refresh or drop only its own planned holds).
+            unit: The unit-of-work key within the flow.
+            vram_mb: The planned charge (MB); stored as zero when non-positive.
+            target_process_id: The process the charge will materialise on, whose measured reservation decays it.
+            reserved_at_admit_mb: The target's measured allocator reservation (MB) at admit time; growth beyond
+                this figure is treated as the planned charge materialising.
+        """
+        self._planned[(flow, unit)] = _PlannedReserve(
+            vram_mb=max(0.0, vram_mb),
+            target_process_id=target_process_id,
+            reserved_at_admit_mb=max(0.0, reserved_at_admit_mb),
+        )
+
+    def effective_planned_vram_mb(self, process_reserved_by_pid: dict[int, float]) -> float:
+        """Return the combined planned VRAM (MB) still outstanding, each entry decayed by what has materialised.
+
+        For each planned entry the materialised amount is the high-water mark of
+        ``max(0, current_reserved - reserved_at_admit)`` seen for its target process, and the entry's
+        outstanding charge is ``max(0, planned - materialised)``. Summing these gives the planned overlay the
+        admission identity adds on top of the measured committed floor without double-counting a load that is
+        partway into VRAM.
+
+        Consumption is monotonic: each call ratchets the entry's watermark up by any newly-observed growth and
+        never lowers it. This is what stops a materialised-then-evicted anchor from resurrecting: once the
+        target's reservation has grown to cover the charge, a later collapse of that reservation (an eviction
+        that returns the VRAM to the card) leaves the watermark high, so the charge stays consumed. A load that
+        is genuinely still in flight (its reservation has not yet grown) keeps its full charge, preserving the
+        same-cycle double-admit guard the overlay exists for.
+
+        Args:
+            process_reserved_by_pid: Current measured allocator reservation (MB) keyed by process id; a target
+                absent from the map is treated as holding zero (nothing has materialised for it yet).
+        """
+        total = 0.0
+        for entry in self._planned.values():
+            current_reserved = process_reserved_by_pid.get(entry.target_process_id, 0.0)
+            materialised = max(0.0, current_reserved - entry.reserved_at_admit_mb)
+            if materialised > entry.materialized_watermark_mb:
+                entry.materialized_watermark_mb = materialised
+            total += max(0.0, entry.vram_mb - entry.materialized_watermark_mb)
+        return total
+
+    def reconcile_planned(self, flow: str, live_units: Iterable[str]) -> None:
+        """Prune ``flow``'s planned charges to only the units whose admission is still in flight (self-healing).
+
+        The planned counterpart of :meth:`replace_flow`: each scheduling cycle the caller derives, from live
+        process/model state, the set of units whose admitted load has not yet materialised, and passes it here.
+        Any planned entry for ``flow`` whose unit is absent from that set is dropped, so a finished, faulted, or
+        dead admission releases its charge purely by omission with no explicit release call (the same reason the
+        flat reserve is reconciled rather than event-tracked: a lost result message cannot leak a stale hold).
+
+        Surviving entries are kept *as-is*, preserving each one's admit-time reservation baseline so its
+        per-target decay (see :meth:`effective_planned_vram_mb`) is never reset. Entries under other flows are
+        untouched. The rebuild is idempotent: re-running it with the same live set is a no-op, so it is safe to
+        drive from any per-cycle choke point that assembles the measured state (it may run several times a cycle).
+        Creating an entry is the grant path's job (:meth:`set_planned`); this method only ever prunes, so a unit
+        that appears live but was never granted simply carries no planned charge (a conservative under-count).
+        """
+        live = set(live_units)
+        self._planned = {key: entry for key, entry in self._planned.items() if key[0] != flow or key[1] in live}
+
     def release(self, flow: str, unit: str) -> None:
-        """Drop the reserve for one unit of work (idempotent)."""
+        """Drop the reserve for one unit of work (idempotent), including any planned charge for it."""
         self._vram_mb.pop((flow, unit), None)
         self._ram_mb.pop((flow, unit), None)
+        self._planned.pop((flow, unit), None)
 
     def replace_flow(
         self,
@@ -1125,6 +1391,8 @@ class VramBudget:
         baseline: str | None,
         free_vram_mb: float | None,
         committed_reserve_mb: float = 0.0,
+        *,
+        disaggregated: bool = False,
     ) -> BudgetVerdict:
         """Return the budget verdict for admitting ``job`` given the measured free VRAM.
 
@@ -1145,12 +1413,21 @@ class VramBudget:
         it back here is what stops the freed slot from being handed VRAM the in-flight job is about to
         claim. It defaults to 0.0, so callers that do not track it (and the unit tests) keep the prior
         instantaneous behavior.
+
+        ``disaggregated`` marks a job that runs on the pipeline-disaggregation path: its sampler process
+        holds only the UNet, so the charge is :func:`predict_job_sampler_only_vram_mb` (the ~6.6GB SDXL
+        sampler figure) rather than the ~16GB whole-job sampling peak. This is what admits a second sampler
+        beside a first on a card the whole-job charge would collapse to one.
         """
         if free_vram_mb is None:
             return BudgetVerdict(fits=True, predicted_mb=None, available_mb=None, reserve_mb=self._reserve_mb)
 
         effective_free_mb = free_vram_mb - committed_reserve_mb
-        predicted = predict_job_sampling_vram_mb(job, baseline)
+        predicted = (
+            predict_job_sampler_only_vram_mb(job, baseline)
+            if disaggregated
+            else predict_job_sampling_vram_mb(job, baseline)
+        )
         if predicted is None:
             return BudgetVerdict(
                 fits=True,

@@ -204,6 +204,16 @@ class RunMetricsSnapshot(BaseModel):
     disk_min_free_bytes: dict[str, int]
     num_process_recoveries: int
     num_job_slowdowns: int
+    job_slowdown_events: int = 0
+    """Count of in-flight WARN-level slowdown gradings the hung-process watchdog raised this run (a running
+    job measured far past its expected sampling time). Distinct from ``num_job_slowdowns``, which counts
+    *completed* jobs that finished slow: this counts the mid-flight escalations, the same signal the
+    paged-slowdown watchdog joins with WDDM paging attribution to reclaim a card."""
+    paging_victim_replacements: int = 0
+    """Count of inference slots the paged-slowdown watchdog replaced this run: a WARN-graded job that was
+    still advancing but on VRAM the WDDM driver had demoted to system memory (measured per-PID paging
+    attribution). Each is a card reclaimed from a job that would otherwise have limped for minutes without
+    tripping the silence-based hang timeout."""
     time_spent_no_jobs_available: float
     process_crash_events: list[ProcessCrashRecord]
     gpu_utilization_mean_percent: float | None = None
@@ -223,6 +233,64 @@ class RunMetricsSnapshot(BaseModel):
     so a slow cold start reads as motion rather than a hang. Empty when not populated."""
     process_state_summary: str = ""
     """Compact per-process state line (e.g. ``inf#1=PROCESS_STARTING safety#0=WAITING_FOR_JOB``)."""
+    committed_vram_mb: float | None = None
+    """Last reconciled committed-VRAM ledger sum (context constant + allocator-reserved per live GPU
+    process) for the primary card, when the attribution reconciler has observed one. Calibration
+    visibility only; scheduling never reads it from here."""
+    vram_attribution_drift_mb: float | None = None
+    """Last reconciled attribution drift (device used minus baseline+committed) for the primary card.
+    Persistent positive drift is the only early overcommit signal that exists under WDDM."""
+    admission_denials: int = 0
+    """Count of admissions denied by the ledger-driven measured floor for the primary card this run.
+
+    A measured denial is one the lying free-VRAM figure would have admitted but the committed-plus-planned
+    ledger arithmetic rejected as a physical over-commit. Calibration visibility only."""
+    measured_unloads_issued: int = 0
+    """Count of under-pressure idle-model unloads the physical-overcommit trigger issued for the primary card.
+
+    Each is one idle resident model evicted because ``committed + baseline > total`` held across the confirming
+    streak. Calibration visibility only."""
+    admission_headroom_mb: float | None = None
+    """Last observed admission headroom (capacity minus committed-plus-planned demand) for the primary card,
+    or None when the measured floor was not applied (cold start or a stale ledger). Calibration visibility."""
+    admission_foreign_pressure_defers: int = 0
+    """Count of preloads the arbiter deferred under foreign pressure this run: reclaim was exhausted and the
+    worker's own committed load fit capacity, yet the candidate did not physically fit the truthful device-free
+    reading, so it could not be admitted into reality. A rising count marks a card held by load the worker did
+    not commit. Calibration visibility only."""
+    starvation_diagnostics: int = 0
+    """Count of starvation diagnostics the arbiter emitted this run: a head-of-queue preload deferred past the
+    diagnostic horizon with the reclaim ladder exhausted and no verified progress. Each named the full
+    admission arithmetic in a warning; the job stays queued for the structural-wedge recovery supervisor to
+    reroute. Calibration visibility only."""
+    device_free_mb: float | None = None
+    """Latest NVML device-level free VRAM (MB) for the primary card, read by the device-free governor in the
+    torch-free parent, or None before the first governor sample. On WDDM this device-level figure is the only
+    truthful proximity-to-cliff signal: per-process reads lie once the driver demotes an allocator to system
+    memory. Calibration visibility only."""
+    governor_pressure_events: int = 0
+    """Count of device-free governor transitions into PRESSURE (free below the soft floor) this run, summed
+    across governed cards. Each marks a card crossing into the band where new VRAM growth is held. Calibration
+    visibility only."""
+    governor_saturation_events: int = 0
+    """Count of device-free governor transitions into SATURATED (free below the hard floor) this run, summed
+    across governed cards. Each marks a card crossing the paging cliff, where the reclaim ladder runs.
+    Calibration visibility only."""
+    ladder_rungs_issued: int = 0
+    """Count of verified-reclaim-ladder rungs the engine issued this run (each an idle-model unload, allocator
+    cache release, lane pause, or safety off-GPU that actually acted). Calibration visibility only."""
+    ladder_verified_frees_mb: float = 0.0
+    """Cumulative realized NVML device-free gain (MB) the reclaim ladder verified against its rungs' promises
+    this run. The measured, externally-confirmed counterpart to the promised frees. Calibration visibility."""
+    ladder_verification_shortfalls: int = 0
+    """Count of reclaim rungs that freed less than half their promised device memory within the verification
+    window this run: each named its tenant in a warning and recorded a calibration event. Calibration
+    visibility only."""
+    per_step_floor_triggers: int = 0
+    """Count of times the per-step floor tripped this run: a sampling slot ran two consecutive steps each at
+    or above the floor multiple of its expected per-step time while its card was at PRESSURE or SATURATED,
+    forcing the reclaim ladder to run without waiting for the whole-job elapsed-ratio rungs. Calibration
+    visibility only."""
 
 
 class WorkerRunMetrics:
@@ -555,10 +623,26 @@ class WorkerRunMetrics:
         *,
         num_process_recoveries: int = 0,
         num_job_slowdowns: int = 0,
+        job_slowdown_events: int = 0,
+        paging_victim_replacements: int = 0,
         time_spent_no_jobs_available: float = 0.0,
         disk_min_free_bytes: dict[str, int] | None = None,
         phase: str = "",
         process_state_summary: str = "",
+        committed_vram_mb: float | None = None,
+        vram_attribution_drift_mb: float | None = None,
+        admission_denials: int = 0,
+        measured_unloads_issued: int = 0,
+        admission_headroom_mb: float | None = None,
+        admission_foreign_pressure_defers: int = 0,
+        starvation_diagnostics: int = 0,
+        device_free_mb: float | None = None,
+        governor_pressure_events: int = 0,
+        governor_saturation_events: int = 0,
+        ladder_rungs_issued: int = 0,
+        ladder_verified_frees_mb: float = 0.0,
+        ladder_verification_shortfalls: int = 0,
+        per_step_floor_triggers: int = 0,
     ) -> RunMetricsSnapshot:
         """Return an immutable snapshot of everything observed so far.
 
@@ -573,9 +657,25 @@ class WorkerRunMetrics:
             disk_min_free_bytes=dict(disk_min_free_bytes or {}),
             num_process_recoveries=num_process_recoveries,
             num_job_slowdowns=num_job_slowdowns,
+            job_slowdown_events=job_slowdown_events,
+            paging_victim_replacements=paging_victim_replacements,
             time_spent_no_jobs_available=time_spent_no_jobs_available,
             process_crash_events=list(self._crash_events),
             churn_event_times={kind: list(times) for kind, times in self._churn_event_times.items()},
             phase=phase,
             process_state_summary=process_state_summary,
+            committed_vram_mb=committed_vram_mb,
+            vram_attribution_drift_mb=vram_attribution_drift_mb,
+            admission_denials=admission_denials,
+            measured_unloads_issued=measured_unloads_issued,
+            admission_headroom_mb=admission_headroom_mb,
+            admission_foreign_pressure_defers=admission_foreign_pressure_defers,
+            starvation_diagnostics=starvation_diagnostics,
+            device_free_mb=device_free_mb,
+            governor_pressure_events=governor_pressure_events,
+            governor_saturation_events=governor_saturation_events,
+            ladder_rungs_issued=ladder_rungs_issued,
+            ladder_verified_frees_mb=ladder_verified_frees_mb,
+            ladder_verification_shortfalls=ladder_verification_shortfalls,
+            per_step_floor_triggers=per_step_floor_triggers,
         )
