@@ -21,8 +21,6 @@ The fix:
 
 from __future__ import annotations
 
-import pytest
-
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import (
     InferenceFailureResolution,
