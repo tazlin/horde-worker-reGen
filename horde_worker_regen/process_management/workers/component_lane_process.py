@@ -229,7 +229,7 @@ class HordeComponentLaneProcess(HordeProcess):
             try:
                 from hordelib.api import clear_gc_and_torch_cache
 
-                clear_gc_and_torch_cache()
+                clear_gc_and_torch_cache()  # type: ignore - PEP 562 lazy imported; pyrefly see this as `object``
             except Exception as cleanup_error:  # noqa: BLE001 - teardown must not raise
                 logger.debug(f"Text-encode service VRAM cleanup failed ({cleanup_error})")
 

@@ -1475,8 +1475,9 @@ def save_config(data: Any, path: Path = DEFAULT_CONFIG_PATH) -> None:  # noqa: A
     tmp.replace(path)
 
 
-def coerce_value(field: ConfigField, raw: object) -> Any:  # noqa: ANN401 - kind-dependent
+def coerce_value(field: ConfigField, raw: object) -> bool | int | float | str | list[str] | None:
     """Convert a widget value into the typed value for the YAML, raising ValueError on bad input."""
+    value: bool | int | float | str | list[str] | None
     if field.kind is FieldKind.BOOL:
         return bool(raw)
     if field.kind in (FieldKind.INT, FieldKind.FLOAT):
@@ -1485,7 +1486,7 @@ def coerce_value(field: ConfigField, raw: object) -> Any:  # noqa: ANN401 - kind
             return None
         is_int = field.kind is FieldKind.INT
         try:
-            value: float = int(text) if is_int else float(text)
+            value = int(text) if is_int else float(text)
         except ValueError as error:
             noun = "a whole number" if is_int else "a number"
             raise ValueError(f"{field.label} must be {noun}") from error
