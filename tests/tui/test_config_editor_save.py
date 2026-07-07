@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Input, Switch, TabbedContent
+from textual.widgets import Input, Select, Switch, TabbedContent
 
 from horde_worker_regen.tui.config_form import load_config
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
@@ -79,6 +79,21 @@ async def test_editing_float_field_round_trips(tmp_path: Path) -> None:
         await pilot.pause()
 
     assert load_config(path)["min_lora_disk_free_gb"] == 1.5
+
+
+@pytest.mark.e2e
+async def test_select_field_round_trips(tmp_path: Path) -> None:
+    """A single-choice config field renders as a Select and saves the chosen value."""
+    app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "n"\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        selector = editor.query_one("#cfg-dedicated_post_processing", Select)
+        selector.value = "off"
+        assert editor._save() is True
+        await pilot.pause()
+
+    assert load_config(path)["dedicated_post_processing"] == "off"
 
 
 @pytest.mark.e2e

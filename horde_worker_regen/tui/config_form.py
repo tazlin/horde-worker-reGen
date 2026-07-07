@@ -26,7 +26,18 @@ MODELS_TO_LOAD_KEY = "models_to_load"
 MODELS_TO_SKIP_KEY = "models_to_skip"
 
 # Alchemy forms a worker may offer (template spelling, hyphenated).
-ALCHEMY_FORMS = ("caption", "nsfw", "interrogation", "post-process")
+ALCHEMY_FORMS = (
+    "caption",
+    "nsfw",
+    "interrogation",
+    "post-process",
+    "vectorize",
+    "palette",
+    "describe",
+    "aesthetic",
+)
+
+DEDICATED_POST_PROCESSING_CHOICES = ("auto", "on", "off")
 
 # The reserved placeholder names shipped in bridgeData_template.yaml. The horde rejects a worker that
 # tries to register under one (names are unique horde-wide), so the editor must require the operator to
@@ -43,6 +54,8 @@ class FieldKind(enum.StrEnum):
     INT = "int"
     FLOAT = "float"
     STR = "str"
+    SELECT = "select"
+    """A fixed set of single-selectable string choices."""
     STR_LIST = "str_list"
     MODEL_LIST = "model_list"
     """A models_to_load/skip list, edited via the dedicated model-list control."""
@@ -106,6 +119,8 @@ class ConfigField:
             return int(self.minimum) if self.minimum is not None else 0
         if self.kind in (FieldKind.STR_LIST, FieldKind.MODEL_LIST, FieldKind.SELECT_MULTI):
             return []
+        if self.kind is FieldKind.SELECT and self.choices:
+            return self.choices[0]
         return ""
 
 
@@ -301,6 +316,15 @@ CONFIG_FIELDS: list[ConfigField] = [
         explicit_default=True,
     ),
     ConfigField(
+        "comfy_smart_memory",
+        "Comfy smart memory",
+        FieldKind.BOOL,
+        "Memory & performance",
+        "Keep ComfyUI smart memory enabled so child processes may keep model weights resident in VRAM "
+        "between jobs. Experimental on tight cards; requires restart because it is passed at child startup.",
+        requires_restart=True,
+    ),
+    ConfigField(
         "very_fast_disk_mode",
         "Very fast disk mode",
         FieldKind.BOOL,
@@ -395,6 +419,26 @@ CONFIG_FIELDS: list[ConfigField] = [
         FieldKind.BOOL,
         "Features",
         "Accept upscaling / face-fixing / other post-gen features.",
+    ),
+    ConfigField(
+        "dedicated_post_processing",
+        "Dedicated post-processing lane",
+        FieldKind.SELECT,
+        "Features",
+        "Whether to run the dedicated post-processing lane: auto follows served work, on always runs it, "
+        "off disables the lane and post-processing work.",
+        requires_restart=True,
+        choices=DEDICATED_POST_PROCESSING_CHOICES,
+        explicit_default="auto",
+    ),
+    ConfigField(
+        "enable_pipeline_disaggregation",
+        "Pipeline disaggregation",
+        FieldKind.BOOL,
+        "Features",
+        "Run eligible SD1.5/SDXL jobs as text-encode + UNet-sample + VAE-decode stages. Experimental; "
+        "requires restart so the component and VAE lane processes are started.",
+        requires_restart=True,
     ),
     ConfigField(
         "allow_controlnet",
@@ -1458,6 +1502,12 @@ def coerce_value(field: ConfigField, raw: object) -> Any:  # noqa: ANN401 - kind
         if isinstance(raw, list):
             return [str(item).strip() for item in raw if str(item).strip()]
         return [line.strip() for line in str(raw).splitlines() if line.strip()]
+    if field.kind is FieldKind.SELECT:
+        value = str(raw).strip()
+        if field.choices and value not in field.choices:
+            choices = ", ".join(field.choices)
+            raise ValueError(f"{field.label} must be one of: {choices}")
+        return value
     return str(raw)
 
 

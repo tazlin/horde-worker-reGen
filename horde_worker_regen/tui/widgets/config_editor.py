@@ -12,7 +12,19 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, Label, Rule, Static, Switch, TabbedContent, TabPane, TextArea
+from textual.widgets import (
+    Button,
+    Checkbox,
+    Input,
+    Label,
+    Rule,
+    Select,
+    Static,
+    Switch,
+    TabbedContent,
+    TabPane,
+    TextArea,
+)
 
 from horde_worker_regen.app_state import OverviewViewMode
 from horde_worker_regen.tui.config_form import (
@@ -322,6 +334,19 @@ class ConfigEditorView(Vertical):
                 Horizontal(*checkboxes, classes="config-row"),
                 classes="config-field",
             )
+        elif field.kind is FieldKind.SELECT:
+            selected = str(value)
+            if selected not in field.choices and field.choices:
+                selected = field.choices[0]
+            control = Vertical(
+                Horizontal(
+                    Label(label_text),
+                    Select([(choice, choice) for choice in field.choices], value=selected, id=widget_id),
+                    classes="config-row",
+                ),
+                Static(field.help, classes="config-help"),
+                classes="config-field",
+            )
         elif field.kind is FieldKind.STR_LIST:
             text = "\n".join(str(item) for item in value)
             control = Vertical(
@@ -440,7 +465,7 @@ class ConfigEditorView(Vertical):
                 )
             else:
                 widget = self.query_one(f"#cfg-{field.key}")
-                if isinstance(widget, Switch):
+                if isinstance(widget, Switch | Select):
                     state[field.key] = widget.value
                 elif isinstance(widget, TextArea):
                     state[field.key] = widget.text
@@ -514,6 +539,9 @@ class ConfigEditorView(Vertical):
                 widget = self.query_one(f"#cfg-{field.key}")
                 if isinstance(widget, Switch):
                     widget.value = bool(value)
+                elif isinstance(widget, Select):
+                    selected = str(value)
+                    widget.value = selected if selected in field.choices else field.choices[0]
                 elif isinstance(widget, TextArea):
                     widget.text = "\n".join(str(item) for item in value)
                 elif isinstance(widget, Input):
@@ -606,6 +634,8 @@ class ConfigEditorView(Vertical):
         widget = self.query_one(f"#cfg-{field.key}")
         if isinstance(widget, Switch):
             raw: object = widget.value
+        elif isinstance(widget, Select):
+            raw = widget.value
         elif isinstance(widget, TextArea):
             raw = widget.text
         elif isinstance(widget, Input):

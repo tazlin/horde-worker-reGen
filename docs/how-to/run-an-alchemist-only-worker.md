@@ -1,10 +1,10 @@
 # Run an alchemist-only worker
 
 An *alchemist-only* worker serves only alchemy (interrogation/post-processing) jobs: upscaling,
-face-fixing, background removal, captioning, interrogation, and NSFW classification. It does **not**
-pop image-generation jobs. Use this when you want to contribute alchemy without running the dreamer
-(image-generation) role, for example to leave a GPU free for other work, or because you have no usable
-GPU at all.
+face-fixing, background removal, captioning, interrogation, NSFW classification, vectorize, palette,
+describe, and aesthetic forms. It does **not** pop image-generation jobs. Use this when you want to
+contribute alchemy without running the dreamer (image-generation) role, for example to leave a GPU free
+for other work, or because you have no usable GPU at all.
 
 There are two ways to end up alchemist-only:
 
@@ -30,8 +30,9 @@ There are two ways to end up alchemist-only:
    alchemist_name: "My Unique Alchemist"
    ```
 
-4. (Optional) Choose which forms to offer with `forms:`. If unset, all of them are offered. Captioning
-   additionally requires `alchemy_caption_enabled: true` because it loads BLIP.
+4. (Optional) Choose which forms to offer with `forms:`. If unset, all default forms are offered:
+   `caption`, `nsfw`, `interrogation`, `post-process`, `vectorize`, `palette`, `describe`, and
+   `aesthetic`. Captioning additionally requires `alchemy_caption_enabled: true` because it loads BLIP.
 5. Start the worker as usual.
 
 ### The role matrix
@@ -47,7 +48,8 @@ There are two ways to end up alchemist-only:
 
 - **One inference process.** Instead of the image-generation fleet, a single inference process is
   spawned per card; graph alchemy forms (upscale, face-fix, background removal) serialize through it.
-  Text/CLIP forms (caption, interrogation, NSFW) run on the safety process.
+  Text/CLIP forms (caption, interrogation, NSFW, vectorize, palette, describe, aesthetic) run on the
+  safety process.
 - **No image models are loaded.** Any configured `models_to_load`/`dynamic_models` are coerced off, so
   the worker never advertises or pops an image job.
 - **The dashboard reshapes around alchemy.** The overview shows an "ALCHEMIST-ONLY WORKER" identity, an

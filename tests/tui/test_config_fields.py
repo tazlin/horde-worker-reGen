@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from horde_worker_regen.process_management.jobs.alchemy_popper import DEFAULT_ALCHEMY_FORMS
 from horde_worker_regen.tui.config_form import CONFIG_FIELDS, FieldKind, coerce_value
 
 _BY_KEY = {field.key: field for field in CONFIG_FIELDS}
@@ -14,6 +15,7 @@ def test_core_fields_present_with_expected_kinds() -> None:
     assert _BY_KEY["models_to_load"].kind is FieldKind.MODEL_LIST
     assert _BY_KEY["models_to_skip"].kind is FieldKind.MODEL_LIST
     assert _BY_KEY["forms"].kind is FieldKind.SELECT_MULTI
+    assert _BY_KEY["dedicated_post_processing"].kind is FieldKind.SELECT
     for key in (
         "api_key",
         "horde_url",
@@ -28,8 +30,15 @@ def test_core_fields_present_with_expected_kinds() -> None:
         "load_large_models",
         "alchemist",
         "cache_home",
+        "comfy_smart_memory",
+        "enable_pipeline_disaggregation",
     ):
         assert key in _BY_KEY, key
+
+
+def test_alchemy_forms_include_worker_default_forms() -> None:
+    """The TUI exposes every top-level alchemy form the worker offers by default."""
+    assert set(DEFAULT_ALCHEMY_FORMS) <= set(_BY_KEY["forms"].choices)
 
 
 def test_int_bounds_enforced() -> None:
@@ -46,6 +55,14 @@ def test_list_kinds_accept_lists() -> None:
     """Model-list and multi-select fields coerce a list of values, trimming blanks."""
     assert coerce_value(_BY_KEY["forms"], ["caption", " nsfw "]) == ["caption", "nsfw"]
     assert coerce_value(_BY_KEY["models_to_load"], ["top 2", "Deliberate", ""]) == ["top 2", "Deliberate"]
+
+
+def test_select_kind_rejects_unknown_choice() -> None:
+    """Single-select fields only save one of their declared choices."""
+    dedicated = _BY_KEY["dedicated_post_processing"]
+    assert coerce_value(dedicated, "auto") == "auto"
+    with pytest.raises(ValueError, match="auto, on, off"):
+        coerce_value(dedicated, "sometimes")
 
 
 def test_secret_fields_flagged() -> None:
