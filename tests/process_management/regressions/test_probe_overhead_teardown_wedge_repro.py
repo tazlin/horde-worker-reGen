@@ -21,11 +21,12 @@ evicting a sibling *model* into one that demands stopping a sibling *process*, a
 
 These tests reproduce that from the measured numbers, driving the scheduler's own ``_forecast_streaming``.
 The fix derives a *marginal* per-additional-context cost from the device's measured all-contexts idle
-residency (which the scheduler already collects via memory reports) and sizes ``free_after_model_evict`` as
-``per_process_overhead + (contexts - 1) * marginal`` instead of ``contexts * per_process_overhead``. The
-over-count corrupts ``free_after_model_evict`` for any multi-process worker; it surfaced first under a
-residency mode that kept every process loaded, so no idle sibling existed to satisfy the bogus teardown
-demand and the worker had no way out.
+residency (fed by the parent's attribution tick as truthful device-used net of the shared baseline and the
+tenants' byte-exact reservations) and sizes ``free_after_model_evict`` as ``per_process_overhead +
+(contexts - 1) * marginal`` instead of ``contexts * per_process_overhead``. The over-count corrupts
+``free_after_model_evict`` for any multi-process worker; it surfaced first under a residency mode that kept
+every process loaded, so no idle sibling existed to satisfy the bogus teardown demand and the worker had no
+way out.
 """
 
 from __future__ import annotations
@@ -98,6 +99,9 @@ def _build_scheduler_at_idle_residency() -> InferenceScheduler:
         # Children report device-wide used / total, so every idle process carries the same figures.
         proc.vram_usage_mb = _IDLE_DEVICE_USED_ALL_CONTEXTS_MB
         proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
+        # An idle, model-less context holds no allocator reservation; a zero (not None) figure makes the
+        # process a committed-ledger tenant, which the bare-context decomposition keys on.
+        proc.process_reserved_mb = 0.0
         process_map[process_id] = proc
 
     bridge_data = make_mock_bridge_data(
@@ -193,15 +197,57 @@ class TestProbeOverheadTeardownWedge:
     def test_marginal_derived_from_measured_idle_residency(self) -> None:
         """The scheduler derives marginal = (idle residency - first-context overhead) / (contexts - 1)."""
         scheduler = _build_scheduler_at_idle_residency()
-        # The capture runs on the scheduling path; trigger it directly here.
-        scheduler._maybe_capture_idle_context_residency()
+        # The capture is fed by the parent's attribution tick with the truthful device-used reading and the
+        # reconciled shared baseline; with a zero baseline and zero tenant reservations the bare-context
+        # residual is the full idle reading.
+        scheduler.capture_idle_context_residency(
+            device_used_mb=_IDLE_DEVICE_USED_ALL_CONTEXTS_MB,
+            baseline_mb=0.0,
+            device_index=0,
+        )
 
         assert scheduler._overhead._idle_context_residency_mb == pytest.approx(_IDLE_DEVICE_USED_ALL_CONTEXTS_MB)
-        assert scheduler._overhead._idle_residency_process_count == _NUM_INFERENCE_PROCESSES
+        assert scheduler._overhead._idle_residency_context_count == _NUM_INFERENCE_PROCESSES
         expected = (_IDLE_DEVICE_USED_ALL_CONTEXTS_MB - _PROBE_SINGLE_PROCESS_OVERHEAD_MB) / (
             _NUM_INFERENCE_PROCESSES - 1
         )
         assert scheduler._marginal_process_overhead_mb() == pytest.approx(expected)
+
+    def test_capture_nets_out_baseline_and_reservations(self) -> None:
+        """The bare-context residual excludes the shared baseline and the tenants' byte-exact reservations.
+
+        Attributing either into the residual multiplies it across the process count and re-creates the
+        inflated per-context marginal this repro exists to prevent (the 2272 MB/context phantom charged a
+        16 GB card into a 15.9 GB committed ledger on a 5.2 GB-used device).
+        """
+        scheduler = _build_scheduler_at_idle_residency()
+        baseline_mb = 1614.0
+        reserved_each_mb = 100.0
+        for process_info in scheduler._process_map.values():
+            process_info.process_reserved_mb = reserved_each_mb
+        scheduler.capture_idle_context_residency(
+            device_used_mb=_IDLE_DEVICE_USED_ALL_CONTEXTS_MB,
+            baseline_mb=baseline_mb,
+            device_index=0,
+        )
+        expected_residual = (
+            _IDLE_DEVICE_USED_ALL_CONTEXTS_MB - baseline_mb - reserved_each_mb * _NUM_INFERENCE_PROCESSES
+        )
+        assert scheduler._overhead._idle_context_residency_mb == pytest.approx(expected_residual)
+
+    def test_capture_skips_when_baseline_absorbed_contexts(self) -> None:
+        """A non-positive residual (baseline captured with tenants already up) latches nothing.
+
+        The marginal then correctly falls back to the probe or the platform seed instead of latching a
+        meaningless figure.
+        """
+        scheduler = _build_scheduler_at_idle_residency()
+        scheduler.capture_idle_context_residency(
+            device_used_mb=_IDLE_DEVICE_USED_ALL_CONTEXTS_MB,
+            baseline_mb=float(_IDLE_DEVICE_USED_ALL_CONTEXTS_MB),
+            device_index=0,
+        )
+        assert scheduler._overhead._idle_context_residency_mb is None
 
     def test_marginal_falls_back_without_clean_baseline(self) -> None:
         """With no clean all-idle baseline observed, marginal is None so the forecast reuses the overhead."""
@@ -209,7 +255,11 @@ class TestProbeOverheadTeardownWedge:
         # No capture has run, and a resident model means the all-idle-no-model window never holds.
         for process_info in scheduler._process_map.values():
             process_info.loaded_horde_model_name = "AMPonyXL"
-        scheduler._maybe_capture_idle_context_residency()
+        scheduler.capture_idle_context_residency(
+            device_used_mb=_IDLE_DEVICE_USED_ALL_CONTEXTS_MB,
+            baseline_mb=0.0,
+            device_index=0,
+        )
 
         assert scheduler._overhead._idle_context_residency_mb is None
         assert scheduler._marginal_process_overhead_mb() is None
@@ -221,7 +271,11 @@ class TestProbeOverheadTeardownWedge:
         scheduler prefers it. Without it, the idle-residency derivation is the fallback; with neither, None.
         """
         scheduler = _build_scheduler_at_idle_residency()
-        scheduler._maybe_capture_idle_context_residency()
+        scheduler.capture_idle_context_residency(
+            device_used_mb=_IDLE_DEVICE_USED_ALL_CONTEXTS_MB,
+            baseline_mb=0.0,
+            device_index=0,
+        )
         derived = (_IDLE_DEVICE_USED_ALL_CONTEXTS_MB - _PROBE_SINGLE_PROCESS_OVERHEAD_MB) / (
             _NUM_INFERENCE_PROCESSES - 1
         )
@@ -238,7 +292,11 @@ class TestProbeOverheadTeardownWedge:
         # Simulate the startup window: a sibling is still loading, so the clean all-idle baseline never holds.
         for process_info in scheduler._process_map.values():
             process_info.loaded_horde_model_name = "AMPonyXL"
-        scheduler._maybe_capture_idle_context_residency()
+        scheduler.capture_idle_context_residency(
+            device_used_mb=_IDLE_DEVICE_USED_ALL_CONTEXTS_MB,
+            baseline_mb=0.0,
+            device_index=0,
+        )
         assert scheduler._overhead._idle_context_residency_mb is None  # no idle-residency fallback available
 
         scheduler.set_measured_marginal_overhead_mb(455.0)

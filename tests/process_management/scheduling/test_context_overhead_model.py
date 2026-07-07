@@ -75,7 +75,7 @@ class TestMarginalDerivation:
         """The marginal derives from (idle residency - first-context overhead) / (contexts - 1)."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1288)
-        model.observe_idle_residency(used_mb=4000.0, idle_inference_process_count=4)
+        model.observe_idle_residency(context_total_mb=4000.0, context_count=4)
         expected = (4000.0 - 1288.0) / 3
         assert model.marginal_mb(config_override_mb=None) == pytest.approx(expected)
 
@@ -83,24 +83,24 @@ class TestMarginalDerivation:
         """A later, cache-dirtied higher reading must not replace the clean minimum baseline."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1000)
-        model.observe_idle_residency(used_mb=4000.0, idle_inference_process_count=3)
-        model.observe_idle_residency(used_mb=9000.0, idle_inference_process_count=3)
+        model.observe_idle_residency(context_total_mb=4000.0, context_count=3)
+        model.observe_idle_residency(context_total_mb=9000.0, context_count=3)
         assert model._idle_context_residency_mb == pytest.approx(4000.0)
 
     def test_effective_floor_keeps_worst_reading(self) -> None:
         """The effective floor keeps the worst (highest) used-VRAM reading at a process count."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1000)
-        model.observe_idle_residency(used_mb=4000.0, idle_inference_process_count=3)
-        model.observe_idle_residency(used_mb=9000.0, idle_inference_process_count=3)
-        assert model._effective_idle_used_mb == pytest.approx(9000.0)
+        model.observe_idle_residency(context_total_mb=4000.0, context_count=3)
+        model.observe_idle_residency(context_total_mb=9000.0, context_count=3)
+        assert model._effective_idle_context_total_mb == pytest.approx(9000.0)
 
     def test_sustained_idle_floor_supersedes_probe(self) -> None:
         """An uncontradicted (sustained) idle floor above the probe supersedes it, never under-counting."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1000)
         model.set_marginal_overhead_mb(650.0)
-        model.observe_idle_residency(used_mb=9000.0, idle_inference_process_count=3)
+        model.observe_idle_residency(context_total_mb=9000.0, context_count=3)
         # No later reading contradicts the floor, so it stands: (9000 - 1000) / 2 = 4000 > the 650 probe.
         breakdown = model.marginal_breakdown(config_override_mb=None)
         assert breakdown.source == "idle_floor"
@@ -110,7 +110,7 @@ class TestMarginalDerivation:
         """A probe above the idle-floor derivation stands; the floor never under-cuts the isolated probe."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1288)
-        model.observe_idle_residency(used_mb=4000.0, idle_inference_process_count=4)  # derives ~904
+        model.observe_idle_residency(context_total_mb=4000.0, context_count=4)  # derives ~904
         model.set_marginal_overhead_mb(2000.0)
         breakdown = model.marginal_breakdown(config_override_mb=None)
         assert breakdown.source == "probe"
@@ -130,14 +130,14 @@ class TestMarginalDerivation:
         """One context has no additional-context cost to derive (count - 1 == 0)."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1288)
-        model.observe_idle_residency(used_mb=2000.0, idle_inference_process_count=1)
+        model.observe_idle_residency(context_total_mb=2000.0, context_count=1)
         assert model.marginal_mb(config_override_mb=None) is None
 
     def test_residency_at_or_below_overhead_is_inconsistent(self) -> None:
         """A residency at/below the first-context overhead is inconsistent, so no marginal is derived."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(3000)
-        model.observe_idle_residency(used_mb=2500.0, idle_inference_process_count=3)
+        model.observe_idle_residency(context_total_mb=2500.0, context_count=3)
         assert model.marginal_mb(config_override_mb=None) is None
 
 
@@ -164,7 +164,7 @@ class TestMarginalBreakdown:
         """No probe and a usable idle reading: the derivation is reported with source ``idle_floor``."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(4000)
-        model.observe_idle_residency(used_mb=6000.0, idle_inference_process_count=3)  # derives 1000
+        model.observe_idle_residency(context_total_mb=6000.0, context_count=3)  # derives 1000
         breakdown = model.marginal_breakdown(config_override_mb=None)
         assert breakdown.source == "idle_floor"
         assert breakdown.chosen_mb == pytest.approx(1000.0)
@@ -179,11 +179,11 @@ class TestEffectiveFloorInvalidation:
         model.set_per_process_overhead_mb(4266)
         model.set_marginal_overhead_mb(650.0)
         # Latch a transient spike: 4 idle contexts momentarily read ~16.6 GB used (the db0 phantom).
-        model.observe_idle_residency(used_mb=16642.0, idle_inference_process_count=4)
+        model.observe_idle_residency(context_total_mb=16642.0, context_count=4)
         assert model.marginal_breakdown(config_override_mb=None).source == "idle_floor"
         # The device later runs at only ~9 GB used with the same contexts live: the spike was reclaimable.
-        model.observe_device_residency(used_mb=9000.0, live_inference_process_count=4)
-        assert model._effective_idle_used_mb == pytest.approx(9000.0)
+        model.observe_device_residency(context_total_mb=9000.0, context_count=4)
+        assert model._effective_idle_context_total_mb == pytest.approx(9000.0)
         # The corrected floor (~1578/ctx) no longer dwarfs the 650 probe by a phantom margin.
         assert model.marginal_mb(config_override_mb=None) == pytest.approx((9000.0 - 4266.0) / 3)
 
@@ -191,21 +191,21 @@ class TestEffectiveFloorInvalidation:
         """A later higher reading does not raise the floor; only lower readings correct it."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1000)
-        model.observe_idle_residency(used_mb=9000.0, idle_inference_process_count=3)
-        model.observe_device_residency(used_mb=12000.0, live_inference_process_count=3)
-        assert model._effective_idle_used_mb == pytest.approx(9000.0)
+        model.observe_idle_residency(context_total_mb=9000.0, context_count=3)
+        model.observe_device_residency(context_total_mb=12000.0, context_count=3)
+        assert model._effective_idle_context_total_mb == pytest.approx(9000.0)
 
     def test_invalidation_ignores_fewer_live_contexts(self) -> None:
         """A lower reading with fewer contexts live is not comparable and must not lower the floor."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1000)
-        model.observe_idle_residency(used_mb=9000.0, idle_inference_process_count=4)
-        model.observe_device_residency(used_mb=5000.0, live_inference_process_count=2)
-        assert model._effective_idle_used_mb == pytest.approx(9000.0)
+        model.observe_idle_residency(context_total_mb=9000.0, context_count=4)
+        model.observe_device_residency(context_total_mb=5000.0, context_count=2)
+        assert model._effective_idle_context_total_mb == pytest.approx(9000.0)
 
     def test_invalidation_noop_without_a_latched_floor(self) -> None:
         """With no effective floor yet, an observation is a harmless no-op."""
         model = ContextOverheadModel()
         model.set_per_process_overhead_mb(1000)
-        model.observe_device_residency(used_mb=5000.0, live_inference_process_count=4)
-        assert model._effective_idle_used_mb is None
+        model.observe_device_residency(context_total_mb=5000.0, context_count=4)
+        assert model._effective_idle_context_total_mb is None

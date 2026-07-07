@@ -2528,6 +2528,22 @@ class HordeWorkerProcessManager:
             self._last_vram_drift_mb_by_device[device_index] = observation.drift_mb
             self._last_baseline_estimate_mb_by_device[device_index] = reconciler.baseline_estimate_mb
 
+            # Feed the truthful bare-context readings to the per-context overhead model: device-used truth
+            # minus the reconciled baseline minus the tenants' byte-exact reservations is the only honest
+            # source for the per-context marginal (per-child views are per-process artefacts under WDDM).
+            baseline_estimate_mb = reconciler.baseline_estimate_mb
+            if device_used_mb is not None and baseline_estimate_mb is not None:
+                self._inference_scheduler.capture_idle_context_residency(
+                    device_used_mb=device_used_mb,
+                    baseline_mb=baseline_estimate_mb,
+                    device_index=device_index,
+                )
+                self._inference_scheduler.invalidate_idle_context_floor(
+                    device_used_mb=device_used_mb,
+                    baseline_mb=baseline_estimate_mb,
+                    device_index=device_index,
+                )
+
             # Pressure-driven unload: when the worker's own committed footprint plus the shared baseline
             # physically over-commits the card (streak-confirmed on fresh reports), reclaim one idle resident
             # model. Keyed on the PHYSICAL ceiling, not the admission ceiling: legitimate transient sampling
@@ -2547,12 +2563,16 @@ class HordeWorkerProcessManager:
                 # bookkeeping figure the card does not actually hold.
                 lanes_asked = self._inference_scheduler.recalibrate_committed_ledger(device_index=device_index)
                 overcount = committed_mb - (device_used_mb if device_used_mb is not None else 0.0)
+                tenant_count = len(self._process_map.committed_ledger_processes(device_index))
                 logger.warning(
                     f"VRAM committed-ledger phantom on device {device_index}: committed {committed_mb:.0f}MB "
                     f"over-counts device-used {device_used_mb:.0f}MB by ~{overcount:.0f}MB "
-                    f"(baseline {reconciler.baseline_estimate_mb:.0f}MB, total {total_vram_mb:.0f}MB); the "
-                    f"over-commit is a stale allocator-cache reservation no eviction can cure. Asked "
-                    f"{lanes_asked} idle lane(s) to release their allocator cache and re-report to recalibrate.",
+                    f"(baseline {reconciler.baseline_estimate_mb:.0f}MB, total {total_vram_mb:.0f}MB, context "
+                    f"charge {context_constant_mb:.0f}MB x {tenant_count} tenant(s)); the over-count is "
+                    f"bookkeeping the device does not corroborate (a stale allocator reservation, or an "
+                    f"inflated per-context charge). Asked {lanes_asked} idle lane(s) to release their "
+                    f"allocator cache and re-report; if committed does not converge, the over-count is "
+                    f"structural and admission prices against device truth instead.",
                 )
             elif pressure.should_unload:
                 reclaimed = self._inference_scheduler.reclaim_one_idle_model_under_pressure(

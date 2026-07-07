@@ -90,28 +90,29 @@ class ContextOverheadModel:
         # until measured (or unmeasurable), where the model falls back to the idle-residency derivation
         # and then to the conservative overhead-per-context sizing.
         self._marginal_overhead_mb: float = 0.0
-        # Lowest device-wide *used* VRAM observed while every loaded inference process is idle with no model
-        # resident (the clean all-contexts baseline, typically at startup). This is the true combined cost
-        # of all process contexts, the one-time CUDA runtime plus one context each, so the marginal cost of
-        # an additional context is (residency - per_process_overhead) / (count - 1). A runtime fallback for
-        # the probe's direct marginal measurement: sizes free_after_model_evict from measurement instead of
+        # Lowest worker-attributable bare-context total (MB) observed while every loaded inference process is
+        # idle with no model resident (the clean all-contexts baseline, typically at startup). The caller
+        # computes the reading as truthful device-used minus the shared device baseline minus every GPU
+        # tenant's byte-exact allocator reservation, so it contains ONLY the context costs of the live GPU
+        # tenants: the one-time CUDA runtime plus one context each. The marginal cost of an additional
+        # context is then (residency - per_process_overhead) / (count - 1). A runtime fallback for the
+        # probe's direct marginal measurement: sizes free_after_model_evict from measurement instead of
         # multiplying the one-time cost by the process count. None until seen.
         self._idle_context_residency_mb: float | None = None
-        self._idle_residency_process_count: int = 0
-        # Highest device-wide *used* VRAM observed while every loaded inference process is idle with no model
-        # resident: the floor reclaim can never get below. The clean baseline above keeps the *minimum* on
-        # the assumption a model's cache returns to the device when it unloads; when that assumption fails
-        # (the allocator/runtime retains multi-GB per context, as a real inference context does once it has
-        # loaded a checkpoint), the *effective* floor is the maximum, not the minimum. A probe measured
-        # against a minimal holder under-counts this, so once the effective floor is known it supersedes the
-        # probe in deriving the per-context marginal; otherwise the forecast believes in reclaimable VRAM the
-        # device never returns and routes every load into an evict-all admit. The max can over-read on a
-        # transient spike (a reading taken before a just-unloaded model's cache was returned), so
-        # observe_device_residency ratchets it back down when a later reading proves the device runs below it:
-        # capture raises it to the worst clean reading, invalidation lowers it toward the level the device
-        # actually sustains. None until seen.
-        self._effective_idle_used_mb: float | None = None
-        self._effective_idle_process_count: int = 0
+        self._idle_residency_context_count: int = 0
+        # Highest bare-context total observed at a clean all-idle reading: the floor reclaim can never get
+        # below. The clean baseline above keeps the *minimum* on the assumption a context's runtime-held VRAM
+        # returns when its work ends; when that assumption fails (the runtime retains allocations the torch
+        # allocator cannot see, so they survive the reservation subtraction), the *effective* floor is the
+        # maximum, not the minimum. A probe measured against a minimal holder under-counts this, so once the
+        # effective floor is known it supersedes the probe in deriving the per-context marginal; otherwise
+        # the forecast believes in reclaimable VRAM the device never returns and routes every load into an
+        # evict-all admit. The max can over-read on a transient spike (a reading taken before a freed
+        # allocation actually returned), so observe_device_residency ratchets it back down when a later
+        # reading proves the device runs below it: capture raises it to the worst clean reading,
+        # invalidation lowers it toward the level the device actually sustains. None until seen.
+        self._effective_idle_context_total_mb: float | None = None
+        self._effective_idle_context_count: int = 0
 
     def set_per_process_overhead_mb(self, overhead_mb: int | float) -> None:
         """Record the startup-measured per-process VRAM overhead (MB) for the streaming forecast."""
@@ -146,39 +147,42 @@ class ContextOverheadModel:
             return config_override_mb
         return self._per_process_overhead_mb
 
-    def observe_idle_residency(self, *, used_mb: float, idle_inference_process_count: int) -> None:
-        """Record a device-wide used-VRAM reading taken while every inference process is idle and model-less.
+    def observe_idle_residency(self, *, context_total_mb: float, context_count: int) -> None:
+        """Record the bare-context total observed while every inference process is idle and model-less.
 
-        The reading is the true combined cost of all process contexts (the one-time CUDA runtime plus one
-        context each), which the forecast needs to size ``free_after_model_evict`` without multiplying the
-        one-time cost by the process count. The clean window is at startup, before any model loads; once a
-        model has loaded this rarely holds again, so the minimum observed value is kept (later, cache-dirtied
-        observations read higher and are ignored for the clean baseline). The *effective* floor keeps the
-        worst (highest) reading per process count instead, since that VRAM provably never returns.
+        The reading is the true combined cost of the live GPU tenants' contexts (the one-time CUDA runtime
+        plus one context each), which the forecast needs to size ``free_after_model_evict`` without
+        multiplying the one-time cost by the process count. The clean window is at startup, before any model
+        loads; once a model has loaded this rarely holds again, so the minimum observed value is kept. The
+        *effective* floor keeps the worst (highest) reading per context count instead, since that VRAM
+        provably never returns.
 
         The caller is responsible for confirming the clean precondition (all inference processes up, idle,
-        and holding no model) and for computing ``used_mb``; this method only updates the cached figures.
+        and holding no model) and for computing ``context_total_mb`` as truthful device-used minus the shared
+        device baseline minus every GPU tenant's byte-exact allocator reservation, so the figure contains
+        only context costs: never the device baseline, never resident weights. Attributing anything else here
+        multiplies it into the per-context marginal and prices the whole card into phantom over-commit.
 
         Args:
-            used_mb (float): Device-wide used VRAM (total minus free) at the clean-baseline reading.
-            idle_inference_process_count (int): Number of live inference processes at the reading.
+            context_total_mb (float): Worker-attributable bare-context VRAM total (MB) at the reading.
+            context_count (int): Number of live GPU-context-bearing worker processes at the reading.
         """
-        if self._idle_context_residency_mb is None or used_mb < self._idle_context_residency_mb:
-            self._idle_context_residency_mb = used_mb
-            self._idle_residency_process_count = idle_inference_process_count
+        if self._idle_context_residency_mb is None or context_total_mb < self._idle_context_residency_mb:
+            self._idle_context_residency_mb = context_total_mb
+            self._idle_residency_context_count = context_count
         # The effective floor is the *worst* (highest) fully-idle, fully-evicted reading: the VRAM reclaim
         # provably cannot return. Kept per the live context count so a later, fewer-process reading does not
         # mask an earlier over-commit.
         if (
-            self._effective_idle_used_mb is None
-            or idle_inference_process_count > self._effective_idle_process_count
+            self._effective_idle_context_total_mb is None
+            or context_count > self._effective_idle_context_count
             or (
-                idle_inference_process_count == self._effective_idle_process_count
-                and used_mb > self._effective_idle_used_mb
+                context_count == self._effective_idle_context_count
+                and context_total_mb > self._effective_idle_context_total_mb
             )
         ):
-            self._effective_idle_used_mb = used_mb
-            self._effective_idle_process_count = idle_inference_process_count
+            self._effective_idle_context_total_mb = context_total_mb
+            self._effective_idle_context_count = context_count
 
     def marginal_mb(self, *, config_override_mb: float | None) -> float | None:
         """Return the per-additional-context VRAM cost (MB), or None to fall back to the first-context overhead.
@@ -220,10 +224,10 @@ class ContextOverheadModel:
             return (residency - per_process) / (count - 1)
 
         probe = self._marginal_overhead_mb if self._marginal_overhead_mb > 0 else None
-        idle_floor = _derive(self._effective_idle_used_mb, self._effective_idle_process_count)
+        idle_floor = _derive(self._effective_idle_context_total_mb, self._effective_idle_context_count)
         if idle_floor is None:
             # No effective (worst-case) floor yet: fall back to the clean idle-residency derivation (startup).
-            idle_floor = _derive(self._idle_context_residency_mb, self._idle_residency_process_count)
+            idle_floor = _derive(self._idle_context_residency_mb, self._idle_residency_context_count)
 
         candidates = [
             (value, source) for value, source in ((probe, "probe"), (idle_floor, "idle_floor")) if value is not None
@@ -233,29 +237,29 @@ class ContextOverheadModel:
         chosen, source = max(candidates, key=lambda candidate: candidate[0])
         return MarginalOverheadBreakdown(probe, idle_floor, chosen, source)
 
-    def observe_device_residency(self, *, used_mb: float, live_inference_process_count: int) -> None:
+    def observe_device_residency(self, *, context_total_mb: float, context_count: int) -> None:
         """Lower a latched effective idle floor once a later reading proves it was not sustained.
 
         The effective floor (:meth:`observe_idle_residency`) keeps the *worst* clean all-idle reading on the
-        premise that the device retains that VRAM. A single transient spike, a reading taken before the
-        allocator returned a just-unloaded model's cache, would otherwise pin the floor for the whole session
-        and inflate the per-context marginal into a teardown-forcing phantom. Any later device-wide *used*
-        reading below the floor, taken with at least as many inference contexts live, disproves it: the device
-        demonstrably runs below that level, so the VRAM the floor counted as unreclaimable was reclaimed.
+        premise that the device retains that VRAM. A single transient spike, a reading taken before a freed
+        runtime allocation actually returned, would otherwise pin the floor for the whole session and inflate
+        the per-context marginal into a teardown-forcing phantom. Any later bare-context reading below the
+        floor, taken with at least as many contexts live, disproves it: the device demonstrably runs below
+        that level, so the VRAM the floor counted as unreclaimable was reclaimed.
 
-        Unlike :meth:`observe_idle_residency` this does not require the clean all-idle precondition, because a
-        reading with resident models can only make the correction *conservative* (residency adds VRAM, so a
-        resident reading already over-states the idle floor); a resident reading still below the latched floor
-        is therefore unambiguous proof the latch was too high. The floor only ratchets *down* here, toward the
-        minimum the device has demonstrated, and never below zero.
+        Unlike :meth:`observe_idle_residency` this does not require the clean all-idle precondition: the
+        caller nets resident weights out via the byte-exact reservations, and any residual weight-adjacent
+        VRAM only makes the reading (hence the correction) *conservative*. A reading still below the latched
+        floor is therefore unambiguous proof the latch was too high. The floor only ratchets *down* here,
+        toward the minimum the device has demonstrated, and never below zero.
 
         Args:
-            used_mb (float): Current device-wide used VRAM (total minus free).
-            live_inference_process_count (int): Number of live inference contexts at the reading.
+            context_total_mb (float): Current worker-attributable bare-context VRAM total (MB).
+            context_count (int): Number of live GPU-context-bearing worker processes at the reading.
         """
-        if self._effective_idle_used_mb is None:
+        if self._effective_idle_context_total_mb is None:
             return
-        if live_inference_process_count < self._effective_idle_process_count:
+        if context_count < self._effective_idle_context_count:
             return
-        if used_mb < self._effective_idle_used_mb:
-            self._effective_idle_used_mb = max(0.0, used_mb)
+        if context_total_mb < self._effective_idle_context_total_mb:
+            self._effective_idle_context_total_mb = max(0.0, context_total_mb)

@@ -612,8 +612,10 @@ class InferenceScheduler:
         self._line_skip_rejection_log_state: dict[str, float] = {}
         # Per-context VRAM overhead model: owns the startup-measured per-process and marginal context costs
         # and derives the figures the streaming forecast needs (see ContextOverheadModel). The manager feeds
-        # it the probe measurements via set_measured_*; the scheduler feeds it clean idle-residency readings
-        # captured each tick by _maybe_capture_idle_context_residency.
+        # it the probe measurements via set_measured_*, and its attribution tick feeds the truthful
+        # NVML-derived bare-context readings via capture_idle_context_residency /
+        # invalidate_idle_context_floor (per-child VRAM views are per-process artefacts under WDDM and are
+        # never decomposed as device truth).
         self._overhead = ContextOverheadModel()
         # Whole-card exclusive-residency records, keyed by the device index a residency is held on. A heavy
         # model claims a card by stopping that card's idle sibling contexts (and cycling safety off-GPU on the
@@ -1007,27 +1009,71 @@ class InferenceScheduler:
         """
         return self._overhead.per_process_mb(config_override_mb=self._config_overhead_override_mb())
 
-    def _maybe_capture_idle_context_residency(self) -> None:
-        """Record the device-wide used VRAM when every inference process is idle with no model resident.
+    def _bare_context_total_mb(
+        self,
+        *,
+        device_used_mb: float,
+        baseline_mb: float,
+        device_index: int | None,
+    ) -> tuple[float, int] | None:
+        """Decompose a truthful device-used reading into the tenants' bare-context total and their count.
 
-        That measurement is the true combined cost of all process contexts (the one-time CUDA runtime plus one
-        context each), which the forecast needs to size ``free_after_model_evict`` without multiplying the
-        one-time cost by the process count. Inspects the process map for the clean precondition (every live
-        inference process up, idle, and holding no model) and feeds a confirmed reading to the overhead model,
-        which keeps the relevant extremes. Cheap and side-effect-free beyond the cached figure, so it is safe
-        to call every scheduling tick.
+        The worker-attributable bare-context total is truthful device-used minus the shared device baseline
+        minus every committed-ledger tenant's byte-exact allocator reservation: what remains is only the
+        context costs (the one-time CUDA runtime plus one context each), the exact quantity the overhead
+        model's marginal derivation is defined over. Charging anything else (the baseline, resident weights,
+        another tenant's reservation) into that residual multiplies it across the process count and prices
+        the card into a phantom over-commit. Keyed on the committed ledger's tenant set so the marginal
+        derivation and the ledger can never disagree about who holds a context. Returns None when the card
+        has no ledger tenants; the residual may be negative (a baseline estimate that absorbed context cost),
+        which the capture path skips and the invalidation path clamps toward zero.
         """
-        free_mb = self._process_map.get_free_vram_mb()
-        total_mb = self._process_map.get_reported_total_vram_mb()
-        if free_mb is None or total_mb is None:
-            return
-        process_count = 0
+        reserved_sum_mb = 0.0
+        tenants = self._process_map.committed_ledger_processes(device_index)
+        if not tenants:
+            return None
+        for process_info in tenants:
+            reserved_sum_mb += (process_info.process_reserved_mb or 0.0) + (process_info.process_aimdo_mb or 0.0)
+        context_total_mb = device_used_mb - baseline_mb - reserved_sum_mb
+        return context_total_mb, len(tenants)
+
+    def capture_idle_context_residency(
+        self,
+        *,
+        device_used_mb: float,
+        baseline_mb: float,
+        device_index: int | None = None,
+    ) -> None:
+        """Record the tenants' bare-context total when every inference process is idle with no model resident.
+
+        That measurement is the true combined cost of the GPU tenants' contexts (the one-time CUDA runtime
+        plus one context each), which the forecast needs to size ``free_after_model_evict`` without
+        multiplying the one-time cost by the process count. Inspects the process map for the clean
+        precondition (every live inference process up, idle, and holding no model, and no GPU tenant busy)
+        and feeds a confirmed reading to the overhead model, which keeps the relevant extremes.
+
+        Fed by the parent's attribution tick, which owns the truthful NVML device-used reading and the
+        reconciled shared-baseline estimate: per-child VRAM views are per-process artefacts under WDDM and
+        must never be decomposed as if they were device truth.
+
+        Args:
+            device_used_mb: Truthful device-wide used VRAM (MB) from the parent-side NVML read.
+            baseline_mb: The reconciler's shared-device baseline estimate (MB) for the card.
+            device_index: The card the reading belongs to; None for the single-GPU/worker-wide case.
+        """
+        inference_count = 0
         for process_info in self._process_map.values():
-            if process_info.process_type != HordeProcessType.INFERENCE:
+            if device_index is not None and process_info.device_index != device_index:
                 continue
             if process_info.last_process_state in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED):
                 continue
-            process_count += 1
+            # Any busy GPU tenant (an in-flight safety evaluation, a post-processing form) is transient VRAM
+            # the residual would misread as context cost, so the clean window requires full quiescence.
+            if process_info.is_process_busy():
+                return
+            if process_info.process_type != HordeProcessType.INFERENCE:
+                continue
+            inference_count += 1
             # A clean baseline requires every live inference process up, idle, and holding no model: any model
             # resident (even one offloaded to RAM but still tracked) means the reading includes weight VRAM.
             if (
@@ -1035,41 +1081,54 @@ class InferenceScheduler:
                 or process_info.loaded_horde_model_name is not None
             ):
                 return
-        if process_count < 1:
+        if inference_count < 1:
             return
-        used_mb = total_mb - free_mb
-        if used_mb <= 0:
+        decomposed = self._bare_context_total_mb(
+            device_used_mb=device_used_mb,
+            baseline_mb=baseline_mb,
+            device_index=device_index,
+        )
+        if decomposed is None:
             return
-        self._overhead.observe_idle_residency(used_mb=used_mb, idle_inference_process_count=process_count)
+        context_total_mb, context_count = decomposed
+        if context_total_mb <= 0:
+            # The baseline estimate absorbed the context cost (it was captured with tenants already up): there
+            # is no attributable residual to latch, and the marginal correctly falls back to probe/seed.
+            return
+        self._overhead.observe_idle_residency(context_total_mb=context_total_mb, context_count=context_count)
 
-    def _maybe_invalidate_idle_context_floor(self) -> None:
+    def invalidate_idle_context_floor(
+        self,
+        *,
+        device_used_mb: float,
+        baseline_mb: float,
+        device_index: int | None = None,
+    ) -> None:
         """Lower a latched effective idle floor once the device proves it was not a sustained reading.
 
-        Complements :meth:`_maybe_capture_idle_context_residency`. The capture keeps the worst clean all-idle
-        reading; a transient spike (taken before the allocator returned a just-unloaded model's cache) would
-        otherwise pin the per-context marginal high for the whole session and route ordinary models into
-        teardown/exclusive admits. Unlike the capture this does not require the clean precondition: a reading
-        with resident models can only make the correction conservative, so any device-wide used reading below
-        the latched floor (with at least as many inference contexts live) is unambiguous proof it was too high.
-        Read-only beyond the cached figure, so it is safe every scheduling tick.
+        Complements :meth:`capture_idle_context_residency`. The capture keeps the worst clean all-idle
+        reading; a transient spike would otherwise pin the per-context marginal high for the whole session
+        and route ordinary models into teardown/exclusive admits. Unlike the capture this does not require
+        the clean precondition: resident weights are netted out via the byte-exact reservations, and any
+        residual transient VRAM only makes the correction conservative, so a bare-context reading below the
+        latched floor (with at least as many tenants live) is unambiguous proof it was too high.
+
+        Args:
+            device_used_mb: Truthful device-wide used VRAM (MB) from the parent-side NVML read.
+            baseline_mb: The reconciler's shared-device baseline estimate (MB) for the card.
+            device_index: The card the reading belongs to; None for the single-GPU/worker-wide case.
         """
-        free_mb = self._process_map.get_free_vram_mb()
-        total_mb = self._process_map.get_reported_total_vram_mb()
-        if free_mb is None or total_mb is None:
-            return
-        used_mb = total_mb - free_mb
-        if used_mb <= 0:
-            return
-        live_inference_processes = sum(
-            1
-            for process_info in self._process_map.values()
-            if process_info.process_type == HordeProcessType.INFERENCE
-            and process_info.last_process_state
-            not in (HordeProcessState.PROCESS_ENDING, HordeProcessState.PROCESS_ENDED)
+        decomposed = self._bare_context_total_mb(
+            device_used_mb=device_used_mb,
+            baseline_mb=baseline_mb,
+            device_index=device_index,
         )
+        if decomposed is None:
+            return
+        context_total_mb, context_count = decomposed
         self._overhead.observe_device_residency(
-            used_mb=used_mb,
-            live_inference_process_count=live_inference_processes,
+            context_total_mb=max(0.0, context_total_mb),
+            context_count=context_count,
         )
 
     def _marginal_process_overhead_mb(self) -> float | None:
@@ -1302,11 +1361,6 @@ class InferenceScheduler:
             if self._process_lifecycle.is_post_process_gpu_paused
             else self._process_map.num_post_process_processes(device_index=device_index)
         )
-        # Refresh the clean all-contexts idle baseline (a no-op once startup has passed) so the marginal
-        # per-context cost reflects measurement rather than the one-time-cost-times-N over-count, then let a
-        # later lower reading invalidate a latched floor that was a transient spike rather than sustained.
-        self._maybe_capture_idle_context_residency()
-        self._maybe_invalidate_idle_context_floor()
         # The EXTRA_LARGE tier (extra-large baselines plus the named VRAM-heavy checkpoints) is the single
         # source of truth for "wants the whole card and never shares". Feed it to the forecast so a baseline
         # whose conservative weight seed happens to fit co-resident still claims sole residency on intent,

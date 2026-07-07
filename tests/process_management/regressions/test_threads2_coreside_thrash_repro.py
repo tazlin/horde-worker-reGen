@@ -68,6 +68,9 @@ def _idle_context_map(num_processes: int, *, free_mb: float) -> ProcessMap:
         proc = make_mock_process_info(pid, model_name=None, state=HordeProcessState.WAITING_FOR_JOB)
         proc.total_vram_mb = _DEVICE_TOTAL_VRAM_MB
         proc.vram_usage_mb = used_mb
+        # The retention this repro models is runtime-held VRAM the torch allocator cannot see, so the
+        # byte-exact reservation stays zero and the whole idle-used reading lands in the context residual.
+        proc.process_reserved_mb = 0.0
         procs[pid] = proc
     return ProcessMap(procs)
 
@@ -106,8 +109,12 @@ class TestMeasuredMarginalReconciliation:
         """
         scheduler, _process_map = _coreside_scheduler(_LIVE_CONTEXT_COUNT, free_mb=_MEASURED_IDLE_FREE_MB)
         scheduler.set_measured_marginal_overhead_mb(_PROBE_MARGINAL_MB)
-        # Feed the clean idle baseline the scheduler would capture from the live reports.
-        scheduler._maybe_capture_idle_context_residency()
+        # Feed the clean idle baseline the parent's attribution tick would supply from the truthful read.
+        scheduler.capture_idle_context_residency(
+            device_used_mb=_MEASURED_IDLE_USED_MB,
+            baseline_mb=0.0,
+            device_index=0,
+        )
 
         marginal = scheduler._marginal_process_overhead_mb()
 
@@ -197,7 +204,11 @@ class TestNoEvictAllThrash:
 
         scheduler, process_map = _coreside_scheduler(_LIVE_CONTEXT_COUNT, free_mb=_MEASURED_IDLE_FREE_MB)
         scheduler.set_measured_marginal_overhead_mb(_PROBE_MARGINAL_MB)
-        scheduler._maybe_capture_idle_context_residency()
+        scheduler.capture_idle_context_residency(
+            device_used_mb=_MEASURED_IDLE_USED_MB,
+            baseline_mb=0.0,
+            device_index=0,
+        )
         monkeypatch.setattr(
             "horde_worker_regen.process_management.resources.resource_budget.predict_job_weight_mb",
             lambda job, baseline: _SDXL_WEIGHTS_MB,

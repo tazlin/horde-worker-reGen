@@ -711,13 +711,14 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             return None
         return float(max(totals))
 
-    def _committed_ledger_processes(self, device_index: int | None) -> list[HordeProcessInfo]:
+    def committed_ledger_processes(self, device_index: int | None = None) -> list[HordeProcessInfo]:
         """Return the GPU processes whose footprint the committed-VRAM ledger charges (a shared predicate).
 
         A process is counted when it has reported a ``process_reserved_mb`` (a GPU-bearing process that has
         sent at least one VRAM-inclusive memory report) and has not entered its terminal shutdown states.
-        Both :meth:`committed_vram_mb` and :meth:`oldest_committed_report_age_seconds` key on this exact set so
-        the ledger sum and its staleness assessment can never disagree about which tenants make it up.
+        :meth:`committed_vram_mb`, :meth:`oldest_committed_report_age_seconds`, and the scheduler's
+        idle-context residency capture all key on this exact set so the ledger sum, its staleness assessment,
+        and the per-context marginal derivation can never disagree about which tenants make it up.
         """
         processes: list[HordeProcessInfo] = []
         for process_info in self.values():
@@ -757,7 +758,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             device_index: When given, sum only processes pinned to that card; when None, sum every card.
         """
         total = 0.0
-        for process_info in self._committed_ledger_processes(device_index):
+        for process_info in self.committed_ledger_processes(device_index):
             total += (
                 context_constant_mb + (process_info.process_reserved_mb or 0) + (process_info.process_aimdo_mb or 0)
             )
@@ -777,7 +778,7 @@ class ProcessMap(dict[int, HordeProcessInfo]):
             now: The wall-clock epoch (``time.time()``) to age reports against.
             device_index: When given, consider only processes pinned to that card; when None, every card.
         """
-        contributors = self._committed_ledger_processes(device_index)
+        contributors = self.committed_ledger_processes(device_index)
         if not contributors:
             return None
         ages = [(now - p.report_sampled_at) if p.report_sampled_at is not None else float("inf") for p in contributors]

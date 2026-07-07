@@ -831,22 +831,28 @@ It derives them from two measurements, preferring hard data and erring conservat
   the structural per-context cost, available from the first scheduling tick, so it also covers the startup
   window where sibling processes have not yet reached idle. `vram_per_process_overhead_mb` (config) can
   override the first-context figure when an operator knows their card.
-- **The idle floor** is derived from the device-wide used-VRAM observed when every inference process is up,
-  idle, and holding no model. A real inference context can retain more allocator/runtime VRAM than the
-  probe's minimal matmul holder did (emptying the cache does not return it), so the floor can legitimately
-  refine the probe upward. The scheduler takes the **max** of the probe and the idle-floor derivation, so it
-  never believes in headroom the device will not give back.
+- **The idle floor** is derived from the worker's bare-context total observed when every inference process
+  is up, idle, and holding no model. The reading is supplied by the parent's attribution tick as truthful
+  NVML device-used **minus the reconciled shared baseline minus every GPU tenant's byte-exact allocator
+  reservation**, so what remains is only the contexts themselves, counted across every GPU tenant (safety
+  and the lanes included), never the device baseline or resident weights. Decomposing a per-child VRAM view
+  instead would fold the baseline and one tenant's weights into the "cost of one extra context" and multiply
+  that fiction across the process count (on Windows the per-child `mem_get_info` view is a per-process
+  artefact, which is exactly how a 16 GB card was once priced into a 15.9 GB committed ledger while holding
+  5.2 GB). A real inference context can still retain runtime VRAM the torch allocator cannot see (emptying
+  the cache does not return it); that retention survives the reservation subtraction and legitimately
+  refines the probe upward. The scheduler takes the **max** of the probe and the idle-floor derivation, so
+  it never believes in headroom the device will not give back.
 
-The risk in that `max` is a *transient* spike: with `unload_models_from_vram_often` off the caching allocator
-holds a just-unloaded model's freed blocks for a while, so a clean all-idle reading taken in that window
-reads high and, kept as the worst-ever floor, would pin an inflated per-context cost for the whole session
-and route ordinary models into needless teardowns. The floor is therefore kept honest by **invalidation**:
-any later device-wide used reading below the latched floor (with at least as many inference contexts live)
-proves the device runs below that level, so the retained VRAM was reclaimable and the floor is lowered to the
-demonstrated reading. A *sustained* retention is never contradicted and stands; a transient spike is
-corrected down toward the minimum the device has actually shown. (A reading with resident models only makes
-the correction conservative, since residency adds VRAM, so the invalidation does not need the clean
-all-idle precondition the capture does.)
+The risk in that `max` is a *transient* spike: a clean all-idle reading taken before a freed runtime
+allocation actually returned reads high and, kept as the worst-ever floor, would pin an inflated per-context
+cost for the whole session and route ordinary models into needless teardowns. The floor is therefore kept
+honest by **invalidation**: any later bare-context reading below the latched floor (with at least as many
+tenants live) proves the device runs below that level, so the retained VRAM was reclaimable and the floor is
+lowered to the demonstrated reading. A *sustained* retention is never contradicted and stands; a transient
+spike is corrected down toward the minimum the device has actually shown. (Resident weights are netted out
+via the byte-exact reservations, so a reading with models loaded only makes the correction conservative and
+the invalidation does not need the clean all-idle precondition the capture does.)
 
 The streaming-forecast log reports the chosen marginal alongside its inputs (`marginal/ctx=…MB(src=…,
 probe=…,idle_floor=…)`), so a bundle shows which signal won and the value the (corrected) idle floor settled
