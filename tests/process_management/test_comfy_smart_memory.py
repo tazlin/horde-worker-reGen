@@ -1,9 +1,11 @@
 """Tests for the ComfyUI smart-memory policy plumbed to inference-serving children.
 
-Per-job offloading (``--disable-smart-memory``) is the default: cross-process residency is not
-reconciled at dispatch time, so on tight cards a sampling peak beside an idle sibling's resident weights
-overcommits the device faster than the reclaim ladder can evict. The ``comfy_smart_memory`` bridge field
-opts in to cross-job VRAM residency for cards with headroom to spare.
+Per-job offloading (``--disable-smart-memory``) is the default. Cross-job VRAM residency (smart memory on)
+leaves idle weights on the card, so on tight cards a later job's sampling peak beside an idle sibling's
+resident weights can overcommit the device. Dispatch-time residency reconciliation holds such a dispatch
+and evicts the idle residents before it commits to VRAM; the default stays off until that regime is
+validated at system scale. The ``comfy_smart_memory`` bridge field opts in to cross-job residency for cards
+with headroom to spare.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from horde_worker_regen.process_management.worker_entry_points import _seed_extr
 
 
 def test_bridge_data_defaults_smart_memory_off() -> None:
-    """The default keeps per-job offloading until dispatch-time residency reconciliation exists."""
+    """The default keeps per-job offloading; cross-job residency is opt-in pending system-scale validation."""
     assert reGenBridgeData.model_fields["comfy_smart_memory"].default is False
 
 

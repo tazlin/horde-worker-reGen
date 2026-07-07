@@ -178,6 +178,30 @@ startup beat), then lets the arbiter decide the memory question through a `MONOL
 fires only on positive confirmation of room (a cycle that admits), so a cold start keeps the strict headway
 fractions rather than reading the admit-on-missing-telemetry relaxation as evidence of room.
 
+**Dispatch reconciliation.** The overlap gate reasons only about jobs already sampling; it says nothing about
+an idle sibling whose weights are still resident from a prior job. Yet the instant a RAM-staged job is handed
+to its child, its weights and first activation commit to VRAM, and that materialisation lands on top of any
+idle resident. Neither the preload nor the second-sampler seam prices that moment, so a dispatch is the last
+uncrossed admission point. The scheduler's dispatch adapter closes it with the same `MONOLITHIC_DISPATCH`
+identity: before a staged job is dispatched, it prices the job's expected materialisation against the card
+(the learned per-signature peak the admission overlay already uses, against the truthful device-free reading
+net of the proportional buffer that the identity's foreign-pressure branch enforces). A `FITS` releases the
+dispatch. A conflict holds it: the job keeps its head-of-queue position and is never faulted, the idle
+residents that tip the card over are evicted through the one reclaim owner (the head's own target slot is
+protected, so its staged weights are spared), and the dispatch re-asks each pass, releasing only once the
+arbiter next verdicts `FITS` on the governor's verified device-free reading. Can't-fit-ever jobs are already
+excluded by model serviceability, so this gate only ever holds a can't-fit-now dispatch.
+
+A held dispatch is not mistaken for a wedge. The job stays queued with its model resident and never enters
+in-progress, so the clocks that time the preloaded-to-inference-started transition have nothing to reap: the
+stale-entry expiry only touches a `LOADING` entry (not a resident one), the resident-cleanup spares any model
+a pending job still wants, and the lost-result reap and orphaned-in-progress reconciler act only on a job that
+actually ran. The deadlock detector does see an all-idle queue whose head model is resident as a queue
+deadlock, but only a queue deadlock sustained past the structural-wedge horizon reaches the recovery
+supervisor: a transient hold (reclaim frees the idle resident within a few ticks) clears far below it, while a
+hold that genuinely never clears (foreign pressure, reclaim exhausted) is exactly the case the recovery
+supervisor exists to reroute, identical to a never-admittable preload.
+
 **Disaggregated sampling.** The orchestrator's concurrent-sampling gate admits a first-of-kind sampling on an
 empty ledger, then defers to the arbiter's `DISAGG_SAMPLE` verdict for every later sampling. It passes the
 live in-flight sampling total with the request so a peak booked earlier in the same tick is counted before
@@ -208,9 +232,12 @@ deferred safety load is not stranded off-GPU, restoring it once the card has roo
 requires safety off its card. The initial cold-start safety load onto the GPU (at worker bring-up, before any
 heavy residency pressure) is not gated and always proceeds.
 
-Reclaim stays single-owner: only the preload path runs a `DEFER` verdict's actuations. Every other
-authoritative seam ignores those actuations and simply withholds the demand, so the dispatch re-asks next
-cycle without any second party driving reclaim.
+Reclaim stays single-owner even though two seams drive it: the preload path and the dispatch-reconciliation
+gate both run a `DEFER` verdict's actuations, but both route them through the one reclaim engine
+(`execute_arbiter_commands`), which the governor's SATURATED verified ladder shares, so there is never a
+second mechanism evicting the same card by different rules. Every other authoritative seam (overlap,
+disaggregated sampling, post-processing, safety) ignores the actuations and simply withholds the demand, so
+that dispatch re-asks next cycle without any second party driving reclaim.
 
 ### Cache reclaim is on-demand only
 
@@ -317,5 +344,11 @@ each free at the device level.
 Eviction is therefore just-in-time. A cross-model preload that no longer fits because idle retained
 residents hold the card defers while the ladder evicts them (the head-of-queue reclaim targets the idle
 resident and re-asks once its free verifies), and the under-pressure reclaim overrides retention outright.
-An unused hold costs only the interval until the next dispatch, so retention can stay generous while the
-card is healthy and the ladder takes the weights back the instant any overcommit picture appears.
+The dispatch-reconciliation gate is the same reclaim in the other direction: where the preload gate makes
+room to bring a model *toward* the card, the dispatch gate makes room for an already-staged job to *commit*
+to the card, evicting the retained idle resident that would otherwise share the sampling peak. An unused hold
+costs only the interval until the next dispatch, so retention can stay generous while the card is healthy and
+the ladder takes the weights back the instant any overcommit picture appears. This dispatch-time
+reconciliation is the precondition for defaulting cross-job retention on: until a staged dispatch is priced
+against the card, retention's idle residents can only be reclaimed after the fact, so the retention default
+stays off pending that regime's validation at system scale.

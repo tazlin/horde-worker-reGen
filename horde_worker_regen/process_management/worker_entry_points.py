@@ -165,7 +165,7 @@ class InferenceProcessEntryPoint(Protocol):
         vram_heavy_models: bool = False,
         dry_run_skip_inference: bool = False,
         dry_run_inference_delay: float = 1.0,
-        comfy_smart_memory: bool = True,
+        comfy_smart_memory: bool = False,
     ) -> None:
         """Run an inference process until told to end."""
 
@@ -187,7 +187,7 @@ class SafetyProcessEntryPoint(Protocol):
         amd_gpu: bool = False,
         directml: int | None = None,
         dry_run_skip_safety: bool = False,
-        comfy_smart_memory: bool = True,
+        comfy_smart_memory: bool = False,
     ) -> None:
         """Run a safety process until told to end."""
 
@@ -208,7 +208,7 @@ class PostProcessProcessEntryPoint(Protocol):
         amd_gpu: bool = False,
         directml: int | None = None,
         dry_run_skip_post_processing: bool = False,
-        comfy_smart_memory: bool = True,
+        comfy_smart_memory: bool = False,
     ) -> None:
         """Run a post-processing process until told to end."""
 
@@ -229,7 +229,7 @@ class VaeLaneProcessEntryPoint(Protocol):
         amd_gpu: bool = False,
         directml: int | None = None,
         dry_run_skip_vae_lane: bool = False,
-        comfy_smart_memory: bool = True,
+        comfy_smart_memory: bool = False,
     ) -> None:
         """Run the VAE lane process until told to end."""
 
@@ -251,7 +251,7 @@ class ComponentProcessEntryPoint(Protocol):
         directml: int | None = None,
         horde_model_names: list[str] | None = None,
         dry_run_skip_component_lane: bool = False,
-        comfy_smart_memory: bool = True,
+        comfy_smart_memory: bool = False,
     ) -> None:
         """Run the component lane process until told to end."""
 
@@ -302,7 +302,7 @@ def start_inference_process(
     dry_run_inference_delay: float = 1.0,
     gpu_sampling_lease: Semaphore | None = None,
     expect_image_models: bool = True,
-    comfy_smart_memory: bool = True,
+    comfy_smart_memory: bool = False,
 ) -> None:
     """Start an inference process.
 
@@ -336,7 +336,7 @@ def start_inference_process(
             database is expected rather than a fatal error. Defaults to True.
         comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
             device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
-            offloads every model to RAM after each job. Defaults to True.
+            offloads every model to RAM after each job. Defaults to False.
     """
     _spawn_timing_mark(process_id, "inference", "entry")
     # Must precede the first torch/hordelib import below so the allocator reads it, and the device mask
@@ -477,7 +477,7 @@ def start_safety_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_safety: bool = False,
-    comfy_smart_memory: bool = True,
+    comfy_smart_memory: bool = False,
 ) -> None:
     """Start a safety process.
 
@@ -501,7 +501,7 @@ def start_safety_process(
             Defaults to False.
         comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
             device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
-            offloads every model to RAM after each job. Defaults to True.
+            offloads every model to RAM after each job. Defaults to False.
     """
     _spawn_timing_mark(process_id, "safety", "entry")
     # The on-GPU safety model (cpu_only False) must be masked to its assigned card before torch loads, the
@@ -607,7 +607,7 @@ def start_post_process_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_post_processing: bool = False,
-    comfy_smart_memory: bool = True,
+    comfy_smart_memory: bool = False,
 ) -> None:
     """Start the dedicated post-processing process.
 
@@ -630,7 +630,7 @@ def start_post_process_process(
             echo images back. Defaults to False.
         comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
             device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
-            offloads every model to RAM after each job. Defaults to True.
+            offloads every model to RAM after each job. Defaults to False.
     """
     _spawn_timing_mark(process_id, "post_process", "entry")
     if not dry_run_skip_post_processing:
@@ -732,7 +732,7 @@ def start_vae_lane_process(
     amd_gpu: bool = False,
     directml: int | None = None,
     dry_run_skip_vae_lane: bool = False,
-    comfy_smart_memory: bool = True,
+    comfy_smart_memory: bool = False,
 ) -> None:
     """Start the dedicated VAE lane process.
 
@@ -755,7 +755,7 @@ def start_vae_lane_process(
             stand-in latent/image bytes. Defaults to False.
         comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
             device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
-            offloads every model to RAM after each job. Defaults to True.
+            offloads every model to RAM after each job. Defaults to False.
     """
     _spawn_timing_mark(process_id, "vae_lane", "entry")
     if not dry_run_skip_vae_lane:
@@ -848,7 +848,7 @@ def start_component_process(
     directml: int | None = None,
     horde_model_names: list[str] | None = None,
     dry_run_skip_component_lane: bool = False,
-    comfy_smart_memory: bool = True,
+    comfy_smart_memory: bool = False,
 ) -> None:
     """Start the dedicated component lane process.
 
@@ -872,7 +872,7 @@ def start_component_process(
         dry_run_skip_component_lane (bool, optional): Skip the backend and materialisation. Defaults to False.
         comfy_smart_memory (bool, optional): Keep ComfyUI's smart memory management on so model weights stay
             device-resident across jobs. False restores the old ``--disable-smart-memory`` behavior that
-            offloads every model to RAM after each job. Defaults to True.
+            offloads every model to RAM after each job. Defaults to False.
     """
     _spawn_timing_mark(process_id, "component", "entry")
     if not dry_run_skip_component_lane:

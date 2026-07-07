@@ -2962,6 +2962,17 @@ class HordeWorkerProcessManager:
             ladder_verified_frees_mb=self._reclaim_ladder.verified_frees_mb,
             ladder_verification_shortfalls=self._reclaim_ladder.verification_shortfalls,
             per_step_floor_triggers=self._per_step_floor_triggers,
+            dispatch_reconciliation_holds=self._inference_scheduler.latest_dispatch_reconciliation_holds(),
+            dispatch_reconciliation_conflicts=self._inference_scheduler.latest_dispatch_reconciliation_conflicts(),
+            dispatch_reconciliation_hold_seconds=(
+                self._inference_scheduler.latest_dispatch_reconciliation_hold_seconds()
+            ),
+            dispatch_reconciliation_released_by_reclaim=(
+                self._inference_scheduler.latest_dispatch_reconciliation_released_by_reclaim()
+            ),
+            dispatch_reconciliation_released_by_natural_free=(
+                self._inference_scheduler.latest_dispatch_reconciliation_released_by_natural_free()
+            ),
         )
 
     def describe_run_phase(self) -> tuple[str, str]:

@@ -504,8 +504,12 @@ away frees nothing and is skipped immediately. When the whole ladder is exhauste
 SATURATED, the episode is marked **unresolved**: nothing the worker can give back relieved the card, the
 signal a later, harder rung reads. The rung count, cumulative verified frees, and shortfall count are
 surfaced on the run-metrics snapshot (`ladder_rungs_issued`, `ladder_verified_frees_mb`,
-`ladder_verification_shortfalls`). The arbiter's deferred-preload actuations run through this same engine, so
-the governor's SATURATED ladder and the arbiter's per-cycle DEFER ladder share one reclaim execution surface.
+`ladder_verification_shortfalls`). The arbiter's deferred actuations, both the preload path's and the
+dispatch-reconciliation gate's, run through this same engine, so the governor's SATURATED ladder and the
+arbiter's per-cycle DEFER ladder share one reclaim execution surface. The dispatch gate's own activity is
+surfaced separately (`dispatch_reconciliation_holds`, `dispatch_reconciliation_conflicts`,
+`dispatch_reconciliation_hold_seconds`, and the reclaim-versus-natural-free release split) so a soak can
+attribute the re-transfer cost of holding a dispatch to reconcile co-resident weights.
 
 The verification window is **wider for teardown-class rungs**. A model unload or cache release frees its memory
 synchronously as the actuator returns, but a lane pause and a safety off-GPU cycle free their memory only once

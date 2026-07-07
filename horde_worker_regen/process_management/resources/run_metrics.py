@@ -291,6 +291,27 @@ class RunMetricsSnapshot(BaseModel):
     or above the floor multiple of its expected per-step time while its card was at PRESSURE or SATURATED,
     forcing the reclaim ladder to run without waiting for the whole-job elapsed-ratio rungs. Calibration
     visibility only."""
+    dispatch_reconciliation_holds: int = 0
+    """Count of dispatches the residency-reconciliation gate held this run: a staged job whose VRAM
+    materialisation would over-commit the card was kept queued (never faulted) while the single reclaim owner
+    evicted idle residents, rather than committing its weights to VRAM into an over-commit. Calibration
+    visibility only."""
+    dispatch_reconciliation_conflicts: int = 0
+    """Count of dispatch-time residency conflicts detected this run: every scheduling pass a staged dispatch
+    was priced non-fitting counts once, so this can exceed the held-dispatch count when a single job is held
+    across several passes. Calibration visibility only."""
+    dispatch_reconciliation_hold_seconds: float = 0.0
+    """Cumulative seconds dispatches spent held for residency reconciliation this run, summed across held jobs.
+    A rising figure marks the card spending real time reconciling co-resident weights before dispatch.
+    Calibration visibility only."""
+    dispatch_reconciliation_released_by_reclaim: int = 0
+    """Count of held dispatches released after this gate's own idle-resident eviction freed the room this run
+    (device-free verified sufficient on a later pass). Its counterpart to natural free separates room this gate
+    made from room the card recovered on its own. Calibration visibility only."""
+    dispatch_reconciliation_released_by_natural_free: int = 0
+    """Count of held dispatches released because the card freed on its own this run (a sibling finished or
+    foreign pressure abated), without this gate having emitted an eviction for the held job. Calibration
+    visibility only."""
 
 
 class WorkerRunMetrics:
@@ -643,6 +664,11 @@ class WorkerRunMetrics:
         ladder_verified_frees_mb: float = 0.0,
         ladder_verification_shortfalls: int = 0,
         per_step_floor_triggers: int = 0,
+        dispatch_reconciliation_holds: int = 0,
+        dispatch_reconciliation_conflicts: int = 0,
+        dispatch_reconciliation_hold_seconds: float = 0.0,
+        dispatch_reconciliation_released_by_reclaim: int = 0,
+        dispatch_reconciliation_released_by_natural_free: int = 0,
     ) -> RunMetricsSnapshot:
         """Return an immutable snapshot of everything observed so far.
 
@@ -678,4 +704,9 @@ class WorkerRunMetrics:
             ladder_verified_frees_mb=ladder_verified_frees_mb,
             ladder_verification_shortfalls=ladder_verification_shortfalls,
             per_step_floor_triggers=per_step_floor_triggers,
+            dispatch_reconciliation_holds=dispatch_reconciliation_holds,
+            dispatch_reconciliation_conflicts=dispatch_reconciliation_conflicts,
+            dispatch_reconciliation_hold_seconds=dispatch_reconciliation_hold_seconds,
+            dispatch_reconciliation_released_by_reclaim=dispatch_reconciliation_released_by_reclaim,
+            dispatch_reconciliation_released_by_natural_free=dispatch_reconciliation_released_by_natural_free,
         )

@@ -527,6 +527,21 @@ class InferenceScheduler:
         # adapter runs a verdict's commands and cleared once they have. None outside that window.
         self._preload_actuation: _PreloadActuation | None = None
 
+        # Dispatch-time residency reconciliation state. The dispatch gate re-uses the arbiter's
+        # MONOLITHIC_DISPATCH identity to check that a staged job's VRAM materialisation fits the card before it
+        # is handed to a child (the moment RAM-staged weights actually commit to VRAM). A conflicting verdict
+        # holds the dispatch (the job keeps its queue position, never faulted) and routes idle-resident eviction
+        # through the single reclaim owner. The per-job map stamps when each held job first held, so a release is
+        # attributed to reclaim (this gate emitted eviction commands for it) versus natural free (device-free
+        # recovered on its own); the counters are calibration visibility only.
+        self._dispatch_hold_since: dict[str, float] = {}
+        self._dispatch_hold_reclaim_requested: set[str] = set()
+        self._dispatch_reconciliation_holds = 0
+        self._dispatch_reconciliation_conflicts = 0
+        self._dispatch_reconciliation_hold_seconds = 0.0
+        self._dispatch_reconciliation_released_by_reclaim = 0
+        self._dispatch_reconciliation_released_by_natural_free = 0
+
         # The learned-footprint store, injected by the manager (one shared instance, the same the message
         # dispatcher observes into). Admission pricing of a job's sampling peak reads it so a measured
         # activation high-water raises the static per-model seed the predictor returns; a static seed
@@ -6255,6 +6270,169 @@ class InferenceScheduler:
                 process_timeout=bridge_data.process_timeout,
             )
 
+    def _prune_abandoned_dispatch_holds(self) -> None:
+        """Drop hold bookkeeping for jobs no longer pending inference (rerouted, faulted, or dispatched).
+
+        An abandoned hold (its job left the pending queue by some path other than a release through the gate)
+        is not a release, so it advances neither release counter; it is simply forgotten so the maps stay
+        bounded to the live queue.
+        """
+        pending_ids = {str(job.id_) for job in self._job_tracker.jobs_pending_inference if job.id_ is not None}
+        for held_id in [held_id for held_id in self._dispatch_hold_since if held_id not in pending_ids]:
+            self._dispatch_hold_since.pop(held_id, None)
+            self._dispatch_hold_reclaim_requested.discard(held_id)
+
+    def _note_dispatch_hold(self, job: ImageGenerateJobPopResponse, *, reclaim_requested: bool) -> None:
+        """Record that the dispatch of ``job`` was held this pass, stamping the first hold and its cause.
+
+        Every hold pass counts a conflict; the first hold for a job also stamps the hold-start instant and
+        counts a distinct held dispatch. A pass that emitted eviction commands marks the job so its eventual
+        release is attributed to reclaim rather than to the card recovering on its own.
+        """
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None:
+            return
+        self._dispatch_reconciliation_conflicts += 1
+        if job_id not in self._dispatch_hold_since:
+            self._dispatch_hold_since[job_id] = time.time()
+            self._dispatch_reconciliation_holds += 1
+        if reclaim_requested:
+            self._dispatch_hold_reclaim_requested.add(job_id)
+
+    def _resolve_dispatch_hold(self, job: ImageGenerateJobPopResponse) -> None:
+        """Close out any dispatch hold on ``job`` now that it fits, folding its duration and release cause.
+
+        A no-op for a job that was never held (the common admit-first-pass case). A held job's accumulated
+        wait folds into the cumulative hold seconds, and the release is attributed to reclaim when this gate
+        emitted eviction commands during the hold, otherwise to the card freeing on its own.
+        """
+        job_id = str(job.id_) if job.id_ is not None else None
+        if job_id is None:
+            return
+        held_since = self._dispatch_hold_since.pop(job_id, None)
+        if held_since is None:
+            self._dispatch_hold_reclaim_requested.discard(job_id)
+            return
+        self._dispatch_reconciliation_hold_seconds += max(0.0, time.time() - held_since)
+        if job_id in self._dispatch_hold_reclaim_requested:
+            self._dispatch_reconciliation_released_by_reclaim += 1
+            self._dispatch_hold_reclaim_requested.discard(job_id)
+        else:
+            self._dispatch_reconciliation_released_by_natural_free += 1
+
+    def _dispatch_residency_reconciliation_holds(
+        self,
+        next_job: ImageGenerateJobPopResponse,
+        process_with_model: HordeProcessInfo,
+    ) -> bool:
+        """Return whether ``next_job``'s dispatch must be held because its VRAM would over-commit the card now.
+
+        The dispatch of an already-RAM-staged job is the moment its weights and first activation actually
+        materialise on the device. Admission is consulted at preload and at the second-concurrent-sampler seam,
+        but not here, so a job whose materialisation lands beside an idle sibling's still-resident weights can
+        tip the card over the paging cliff faster than the tick-paced reclaim reacts. This gate closes that
+        seam by pricing the dispatch through the arbiter's single MONOLITHIC_DISPATCH identity (the same
+        ledger-driven admission math the preload and overlap seams use, which already tests the truthful
+        device-free reading net of the proportional buffer in its foreign-pressure branch): a FITS releases the
+        dispatch, a DEFER or DENY holds it.
+
+        On a hold the job is never faulted: it keeps its queue position and re-asks on the next scheduling pass.
+        The conflicting idle residents are evicted through the one reclaim owner (the same
+        :meth:`_execute_preload_actuations` surface the arbiter's preload-DEFER path drives), never inline and
+        never through a second ladder; the head's own target slot is protected. The hold releases only once the
+        arbiter next verdicts FITS, matching the verified-reclaim doctrine that a demand is admitted into
+        measured reality rather than into hope. Can't-fit-ever models are excluded upstream by model
+        serviceability, so this gate only ever holds a can't-fit-now dispatch.
+        """
+        self._prune_abandoned_dispatch_holds()
+
+        if next_job.model is None:
+            return False
+
+        device_index = process_with_model.device_index if self._multi_gpu_routing_active else None
+        baseline = self._model_metadata.get_baseline(next_job.model)
+        has_reclaimable_idle_model = self._has_reclaimable_idle_model(
+            process_with_model,
+            for_head_of_queue=True,
+            device_index=device_index,
+        )
+        request = VramRequest(
+            kind=VramRequestKind.MONOLITHIC_DISPATCH,
+            job_label=str(next_job.model),
+            baseline=baseline,
+            device_index=device_index,
+            target_process_id=process_with_model.process_id,
+            candidate_delta_mb=self._measured_admission_candidate_delta_mb(
+                next_job,
+                baseline,
+                process_id=process_with_model.process_id,
+                disaggregated=self._is_disaggregation_class_eligible(next_job),
+            ),
+            is_head_of_queue=True,
+            starved_seconds=self._head_starved_seconds(next_job),
+            has_reclaimable_idle_model=has_reclaimable_idle_model,
+            # A staged dispatch never reduces the live inference-context count: it evicts idle residents to make
+            # room, it does not collapse the co-resident pool the way a whole-card preload does.
+            can_reduce_live_contexts=False,
+        )
+        verdict = self._ensure_preload_arbiter().evaluate(request)
+
+        if verdict.admits:
+            self._resolve_dispatch_hold(next_job)
+            return False
+
+        # The dispatch cannot land yet. Route the described idle-resident eviction through the single reclaim
+        # owner, protecting the head's own slot, then hold. The job re-asks next pass and releases once the
+        # arbiter verdicts FITS (the governor's device-free reading having verified the reclaimed room).
+        actuations = verdict.required_actuations
+        forecast = self._forecast_streaming(next_job, baseline, device_index=device_index)
+        self._preload_actuation = _PreloadActuation(
+            job=next_job,
+            available_process=process_with_model,
+            forecast=forecast,
+            max_resident=None,
+        )
+        try:
+            self._execute_preload_actuations(
+                actuations,
+                device_index=device_index,
+                for_head_of_queue=True,
+            )
+        finally:
+            self._preload_actuation = None
+        self._note_dispatch_hold(next_job, reclaim_requested=bool(actuations))
+
+        suppressed = self._scheduler_diagnostic_suppressed_count(
+            "dispatch_residency_hold",
+            (str(next_job.id_), verdict.disposition.value),
+        )
+        if suppressed is not None:
+            logger.opt(ansi=True).warning(
+                f"<fg #f0beff>Holding dispatch of {next_job.model} to reconcile residency: {verdict.reason}. "
+                "Evicting idle VRAM so the job's materialisation fits the card before it commits to VRAM.</>",
+            )
+        return True
+
+    def latest_dispatch_reconciliation_holds(self) -> int:
+        """Return the count of dispatches held for residency reconciliation this run (calibration visibility)."""
+        return self._dispatch_reconciliation_holds
+
+    def latest_dispatch_reconciliation_conflicts(self) -> int:
+        """Return the count of dispatch-time residency conflicts detected this run (calibration visibility)."""
+        return self._dispatch_reconciliation_conflicts
+
+    def latest_dispatch_reconciliation_hold_seconds(self) -> float:
+        """Return the cumulative seconds dispatches spent held for residency reconciliation (calibration)."""
+        return self._dispatch_reconciliation_hold_seconds
+
+    def latest_dispatch_reconciliation_released_by_reclaim(self) -> int:
+        """Return the count of held dispatches released after this gate's eviction freed room (calibration)."""
+        return self._dispatch_reconciliation_released_by_reclaim
+
+    def latest_dispatch_reconciliation_released_by_natural_free(self) -> int:
+        """Return the count of held dispatches released by the card recovering on its own (calibration)."""
+        return self._dispatch_reconciliation_released_by_natural_free
+
     async def start_inference(self) -> bool:
         """Start inference for the next job in jobs_pending_inference, if possible.
 
@@ -6291,6 +6469,14 @@ class InferenceScheduler:
         if self._should_defer_dispatch_for_post_processing(next_job):
             # A post-processing chain holds the card and this job's sampling peak cannot share it: wait
             # out the chain (seconds) rather than co-run and demand-page both for the whole overlap.
+            return False
+
+        if self._dispatch_residency_reconciliation_holds(next_job, process_with_model):
+            # The staged job's VRAM materialisation would over-commit the card against an idle sibling's
+            # still-resident weights: hold the dispatch (the job keeps its head-of-queue position) while the
+            # single reclaim owner evicts the idle residents, and re-ask next pass once the arbiter verifies the
+            # reclaimed room fits it. This is the seam where RAM-staged weights actually commit to VRAM, which
+            # neither the preload nor the second-sampler admission consult.
             return False
 
         if next_job_and_process.line_skip is not None:
