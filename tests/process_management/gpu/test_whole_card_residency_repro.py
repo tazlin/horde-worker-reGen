@@ -988,17 +988,22 @@ class TestWholeCardTerminalAdmit:
         head_job = make_job_pop_response(_FLUX_MODEL, width=1216, height=1216)
         await track_popped_job_async(job_tracker, head_job)
 
-        # Freeze an arbiter cycle where the ledger identity denies (committed 13000 + weights 11500 exceed
-        # capacity (16375 - 1500 baseline - 819 noise) = 14056), yet the weights physically fit the truthful
-        # device-free reading (15007 - 819 = 14188 >= 11500): the foreign-pressure fit-into-reality path.
+        # Freeze an arbiter cycle where the ledger identity denies while the truthful device-free reading
+        # still physically holds the priced candidate (~9774 MB for this head at sole residency): the
+        # foreign-pressure fit-into-reality path. The geometry must be honest: committed 6000 stays within
+        # the phantom tolerance of device-used 4975, because an honest ledger can only deny a candidate the
+        # free card holds when real (foreign-attributed) load is present; an inflated committed on an empty
+        # card would instead classify as a phantom and take the phantom-truth bypass, which marks nothing
+        # over-budget. Arithmetic: committed 6000 + candidate 9774 = 15774 > capacity (16375 - 1500 - 819)
+        # = 14056 (identity denies); candidate 9774 <= device-free 11400 - noise 819 (physically fits).
         state = DeviceVramState(
             total_vram_mb=float(_DEVICE_TOTAL_VRAM_MB),
             baseline_mb=1500.0,
-            committed_vram_mb=13000.0,
+            committed_vram_mb=6000.0,
             planned_unmaterialized_mb=0.0,
             committed_is_stale=False,
             noise_buffer_mb=admission_noise_buffer_mb(float(_DEVICE_TOTAL_VRAM_MB)),
-            device_free_mb=15007.0,
+            device_free_mb=11400.0,
         )
         arbiter = VramArbiter()
         arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: state}))

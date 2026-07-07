@@ -65,6 +65,25 @@ _RECALIBRATE_INTERVAL_SECONDS = 30.0
 release their allocator cache and re-report periodically rather than every attribution tick while the fresh
 reports are still settling back to device truth."""
 
+
+def committed_ledger_is_phantom(*, committed_vram_mb: float, device_used_mb: float | None) -> bool:
+    """Whether the committed ledger over-counts the device-used truth beyond the phantom tolerance.
+
+    The worker cannot hold more device VRAM than the device itself reports used, so ``committed`` exceeding
+    ``device_used`` by more than :data:`_LEDGER_PHANTOM_TOLERANCE_MB` is arithmetically impossible for a
+    truthful ledger: the over-count is bookkeeping, not memory. The single owner of that judgement; both the
+    drift reconciler (to signal recalibration instead of eviction) and the VRAM arbiter (to refuse
+    destructive reclaim and price against device truth instead) key on this exact predicate so they can
+    never disagree about whether the ledger is lying. Returns False when no device-used truth is available:
+    without the truthful reading the ledger must be trusted.
+
+    Args:
+        committed_vram_mb: The committed-VRAM ledger sum (MB) for the device.
+        device_used_mb: The truthful device-wide used VRAM (MB), or None when unavailable.
+    """
+    return device_used_mb is not None and committed_vram_mb > device_used_mb + _LEDGER_PHANTOM_TOLERANCE_MB
+
+
 _REPORT_STALENESS_SECONDS = 15.0
 """Report age (seconds) beyond which a ledger contributor is treated as an UNKNOWN, incomparable tenant.
 
@@ -179,8 +198,8 @@ class VramAttributionReconciler:
         self._pressure_suppressed = False
         # A phantom over-commit (committed exceeds device-used truth) drives recalibration, not eviction; it
         # carries its own confirming streak and rate-limit so a transient reading does not fire and a persistent
-        # one recalibrates periodically rather than every tick.
-        self._ledger_phantom_tolerance_mb = _LEDGER_PHANTOM_TOLERANCE_MB
+        # one recalibrates periodically rather than every tick. The phantom judgement itself lives in
+        # committed_ledger_is_phantom, shared with the arbiter.
         self._recalibrate_interval_seconds = _RECALIBRATE_INTERVAL_SECONDS
         self._phantom_consecutive = 0
         self._last_recalibrate_time: float | None = None
@@ -335,10 +354,9 @@ class VramAttributionReconciler:
             )
 
         over_ceiling = (committed_vram_mb + baseline) > total_vram_mb
-        phantom = (
-            over_ceiling
-            and device_used_mb is not None
-            and committed_vram_mb > device_used_mb + self._ledger_phantom_tolerance_mb
+        phantom = over_ceiling and committed_ledger_is_phantom(
+            committed_vram_mb=committed_vram_mb,
+            device_used_mb=device_used_mb,
         )
 
         should_unload = False

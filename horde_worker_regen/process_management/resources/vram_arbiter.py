@@ -76,6 +76,7 @@ from horde_worker_regen.process_management.resources.admission_identity import (
     evaluate_admission,
 )
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.resources.vram_attribution import committed_ledger_is_phantom
 
 _STARVATION_DIAGNOSTIC_SECONDS = 60.0
 """Age (seconds) past which a head-of-queue request that keeps deferring with reclaim exhausted and no
@@ -355,6 +356,11 @@ class VramVerdict:
     physically fits the truthful device-free reading net of the noise buffer despite foreign load. The caller
     loads it under the heavy-head grace (it may sample slowly while foreign load holds the card) rather than
     as an ordinary co-resident admit."""
+    phantom_truth_admit: bool = False
+    """True on a FITS granted against device truth because the committed ledger was phantom-flagged: the
+    ledger over-counted the device-used truth beyond the phantom tolerance, so its rejection was bookkeeping,
+    not memory. Distinct from ``foreign_pressure_admit`` (real foreign load, reclaim exhausted); here the
+    pressure never existed and no reclaim was spent on it."""
 
     @property
     def admits(self) -> bool:
@@ -399,6 +405,7 @@ class VramArbiter:
         self.admission_foreign_pressure_defers = 0
         self.starvation_diagnostics = 0
         self.starvation_context_teardowns = 0
+        self.phantom_truth_admissions = 0
 
     def begin_cycle(self, snapshot: MeasuredVramSnapshot) -> None:
         """Freeze the measurement this cycle's requests are priced against."""
@@ -480,7 +487,20 @@ class VramArbiter:
                 measured=measured,
             )
 
+        ledger_phantom = self._ledger_phantom(state)
+        if ledger_phantom and not self._verified_reclaim_unfinished(state):
+            # The governor's verified ladder outranks the phantom bypass: SATURATED is a truthful device-level
+            # reading, so while its ladder still works the card, even a phantom-rejected head keeps deferring.
+            phantom_verdict = self._phantom_truth_admission(request, state, measured)
+            if phantom_verdict is not None:
+                return phantom_verdict
+
         actuations = self._escalation_ladder(state, request)
+        if ledger_phantom:
+            # A phantom over-commit is bookkeeping: evicting a model or tearing a context down reclaims
+            # nothing the ledger's fiction counted, so only the cache-release rungs (the recalibration
+            # actuation) survive. Destructive reclaim under a lying ledger is how a free card gets torn down.
+            actuations = tuple(command for command in actuations if command.kind is ActuatorCommandKind.RELEASE_CACHE)
         if actuations or self._verified_reclaim_unfinished(state):
             # Reclaim can still free space on this card: the arbiter's own per-cycle ladder still emits rungs,
             # or the governor's verified reclaim ladder is still running (SATURATED and not proven
@@ -510,7 +530,7 @@ class VramArbiter:
         # weight eviction cannot reclaim, because a context's VRAM returns only when its process exits) escalates
         # to a verified context teardown rather than deferring forever. It never force-admits: the teardown only
         # frees room and the head re-asks for a verified FITS next cycle.
-        teardown_actuations = self._starvation_context_teardown(request)
+        teardown_actuations = None if ledger_phantom else self._starvation_context_teardown(request)
         if teardown_actuations is not None:
             self.starvation_context_teardowns += 1
             return VramVerdict(
@@ -645,6 +665,69 @@ class VramArbiter:
             ),
             measured=measured,
             required_actuations=self._escalation_ladder(state, request),
+        )
+
+    @staticmethod
+    def _ledger_phantom(state: DeviceVramState) -> bool:
+        """Whether this cycle's committed ledger is contradicted by the device-used truth on this card.
+
+        Requires both the raw total and the truthful device-free reading; without them there is no truth to
+        contradict the ledger with, and the ledger must be trusted. The judgement itself is shared with the
+        drift reconciler via ``committed_ledger_is_phantom`` so the two can never disagree.
+        """
+        if state.total_vram_mb is None or state.device_free_mb is None:
+            return False
+        return committed_ledger_is_phantom(
+            committed_vram_mb=state.committed_vram_mb,
+            device_used_mb=state.total_vram_mb - state.device_free_mb,
+        )
+
+    def _phantom_truth_admission(
+        self,
+        request: VramRequest,
+        state: DeviceVramState,
+        measured: AdmissionVerdict,
+    ) -> VramVerdict | None:
+        """Admit a ledger-rejected head against device truth when the ledger is provably lying.
+
+        The committed ledger is the admission arithmetic's floor, but it is bookkeeping: when it exceeds the
+        truthful device-used reading beyond the phantom tolerance, the over-count is arithmetically
+        impossible for a truthful ledger and pricing against it withholds a card that is demonstrably free.
+        Deferring on it instead would hand the request to the reclaim ladder, whose rungs escalate to model
+        eviction and context teardown: destructive actuation spent on memory the device never held. So a
+        phantom-rejected candidate is re-priced against the truthful device-free reading, charged with the
+        planned-but-unmaterialized overlay (loads already admitted will consume that free space) net of its
+        own outstanding charge, plus the noise buffer.
+
+        Reserved for the head of the queue, the same priority rule as the foreign-pressure reality-admit: a
+        line-skip materialising into the truthful room would starve the head that needs the same space.
+        Returns None (fall through to the ordinary, rung-suppressed flow) for a non-head request or when even
+        device truth has no room; the caller only reaches here with the ledger already phantom-flagged.
+        """
+        if state.device_free_mb is None or state.total_vram_mb is None:
+            return None
+        if not request.is_head_of_queue:
+            return None
+        candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
+        net_planned_mb = max(0.0, state.planned_unmaterialized_mb - max(0.0, request.own_planned_unmaterialized_mb))
+        truth_demand_mb = candidate_delta_mb + net_planned_mb
+        truth_room_mb = state.device_free_mb - state.noise_buffer_mb
+        if truth_demand_mb > truth_room_mb:
+            return None
+        device_used_mb = state.total_vram_mb - state.device_free_mb
+        self.phantom_truth_admissions += 1
+        return VramVerdict(
+            disposition=VramDisposition.FITS,
+            request_kind=request.kind,
+            device_index=request.device_index,
+            reason=(
+                f"committed ledger is phantom (committed {state.committed_vram_mb:.0f}MB vs device-used "
+                f"{device_used_mb:.0f}MB); admitted against device truth: candidate {candidate_delta_mb:.0f} + "
+                f"planned {net_planned_mb:.0f} = {truth_demand_mb:.0f}MB within free {state.device_free_mb:.0f} - "
+                f"noise {state.noise_buffer_mb:.0f}MB. ledger said: {measured.reason()}"
+            ),
+            measured=measured,
+            phantom_truth_admit=True,
         )
 
     @staticmethod

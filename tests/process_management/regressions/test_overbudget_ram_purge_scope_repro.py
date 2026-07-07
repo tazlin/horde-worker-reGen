@@ -92,16 +92,18 @@ def _drive_overbudget_admit(scheduler, job) -> bool:  # noqa: ANN001
     scheduler._vram_budget.check_job = Mock(
         return_value=BudgetVerdict(fits=False, predicted_mb=5000.0, available_mb=5000.0, reserve_mb=2048.0),
     )
-    # committed 20000 fits capacity ((24000 - 1000 - 512) = 22488), so the shortfall is foreign; the candidate
+    # committed 16000 fits capacity ((24000 - 1000 - 512) = 22488), so the shortfall is foreign; the candidate
     # (~8315 MB for this SDXL head) physically fits the truthful device-free reading net of the noise buffer
-    # (16000 - 512 = 15488), so the admit takes the foreign-pressure fit-into-reality path.
+    # (9500 - 512 = 8988), so the admit takes the foreign-pressure fit-into-reality path. committed 16000
+    # stays within the phantom tolerance of device-used 14500, so the ledger is honest and the admit
+    # exercises the foreign-pressure branch rather than the phantom-truth bypass.
     state = DeviceVramState(
         total_vram_mb=24000.0,
         baseline_mb=1000.0,
-        committed_vram_mb=20000.0,
+        committed_vram_mb=16000.0,
         planned_unmaterialized_mb=0.0,
         committed_is_stale=False,
-        device_free_mb=16000.0,
+        device_free_mb=9500.0,
     )
     arbiter = VramArbiter()
     arbiter.begin_cycle(MeasuredVramSnapshot(devices={0: state}))

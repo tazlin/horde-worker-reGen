@@ -139,7 +139,26 @@ identity cannot express that no-op (the resident model's own reservation can leg
 noise-adjusted ceiling, which would otherwise withhold a dispatch that needs no memory), so this is the
 whole-card analogue of the disaggregated stage dispatch a resident lane never withholds.
 
-If it does not fit, the arbiter first asks whether reclaim can still make progress. Reclaim can still make
+Before reclaim is consulted, a non-fitting request is checked against the **phantom-ledger** judgement. The
+committed floor is bookkeeping, and the worker cannot hold more device VRAM than the device itself reports
+used: when committed exceeds the truthful device-used reading beyond a tolerance
+([`committed_ledger_is_phantom`][horde_worker_regen.process_management.resources.vram_attribution.committed_ledger_is_phantom],
+the same predicate the drift reconciler keys its recalibration on), the rejection is arithmetically
+impossible for a truthful ledger and the over-count is fiction. Handing that rejection to the reclaim ladder
+would spend destructive actuation (model eviction, context teardown, whole-card residency) on memory the
+device never held, so instead the head of queue is re-priced against the truthful device-free reading:
+candidate plus the (self-netted) planned overlay against device-free minus the noise buffer. When it
+physically fits, the verdict is a `FITS` flagged `phantom_truth_admit` and counted in
+`phantom_truth_admissions`; nothing is marked over-budget, because the card genuinely has the room. The
+bypass keeps the same head-of-queue priority rule as the foreign-pressure admit, and the device-free
+governor outranks it: while a SATURATED card's verified ladder is still working, even a phantom-rejected
+head keeps deferring, because SATURATED is itself a device-level truth. While the phantom holds, the
+escalation ladder below describes only its cache-release rungs (the recalibration actuation) and the
+starved-head context teardown is suppressed: destructive reclaim under a lying ledger is how a free card
+gets torn down. The reconciler's recalibration (asking idle lanes to release their allocator cache and
+re-report) runs on its own cadence to converge the ledger back to truth.
+
+If it does not fit, the arbiter next asks whether reclaim can still make progress. Reclaim can still make
 progress when the arbiter's own ladder emits a command, or when the device-free governor is SATURATED and
 its verified ladder has not proven the card unresolved. In that state the disposition is `DEFER`: for
 preload the scheduler runs the described actuation and the request re-asks next cycle once the device-level
