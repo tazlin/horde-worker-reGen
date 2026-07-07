@@ -228,7 +228,9 @@ def test_progress_line_shows_phase_and_restarts() -> None:
     assert "inf#1=PROCESS_STARTING" in (format_progress_event(event, verbose=True) or "")
 
 
+# Unlike the fast codec/formatting tests above, this one drives a full fake-mode capability run.
 @pytest.mark.e2e
+@pytest.mark.slow
 def test_fake_run_emits_lifecycle_events(tmp_path: Path) -> None:
     """A fake-mode capability run writes the ramp/probe lifecycle events to progress.jsonl."""
     from horde_worker_regen.benchmark.capabilities.catalog import CatalogOptions

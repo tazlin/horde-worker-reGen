@@ -17,7 +17,9 @@ from horde_worker_regen.benchmark.capabilities.catalog import CatalogOptions
 from horde_worker_regen.benchmark.capabilities.executor import ProbeExecutor
 from horde_worker_regen.benchmark.enums import BenchTier
 
-pytestmark = pytest.mark.e2e
+# Each test drives the executor against a real reused fake worker (a multi-second run), so the module is
+# opt-in via -m slow (skipped in a default sweep).
+pytestmark = [pytest.mark.e2e, pytest.mark.slow]
 
 
 async def test_executor_runs_static_catalog_and_synthesizes(tmp_path: Path) -> None:
