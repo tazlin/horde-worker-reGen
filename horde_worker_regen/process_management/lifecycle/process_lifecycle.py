@@ -436,6 +436,18 @@ class ProcessLifecycleManager:
         self._quarantined_models = set()
         self._recent_load_failure_by_process = {}
 
+        self._print_config()
+
+    def _print_config(self) -> None:
+        """Emit a structured snapshot of the current configuration, so a future hang explains itself."""
+        logger.info(
+            f"ProcessLifecycleManager config: max_inference_processes={self._max_inference_processes}, "
+            f"max_safety_processes={self._max_safety_processes}, "
+            f"gpu_sampling_lease_enabled={self._gpu_sampling_lease_enabled}, "
+            f"amd_gpu={self._amd_gpu}, directml={self._directml}, "
+            f"runtime_config={self._runtime_config}"
+        )
+
     def _validate_spawn_start_method(self) -> None:
         """Fail loudly if children would be created with a CUDA-unsafe start method.
 

@@ -963,7 +963,11 @@ class HordeWorkerProcessManager:
             mp_primitives=mp_primitives,
             max_threads_ceiling=ceiling,
         )
+        logger.debug(f"Card runtimes: {self._card_runtimes}")
+
         self.max_inference_processes = sum(card.target_process_count for card in self._card_runtimes.values())
+        logger.debug(f"Max inference processes: {self.max_inference_processes}")
+
         self._lru = LRUCache(self.max_inference_processes)
 
         # Multi-GPU is auto-all by default, so a host that previously only used card 0 now drives every
@@ -1422,6 +1426,8 @@ class HordeWorkerProcessManager:
             )
             for index in device_indices
         }
+        logger.debug(f"Resolved per-card concurrency: {per_card_concurrency}")
+
         if mp_primitives is None:
             mp_primitives = MultiprocessingPrimitives.create(ctx=ctx, per_card=per_card_concurrency)
 
