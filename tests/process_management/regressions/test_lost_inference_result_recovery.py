@@ -397,6 +397,26 @@ class TestKeepSingleInferenceReadsRetainedReference:
         )
         assert keep_busy is False
 
+    async def test_batched_job_does_not_hold_worker_single(self) -> None:
+        """A batched job actively sampling places no worker-wide single-process hold here.
+
+        A batch multiplies the activation peak, but that cost is priced per-card against measured
+        headroom by the scheduler's size-tier overlap gate. A worker-wide hold here would force full
+        serialization whenever any batch samples, even on a card with ample room for a second lane.
+        """
+        batched = make_mock_process_info(
+            1,
+            model_name="stable_diffusion",
+            state=HordeProcessState.INFERENCE_STARTING,
+        )
+        batched.batch_amount = 2
+        batched.last_job_referenced = make_mock_job(model="stable_diffusion", n_iter=2)
+
+        keep, _reason = ProcessMap({1: batched}).keep_single_inference(
+            stable_diffusion_model_reference={},
+        )
+        assert keep is False
+
 
 class TestReferenceClearedOnModelTeardown:
     """The reference is cleared when the model leaves the slot: that is the field's real lifecycle."""

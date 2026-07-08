@@ -157,8 +157,9 @@ depend on this queue-gated cycle running; see
    decide heavy-model/batch blocking. This method is called _twice_ per cycle (peek, then launch) and
    must agree with itself; line-skip decisions (a small job jumping ahead of one blocked on a LoRA
    download) are cached in `_pending_line_skip` to keep the two calls consistent.
-3. **Blocking rules**: `ProcessMap.keep_single_inference` (active batch, VRAM-heavy model,
-   ControlNet-XL, post-processing overlap) and a batch/heavy-workflow check can defer launch.
+3. **Blocking rules**: `ProcessMap.keep_single_inference` (a resident ControlNet-XL slot that must
+   stay exclusive) can defer launch. Batch and card-demanding serialization is not held here: it is
+   priced per-card against measured headroom by the scheduler's size-tier overlap gate.
 4. **`start_inference()`**: sends `START_INFERENCE` with the full `ImageGenerateJobPopResponse`; on
    success `JobTracker.mark_inference_started` moves the job to `INFERENCE_IN_PROGRESS`. By the
    [dual-presence rule](job_state_machine.md#the-stage-dual-presence-rule) it stays visible in the

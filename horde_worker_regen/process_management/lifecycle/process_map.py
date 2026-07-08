@@ -868,18 +868,18 @@ class ProcessMap(dict[int, HordeProcessInfo]):
     ) -> tuple[bool, str]:
         """Return true if we should keep only a single inference process running.
 
-        This is used to prevent overloading the system with inference processes, such as with batched jobs.
+        This is a worker-wide, device-blind hold, reserved for a workflow that cannot coexist with any
+        concurrent inference at all. It is checked before the scheduler's dispatch path, so anything held
+        here never reaches the size-tier overlap gate.
 
-        Card-demanding models are deliberately not a rule here: their serialization belongs to the
-        scheduler's size-tier overlap gate, which is derived from the model reference (not a hand-kept
-        name list), scopes to the card the in-flight job runs on, and relaxes against measured headroom.
-        A worker-wide hold from this map would sit on top of that gate, blind to devices and to models
-        the list never learned about.
+        Batched and otherwise card-demanding jobs are deliberately not a rule here: their serialization
+        belongs to the scheduler's size-tier overlap gate, which prices a batch's multiplied activation
+        peak against the card's measured headroom, scopes to the card the in-flight job runs on, and admits
+        an overlap once the running job has made size-appropriate headway. A worker-wide hold on batches
+        would sit on top of that gate and force full serialization whenever any batch samples, blind to
+        whether the card has room for a second lane.
         """
         for p in self.values():
-            if p.batch_amount > 1 and p.last_process_state == HordeProcessState.INFERENCE_STARTING:
-                return True, "Batched job"
-
             if (
                 p.last_job_referenced is not None
                 and p.last_job_referenced.payload.workflow in KNOWN_CONTROLNET_WORKFLOWS

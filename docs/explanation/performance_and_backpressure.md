@@ -195,8 +195,9 @@ response stay live even when the queue is empty.
    `UNLOADED_MODEL_FROM_RAM` -> `DOWNLOADING_AUX_MODEL` ->
    `DOWNLOAD_AUX_COMPLETE` aux-model download path.
 2. **Single-inference hold**: defer launch while `keep_single_inference` is
-   active, such as a batched job already sampling or an idle ControlNet-XL
-   resident that must keep its slot exclusive.
+   active, such as an idle ControlNet-XL resident that must keep its slot
+   exclusive. A batch is not held here; its multiplied activation peak is priced
+   per-card by the concurrent-overlap gate below.
 3. **Start inference**: send `START_INFERENCE` with the job payload. The
    dispatch path applies the concurrent-overlap gate below, so heavy models,
    batches, and extra-large models are serialized only when their progress,
