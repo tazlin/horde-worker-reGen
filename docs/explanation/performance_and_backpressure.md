@@ -194,18 +194,18 @@ response stay live even when the queue is empty.
    states, including the short `WAITING_FOR_JOB` first-report race and the
    `UNLOADED_MODEL_FROM_RAM` -> `DOWNLOADING_AUX_MODEL` ->
    `DOWNLOAD_AUX_COMPLETE` aux-model download path.
-2. **Peek ahead**: call `get_next_job_and_process(information_only=True)` to
-   decide whether to block on a heavy model or batch.
-3. **Blocking rules**: defer launch if:
-    - `keep_single_inference` is active (batch mode, VRAM-heavy model,
-      ControlNet-XL).
-    - A batch/heavy-workflow job is waiting but not enough jobs have accumulated
-      for the batch.
-4. **Start inference**: send `START_INFERENCE` with the job payload. A
+2. **Single-inference hold**: defer launch while `keep_single_inference` is
+   active, such as a batched job already sampling or an idle ControlNet-XL
+   resident that must keep its slot exclusive.
+3. **Start inference**: send `START_INFERENCE` with the job payload. The
+   dispatch path applies the concurrent-overlap gate below, so heavy models,
+   batches, and extra-large models are serialized only when their progress,
+   tier, or measured headroom requires it; a scheduling-cycle pre-gate does not
+   hold them back merely because another thread is busy. A
    per-dispatch *expected sampling time* is computed and attached to the process
    (see [Performance-model scoring](#performance-model-scoring) below) so a
    running job can later be graded as "slow".
-5. **Unload models**: evict models not needed by the upcoming queue
+4. **Unload models**: evict models not needed by the upcoming queue
    (LRU-informed), subject to **model affinity** (below).
 
 ### Performance-model scoring

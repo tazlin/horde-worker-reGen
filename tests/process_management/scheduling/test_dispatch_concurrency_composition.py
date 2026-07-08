@@ -16,6 +16,10 @@ this scenario and full concurrency.
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
+from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
+
 from horde_worker_regen.process_management.ipc.messages import HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -23,12 +27,18 @@ from horde_worker_regen.process_management.models.horde_model_map import HordeMo
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_bridge_data,
+    make_mock_model_reference_record,
     make_mock_process_info,
+    make_test_model_metadata,
+    mark_job_in_progress_async,
 )
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 _MODEL_A = "model_alpha"
 _MODEL_B = "model_beta"
+_SDXL_A = "sdxl_alpha"
+_SDXL_B = "sdxl_beta"
+_SLOW_WORKFLOW = "qr_code"
 
 
 async def _two_lane_scheduler(job_tracker: JobTracker, *, max_concurrent: int = 2):  # noqa: ANN202
@@ -113,3 +123,57 @@ class TestHealthyPoolReachesConfiguredConcurrency:
         second = await scheduler.get_next_job_and_process()
 
         assert second is None
+
+
+class TestSchedulingCycleOverlapComposition:
+    """The scheduling cycle should reach the overlap gate before serializing heavy work."""
+
+    async def test_cycle_starts_second_heavy_job_after_progress_and_headroom(self, job_tracker: JobTracker) -> None:
+        """A progressed heavy job with confirmed room should not keep the second slot idle."""
+        running_slot = make_mock_process_info(1, model_name=_SDXL_A, state=HordeProcessState.INFERENCE_STARTING)
+        candidate_slot = make_mock_process_info(2, model_name=_SDXL_B, state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({1: running_slot, 2: candidate_slot})
+
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(horde_model_name=_SDXL_A, load_state=ModelLoadState.LOADED_IN_RAM, process_id=1)
+        horde_model_map.update_entry(horde_model_name=_SDXL_B, load_state=ModelLoadState.LOADED_IN_RAM, process_id=2)
+
+        reference = {
+            _SDXL_A: make_mock_model_reference_record(
+                _SDXL_A,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            ),
+            _SDXL_B: make_mock_model_reference_record(
+                _SDXL_B,
+                baseline=KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl,
+            ),
+        }
+        running_job = make_job_pop_response(_SDXL_A, ddim_steps=20, workflow=_SLOW_WORKFLOW)
+        candidate_job = make_job_pop_response(_SDXL_B, ddim_steps=20, workflow=_SLOW_WORKFLOW)
+        await job_tracker.record_popped_job(running_job)
+        await mark_job_in_progress_async(job_tracker, running_job)
+        await job_tracker.record_popped_job(candidate_job)
+
+        running_slot.last_job_referenced = running_job
+        running_slot.loaded_horde_model_baseline = KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+        running_slot.batch_amount = 1
+        running_slot.last_total_steps = 20
+        running_slot.last_current_step = 18
+        running_slot.last_heartbeat_percent_complete = 90
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+            bridge_data=make_mock_bridge_data(max_threads=2, gpu_sampling_lease_enabled=False),
+            max_concurrent=2,
+            max_inference=2,
+            model_metadata=make_test_model_metadata(reference),
+        )
+        scheduler.preload_models = Mock(return_value=False)  # type: ignore[method-assign]
+        scheduler._overlap_memory_verdict = Mock(return_value=True)  # type: ignore[method-assign]
+        scheduler._should_keep_model_resident = Mock(return_value=False)  # type: ignore[method-assign]
+
+        await scheduler.run_scheduling_cycle(reference)
+
+        assert candidate_job in job_tracker.jobs_in_progress

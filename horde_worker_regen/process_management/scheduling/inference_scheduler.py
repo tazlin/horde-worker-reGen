@@ -15,7 +15,6 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
 from horde_worker_regen.compute_mode import is_cpu_only_install
-from horde_worker_regen.consts import KNOWN_SLOW_WORKFLOWS
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
@@ -7554,34 +7553,8 @@ class InferenceScheduler:
         self.unload_from_ram(victim.process_id)
         return True
 
-    def _is_heavy_model_and_workflow(
-        self,
-        job: ImageGenerateJobPopResponse,
-        stable_diffusion_reference: dict[str, ImageGenerationModelRecord],
-    ) -> bool:
-        """Return whether the job's model and workflow are heavy enough to serialise behind in-flight work.
-
-        True for an SDXL model running a known-slow workflow, or any very large (EXTRA_LARGE tier) model,
-        resolved through the same size-tier authority the whole-card machinery classifies by. Used to hold a
-        heavy batch head back while a thread is already busy, so stacked weight loads and activation peaks do
-        not thrash a sampler into a watchdog teardown.
-        """
-        model = job.model
-        if model is None:
-            return False
-        next_model_record = stable_diffusion_reference.get(model)
-        next_workflow = job.payload.workflow
-        heavy = (
-            next_model_record is not None
-            and next_model_record.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
-            and next_workflow in KNOWN_SLOW_WORKFLOWS
-        )
-        if self._model_size_tier(model) >= _ModelSizeTier.EXTRA_LARGE:
-            heavy = True
-        return heavy
-
     async def run_scheduling_cycle(self, stable_diffusion_reference: dict[str, ImageGenerationModelRecord]) -> None:
-        """Run a single scheduling cycle: preload, detect heavy model/batch, start inference, unload.
+        """Run a single scheduling cycle: preload, start inference, unload.
 
         This absorbs the inline orchestration block from _process_control_loop.
         """
@@ -7595,12 +7568,6 @@ class InferenceScheduler:
         # control-loop iteration, so the danger-floor verdict and shed/restore response are already fresh
         # for this cycle regardless of whether any preload or dispatch happens.
         if not self.preload_models():
-            next_job_and_process = await self.get_next_job_and_process(information_only=True)
-
-            next_job_heavy_model_and_workflow = next_job_and_process is not None and self._is_heavy_model_and_workflow(
-                next_job_and_process.next_job, stable_diffusion_reference
-            )
-
             keep_single_inference, single_inf_reason = self._process_map.keep_single_inference(
                 stable_diffusion_model_reference=stable_diffusion_reference,
             )
@@ -7615,23 +7582,6 @@ class InferenceScheduler:
                     )
                     self._batch_wait_log_time = time.time()
 
-            elif (
-                next_job_and_process is not None
-                and (next_job_and_process.next_job.payload.n_iter > 1 or next_job_heavy_model_and_workflow)
-                and (
-                    self._process_map.num_busy_with_inference() > 0
-                    or self._process_map.num_busy_with_post_processing() > 0
-                )
-            ):
-                if time.time() - self._batch_wait_log_time > 10:
-                    logger.opt(ansi=True).info(
-                        "<fg #7b7d7d>"
-                        f"<i>Blocking starting batch job {next_job_and_process.next_job.id_} "
-                        "because a thread is already busy with a heavy model/workflow or batch job"
-                        ".</i>"
-                        "</>",
-                    )
-                    self._batch_wait_log_time = time.time()
             else:
                 # Fill every free inference slot this cycle rather than one per ~0.5s control-loop
                 # tick: when several jobs complete close together, dispatching them one tick apart
