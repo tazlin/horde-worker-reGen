@@ -76,15 +76,16 @@ def line_skip_candidate_emps_limit(
     """Return the eMPS ceiling a job must fall under to line-skip a slot blocked on aux downloads.
 
     A line-skip job fills an idle sibling process while another slot waits on an auxiliary-model
-    download, so it must be quick enough that it does not become a long-running tenant of its own. The
-    ceiling widens with the worker's performance mode, matching the job sizes those modes are provisioned
-    to absorb.
+    download. The ceiling is kept generous so that ordinary and moderately large resident jobs can absorb
+    the otherwise-idle GPU time rather than the card starving for the whole download: admission is still
+    enforced against measured device VRAM at dispatch, so this cap only bounds how large a tenant the skip
+    may introduce, not whether it can safely run. The ceiling widens with the worker's performance mode.
     """
     if high_performance_mode:
-        return 100
+        return 400
     if moderate_performance_mode:
-        return 50
-    return 25
+        return 200
+    return 100
 
 
 _LINE_SKIP_POP_NOMINAL_STEPS = 30

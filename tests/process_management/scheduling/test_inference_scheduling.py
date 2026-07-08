@@ -652,7 +652,7 @@ class TestAuxDownloadLineSkip:
 
     async def test_aux_download_cap_bypass_rejects_oversized_candidate(self) -> None:
         """The cap bypass still enforces the performance-mode eMPS threshold."""
-        large_candidate = make_job_pop_response("small_model", width=1024, height=1024, ddim_steps=100)
+        large_candidate = make_job_pop_response("small_model", width=1024, height=1024, ddim_steps=500)
         bridge_data = make_mock_bridge_data(high_performance_mode=True)
         scheduler, _, _, _ = await self._make_scheduler(candidate_job=large_candidate, bridge_data=bridge_data)
 
