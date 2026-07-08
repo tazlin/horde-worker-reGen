@@ -73,13 +73,19 @@ def _make_overlap_scheduler(  # noqa: ANN202
     *,
     tiers: dict[str, ModelSizeTier],
     memory_admits: bool,
+    high_performance_mode: bool = False,
+    moderate_performance_mode: bool = False,
 ):
     """A two-slot scheduler with pinned model tiers and a crafted arbiter cycle for the memory question."""
     process_map = ProcessMap({1: make_mock_process_info(1), 2: make_mock_process_info(2)})
     scheduler = _make_inference_scheduler(
         process_map=process_map,
         job_tracker=job_tracker,
-        bridge_data=make_mock_bridge_data(max_threads=2),
+        bridge_data=make_mock_bridge_data(
+            max_threads=2,
+            high_performance_mode=high_performance_mode,
+            moderate_performance_mode=moderate_performance_mode,
+        ),
         max_concurrent=2,
         max_inference=2,
     )
@@ -138,6 +144,51 @@ class TestHeavyPairHeadwayScalesWithHeadroom:
         scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
         await _running(job_tracker, _HEAVY_A)
         _pin_progress(monkeypatch, scheduler, 0.05)
+
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is False
+
+
+class TestPerformanceModeShrinksHeadway:
+    """Higher performance modes pull a newcomer into the running job's tail sooner (unpriced-memory path).
+
+    The arbiter is left unwired so the memory question relaxes to admit and the strict fraction (not the
+    ample-VRAM relaxation) is the value being scaled, isolating the performance-mode effect.
+    """
+
+    async def test_default_mode_keeps_full_headway(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL: with no performance mode, a second heavy job still waits the full both-heavy headway."""
+        scheduler = _make_overlap_scheduler(job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True)
+        scheduler._vram_arbiter = None
+        await _running(job_tracker, _HEAVY_A)
+        _pin_progress(monkeypatch, scheduler, 0.5)
+
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is False
+
+    async def test_high_performance_mode_admits_at_scaled_headway(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same 0.5 progress a default worker blocks admits in high-performance mode (0.75 -> 0.375)."""
+        scheduler = _make_overlap_scheduler(
+            job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True, high_performance_mode=True
+        )
+        scheduler._vram_arbiter = None
+        await _running(job_tracker, _HEAVY_A)
+        _pin_progress(monkeypatch, scheduler, 0.5)
+
+        assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is True
+
+    async def test_high_performance_mode_still_holds_below_scaled_headway(
+        self, job_tracker: JobTracker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """High mode shrinks but never removes the headway: below the scaled 0.375 the second heavy waits."""
+        scheduler = _make_overlap_scheduler(
+            job_tracker, monkeypatch, tiers=_BOTH_HEAVY, memory_admits=True, high_performance_mode=True
+        )
+        scheduler._vram_arbiter = None
+        await _running(job_tracker, _HEAVY_A)
+        _pin_progress(monkeypatch, scheduler, 0.3)
 
         assert scheduler._concurrent_overlap_allowed(make_job_pop_response(model=_HEAVY_B)) is False
 

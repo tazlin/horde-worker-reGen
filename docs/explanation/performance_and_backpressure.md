@@ -326,6 +326,13 @@ conservative here because a dispatchable candidate's weights are already residen
 drops to a small constant that still gives the running job its memory-hungry startup beat. No measurement
 (cold start) or a disabled VRAM budget keeps the strict fractions.
 
+The required headway is finally scaled by the worker's performance mode
+(`_performance_mode_headway_scale`): high-performance mode multiplies it by `0.5` and moderate-performance
+mode by `0.75`, so an operator who has provisioned the card for aggressive co-sampling brings the next
+job's sampling into the tail of the current one sooner. The scale only moves *when* an admissible overlap
+begins; the arbiter's memory verdict still independently decides *whether* the card can hold it, so a
+shrunk headway never admits an over-committing overlap.
+
 A blocked candidate is never dropped; it keeps its queue position and dispatches the moment the in-flight
 jobs progress past the headway threshold or finish.
 

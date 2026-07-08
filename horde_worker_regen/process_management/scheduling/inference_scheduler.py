@@ -7,6 +7,7 @@ import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import psutil
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -151,6 +152,9 @@ from horde_worker_regen.utils.job_utils import (
 )
 from horde_worker_regen.utils.job_utils import line_skip_candidate_emps_limit
 from horde_worker_regen.utils.vram_quota import effective_post_process_vram_quota_mb
+
+if TYPE_CHECKING:
+    from horde_worker_regen.bridge_data.data_model import reGenBridgeData
 
 
 @dataclass(frozen=True)
@@ -335,6 +339,31 @@ prices a second configured thread out of existence (a both-heavy candidate waits
 two threads converge to ~one effective thread). When the measurement says the newcomer's whole peak
 fits *now*, the over-subscription the strict headway guards against cannot occur; a small headway is
 kept so the running job clears its memory-hungry startup before a sibling adds pressure."""
+
+_OVERLAP_HEADWAY_SCALE_HIGH_PERFORMANCE = 0.5
+"""Multiplier applied to the required overlap headway when the worker runs in high-performance mode.
+
+High-performance operators have provisioned the card for aggressive co-sampling and want the next job's
+sampling to overlap the tail of the current one sooner. Halving the headway brings the newcomer in
+earlier while the VRAM arbiter still independently decides whether the card can hold the overlap."""
+
+_OVERLAP_HEADWAY_SCALE_MODERATE_PERFORMANCE = 0.75
+"""Multiplier applied to the required overlap headway in moderate-performance mode: a milder pull-in than
+high-performance mode, still gated by the arbiter's memory verdict."""
+
+
+def _performance_mode_headway_scale(bridge_data: reGenBridgeData) -> float:
+    """Return the overlap-headway multiplier for the worker's performance mode (1.0 outside the fast modes).
+
+    Higher performance modes shrink the sampling headway a newcomer must wait for, so concurrent inference
+    starts sooner. The memory arbiter still gates whether the overlap fits, so this only moves *when* an
+    admissible overlap begins, never *whether* an over-committing one is allowed.
+    """
+    if bridge_data.high_performance_mode:
+        return _OVERLAP_HEADWAY_SCALE_HIGH_PERFORMANCE
+    if bridge_data.moderate_performance_mode:
+        return _OVERLAP_HEADWAY_SCALE_MODERATE_PERFORMANCE
+    return 1.0
 
 
 class _WholeCardDemandOutcome(enum.Enum):
@@ -3808,6 +3837,10 @@ class InferenceScheduler:
         if candidate_batched and not memory_ample():
             return False
 
+        # Higher performance modes pull a newcomer's sampling into the current job's tail sooner by shrinking
+        # the headway it must wait for; the arbiter's memory verdict below still independently gates the overlap.
+        headway_scale = _performance_mode_headway_scale(self._runtime_config.bridge_data)
+
         for job in in_progress_jobs:
             running_tier = self._model_size_tier(job.model)
             if running_tier >= _ModelSizeTier.EXTRA_LARGE:
@@ -3824,6 +3857,8 @@ class InferenceScheduler:
                 required_headway = self._required_overlap_headway(running_tier, candidate_tier)
                 if required_headway > 0.0 and memory_ample():
                     required_headway = _OVERLAP_HEADWAY_AMPLE_VRAM
+
+            required_headway *= headway_scale
 
             if required_headway <= 0.0:
                 continue
