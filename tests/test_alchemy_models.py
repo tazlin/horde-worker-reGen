@@ -1,6 +1,8 @@
 """Tests for the alchemy job models, form routing, and wire-format workarounds."""
 
 from collections import deque
+from io import BytesIO
+from typing import cast
 
 import PIL.Image
 import pytest
@@ -8,6 +10,7 @@ from horde_sdk.ai_horde_api import GENERATION_STATE
 from pydantic import ValidationError
 
 from horde_worker_regen.bridge_data.data_model import reGenBridgeData
+from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.ipc.messages import (
     AlchemyFormSpec,
     HordeAlchemyControlMessage,
@@ -26,6 +29,23 @@ from horde_worker_regen.process_management.jobs.alchemy_popper import (
 from horde_worker_regen.process_management.jobs.job_models import PendingAlchemySubmitJob
 from horde_worker_regen.process_management.lifecycle.horde_process import WorkerCapability
 from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
+
+
+class _RecordingQueue:
+    """Minimal process-message queue for child-process unit tests."""
+
+    def __init__(self) -> None:
+        self.messages: list[object] = []
+
+    def put(self, message: object) -> None:
+        self.messages.append(message)
+
+
+def _png_bytes() -> bytes:
+    image = PIL.Image.new("RGB", (8, 8), (255, 0, 0))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def _result_message(
@@ -268,6 +288,36 @@ class TestAlchemySubmitShapes:
             state=GENERATION_STATE.ok,
         )
         assert request.result == {"nsfw": False}
+
+    def test_aesthetic_form_submits_inline_score(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A successful aesthetic form reports its numeric score without terminating the child process."""
+        from horde_worker_regen.process_management.workers.safety_process import HordeSafetyProcess
+
+        process = HordeSafetyProcess.__new__(HordeSafetyProcess)
+        process_queue = _RecordingQueue()
+        process.process_id = 0
+        process.process_launch_identifier = 1
+        process.process_message_queue = cast(ProcessQueue, process_queue)
+        monkeypatch.setattr(process, "_score_aesthetic", lambda _image: 4.9564)
+        monkeypatch.setattr(process, "_send_alchemy_job_metrics", lambda _form: None)
+
+        process.start_alchemy(
+            AlchemyFormSpec(
+                form_id="00000000-0000-0000-0000-000000000000",
+                form="aesthetic",
+                source_image_bytes=_png_bytes(),
+            ),
+        )
+
+        result_messages = [
+            message for message in process_queue.messages if isinstance(message, HordeAlchemyResultMessage)
+        ]
+        assert len(result_messages) == 1
+        assert result_messages[0].state == GENERATION_STATE.ok
+        assert result_messages[0].result_payload == {"aesthetic": 4.9564}
+        assert PendingAlchemySubmitJob(result_message=result_messages[0], time_popped=0.0).submit_result == {
+            "aesthetic": 4.9564,
+        }
 
     def test_pop_request_accepts_plain_string_forms(self) -> None:
         """The pop request subclass offers post-processors by name without round-tripping the SDK enum."""

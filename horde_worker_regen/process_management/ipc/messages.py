@@ -666,9 +666,9 @@ class HordeAlchemyControlMessage(HordeControlMessage):
 class HordeAlchemyResultMessage(HordeProcessMessage):
     """The result of one alchemy form, sent from a child process to the main process.
 
-    Matches the legacy alchemist submit protocol: text forms carry ``result_payload``
-    (e.g. ``{"caption": "..."}``); image forms carry ``image_bytes`` (WebP, ready for R2)
-    and submit ``{"<form>": "R2"}``.
+    Matches the legacy alchemist submit protocol: inline forms carry ``result_payload``
+    (e.g. ``{"caption": "..."}`` or ``{"aesthetic": 6.42}``); image forms carry
+    ``image_bytes`` (WebP, ready for R2) and submit ``{"<form>": "R2"}``.
     """
 
     form_id: str
@@ -677,8 +677,8 @@ class HordeAlchemyResultMessage(HordeProcessMessage):
     """The form name that was processed."""
     state: GENERATION_STATE
     """The state of the form to send to the API."""
-    result_payload: dict[str, str | bool | dict | list] | None = None
-    """The inline result for text forms (caption/interrogation/nsfw)."""
+    result_payload: dict[str, str | bool | int | float | dict | list] | None = None
+    """The inline result for non-image forms (caption/interrogation/nsfw/aesthetic/etc.)."""
     image_bytes: bytes | None = None
     """The WebP-encoded result image bytes for graph forms, to be uploaded to R2."""
 
