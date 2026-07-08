@@ -60,6 +60,10 @@ class LogBundle:
     child_loop_paths: dict[int, list[Path]] = field(default_factory=dict)
     startup_paths: dict[int, list[Path]] = field(default_factory=dict)
     stderr_paths: dict[int, list[Path]] = field(default_factory=dict)
+    _orchestrator_cache: list[LogRecord] | None = field(default=None, init=False, repr=False, compare=False)
+    _active_orchestrator_cache: list[LogRecord] | None = field(default=None, init=False, repr=False, compare=False)
+    _child_cache: dict[int, list[LogRecord]] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _startup_cache: dict[int, list[LogRecord]] = field(default_factory=dict, init=False, repr=False, compare=False)
     _ledger_cache: list[LedgerEvent] | None = field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
@@ -109,7 +113,9 @@ class LogBundle:
 
     def orchestrator_records(self) -> list[LogRecord]:
         """All parsed orchestrator (``bridge.log``) records, active plus rotations, in time order."""
-        return read_records(*self.orchestrator_paths)
+        if self._orchestrator_cache is None:
+            self._orchestrator_cache = read_records(*self.orchestrator_paths)
+        return self._orchestrator_cache
 
     def active_orchestrator_paths(self) -> list[Path]:
         """Only the live ``bridge.log`` (no zipped/rotated archives): where the most recent sessions live.
@@ -125,15 +131,21 @@ class LogBundle:
 
     def active_orchestrator_records(self) -> list[LogRecord]:
         """Parsed records from only the live ``bridge.log`` (skips rotations); see ``active_orchestrator_paths``."""
-        return read_records(*self.active_orchestrator_paths())
+        if self._active_orchestrator_cache is None:
+            self._active_orchestrator_cache = read_records(*self.active_orchestrator_paths())
+        return self._active_orchestrator_cache
 
     def child_records(self, process_id: int) -> list[LogRecord]:
         """Parsed loop-log records for one slot, in time order (empty if that slot has no loop log)."""
-        return read_records(*self.child_loop_paths.get(process_id, []))
+        if process_id not in self._child_cache:
+            self._child_cache[process_id] = read_records(*self.child_loop_paths.get(process_id, []))
+        return self._child_cache[process_id]
 
     def startup_records(self, process_id: int) -> list[LogRecord]:
         """Parsed startup-crash-backstop records for one slot (where pre-sink crashes land)."""
-        return read_records(*self.startup_paths.get(process_id, []))
+        if process_id not in self._startup_cache:
+            self._startup_cache[process_id] = read_records(*self.startup_paths.get(process_id, []))
+        return self._startup_cache[process_id]
 
     def ledger_events(self) -> list[LedgerEvent]:
         """All action-ledger events related to this bundle (empty when no ledger was shipped).

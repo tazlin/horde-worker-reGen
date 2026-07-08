@@ -12,6 +12,9 @@ import json
 import zipfile
 from pathlib import Path
 
+import pytest
+
+from horde_worker_regen.analysis import support_bundle
 from horde_worker_regen.analysis.support_bundle import build_support_bundle
 
 _API_KEY = "abcdEFGH1234ijklMNOP56"
@@ -153,3 +156,24 @@ class TestContents:
         assert "stats/stats-v1.0.0-20260620-010203-001.jsonl" in names
         assert _WORKER not in stats_text
         assert _CIVITAI not in compressed_stats_text
+
+
+class TestPerformance:
+    """Support-bundle generation should not pay full-read cost for logs it tail-caps."""
+
+    def test_capped_plain_log_reads_only_tail(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A large active ``.log`` is read from the end instead of through the full physical-line reader."""
+        path = tmp_path / "bridge_1.log"
+        path.write_text("old prefix\n" + ("x" * 2048) + "\nnew tail\n", encoding="utf-8")
+        monkeypatch.setattr(support_bundle, "_MAX_FILE_BYTES", 1024)
+
+        def _fail_full_read(_path: Path) -> list[str]:
+            raise AssertionError("oversized plain logs should be tail-read directly")
+
+        monkeypatch.setattr(support_bundle, "_read_physical_lines", _fail_full_read)
+
+        text = support_bundle._read_log_text(path, cap=True)
+
+        assert text.startswith("[... truncated to the most recent")
+        assert "new tail" in text
+        assert "old prefix" not in text

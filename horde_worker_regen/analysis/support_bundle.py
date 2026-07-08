@@ -104,6 +104,14 @@ def _member_name(file_path: Path, logs_root: Path) -> str:
 
 def _read_log_text(file_path: Path, *, cap: bool) -> str:
     """Read a log file (plain/.zip/.gz, NUL-stripped) as text, keeping only the tail past the size cap."""
+    if cap and file_path.suffix.lower() == ".log":
+        size = file_path.stat().st_size
+        if size > _MAX_FILE_BYTES:
+            megabytes = _MAX_FILE_BYTES // (1024 * 1024)
+            with file_path.open("rb") as handle:
+                handle.seek(-_MAX_FILE_BYTES, os.SEEK_END)
+                text = handle.read().decode("utf-8", errors="replace").replace("\x00", "")
+            return f"[... truncated to the most recent {megabytes} MB ...]\n{text}"
     lines = list(_read_physical_lines(file_path))
     text = "\n".join(lines)
     if cap and len(text) > _MAX_FILE_BYTES:

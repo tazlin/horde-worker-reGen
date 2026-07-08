@@ -281,7 +281,7 @@ horde-log bundle
 |------|---------|
 | `--out FILE.zip` | Output path (default `horde_support_<timestamp>.zip`). |
 | `--last` / `--session N` | Diagnose only the most recent / a specific session (the logs are still included). |
-| `--full-logs` | Include rotation archives and do not tail-cap large logs (a much larger bundle). By default only the active logs are bundled, with oversized files tail-trimmed; the active `bridge.log` already spans many sessions. |
+| `--full-logs` | Include rotation archives and do not tail-cap large logs (a much larger bundle). By default only the active logs are bundled; oversized plain logs are read from their tail and bundled already-trimmed, and the active `bridge.log` already spans many sessions. |
 | `--no-cache-inventory` | Skip the on-disk model listing. |
 | `--probe-gpu` | Run the GPU probe for the system-info block (slower; the logs already record the GPUs). |
 | `--keep-identifiers` | Do not scrub home path / username / worker name (the keys are still redacted). |
