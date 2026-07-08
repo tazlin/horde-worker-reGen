@@ -833,6 +833,17 @@ def test_intentional_safety_cycle_not_counted_as_recovery() -> None:
     assert plm._num_process_recoveries == before  # not counted as a recovery
     assert plm._safety_recovery_history == []  # crash-loop breaker not fed
     assert plm._safety_replacement_intentional is False  # consumed
+    assert plm._safety_replacement_intentional_until_ready is True
+
+    plm._process_map[0] = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.SAFETY,
+    )
+    plm._clear_completed_intentional_safety_replacement()
+    assert plm._safety_replacement_intentional_until_ready is False
+    plm._process_map.clear()
 
     # A crash-driven rebuild (flag clear) DOES count.
     plm._safety_processes_should_be_replaced = True
@@ -840,6 +851,35 @@ def test_intentional_safety_cycle_not_counted_as_recovery() -> None:
     plm._replace_all_safety_process()
     assert plm._num_process_recoveries == before + 1
     assert len(plm._safety_recovery_history) == 1
+
+
+def test_intentional_safety_replacement_startup_churn_not_counted_as_recovery() -> None:
+    """Safety replacements before the new safety process is loaded remain part of the placement change."""
+    plm = _make_plm()
+    plm.start_safety_processes = Mock()  # type: ignore[method-assign]
+    before = plm._num_process_recoveries
+
+    plm._safety_replacement_intentional = True
+    plm._safety_processes_should_be_replaced = True
+    plm._safety_processes_ending = True
+    plm._replace_all_safety_process()
+
+    assert plm._num_process_recoveries == before
+    assert plm._safety_replacement_intentional_until_ready is True
+
+    plm._process_map[0] = make_mock_process_info(
+        0,
+        model_name=None,
+        state=HordeProcessState.PROCESS_STARTING,
+        process_type=HordeProcessType.SAFETY,
+    )
+    plm._safety_processes_should_be_replaced = True
+    plm._safety_processes_ending = True
+    plm._replace_all_safety_process()
+
+    assert plm._num_process_recoveries == before
+    assert plm._safety_recovery_history == []
+    assert plm._safety_replacement_intentional_until_ready is True
 
 
 def test_soft_reset_safety_rebuild_not_counted_as_recovery() -> None:

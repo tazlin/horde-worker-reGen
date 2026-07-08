@@ -378,6 +378,7 @@ class ProcessLifecycleManager:
         # Without this, repeated whole-card jobs cycling safety off/on read as a safety crash loop and trip
         # save-our-ship. Mirrors the intentional_reclaim path for inference RAM reclaim.
         self._safety_replacement_intentional = False
+        self._safety_replacement_intentional_until_ready = False
         # Runtime override forcing the dedicated post-processing lane off the GPU (stopped, not merely
         # model-unloaded) while a whole-card (single-residency) model claims the device. Unlike the safety
         # process, which cycles cpu_only, the post-processing lane has no useful CPU fallback (upscalers on
@@ -2030,14 +2031,26 @@ class ProcessLifecycleManager:
             self.start_safety_processes()
             self._safety_processes_ending = False
             self._safety_processes_should_be_replaced = False
-            if self._safety_replacement_intentional:
+            if self._safety_replacement_intentional or self._safety_replacement_intentional_until_ready:
                 # A deliberate whole-card pause/restore cycle, not a crash: keep it out of the recovery
                 # count and the crash-loop breaker so a burst of whole-card jobs is not mistaken for a
-                # safety crash loop (which would trip save-our-ship).
+                # safety crash loop (which would trip save-our-ship). Keep suppressing replacements until
+                # the new safety process reaches readiness; startup churn before then is still part of the
+                # same placement change, not a recovered crash.
                 self._safety_replacement_intentional = False
+                self._safety_replacement_intentional_until_ready = True
             else:
                 self._num_process_recoveries += 1
                 self._record_safety_recovery()
+
+    def _clear_completed_intentional_safety_replacement(self) -> None:
+        """End count suppression after an intentional safety replacement has reached readiness."""
+        if (
+            self._safety_replacement_intentional_until_ready
+            and not self._safety_processes_should_be_replaced
+            and self._process_map.num_loaded_safety_processes() > 0
+        ):
+            self._safety_replacement_intentional_until_ready = False
 
     def _record_safety_recovery(self) -> None:
         """Record that the safety pool was just rebuilt, pruning the history to the crash-loop window."""
@@ -2850,6 +2863,7 @@ class ProcessLifecycleManager:
             self._recently_recovered = False
 
         now = time.time()
+        self._clear_completed_intentional_safety_replacement()
 
         # A live inference slot that has advanced past PROCESS_STARTING has proven it can initialise,
         # so clear any consecutive crash-on-start streak it accrued. Only slots that never get past

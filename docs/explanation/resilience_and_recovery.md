@@ -95,14 +95,17 @@ holds anyway:
   cannot misfire on a normally completed job. The job is released retryably
   (Layer 1) the tick the loss becomes observable. The slot is alive, so this is
   **not** treated as a process crash. The "from an inference-active state"
-  qualifier is essential: `last_job_referenced` and the in-progress mark are
-  stamped by the scheduler the instant it *dispatches* a job, before the child has
-  acknowledged it, so a slot can carry a freshly dispatched job while it is still
-  draining state messages from *before* the dispatch (the idle it reports after
-  unloading the previous model to free VRAM, say). Reaping on that idle would fault
-  a job that never ran, a window that widens on slower disks and larger models, so
-  only a return to idle from a state where inference actually ran can mean a result
-  was lost. The periodic watchdog below covers the remaining shapes.
+  qualifier is essential, but not sufficient by itself: `last_job_referenced` and
+  the in-progress mark are stamped by the scheduler the instant it *dispatches* a
+  job, before the child has acknowledged it, so a slot can carry a freshly
+  dispatched job while it is still draining state messages from *before* the
+  dispatch (the idle it reports after unloading the previous model to free VRAM,
+  say). The reaper also compares the active dispatch timestamp with the state
+  transition it is closing; an idle report older than the current dispatch is left
+  alone. Reaping on that idle would fault a job that never ran, a window that
+  widens on slower disks and larger models, so only a return to idle from a state
+  where inference actually ran *for the same dispatch epoch* can mean a result was
+  lost. The periodic watchdog below covers the remaining shapes.
 - **Periodic watchdog** (`WorkerRecoveryCoordinator.reconcile_orphaned_in_progress_jobs`):
   each control-loop tick, any `in_progress` job that **no live slot is actively
   working** is punted (retryably) once it has been un-owned for a short grace

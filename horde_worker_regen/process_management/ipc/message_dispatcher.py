@@ -600,6 +600,7 @@ class MessageDispatcher:
         # Captured before the slot's state is advanced below; the lost-result reap needs the state the
         # slot is transitioning *from* to tell a post-inference idle from the dispatch window.
         previous_state = self._process_map[message.process_id].last_process_state
+        previous_state_started_at = self._process_map[message.process_id].last_process_state_started_at
 
         self._process_map.on_process_state_change(
             process_id=message.process_id,
@@ -654,7 +655,11 @@ class MessageDispatcher:
             self._process_map.on_model_ram_clear(process_id=message.process_id)
 
         if message.process_state == HordeProcessState.WAITING_FOR_JOB:
-            self._reap_lost_inference_result(message.process_id, previous_state=previous_state)
+            self._reap_lost_inference_result(
+                message.process_id,
+                previous_state=previous_state,
+                previous_state_started_at=previous_state_started_at,
+            )
 
     def _handle_inference_starting(self, process_id: int) -> None:
         """Apply the whole-job inference bookkeeping when an INFERENCE process reports it is sampling.
@@ -689,7 +694,13 @@ class MessageDispatcher:
             process_id=process_id,
         )
 
-    def _reap_lost_inference_result(self, process_id: int, *, previous_state: HordeProcessState) -> None:
+    def _reap_lost_inference_result(
+        self,
+        process_id: int,
+        *,
+        previous_state: HordeProcessState,
+        previous_state_started_at: float,
+    ) -> None:
         """Release a job left in progress after its slot returned to idle without a result.
 
         Inference results and process-state changes share one ordered message stream, and a completing
@@ -710,12 +721,19 @@ class MessageDispatcher:
         stamped job would fault a job that never ran (a window that widens on slower disks/model swaps). The
         slot's prior state is the discriminator: only a return to idle from an inference-active state can
         mean a result was produced and then lost. A return from a teardown/preload path is the dispatch
-        window, so the job is left for the slot to take up.
+        window, so the job is left for the slot to take up. The same ordering check also needs the active
+        dispatch timestamp: if a newer dispatch was stamped after the state being closed began, then the
+        idle report belongs to older slot work and must not release the newer job.
         """
         if previous_state not in _INFERENCE_ACTIVE_STATES:
             return
         process_info = self._process_map.get(process_id)
         if process_info is None:
+            return
+        if (
+            process_info.current_inference_started_at is not None
+            and process_info.current_inference_started_at > previous_state_started_at
+        ):
             return
         # Only a whole-job INFERENCE slot can lose an inference result here. A disaggregated stage lane
         # (the encode service reports INFERENCE_STARTING, then WAITING_FOR_JOB) would otherwise trip this

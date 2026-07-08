@@ -185,7 +185,12 @@ crash loop spanning levels is still caught.
 
 The safety process gets special treatment: if it dies, the
 `safety_processes_should_be_replaced` flag is set, and any jobs in
-`jobs_being_safety_checked` are requeued to `jobs_pending_safety_check`.
+`jobs_being_safety_checked` are requeued to `jobs_pending_safety_check`. A
+whole-card residency pause/restore also replaces the safety process, but that is
+an intentional placement change rather than crash recovery. Those replacements
+stay out of `_num_process_recoveries`, including any repeat replacement before
+the newly spawned safety process reaches a loaded state; once a safety process is
+loaded again, later unexpected safety replacement counts normally.
 
 ## Model preloading lifecycle
 

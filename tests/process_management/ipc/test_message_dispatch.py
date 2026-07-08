@@ -21,7 +21,7 @@ from horde_worker_regen.process_management.ipc.messages import (
     HordeProcessStateChangeMessage,
     ModelLoadState,
 )
-from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
+from horde_worker_regen.process_management.jobs.job_tracker import JobStage, JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
@@ -274,6 +274,66 @@ class TestReceiveAndHandleProcessMessages:
 
         assert state.torch_build_cpu_only is True
         assert "CPU-only build" in state.torch_build_cpu_only_reason
+
+    async def test_stale_idle_after_fresh_dispatch_does_not_release_current_job(self) -> None:
+        """An idle transition older than the current dispatch must not release the newly assigned job."""
+        job_tracker = JobTracker()
+        job_tracker.set_retry_policy(2)
+        job = make_job_pop_response(model="stable_diffusion")
+        await job_tracker.record_popped_job(job)
+        await mark_job_in_progress_async(job_tracker, job)
+        assert job.id_ is not None
+
+        process_info = make_mock_process_info(3, model_name="stable_diffusion")
+        process_info.process_launch_identifier = 0
+        process_info.last_process_state = HordeProcessState.INFERENCE_COMPLETE
+        process_info.last_process_state_started_at = time.time() - 5.0
+        process_info.last_job_referenced = job
+        process_info.current_inference_started_at = time.time()
+        process_map = ProcessMap({3: process_info})
+        message_dispatcher = _make_dispatcher(process_map=process_map, job_tracker=job_tracker)
+
+        msg = Mock(spec=HordeProcessStateChangeMessage)
+        msg.process_id = 3
+        msg.process_launch_identifier = 0
+        msg.process_state = HordeProcessState.WAITING_FOR_JOB
+        msg.info = "waiting"
+
+        _enqueue(message_dispatcher, msg)
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert job in job_tracker.jobs_in_progress
+        assert job_tracker.get_stage(job.id_) == JobStage.INFERENCE_IN_PROGRESS
+
+    async def test_active_to_idle_without_result_releases_current_job(self) -> None:
+        """An active slot that returns idle with its own job still in progress releases that job for retry."""
+        job_tracker = JobTracker()
+        job_tracker.set_retry_policy(2)
+        job = make_job_pop_response(model="stable_diffusion")
+        await job_tracker.record_popped_job(job)
+        await mark_job_in_progress_async(job_tracker, job)
+        assert job.id_ is not None
+
+        process_info = make_mock_process_info(3, model_name="stable_diffusion")
+        process_info.process_launch_identifier = 0
+        process_info.last_process_state = HordeProcessState.INFERENCE_COMPLETE
+        process_info.last_process_state_started_at = time.time()
+        process_info.last_job_referenced = job
+        process_info.current_inference_started_at = time.time() - 5.0
+        process_map = ProcessMap({3: process_info})
+        message_dispatcher = _make_dispatcher(process_map=process_map, job_tracker=job_tracker)
+
+        msg = Mock(spec=HordeProcessStateChangeMessage)
+        msg.process_id = 3
+        msg.process_launch_identifier = 0
+        msg.process_state = HordeProcessState.WAITING_FOR_JOB
+        msg.info = "waiting"
+
+        _enqueue(message_dispatcher, msg)
+        await message_dispatcher.receive_and_handle_process_messages()
+
+        assert job not in job_tracker.jobs_in_progress
+        assert job_tracker.get_stage(job.id_) == JobStage.PENDING_INFERENCE
 
     async def test_mismatched_launch_identifier_is_ignored(self) -> None:
         """Ignore if a message is received with a launch identifier that doesn't match the process's current one."""
