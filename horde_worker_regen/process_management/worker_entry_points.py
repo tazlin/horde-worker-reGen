@@ -382,7 +382,12 @@ def start_inference_process(
                 logger.debug(
                     f"Initialising hordelib with process_id={process_id}, "
                     f"process_launch_identifier={process_launch_identifier}, "
-                    f"amd_gpu={amd_gpu}, low_memory_mode={low_memory_mode}",
+                    f"amd_gpu={amd_gpu}, low_memory_mode={low_memory_mode}, "
+                    f"vram_heavy_models={vram_heavy_models}, directml={directml}, "
+                    f"accelerator_kind={accelerator_kind}, device_index={device_index}, "
+                    f"expect_image_models={expect_image_models}, "
+                    f"has_sampling_lease={gpu_sampling_lease is not None}",
+                    f" and comfy_smart_memory={comfy_smart_memory}",
                 )
 
                 extra_comfyui_args = _seed_extra_comfyui_args(comfy_smart_memory=comfy_smart_memory)

@@ -963,7 +963,6 @@ class HordeWorkerProcessManager:
             mp_primitives=mp_primitives,
             max_threads_ceiling=ceiling,
         )
-        logger.debug(f"Card runtimes: {self._card_runtimes}")
 
         self.max_inference_processes = sum(card.target_process_count for card in self._card_runtimes.values())
         logger.debug(f"Max inference processes: {self.max_inference_processes}")
