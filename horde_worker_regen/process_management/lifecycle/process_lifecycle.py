@@ -24,7 +24,6 @@ if TYPE_CHECKING:
 from horde_sdk.ai_horde_api.fields import GenerationID
 
 from horde_worker_regen.compute_mode import is_cpu_only_install
-from horde_worker_regen.consts import VRAM_HEAVY_MODELS
 from horde_worker_regen.process_management._internal._aliased_types import ProcessQueue
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import WorkerState
@@ -44,6 +43,7 @@ from horde_worker_regen.process_management.lifecycle.owned_process_registry impo
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
+from horde_worker_regen.process_management.models.model_sizing import any_offered_model_wants_whole_card
 from horde_worker_regen.process_management.resources.resource_budget import ram_pressure_floor_mb
 from horde_worker_regen.process_management.scheduling.performance_model import (
     BatchBucket,
@@ -1470,7 +1470,7 @@ class ProcessLifecycleManager:
         # configured card so a spawn never fails on a missing key; single-GPU always resolves to card 0.
         card = self._card_runtimes.get(device_index) or self._card_runtimes[min(self._card_runtimes)]
         logger.info(f"Starting inference process on PID {pid} (device {card.device_index})")
-        vram_heavy_models = any(model in VRAM_HEAVY_MODELS for model in bridge_data.image_models_to_load)
+        vram_heavy_models = any_offered_model_wants_whole_card(bridge_data.image_models_to_load)
 
         # DirectML has no env-var device mask (unlike CUDA/ROCm/XPU); a process is pinned to a DirectML
         # adapter only by its ``--directml=N`` comfy arg. When this worker drives several DirectML cards

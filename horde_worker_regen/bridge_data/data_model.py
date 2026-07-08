@@ -785,7 +785,11 @@ class reGenBridgeData(CombinedHordeBridgeData):
     their freed VRAM to the driver, and suppresses prefetch into sibling slots for its duration, so the model
     loads fully resident and samples at full speed instead of streaming weights and being hang-graded. This
     is the preventative form of `overbudget_exclusive_mode`, which only reacts once a model has already been
-    admitted over budget. Only used when `enable_vram_budget` is true."""
+    admitted over budget. Only used when `enable_vram_budget` is true.
+
+    This flag governs steady-state preference only. It does not gate the emergency starvation teardown: a
+    weight-dominant head starved behind the worker's own idle sibling contexts still tears them down to admit
+    even when this is false. See the VRAM arbiter explanation doc for that unconditional liveness path."""
 
     whole_card_residency_safety_off_gpu: bool = Field(default=True)
     """Move the safety process off-GPU while a whole-card model holds the device.

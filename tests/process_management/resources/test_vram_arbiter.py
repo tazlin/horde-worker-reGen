@@ -10,6 +10,7 @@ from horde_worker_regen.process_management.resources.admission_identity import (
 )
 from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
 from horde_worker_regen.process_management.resources.vram_arbiter import (
+    _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
     _STARVATION_DIAGNOSTIC_SECONDS,
     ActuatorCommandKind,
     DeviceVramState,
@@ -439,11 +440,11 @@ class TestStarvationContextTeardown:
         assert verdict.required_actuations == ()
         assert arbiter.starvation_context_teardowns == 0
 
-    def test_dispatch_gate_hold_never_tears_a_context_down(self) -> None:
-        """A MONOLITHIC_DISPATCH request never escalates to context teardown, whatever its starvation age.
+    def test_unstarved_dispatch_never_tears_a_context_down(self) -> None:
+        """An ordinary (un-starved) MONOLITHIC_DISPATCH request never escalates to context teardown.
 
-        The dispatch gate reconciles a staged job onto the card; it evicts idle residents but never collapses
-        the context pool. Only the preload/whole-card path may tear contexts down.
+        The dispatch gate reconciles a staged job onto the card; below the teardown grace it evicts idle
+        residents but never collapses the context pool. Only a starved head escalates.
         """
         arbiter = VramArbiter()
         state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
@@ -455,13 +456,327 @@ class TestStarvationContextTeardown:
             device_index=0,
             candidate_delta_mb=5000.0,
             is_head_of_queue=True,
-            starved_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 5.0,
+            starved_seconds=1.0,
             idle_contexts_teardownable=True,
         )
         verdict = arbiter.evaluate(dispatch)
         assert verdict.disposition == VramDisposition.DEFER
         assert ActuatorCommandKind.REDUCE_LIVE_CONTEXTS not in [c.kind for c in verdict.required_actuations]
         assert arbiter.starvation_context_teardowns == 0
+
+    def test_starved_dispatch_head_escalates_to_context_teardown(self) -> None:
+        """A starved MONOLITHIC_DISPATCH head with no reality room tears its own idle contexts down.
+
+        Parity with the preload seam: once the reality admit is ruled out (the candidate does not fit device-free
+        net of the hard floor) and the deficit is held by the head's own idle sibling contexts, the dispatch head
+        escalates to the same verified teardown past the grace.
+        """
+        arbiter = VramArbiter()
+        # device_free 4000 cannot hold candidate 5000 even net of the hard floor, so the reality admit is ruled
+        # out and the deficit is the idle sibling contexts.
+        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
+        arbiter.begin_cycle(_snapshot(state))
+        dispatch = VramRequest(
+            kind=VramRequestKind.MONOLITHIC_DISPATCH,
+            job_label="model_a",
+            baseline="stable_diffusion_xl",
+            device_index=0,
+            candidate_delta_mb=5000.0,
+            is_head_of_queue=True,
+            starved_seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0,
+            idle_contexts_teardownable=True,
+        )
+        verdict = arbiter.evaluate(dispatch)
+        assert verdict.disposition == VramDisposition.DEFER
+        assert [c.kind for c in verdict.required_actuations] == [ActuatorCommandKind.REDUCE_LIVE_CONTEXTS]
+        assert arbiter.starvation_context_teardowns == 1
+
+
+class TestFirstPartyContextPressureClassification:
+    """A starved head's own idle sibling contexts are reclaimable first-party residency, never foreign pressure.
+
+    The ordinary ladder cannot describe a bare-context teardown, so a head whose deficit is exactly its own idle
+    sibling contexts reaches the post-ladder analysis with an empty ladder. It must be classified as a
+    first-party reclaim awaiting the starvation threshold, not blamed on foreign pressure and rerouted to the
+    structural-wedge recovery supervisor.
+    """
+
+    def _first_party_head(self, **overrides: object) -> VramRequest:
+        """A head whose only unreclaimed deficit is its own teardownable idle sibling contexts."""
+        defaults: dict[str, object] = {
+            "candidate_delta_mb": 5000.0,
+            "is_head_of_queue": True,
+            "idle_contexts_teardownable": True,
+            "has_reclaimable_idle_model": False,
+            "can_reduce_live_contexts": False,
+        }
+        defaults.update(overrides)
+        return _preload(**defaults)
+
+    def test_below_threshold_defers_as_first_party_not_foreign(self) -> None:
+        """Before the escalation threshold the head defers on its own contexts, not as foreign pressure."""
+        arbiter = VramArbiter()
+        # committed 20000 <= capacity (own load fits); candidate 5000 tips it over; device-free has no room.
+        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
+        arbiter.begin_cycle(_snapshot(state))
+        verdict = arbiter.evaluate(self._first_party_head(starved_seconds=5.0))
+        assert verdict.disposition == VramDisposition.DEFER
+        assert verdict.required_actuations == ()
+        assert verdict.foreign_pressure_admit is False
+        assert "idle sibling contexts" in verdict.reason
+        assert arbiter.first_party_context_defers == 1
+        assert arbiter.admission_foreign_pressure_defers == 0
+        assert arbiter.starvation_diagnostics == 0
+        assert arbiter.starvation_context_teardowns == 0
+
+    def test_without_first_party_contexts_the_foreign_defer_still_classifies_as_foreign(self) -> None:
+        """A starved head with no teardownable contexts is genuinely foreign-pressured and diagnosed as such."""
+        arbiter = VramArbiter()
+        state = _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
+        arbiter.begin_cycle(_snapshot(state))
+        verdict = arbiter.evaluate(
+            self._first_party_head(
+                idle_contexts_teardownable=False,
+                starved_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 5.0,
+            ),
+        )
+        assert verdict.disposition == VramDisposition.DEFER
+        assert arbiter.first_party_context_defers == 0
+        assert arbiter.admission_foreign_pressure_defers == 1
+        assert arbiter.starvation_diagnostics == 1
+
+
+class TestDispatchStarvedRealityAdmit:
+    """A starved monolithic-dispatch head admits against device truth net of the governor hard floor.
+
+    The dispatch candidate is an activation-inclusive learned high-watermark peak, so stacking the full noise
+    buffer on top of it double-counts the margin. Past the grace, a head that physically fits device-free net of
+    the tighter governor hard floor admits into reality rather than parking on a ledger fiction.
+    """
+
+    _TOTAL_MB = 16375.0
+    _BASELINE_MB = 2055.0
+
+    def _state(self, *, committed_mb: float, device_free_mb: float) -> DeviceVramState:
+        """The incident card: 16375MB total, committed the worker's own bare idle contexts."""
+        return DeviceVramState(
+            total_vram_mb=self._TOTAL_MB,
+            baseline_mb=self._BASELINE_MB,
+            committed_vram_mb=committed_mb,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+            noise_buffer_mb=admission_noise_buffer_mb(self._TOTAL_MB),
+            device_free_mb=device_free_mb,
+        )
+
+    def _dispatch(self, *, candidate_delta_mb: float, starved_seconds: float, **overrides: object) -> VramRequest:
+        """A monolithic-dispatch head starved for the given duration."""
+        defaults: dict[str, object] = {
+            "kind": VramRequestKind.MONOLITHIC_DISPATCH,
+            "job_label": "WAI-SDXL",
+            "baseline": "stable_diffusion_xl",
+            "device_index": 0,
+            "candidate_delta_mb": candidate_delta_mb,
+            "is_head_of_queue": True,
+            "starved_seconds": starved_seconds,
+        }
+        defaults.update(overrides)
+        return VramRequest(**defaults)  # type: ignore[arg-type]
+
+    def test_incident_geometry_admits_into_reality(self) -> None:
+        """The 141s incident: candidate 9517 fits device-free 9938 net of the ~409 hard floor by 421MB."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state(committed_mb=4060.0, device_free_mb=9938.0)))
+        verdict = arbiter.evaluate(
+            self._dispatch(candidate_delta_mb=9517.0, starved_seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0),
+        )
+        assert verdict.disposition == VramDisposition.FITS
+        assert arbiter.dispatch_reality_admits == 1
+        assert "admit into reality" in verdict.reason
+
+    def test_just_below_the_hard_floor_stays_held(self) -> None:
+        """A candidate that overshoots device-free net of the hard floor does not take the reality admit."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state(committed_mb=4060.0, device_free_mb=9938.0)))
+        # 9938 - 9600 = 338 MB spare, below the ~409 MB hard floor: held.
+        verdict = arbiter.evaluate(
+            self._dispatch(candidate_delta_mb=9600.0, starved_seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0),
+        )
+        assert verdict.disposition == VramDisposition.DEFER
+        assert arbiter.dispatch_reality_admits == 0
+
+    def test_unstarved_head_does_not_take_the_reality_admit(self) -> None:
+        """Below the grace the ordinary identity stands: no reality admit even when the hard floor would fit."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state(committed_mb=4060.0, device_free_mb=9938.0)))
+        verdict = arbiter.evaluate(self._dispatch(candidate_delta_mb=9517.0, starved_seconds=1.0))
+        assert verdict.disposition == VramDisposition.DEFER
+        assert arbiter.dispatch_reality_admits == 0
+
+    def test_preload_head_does_not_take_the_dispatch_reality_admit(self) -> None:
+        """The hard-floor reality admit is dispatch-only: a preload head keeps the noise-buffer admission."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state(committed_mb=4060.0, device_free_mb=9938.0)))
+        arbiter.evaluate(
+            _preload(
+                candidate_delta_mb=9517.0,
+                is_head_of_queue=True,
+                starved_seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0,
+            ),
+        )
+        assert arbiter.dispatch_reality_admits == 0
+
+
+class TestFirstPartyTeardownGraceTiming:
+    """The first-party context teardown fires after a short grace, distinct from the 60s diagnostic threshold.
+
+    In the first-party geometry no alternative remedy can arrive (weight eviction cannot free a bare context; a
+    busy sibling finishing does not surrender its context), so the escalation is evidence-based and quick: it
+    waits only a short grace to ride out state churn, not the 60s diagnostic clock the genuinely-foreign
+    starvation path keeps.
+    """
+
+    def _state(self) -> DeviceVramState:
+        """Committed 20000 (own load fits capacity); candidate tips it over; no device-free room to admit into."""
+        return _roomy_state(committed_vram_mb=20000.0, device_free_mb=4000.0)
+
+    def _first_party_head(self, starved_seconds: float) -> VramRequest:
+        """A head whose deficit is its own teardownable idle contexts, starved for the given duration."""
+        return _preload(
+            candidate_delta_mb=5000.0,
+            is_head_of_queue=True,
+            starved_seconds=starved_seconds,
+            idle_contexts_teardownable=True,
+        )
+
+    def test_just_below_the_grace_defers_without_teardown(self) -> None:
+        """A head starved just under the grace defers as first-party without a teardown actuation."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state()))
+        verdict = arbiter.evaluate(self._first_party_head(_FIRST_PARTY_TEARDOWN_GRACE_SECONDS - 1.0))
+        assert verdict.disposition == VramDisposition.DEFER
+        assert ActuatorCommandKind.REDUCE_LIVE_CONTEXTS not in [c.kind for c in verdict.required_actuations]
+        assert arbiter.starvation_context_teardowns == 0
+        assert arbiter.first_party_context_defers == 1
+
+    def test_just_past_the_grace_escalates_to_teardown(self) -> None:
+        """A head starved just past the grace escalates to a REDUCE_LIVE_CONTEXTS teardown."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state()))
+        verdict = arbiter.evaluate(self._first_party_head(_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0))
+        assert verdict.disposition == VramDisposition.DEFER
+        assert [c.kind for c in verdict.required_actuations] == [ActuatorCommandKind.REDUCE_LIVE_CONTEXTS]
+        assert arbiter.starvation_context_teardowns == 1
+
+    def test_teardown_fires_well_before_the_diagnostic_threshold(self) -> None:
+        """Between the grace and the 60s diagnostic threshold the head tears down, not waits out the clock."""
+        assert _FIRST_PARTY_TEARDOWN_GRACE_SECONDS < _STARVATION_DIAGNOSTIC_SECONDS
+        midpoint = (_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + _STARVATION_DIAGNOSTIC_SECONDS) / 2.0
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state()))
+        verdict = arbiter.evaluate(self._first_party_head(midpoint))
+        assert [c.kind for c in verdict.required_actuations] == [ActuatorCommandKind.REDUCE_LIVE_CONTEXTS]
+        assert arbiter.starvation_context_teardowns == 1
+        assert arbiter.starvation_diagnostics == 0
+
+    def test_foreign_geometry_keeps_the_60s_diagnostic_timing(self) -> None:
+        """A genuinely-foreign starved head (no first-party contexts) still warns at 60s, not the short grace."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state()))
+        past_grace = _preload(
+            candidate_delta_mb=5000.0,
+            is_head_of_queue=True,
+            starved_seconds=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 1.0,
+            idle_contexts_teardownable=False,
+        )
+        arbiter.evaluate(past_grace)
+        assert arbiter.starvation_diagnostics == 0
+
+        arbiter.begin_cycle(_snapshot(self._state()))
+        past_diagnostic = _preload(
+            candidate_delta_mb=5000.0,
+            is_head_of_queue=True,
+            starved_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 1.0,
+            idle_contexts_teardownable=False,
+        )
+        arbiter.evaluate(past_diagnostic)
+        assert arbiter.starvation_diagnostics == 1
+
+
+class TestFlagIndependentStarvationLivenessRegression:
+    """The 4090 flag-off wedge: a weight-dominant head starved behind its own idle sibling contexts.
+
+    A 24GB card with ``whole_card_exclusive_residency`` off held two idle sibling inference contexts (5036 MB
+    committed, the worker's own) when a Flux fp8 head (16097 MB) reached the queue. The head fit capacity once
+    those contexts were torn down, but the deferral was misattributed to foreign pressure and rerouted to the
+    structural-wedge recovery supervisor, which destroyed the pool. The arbiter now escalates to a verified
+    context teardown regardless of the config flag (the scheduler feeds ``idle_contexts_teardownable`` true on
+    the emergency-liveness seam even with the flag off), and the head admits once the contexts exit.
+    """
+
+    _TOTAL_MB = 24074.0
+    _BASELINE_MB = 3972.0
+    _NOISE_MB = 1204.0
+    _CANDIDATE_MB = 16097.0
+
+    def _state(self, *, committed_mb: float) -> DeviceVramState:
+        """The card with ``committed_mb`` of the worker's own load and a truthful free reading net of it."""
+        return DeviceVramState(
+            total_vram_mb=self._TOTAL_MB,
+            baseline_mb=self._BASELINE_MB,
+            committed_vram_mb=committed_mb,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+            noise_buffer_mb=self._NOISE_MB,
+            device_free_mb=max(0.0, self._TOTAL_MB - self._BASELINE_MB - committed_mb),
+        )
+
+    def _head(self) -> VramRequest:
+        """The Flux head re-asking its preload, starved past the threshold, its own idle contexts torn-down-able."""
+        return _preload(
+            job_label="Flux.1-Schnell",
+            baseline="flux_1",
+            candidate_delta_mb=self._CANDIDATE_MB,
+            is_head_of_queue=True,
+            starved_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 51.0,
+            idle_contexts_teardownable=True,
+            has_reclaimable_idle_model=False,
+            can_reduce_live_contexts=False,
+        )
+
+    def test_escalates_to_teardown_instead_of_rerouting_to_the_supervisor(self) -> None:
+        """The head tears its own idle contexts down rather than being deferred as foreign and rerouted."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state(committed_mb=5036.0)))
+        verdict = arbiter.evaluate(self._head())
+        assert verdict.disposition == VramDisposition.DEFER
+        assert [c.kind for c in verdict.required_actuations] == [ActuatorCommandKind.REDUCE_LIVE_CONTEXTS]
+        assert verdict.foreign_pressure_admit is False
+        assert arbiter.starvation_context_teardowns == 1
+        # The foreign-pressure reroute path (the permanent-DEFER branch) is no longer reachable in this geometry.
+        assert arbiter.admission_foreign_pressure_defers == 0
+        assert arbiter.starvation_diagnostics == 0
+
+    def test_reask_admits_once_the_idle_contexts_exit(self) -> None:
+        """After the torn-down contexts drop the committed floor, the head's re-ask fits capacity."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state(committed_mb=5036.0)))
+        assert arbiter.evaluate(self._head()).disposition == VramDisposition.DEFER
+        # Both idle sibling contexts exited: the committed floor drops to a single retained context.
+        arbiter.begin_cycle(_snapshot(self._state(committed_mb=2518.0)))
+        assert arbiter.evaluate(self._head()).disposition == VramDisposition.FITS
+
+    def test_reroute_remains_reachable_when_the_candidate_can_never_fit(self) -> None:
+        """A candidate larger than an emptied card with no teardown target still DENIES: legitimate non-progress."""
+        arbiter = VramArbiter()
+        arbiter.begin_cycle(_snapshot(self._state(committed_mb=5036.0)))
+        oversized = _preload(
+            candidate_delta_mb=self._TOTAL_MB,  # cannot fit even a fully cleared card
+            is_head_of_queue=True,
+            starved_seconds=_STARVATION_DIAGNOSTIC_SECONDS + 51.0,
+            idle_contexts_teardownable=False,
+        )
+        assert arbiter.evaluate(oversized).disposition == VramDisposition.DENY
 
 
 class TestDisaggSampling:

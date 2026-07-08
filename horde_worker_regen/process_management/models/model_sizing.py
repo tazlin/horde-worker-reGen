@@ -13,6 +13,7 @@ without touching torch or the device.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from enum import IntEnum
 
 from horde_model_reference.meta_consts import KNOWN_IMAGE_GENERATION_BASELINE
@@ -87,3 +88,23 @@ def is_extra_large_model(model_name: str | None, baseline_value: str | None) -> 
     set of models the limiter throttles is exactly the set the residency machinery would give the card to.
     """
     return model_size_tier(model_name, baseline_value) >= ModelSizeTier.EXTRA_LARGE
+
+
+def any_offered_model_wants_whole_card(
+    model_names: Iterable[str],
+    baseline_lookup: Callable[[str], str | None] | None = None,
+) -> bool:
+    """Whether any model in an offered set is EXTRA_LARGE: a "very large" model that wants the whole card.
+
+    The single question the worker's spawn-time sizing and process-launch paths ask about a configured model
+    set, routed through the same :func:`is_extra_large_model` predicate the scheduler and popper use so "very
+    large" means one thing across the worker. ``baseline_lookup`` maps a model name to its baseline value when
+    a loaded reference is available; without it (before any reference is loaded, as at spawn-time sizing) the
+    classification falls back to the named-checkpoint branch of :func:`model_size_tier`, which still recognises
+    the named VRAM-heavy checkpoints by name alone.
+    """
+    for model_name in model_names:
+        baseline_value = baseline_lookup(model_name) if baseline_lookup is not None else None
+        if is_extra_large_model(model_name, baseline_value):
+            return True
+    return False

@@ -8,7 +8,17 @@ VERSION_META_REMOTE_URL = (
 
 
 KNOWN_SLOW_MODELS_DIFFICULTIES = {"Stable Cascade 1.0": 6.0, "Flux.1-Schnell fp8 (Compact)": 6.0}
+
 VRAM_HEAVY_MODELS = ["Stable Cascade 1.0", "Flux.1-Schnell fp16 (Compact)", "Flux.1-Schnell fp8 (Compact)"]
+"""Checkpoints classified as "very large" by name rather than baseline.
+
+The named-checkpoint escape hatch folded into
+:func:`~horde_worker_regen.process_management.models.model_sizing.model_size_tier`, which is the single
+authority for "very large" (whole-card) classification across the worker. Prefer the tier predicates
+(:func:`~horde_worker_regen.process_management.models.model_size_tier`,
+:func:`~horde_worker_regen.process_management.models.model_sizing.is_extra_large_model`) over reading this
+list directly, so a model's size is asked the same way everywhere.
+"""
 KNOWN_SLOW_WORKFLOWS = {"qr_code": 2.0}
 KNOWN_CONTROLNET_WORKFLOWS = {"qr_code": 2.0}
 

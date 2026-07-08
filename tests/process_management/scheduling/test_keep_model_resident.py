@@ -270,15 +270,79 @@ async def test_jobs_own_post_processing_peak_is_charged_against_the_static_fit(m
     assert seen_free[0] == float(_TOTAL_VRAM_MB) - 3100.0
 
 
-async def test_no_retain_when_budget_rejects_footprint() -> None:
-    """Under VRAM pressure the budget says the model does not fit, so retention is refused (would starve a swap)."""
+async def test_soak_geometry_sdxl_peak_retains_on_a_16gb_card_with_a_sibling() -> None:
+    """The soak geometry: SDXL peak 8258 on a 16375MB card with a sibling context retains.
+
+    The old static fit stacked the full operator reserve (4096) on top of the learned peak plus the sibling
+    context charge, denying retention on a 16GB card by a few dozen MB and forcing a weight re-transfer every
+    job. Charging only the measurement noise buffer instead flips it to a grant, which the baseline tree ran
+    with zero corroborated paging.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=None)
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map)
+    scheduler._overhead.set_marginal_overhead_mb(2030.0)
+
+    def peak_8258(job, baseline, free_vram_mb, committed_reserve_mb=0.0, *, disaggregated=False):  # noqa: ANN001, ANN202
+        return Mock(fits=free_vram_mb >= 8258.0 + 4096.0, predicted_mb=8258.0, reserve_mb=4096.0)
+
+    scheduler._vram_budget.check_job = peak_8258  # type: ignore[method-assign]
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    # check_job's own fits (peak + operator reserve 4096) would deny: 8258 + 4096 = 12354 > 16375 - 2030 = 14345
+    # is false, but net of only the noise buffer it fits, so the de-stacked gate grants.
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is True
+    )
+
+
+async def test_conflicting_sibling_working_set_still_denies_retention() -> None:
+    """A peak that cannot coexist with a sibling's resident working set is still refused.
+
+    De-stacking the operator reserve does not remove the protection: a genuinely too-large peak (net of the
+    sibling contexts already charged and the noise buffer) still fails the static fit.
+    """
+    job_tracker = JobTracker()
+    dispatched = make_job_pop_response(model=_MODEL)
+    await track_popped_job_async(job_tracker, dispatched)
+
+    sibling = make_mock_process_info(_SIBLING_PROCESS_ID, model_name=_OTHER_MODEL)
+    process_map = ProcessMap({_PROCESS_ID: _dispatch_process(), _SIBLING_PROCESS_ID: sibling})
+    model_map = _map_with_model_on_process(_OTHER_MODEL, _SIBLING_PROCESS_ID)
+    scheduler = _budget_on_scheduler(job_tracker, process_map=process_map, horde_model_map=model_map)
+    scheduler._overhead.set_marginal_overhead_mb(2030.0)
+
+    # A peak larger than the card net of the sibling context and the noise buffer cannot coexist.
+    def oversized_peak(job, baseline, free_vram_mb, committed_reserve_mb=0.0, *, disaggregated=False):  # noqa: ANN001, ANN202
+        return Mock(fits=False, predicted_mb=15000.0, reserve_mb=4096.0)
+
+    scheduler._vram_budget.check_job = oversized_peak  # type: ignore[method-assign]
+    process_info = scheduler._process_map[_PROCESS_ID]
+
+    assert (
+        scheduler._should_keep_model_resident(dispatched, process_with_model=process_info, device_index=None) is False
+    )
+
+
+async def test_no_retain_when_footprint_exceeds_the_static_fit() -> None:
+    """A sampling peak that cannot fit the card even net of the noise buffer refuses retention.
+
+    Retention charges the learned peak against the card total (net of sibling contexts and the job's own
+    post-processing) plus the measurement noise buffer, not the operator reserve. A peak that overshoots that
+    static fit is refused, so retention never starves a genuinely-conflicting swap.
+    """
     job_tracker = JobTracker()
     dispatched = make_job_pop_response(model=_MODEL)
     await track_popped_job_async(job_tracker, dispatched)
 
     scheduler = _budget_on_scheduler(job_tracker)
+    # A peak larger than the whole card cannot fit even net of only the noise buffer.
     scheduler._vram_budget.check_job = Mock(  # type: ignore[method-assign]
-        return_value=Mock(fits=False, predicted_mb=None, reserve_mb=0.0),
+        return_value=Mock(fits=False, predicted_mb=float(_TOTAL_VRAM_MB), reserve_mb=0.0),
     )
     process_info = scheduler._process_map[_PROCESS_ID]
 

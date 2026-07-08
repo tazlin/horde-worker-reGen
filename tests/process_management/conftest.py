@@ -334,6 +334,7 @@ def make_job_pop_response(
     loras: list[LorasPayloadEntry] | None = None,
     r2_upload: str | None = None,
     post_processing: list[str] | None = None,
+    workflow: str | None = None,
 ) -> ImageGenerateJobPopResponse:
     """Create a real ImageGenerateJobPopResponse for testing."""
     job_id = uuid.uuid4()
@@ -353,6 +354,8 @@ def make_job_pop_response(
         "skipped": {},
         "source_processing": "txt2img",
     }
+    if workflow is not None:
+        data["payload"]["workflow"] = workflow  # pyrefly: ignore - validated by pydantic
     if post_processing is not None:
         data["payload"]["post_processing"] = post_processing  # pyrefly: ignore - validated by pydantic
     if loras is not None:

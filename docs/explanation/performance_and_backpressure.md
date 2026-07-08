@@ -389,8 +389,15 @@ device level), retention no longer has to be preemptively stingy. It grants when
   reads the one figure a WDDM driver cannot misreport under demand-paging (NVML device-free), so it holds
   precisely in the regime where measured free VRAM lies.
 - **Static fit**: the card's reported *total* VRAM (a constant the driver cannot misreport under pressure)
-  must absorb the job's sampling peak plus the configured reserve and any committed reserves, after charging
-  the sibling CUDA contexts and the job's own post-processing that share the card while the weights are held.
+  must absorb the job's sampling peak plus the measurement noise buffer and any committed reserves, after
+  charging the sibling CUDA contexts (at their truthful per-context marginal) and the job's own
+  post-processing that share the card while the weights are held. The margin added on top of the peak is the
+  admission noise buffer, **not** the operator's configured `vram_reserve_mb`: that configured reserve is a
+  sampling / co-residency headroom term, and enforcing it as a hard static-fit floor stacks it on an already
+  activation-inclusive learned peak and denies retention on a small card by a few dozen MB, forcing a weight
+  re-transfer every job (and re-crossing the dispatch gate as a fresh materialisation). The de-stacked fit
+  grants where the card genuinely holds the weights; the engine's force-load overflow guard remains the hard
+  backstop if a grant is ever wrong.
 
 The [VRAM budget](#the-vram-and-ram-budget) measured-free check is deliberately *not* re-applied in this
 seam: it is the admission/dispatch gate's job, and retaining already-materialized weights adds no new bytes
@@ -706,25 +713,38 @@ lower it, each only ever reducing a card and never below one context per card.
 First,
 [`cap_card_processes_to_vram_fit`][horde_worker_regen.process_management.process_manager.cap_card_processes_to_vram_fit]
 bounds **every** card, single-GPU included, to the inference contexts its VRAM
-physically holds: solving `contexts * idle_overhead + heaviest_footprint <= total -
+physically holds: solving `contexts * idle_overhead + working_set <= total -
 noise_buffer` for the context count. It charges each planned context the idle
-CUDA/runtime baseline and the heaviest offered model only once (the state the
-runtime governor steers toward: contexts idle-staged, one heaviest model resident
-at a time), net of the same proportional admission noise buffer runtime admission
-keeps. This is the cap that closes the single-GPU over-configuration gap where one
-card is asked to spawn more contexts than it can hold.
+CUDA/runtime baseline plus **one typical working set** (a single SDXL-class model
+actively serving), net of the same proportional admission noise buffer runtime
+admission keeps. It closes the single-GPU over-configuration gap where one card is
+asked to spawn more contexts than it can hold.
 
-Second, the resolved plan summed across a multi-GPU host double-counts the single
-shared system-RAM pool (a second card doubles VRAM, not RAM). So when the worker
-drives more than one card,
+Crucially, a very large model (Cascade, Flux, Qwen, Z-Image) does **not** raise this
+bound. Such models never co-sample: the scheduler runs them through whole-card
+residency that tears down or pauses sibling contexts just-in-time when one dispatches,
+so their footprint is paid at *their* dispatch, not reserved at all times. Charging
+the largest offered model here instead would pay flux's cost continuously and delete
+the spare contexts a worker needs to preload the next model ahead of the dominant
+typical-model traffic, starving the card between model switches. Sizing to one typical
+working set keeps those preload-ahead contexts and leaves the just-in-time whole-card
+machinery to reclaim for a large model only when one actually runs.
+
+Second, every resident context retains system RAM that no card's VRAM offsets, and the
+RAM pool is shared across all cards, so the resolved plan can over-commit it: summed
+across a multi-GPU host (a second card doubles VRAM, not RAM), and on a single card
+whose plan alone exceeds the pool.
 [`cap_card_process_counts`][horde_worker_regen.process_management.process_manager.cap_card_process_counts]
-lowers each card's spawned-process count further so the worker-wide resident-context
-count fits system RAM. Both caps use conservative footprint estimates (no model
-reference or measurement exists at startup); the measured runtime budget then refines
-the live count downward under real pressure. The `horde-benchmark` path provisions an
-elevated concurrency ceiling to probe higher parallelism than steady-state operation
-keeps, so it is exempt from the VRAM-fit cap (capping it would forbid the levels it
-exists to measure); the runtime governor still enforces real residency during the run.
+therefore applies to **every** host and lowers each card's spawned-process count so the
+worker-wide resident-context count fits system RAM. It is deliberately kept as a
+separate, orthogonal cap from the VRAM-fit bound above, because a runtime RAM
+over-commit is a fatal OS kill the worker cannot reclaim, whereas VRAM pressure is
+recoverable. Both caps use conservative footprint estimates (no model reference or
+measurement exists at startup); the measured runtime budget then refines the live count
+downward under real pressure. The `horde-benchmark` path provisions an elevated
+concurrency ceiling to probe higher parallelism than steady-state operation keeps, so
+it is exempt from **both** caps (capping it would forbid the levels it exists to
+measure); the runtime governor still enforces real residency during the run.
 Post-processing VRAM is split across two budget paths: the lane's fixed CUDA
 context is part of the resident-process forecast, while each active
 post-processing job's estimated upscale/face-fix peak is entered in the shared

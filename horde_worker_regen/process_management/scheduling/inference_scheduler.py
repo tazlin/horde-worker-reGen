@@ -15,7 +15,7 @@ from horde_sdk.ai_horde_api.apimodels import ImageGenerateJobPopResponse
 from loguru import logger
 
 from horde_worker_regen.compute_mode import is_cpu_only_install
-from horde_worker_regen.consts import KNOWN_SLOW_WORKFLOWS, VRAM_HEAVY_MODELS
+from horde_worker_regen.consts import KNOWN_SLOW_WORKFLOWS
 from horde_worker_regen.process_management.config.runtime_config import RuntimeConfig
 from horde_worker_regen.process_management.config.worker_state import PopPauseOwner, WorkerState
 from horde_worker_regen.process_management.gpu.card_runtime import CardRuntime
@@ -4783,15 +4783,18 @@ class InferenceScheduler:
         """Return whether an idle sibling inference context could be torn down to reclaim VRAM for a starved head.
 
         A bare CUDA context's VRAM is reclaimed only when its process exits, which weight eviction (model
-        unload, cache release) cannot achieve. When whole-card residency is enabled, an idle inference process
-        on the card other than the head's own target slot, not busy and not serving an in-progress job, is a
-        teardown candidate the starvation escalation can reduce via
-        :meth:`reduce_live_contexts`. Excludes the head's target slot and every busy process, matching that
-        actuator's own protections; returns False when whole-card residency is disabled (the teardown runs
-        through the residency machinery, so it must not fire without it).
+        unload, cache release) cannot achieve. An idle inference process on the card other than the head's own
+        target slot, not busy and not serving an in-progress job, is a teardown candidate the starvation
+        escalation can reduce via :meth:`reduce_live_contexts`. Excludes the head's target slot and every busy
+        process, matching that actuator's own protections.
+
+        This is independent of ``whole_card_exclusive_residency``: that flag governs whether the worker
+        establishes exclusive residency as a steady-state preference, but the starvation escalation is an
+        emergency liveness path (a head starved past the arbiter's threshold whose own idle contexts hold the
+        deficit) that must be reachable regardless. The actuation runs through :meth:`reduce_live_contexts` ->
+        :meth:`_establish_whole_card_residency` -> ``scale_inference_processes``, none of which gate on the flag,
+        so tearing the idle contexts down proceeds when the flag is off.
         """
-        if not self._whole_card_residency_enabled():
-            return False
         in_progress_models = {job.model for job in self._job_tracker.jobs_in_progress}
         for process_info in self._process_map.values():
             if process_info.process_type != HordeProcessType.INFERENCE:
@@ -6048,10 +6051,14 @@ class InferenceScheduler:
           resident to evict. This state is derived from the one figure a WDDM driver cannot misreport under
           demand-paging (NVML device-free), so it holds precisely in the regime measured free VRAM lies.
         - **Static fit**: the card's reported total VRAM must absorb this job's sampling peak plus the
-          configured reserve (and any committed in-flight reserves), after charging the sibling CUDA contexts
-          and the job's own post-processing that share the card while the weights are held. The total is a
-          constant the driver cannot misreport under pressure, so a model too large to hold at all is refused
-          regardless of what "free" claims.
+          measurement noise buffer (and any committed in-flight reserves), after charging the sibling CUDA
+          contexts and the job's own post-processing that share the card while the weights are held. The margin
+          added on top of the peak is the admission noise buffer, not the operator's configured
+          ``vram_reserve_mb``: that reserve is a sampling / co-residency headroom term, and enforcing it as a
+          hard static-fit floor stacks it on an already activation-inclusive learned peak, denying retention on
+          a small card by a few dozen MB and forcing a re-transfer every job. The total is a constant the driver
+          cannot misreport under pressure, so a model too large to hold at all is refused regardless of what
+          "free" claims.
 
         The measured admission floor is deliberately *not* re-checked here: it is the admission/dispatch
         gate's job, and retaining already-materialized weights adds zero new bytes to the card, so a measured
@@ -6116,14 +6123,25 @@ class InferenceScheduler:
             committed_reserve_mb=committed_reserve_mb,
             disaggregated=self._is_disaggregation_class_eligible(dispatched_job),
         )
-        granted = static_verdict.fits
+        # De-stack the margin: the learned sampling peak is already activation-inclusive, and the operator's
+        # configured vram_reserve_mb is a sampling / co-residency headroom term, not a static load-feasibility
+        # floor. Enforcing that full reserve on top of the peak (as check_job's fits does) prices already
+        # materialised weights off a small card and forces a re-transfer every job. The measurement margin for a
+        # static fit is the admission noise buffer, the same slack the admission identity uses. The sibling
+        # contexts (charged above at their truthful marginal) and the job's own post-processing are already
+        # netted out of static_available_mb.
+        predicted_mb = static_verdict.predicted_mb
+        noise_mb = admission_noise_buffer_mb(total_vram_mb)
+        effective_available_mb = static_available_mb - committed_reserve_mb
+        granted = predicted_mb is None or (predicted_mb + noise_mb) <= effective_available_mb
         self._log_retention_decision(
             model,
             process_with_model,
             granted=granted,
             reason=(
-                f"static: peak {static_verdict.predicted_mb} + reserve vs {static_available_mb:.0f}MB "
-                f"(total {total_vram_mb:.0f}MB minus sibling contexts and the job's own post-processing)"
+                f"static: peak {predicted_mb} + noise {noise_mb:.0f} vs {effective_available_mb:.0f}MB "
+                f"(total {total_vram_mb:.0f}MB minus sibling contexts, the job's own post-processing, and "
+                f"in-flight commitments)"
             ),
         )
         return granted
@@ -6869,11 +6887,15 @@ class InferenceScheduler:
             is_head_of_queue=is_head_of_queue,
             starved_seconds=self._head_starved_seconds(next_job),
             has_reclaimable_idle_model=has_reclaimable_idle_model,
-            # A staged dispatch never reduces the live inference-context count: it evicts idle residents to make
-            # room, it does not collapse the co-resident pool the way a whole-card preload does. A dispatch-gate
-            # hold therefore never tears an idle context down (idle_contexts_teardownable stays False), matching
-            # the whole-card path being the only teardown-eligible seam.
+            # An ordinary staged dispatch never reduces the live inference-context count: it evicts idle
+            # residents to make room, it does not collapse the co-resident pool (can_reduce_live_contexts stays
+            # False, so the ordinary activation-peak warrant never tears a context down). The one exception is a
+            # starved head whose deficit is held by its own bare idle sibling contexts with no reality-admit and
+            # no weight reclaim left: it escalates to the same verified teardown the preload seam uses, so this
+            # head-only signal is reported for that path.
             can_reduce_live_contexts=False,
+            idle_contexts_teardownable=is_head_of_queue
+            and self._has_teardownable_idle_context(process_with_model, device_index=device_index),
         )
         verdict = self._ensure_preload_arbiter().evaluate(request)
 
@@ -7539,21 +7561,22 @@ class InferenceScheduler:
     ) -> bool:
         """Return whether the job's model and workflow are heavy enough to serialise behind in-flight work.
 
-        True for an SDXL model running a known-slow workflow, or any model in ``VRAM_HEAVY_MODELS``. Used to
-        hold a heavy batch head back while a thread is already busy, so stacked weight loads and activation
-        peaks do not thrash a sampler into a watchdog teardown.
+        True for an SDXL model running a known-slow workflow, or any very large (EXTRA_LARGE tier) model,
+        resolved through the same size-tier authority the whole-card machinery classifies by. Used to hold a
+        heavy batch head back while a thread is already busy, so stacked weight loads and activation peaks do
+        not thrash a sampler into a watchdog teardown.
         """
         model = job.model
         if model is None:
             return False
-        next_model_baseline = stable_diffusion_reference.get(model)
+        next_model_record = stable_diffusion_reference.get(model)
         next_workflow = job.payload.workflow
         heavy = (
-            next_model_baseline is not None
-            and next_model_baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
+            next_model_record is not None
+            and next_model_record.baseline == KNOWN_IMAGE_GENERATION_BASELINE.stable_diffusion_xl
             and next_workflow in KNOWN_SLOW_WORKFLOWS
         )
-        if model in VRAM_HEAVY_MODELS:
+        if self._model_size_tier(model) >= _ModelSizeTier.EXTRA_LARGE:
             heavy = True
         return heavy
 

@@ -33,27 +33,40 @@ measured capacity follows from why it does not fit:
   running on the card (SATURATED and not yet proven unrelievable). Because reclaim is verified, a deferred
   demand either gets its space demonstrably freed within a bounded number of cycles or the ladder proves
   nothing remains to reclaim. The caller runs the described rungs and the request re-asks next cycle.
-- Once reclaim is exhausted and the demand still does not fit, the verdict depends on the shortfall's cause.
-  If the worker's own committed load exceeds capacity even after full reclaim, live samplers legitimately
-  hold the card and the head DEFERS to wait for a slot like any queued job. If the shortfall is foreign
-  (the worker's own committed load fits capacity but the card is consumed by baseline/desktop load), the
-  candidate is admitted only when it physically fits the truthful device-free reading net of the noise
-  buffer right now, and only for the true head of queue: fitting into reality, never into hope, and never
-  handing that physical room to a non-head line-skipper the head would then starve behind. Otherwise it
-  DEFERS.
+- Once reclaim is exhausted and the demand still does not fit, a head whose deficit is held by its own idle
+  sibling contexts (a bare CUDA context freed only when its process exits, so no model-unload or cache-release
+  rung reclaims it), with no physically-available VRAM to admit into, escalates to a verified context teardown
+  before the shortfall analysis (below) once it has starved past a short grace: it DEFERS with a
+  REDUCE_LIVE_CONTEXTS actuation and re-asks once the room frees. The grace is short by design, not the 60s
+  diagnostic threshold: in that geometry no alternative remedy can arrive (weight eviction cannot free a bare
+  context; a busy sibling finishing does not surrender its context), so the grace exists only to ride out state
+  churn, and waiting longer is pure idle-card loss.
+- Otherwise the verdict depends on the shortfall's cause. If the worker's own committed load exceeds capacity
+  even after full reclaim, live samplers legitimately hold the card and the head DEFERS to wait for a slot like
+  any queued job. If the shortfall is foreign (the worker's own committed load fits capacity but the card is
+  consumed by baseline/desktop load), the candidate is admitted only when it physically fits the truthful
+  device-free reading net of the noise buffer right now, and only for the true head of queue: fitting into
+  reality, never into hope, and never handing that physical room to a non-head line-skipper the head would then
+  starve behind. A head that does not physically fit but whose deficit is its own not-yet-torn-down idle sibling
+  contexts (still within the short teardown grace) DEFERS as that reclaimable first-party residency, distinct
+  from genuinely foreign pressure: reclaim is not exhausted while its own context teardown is still pending. Any
+  other non-fitting demand DEFERS as foreign pressure.
 - A candidate that cannot fit an even fully-cleared card DENIES: no escalation on this card could seat it.
 
 There is no overcommit-admit path. A head that never becomes admittable while the device is idle is caught by
 the structural-queue-wedge recovery supervisor (the deadlock detector feeding the worker recovery
 coordinator), which soft-resets the pools and, failing that, faults the wedged jobs non-retryably so the
-horde reissues them elsewhere. Before that, a head starved past :data:`_STARVATION_DIAGNOSTIC_SECONDS` whose
-remaining deficit is held by its own idle sibling contexts (a bare CUDA context that weight eviction cannot
-reclaim, freed only when the process exits) escalates to a verified context teardown: it DEFERS with a
-REDUCE_LIVE_CONTEXTS actuation that reduces the live inference-context count, protecting the head's own target
-slot and every busy process, and re-asks for a verified FITS once the room frees. That escalation is the
-preload/whole-card path's alone; a dispatch-gate hold never tears a context down. A head deferred past the
-threshold with the ladder exhausted and no such teardown target emits a warning naming the arithmetic and
-increments :attr:`VramArbiter.starvation_diagnostics`, but it never admits: the job stays queued for that
+horde reissues them elsewhere. Before that, a head starved past the short
+:data:`_FIRST_PARTY_TEARDOWN_GRACE_SECONDS` grace whose remaining deficit is held by its own idle sibling
+contexts (a bare CUDA context that weight eviction cannot reclaim, freed only when the process exits) escalates
+to a verified context teardown: it DEFERS with a REDUCE_LIVE_CONTEXTS actuation that reduces the live
+inference-context count, protecting the head's own target slot and every busy process, and re-asks for a
+verified FITS once the room frees. Both the preload/whole-card path and a starved monolithic-dispatch head can
+reach that escalation; an ordinary (un-starved) dispatch still never collapses the pool, and the dispatch head
+only escalates once its reality admit (below) has been ruled out. A genuinely-foreign starved head (no
+first-party context reclaim) instead emits a
+warning naming the arithmetic once past :data:`_STARVATION_DIAGNOSTIC_SECONDS` and increments
+:attr:`VramArbiter.starvation_diagnostics`, but it never admits: the job stays queued for that
 recovery machinery to reroute.
 
 Staleness and cold start relax to FITS, never deny: a stale committed ledger or an unknown device total
@@ -75,8 +88,21 @@ from horde_worker_regen.process_management.resources.admission_identity import (
     AdmissionVerdict,
     evaluate_admission,
 )
-from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.resources.device_free_governor import GovernorState, hard_floor_mb
 from horde_worker_regen.process_management.resources.vram_attribution import committed_ledger_is_phantom
+
+_FIRST_PARTY_TEARDOWN_GRACE_SECONDS = 10.0
+"""Age (seconds) a head must be the undispatched head of an idle device before its own idle sibling contexts
+are torn down, when those contexts provably hold the entire remaining deficit and nothing else can free it.
+
+This is a short grace, not the diagnostic threshold. When weight reclaim is exhausted, no physically-available
+VRAM exists to admit into, and the deficit is exactly the head's own idle sibling contexts (a bare CUDA context
+weight eviction cannot reclaim), no alternative remedy can arrive: evicting a model or releasing a cache frees
+nothing the contexts hold, and a busy sibling finishing does not surrender its context. Waiting past this point
+is pure idle-card loss, so the escalation fires quickly. The grace exists only to ride out transient state
+churn and measurement noise (a sibling about to pick up work, a snapshot mid-reconciliation), not to wait for a
+remedy that cannot come. Rapid large/small model alternation is damped on the pop side by
+``large_model_switch_min_seconds`` and the re-entry cooldown, not by lengthening this timer."""
 
 _STARVATION_DIAGNOSTIC_SECONDS = 60.0
 """Age (seconds) past which a head-of-queue request that keeps deferring with reclaim exhausted and no
@@ -227,9 +253,10 @@ class VramRequest:
     busy process) exist that a teardown could reclaim for this head. Distinct from ``can_reduce_live_contexts``:
     that flag is the ordinary activation-peak warrant, which a bare-context over-commit (idle siblings holding
     no evictable model or cache) does not trip, so a head whose remaining deficit is exactly those contexts
-    would defer forever. This lets a head starved past the escalation threshold escalate to a verified context
-    teardown regardless of that warrant. Only the preload/whole-card path sets it; a dispatch-gate hold leaves
-    it False so a line-skip or staged-dispatch reconciliation never tears a context down."""
+    would defer forever. This lets a head starved past the teardown grace escalate to a verified context
+    teardown regardless of that warrant. Both a preload/whole-card head and a monolithic-dispatch head set it
+    when they are the true head of queue; an ordinary (un-starved) dispatch and a line-skip never reach the
+    escalation, and a dispatch head only escalates once its reality admit has been ruled out."""
 
 
 @dataclass(frozen=True)
@@ -403,9 +430,11 @@ class VramArbiter:
         self._cycle_seq = 0
         self._starvation_diag_cycle: dict[int, int] = {}
         self.admission_foreign_pressure_defers = 0
+        self.first_party_context_defers = 0
         self.starvation_diagnostics = 0
         self.starvation_context_teardowns = 0
         self.phantom_truth_admissions = 0
+        self.dispatch_reality_admits = 0
 
     def begin_cycle(self, snapshot: MeasuredVramSnapshot) -> None:
         """Freeze the measurement this cycle's requests are priced against."""
@@ -495,6 +524,10 @@ class VramArbiter:
             if phantom_verdict is not None:
                 return phantom_verdict
 
+        dispatch_reality_verdict = self._dispatch_starved_reality_admit(request, state, measured)
+        if dispatch_reality_verdict is not None:
+            return dispatch_reality_verdict
+
         actuations = self._escalation_ladder(state, request)
         if ledger_phantom:
             # A phantom over-commit is bookkeeping: evicting a model or tearing a context down reclaims
@@ -525,12 +558,27 @@ class VramArbiter:
                 measured=measured,
             )
 
-        # Reclaim is exhausted and the demand still does not fit. Before the shortfall analysis, a head starved
-        # past the escalation threshold whose remaining deficit is held by its own idle sibling contexts (which
-        # weight eviction cannot reclaim, because a context's VRAM returns only when its process exits) escalates
-        # to a verified context teardown rather than deferring forever. It never force-admits: the teardown only
-        # frees room and the head re-asks for a verified FITS next cycle.
-        teardown_actuations = None if ledger_phantom else self._starvation_context_teardown(request)
+        # Reclaim through the ordinary ladder is exhausted and the demand still does not fit. Compute the
+        # shortfall figures and the truthful reality reading once: they decide both the foreign-pressure admit
+        # and whether a first-party context teardown is warranted.
+        capacity_mb = measured.capacity_mb
+        candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
+        own_committed_demand_mb = measured.measured_committed_mb + measured.planned_unmaterialized_mb
+        device_free_mb = state.device_free_mb
+        physically_fits_reality = (
+            device_free_mb is not None and candidate_delta_mb <= device_free_mb - state.noise_buffer_mb
+        )
+
+        # Before the shortfall analysis, a head starved past the short teardown grace whose remaining deficit is
+        # held by its own idle sibling contexts (which weight eviction cannot reclaim, because a context's VRAM
+        # returns only when its process exits) escalates to a verified context teardown rather than deferring
+        # forever. It never fires when the head could instead admit into physically-available VRAM: the reality
+        # admit below is less disruptive than tearing the worker's own contexts down. It never force-admits
+        # either: the teardown only frees room and the head re-asks for a verified FITS next cycle. Suppressed
+        # under a phantom ledger, where destructive reclaim would tear a demonstrably free card down.
+        teardown_actuations = (
+            None if ledger_phantom or physically_fits_reality else self._starvation_context_teardown(request)
+        )
         if teardown_actuations is not None:
             self.starvation_context_teardowns += 1
             return VramVerdict(
@@ -538,17 +586,16 @@ class VramArbiter:
                 request_kind=request.kind,
                 device_index=request.device_index,
                 reason=(
-                    f"head starved {request.starved_seconds:.0f}s with weight reclaim exhausted and idle sibling "
-                    f"contexts holding the deficit; tearing idle contexts down. measured: {measured.reason()}"
+                    f"head starved {request.starved_seconds:.0f}s (past the "
+                    f"{_FIRST_PARTY_TEARDOWN_GRACE_SECONDS:.0f}s teardown grace) with weight reclaim exhausted and "
+                    f"idle sibling contexts holding the deficit; tearing idle contexts down. measured: "
+                    f"{measured.reason()}"
                 ),
                 measured=measured,
                 required_actuations=teardown_actuations,
             )
 
         # The verdict follows the shortfall's cause.
-        capacity_mb = measured.capacity_mb
-        candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
-        own_committed_demand_mb = measured.measured_committed_mb + measured.planned_unmaterialized_mb
         if capacity_mb is None or own_committed_demand_mb > capacity_mb:
             # The worker's own committed load exceeds capacity even after full reclaim: live samplers
             # legitimately hold the card. The head waits for a slot like any queued job.
@@ -567,12 +614,9 @@ class VramArbiter:
             )
 
         # Foreign shortfall: the worker's own committed load fits capacity, so the candidate tips the ledger
-        # over only because the card is consumed by load the worker did not commit. Consult reality: admit iff
-        # the candidate physically fits the truthful device-free reading net of the noise buffer right now.
-        device_free_mb = state.device_free_mb
-        physically_fits_reality = (
-            device_free_mb is not None and candidate_delta_mb <= device_free_mb - state.noise_buffer_mb
-        )
+        # over only because the card is consumed by load the worker did not commit. Consult reality (computed
+        # above): admit iff the candidate physically fits the truthful device-free reading net of the noise
+        # buffer right now.
         if physically_fits_reality and request.is_head_of_queue:
             return VramVerdict(
                 disposition=VramDisposition.FITS,
@@ -585,6 +629,29 @@ class VramArbiter:
                 measured=measured,
                 foreign_pressure_admit=True,
             )
+        if not physically_fits_reality and self._has_first_party_context_reclaim(request) and not ledger_phantom:
+            # The candidate does not physically fit device-free, but the deficit is not foreign: the head's own
+            # idle sibling contexts hold it, a first-party reclaim the ordinary ladder cannot express (a bare
+            # CUDA context returns its VRAM only when its process exits, so no model-unload or cache-release rung
+            # frees it). This is reachable only within the short teardown grace, since past it the teardown above
+            # already fired; here the head simply waits out the grace for its own contexts to age into the
+            # verified teardown, never misattributed to foreign load nor rerouted to the structural-wedge recovery
+            # supervisor as if reclaim were exhausted. Suppressed under a phantom ledger, where destructive
+            # reclaim is barred.
+            self.first_party_context_defers += 1
+            return VramVerdict(
+                disposition=VramDisposition.DEFER,
+                request_kind=request.kind,
+                device_index=request.device_index,
+                reason=(
+                    f"candidate {candidate_delta_mb:.0f} MB does not fit device-free but the deficit is held by "
+                    f"the head's own idle sibling contexts; a verified context teardown escalates once it starves "
+                    f"past the {_FIRST_PARTY_TEARDOWN_GRACE_SECONDS:.0f}s teardown grace. measured: "
+                    f"{measured.reason()}"
+                ),
+                measured=measured,
+            )
+
         # The best-effort over-budget admit belongs to the true head of queue alone. A non-head request (a
         # line-skip job jumping the queue) is denied it even when the card physically has room right now,
         # because materialising into that room starves the head it skipped: the head needs the same space and
@@ -771,27 +838,94 @@ class VramArbiter:
         """
         return state.governor_state is GovernorState.SATURATED and not state.reclaim_unresolved
 
-    @staticmethod
-    def _starvation_context_teardown(request: VramRequest) -> tuple[ActuatorCommand, ...] | None:
-        """Return a context-teardown actuation when a starved head's deficit is held by idle sibling contexts.
+    def _dispatch_starved_reality_admit(
+        self,
+        request: VramRequest,
+        state: DeviceVramState,
+        measured: AdmissionVerdict,
+    ) -> VramVerdict | None:
+        """Admit a starved monolithic-dispatch head against device truth net of the governor hard floor.
 
-        The per-cycle ladder's weight-eviction rungs (release cache, evict idle model) cannot reclaim a bare
-        CUDA context: its VRAM returns only when the process exits. A head whose remaining over-commit is
-        exactly those idle sibling contexts, with no reclaimable model or cache left, would otherwise defer
-        indefinitely (the ordinary activation-peak warrant behind ``can_reduce_live_contexts`` does not trip on
-        a bare-context over-commit). Once such a head has been the undispatched head of an idle device past
-        :data:`_STARVATION_DIAGNOSTIC_SECONDS`, this escalates to a single REDUCE_LIVE_CONTEXTS command: the
-        caller reduces the live inference-context count, tearing the idle contexts down while protecting the
-        head's own target slot and every busy process, and the freed room is verified at device level before the
-        head is admitted (the escalation never force-admits). Restricted to the preload/whole-card path: a
-        dispatch-gate hold is a MONOLITHIC_DISPATCH request and never tears a context down, matching the
-        ``can_reduce_live_contexts`` semantics that gate stays under.
+        A dispatch candidate is an activation-inclusive learned high-watermark peak, so it already carries its
+        own headroom. Stacking the full admission noise buffer on top of it double-counts the measurement margin
+        and prices a demonstrated-fine dispatch out of existence on a small card. When such a head has been the
+        undispatched head of an idle device past the starvation grace and the ordinary ledger identity does not
+        fit, this escape admits it iff its candidate physically fits the truthful device-free reading net of the
+        floor the governor actually defends (:func:`hard_floor_mb`), not the larger noise buffer. It is the
+        dispatch seam's parity with the preload seam's foreign-pressure reality admit, using the tighter margin
+        the high-watermark peak warrants.
+
+        Returns None for any request that is not a starved head-of-queue monolithic dispatch, or when even the
+        hard-floor reading has no room, so the caller falls through to reclaim and the context teardown
+        escalation. The ordinary (un-starved) identity is untouched: the grace gate is what confines this to a
+        head the tick-paced reclaim has already had its window to relieve.
         """
-        if request.kind is not VramRequestKind.PRELOAD:
+        if request.kind is not VramRequestKind.MONOLITHIC_DISPATCH:
             return None
-        if not (request.is_head_of_queue and request.idle_contexts_teardownable):
+        if not request.is_head_of_queue:
             return None
-        if request.starved_seconds < _STARVATION_DIAGNOSTIC_SECONDS:
+        if request.starved_seconds < _FIRST_PARTY_TEARDOWN_GRACE_SECONDS:
+            return None
+        device_free_mb = state.device_free_mb
+        if device_free_mb is None:
+            return None
+        candidate_delta_mb = request.candidate_delta_mb if request.candidate_delta_mb is not None else 0.0
+        floor_mb = hard_floor_mb(state.total_vram_mb)
+        if candidate_delta_mb > device_free_mb - floor_mb:
+            return None
+        self.dispatch_reality_admits += 1
+        return VramVerdict(
+            disposition=VramDisposition.FITS,
+            request_kind=request.kind,
+            device_index=request.device_index,
+            reason=(
+                f"starved dispatch head: candidate {candidate_delta_mb:.0f} MB physically fits device-free "
+                f"{device_free_mb:.0f} - hard floor {floor_mb:.0f} MB (the learned peak already carries its "
+                f"high-watermark margin, so the noise buffer is not stacked on top): admit into reality. "
+                f"ledger said: {measured.reason()}"
+            ),
+            measured=measured,
+        )
+
+    @staticmethod
+    def _has_first_party_context_reclaim(request: VramRequest) -> bool:
+        """Whether a head's remaining deficit could be relieved by tearing its own idle sibling contexts down.
+
+        A bare CUDA context returns its VRAM only when the process exits, so the per-cycle ladder's
+        weight-eviction rungs (release cache, evict idle model) cannot reclaim it. A head whose remaining
+        over-commit is exactly its own idle sibling contexts holds a first-party reclaim the ordinary ladder
+        cannot describe; the ordinary activation-peak warrant behind ``can_reduce_live_contexts`` does not trip
+        on a bare-context over-commit, so without this the head would defer indefinitely on space it could
+        itself free. This decides only reachability of that reclaim (whether such contexts exist and the caller
+        is a head whose seam owns the teardown), not the timing: the short teardown grace gates when it fires.
+
+        Both the preload/whole-card path and a monolithic-dispatch head reach it. Ordinary staged dispatch still
+        never collapses the pool (``can_reduce_live_contexts`` stays False for a dispatch, so the ordinary
+        activation-peak warrant never tears a context down); the starved-head escalation is the one exception,
+        the same as the preload seam, and only after the reality admit that needs no teardown has been ruled out.
+        """
+        if request.kind not in (VramRequestKind.PRELOAD, VramRequestKind.MONOLITHIC_DISPATCH):
+            return False
+        return request.is_head_of_queue and request.idle_contexts_teardownable
+
+    def _starvation_context_teardown(self, request: VramRequest) -> tuple[ActuatorCommand, ...] | None:
+        """Return a context-teardown actuation once a starved first-party head clears the short teardown grace.
+
+        The reclaim itself (idle sibling contexts the head could free) is decided by
+        :meth:`_has_first_party_context_reclaim`; this adds the timing gate. Because the caller only reaches this
+        with weight reclaim exhausted, no physically-available VRAM to admit into, and the deficit held by the
+        head's own idle sibling contexts, no other remedy can arrive: the escalation is evidence-based, not a
+        long wait. Once such a head has been the undispatched head of an idle device past
+        :data:`_FIRST_PARTY_TEARDOWN_GRACE_SECONDS` (a short grace that rides out state churn, not the 60s
+        diagnostic threshold), it escalates to a single REDUCE_LIVE_CONTEXTS command: the caller reduces the
+        live inference-context count, tearing the idle contexts down while protecting the head's own target slot
+        and every busy process, and the freed room is verified at device level before the head is admitted (the
+        escalation never force-admits). Returns None while the head is younger than the grace or has no such
+        reclaim.
+        """
+        if not self._has_first_party_context_reclaim(request):
+            return None
+        if request.starved_seconds < _FIRST_PARTY_TEARDOWN_GRACE_SECONDS:
             return None
         return (ActuatorCommand(kind=ActuatorCommandKind.REDUCE_LIVE_CONTEXTS, device_index=None),)
 

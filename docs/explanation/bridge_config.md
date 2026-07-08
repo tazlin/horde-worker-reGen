@@ -106,16 +106,21 @@ There is always **one additional safety process**. The formula above is an
 **upper bound**: two plan-time caps can lower it, each only ever reducing a card
 and never below one context per card. First, a **per-card VRAM-fit cap** bounds
 every card (single-GPU included) to the inference contexts its VRAM physically
-holds: each planned context's idle CUDA/runtime baseline plus one copy of the
-heaviest offered model, within the card total net of the proportional admission
-noise buffer. Second, on a multi-GPU host the count is computed **per card and
-summed**, then a **shared-RAM cap** (`cap_card_process_counts`) lowers it further
-so the worker-wide resident set fits the single system-RAM pool (a second card
-doubles VRAM, not RAM). Both are spawn-time bounds; the running worker's runtime
-governor down-regulates live concurrency further under memory pressure, and the
-`horde-benchmark` path is exempt from the VRAM-fit cap so it can probe higher
-concurrency than steady-state operation would keep. When a cap reduces the
-configured count the worker logs the arithmetic so the smaller spawn is explained.
+holds: each planned context's idle CUDA/runtime baseline plus one copy of a single
+typical (SDXL-class) working set, within the card total net of the proportional
+admission noise buffer. A very large model (Flux, Cascade, Qwen, Z-Image) does not
+raise this bound: it never co-samples, and its footprint is paid just-in-time by the
+whole-card residency machinery when one actually dispatches, not reserved at spawn,
+so the spare contexts stay free to preload the next model. Second, a **shared-RAM
+cap** (`cap_card_process_counts`) applies to every host, single-GPU included, and
+lowers the count so the worker-wide resident set fits the single system-RAM pool
+(each resident context retains system RAM that no card's VRAM offsets; a second card
+doubles VRAM, not RAM, and one card's plan can over-commit the pool alone). Both are
+spawn-time bounds; the running worker's runtime governor down-regulates live
+concurrency further under memory pressure, and the `horde-benchmark` path is exempt
+from both caps so it can probe higher concurrency than steady-state operation would
+keep. When a cap reduces the configured count the worker logs the arithmetic so the
+smaller spawn is explained.
 
 The **Config tab** shows a live estimate of this count under the Throughput
 fields, updating as you edit, so the consequence of a concurrency change is

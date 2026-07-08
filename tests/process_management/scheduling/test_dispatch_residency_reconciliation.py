@@ -26,6 +26,7 @@ from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.admission_identity import evaluate_admission
 from horde_worker_regen.process_management.resources.vram_arbiter import (
+    _FIRST_PARTY_TEARDOWN_GRACE_SECONDS,
     DeviceVramState,
     MeasuredVramSnapshot,
     VramArbiter,
@@ -226,6 +227,62 @@ class TestLineSkipDispatchHeadTruth:
         assert scheduler._dispatch_residency_reconciliation_holds(job, target, is_head_of_queue=False) is False
         assert capture.last_request is not None
         assert capture.last_request.is_head_of_queue is False
+
+
+class TestStarvedDispatchHeadSignals:
+    """The gate feeds the arbiter the starvation age and the teardownable-context signal for the dispatch head.
+
+    The starved-head reality admit and the context-teardown escalation both live in the arbiter, but they can
+    only fire if this seam reports how long the head has starved and whether idle sibling contexts exist. This
+    pins that wiring: a genuine head beside an idle sibling presents a nonzero ``starved_seconds`` and
+    ``idle_contexts_teardownable=True``.
+    """
+
+    def _fits_verdict(self) -> VramVerdict:
+        """A cold-path FITS so the gate releases and only the request signals are asserted."""
+        measured = evaluate_admission(
+            measured_committed_mb=0.0,
+            planned_unmaterialized_mb=0.0,
+            candidate_delta_mb=0.0,
+            total_vram_mb=None,
+            baseline_mb=0.0,
+            committed_is_stale=False,
+        )
+        return VramVerdict(
+            disposition=VramDisposition.FITS,
+            request_kind=VramRequestKind.MONOLITHIC_DISPATCH,
+            device_index=None,
+            reason="test-fits",
+            measured=measured,
+        )
+
+    async def test_gate_reports_starvation_age_and_teardownable_contexts(self) -> None:
+        """A starved head beside an idle sibling presents the age and the teardownable-context signal."""
+        scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
+        scheduler._head_starved_seconds = Mock(  # type: ignore[method-assign]
+            return_value=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0,
+        )
+        capture = _CapturingArbiter(self._fits_verdict())
+        scheduler._vram_arbiter = capture  # type: ignore[assignment]
+
+        assert scheduler._dispatch_residency_reconciliation_holds(job, target) is False
+        assert capture.last_request is not None
+        assert capture.last_request.kind is VramRequestKind.MONOLITHIC_DISPATCH
+        assert capture.last_request.starved_seconds == _FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0
+        assert capture.last_request.idle_contexts_teardownable is True
+
+    async def test_line_skip_dispatch_reports_no_teardownable_context(self) -> None:
+        """A line-skip dispatch (not the head) never reports a teardownable context, so it cannot tear one down."""
+        scheduler, job, target, _sibling = await _scheduler_with_idle_sibling()
+        scheduler._head_starved_seconds = Mock(  # type: ignore[method-assign]
+            return_value=_FIRST_PARTY_TEARDOWN_GRACE_SECONDS + 5.0,
+        )
+        capture = _CapturingArbiter(self._fits_verdict())
+        scheduler._vram_arbiter = capture  # type: ignore[assignment]
+
+        assert scheduler._dispatch_residency_reconciliation_holds(job, target, is_head_of_queue=False) is False
+        assert capture.last_request is not None
+        assert capture.last_request.idle_contexts_teardownable is False
 
 
 class TestHeldDispatchSurvivesWatchdogs:

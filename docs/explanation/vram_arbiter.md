@@ -180,20 +180,59 @@ the requester is not the head), the disposition is `DEFER` and the `admission_fo
 advances. The dispatch-reconciliation gate plumbs the same truth, presenting `is_head_of_queue=False` for a
 line-skip dispatch so a line-skipper is held rather than committing over the head at the dispatch seam.
 
-There is no starved-head overcommit admit, but a starved head does escalate reclaim. When a head has been the
-undispatched head of an idle device longer than 60 seconds with weight eviction exhausted, and its remaining
-deficit is held by its own idle sibling contexts (a bare CUDA context whose VRAM returns only when the process
-exits, so no model-unload or cache-release rung can reclaim it), the arbiter escalates to a verified context
-teardown: it defers with a `REDUCE_LIVE_CONTEXTS` actuation that reduces the live inference-context count
-(protecting the head's own target slot and every busy process) and advances `starvation_context_teardowns`.
-The freed room is verified at device level before the head is admitted, so the escalation never force-admits;
-it only makes room the re-ask can then fit. This escalation belongs to the preload/whole-card path alone: a
-dispatch-gate hold (a `MONOLITHIC_DISPATCH` request) never tears a context down, matching the
-`can_reduce_live_contexts` semantics that gate stays under. A head deferred past the threshold with reclaim
-exhausted and no such teardown target emits a warning with the full arithmetic and increments
-`starvation_diagnostics`; it still does not admit. The job stays queued for the structural queue wedge
-recovery supervisor, which detects a stuck queue with no dispatch progress, soft-resets the pools, and then
-faults wedged jobs non-retryably so the horde can reissue them elsewhere.
+The "foreign" label is earned, not assumed. Before a non-fitting head is charged to foreign pressure, the
+arbiter separates a shortfall the worker can itself reclaim: a head whose deficit is held by its own idle
+sibling contexts (a bare CUDA context whose VRAM returns only when the process exits, so no model-unload or
+cache-release rung reclaims it), with no physically-available VRAM to admit into, is deferred as reclaimable
+first-party residency and advances `first_party_context_defers`, not the foreign counter, and emits no reroute
+diagnostic. Reclaim is not exhausted while its own context teardown is still pending; the head simply waits out
+the short teardown grace for those contexts to age into the verified teardown below. This is what keeps the
+worker's own idle contexts from being mistaken for unreachable desktop load and rerouted to the recovery
+supervisor while surgical room sat one teardown away.
+
+There is no starved-head overcommit admit, but a starved head does escalate reclaim, and it does so on
+evidence rather than a long clock. Two timings apply, deliberately different:
+
+* **First-party context teardown fires after a short grace (`_FIRST_PARTY_TEARDOWN_GRACE_SECONDS`, 10s).** When
+  weight eviction is exhausted, no physically-available VRAM exists to admit into, and the head's remaining
+  deficit is exactly its own idle sibling contexts, no alternative remedy can ever arrive: evicting a model or
+  releasing a cache frees nothing a bare context holds, and a busy sibling finishing does not surrender its
+  context. Waiting longer is pure idle-card loss, so the arbiter escalates quickly. The grace exists only to
+  ride out transient state churn and measurement noise (a sibling about to pick up work, a snapshot mid
+  reconciliation), not to wait for a remedy that cannot come. The escalation defers with a
+  `REDUCE_LIVE_CONTEXTS` actuation that reduces the live inference-context count (protecting the head's own
+  target slot and every busy process) and advances `starvation_context_teardowns`. The freed room is verified
+  at device level before the head is admitted, so the escalation never force-admits; it only makes room the
+  re-ask can then fit. Because the trigger is short, a re-ask arrives every scheduler cycle; that is safe
+  because the teardown scales to a fixed target and retires its victims from the process map synchronously, so
+  a repeated command sees the count already at target and tears nothing more down (`_establish_whole_card_residency`
+  only scales while the live count exceeds the target, and re-stamps the residency once). This escalation
+  belongs to the preload/whole-card path alone: a dispatch-gate hold (a `MONOLITHIC_DISPATCH` request) never
+  tears a context down, matching the `can_reduce_live_contexts` semantics that gate stays under.
+* **The genuinely-foreign starvation diagnostic keeps its 60s threshold (`_STARVATION_DIAGNOSTIC_SECONDS`).** A
+  head whose shortfall is real foreign load with no first-party context reclaim has no surgical remedy the
+  arbiter can apply, so its long-wait warning stays at 60s (see below); shortening it would only spam the log.
+
+Thrash between distinct large models (or large/small alternation) is not damped by lengthening the escalation
+timer, which would just cost idle-card time. It is damped on the pop side by `large_model_switch_min_seconds`
+and the large-model re-entry cooldown, which stop the worker offering a churning sequence of heavy models in
+the first place.
+
+**The `whole_card_exclusive_residency` flag governs steady-state preference, never this emergency liveness.**
+That config flag decides whether the worker proactively establishes exclusive whole-card residency as a matter
+of course (the pre-staging and forecast-driven teardown described under whole-card residency). It does **not**
+gate the starvation escalation. A weight-dominant head starved behind its own idle sibling contexts must reach
+the verified teardown even with the flag off, because the alternative is the catastrophic save-our-ship pool
+reset resolving a situation the arbiter could relieve surgically. The scheduler therefore reports
+`idle_contexts_teardownable` on this seam independent of the flag, and the actuation (establish the head's
+residency, then evict the idle siblings' VRAM) runs through machinery that does not itself consult the flag, so
+the contexts are torn down and the head admits regardless of the steady-state preference.
+
+A head deferred past the 60s diagnostic threshold with reclaim genuinely exhausted and no such teardown target
+(no first-party context reclaim remains) emits a warning with the full arithmetic and increments
+`starvation_diagnostics`; it still does not admit. The job stays queued for the structural queue wedge recovery
+supervisor, which detects a stuck queue with no dispatch progress, soft-resets the pools, and then faults
+wedged jobs non-retryably so the horde can reissue them elsewhere.
 
 `DENY` is reserved for a candidate that could not fit even an empty card. Model-level prevention keeps those
 jobs out earlier, so a runtime `DENY` is a diagnostic boundary rather than a throughput path. The first
@@ -247,6 +286,19 @@ residents that tip the card over are evicted through the one reclaim owner (the 
 protected, so its staged weights are spared), and the dispatch re-asks each pass, releasing only once the
 arbiter next verdicts `FITS` on the governor's verified device-free reading. Can't-fit-ever jobs are already
 excluded by model serviceability, so this gate only ever holds a can't-fit-now dispatch.
+
+The dispatch head has the same two starved-head escapes the preload head does, so it can never wedge on a
+ledger fiction while its own idle sibling contexts hold the card. The dispatch candidate is an
+activation-inclusive learned high-watermark peak, so it already carries its own headroom; stacking the full
+admission noise buffer on top of it prices demonstrated-fine dispatches out of existence on a small card.
+Past the starved-head grace, a dispatch head that physically fits the truthful device-free reading net of the
+governor's **hard floor** (`hard_floor_mb`, the band the governor actually defends, not the larger noise
+buffer) admits into reality and advances `dispatch_reality_admits`. Only when even that hard-floor reading has
+no room, and the deficit is held by the head's own bare idle sibling contexts (a context weight eviction
+cannot reclaim), does the dispatch head escalate to the same verified `REDUCE_LIVE_CONTEXTS` teardown the
+preload seam uses, after the same grace. An ordinary (un-starved) dispatch still never collapses the pool: the
+reality admit and the teardown are the starved head's alone, and the reality admit is tried first so no
+teardown happens when physically-available room already exists.
 
 **Pinned-lane residency.** A disaggregated job's sampler lane is pinned (reserved out of the availability
 pool) from the moment it is scheduled until its sampling finishes, and while pinned it is excluded from the
