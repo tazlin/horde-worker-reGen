@@ -243,6 +243,8 @@ class HordePostProcessProcess(HordeProcess):
         time_start = time.time()
         state = GENERATION_STATE.ok
         job_image_results: list[HordeImageResult] | None
+        fault_is_resource_class = False
+        fault_reason: str | None = None
 
         if self._dry_run_skip_post_processing:
             job_image_results = [HordeImageResult(image_bytes=image_bytes) for image_bytes in message.images_bytes]
@@ -253,7 +255,9 @@ class HordePostProcessProcess(HordeProcess):
                     context=f"job {message.job_id}",
                 )
             except Exception as e:
-                logger.error(f"Post-processing failed for job {message.job_id}: {type(e).__name__} {e}")
+                fault_reason = f"{type(e).__name__}: {e}"
+                fault_is_resource_class = is_out_of_memory_text(fault_reason)
+                logger.error(f"Post-processing failed for job {message.job_id}: {fault_reason}")
                 state = GENERATION_STATE.faulted
                 job_image_results = None
 
@@ -261,11 +265,13 @@ class HordePostProcessProcess(HordeProcess):
             HordePostProcessResultMessage(
                 process_id=self.process_id,
                 process_launch_identifier=self.process_launch_identifier,
-                info=f"Post-processing for job {message.job_id}",
+                info=fault_reason or f"Post-processing for job {message.job_id}",
                 time_elapsed=time.time() - time_start,
                 job_id=message.job_id,
                 job_image_results=job_image_results,
                 state=state,
+                fault_is_resource_class=fault_is_resource_class,
+                fault_reason=fault_reason,
             ),
         )
 

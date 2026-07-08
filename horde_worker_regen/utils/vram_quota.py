@@ -56,13 +56,39 @@ def effective_post_process_vram_quota_mb(total_vram_mb: float | None) -> float:
     return max(POST_PROCESS_VRAM_QUOTA_FLOOR_MB, min(guard, POST_PROCESS_VRAM_QUOTA_CEILING_MB))
 
 
-SAFETY_VRAM_QUOTA_MB = 4096.0
-"""The safety process's allocator cap (MB).
+SAFETY_VRAM_QUOTA_FLOOR_MB = 4096.0
+"""The smallest allocator cap the on-GPU safety process is ever given (MB).
 
 Sized from its measured resident set: the safety checkers plus the CLIP interrogator's ViT model load
 to roughly 3.3GB before any evaluation runs (a 2GB cap faults the model load itself), plus headroom
-for per-eval activations. The cap's job is bounding, not shrinking: reducing safety's footprint
-(CPU evaluation, post-eval unloads) is a separate lever."""
+for per-eval activations."""
+
+SAFETY_VRAM_QUOTA_CEILING_MB = 6144.0
+"""The largest allocator cap the on-GPU safety process is ever given (MB).
+
+CLIP alchemy forms run on the safety process and can transiently need more than the base safety resident
+set. The ceiling gives roomy cards enough allocator space for those forms while still bounding the safety
+pool below a size where it can squat the whole device between checks."""
+
+SAFETY_CARD_HEADROOM_MB = 6144.0
+"""How much of the card the safety guard always leaves for inference and post-processing (MB)."""
+
+SAFETY_VRAM_QUOTA_MB = SAFETY_VRAM_QUOTA_FLOOR_MB
+"""Backward-compatible name for the safety quota floor."""
+
+
+def effective_safety_vram_quota_mb(total_vram_mb: float | None) -> float:
+    """Return the on-GPU safety allocator-guard cap (MB) for a card of ``total_vram_mb`` total VRAM.
+
+    The safety process owns the CLIP stack and also serves CLIP alchemy forms. A fixed 4GB cap protects
+    small cards but is too tight on a 16GB/24GB card once interrogation or captioning transiently allocates
+    above the resident safety models. This mirrors the post-processing quota shape: keep a floor for small
+    cards, grow on cards that have room, and clamp at a role-specific ceiling.
+    """
+    if total_vram_mb is None or total_vram_mb <= 0:
+        return SAFETY_VRAM_QUOTA_FLOOR_MB
+    guard = total_vram_mb - SAFETY_CARD_HEADROOM_MB
+    return max(SAFETY_VRAM_QUOTA_FLOOR_MB, min(guard, SAFETY_VRAM_QUOTA_CEILING_MB))
 
 
 def apply_process_vram_quota_mb(quota_mb: float, *, device_index: int = 0) -> bool:
@@ -120,4 +146,13 @@ def apply_post_process_vram_quota(*, device_index: int = 0) -> bool:
     keeps the guard tight. A no-op (returns False) on any non-CUDA backend or error.
     """
     quota_mb = effective_post_process_vram_quota_mb(read_device_total_vram_mb(device_index))
+    return apply_process_vram_quota_mb(quota_mb, device_index=device_index)
+
+
+def apply_safety_vram_quota(*, device_index: int = 0) -> bool:
+    """Cap the on-GPU safety process at its card-sized runaway guard on ``device_index``.
+
+    A no-op (returns False) on any non-CUDA backend or error.
+    """
+    quota_mb = effective_safety_vram_quota_mb(read_device_total_vram_mb(device_index))
     return apply_process_vram_quota_mb(quota_mb, device_index=device_index)

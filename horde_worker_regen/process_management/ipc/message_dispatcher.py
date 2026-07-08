@@ -1010,6 +1010,7 @@ class MessageDispatcher:
             )
 
         if message.state == GENERATION_STATE.faulted or message.job_image_results is None:
+            fault_reason = message.fault_reason or message.info or "post-processing failed"
             tracked = self._job_tracker.get_tracked_job(message.job_id)
             if tracked is None or tracked.job_info is None:
                 logger.error(
@@ -1019,19 +1020,22 @@ class MessageDispatcher:
                 return
             logger.error(
                 f"Post-processing faulted for job {message.job_id} on process {message.process_id}; "
-                "reporting the job faulted without images so the horde reissues it.",
+                f"reporting the job faulted without images so the horde reissues it: {fault_reason}",
             )
             self._job_tracker.note_post_processing_overcommit_fault()
             self._action_ledger.record(
                 LedgerEventType.POST_PROCESS_FAULTED,
                 process_id=message.process_id,
                 job_id=str(message.job_id),
-                reason=message.info or "post-processing failed",
-                detail={"fallback": "fault_no_images"},
+                reason=fault_reason,
+                detail={
+                    "fallback": "fault_no_images",
+                    "resource_class": message.fault_is_resource_class,
+                },
             )
             await self._job_tracker.fault_post_inference_job(
                 tracked.job_info,
-                reason=message.info or "post-processing failed",
+                reason=fault_reason,
             )
             return
 

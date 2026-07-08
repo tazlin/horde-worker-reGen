@@ -470,8 +470,11 @@ real jobs, three cooperating behaviors keep it from faulting work the card can h
 - **Crisp attribution.** A genuine overstep still becomes an out-of-memory inside the offender, on a
   path that degrades deliberately (the faulted chain is reported without images).
 
-The safety process's quota is a fixed cap sized to its resident set (the safety models plus one
-evaluation); a faulted safety evaluation recycles the process.
+The safety process's quota is also a runaway guard, but its floor is sized to the resident safety set
+(the safety models plus one evaluation). On roomy cards it grows to a bounded ceiling so CLIP alchemy
+forms (caption/interrogation/NSFW), which run on the same process and transiently allocate above the
+base safety models, do not fault merely because the old fixed floor was too tight. A faulted safety
+evaluation still recycles the process.
 
 On Windows the worker also watches the one signal the driver cannot fake: the per-process
 `GPU Process Memory` counters (the data behind Task Manager's "Shared GPU memory" column). When a worker

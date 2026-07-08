@@ -558,6 +558,30 @@ class TestPostProcessResultHandling:
         assert job_info.job_image_results is None
         assert process_manager._job_tracker.count_recent_post_processing_faults(60.0) == 1
 
+    async def test_faulted_result_preserves_oom_reason(self) -> None:
+        """A lane OOM is submitted as a no-image fault with the real allocator text in metadata."""
+        process_manager = make_testable_process_manager()
+        job_info = await self._job_being_post_processed(process_manager)
+        fault_reason = "RuntimeError: CUDA out of memory. 4.00 GiB allowed"
+
+        message = HordePostProcessResultMessage(
+            process_id=7,
+            process_launch_identifier=0,
+            info="generic post-processing wrapper",
+            time_elapsed=1.0,
+            job_id=job_info.sdk_api_job_info.id_,
+            job_image_results=None,
+            state=GENERATION_STATE.faulted,
+            fault_is_resource_class=True,
+            fault_reason=fault_reason,
+        )
+
+        await process_manager._message_dispatcher._handle_post_process_result(message)
+
+        faults = await process_manager._job_tracker.get_faults_for_job(job_info.sdk_api_job_info.id_)
+        assert faults
+        assert fault_reason in (faults[-1].ref or "")
+
 
 class TestPostProcessOrphanRecovery:
     """The watchdog for jobs whose lane result will never return."""

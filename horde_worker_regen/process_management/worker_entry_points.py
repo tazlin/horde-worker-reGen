@@ -576,9 +576,9 @@ def start_safety_process(
             # take only the share of the card their role justifies; an eval that cannot fit the cap faults
             # inside this process (which is recycled) rather than silently demand-paging the whole device.
             # After the device pin the process sees its card as device 0. A no-op on non-CUDA backends.
-            from horde_worker_regen.utils.vram_quota import SAFETY_VRAM_QUOTA_MB, apply_process_vram_quota_mb
+            from horde_worker_regen.utils.vram_quota import apply_safety_vram_quota
 
-            apply_process_vram_quota_mb(SAFETY_VRAM_QUOTA_MB, device_index=0)
+            apply_safety_vram_quota(device_index=0)
 
         from horde_worker_regen.process_management.workers.safety_process import HordeSafetyProcess
 

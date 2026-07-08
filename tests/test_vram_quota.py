@@ -16,9 +16,13 @@ import pytest
 from horde_worker_regen.utils.vram_quota import (
     POST_PROCESS_VRAM_QUOTA_CEILING_MB,
     POST_PROCESS_VRAM_QUOTA_FLOOR_MB,
+    SAFETY_VRAM_QUOTA_CEILING_MB,
+    SAFETY_VRAM_QUOTA_FLOOR_MB,
     apply_post_process_vram_quota,
     apply_process_vram_quota_mb,
+    apply_safety_vram_quota,
     effective_post_process_vram_quota_mb,
+    effective_safety_vram_quota_mb,
 )
 
 
@@ -116,3 +120,34 @@ def test_apply_post_process_quota_is_a_noop_without_cuda(monkeypatch) -> None:  
 
     assert apply_post_process_vram_quota() is False
     fake.cuda.set_per_process_memory_fraction.assert_not_called()
+
+
+class TestEffectiveSafetyQuota:
+    """The safety guard grows on roomy cards so CLIP alchemy is not capped at the startup floor."""
+
+    @pytest.mark.parametrize(
+        ("total_mb", "expected_mb"),
+        [
+            (None, SAFETY_VRAM_QUOTA_FLOOR_MB),
+            (0.0, SAFETY_VRAM_QUOTA_FLOOR_MB),
+            (8192.0, SAFETY_VRAM_QUOTA_FLOOR_MB),
+            (10240.0, SAFETY_VRAM_QUOTA_FLOOR_MB),
+            (12288.0, SAFETY_VRAM_QUOTA_CEILING_MB),
+            (16384.0, SAFETY_VRAM_QUOTA_CEILING_MB),
+            (24576.0, SAFETY_VRAM_QUOTA_CEILING_MB),
+        ],
+    )
+    def test_guard_scales_with_card(self, total_mb: float | None, expected_mb: float) -> None:
+        """The safety cap preserves small-card protection and expands on cards with room."""
+        assert effective_safety_vram_quota_mb(total_mb) == expected_mb
+
+
+def test_apply_safety_quota_sizes_fraction_to_card(monkeypatch) -> None:  # noqa: ANN001
+    """The safety process gets the card-sized guard rather than the fixed 4GB floor on a 24GB card."""
+    fake = _fake_torch(cuda_available=True, total_memory_bytes=24 * 1024**3)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+
+    assert apply_safety_vram_quota(device_index=0) is True
+    fraction, device = fake.cuda.set_per_process_memory_fraction.call_args.args
+    assert abs(fraction - (SAFETY_VRAM_QUOTA_CEILING_MB / (24 * 1024))) < 1e-6
+    assert device == 0

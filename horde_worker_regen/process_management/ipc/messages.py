@@ -744,6 +744,14 @@ class HordePostProcessResultMessage(HordeProcessMessage):
     """The post-processed per-image results, or None if post-processing faulted with no usable output."""
     state: GENERATION_STATE
     """The state of the job to be sent to the API (``ok`` or ``faulted``)."""
+    fault_is_resource_class: bool = False
+    """Whether the post-processing fault was a device-resource failure, such as CUDA out-of-memory.
+
+    Set by the lane when the fault is a CUDA out-of-memory (or its swallowed fingerprint), so the parent can
+    preserve the true failure class in diagnostics and feature-level fault accounting. Meaningless when
+    ``state`` is not ``faulted``."""
+    fault_reason: str | None = None
+    """The originating exception summary (``"{type}: {message}"``) when the stage faulted, else None."""
 
 
 # ---------------------------------------------------------------------------------------------------
