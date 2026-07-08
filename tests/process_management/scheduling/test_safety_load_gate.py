@@ -7,6 +7,7 @@ card with room restores it. The initial cold-start safety load is not gated and 
 
 from __future__ import annotations
 
+import uuid
 from unittest.mock import Mock
 
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
@@ -48,6 +49,17 @@ def _safety_scheduler():  # noqa: ANN202
     return scheduler
 
 
+async def _queue_safety_backlog(scheduler, *, depth: int) -> None:  # noqa: ANN001
+    """Place completed jobs in the pending safety stage."""
+    for _ in range(depth):
+        job = Mock()
+        job.id_ = uuid.uuid4()
+        job.model = "stable_diffusion"
+        job_info = Mock()
+        job_info.sdk_api_job_info = job
+        await scheduler._job_tracker.queue_for_safety(job_info)
+
+
 class TestArbiterAdmitsSafetyGpuLoad:
     """The direct SAFETY_LOAD verdict over the frozen cycle measurement."""
 
@@ -85,6 +97,26 @@ class TestDeferredSafetyLoadReconciler:
         _install_cycle(scheduler, total_mb=24000.0, committed_mb=1000.0)
         scheduler._restore_deferred_safety_gpu_load()
         scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with()
+
+    async def test_reconciler_restores_during_deep_backlog_when_the_card_has_room(self) -> None:
+        """A deep safety backlog does not strand a deferred safety load off-GPU."""
+        scheduler = _safety_scheduler()
+        await _queue_safety_backlog(scheduler, depth=3)
+        _install_cycle(scheduler, total_mb=24000.0, committed_mb=1000.0)
+
+        scheduler._restore_deferred_safety_gpu_load()
+
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with()
+
+    async def test_reconciler_avoids_churning_a_shallow_backlog(self) -> None:
+        """Shallow safety work still keeps the deferred restore from cycling the safety lane."""
+        scheduler = _safety_scheduler()
+        await _queue_safety_backlog(scheduler, depth=2)
+        _install_cycle(scheduler, total_mb=24000.0, committed_mb=1000.0)
+
+        scheduler._restore_deferred_safety_gpu_load()
+
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
 
     def test_reconciler_is_a_noop_when_safety_is_not_paused(self) -> None:
         """With safety already on-GPU the reconciler does nothing (nothing to restore)."""

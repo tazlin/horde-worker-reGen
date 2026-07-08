@@ -246,6 +246,9 @@ proportional margin* before the runtime safety-placement policy restores safety 
 than :data:`_SAFETY_PLACEMENT_PAUSE_STREAK` (evict quickly on real pressure, readmit slowly and only once the
 card has proven durable headroom) so the readmit does not immediately re-trip the evict on the next heavy job."""
 
+_SAFETY_BACKLOG_PRIORITY_DEPTH = 2
+"""Safety backlog depth above which GPU safety restoration is prioritized over placement inertia."""
+
 _DISPATCH_STALL_MIN_SECONDS = 10.0
 """How long the head must be continuously undispatched before the dispatch-stall diagnostic speaks.
 
@@ -1436,7 +1439,15 @@ class InferenceScheduler:
 
     def _has_safety_backlog(self) -> bool:
         """Return whether safety has work that should not be interrupted by residency churn."""
-        return bool(self._job_tracker.jobs_pending_safety_check or self._job_tracker.jobs_being_safety_checked)
+        return self._safety_backlog_depth() > 0
+
+    def _safety_backlog_depth(self) -> int:
+        """Return the total safety backlog: pending checks plus checks awaiting a verdict."""
+        return len(self._job_tracker.jobs_pending_safety_check) + len(self._job_tracker.jobs_being_safety_checked)
+
+    def _has_priority_safety_backlog(self) -> bool:
+        """Return whether the safety backlog is deep enough to prioritize GPU restoration."""
+        return self._safety_backlog_depth() > _SAFETY_BACKLOG_PRIORITY_DEPTH
 
     def _pause_safety_for_residency_if_idle(self, device_index: int | None) -> bool:
         """Pause safety for whole-card residency only when no safety job is pending or active."""
@@ -1477,16 +1488,17 @@ class InferenceScheduler:
         The safety-load gate can keep safety off-GPU when the card is momentarily over-committed as a whole-card
         residency drains; this per-tick reconciler re-asks the arbiter so a deferred safety load is not stranded
         off-GPU for the rest of the session. It never fights the residency machinery: it acts only when no held
-        whole-card residency still requires safety off its card (and never mid safety backlog, to avoid churn),
-        then restores on a FITS verdict and leaves safety off for the next re-ask on a DEFER. Only the
-        recurring residency-drain restore is gated this way; the initial cold-start safety load onto the GPU (at
-        worker bring-up, before any heavy residency pressure) is not gated and always proceeds.
+        whole-card residency still requires safety off its card. It avoids churning a shallow safety backlog,
+        but a backlog deeper than :data:`_SAFETY_BACKLOG_PRIORITY_DEPTH` is urgent enough to let a paused
+        safety process return to GPU service when the arbiter admits the load. Only the recurring
+        residency-drain restore is gated this way; the initial cold-start safety load onto the GPU (at worker
+        bring-up, before any heavy residency pressure) is not gated and always proceeds.
         """
         if not self._whole_card_safety_off_gpu_enabled():
             return
         if not self._process_lifecycle.is_safety_gpu_paused:
             return
-        if self._has_safety_backlog():
+        if self._has_safety_backlog() and not self._has_priority_safety_backlog():
             return
         # The runtime safety-placement policy is the other owner of the safety process's on/off-GPU state; while
         # it holds safety off (the charge does not fit beside the largest sampling peak) this residency-drain
@@ -1659,12 +1671,14 @@ class InferenceScheduler:
         only after a longer run of measured-headroom cycles, with a deadband (modeled fit but measured room not
         yet proven) that advances neither streak. The asymmetric streaks double as a demote-again cooldown: a
         promotion resets the miss streak, so at least :data:`_SAFETY_PLACEMENT_PAUSE_STREAK` fresh non-fit
-        cycles must pass before safety can be evicted again. Actuation is skipped while a safety check is
-        pending or active (no mid-backlog churn); the restore is additionally withheld while a whole-card
-        residency still needs safety off its card and while the device-free governor holds growth, so this
-        policy fights neither the residency machinery nor the cliff brake. The card safety is placed on is the
-        headroom-aware choice (:meth:`_choose_safety_gpu_card`), pushed to the lifecycle manager so spawn and
-        re-promotion agree.
+        cycles must pass before safety can be evicted again. Demotion actuation is skipped while a safety check
+        is pending or active (no mid-backlog churn). If safety is already off-GPU and the backlog grows beyond
+        :data:`_SAFETY_BACKLOG_PRIORITY_DEPTH`, restore actuation is allowed once measured headroom satisfies
+        the normal restore hysteresis, because leaving a deep backlog on CPU safety is worse than preserving
+        placement inertia. The restore is still withheld while a whole-card residency needs safety off its card
+        and while the device-free governor holds growth, so this policy fights neither the residency machinery
+        nor the cliff brake. The card safety is placed on is the headroom-aware choice
+        (:meth:`_choose_safety_gpu_card`), pushed to the lifecycle manager so spawn and re-promotion agree.
         """
         # Push the headroom-aware placement choice to the lifecycle manager every cycle so any safety
         # (re)spawn (this policy's re-promotion, a residency restore, or a crash rebuild) pins to the current
@@ -1677,7 +1691,11 @@ class InferenceScheduler:
             self._safety_placement_fit_streak = 0
             self._safety_placement_wants_off = False
             return
-        if self._has_safety_backlog():
+        safety_backlog_depth = self._safety_backlog_depth()
+        if safety_backlog_depth > 0 and not self._process_lifecycle.is_safety_gpu_paused:
+            self._safety_placement_miss_streak = 0
+            return
+        if 0 < safety_backlog_depth <= _SAFETY_BACKLOG_PRIORITY_DEPTH:
             return
 
         safety_card = self._safety_gpu_card()

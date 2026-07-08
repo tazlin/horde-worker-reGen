@@ -124,6 +124,16 @@ stops and resumes, and nothing is aborted. On a box where safety runs on CPU beh
 two GPU producers this is what keeps the in-flight backlog from climbing without limit
 until jobs age out.
 
+Safety placement also yields to this backlog. Any pending or active safety work protects
+an already-on-GPU safety process from being demoted for sampling headroom. If safety has
+already been moved off-GPU and the backlog grows deeper than two jobs, the runtime
+placement policy treats restoration as urgent: once the chosen card reports the normal
+measured-headroom streak (and no whole-card residency or device-free governor still
+blocks growth), safety is restored to GPU service instead of leaving the backlog on the
+slower CPU path. On multi-GPU workers the same headroom-aware card choice is used, so a
+second card with room can take the safety context; on single-GPU workers the same rule
+applies to the one card.
+
 ## Model stickiness
 
 When the worker has more configured models than inference processes, every new

@@ -11,6 +11,7 @@ process on and off the card. Placement is headroom-aware across cards, not a fix
 
 from __future__ import annotations
 
+import uuid
 from unittest.mock import Mock
 
 import pytest
@@ -40,6 +41,17 @@ def _placement_scheduler(monkeypatch: pytest.MonkeyPatch, *, safety_on_gpu: bool
     lifecycle.restore_safety_on_gpu = Mock(return_value=True)
     scheduler._process_lifecycle = lifecycle
     return scheduler
+
+
+async def _queue_safety_backlog(scheduler: object, depth: int) -> None:
+    """Place ``depth`` completed jobs in the pending safety stage."""
+    for _ in range(depth):
+        job = Mock()
+        job.id_ = uuid.uuid4()
+        job.model = "stable_diffusion"
+        job_info = Mock()
+        job_info.sdk_api_job_info = job
+        await scheduler._job_tracker.queue_for_safety(job_info)  # type: ignore[attr-defined]
 
 
 class TestSafetyFitArithmetic:
@@ -186,6 +198,45 @@ class TestDemoteThenMeasuredRepromote:
 
         scheduler._process_lifecycle.restore_safety_on_gpu.assert_not_called()
         assert scheduler._safety_placement_wants_off is True
+
+
+class TestSafetyBacklogPriority:
+    """A deep safety backlog makes safety placement more urgent, not less."""
+
+    async def test_deep_backlog_allows_repromotion_when_headroom_is_available(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A paused safety process should return to GPU service while a backlog waits and headroom is proven."""
+        scheduler = _placement_scheduler(monkeypatch)
+        scheduler._process_lifecycle.is_safety_gpu_paused = True
+        scheduler._safety_placement_wants_off = True
+        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
+        scheduler._safety_restore_headroom_fits = lambda device_index: True
+        await _queue_safety_backlog(scheduler, depth=3)
+
+        for _ in range(_SAFETY_PLACEMENT_RESTORE_STREAK):
+            scheduler._reconcile_runtime_safety_placement()
+
+        scheduler._process_lifecycle.restore_safety_on_gpu.assert_called_once_with()
+        scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
+        assert scheduler._safety_placement_wants_off is False
+
+    async def test_deep_backlog_does_not_demote_safety_that_is_already_on_gpu(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A deep backlog protects an active GPU safety process from placement demotion."""
+        scheduler = _placement_scheduler(monkeypatch)
+        scheduler._safety_fits_beside_largest_sampling_peak = lambda device_index, *, require_margin: False
+        scheduler._safety_restore_headroom_fits = lambda device_index: False
+        await _queue_safety_backlog(scheduler, depth=3)
+
+        for _ in range(_SAFETY_PLACEMENT_PAUSE_STREAK):
+            scheduler._reconcile_runtime_safety_placement()
+
+        scheduler._process_lifecycle.pause_safety_on_gpu.assert_not_called()
+        assert scheduler._safety_placement_wants_off is False
 
 
 class TestHeadroomAwarePlacement:
