@@ -26,7 +26,7 @@ the one below and only escalating when the lower layer cannot cope:
 | ----- | ----- | --------- | ----- |
 | 1 | A single job faulted | Bounded retry; one degraded (isolated) retry for resource faults | `JobTracker` + `failure_classification.py` |
 | 2 | A single slot crashed | Replace the process; quarantine it if it crash-loops | `ProcessLifecycleManager` |
-| 3 | The whole worker is wedged | Soft-reset the pools (limp-by), then give up cleanly on unservable jobs | `RecoverySupervisor` (policy) + `WorkerRecoveryCoordinator` (assessment/actions) |
+| 3 | The whole worker is wedged | Soft-reset the pools (concurrency preserved), then give up cleanly on unservable jobs | `RecoverySupervisor` (policy) + `WorkerRecoveryCoordinator` (assessment/actions) |
 
 Cutting across all three are two durable records used for diagnosis and orphan
 cleanup: the [action ledger](#the-action-ledger) and the
@@ -179,12 +179,14 @@ manager-side **actions**:
 The escalation, in order:
 
 1. **Soft reset (bounded)** (`perform_soft_reset`): rebuild the process pools
-   in place (kill and respawn every child, un-quarantine slots) and drop one
-   **limp-by** notch, reducing effective concurrency (`max_threads`) so a worker
-   that wedges under load can keep limping along. The parent process and the TUI
-   stay attached. A transient wedge (a bad model load, a one-off deadlock)
-   recovers here. If the episode later recovers after a sustained clean streak,
-   limp-by is cleared exactly once and configured concurrency is restored.
+   in place (kill and respawn every child, un-quarantine slots), preserving the
+   configured concurrency (`max_threads`). The rebuild alone clears a transient
+   wedge; the cap is deliberately not lowered, because shedding a lane on every
+   wedge let a one-off blip (including one provoked by aggressive co-sampling
+   tripping a sampler watchdog) ratchet throughput down and outlast its cause. The
+   escalation policy still **counts** each soft reset (`limp_by_level`) so a
+   persistent wedge still escalates to give-up. The parent process and the TUI stay
+   attached. A transient wedge (a bad model load, a one-off deadlock) recovers here.
 2. **Give up cleanly** (`give_up_on_wedged_jobs`): once resets clearly are not
    helping (e.g. a deterministic crash-on-start), stop fighting: fault the jobs
    that cannot be served so the horde reissues them, rather than wedging forever.

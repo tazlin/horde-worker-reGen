@@ -519,21 +519,27 @@ class WorkerRecoveryCoordinator:
             self.give_up_on_wedged_jobs(terminal=self.recovery_supervisor.give_up_is_terminal)
         elif self.limp_by_active and not self.recovery_supervisor.is_in_episode:
             self.limp_by_active = False
-            self._runtime_config.set_effective_max_threads(self.bridge_data.max_threads)
-            logger.info("Save-our-ship: pools recovered; restored configured concurrency (limp-by cleared).")
+            logger.info("Save-our-ship: pools recovered (soft-reset episode cleared).")
 
     def perform_soft_reset(self) -> None:
-        """Rebuild the worker's process pools in place and drop one limp-by notch."""
+        """Rebuild the worker's process pools in place, preserving the configured concurrency.
+
+        A soft reset rebuilds the pools to clear a transient wedge, but it deliberately does not shed a
+        concurrency lane while doing so. Cutting ``effective_max_threads`` on every soft reset let a wedge,
+        including one provoked by aggressive co-sampling, ratchet throughput down and outlast its cause. The
+        escalation policy still *counts* this reset (a persistent wedge escalates to give-up), so preserving
+        concurrency here demotes the lane cut to a warning without weakening the give-up backstop.
+        """
         level = self.recovery_supervisor.limp_by_level
-        applied = self._runtime_config.set_effective_max_threads(self._runtime_config.effective_max_threads - 1)
-        logger.error(
-            f"Save-our-ship soft reset #{level}: rebuilding process pools and limping by "
-            f"(effective max_threads -> {applied}).",
+        effective = self._runtime_config.effective_max_threads
+        logger.warning(
+            f"Save-our-ship soft reset #{level}: rebuilding process pools "
+            f"(concurrency preserved at effective max_threads {effective}).",
         )
         self._action_ledger.record(
             LedgerEventType.SOFT_RESET,
             reason=f"save-our-ship soft reset #{level}",
-            detail={"limp_by_level": level, "effective_max_threads": applied},
+            detail={"limp_by_level": level, "effective_max_threads": effective},
         )
         self._process_lifecycle.rebuild_inference_pool(reason=f"soft reset #{level}")
         self._process_lifecycle.rebuild_safety_pool(reason=f"soft reset #{level}")

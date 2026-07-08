@@ -6,8 +6,8 @@ different question: *the worker as a whole has stopped making progress on work i
 what?* Continued operation is the paramount goal, so the escalation is, in order:
 
 1. **Soft reset** (bounded): rebuild the worker's process pools in-place (kill and re-spawn every child,
-   un-quarantine slots, reduce settings a notch for "limp-by") without restarting the parent process or
-   detaching the TUI. A transient wedge (a bad model load, a one-off deadlock) recovers here.
+   un-quarantine slots) without restarting the parent process or detaching the TUI, preserving the
+   configured concurrency. A transient wedge (a bad model load, a one-off deadlock) recovers here.
 2. **Give up cleanly**: once the worker has been wedged long enough that resets clearly are not helping
    (e.g. a deterministic crash-on-start), stop fighting: fault the jobs that cannot be served so the
    horde reissues them, rather than wedging forever. The worker keeps running and keeps popping.
@@ -24,9 +24,8 @@ the wedge has then persisted for a further grace. The manager supplies the readi
 
 This module is *only the policy*: it tracks how long the worker has been wedged, whether its pool is
 ready, and returns an action. The manager owns the wedge assessment (what "wedged" means in terms of
-live processes and pending work), the readiness assessment, and the actions (rebuilding pools, applying
-limp-by, faulting stuck jobs, aborting). Keeping the policy pure makes the escalation timing unit-testable
-with a fake clock.
+live processes and pending work), the readiness assessment, and the actions (rebuilding pools, faulting
+stuck jobs, aborting). Keeping the policy pure makes the escalation timing unit-testable with a fake clock.
 """
 
 from __future__ import annotations
@@ -79,7 +78,7 @@ The first faults the unservable jobs so the horde reissues them; a continuation 
 cycle; a second give-up is flagged terminal so the manager abandons ship deliberately instead of by chance."""
 
 _DEFAULT_CLEAN_STREAK_SECONDS = 30.0
-"""Continuous non-wedge time that ends a wedge episode and restores full settings (limp-by recovery).
+"""Continuous non-wedge time that ends a wedge episode and resets the escalation counters.
 
 Set longer than a soft reset's transient un-quarantine + re-quarantine window so a doomed pool's soft
 reset does not look like a recovery and reopen a fresh (give-up-resetting) episode each time."""
@@ -91,7 +90,7 @@ class RecoveryAction(enum.Enum):
     NONE = enum.auto()
     """No action: not wedged, still within a grace/backoff window, or holding after a latched give-up."""
     SOFT_RESET = enum.auto()
-    """Rebuild the process pools in-place and drop one limp-by notch."""
+    """Rebuild the process pools in-place; the configured concurrency is preserved across the rebuild."""
     GIVE_UP = enum.auto()
     """Fault the jobs that cannot be served so they drain; the worker keeps running.
 
@@ -105,8 +104,8 @@ class RecoverySupervisor:
     Drive it once per control-loop tick with :meth:`evaluate`, passing whether the worker is currently
     wedged (pending work it structurally cannot make progress on) and whether its inference pool is ready
     (a lane has reached an accepting state). The returned :class:`RecoveryAction` tells the manager what
-    to do; :attr:`limp_by_level` is the number of soft resets done in the current cycle, which the manager
-    maps to reduced settings; :attr:`give_up_is_terminal` marks the give-up that should abandon ship.
+    to do; :attr:`limp_by_level` is the number of soft resets done in the current cycle (an escalation
+    counter, not a settings reduction); :attr:`give_up_is_terminal` marks the give-up that should abandon ship.
     """
 
     def __init__(
@@ -154,7 +153,7 @@ class RecoverySupervisor:
 
     @property
     def limp_by_level(self) -> int:
-        """Soft resets done in the current cycle; the manager reduces settings by this many notches."""
+        """Soft resets done in the current cycle; an escalation counter (the concurrency cap is preserved)."""
         return self._soft_resets_done
 
     @property
