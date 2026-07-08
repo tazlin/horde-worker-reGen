@@ -715,7 +715,7 @@ def detect_orphan_wedge(context: SessionContext) -> list[Finding]:
             ),
             remediation=(
                 "Inspect the inference slots for hangs/OOM around these punts; a sustained storm should "
-                "escalate to a soft reset and reduced concurrency."
+                "escalate to a soft reset (pool rebuild)."
             ),
             evidence=[_evidence(r) for r in orphans[:4]],
         ),

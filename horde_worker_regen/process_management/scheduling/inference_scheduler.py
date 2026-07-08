@@ -5617,6 +5617,34 @@ class InferenceScheduler:
             return None
         return self._pick_best_resident_process(candidates)
 
+    def _idle_resident_process_excluding(
+        self,
+        job: ImageGenerateJobPopResponse,
+        *,
+        exclude_process_id: int | None,
+    ) -> HordeProcessInfo | None:
+        """A resident, idle (can-accept) process for ``job`` other than ``exclude_process_id``.
+
+        Used by the line-skip when the candidate shares the blocked head's model: the head's own slot reads
+        as able to accept work while it downloads auxiliary models, so a same-model skip must be routed onto
+        a *different* idle process that already holds the model, never back onto the downloading slot.
+        Returns None when the model is resident only on the excluded slot or on busy lanes, honoring per-card
+        eligibility on a multi-GPU host. Ties break to the least-loaded card, matching dispatch selection.
+        """
+        if job.model is None:
+            return None
+        if self._multi_gpu_routing_active:
+            candidates = self._process_map.get_processes_by_horde_model_name(
+                job.model,
+                allowed_cards=self._eligible_card_indices(job),
+            )
+        else:
+            candidates = self._process_map.get_processes_by_horde_model_name(job.model)
+        ready = [p for p in candidates if p.process_id != exclude_process_id and p.can_accept_job()]
+        if not ready:
+            return None
+        return min(ready, key=lambda p: self._card_inference_load(p.device_index))
+
     def _pinned_lane_resident_for_job(self, job: ImageGenerateJobPopResponse) -> HordeProcessInfo | None:
         """The disaggregation-pinned lane holding ``job``'s model when that is the only resident copy, else None.
 
@@ -5704,13 +5732,18 @@ class InferenceScheduler:
         *,
         next_n_jobs: list[ImageGenerateJobPopResponse],
         candidate_job_size: int,
+        displaced_process_id: int | None,
     ) -> NextJobAndProcess | None:
         """Select a small, ready job that may bypass ``displaced_job`` while its slot is non-sampling.
 
-        Scans the pending jobs for the first resident on an idle process that holds a *different* model
-        than the blocked head, carries no LoRAs, is not a degraded retry, and is within the
-        per-performance-mode size limit. Returns a :class:`NextJobAndProcess` carrying the
-        :class:`LineSkip` record, or None when nothing qualifies. Rejections are logged (rate-limited).
+        Scans the pending jobs for the first resident on an idle process that carries no LoRAs, is not a
+        degraded retry, and is within the per-performance-mode size limit. A candidate sharing the blocked
+        head's model qualifies as long as that model is resident on a *different* idle process than the
+        downloading head (``displaced_process_id``): during an aux-model download the head's own slot reads
+        as able to accept work, so a same-model skip is routed onto a sibling copy, never back onto the
+        downloading slot. This keeps a mono-model queue from starving the GPU whenever its one head stalls
+        on a LoRA download. Returns a :class:`NextJobAndProcess` carrying the :class:`LineSkip` record, or
+        None when nothing qualifies. Rejections are logged (rate-limited).
         """
         for candidate_small_job in next_n_jobs:
             candidate_id = str(candidate_small_job.id_)[:8]
@@ -5719,13 +5752,6 @@ class InferenceScheduler:
             )
             if candidate_small_job.model is None:
                 self._log_line_skip_rejection(candidate_id, "missing_model", "rejected: missing model.")
-                continue
-            if candidate_small_job.model == displaced_job.model:
-                self._log_line_skip_rejection(
-                    candidate_id,
-                    "same_model",
-                    f"rejected: same model as blocked job {str(displaced_job.id_)[:8]}.",
-                )
                 continue
             if job_has_loras:
                 self._log_line_skip_rejection(candidate_id, "has_loras", "rejected: candidate has LoRAs.")
@@ -5738,14 +5764,28 @@ class InferenceScheduler:
                 )
                 continue
 
-            candidate_process_with_model = self._resident_process_for_job(candidate_small_job)
-            if candidate_process_with_model is None:
-                self._log_line_skip_rejection(
-                    candidate_id,
-                    "not_resident",
-                    f"rejected: model {candidate_small_job.model} is not resident.",
+            if candidate_small_job.model == displaced_job.model:
+                candidate_process_with_model = self._idle_resident_process_excluding(
+                    candidate_small_job,
+                    exclude_process_id=displaced_process_id,
                 )
-                continue
+                if candidate_process_with_model is None:
+                    self._log_line_skip_rejection(
+                        candidate_id,
+                        "same_model",
+                        f"rejected: same model as blocked job {str(displaced_job.id_)[:8]} with no other "
+                        "idle resident lane.",
+                    )
+                    continue
+            else:
+                candidate_process_with_model = self._resident_process_for_job(candidate_small_job)
+                if candidate_process_with_model is None:
+                    self._log_line_skip_rejection(
+                        candidate_id,
+                        "not_resident",
+                        f"rejected: model {candidate_small_job.model} is not resident.",
+                    )
+                    continue
 
             candidate_effective_mps = self.get_single_job_effective_megapixelsteps(candidate_small_job)
             if candidate_effective_mps > candidate_job_size:
@@ -5934,6 +5974,7 @@ class InferenceScheduler:
                     next_job,
                     next_n_jobs=next_n_jobs,
                     candidate_job_size=candidate_job_size,
+                    displaced_process_id=process_with_model.process_id,
                 )
                 if bypass is not None:
                     self._pending_line_skip = bypass
@@ -6006,6 +6047,7 @@ class InferenceScheduler:
                     next_job,
                     next_n_jobs=next_n_jobs,
                     candidate_job_size=candidate_job_size,
+                    displaced_process_id=process_with_model.process_id,
                 )
                 if line_skip_selection is None:
                     return None

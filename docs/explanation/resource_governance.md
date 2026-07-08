@@ -95,7 +95,7 @@ is in progress, and the queue is empty, sustained past a grace window. The pop-h
 distinguishes a genuine latch from a merely idle worker with no matching jobs. It escalates in tiers: first
 a governance-baseline reset, and only if the hold re-latches despite a healthy host does it rebuild the
 (all-idle) inference pool. It is deliberately not an `assess_wedge` trigger, because that would apply the
-soft reset's limp-by concurrency notch and unconditional pool churn to a pool that is actually healthy.
+soft reset's unconditional pool churn to a pool that is actually healthy.
 
 ## Decisions are values
 

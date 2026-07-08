@@ -247,11 +247,16 @@ different job, causing the block decision to be wasted.
 #### Sourcing a skip job when none is queued
 
 A line-skip needs a small, non-LoRA job that is already resident on an idle
-sibling process. Often one is: the queue holds a mix and the scheduler simply
-picks it. But when the blocked head sits behind an auxiliary-model download and
-*nothing queued qualifies* (every other queued job shares the head's model, is
-itself LoRA-bearing, or is too large), the GPU would idle for the whole
-download. `aux_model_download_line_skip_threshold_seconds` bounds how long the
+sibling process. A candidate sharing the blocked head's model qualifies too, as
+long as that model is resident on a *different* idle process than the downloading
+head (its own slot reads as able to accept work while it downloads aux models, so
+the skip is routed onto a sibling copy, never back onto the downloading slot).
+This keeps a mono-model queue from starving whenever its one head stalls on a
+LoRA download. Often a candidate is available: the queue holds a mix and the
+scheduler simply picks it. But when the blocked head sits behind an
+auxiliary-model download and *nothing queued qualifies* (every other queued job is
+itself LoRA-bearing, is too large, or shares the head's model with no idle sibling
+copy to run it on), the GPU would idle for the whole download. `aux_model_download_line_skip_threshold_seconds` bounds how long the
 scheduler tolerates that before acting: once a slot has been in
 `DOWNLOADING_AUX_MODEL` past the threshold with no usable candidate, it arms
 `WorkerState.wants_line_skip_candidate`. Two things then happen:

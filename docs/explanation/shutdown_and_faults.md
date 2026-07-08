@@ -130,7 +130,7 @@ Two independent mechanisms guard against the worker getting stuck:
 The mechanisms above handle *individual* faults and stuck processes. A separate
 escalation layer handles the case where the worker **as a whole** has stopped
 making progress: a "save-our-ship" supervisor first soft-resets the process pools
-in place (rebuild every child, reduce concurrency a notch for "limp-by"), and
+in place (rebuild every child, preserving the configured concurrency), and
 only if that clearly is not helping does it give up cleanly on jobs it cannot
 serve (faulting them so the horde reissues them). If the process pools are
 structurally broken, that give-up escalates through abort so the supervised

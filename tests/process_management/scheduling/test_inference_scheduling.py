@@ -650,6 +650,66 @@ class TestAuxDownloadLineSkip:
         assert await scheduler.start_inference() is True
         assert candidate_job in job_tracker.jobs_in_progress
 
+    async def test_same_model_candidate_bypasses_via_idle_sibling(self) -> None:
+        """A candidate sharing the blocked head's model skips onto a different idle resident lane.
+
+        A mono-model queue whose one head stalls on a LoRA download would otherwise starve the GPU: every
+        alternative shares the head's model, so the different-model line-skip finds nothing. Routing the
+        same-model job onto a sibling copy (never the downloading slot) keeps the card sampling.
+        """
+        blocked_process = make_mock_process_info(
+            0, model_name="blocked_model", state=HordeProcessState.DOWNLOADING_AUX_MODEL
+        )
+        idle_sibling = make_mock_process_info(2, model_name="blocked_model", state=HordeProcessState.PRELOADED_MODEL)
+        process_map = ProcessMap({0: blocked_process, 2: idle_sibling})
+        job_tracker = JobTracker()
+
+        active_aux_job = make_job_pop_response("blocked_model", loras=[LorasPayloadEntry(name="lora-a")])
+        await track_popped_job_async(job_tracker, active_aux_job)
+        await mark_job_in_progress_async(job_tracker, active_aux_job)
+
+        blocked_head_job = make_job_pop_response("blocked_model", loras=[LorasPayloadEntry(name="lora-b")])
+        await track_popped_job_async(job_tracker, blocked_head_job)
+
+        same_model_candidate = make_job_pop_response("blocked_model")
+        await track_popped_job_async(job_tracker, same_model_candidate)
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map, job_tracker=job_tracker, max_concurrent=1, max_inference=2
+        )
+
+        result = await scheduler.get_next_job_and_process()
+
+        assert result is not None
+        assert result.next_job is same_model_candidate
+        assert result.process_with_model.process_id == 2
+        assert result.line_skip is not None
+        assert result.line_skip.displaced_job is blocked_head_job
+
+    async def test_same_model_candidate_rejected_without_idle_sibling(self) -> None:
+        """CONTROL: with the head's model resident only on the downloading slot, no same-model skip is made."""
+        blocked_process = make_mock_process_info(
+            0, model_name="blocked_model", state=HordeProcessState.DOWNLOADING_AUX_MODEL
+        )
+        process_map = ProcessMap({0: blocked_process})
+        job_tracker = JobTracker()
+
+        active_aux_job = make_job_pop_response("blocked_model", loras=[LorasPayloadEntry(name="lora-a")])
+        await track_popped_job_async(job_tracker, active_aux_job)
+        await mark_job_in_progress_async(job_tracker, active_aux_job)
+
+        blocked_head_job = make_job_pop_response("blocked_model", loras=[LorasPayloadEntry(name="lora-b")])
+        await track_popped_job_async(job_tracker, blocked_head_job)
+
+        same_model_candidate = make_job_pop_response("blocked_model")
+        await track_popped_job_async(job_tracker, same_model_candidate)
+
+        scheduler = _make_inference_scheduler(
+            process_map=process_map, job_tracker=job_tracker, max_concurrent=1, max_inference=2
+        )
+
+        assert await scheduler.get_next_job_and_process() is None
+
     async def test_aux_download_cap_bypass_rejects_oversized_candidate(self) -> None:
         """The cap bypass still enforces the performance-mode eMPS threshold."""
         large_candidate = make_job_pop_response("small_model", width=1024, height=1024, ddim_steps=500)
