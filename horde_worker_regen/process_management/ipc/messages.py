@@ -409,7 +409,10 @@ class HordeInferenceResultMessage(HordeProcessMessage):
     """The state of the job to be sent to the API."""
     sdk_api_job_info: ImageGenerateJobPopResponse
 
-    non_reportable_faults: ClassVar[list[METADATA_TYPE]] = [METADATA_TYPE.aesthetic_score, METADATA_TYPE.information]
+    non_reportable_faults: ClassVar[set[METADATA_TYPE | str]] = {
+        METADATA_TYPE.aesthetic_score,
+        METADATA_TYPE.information,
+    }
 
     @property
     def faults_count(self) -> int:
@@ -422,7 +425,7 @@ class HordeInferenceResultMessage(HordeProcessMessage):
                 total += sum(
                     1
                     for fault in f.generation_faults
-                    if fault not in HordeInferenceResultMessage.non_reportable_faults
+                    if fault.type_ not in HordeInferenceResultMessage.non_reportable_faults
                 )
         return total
 

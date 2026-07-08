@@ -6757,6 +6757,10 @@ class InferenceScheduler:
             process_with_model.last_job_referenced = next_job
             process_with_model.loaded_horde_model_name = next_job.model
             process_with_model.loaded_horde_model_baseline = horde_model_baseline
+            self._process_map.on_process_state_change(
+                process_id=process_with_model.process_id,
+                new_state=HordeProcessState.INFERENCE_STARTING,
+            )
 
         else:
             logger.error(
