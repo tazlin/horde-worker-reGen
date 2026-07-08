@@ -10,12 +10,16 @@ from unittest.mock import Mock
 import pytest
 
 from horde_worker_regen.process_management.config.worker_state import WorkerState
+from horde_worker_regen.process_management.ipc.action_ledger import ActionLedger
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
 from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.lifecycle.process_lifecycle import PauseOwner, ProcessLifecycleManager
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
+from horde_worker_regen.process_management.lifecycle.worker_recovery_coordinator import WorkerRecoveryCoordinator
+from horde_worker_regen.process_management.resources.device_free_governor import GovernorState
+from horde_worker_regen.process_management.resources.resource_budget import CommittedReserveLedger
 from tests.process_management.conftest import (
     make_job_pop_response,
     make_mock_process_info,
@@ -30,6 +34,10 @@ def _make_plm(
     process_map: ProcessMap | None = None,
     job_tracker: JobTracker | None = None,
     ctx: object | None = None,
+    device_free_mb_provider: object | None = None,
+    device_total_vram_mb_provider: object | None = None,
+    device_governor_state_provider: object | None = None,
+    gpu_start_context_mb_provider: object | None = None,
 ) -> ProcessLifecycleManager:
     """Helper to build a PLM with mostly-mocked dependencies."""
     bridge_data = Mock()
@@ -63,6 +71,10 @@ def _make_plm(
         directml=None,
         abort_callback=Mock(),
         state=WorkerState(),
+        device_free_mb_provider=device_free_mb_provider,  # type: ignore[arg-type]
+        device_total_vram_mb_provider=device_total_vram_mb_provider,  # type: ignore[arg-type]
+        device_governor_state_provider=device_governor_state_provider,  # type: ignore[arg-type]
+        gpu_start_context_mb_provider=gpu_start_context_mb_provider,  # type: ignore[arg-type]
     )
 
 
@@ -81,6 +93,86 @@ def test_inference_child_is_created_from_the_injected_context() -> None:
     plm._start_inference_process(0)
 
     fake_ctx.Process.assert_called_once()
+
+
+def test_inference_replacement_defers_start_until_gpu_headroom_recovers() -> None:
+    """A reclaim replacement kills the old slot but does not respawn into a pressured card."""
+    free_mb = 500.0
+    governor_state = GovernorState.PRESSURE
+
+    fake_ctx = Mock()
+    fake_ctx.get_start_method.return_value = "spawn"
+    fake_ctx.Pipe.return_value = (Mock(), Mock())
+    fake_process = Mock()
+    fake_process.pid = 22222
+    fake_process.is_alive.return_value = True
+    fake_ctx.Process.return_value = fake_process
+
+    old_process = make_mock_process_info(
+        2,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.INFERENCE,
+    )
+    old_process.ram_usage_bytes = 12 * 1024 * 1024 * 1024
+    process_map = ProcessMap({2: old_process})
+    plm = _make_plm(
+        ctx=fake_ctx,
+        process_map=process_map,
+        device_free_mb_provider=lambda _device_index: free_mb,
+        device_total_vram_mb_provider=lambda _device_index: 24_564.0,
+        device_governor_state_provider=lambda _device_index: governor_state,
+        gpu_start_context_mb_provider=lambda: 243.0,
+    )
+
+    plm._replace_inference_process(old_process, intentional_reclaim=True)
+
+    assert 2 not in process_map
+    assert plm.has_pending_inference_starts() is True
+    fake_ctx.Process.assert_not_called()
+
+    free_mb = 4_000.0
+    governor_state = GovernorState.HEALTHY
+
+    assert plm.drain_pending_gpu_starts() == 1
+    assert 2 in process_map
+    assert process_map[2].last_process_state == HordeProcessState.PROCESS_STARTING
+    fake_ctx.Process.assert_called_once()
+
+
+def test_pending_inference_start_is_recoverable_capacity_during_backoff() -> None:
+    """Save-our-ship should not treat bounded deferred starts as an unrecoverable pool."""
+    bridge_data = Mock()
+    bridge_data.max_threads = 2
+    lifecycle = Mock()
+    lifecycle.has_pending_inference_starts.return_value = True
+    lifecycle.pending_gpu_starts_backing_off.return_value = True
+    lifecycle.quarantined_inference_slots = frozenset({1, 2})
+
+    dispatcher = Mock()
+    dispatcher.get_deadlock_snapshot.return_value.indicates_structural_wedge.return_value = False
+    scheduler = Mock()
+    scheduler.whole_card_residency_grace_active.return_value = False
+    scheduler.heavy_head_load_grace_active.return_value = False
+    scheduler.ram_reclaim_cycle_grace_active.return_value = False
+
+    coordinator = WorkerRecoveryCoordinator(
+        state=WorkerState(),
+        runtime_config=make_test_runtime_config(bridge_data=bridge_data),
+        job_tracker=JobTracker(),
+        process_map=ProcessMap({}),
+        process_lifecycle=lifecycle,
+        message_dispatcher=dispatcher,
+        inference_scheduler=scheduler,
+        action_ledger=ActionLedger(),
+        reserve_ledger=CommittedReserveLedger(),
+        bridge_data_provider=lambda: bridge_data,
+        max_inference_processes_provider=lambda: 2,
+        abort_callback=Mock(),
+    )
+
+    assert coordinator.is_inference_capacity_available() is True
+    assert coordinator.is_inference_pool_unrecoverable() is False
 
 
 def test_inference_pids_never_take_the_reserved_safety_slot() -> None:

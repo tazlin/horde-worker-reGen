@@ -9,6 +9,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as Lock_MultiProcessing
@@ -44,6 +45,7 @@ from horde_worker_regen.process_management.lifecycle.process_info import HordePr
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.models.horde_model_map import HordeModelMap
 from horde_worker_regen.process_management.models.model_sizing import any_offered_model_wants_whole_card
+from horde_worker_regen.process_management.resources.device_free_governor import GovernorState, soft_floor_mb
 from horde_worker_regen.process_management.resources.resource_budget import ram_pressure_floor_mb
 from horde_worker_regen.process_management.scheduling.performance_model import (
     BatchBucket,
@@ -70,6 +72,17 @@ class PauseOwner(enum.StrEnum):
     """The whole-card residency stopped the lane; its completion loop owns the restore."""
     RECLAIM_LADDER = "reclaim_ladder"
     """The verified reclaim ladder stopped the lane; the ladder's episode-end unwind owns the restore."""
+
+
+@dataclass(frozen=True)
+class _PendingGpuStart:
+    """Represents a GPU-bearing child process start waiting for device headroom."""
+
+    process_type: HordeProcessType
+    process_id: int | None
+    device_index: int
+    reason: str
+    created_at: float
 
 
 SAFETY_PROCESS_ID: int = 0
@@ -113,6 +126,12 @@ The crash-loop circuit breaker quarantines individual *inference* slots, but the
 per-slot breaker. This count is the equivalent signal for safety: a pool that has been rebuilt more than
 this many times in the window is failing (e.g. a safety process that crashes on every start), which the
 recovery supervisor escalates rather than rebuilding the pool forever."""
+
+PENDING_GPU_START_NO_PROGRESS_SECONDS: float = 600.0
+"""How long deferred GPU starts may show no free-VRAM progress before recovery may escalate normally."""
+
+PENDING_GPU_START_PROGRESS_EPSILON_MB: float = 128.0
+"""Minimum free-VRAM increase that counts as drain progress for deferred GPU starts."""
 
 MODEL_LOAD_FAILURE_WINDOW_SECONDS: float = 600.0
 """Sliding window over which a single model's load failures are counted for quarantine."""
@@ -280,6 +299,10 @@ class ProcessLifecycleManager:
         wddm_paging_victims_provider: Callable[[float], dict[int, float]] | None = None,
         device_saturation_duration_provider: Callable[[int], float] | None = None,
         saturation_unresolved_provider: Callable[[int], bool] | None = None,
+        device_free_mb_provider: Callable[[int], float | None] | None = None,
+        device_total_vram_mb_provider: Callable[[int], float | None] | None = None,
+        device_governor_state_provider: Callable[[int], GovernorState] | None = None,
+        gpu_start_context_mb_provider: Callable[[], float] | None = None,
     ) -> None:
         """Initialize with shared references and callbacks from the parent manager."""
         # All child processes are created from this context (ctx.Process/ctx.Pipe), not the bare
@@ -338,6 +361,22 @@ class ProcessLifecycleManager:
             saturation_unresolved_provider
             if saturation_unresolved_provider is not None
             else (lambda _device_index: False)
+        )
+        self._device_free_mb_provider: Callable[[int], float | None] = (
+            device_free_mb_provider if device_free_mb_provider is not None else (lambda _device_index: None)
+        )
+        self._device_total_vram_mb_provider: Callable[[int], float | None] = (
+            device_total_vram_mb_provider
+            if device_total_vram_mb_provider is not None
+            else (lambda _device_index: None)
+        )
+        self._device_governor_state_provider: Callable[[int], GovernorState] = (
+            device_governor_state_provider
+            if device_governor_state_provider is not None
+            else (lambda _device_index: GovernorState.HEALTHY)
+        )
+        self._gpu_start_context_mb_provider: Callable[[], float] = (
+            gpu_start_context_mb_provider if gpu_start_context_mb_provider is not None else (lambda: 0.0)
         )
 
         self.num_processes_launched = 0
@@ -436,6 +475,9 @@ class ProcessLifecycleManager:
         self._model_load_failure_history = {}
         self._quarantined_models = set()
         self._recent_load_failure_by_process = {}
+        self._pending_gpu_starts: dict[tuple[HordeProcessType, int], _PendingGpuStart] = {}
+        self._pending_gpu_start_last_free_mb_by_device: dict[int, float] = {}
+        self._pending_gpu_start_last_progress_at_by_device: dict[int, float] = {}
 
         self._print_config()
 
@@ -521,6 +563,113 @@ class ProcessLifecycleManager:
         """The self-audited record of lifecycle actions taken on child processes (read-only)."""
         return self._action_ledger
 
+    @staticmethod
+    def _pending_gpu_start_key(process_type: HordeProcessType, process_id: int | None) -> tuple[HordeProcessType, int]:
+        """Return the stable pending-start key for a process type and optional slot id."""
+        return process_type, process_id if process_id is not None else -1
+
+    def has_pending_gpu_starts(self) -> bool:
+        """Return whether any GPU-bearing child start is intentionally waiting for device headroom."""
+        return bool(self._pending_gpu_starts)
+
+    def has_pending_inference_starts(self) -> bool:
+        """Return whether any inference slot is intentionally waiting for device headroom."""
+        return any(pending.process_type is HordeProcessType.INFERENCE for pending in self._pending_gpu_starts.values())
+
+    def has_pending_safety_starts(self) -> bool:
+        """Return whether the safety process is intentionally waiting for device headroom."""
+        return any(pending.process_type is HordeProcessType.SAFETY for pending in self._pending_gpu_starts.values())
+
+    def pending_gpu_starts_backing_off(self) -> bool:
+        """Return whether deferred starts are still an active, bounded backoff rather than a hard wedge.
+
+        A pending start stays protected while it is young, or while device-free readings show recent drain
+        progress. Once all pending starts have outlived the no-progress window and no card has made progress,
+        the higher-level recovery backstop may treat the pool normally again.
+        """
+        if not self._pending_gpu_starts:
+            return False
+        now = time.monotonic()
+        if any(
+            (now - pending.created_at) < PENDING_GPU_START_NO_PROGRESS_SECONDS
+            for pending in self._pending_gpu_starts.values()
+        ):
+            return True
+        return any(
+            (now - progressed_at) < PENDING_GPU_START_NO_PROGRESS_SECONDS
+            for progressed_at in self._pending_gpu_start_last_progress_at_by_device.values()
+        )
+
+    def _note_pending_gpu_start_sample(self, device_index: int, device_free_mb: float | None = None) -> None:
+        """Track free-VRAM progress while starts are deferred on a device."""
+        free_mb = self._device_free_mb_provider(device_index) if device_free_mb is None else device_free_mb
+        if free_mb is None:
+            return
+        previous = self._pending_gpu_start_last_free_mb_by_device.get(device_index)
+        if previous is not None and free_mb >= previous + PENDING_GPU_START_PROGRESS_EPSILON_MB:
+            self._pending_gpu_start_last_progress_at_by_device[device_index] = time.monotonic()
+        self._pending_gpu_start_last_free_mb_by_device[device_index] = free_mb
+
+    def _gpu_start_required_free_mb(self, device_index: int) -> float:
+        """Return the free-VRAM floor needed before starting another CUDA-bearing child."""
+        total_mb = self._device_total_vram_mb_provider(device_index)
+        if total_mb is None:
+            card = self._card_runtimes.get(device_index)
+            total_mb = card.total_vram_mb if card is not None else None
+        try:
+            context_mb = max(0.0, float(self._gpu_start_context_mb_provider()))
+        except Exception as e:
+            logger.debug(f"GPU-start context estimate unavailable: {type(e).__name__} {e}")
+            context_mb = 0.0
+        return soft_floor_mb(total_mb) + context_mb
+
+    def _gpu_start_has_headroom(self, device_index: int, *, cpu_only: bool = False) -> tuple[bool, str]:
+        """Return whether a CUDA-capable child may start now, plus a human-readable reason if not."""
+        if cpu_only:
+            return True, ""
+        free_mb = self._device_free_mb_provider(device_index)
+        if free_mb is None:
+            return True, ""
+        required_mb = self._gpu_start_required_free_mb(device_index)
+        governor_state = self._device_governor_state_provider(device_index)
+        if free_mb >= required_mb and governor_state == GovernorState.HEALTHY:
+            return True, ""
+        self._note_pending_gpu_start_sample(device_index, free_mb)
+        return (
+            False,
+            f"device {device_index} is {governor_state.value} with {free_mb:.0f}MB free; "
+            f"waiting for at least {required_mb:.0f}MB before starting another GPU process",
+        )
+
+    def _defer_gpu_start(
+        self,
+        *,
+        process_type: HordeProcessType,
+        process_id: int | None,
+        device_index: int,
+        reason: str,
+    ) -> None:
+        """Record a GPU-bearing process start that should be retried once the device drains."""
+        key = self._pending_gpu_start_key(process_type, process_id)
+        if key in self._pending_gpu_starts:
+            return
+        pending = _PendingGpuStart(
+            process_type=process_type,
+            process_id=process_id,
+            device_index=device_index,
+            reason=reason,
+            created_at=time.monotonic(),
+        )
+        self._pending_gpu_starts[key] = pending
+        self._note_pending_gpu_start_sample(device_index)
+        self._action_ledger.record(
+            LedgerEventType.PROCESS_START_DEFERRED,
+            process_id=process_id,
+            reason=reason,
+            detail={"process_type": process_type.name, "device_index": device_index},
+        )
+        logger.warning(f"Deferred {process_type.name} process start: {reason}.")
+
     _VRAM_MATERIALIZING_PROCESS_TYPES = (
         HordeProcessType.INFERENCE,
         HordeProcessType.SAFETY,
@@ -552,6 +701,78 @@ class ProcessLifecycleManager:
                 launch_identifier=process_info.process_launch_identifier,
                 process_type=process_info.process_type.name,
             )
+
+    def _request_inference_process_start(self, pid: int, *, device_index: int, reason: str) -> bool:
+        """Start an inference slot now, or defer it until the assigned device has headroom."""
+        key = self._pending_gpu_start_key(HordeProcessType.INFERENCE, pid)
+        if key in self._pending_gpu_starts:
+            return False
+        can_start, defer_reason = self._gpu_start_has_headroom(device_index)
+        if not can_start:
+            self._defer_gpu_start(
+                process_type=HordeProcessType.INFERENCE,
+                process_id=pid,
+                device_index=device_index,
+                reason=f"{reason}: {defer_reason}",
+            )
+            return False
+        self._start_inference_process(pid, device_index=device_index)
+        return True
+
+    def drain_pending_gpu_starts(self) -> int:
+        """Retry deferred GPU-bearing starts whose devices have recovered enough headroom.
+
+        Returns:
+            Number of pending starts that were launched on this tick.
+        """
+        if not self._pending_gpu_starts:
+            return 0
+
+        started = 0
+        for key, pending in list(self._pending_gpu_starts.items()):
+            self._note_pending_gpu_start_sample(pending.device_index)
+            can_start, _ = self._gpu_start_has_headroom(pending.device_index)
+            if not can_start:
+                continue
+
+            self._pending_gpu_starts.pop(key, None)
+            if self._start_deferred_gpu_process(pending):
+                started += 1
+            else:
+                self._pending_gpu_start_last_free_mb_by_device.pop(pending.device_index, None)
+        return started
+
+    def _start_deferred_gpu_process(self, pending: _PendingGpuStart) -> bool:
+        """Start one previously deferred GPU-bearing process if it is still wanted."""
+        logger.info(
+            f"Starting deferred {pending.process_type.name} process"
+            + (f" {pending.process_id}" if pending.process_id is not None else "")
+            + f" on device {pending.device_index}.",
+        )
+        if pending.process_type is HordeProcessType.INFERENCE:
+            if pending.process_id is None or pending.process_id in self._quarantined_inference_slots:
+                return False
+            if pending.process_id in self._process_map:
+                return False
+            self._start_inference_process(pending.process_id, device_index=pending.device_index)
+            return True
+        if pending.process_type is HordeProcessType.SAFETY:
+            if self._process_map.num_safety_processes() > 0:
+                return False
+            return self.start_safety_processes()
+        if pending.process_type is HordeProcessType.POST_PROCESS:
+            if self._process_map.num_post_process_processes() > 0:
+                return False
+            return self.start_post_process_processes()
+        if pending.process_type is HordeProcessType.COMPONENT:
+            if self._process_map.num_component_processes() > 0:
+                return False
+            return self.start_component_processes()
+        if pending.process_type is HordeProcessType.VAE_LANE:
+            if self._process_map.num_vae_lane_processes() > 0:
+                return False
+            return self.start_vae_lane_processes()
+        return False
 
     def _log_recovery_diagnostics(self, process_info: HordeProcessInfo, reason: str) -> None:
         """Emit a structured snapshot of why a process is being recovered, so a future hang explains itself.
@@ -596,7 +817,7 @@ class ProcessLifecycleManager:
             return []
         return self._owned_registry.kill_all_owned()
 
-    def start_safety_processes(self) -> None:
+    def start_safety_processes(self) -> bool:
         """Start all the safety processes configured to be used."""
         bridge_data = self._runtime_config.bridge_data
         num_processes_to_start = self._max_safety_processes - self._process_map.num_safety_processes()
@@ -616,7 +837,6 @@ class ProcessLifecycleManager:
             pid = (
                 SAFETY_PROCESS_ID if self._process_map.num_safety_processes() == 0 else self._allocate_inference_pid()
             )
-            pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
 
             # A CPU-only torch build has no CUDA device to pin to, so the safety process must come up
             # off-GPU regardless of config (otherwise loading the safety models on "cuda" raises). The
@@ -635,6 +855,20 @@ class ProcessLifecycleManager:
             else:
                 safety_card = self._card_runtimes[min(self._card_runtimes)]
             self._safety_pinned_card = None if cpu_only else safety_card.device_index
+            key = self._pending_gpu_start_key(HordeProcessType.SAFETY, pid)
+            if key in self._pending_gpu_starts:
+                return False
+            can_start, defer_reason = self._gpu_start_has_headroom(safety_card.device_index, cpu_only=cpu_only)
+            if not can_start:
+                self._defer_gpu_start(
+                    process_type=HordeProcessType.SAFETY,
+                    process_id=pid,
+                    device_index=safety_card.device_index,
+                    reason=f"safety process start: {defer_reason}",
+                )
+                return False
+
+            pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
 
             process = self._new_process(
                 target=self._entry_points.safety_entry_point,
@@ -665,11 +899,13 @@ class ProcessLifecycleManager:
                 process_type=HordeProcessType.SAFETY,
                 last_process_state=HordeProcessState.PROCESS_STARTING,
                 process_launch_identifier=self.num_processes_launched,
+                device_index=safety_card.device_index,
             )
             self._register_owned(self._process_map[pid])
 
             logger.info(f"Started safety process (id: {pid})")
             self.num_processes_launched += 1
+        return True
 
     def post_process_lane_enabled(self) -> bool:
         """Whether the dedicated post-processing lane should be running.
@@ -699,24 +935,36 @@ class ProcessLifecycleManager:
         """Return the device index the dedicated post-processing lane is (or would be) pinned to."""
         return self._post_process_card().device_index
 
-    def start_post_process_processes(self) -> None:
+    def start_post_process_processes(self) -> bool:
         """Start the dedicated post-processing process, if enabled and not already running."""
         if not self.post_process_lane_enabled():
-            return
+            return False
 
         # While a whole-card model holds the card the lane is deliberately kept off-GPU: this per-tick start
         # hook must not resurrect it until the residency restores and clears the pause.
         if self._post_process_gpu_paused:
-            return
+            return False
 
         if self._process_map.num_post_process_processes() > 0:
-            return
+            return True
 
         bridge_data = self._runtime_config.bridge_data
+        lane_card = self._post_process_card()
+        key = self._pending_gpu_start_key(HordeProcessType.POST_PROCESS, None)
+        if key in self._pending_gpu_starts:
+            return False
+        can_start, defer_reason = self._gpu_start_has_headroom(lane_card.device_index)
+        if not can_start:
+            self._defer_gpu_start(
+                process_type=HordeProcessType.POST_PROCESS,
+                process_id=None,
+                device_index=lane_card.device_index,
+                reason=f"post-processing lane start: {defer_reason}",
+            )
+            return False
+
         pid = self._allocate_inference_pid()
         pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
-
-        lane_card = self._post_process_card()
 
         process = self._new_process(
             target=self._entry_points.post_process_entry_point,
@@ -752,6 +1000,7 @@ class ProcessLifecycleManager:
 
         logger.info(f"Started post-process process (id: {pid}, device_index: {lane_card.device_index})")
         self.num_processes_launched += 1
+        return True
 
     def end_post_process_processes(self) -> None:
         """End any dedicated post-processing processes."""
@@ -846,23 +1095,36 @@ class ProcessLifecycleManager:
         """
         return self._runtime_config.bridge_data.enable_pipeline_disaggregation
 
-    def start_component_processes(self) -> None:
+    def start_component_processes(self) -> bool:
         """Start the dedicated text-encode service, if disaggregation is enabled and it is not running."""
         if not self._component_lane_enabled():
-            return
+            return False
 
         # While a whole-card model holds the card the lane is deliberately kept off-GPU: this per-tick start
         # hook must not resurrect it until the residency restores and clears the pause.
         if self._component_gpu_paused:
-            return
+            return False
 
         if self._process_map.num_component_processes() > 0:
-            return
+            return True
 
         bridge_data = self._runtime_config.bridge_data
+        lane_card = self._post_process_card()
+        key = self._pending_gpu_start_key(HordeProcessType.COMPONENT, None)
+        if key in self._pending_gpu_starts:
+            return False
+        can_start, defer_reason = self._gpu_start_has_headroom(lane_card.device_index)
+        if not can_start:
+            self._defer_gpu_start(
+                process_type=HordeProcessType.COMPONENT,
+                process_id=None,
+                device_index=lane_card.device_index,
+                reason=f"component lane start: {defer_reason}",
+            )
+            return False
+
         pid = self._allocate_inference_pid()
         pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
-        lane_card = self._post_process_card()
 
         process = self._new_process(
             target=self._entry_points.component_entry_point,
@@ -898,6 +1160,7 @@ class ProcessLifecycleManager:
 
         logger.info(f"Started component lane (id: {pid}, device_index: {lane_card.device_index})")
         self.num_processes_launched += 1
+        return True
 
     def end_component_processes(self) -> None:
         """End the dedicated component lane process (its publications are withdrawn as it exits)."""
@@ -1047,23 +1310,36 @@ class ProcessLifecycleManager:
         """Return the device index the dedicated VAE lane is (or would be) pinned to."""
         return self._post_process_card().device_index
 
-    def start_vae_lane_processes(self) -> None:
+    def start_vae_lane_processes(self) -> bool:
         """Start the dedicated VAE lane, if disaggregation is enabled and it is not already running."""
         if not self.vae_lane_enabled():
-            return
+            return False
 
         # While a whole-card model holds the card the lane is deliberately kept off-GPU: this per-tick start
         # hook must not resurrect it until the residency restores and clears the pause.
         if self._vae_lane_gpu_paused:
-            return
+            return False
 
         if self._process_map.num_vae_lane_processes() > 0:
-            return
+            return True
 
         bridge_data = self._runtime_config.bridge_data
+        lane_card = self._post_process_card()
+        key = self._pending_gpu_start_key(HordeProcessType.VAE_LANE, None)
+        if key in self._pending_gpu_starts:
+            return False
+        can_start, defer_reason = self._gpu_start_has_headroom(lane_card.device_index)
+        if not can_start:
+            self._defer_gpu_start(
+                process_type=HordeProcessType.VAE_LANE,
+                process_id=None,
+                device_index=lane_card.device_index,
+                reason=f"VAE lane start: {defer_reason}",
+            )
+            return False
+
         pid = self._allocate_inference_pid()
         pipe_connection, child_pipe_connection = self._ctx.Pipe(duplex=True)
-        lane_card = self._post_process_card()
 
         process = self._new_process(
             target=self._entry_points.vae_lane_entry_point,
@@ -1098,6 +1374,7 @@ class ProcessLifecycleManager:
 
         logger.info(f"Started VAE lane (id: {pid}, device_index: {lane_card.device_index})")
         self.num_processes_launched += 1
+        return True
 
     def end_vae_lane_processes(self) -> None:
         """End any dedicated VAE lane processes."""
@@ -1432,6 +1709,9 @@ class ProcessLifecycleManager:
         for process_info in self._process_map.values():
             if process_info.process_type is HordeProcessType.INFERENCE:
                 counts[process_info.device_index] = counts.get(process_info.device_index, 0) + 1
+        for pending in self._pending_gpu_starts.values():
+            if pending.process_type is HordeProcessType.INFERENCE:
+                counts[pending.device_index] = counts.get(pending.device_index, 0) + 1
         for index in sorted(self._card_runtimes):
             if counts.get(index, 0) < self._card_runtimes[index].target_process_count:
                 return index
@@ -1450,7 +1730,12 @@ class ProcessLifecycleManager:
         # pipeline disaggregation is enabled.
         self.start_vae_lane_processes()
 
-        num_processes_to_start = self._max_inference_processes - self._process_map.num_inference_processes()
+        pending_inference_starts = sum(
+            1 for pending in self._pending_gpu_starts.values() if pending.process_type is HordeProcessType.INFERENCE
+        )
+        num_processes_to_start = (
+            self._max_inference_processes - self._process_map.num_inference_processes() - pending_inference_starts
+        )
 
         if num_processes_to_start < 0:
             logger.critical(
@@ -1464,11 +1749,18 @@ class ProcessLifecycleManager:
             # 0 is never taken and ids stay stable across scale cycles. A ``len(map)``-based id would grab 0
             # when the inference pool starts before the safety pool, colliding with the safety process.
             pid = self._allocate_inference_pid()
-            self._start_inference_process(pid, device_index=self._device_for_new_process())
+            started = self._request_inference_process_start(
+                pid,
+                device_index=self._device_for_new_process(),
+                reason="initial inference pool start",
+            )
 
-            logger.info(f"Started inference process (id: {pid})")
+            if started:
+                logger.info(f"Started inference process (id: {pid})")
+            else:
+                logger.info(f"Deferred inference process start (id: {pid})")
 
-            if i == 0:
+            if i == 0 and started:
                 time.sleep(4)
 
     def _start_inference_process(self, pid: int, *, device_index: int = 0) -> HordeProcessInfo:
@@ -1547,6 +1839,11 @@ class ProcessLifecycleManager:
         outside the map at its own reserved id, so it never participates here.
         """
         used = set(self._process_map.keys())
+        used.update(
+            pending.process_id
+            for pending in self._pending_gpu_starts.values()
+            if pending.process_type is HordeProcessType.INFERENCE and pending.process_id is not None
+        )
         pid = SAFETY_PROCESS_ID + 1
         while pid in used:
             pid += 1
@@ -1607,14 +1904,27 @@ class ProcessLifecycleManager:
             card = self._card_runtimes.get(device_index)
             ceiling = card.target_process_count if card is not None else self._max_inference_processes
             current = self._process_map.num_loaded_inference_processes(device_index=device_index)
+        current += sum(
+            1
+            for pending in self._pending_gpu_starts.values()
+            if pending.process_type is HordeProcessType.INFERENCE
+            and (device_index is None or pending.device_index == device_index)
+        )
         target = max(0, min(target_count, ceiling))
 
         if target > current:
             for _ in range(target - current):
                 pid = self._allocate_inference_pid()
                 new_process_device = device_index if device_index is not None else self._device_for_new_process()
-                self._start_inference_process(pid, device_index=new_process_device)
-                logger.info(f"Scaled up: started inference process {pid}")
+                started = self._request_inference_process_start(
+                    pid,
+                    device_index=new_process_device,
+                    reason="inference scale-up",
+                )
+                if started:
+                    logger.info(f"Scaled up: started inference process {pid}")
+                else:
+                    logger.info(f"Scale-up deferred inference process {pid}")
         elif target < current:
             if whole_card_model is not None:
                 disallowed = self._whole_card_protected_processes(whole_card_model, device_index)
@@ -2218,6 +2528,10 @@ class ProcessLifecycleManager:
         too much capacity is lost.
         """
         self._quarantined_inference_slots.add(process_info.process_id)
+        self._pending_gpu_starts.pop(
+            self._pending_gpu_start_key(HordeProcessType.INFERENCE, process_info.process_id),
+            None,
+        )
         self._num_slots_quarantined += 1
         self._process_map.retire_process(process_info, f"inference slot quarantined: {reason}")
         self._action_ledger.record(
@@ -2253,7 +2567,11 @@ class ProcessLifecycleManager:
 
         for slot_id in revived:
             if slot_id not in self._process_map:
-                self._start_inference_process(slot_id, device_index=self._device_for_new_process())
+                self._request_inference_process_start(
+                    slot_id,
+                    device_index=self._device_for_new_process(),
+                    reason=f"soft reset revive: {reason}",
+                )
 
         self._action_ledger.record(
             LedgerEventType.PROCESS_REPLACED,
@@ -2446,7 +2764,12 @@ class ProcessLifecycleManager:
                 },
             )
             self._end_inference_process(process_info)
-            self._start_inference_process(process_info.process_id, device_index=process_info.device_index)
+            self._process_map.retire_process(process_info, reason)
+            self._request_inference_process_start(
+                process_info.process_id,
+                device_index=process_info.device_index,
+                reason=reason,
+            )
             return
 
         failed_model = self._take_recent_load_failure_for_process(process_info.process_id)
@@ -2523,7 +2846,12 @@ class ProcessLifecycleManager:
             self._quarantine_inference_slot(process_info, quarantine_reason)
             return
 
-        self._start_inference_process(process_info.process_id, device_index=process_info.device_index)
+        self._process_map.retire_process(process_info, recovery_reason)
+        self._request_inference_process_start(
+            process_info.process_id,
+            device_index=process_info.device_index,
+            reason=recovery_reason,
+        )
 
     def get_processes_with_model_for_queued_job(self) -> list[int]:
         """Get the processes that have the model for any queued job."""
@@ -2864,6 +3192,7 @@ class ProcessLifecycleManager:
 
         now = time.time()
         self._clear_completed_intentional_safety_replacement()
+        any_started_pending = self.drain_pending_gpu_starts() > 0
 
         # A live inference slot that has advanced past PROCESS_STARTING has proven it can initialise,
         # so clear any consecutive crash-on-start streak it accrued. Only slots that never get past
@@ -2898,7 +3227,7 @@ class ProcessLifecycleManager:
         # The hang/timeout heuristics below are debounced: a just-replaced process is still spinning
         # up and would otherwise trip the startup / all-processes-timed-out checks before it reports in.
         if self._recently_recovered:
-            return any_replaced
+            return any_replaced or any_started_pending
 
         # The first sampling step (which trails the cold model-load/encode work) gets a longer grace than
         # a steady step; is_stuck_on_inference floors this at the per-step timeout, so a config value
@@ -3008,7 +3337,7 @@ class ProcessLifecycleManager:
                         self._recently_recovered = True
 
         if self._state.last_pop_no_jobs_available:
-            return any_replaced
+            return any_replaced or any_started_pending
 
         # ``all(...)`` over an empty map is vacuously True, which would falsely declare "all processes
         # unresponsive" whenever no inference/safety process is running yet: during the startup
@@ -3037,7 +3366,7 @@ class ProcessLifecycleManager:
             last_detected_delta = now - self._hung_processes_detected_time
 
             if last_detected_delta < 20:
-                return False
+                return any_started_pending
 
             self._job_tracker._purge_jobs()
 
@@ -3065,7 +3394,7 @@ class ProcessLifecycleManager:
         if any_replaced:
             threading.Thread(target=timed_unset_recently_recovered).start()
 
-        return any_replaced
+        return any_replaced or any_started_pending
 
     @property
     def safety_processes_should_be_replaced(self) -> bool:

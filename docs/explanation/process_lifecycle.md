@@ -141,9 +141,13 @@ post-processing stall. Post-processing runs on the dedicated lane (see
 only that lane; the affected job is requeued by the orphan watchdog and, after
 bounded re-attempts, is reported as a no-image fault so the horde can reissue it.
 
-When a process exceeds its timeout, it is **replaced immediately** within the
-same call (see below); there is no separate notification sent to the message
-dispatcher. After any recovery, a short `recently_recovered` guard suppresses
+When a process exceeds its timeout, it is ended immediately within the same call
+(see below); there is no separate notification sent to the message dispatcher.
+The replacement start normally happens in that same pass, but GPU-bearing
+children are first admitted against the card's device-free headroom. If the card
+is under pressure, the start is queued as a deferred GPU start and retried on
+later control-loop ticks instead of spawning a fresh CUDA context into an already
+tight device. After any recovery, a short `recently_recovered` guard suppresses
 repeated replacements.
 
 If **every** process is unresponsive past `process_timeout`, a global "hung"
@@ -165,9 +169,21 @@ When a process dies unexpectedly (crash, OOM kill, hung timeout):
    (see [Layer 1](resilience_and_recovery.md#layer-1-bounded-and-degraded-job-retry)).
    A job left stranded in progress despite this (e.g. a lost result) is caught by
    the [orphaned-job backstops](resilience_and_recovery.md#stranded-in-progress-jobs).
-4. A new process is started with a fresh `process_launch_identifier`.
+4. A new process is started with a fresh `process_launch_identifier`, or queued
+   as a deferred GPU start if the assigned card is below its start headroom.
 5. The `process_launch_identifier` bump ensures any stale messages from the dead
    process (still in the IPC queue) are discarded.
+
+Deferred GPU starts apply to inference slots and GPU-resident auxiliary lanes
+(safety-on-GPU, post-processing, component, and VAE lanes). The admission floor is
+the device-free governor's soft floor plus one measured/estimated CUDA context
+cost, so a respawn waits until there is enough room both to stay out of the
+saturation band and to pay the context it is about to create. Missing device-free
+telemetry is permissive: on hosts that cannot report a trustworthy device-level
+free value, lifecycle falls back to the old immediate-start behavior rather than
+inventing a floor. Each deferred start records `PROCESS_START_DEFERRED` in the
+action ledger and is drained by `replace_hung_processes()` before ordinary hung
+detection runs.
 
 Each replacement is also reported to a **process-recovery observer**
 (`set_process_recovery_observer`); the process manager wires this to

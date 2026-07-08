@@ -31,6 +31,7 @@ class LedgerEventType(enum.StrEnum):
     PROCESS_REPLACED = "process_replaced"
     PROCESS_QUARANTINED = "process_quarantined"
     PROCESS_ENDED = "process_ended"
+    PROCESS_START_DEFERRED = "process_start_deferred"
     INFERENCE_DISPATCHED = "inference_dispatched"
     INFERENCE_RETRIED = "inference_retried"
     INFERENCE_FAULTED = "inference_faulted"

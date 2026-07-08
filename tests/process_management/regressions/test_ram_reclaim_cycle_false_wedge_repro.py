@@ -37,6 +37,7 @@ from __future__ import annotations
 import time
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.lifecycle.process_info import HordeProcessInfo
 from horde_worker_regen.process_management.process_manager import HordeWorkerProcessManager
 from tests.process_management.conftest import (
     make_job_pop_response,
@@ -62,10 +63,19 @@ def _stub_low_level_spawn(pm: HordeWorkerProcessManager) -> None:
     as in production, while staying a torch/network-free unit test.
     """
 
-    def fake_start(process_id: int, *, device_index: int = 0) -> None:
-        slot = pm._process_map[process_id]
+    def fake_start(process_id: int, *, device_index: int = 0) -> HordeProcessInfo:
+        slot = pm._process_map.get(process_id)
+        if slot is None:
+            slot = make_mock_process_info(
+                process_id,
+                model_name=None,
+                state=HordeProcessState.PROCESS_STARTING,
+                device_index=device_index,
+            )
+            pm._process_map[process_id] = slot
         slot.last_process_state = HordeProcessState.PROCESS_STARTING
         slot.loaded_horde_model_name = None
+        return slot
 
     pm._process_lifecycle._start_inference_process = fake_start  # type: ignore[method-assign]
 

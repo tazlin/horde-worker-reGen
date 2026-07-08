@@ -502,8 +502,10 @@ once per monitor tick per card:
   buffer`)`); nothing to do.
 - **PRESSURE** — device-free is below the soft floor. The scheduler **holds new VRAM growth**: no new model
   is brought to VRAM on a process that does not already hold it, no safety process is restored to the GPU,
-  and no paused lane is restarted. Work already sampling is left alone, because it is not the active sampler
-  the driver demotes. Held preloads simply re-ask on later cycles and proceed once the card recovers.
+  and no paused lane is restarted. Lifecycle also holds new GPU-bearing process starts, including respawns
+  after a hung slot, until the card has the soft floor plus one CUDA-context cost available. Work already
+  sampling is left alone, because it is not the active sampler the driver demotes. Held preloads and deferred
+  starts simply re-ask on later cycles and proceed once the card recovers.
 - **SATURATED** — device-free is below the *hard floor* (`max(256MB, 0.5x` the noise buffer`)`). The card is
   at or past the cliff, so a reclaim pass runs immediately on the same tick.
 

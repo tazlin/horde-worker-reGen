@@ -173,8 +173,14 @@ manager-side **actions**:
   between jobs), or a recurring [orphaned-job](#stranded-in-progress-jobs) punt
   storm. A busy, slow, replacing, or model-loading worker is never wedged, and a
   queue deliberately held while a heavy model establishes whole-card residency is
-  excused by a bounded grace. `run_recovery_supervisor()` runs each control-loop
-  tick and applies the returned action.
+  excused by a bounded grace. The same grace covers lifecycle's deferred
+  GPU-process starts: a slot killed for recovery or RAM reclamation may be absent
+  from `ProcessMap` while its respawn waits for device-free headroom, but SOS
+  treats that as recoverable capacity while the wait is young or free-VRAM
+  readings show drain progress. If the card never recovers past the bounded
+  no-progress window, the normal unrecoverable-pool checks resume.
+  `run_recovery_supervisor()` runs each control-loop tick and applies the
+  returned action.
 
 The escalation, in order:
 
@@ -255,9 +261,10 @@ over-commits.
 
 [`ActionLedger`][horde_worker_regen.process_management.ipc.action_ledger.ActionLedger]
 is an append-only, self-audited record of the lifecycle actions the parent takes
-on its children: when each slot was spawned (and its OS pid), when inference was
-dispatched, when a held semaphore was released on its behalf, when a timeout
-fired and why a slot was replaced. When a child hangs or crashes, this ordered
+on its children: when each slot was spawned (and its OS pid), when a GPU-bearing
+start was deferred for device-free headroom, when inference was dispatched, when
+a held semaphore was released on its behalf, when a timeout fired and why a slot
+was replaced. When a child hangs or crashes, this ordered
 account is the single most useful diagnostic. It also records worker-level pop
 governance transitions: the shared self-throttle pop-pause is ledgered when armed
 (`POP_PAUSE_ARMED`) and when it lapses (`POP_PAUSE_LAPSED`), each carrying the

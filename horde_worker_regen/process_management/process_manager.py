@@ -1068,6 +1068,15 @@ class HordeWorkerProcessManager:
             saturation_unresolved_provider=lambda device_index: self._reclaim_ladder.is_saturation_unresolved(
                 device_index,
             ),
+            device_free_mb_provider=lambda device_index: self.latest_device_free_mb(device_index),
+            device_total_vram_mb_provider=lambda device_index: self._last_device_total_mb_by_device.get(
+                device_index,
+            ),
+            device_governor_state_provider=lambda device_index: self._governor_states_by_device.get(
+                device_index,
+                GovernorState.HEALTHY,
+            ),
+            gpu_start_context_mb_provider=lambda: self._inference_scheduler.resolved_context_constant_mb(),
         )
 
         self._download_coordinator = ModelDownloadCoordinator(
@@ -1116,6 +1125,7 @@ class HordeWorkerProcessManager:
         self._device_free_governor = DeviceFreeGovernor()
         self._governor_states_by_device: dict[int, GovernorState] = {}
         self._last_device_free_mb_by_device: dict[int, float] = {}
+        self._last_device_total_mb_by_device: dict[int, float] = {}
         # The single-owner verified reclaim ladder: when the governor calls a card SATURATED it issues one
         # pressure-relief rung per tick (newest idle model -> idle allocator caches -> older idle models ->
         # lane pauses -> safety off GPU), then verifies the realized NVML device-free gain against the rung's
@@ -2329,6 +2339,7 @@ class HordeWorkerProcessManager:
             )
             self._governor_states_by_device[device_index] = sample.state
             self._last_device_free_mb_by_device[device_index] = device_free_mb
+            self._last_device_total_mb_by_device[device_index] = total_mb
 
             if sample.transitioned:
                 logger.warning(

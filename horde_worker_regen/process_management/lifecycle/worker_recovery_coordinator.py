@@ -133,13 +133,31 @@ class WorkerRecoveryCoordinator:
 
     def is_inference_capacity_available(self) -> bool:
         """Return whether any inference process is alive to serve pending inference work."""
+        if self._inference_starts_backing_off():
+            return True
         return any(
             process_info.process_type == HordeProcessType.INFERENCE and process_info.is_process_alive()
             for process_info in self._process_map.values()
         )
 
+    def _inference_starts_backing_off(self) -> bool:
+        """Return whether inference starts are intentionally deferred by lifecycle headroom admission."""
+        return (
+            self._process_lifecycle.has_pending_inference_starts()
+            and self._process_lifecycle.pending_gpu_starts_backing_off()
+        )
+
+    def _safety_starts_backing_off(self) -> bool:
+        """Return whether safety starts are intentionally deferred by lifecycle headroom admission."""
+        return (
+            self._process_lifecycle.has_pending_safety_starts()
+            and self._process_lifecycle.pending_gpu_starts_backing_off()
+        )
+
     def is_safety_capacity_available(self) -> bool:
         """Return whether any safety process is alive to serve pending safety checks."""
+        if self._safety_starts_backing_off():
+            return True
         return any(
             process_info.process_type == HordeProcessType.SAFETY and process_info.is_process_alive()
             for process_info in self._process_map.values()
@@ -166,10 +184,14 @@ class WorkerRecoveryCoordinator:
 
     def is_inference_pool_unrecoverable(self) -> bool:
         """Return whether every inference slot is crash-loop quarantined."""
+        if self._inference_starts_backing_off():
+            return False
         return len(self._process_lifecycle.quarantined_inference_slots) >= self.max_inference_processes
 
     def is_safety_pool_unrecoverable(self) -> bool:
         """Return whether the safety pool is crash-looping and not currently ready."""
+        if self._safety_starts_backing_off():
+            return False
         return self._process_lifecycle.safety_pool_failing and not self.is_safety_pool_ready()
 
     def inference_slot_owns_job(self, job_id: GenerationID) -> bool:
@@ -437,6 +459,7 @@ class WorkerRecoveryCoordinator:
             self._inference_scheduler.whole_card_residency_grace_active()
             or self._inference_scheduler.heavy_head_load_grace_active()
             or self._inference_scheduler.ram_reclaim_cycle_grace_active()
+            or self._inference_starts_backing_off()
         ):
             structural_queue_wedge = False
         if structural_queue_wedge and self._process_map.has_inference_in_progress():
