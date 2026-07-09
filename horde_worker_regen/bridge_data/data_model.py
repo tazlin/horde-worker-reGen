@@ -659,6 +659,10 @@ class reGenBridgeData(CombinedHordeBridgeData):
     enable_pipeline_disaggregation: bool = Field(default=False)
     """Run eligible jobs as a disaggregated pipeline (text-encode service + UNet-only samplers + image lane).
 
+    Temporarily forced off by validation even when a config file or environment variable sets it true. The
+    field remains in the model so existing config files keep loading and the pipeline can be re-enabled later
+    without a config-schema break.
+
     When true, a job is split into stages that run in separate processes exchanging small activations
     rather than one process running the whole job: a dedicated text-encode service produces the
     conditioning, UNet-only samplers produce latents, and the image lane VAE-decodes (and post-processes).
@@ -946,6 +950,16 @@ class reGenBridgeData(CombinedHordeBridgeData):
             log=True,
         )
 
+        return self
+
+    @model_validator(mode="after")
+    def disable_pipeline_disaggregation(self) -> Self:
+        """Keep the disaggregated pipeline unavailable while preserving the config field."""
+        if self.enable_pipeline_disaggregation:
+            logger.warning(
+                "Pipeline disaggregation is temporarily disabled; ignoring enable_pipeline_disaggregation=true.",
+            )
+            self.enable_pipeline_disaggregation = False
         return self
 
     @model_validator(mode="after")

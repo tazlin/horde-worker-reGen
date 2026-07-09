@@ -156,6 +156,13 @@ def test_template_matches_ram_safety_defaults() -> None:
     assert parsed.ram_per_process_max_mb == 18432
 
 
+def test_pipeline_disaggregation_config_is_forced_off() -> None:
+    """The disaggregation flag remains accepted but cannot enable the pipeline from config."""
+    bridge_data = reGenBridgeData.model_validate({"enable_pipeline_disaggregation": True})
+
+    assert bridge_data.enable_pipeline_disaggregation is False
+
+
 def test_bridge_data_loader_yaml_template() -> None:
     """Test that the bridge data template file can be loaded and parsed by a BridgeDataLoader.
 

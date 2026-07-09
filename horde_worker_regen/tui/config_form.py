@@ -61,6 +61,8 @@ class FieldKind(enum.StrEnum):
     """A models_to_load/skip list, edited via the dedicated model-list control."""
     SELECT_MULTI = "select_multi"
     """A fixed set of multi-selectable string choices (e.g. alchemy forms)."""
+    YAML = "yaml"
+    """A raw YAML value edited in a text area and parsed on save."""
 
 
 # Sentinel for "no explicit default declared" so that a legitimate falsy explicit default
@@ -106,6 +108,14 @@ class ConfigField:
     non-minimum number, which would mislead the operator. Enforced against the model by
     ``tests/tui/test_config_form_defaults.py``.
     """
+    hidden: bool = False
+    """Whether the field stays in the catalog but is omitted from the operator-facing editor."""
+    risk_level: str = "normal"
+    """Operator-facing risk tier: normal, advanced, or dangerous."""
+    preset_category: str = ""
+    """Category used by preset previews when this field is changed."""
+    yaml_only_reason: str = ""
+    """Why a meaningful config field remains YAML-only or hidden."""
 
     def default(self) -> Any:  # noqa: ANN401 - heterogeneous defaults by kind
         """The value used when the key is absent from the file."""
@@ -119,6 +129,8 @@ class ConfigField:
             return int(self.minimum) if self.minimum is not None else 0
         if self.kind in (FieldKind.STR_LIST, FieldKind.MODEL_LIST, FieldKind.SELECT_MULTI):
             return []
+        if self.kind is FieldKind.YAML:
+            return []
         if self.kind is FieldKind.SELECT and self.choices:
             return self.choices[0]
         return ""
@@ -128,6 +140,8 @@ class ConfigField:
 SECTIONS = (
     "Connection",
     "Identity",
+    "Roles",
+    "Workload policy",
     "Throughput",
     "Memory & performance",
     "Content & safety",
@@ -136,6 +150,7 @@ SECTIONS = (
     "Models",
     "Model downloads",
     "Alchemist",
+    "Logs",
     "Timeouts",
     "Retry & scheduling",
     "VRAM budget",
@@ -151,18 +166,16 @@ SECTIONS = (
 # Sub-tab grouping for the config editor: each tab bundles related sections so no single page
 # requires long scrolling. Order is the tab order; "Models" is its own tab (the unified panel).
 CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Essentials", ("Connection", "Identity")),
-    ("Models", ("Models", "Model downloads")),
-    ("Performance", ("Throughput", "Memory & performance")),
+    ("Essentials", ("Connection", "Identity", "Roles")),
+    ("Workload", ("Models", "Workload policy")),
+    ("Throughput", ("Throughput", "Memory & performance")),
     ("Content", ("Content & safety",)),
     ("Features", ("Features",)),
-    # LoRA and Alchemy are logically distinct concerns (one is an image-job feature, the other a separate
-    # worker role), so each gets its own sub-tab rather than sharing a crowded combined page.
-    ("LoRA", ("LoRA",)),
+    ("LoRA & Downloads", ("LoRA", "Model downloads")),
     ("Alchemy", ("Alchemist",)),
     ("Timeouts", ("Timeouts", "Retry & scheduling")),
     (
-        "Budget",
+        "Advanced",
         (
             "VRAM budget",
             "Post-processing budget",
@@ -170,9 +183,10 @@ CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "Unservable model breaker",
             "Self-maintenance",
             "GPU sampling lease",
+            "Logs",
+            "Other",
         ),
     ),
-    ("Advanced", ("Other",)),
     # ("Developer", ("Dry-run",)),
 )
 
@@ -190,9 +204,12 @@ SECTION_GUIDANCE: dict[str, str] = {
     "its prerequisite has no effect.",
     "Models": "Edit the load/skip rules below; the panel previews exactly which models will load and "
     "their disk cost. Press Resolve to expand 'top N' / 'bottom N' commands (needs usage stats).",
+    "Workload policy": "These switches shape the model set produced by the load/skip rules. Presets may replace "
+    "the model list; review the preset diff before saving.",
     "Model downloads": "Controls background download behaviour. The Downloads tab provides a live pause/resume "
     "toggle; downloads_paused here sets the default at worker startup.",
-    "LoRA": "Allowing LoRA downloads them on demand; set a civitai_api_token for resources that require it.",
+    "LoRA": "Offering LoRA jobs downloads resources on demand and requires a CivitAI API token. Without a token, "
+    "the editor blocks saving LoRA on because many LoRAs and popular checkpoints cannot be fetched.",
     "Alchemist": "Alchemy is a separate worker role (interrogation / post-processing), distinct from LoRA. "
     "Enabling it serves alchemy jobs alongside (or instead of) image generation.",
     "Timeouts": "ADVANCED - most users should leave every field on this tab at its default. "
@@ -211,6 +228,7 @@ SECTION_GUIDANCE: dict[str, str] = {
     "GPU sampling lease": "The lease serializes denoising loops so spare processes can stage their next pipeline "
     "in parallel. Counterproductive with unload_models_from_vram_often (no staged residency to overlap). "
     "Changes to these fields require a worker restart.",
+    "Logs": "Automatic log cleanup runs at startup only. Set both values to 0 to keep logs indefinitely.",
     "Dry-run": "Testing flags that skip real GPU work. All fields here require a worker restart. "
     "Do not enable these on a production worker.",
 }
@@ -231,9 +249,10 @@ CONFIG_FIELDS: list[ConfigField] = [
         "horde_url",
         "Horde URL",
         FieldKind.STR,
-        "Other",
+        "Connection",
         "The horde API base URL. Leave default unless using a custom horde.",
         requires_restart=True,
+        risk_level="advanced",
     ),
     ConfigField(
         "priority_usernames",
@@ -254,20 +273,21 @@ CONFIG_FIELDS: list[ConfigField] = [
     # Throughput
     ConfigField(
         "max_threads",
-        "Max threads",
+        "Concurrent image jobs",
         FieldKind.INT,
         "Throughput",
-        "Parallel jobs. Only high-end cards benefit; keep at 1 for xx60/xx70 or 20xx and older.",
+        "max_threads: image jobs that may sample at the same time. Each one spawns a full inference process.",
         requires_restart=True,
         minimum=1,
         maximum=16,
     ),
     ConfigField(
         "queue_size",
-        "Queue size",
+        "Preload queue slots",
         FieldKind.INT,
         "Throughput",
-        "Extra jobs buffered. Increases system RAM use significantly; 0–1 for ≤32 GB RAM.",
+        "queue_size: extra jobs held locally so another can start as soon as a sampler frees. Each slot "
+        "spawns another full inference process.",
         requires_restart=True,
         minimum=0,
         maximum=4,
@@ -275,7 +295,7 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         "max_batch",
-        "Max batch",
+        "Max batch size",
         FieldKind.INT,
         "Throughput",
         "Images per batched request. Ensure you can make max_batch at half your max_power.",
@@ -284,7 +304,7 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         "max_power",
-        "Max power",
+        "Max resolution",
         FieldKind.INT,
         "Throughput",
         "Max resolution = 64*64*8*max_power px (8=512², 32=1024²). Higher needs more VRAM.",
@@ -400,7 +420,7 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         "allow_img2img",
-        "Allow img2img",
+        "Offer img2img jobs",
         FieldKind.BOOL,
         "Features",
         "Accept jobs that supply a source image.",
@@ -408,21 +428,21 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         "allow_painting",
-        "Allow inpainting",
+        "Offer inpainting jobs",
         FieldKind.BOOL,
         "Features",
         "Accept inpainting jobs (forced off if img2img is off).",
     ),
     ConfigField(
         "allow_post_processing",
-        "Allow post-processing",
+        "Offer post-processing jobs",
         FieldKind.BOOL,
         "Features",
         "Accept upscaling / face-fixing / other post-gen features.",
     ),
     ConfigField(
         "dedicated_post_processing",
-        "Dedicated post-processing lane",
+        "Post-processing lane mode",
         FieldKind.SELECT,
         "Features",
         "Whether to run the dedicated post-processing lane: auto follows served work, on always runs it, "
@@ -435,10 +455,11 @@ CONFIG_FIELDS: list[ConfigField] = [
         "enable_pipeline_disaggregation",
         "Pipeline disaggregation",
         FieldKind.BOOL,
-        "Features",
+        "Other",
         "Run eligible SD1.5/SDXL jobs as text-encode + UNet-sample + VAE-decode stages. Experimental; "
-        "requires restart so the component and VAE lane processes are started.",
+        "temporarily disabled and ignored by the worker even when set in YAML or environment config.",
         requires_restart=True,
+        hidden=True,
     ),
     ConfigField(
         "allow_controlnet",
@@ -466,7 +487,7 @@ CONFIG_FIELDS: list[ConfigField] = [
     # LoRA
     ConfigField(
         "allow_lora",
-        "Allow LoRA",
+        "Offer LoRA jobs",
         FieldKind.BOOL,
         "LoRA",
         "Accept LoRA jobs. Downloads on demand; set a civitai_api_token. Needs fast internet.",
@@ -526,19 +547,37 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         "load_large_models",
-        "Load large models",
+        "Include very large models in TOP/ALL",
         FieldKind.BOOL,
         "Models",
         "Include Flux/Cascade in ALL/TOP meta commands (otherwise excluded by size).",
     ),
     ConfigField(
         "only_models_on_disk",
-        "Only models on disk",
+        "Only offer downloaded models",
         FieldKind.BOOL,
         "Models",
         "Only offer models already downloaded; any resolved model not on disk is dropped, never fetched.",
     ),
+    ConfigField(
+        "custom_models",
+        "Custom models",
+        FieldKind.YAML,
+        "Workload policy",
+        "Optional YAML list of custom model records. Each entry needs name, baseline, and filepath.",
+        requires_restart=True,
+        risk_level="advanced",
+        explicit_default=[],
+    ),
     # Model downloads
+    ConfigField(
+        "cache_home",
+        "Models folder",
+        FieldKind.STR,
+        "Model downloads",
+        "Where models are stored. Leave blank to use the installer/data-dir default.",
+        requires_restart=True,
+    ),
     ConfigField(
         "downloads_paused",
         "Pause downloads",
@@ -606,7 +645,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         "dreamer",
         "Enable dreamer (image generation)",
         FieldKind.BOOL,
-        "Essentials",
+        "Roles",
         "Serve image-generation jobs. Turn this off (with alchemist on) to run an alchemist-only worker; "
         "a CPU-only install is always alchemist-only regardless.",
         requires_restart=True,
@@ -1121,6 +1160,29 @@ CONFIG_FIELDS: list[ConfigField] = [
         unit="s",
         explicit_default=30,
     ),
+    # Logs
+    ConfigField(
+        "log_purge_max_age_days",
+        "Log max age",
+        FieldKind.FLOAT,
+        "Logs",
+        "Delete worker log files older than this many days at startup. 0 disables the age limit.",
+        minimum=0.0,
+        maximum=3650.0,
+        unit="days",
+        explicit_default=30.0,
+    ),
+    ConfigField(
+        "log_purge_max_total_gb",
+        "Log max total size",
+        FieldKind.FLOAT,
+        "Logs",
+        "After age cleanup, delete oldest worker logs until logs/ is under this many GB. 0 disables the size cap.",
+        minimum=0.0,
+        maximum=1024.0,
+        unit="GB",
+        explicit_default=5.0,
+    ),
     # ConfigField(
     #     "capture_kudos_training_data",
     #     "Capture kudos training data",
@@ -1135,9 +1197,6 @@ CONFIG_FIELDS: list[ConfigField] = [
     #     "Other",
     #     "File path to write kudos training data (only used when capture is enabled).",
     # ),
-    ConfigField(
-        "cache_home", "Models folder", FieldKind.STR, "Other", "Where models are stored.", requires_restart=True
-    ),
     # Dry-run
     ConfigField(
         "dry_run_skip_inference",
@@ -1475,7 +1534,7 @@ def save_config(data: Any, path: Path = DEFAULT_CONFIG_PATH) -> None:  # noqa: A
     tmp.replace(path)
 
 
-def coerce_value(field: ConfigField, raw: object) -> bool | int | float | str | list[str] | None:
+def coerce_value(field: ConfigField, raw: object) -> object:
     """Convert a widget value into the typed value for the YAML, raising ValueError on bad input."""
     value: bool | int | float | str | list[str] | None
     if field.kind is FieldKind.BOOL:
@@ -1509,6 +1568,26 @@ def coerce_value(field: ConfigField, raw: object) -> bool | int | float | str | 
             choices = ", ".join(field.choices)
             raise ValueError(f"{field.label} must be one of: {choices}")
         return value
+    if field.kind is FieldKind.YAML:
+        text = str(raw).strip()
+        if not text:
+            return []
+        try:
+            parsed = _yaml().load(text)
+        except Exception as error:
+            raise ValueError(f"{field.label} must be valid YAML") from error
+        if field.key == "custom_models":
+            if parsed is None:
+                return []
+            if not isinstance(parsed, list):
+                raise ValueError("Custom models must be a YAML list")
+            for index, item in enumerate(parsed, start=1):
+                if not isinstance(item, dict):
+                    raise ValueError(f"Custom model #{index} must be a mapping")
+                for required in ("name", "baseline", "filepath"):
+                    if not str(item.get(required) or "").strip():
+                        raise ValueError(f"Custom model #{index} must include {required}")
+        return parsed
     return str(raw)
 
 
@@ -1571,6 +1650,17 @@ def current_value(field: ConfigField, data: Any) -> Any:  # noqa: ANN401 - kind-
     ):
         return [str(value)]
     return value
+
+
+def format_yaml_value(value: object) -> str:
+    """Render a value into a compact YAML block for YAML text-area fields."""
+    if value in (None, [], {}):
+        return ""
+    import io
+
+    buffer = io.StringIO()
+    _yaml().dump(value, buffer)
+    return buffer.getvalue().strip()
 
 
 # ---------------------------------------------------------------------------------------------------

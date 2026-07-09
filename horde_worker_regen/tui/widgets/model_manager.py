@@ -15,7 +15,7 @@ from rich.console import Group, RenderableType
 from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.timer import Timer
 from textual.widgets import Button, Label, Static, Switch
 
@@ -52,6 +52,12 @@ class ModelManagerView(Vertical):
     DEFAULT_CSS = """
     ModelManagerView {
         height: auto;
+        align-horizontal: center;
+    }
+    ModelManagerView #mm-workspace {
+        width: 100%;
+        max-width: 124;
+        height: auto;
     }
     ModelManagerView #mm-headline {
         height: auto;
@@ -80,10 +86,27 @@ class ModelManagerView(Vertical):
         content-align: left middle;
         height: 3;
     }
+    ModelManagerView #mm-rules-grid {
+        height: auto;
+        width: 100%;
+        layout: grid;
+        grid-size: 2;
+        grid-gutter: 0 2;
+    }
+    ModelManagerView .mm-rule-card {
+        width: 1fr;
+        height: auto;
+        padding-right: 1;
+    }
     ModelManagerView .mm-rules-label {
         color: $accent;
         text-style: bold;
         padding: 1 1 0 1;
+    }
+    ModelManagerView .mm-rules-help {
+        color: $text-muted;
+        padding: 0 1 1 1;
+        height: auto;
     }
     ModelManagerView #mm-large-row, ModelManagerView #mm-ondisk-row {
         height: 3;
@@ -121,30 +144,55 @@ class ModelManagerView(Vertical):
 
     def compose(self) -> ComposeResult:
         """Lay out the preview, the Resolve control, the two rule editors, and the large-models switch."""
-        yield Static(id="mm-headline")
-        yield VerticalScroll(Static(id="mm-effective-body"), id="mm-effective")
-        yield Static(id="mm-warnings")
-        with Horizontal(id="mm-resolve-row"):
-            yield Button("Resolve ⟳", id="mm-resolve", variant="primary")
-            yield Static(id="mm-resolve-status")
-        yield Label("LOAD RULES  ·  models and meta commands to offer", classes="mm-rules-label")
-        yield ModelListEditor("models_to_load", self._load_values, sibling_values=self._skip_editor_values)
-        yield Label("SKIP RULES  ·  only remove from the set above (never add back)", classes="mm-rules-label")
-        yield ModelListEditor("models_to_skip", self._skip_values, sibling_values=self._load_editor_values)
-        with Horizontal(id="mm-large-row"):
-            yield Label("Include large models (Flux, Cascade) in 'all' / 'top' commands")
-            yield Switch(value=self._load_large, id="cfg-load_large_models")
-        with Horizontal(id="mm-ondisk-row"):
-            yield Label("Only models already on disk (never download; drop the rest)")
-            yield Switch(value=self._only_on_disk, id="cfg-only_models_on_disk")
+        with Vertical(id="mm-workspace"):
+            yield Static(id="mm-headline")
+            yield VerticalScroll(Static(id="mm-effective-body"), id="mm-effective")
+            yield Static(id="mm-warnings")
+            with Horizontal(id="mm-resolve-row"):
+                yield Button("Resolve ⟳", id="mm-resolve", variant="primary")
+                yield Static(id="mm-resolve-status")
+            with Grid(id="mm-rules-grid"):
+                with Vertical(classes="mm-rule-card"):
+                    yield Label("Offer list", classes="mm-rules-label")
+                    yield Static(
+                        "Start here. Add exact model names or meta rules such as TOP 2 / ALL SDXL. "
+                        "If this list is empty, the worker behaves as TOP 2.",
+                        classes="mm-rules-help",
+                    )
+                    yield ModelListEditor("models_to_load", self._load_values, sibling_values=self._skip_editor_values)
+                with Vertical(classes="mm-rule-card"):
+                    yield Label("Exclusion list", classes="mm-rules-label")
+                    yield Static(
+                        "Subtract only. Entries here remove matches from the offer list above; they never add "
+                        "replacement models back into TOP / ALL results.",
+                        classes="mm-rules-help",
+                    )
+                    yield ModelListEditor("models_to_skip", self._skip_values, sibling_values=self._load_editor_values)
+            with Horizontal(id="mm-large-row"):
+                yield Label("Include large models (Flux, Cascade) in 'all' / 'top' commands")
+                yield Switch(value=self._load_large, id="cfg-load_large_models")
+            with Horizontal(id="mm-ondisk-row"):
+                yield Label("Only models already on disk (never download; drop the rest)")
+                yield Switch(value=self._only_on_disk, id="cfg-only_models_on_disk")
 
     def on_mount(self) -> None:
         """Render the initial hint, then adopt the catalog from the shared cache (warmed at startup)."""
+        self._apply_rule_columns()
         self._recompute()
         self._adopt_from_cache()
         if self._catalog is None:
             # The startup warm may still be in flight; poll the cache and adopt it the moment it lands.
             self._catalog_poll = self.set_interval(0.5, self._adopt_from_cache)
+
+    def on_resize(self) -> None:
+        """Keep the rule editors readable on narrow terminals and compact on wide ones."""
+        self._apply_rule_columns()
+
+    def _apply_rule_columns(self) -> None:
+        """Use two rule columns only when each column has enough space for its controls."""
+        with contextlib.suppress(Exception):
+            grid = self.query_one("#mm-rules-grid", Grid)
+            grid.styles.grid_size_columns = 2 if self.size.width >= 104 else 1
 
     def update_worker_models(self, active_models: list[str]) -> None:
         """Note how many models a running worker currently has loaded (None/empty clears the note)."""

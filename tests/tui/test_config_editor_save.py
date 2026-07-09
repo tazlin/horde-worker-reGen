@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Input, Select, Switch, TabbedContent
+from textual.widgets import Button, Input, Select, Switch, TabbedContent
 
 from horde_worker_regen.tui.config_form import load_config
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
@@ -148,17 +148,37 @@ async def test_save_succeeds_with_unrendered_dry_run_field_present(tmp_path: Pat
 
 
 @pytest.mark.e2e
+async def test_save_succeeds_with_hidden_advanced_field_present(tmp_path: Path) -> None:
+    """A hidden catalogued field in a rendered section is preserved without a widget."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "n"\nmax_threads: 1\nenable_pipeline_disaggregation: true\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        assert not editor.query("#cfg-enable_pipeline_disaggregation")
+        editor.query_one("#cfg-max_threads", Input).value = "4"
+        assert editor._save() is True
+        await pilot.pause()
+
+    reloaded = load_config(path)
+    assert reloaded["max_threads"] == 4
+    assert reloaded["enable_pipeline_disaggregation"] is True
+
+
+@pytest.mark.e2e
 async def test_invalid_edit_reports_error_and_jumps_to_offending_tab(tmp_path: Path) -> None:
     """Editing a field to an invalid value blocks the save and surfaces it on that field's sub-tab."""
     app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "n"\n')
     async with app.run_test() as pilot:
         editor = app.query_one(ConfigEditorView)
         await pilot.pause()
-        # max_lora_cache_size lives on the LoRA sub-tab; 5 is below its minimum of 10.
+        # max_lora_cache_size lives on the LoRA & Downloads sub-tab; 5 is below its minimum of 10.
         editor.query_one("#cfg-max_lora_cache_size", Input).value = "5"
         assert editor._save() is False
         await pilot.pause()
-        assert editor.query_one("#config-subtabs", TabbedContent).active == "cfgtab-lora"
+        assert editor.query_one("#config-subtabs", TabbedContent).active == "cfgtab-lora-downloads"
 
 
 @pytest.mark.e2e
@@ -242,6 +262,92 @@ async def test_valid_identity_names_save(tmp_path: Path) -> None:
         await pilot.pause()
 
     assert load_config(path)["dreamer_name"] == "My Unique Worker"
+
+
+@pytest.mark.e2e
+async def test_interlock_validation_blocks_save_without_worker(tmp_path: Path) -> None:
+    """Interlocked settings are rejected by the editor before the worker validates the file."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "Good Name"\nallow_img2img: true\nallow_painting: true\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor.query_one("#cfg-allow_img2img", Switch).value = False
+        assert editor._save() is False
+        await pilot.pause()
+        assert editor.query_one("#config-subtabs", TabbedContent).active == "cfgtab-features"
+
+
+@pytest.mark.e2e
+async def test_preset_changes_apply_to_live_form_before_save(tmp_path: Path) -> None:
+    """Preset application updates widgets but still requires an explicit save."""
+    app, path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "Good Name"\nmax_threads: 1\nqueue_size: 1\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        editor._apply_preset_changes(
+            {
+                "queue_size": 0,
+                "max_power": 32,
+                "models_to_load": ["Deliberate"],
+                "load_large_models": False,
+            }
+        )
+        await pilot.pause()
+        assert editor.query_one("#cfg-queue_size", Input).value == "0"
+        assert editor.query_one("#cfg-max_power", Input).value == "32"
+        assert load_config(path)["queue_size"] == 1
+        assert editor._save() is True
+
+    reloaded = load_config(path)
+    assert reloaded["queue_size"] == 0
+    assert reloaded["max_power"] == 32
+    assert list(reloaded["models_to_load"]) == ["Deliberate"]
+
+
+@pytest.mark.e2e
+async def test_optional_sampling_lease_slots_can_be_cleared(tmp_path: Path) -> None:
+    """The form accepts a blank sampling-lease slot count, meaning it tracks max_threads."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "Good Name"\ngpu_sampling_lease_slots: 2\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        field = editor.query_one("#cfg-gpu_sampling_lease_slots", Input)
+        assert field.type == "text"
+        field.value = ""
+        assert editor._save() is True
+        await pilot.pause()
+
+    assert load_config(path)["gpu_sampling_lease_slots"] is None
+
+
+@pytest.mark.e2e
+async def test_action_bar_separates_presets_and_highlights_restart_edits(tmp_path: Path) -> None:
+    """Apply preset is visually neutral/separate; restart is emphasized only for restart-locked edits."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "Good Name"\nmax_threads: 1\nmax_batch: 1\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        assert editor.query_one("#config-save", Button).variant == "success"
+        assert editor.query_one("#config-preset", Button).variant == "default"
+        assert editor.query_one("#config-actions-separator") is not None
+        assert editor.query_one("#config-restart", Button).variant == "default"
+
+        editor.query_one("#cfg-max_batch", Input).value = "2"
+        await pilot.pause()
+        assert editor.query_one("#config-restart", Button).variant == "default"
+
+        editor.query_one("#cfg-max_threads", Input).value = "2"
+        await pilot.pause()
+        assert editor.query_one("#config-restart", Button).variant == "warning"
 
 
 @pytest.mark.e2e

@@ -17,8 +17,15 @@ If you are setting up by hand:
 
 ## Starting points by GPU
 
-Pick the block closest to your card and adjust from there. The benchmark (on the dashboard's
-**Benchmark** tab, or `horde-benchmark ramp`) can suggest values tuned to your actual machine.
+In the dashboard, open **Config** and use **Apply preset** for the closest built-in starting point.
+The preset dialog shows every setting it would change and lets you uncheck individual settings before
+they are applied to the form; you still need to press **Save** to write the file. Current built-ins
+cover a 4090/64 GB SDXL-balanced worker, a 4090/64 GB large-model worker, a 2080/32 GB SD1.5-safe
+worker, and a midrange 12-16 GB VRAM worker.
+
+If you are editing YAML by hand, pick the block closest to your card and adjust from there. The
+benchmark (on the dashboard's **Benchmark** tab, or `horde-benchmark ramp`) can suggest values tuned
+to your actual machine.
 
 ### 24 GB+ VRAM (RTX 3090, 4090)
 

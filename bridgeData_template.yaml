@@ -3,6 +3,11 @@
 # !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!
 # See also the readme's "Suggested settings" section for recommended settings.    !!!
 # !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!  !!!
+#
+# The dashboard Config tab is the safest way to edit this file. It groups everyday
+# settings separately from advanced ones, previews the process count implied by
+# max_threads + queue_size, validates interlocked options before save, and can apply
+# hardware presets while letting you opt out of each individual setting change.
 
 # The Horde URL. Do not change this unless you are using a custom Horde.
 horde_url: "https://aihorde.net/api/"
@@ -15,7 +20,7 @@ api_key: "0000000000"
 # The owner's username is always included, so you don't need to add it here if you use the key specified in `api_key` for requests.
 priority_usernames: []
 
-# The maximum number of parallel jobs to run at the same time.
+# Concurrent image jobs: the maximum number of image jobs admitted to sampling at the same time.
 # Only high-end cards (e.g., 3080 or better) benefit from this setting.
 # If you have a 20xx or earlier, or a xx60/xx70, do not change this setting from 1.
 # Cost: each extra thread spawns a whole additional inference process. That process holds a full inference
@@ -30,7 +35,7 @@ max_threads: 1
 #   12GB-16GB VRAM: 1
 #   8GB-10GB VRAM: 1
 
-# Number of extra requests to keep in the queue to start working as soon as a thread is available.
+# Preload queue slots: extra jobs/models kept ready so a slot can start quickly.
 # Generally should be 1 or 2. Never set this higher than 2 if your max_threads is 2.
 # Cost: like max_threads, each queue slot spawns an additional inference process, so it carries the same full
 # per-context VRAM and system RAM cost described above (multiple GB each), not a small fixed reservation. Close
@@ -45,7 +50,7 @@ queue_size: 1
 #   <32gb system RAM: 0
 
 
-# Number of jobs to pull per request and perform batched inference.
+# Max batch size: number of images in one sampled batch.
 # More optimized than doing them one by one but slower.
 # Ensure you can generate your max_batch at half your max_power.
 max_batch: 1
@@ -68,7 +73,8 @@ safety_on_gpu: false
 # fixed, budgetable VRAM footprint and avoids reloading the models per job.
 #   auto: run the lane whenever post-processing is allowed (recommended)
 #   on:   always run the lane
-#   off:  disable the lane; the worker will not offer post-processing at all
+#   off:  disable the lane; allow_post_processing must also be false because this worker has no place
+#         to run post-processing jobs
 dedicated_post_processing: auto
 
 # Only pick up jobs where the user has the required kudos upfront.
@@ -106,7 +112,7 @@ log_purge_max_total_gb: 5
 # If you get the error `Wrong credentials to submit as this worker.`, try changing this name, someone else is already using it.
 dreamer_name: "An Awesome Dreamer"
 
-# Max resolution (max pixels) supported.
+# Max resolution: the largest total pixel count this worker will accept.
 # Formula: `64 * 64 * 8 * max_power` (total pixels)
 # Examples:
 # 8  = 512x512
@@ -154,37 +160,38 @@ censor_nsfw: false
 # List of words to always censor, even if `nsfw` is true.
 censorlist: []
 
-# Accept jobs using a user-supplied image.
+# Offer img2img jobs using a user-supplied image.
 allow_img2img: true
 
-# Accept jobs using a user-supplied image and an inpainting-specific model.
-# Forced to false if `allow_img2img` is false.
+# Offer inpainting jobs using a user-supplied image and an inpainting-specific model.
+# Requires `allow_img2img: true`.
 allow_painting: true
 
 # Allow user requests from behind VPNs.
 # Note: The worker does not directly interact with user IPs - it only interacts with the StableHorde API.
 allow_unsafe_ip: true
 
-# Allow upscaling, facefixer, and other post-generation features.
+# Offer post-processing jobs (upscalers, face-fixers, background removal).
+# Requires `dedicated_post_processing` to be `auto` or `on`; setting the lane to `off`
+# disables post-processing service for this worker.
 allow_post_processing: true
 # 8GB-10GB VRAM: false (if offering SDXL or Flux, otherwise true)
 
-# Allow ControlNet jobs.
+# Offer ControlNet jobs.
 # Note: Additional RAM/VRAM overhead. Low VRAM cards (<6GB) should be cautious.
 allow_controlnet: false
 
-# Allow SDXL jobs with high memory add-ons like ControlNet or transparency.
+# Offer SDXL jobs with high memory add-ons like ControlNet or transparency.
 # Note: Significant additional RAM/VRAM overhead. Medium VRAM cards (<12GB) should be cautious.
-# Note that if this is true, allow_controlnet must also be true.
+# Requires `allow_controlnet: true`.
 allow_sdxl_controlnet: false
 # 16GB+ VRAM: true
 # 8GB-10GB VRAM: false
 
-# Allow LoRas to be used. Requires a fast internet connection.
+# Offer LoRA jobs. Requires a fast internet connection and a `civitai_api_token`.
 # LoRas will be downloaded on demand. `max_lora_cache_size` controls how many gigabytes to keep downloaded.
 # 5GB of preselected LoRas are always downloaded the first time you start the worker with this setting.
 # Note that there can be a significant delay when downloading LoRas causing GPU downtime.
-# If you set this, we strongly recommend setting `civitai_api_token` as well.
 allow_lora: false
 
 # If set, this worker will use this civitai API token when downloading any resources from civitai.
@@ -279,7 +286,8 @@ disable_disk_cache: false # Currently unused in reGen
 #
 # The official model reference (in JSON format) is at https://github.com/Haidra-Org/AI-Horde-image-model-reference/blob/main/stable_diffusion.json.
 # The model name must match the name in the model reference or be a magic constant.
-# If you use `TOP` or `ALL` load commands, you should set a `civitai_api_token`. See that configuration entry for more information.
+# If you use `TOP` or `ALL` load commands, set a `civitai_api_token`; many popular models require it
+# and the Config tab blocks saving meta-load rules without one.
 #
 # SD15 models are generally 1-2GB each, SD21 models are generally 5-37B each, and SDXL models are generally 7B each.
 # Flux.1-Schnell fp8 (Compact) is 17GB, and Cascade is 14gb total.
@@ -381,7 +389,7 @@ branded_model: true
 #   dreamer: true,  alchemist: false  -> image generation only (the default)
 #   dreamer: true,  alchemist: true   -> both image generation and alchemy
 #   dreamer: false, alchemist: true   -> alchemy only (one inference process for graph forms)
-#   dreamer: false, alchemist: false  -> nothing to serve (a warning is logged)
+#   dreamer: false, alchemist: false  -> nothing to serve (the Config tab blocks this combination)
 # A CPU-only install cannot serve image generation regardless of this flag, so it always runs
 # alchemist-only there.
 dreamer: true

@@ -2,6 +2,7 @@
 
 - [Bridge Configuration](#bridge-configuration)
     - [How configuration loads](#how-configuration-loads)
+    - [Config tab save checks and presets](#config-tab-save-checks-and-presets)
     - [Critical sections](#critical-sections)
         - [Image models and model stickiness](#image-models-and-model-stickiness)
         - [Queue sizing](#queue-sizing)
@@ -10,6 +11,7 @@
         - [Very fast disk mode](#very-fast-disk-mode)
         - [Custom models](#custom-models)
         - [Post-processing overlap](#post-processing-overlap)
+        - [Dormant experimental flags](#dormant-experimental-flags)
         - [Alchemy](#alchemy)
     - [Configuration flow at a glance](#configuration-flow-at-a-glance)
     - [See also](#see-also)
@@ -48,6 +50,31 @@ variables and restart the worker to apply them. This reflects the typical use
 case of env var config (e.g. Docker), where dynamic updates are less common and
 file-watching would add complexity for little benefit. Operators who want live
 config changes should run from `bridgeData.yaml` rather than environment variables.
+
+## Config tab save checks and presets
+
+The dashboard's **Config** tab is the preferred editor for operator-facing
+settings. It keeps advanced and restart-locked fields away from the everyday
+pages, preserves comments and untouched YAML keys, and shows a live process-count
+preview for the throughput levers (`max_threads`, `queue_size`, and the model
+set). A plain **Save** writes only fields that actually changed; **Save + restart
+worker** is only needed for fields marked with the restart marker.
+
+Before writing the file, the editor runs import-light interlock checks so
+configuration mistakes are caught even when no worker process is running. Errors
+block the save and jump to the relevant tab; warnings allow the save but are
+shown in the status line. The guarded combinations include inpainting without
+img2img, SDXL ControlNet without ControlNet, post-processing enabled while the
+post-processing lane is off, LoRA or `TOP`/`ALL` model rules without a CivitAI
+token, both worker roles disabled, extra-slow mode combined with incompatible
+throughput settings, and exact model names present in both load and skip lists.
+
+The **Apply preset** action offers built-in hardware starting points (for example
+4090/64 GB SDXL balanced, 4090/64 GB large-model, 2080/32 GB SD1.5-safe, and
+midrange 12-16 GB balanced). Applying a preset does not save immediately. The
+operator sees every setting the preset would change, each change is individually
+checkable, and changes such as enabling LoRA are left unchecked when their
+precondition (a CivitAI token) is missing.
 
 ## Critical sections
 
@@ -234,6 +261,15 @@ the other self-protective throttles. The same session-latched suppression is
 used when a whole-card model cannot fit beside even the post-processing lane's
 bare GPU context; in that case the worker logs an operator warning and the TUI
 health view shows post-processing as disabled until restart.
+
+### Dormant experimental flags
+
+`enable_pipeline_disaggregation` is currently accepted for config compatibility
+but forced off during `reGenBridgeData` validation. Setting it in
+`bridgeData.yaml` or through `AIWORKER_REGEN_ENABLE_PIPELINE_DISAGGREGATION`
+does not start the component/VAE lane processes or route jobs through the
+disaggregated path. The config editor keeps the field in the Advanced catalog
+but hides it until the pipeline is ready to expose again.
 
 ### Alchemy
 

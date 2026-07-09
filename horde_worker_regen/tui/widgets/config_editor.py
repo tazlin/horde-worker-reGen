@@ -31,8 +31,6 @@ from horde_worker_regen.tui.config_form import (
     CONFIG_FIELDS,
     CONFIG_SUBTABS,
     DEFAULT_CONFIG_PATH,
-    GPU_GLOBAL_FIELDS,
-    GPU_OVERRIDE_FIELDS,
     MODELS_TO_LOAD_KEY,
     MODELS_TO_SKIP_KEY,
     SECTION_GUIDANCE,
@@ -42,11 +40,14 @@ from horde_worker_regen.tui.config_form import (
     current_value,
     describe_process_plan,
     format_number,
+    format_yaml_value,
     load_config,
     read_gpu_device_indices,
     save_config,
     validate_identity_names,
 )
+from horde_worker_regen.tui.config_presets import BUILT_IN_PRESETS, ConfigPreset, PresetChange, diff_preset
+from horde_worker_regen.tui.config_validation import ConfigValidationSeverity, validate_config_interlocks
 from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
 from horde_worker_regen.tui.widgets.model_list_editor import ModelListEditor
 from horde_worker_regen.tui.widgets.model_manager import ModelManagerView
@@ -64,9 +65,6 @@ _PROCESS_PREVIEW_ID = "config-process-preview"
 # composed from flat ConfigFields (it edits the nested gpu_overrides block, not top-level keys).
 _GPU_SUBTAB_LABEL = "Per-GPU"
 _GPU_SUBTAB_ID = "cfgtab-per-gpu"
-# Field keys owned by the Per-GPU sub-tab, so a validation error routes there rather than to a flat tab
-# that happens to share a section name (e.g. "Features").
-_GPU_FIELD_KEYS = {field.key for field in (*GPU_GLOBAL_FIELDS, *GPU_OVERRIDE_FIELDS)}
 
 # Which sub-tab a section lives on, so a validation error can name (and jump to) the right page.
 _SECTION_TO_SUBTAB: dict[str, str] = {section: label for label, sections in CONFIG_SUBTABS for section in sections}
@@ -76,13 +74,15 @@ _SECTION_TO_SUBTAB: dict[str, str] = {section: label for label, sections in CONF
 # but are deliberately kept out of the operator UI) is never laid out, so the loops that walk every
 # field must iterate this filtered view; querying an uncomposed field raises ``NoMatches``.
 _RENDERED_FIELDS: tuple[ConfigField, ...] = tuple(
-    field for field in CONFIG_FIELDS if field.section in _SECTION_TO_SUBTAB
+    field for field in CONFIG_FIELDS if field.section in _SECTION_TO_SUBTAB and not field.hidden
 )
 
 
 def _subtab_id(label: str) -> str:
     """A DOM-safe TabPane id derived from a sub-tab label (e.g. ``Alchemy`` -> ``cfgtab-alchemy``)."""
     slug = "".join(char if char.isalnum() else "-" for char in label.lower())
+    while "--" in slug:
+        slug = slug.replace("--", "-")
     return f"cfgtab-{slug.strip('-')}"
 
 
@@ -166,6 +166,127 @@ class ConfigLeaveModal(ModalScreen[ConfigLeaveChoice]):
             self.dismiss(choice)
 
 
+class ConfigPresetModal(ModalScreen[dict[str, object] | None]):
+    """Preview one built-in preset and let the operator opt out per setting."""
+
+    DEFAULT_CSS = """
+    ConfigPresetModal {
+        align: center middle;
+    }
+    ConfigPresetModal #config-preset-dialog {
+        width: 90%;
+        max-width: 160;
+        height: 85%;
+        max-height: 46;
+        padding: 1 2;
+        border: thick $accent;
+        background: $surface;
+    }
+    ConfigPresetModal #config-preset-actions {
+        height: 3;
+    }
+    ConfigPresetModal #config-preset-actions Button {
+        margin-right: 1;
+    }
+    ConfigPresetModal .preset-body {
+        height: 1fr;
+        overflow-x: auto;
+    }
+    ConfigPresetModal .preset-row {
+        height: auto;
+        min-width: 140;
+        padding: 0 1;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, current: dict[str, object]) -> None:
+        """Store the current config values used for the diff preview."""
+        super().__init__()
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        """Build the preset picker, all preset bodies, and actions."""
+        first = BUILT_IN_PRESETS[0]
+        with Vertical(id="config-preset-dialog"):
+            yield Label("Apply configuration preset", classes="config-section")
+            yield Select(
+                [(preset.label, preset.preset_id) for preset in BUILT_IN_PRESETS],
+                value=first.preset_id,
+                id="config-preset-select",
+            )
+            yield Static(first.description, id="config-preset-description", classes="config-help")
+            for preset in BUILT_IN_PRESETS:
+                with VerticalScroll(id=f"config-preset-body-{preset.preset_id}", classes="preset-body") as body:
+                    body.display = preset is first
+                    if preset.warnings:
+                        yield Static("  ".join(preset.warnings), classes="config-guidance")
+                    for change in preset.changes:
+                        yield self._preset_checkbox(preset, change)
+            with Horizontal(id="config-preset-actions"):
+                yield Button("Apply checked changes", id="config-preset-apply", variant="primary")
+                yield Button("Cancel", id="config-preset-cancel", variant="default")
+
+    def _preset_checkbox(self, preset: ConfigPreset, change: PresetChange) -> Checkbox:
+        """Create one selectable row for a preset change."""
+        current = self._current.get(change.key)
+        selected = change.default_selected
+        if (
+            change.key == "allow_lora"
+            and change.value is True
+            and not str(self._current.get("civitai_api_token") or "")
+        ):
+            selected = False
+        restart = " restart" if change.requires_restart else ""
+        label = f"{change.category.value}: {change.key}: {current!r} -> {change.value!r}{restart} - {change.rationale}"
+        checkbox = Checkbox(
+            label,
+            value=selected,
+            id=f"config-preset-{preset.preset_id}-{change.key}",
+            classes="preset-row",
+        )
+        checkbox.disabled = current == change.value
+        return checkbox
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """Show the selected preset body."""
+        preset_id = str(event.value)
+        for preset in BUILT_IN_PRESETS:
+            with contextlib.suppress(Exception):
+                self.query_one(f"#config-preset-body-{preset.preset_id}").display = preset.preset_id == preset_id
+        with contextlib.suppress(Exception):
+            self.query_one("#config-preset-description", Static).update(_preset_by_id(preset_id).description)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Apply the checked changes or cancel."""
+        if event.button.id == "config-preset-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "config-preset-apply":
+            return
+        preset_id = str(self.query_one("#config-preset-select", Select).value)
+        preset = _preset_by_id(preset_id)
+        changes: dict[str, object] = {}
+        for diff in diff_preset(preset, self._current):
+            checkbox = self.query_one(f"#config-preset-{preset.preset_id}-{diff.change.key}", Checkbox)
+            if checkbox.value and diff.changed:
+                changes[diff.change.key] = diff.change.value
+        self.dismiss(changes)
+
+    def action_cancel(self) -> None:
+        """Dismiss without applying changes."""
+        self.dismiss(None)
+
+
+def _preset_by_id(preset_id: str) -> ConfigPreset:
+    """Return a built-in preset by id."""
+    for preset in BUILT_IN_PRESETS:
+        if preset.preset_id == preset_id:
+            return preset
+    return BUILT_IN_PRESETS[0]
+
+
 class ConfigEditorView(Vertical):
     """Edit bridgeData.yaml through typed widgets; save and (optionally) reload/restart the worker."""
 
@@ -183,6 +304,15 @@ class ConfigEditorView(Vertical):
     }
     ConfigEditorView #config-actions Button {
         margin-right: 1;
+    }
+    ConfigEditorView #config-actions-spacer {
+        width: 1fr;
+    }
+    ConfigEditorView #config-actions-separator {
+        width: 3;
+        height: 3;
+        content-align: center middle;
+        color: $text-muted;
     }
     ConfigEditorView .config-field {
         height: auto;
@@ -246,8 +376,11 @@ class ConfigEditorView(Vertical):
         """Lay out the pinned action bar and status line, then the grouped fields in sub-tabs."""
         with Horizontal(id="config-actions"):
             yield Button("Reload from disk", id="config-reload", variant="default")
-            yield Button("Save", id="config-save", variant="primary")
-            yield Button("Save + restart worker", id="config-restart", variant="warning")
+            yield Button("Save", id="config-save", variant="success")
+            yield Button("Save + restart worker", id="config-restart", variant="default")
+            yield Static("", id="config-actions-spacer")
+            yield Static("|", id="config-actions-separator")
+            yield Button("Apply preset", id="config-preset", variant="default")
         yield Static(
             f"Editing {self._config_path}  ·  Save applies automatically (the worker watches the file)  ·  "
             "⟳ marks fields that only take effect on restart",
@@ -277,7 +410,7 @@ class ConfigEditorView(Vertical):
             )
             return
 
-        section_fields = [field for field in CONFIG_FIELDS if field.section == section]
+        section_fields = [field for field in CONFIG_FIELDS if field.section == section and not field.hidden]
         if not section_fields:
             return
         yield Label(section, classes="config-section")
@@ -347,8 +480,8 @@ class ConfigEditorView(Vertical):
                 Static(field.help, classes="config-help"),
                 classes="config-field",
             )
-        elif field.kind is FieldKind.STR_LIST:
-            text = "\n".join(str(item) for item in value)
+        elif field.kind in (FieldKind.STR_LIST, FieldKind.YAML):
+            text = format_yaml_value(value) if field.kind is FieldKind.YAML else "\n".join(str(item) for item in value)
             control = Vertical(
                 Label(label_text),
                 Static(field.help, classes="config-help"),
@@ -356,7 +489,14 @@ class ConfigEditorView(Vertical):
                 classes="config-field",
             )
         else:
-            input_type = {FieldKind.INT: "integer", FieldKind.FLOAT: "number"}.get(field.kind, "text")
+            input_type = (
+                "text"
+                if field.optional
+                else {FieldKind.INT: "integer", FieldKind.FLOAT: "number"}.get(
+                    field.kind,
+                    "text",
+                )
+            )
             field_input = Input(
                 value="" if value is None else str(value),
                 id=widget_id,
@@ -375,14 +515,33 @@ class ConfigEditorView(Vertical):
         with contextlib.suppress(Exception):
             self._clean_state = self._widget_state()
         self._update_process_preview()
+        self._refresh_action_variants()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         """Refresh the process-count preview when any numeric/text field changes."""
         self._update_process_preview()
+        self._refresh_action_variants()
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
         """Refresh the process-count preview when any toggle changes."""
         self._update_process_preview()
+        self._refresh_action_variants()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """Refresh restart-action emphasis when a select value changes."""
+        self._refresh_action_variants()
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        """Refresh restart-action emphasis when a checkbox changes."""
+        self._refresh_action_variants()
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        """Refresh restart-action emphasis when a text area changes."""
+        self._refresh_action_variants()
+
+    def on_model_list_editor_changed(self, message: ModelListEditor.Changed) -> None:
+        """Refresh restart-action emphasis when a model rule list changes."""
+        self._refresh_action_variants()
 
     def _update_process_preview(self) -> None:
         """Recompute and display the live inference/safety process-count estimate (best-effort).
@@ -477,6 +636,8 @@ class ConfigEditorView(Vertical):
         """Dispatch the action-bar buttons (model-list buttons are handled by their own editor)."""
         if event.button.id == "config-reload":
             self._reload_from_disk()
+        elif event.button.id == "config-preset":
+            self._open_preset_modal()
         elif event.button.id == "config-save":
             self._save()
         elif event.button.id == "config-restart" and self._save():
@@ -543,7 +704,11 @@ class ConfigEditorView(Vertical):
                     selected = str(value)
                     widget.value = selected if selected in field.choices else field.choices[0]
                 elif isinstance(widget, TextArea):
-                    widget.text = "\n".join(str(item) for item in value)
+                    widget.text = (
+                        format_yaml_value(value)
+                        if field.kind is FieldKind.YAML
+                        else "\n".join(str(item) for item in value)
+                    )
                 elif isinstance(widget, Input):
                     widget.value = "" if value is None else str(value)
         gpu_editor = self._gpu_editor()
@@ -552,6 +717,7 @@ class ConfigEditorView(Vertical):
         with contextlib.suppress(Exception):
             self._clean_state = self._widget_state()
         self._update_process_preview()
+        self._refresh_action_variants()
         self._set_status("Reloaded from disk.", "green")
 
     def _save(self) -> bool:
@@ -595,11 +761,27 @@ class ConfigEditorView(Vertical):
         # The per-card editor validates and writes its own nested block; an error here aborts the save
         # alongside any flat-field error so the operator sees both at once.
         gpu_errors = gpu_editor.apply_to(self._data) if gpu_editor is not None else []
-        if errors or identity_errors or gpu_errors:
-            self._report_save_errors(errors + identity_errors + gpu_errors)
+        validation_issues = validate_config_interlocks(self._merged_config_state(coerced))
+        interlock_errors = [
+            (_FIELD_BY_KEY.get(issue.field_key, _FIELD_BY_KEY["dreamer"]), issue.message)
+            for issue in validation_issues
+            if issue.severity is ConfigValidationSeverity.ERROR
+        ]
+        validation_warnings = [
+            issue.message for issue in validation_issues if issue.severity is ConfigValidationSeverity.WARNING
+        ]
+
+        if errors or identity_errors or gpu_errors or interlock_errors:
+            self._report_save_errors(
+                errors + identity_errors + gpu_errors + interlock_errors,
+                gpu_error_field_ids={id(field) for field, _message in gpu_errors},
+            )
             return False
         if not coerced and not gpu_dirty:
-            self._set_status("No changes to save.", "green")
+            if validation_warnings:
+                self._set_status(f"No changes to save. Warnings: {'; '.join(validation_warnings)}", "yellow")
+            else:
+                self._set_status("No changes to save.", "green")
             return True
 
         for field, value in coerced:
@@ -615,10 +797,17 @@ class ConfigEditorView(Vertical):
             self._clean_state = self._widget_state()
         if gpu_editor is not None:
             gpu_editor.mark_saved()
-        self._set_status(
-            f"Saved {self._config_path}. A running worker reloads it automatically; restart only for ⟳ fields.",
-            "green",
-        )
+        self._refresh_action_variants()
+        if validation_warnings:
+            self._set_status(
+                f"Saved {self._config_path} with warnings: {'; '.join(validation_warnings)}",
+                "yellow",
+            )
+        else:
+            self._set_status(
+                f"Saved {self._config_path}. A running worker reloads it automatically; restart only for ⟳ fields.",
+                "green",
+            )
         return True
 
     def _coerce_field(self, field: ConfigField) -> object:
@@ -643,6 +832,69 @@ class ConfigEditorView(Vertical):
         else:
             raw = ""
         return coerce_value(field, raw)
+
+    def _merged_config_state(self, coerced_changes: list[tuple[ConfigField, object]]) -> dict[str, object]:
+        """Return current config state plus the already-coerced pending flat-field changes."""
+        state: dict[str, object] = {}
+        for field in _RENDERED_FIELDS:
+            try:
+                state[field.key] = current_value(field, self._data)
+            except Exception:  # noqa: BLE001 - validation should be best-effort for untouched values
+                state[field.key] = field.default()
+        for field, value in coerced_changes:
+            state[field.key] = value
+        return state
+
+    def _current_config_state_for_preset(self) -> dict[str, object]:
+        """Best-effort live config state for preset previews."""
+        state = self._merged_config_state([])
+        for field in _RENDERED_FIELDS:
+            with contextlib.suppress(Exception):
+                state[field.key] = self._coerce_field(field)
+        return state
+
+    def _open_preset_modal(self) -> None:
+        """Open the built-in preset preview and apply selected changes to live widgets."""
+        self.app.push_screen(ConfigPresetModal(self._current_config_state_for_preset()), self._apply_preset_changes)
+
+    def _apply_preset_changes(self, changes: dict[str, object] | None) -> None:
+        """Apply selected preset values to widgets without saving to disk."""
+        if not changes:
+            return
+        for key, value in changes.items():
+            self._set_widget_value(key, value)
+        self._update_process_preview()
+        self._refresh_action_variants()
+        self._set_status(
+            f"Applied preset changes to the form ({len(changes)} setting(s)); save to write them.", "yellow"
+        )
+
+    def _set_widget_value(self, key: str, value: object) -> None:
+        """Set one config widget from a preset value."""
+        field = _FIELD_BY_KEY.get(key)
+        if field is None:
+            return
+        if field.kind is FieldKind.MODEL_LIST:
+            with contextlib.suppress(Exception):
+                self.query_one(f"#mle-root-{key}", ModelListEditor).set_values([str(item) for item in value])
+            return
+        if field.kind is FieldKind.SELECT_MULTI:
+            selected = {str(item) for item in value} if isinstance(value, list) else {str(value)}
+            for choice in field.choices:
+                with contextlib.suppress(Exception):
+                    self.query_one(f"#cfg-{field.key}-{choice}", Checkbox).value = choice in selected
+            return
+        widget = self.query_one(f"#cfg-{key}")
+        if isinstance(widget, Switch):
+            widget.value = bool(value)
+        elif isinstance(widget, Select):
+            widget.value = str(value)
+        elif isinstance(widget, TextArea):
+            widget.text = (
+                format_yaml_value(value) if field.kind is FieldKind.YAML else "\n".join(str(item) for item in value)
+            )
+        elif isinstance(widget, Input):
+            widget.value = "" if value is None else str(value)
 
     def _identity_name_errors(self) -> list[tuple[ConfigField, str]]:
         """Validate the worker identity names from the live widgets, mapped onto their ConfigFields.
@@ -680,7 +932,12 @@ class ConfigEditorView(Vertical):
         except Exception:  # noqa: BLE001 - a DOM read glitch must fall back, not crash the save
             return bool(current_value(_FIELD_BY_KEY[key], self._data))
 
-    def _report_save_errors(self, errors: list[tuple[ConfigField, str]]) -> None:
+    def _report_save_errors(
+        self,
+        errors: list[tuple[ConfigField, str]],
+        *,
+        gpu_error_field_ids: set[int] | None = None,
+    ) -> None:
         """Surface every validation error at once and jump to the first offending field.
 
         The operator may have edited fields across several sub-tabs, so a terse message that silently
@@ -689,7 +946,7 @@ class ConfigEditorView(Vertical):
         field).
         """
         first_field = errors[0][0]
-        if first_field.key in _GPU_FIELD_KEYS:
+        if gpu_error_field_ids is not None and id(first_field) in gpu_error_field_ids:
             tab_label: str | None = _GPU_SUBTAB_LABEL
             with contextlib.suppress(Exception):
                 self.query_one("#config-subtabs", TabbedContent).active = _GPU_SUBTAB_ID
@@ -713,3 +970,25 @@ class ConfigEditorView(Vertical):
     def _set_status(self, message: str, colour: str) -> None:
         """Update the status line with a coloured message."""
         self.query_one("#config-status", Static).update(f"[{colour}]{message}[/]")
+
+    def _restart_locked_dirty(self) -> bool:
+        """Whether unsaved edits include a restart-only field or per-GPU structure."""
+        gpu_editor = self._gpu_editor()
+        if gpu_editor is not None and gpu_editor.is_dirty():
+            return True
+        try:
+            current = self._widget_state()
+        except Exception:  # noqa: BLE001 - button colouring is advisory only
+            return False
+        baseline = self._clean_state
+        if baseline is None:
+            return False
+        restart_keys = {field.key for field in _RENDERED_FIELDS if field.requires_restart}
+        return any(key in restart_keys and baseline.get(key) != value for key, value in current.items())
+
+    def _refresh_action_variants(self) -> None:
+        """Keep save/restart button emphasis aligned with the current unsaved edit set."""
+        with contextlib.suppress(Exception):
+            self.query_one("#config-restart", Button).variant = (
+                "warning" if self._restart_locked_dirty() else "default"
+            )

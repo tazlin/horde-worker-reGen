@@ -31,9 +31,43 @@ def test_core_fields_present_with_expected_kinds() -> None:
         "alchemist",
         "cache_home",
         "comfy_smart_memory",
+        "custom_models",
+        "log_purge_max_age_days",
+        "log_purge_max_total_gb",
         "enable_pipeline_disaggregation",
     ):
         assert key in _BY_KEY, key
+
+
+def test_major_operator_labels_reflect_semantics() -> None:
+    """The biggest levers use labels that describe what the worker actually does."""
+    assert _BY_KEY["max_threads"].label == "Concurrent image jobs"
+    assert _BY_KEY["queue_size"].label == "Preload queue slots"
+    assert _BY_KEY["max_power"].label == "Max resolution"
+    assert _BY_KEY["allow_post_processing"].label == "Offer post-processing jobs"
+    assert _BY_KEY["dedicated_post_processing"].label == "Post-processing lane mode"
+    assert _BY_KEY["allow_lora"].label == "Offer LoRA jobs"
+    assert _BY_KEY["load_large_models"].label == "Include very large models in TOP/ALL"
+
+
+def test_custom_models_yaml_validation() -> None:
+    """The custom model editor accepts a list of mappings with required keys."""
+    value = coerce_value(
+        _BY_KEY["custom_models"],
+        '- name: "my model"\n  baseline: "stable_diffusion"\n  filepath: "/models/my.safetensors"\n',
+    )
+
+    assert value == [{"name": "my model", "baseline": "stable_diffusion", "filepath": "/models/my.safetensors"}]
+    with pytest.raises(ValueError, match="must include filepath"):
+        coerce_value(_BY_KEY["custom_models"], '- name: "bad"\n  baseline: "stable_diffusion"\n')
+
+
+def test_pipeline_disaggregation_field_is_hidden_advanced() -> None:
+    """The dormant disaggregation option stays catalogued under Advanced but is not rendered."""
+    field = _BY_KEY["enable_pipeline_disaggregation"]
+
+    assert field.section == "Other"
+    assert field.hidden is True
 
 
 def test_alchemy_forms_include_worker_default_forms() -> None:
