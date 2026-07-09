@@ -117,6 +117,17 @@ async def _queue_n_jobs_for_safety(job_tracker: JobTracker, n: int) -> None:
         await job_tracker.queue_for_safety(job_info)
 
 
+async def _queue_n_jobs_for_post_processing(job_tracker: JobTracker, n: int) -> None:
+    """Place ``n`` jobs into the post-inference post-processing backlog."""
+    for _ in range(n):
+        job = Mock()
+        job.id_ = uuid.uuid4()
+        job.model = "stable_diffusion"
+        job_info = Mock()
+        job_info.sdk_api_job_info = job
+        await job_tracker.queue_for_post_processing(job_info)
+
+
 class TestApiJobPopGuardClauses:
     """Each guard clause in api_job_pop should short-circuit cleanly."""
 
@@ -518,6 +529,36 @@ class TestPostInferenceBackpressure:
         popper = _make_popper(state=WorkerState(avg_safety_seconds=99.0, recent_job_ttl=1.0))
         assert popper._is_post_inference_backlogged() is False
 
+    async def test_deep_post_processing_backlog_blocks_pop(self) -> None:
+        """Two post-processing jobs waiting/running suppress popping while the lane catches up."""
+        job_tracker = JobTracker()
+        await _queue_n_jobs_for_post_processing(job_tracker, 2)
+        bridge_data = make_mock_bridge_data(post_processing_lane_enabled=True)
+        popper = _make_popper(job_tracker=job_tracker, bridge_data=bridge_data)
+
+        assert popper._is_post_processing_backlogged() is True
+        assert popper._is_post_inference_backlogged() is True
+
+    async def test_shallow_post_processing_backlog_does_not_block(self) -> None:
+        """A single post-processing job can overlap normal intake."""
+        job_tracker = JobTracker()
+        await _queue_n_jobs_for_post_processing(job_tracker, 1)
+        bridge_data = make_mock_bridge_data(post_processing_lane_enabled=True)
+        popper = _make_popper(job_tracker=job_tracker, bridge_data=bridge_data)
+
+        assert popper._is_post_processing_backlogged() is False
+        assert popper._is_post_inference_backlogged() is False
+
+    async def test_post_processing_backlog_is_ignored_when_lane_is_off(self) -> None:
+        """The breaker only applies when the dedicated post-processing lane is enabled."""
+        job_tracker = JobTracker()
+        await _queue_n_jobs_for_post_processing(job_tracker, 2)
+        bridge_data = make_mock_bridge_data(post_processing_lane_enabled=False)
+        popper = _make_popper(job_tracker=job_tracker, bridge_data=bridge_data)
+
+        assert popper._is_post_processing_backlogged() is False
+        assert popper._is_post_inference_backlogged() is False
+
     async def test_cap_rises_when_safety_is_faster(self) -> None:
         """Faster measured safety raises the tolerated backlog (self-tuning, no knob)."""
         job_tracker = JobTracker()
@@ -581,6 +622,27 @@ class TestPostInferenceBackpressure:
         session.submit_request.assert_not_awaited()
         assert state.last_pop_skipped_reasons.get("safety_backlog", 0) >= 1
 
+    async def test_api_job_pop_records_skip_reason_when_post_processing_backlogged(self) -> None:
+        """A pop suppressed by post-processing backpressure records the specific reason."""
+        job_tracker = JobTracker()
+        await _queue_n_jobs_for_post_processing(job_tracker, 2)
+        bridge_data = make_mock_bridge_data(post_processing_lane_enabled=True)
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="should not be called"))
+        state = WorkerState()
+        popper = _make_popper(
+            state=state,
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            bridge_data=bridge_data,
+            horde_client_session=session,
+        )
+
+        await popper.api_job_pop()
+
+        session.submit_request.assert_not_awaited()
+        assert state.last_pop_skipped_reasons.get("post_processing_backlog", 0) >= 1
+
     def test_hungry_is_false_when_backlogged(self) -> None:
         """The fast-pop path also yields to backpressure so it cannot bypass the gate."""
 
@@ -590,6 +652,23 @@ class TestPostInferenceBackpressure:
             return _make_popper(
                 state=WorkerState(avg_safety_seconds=10.0, recent_job_ttl=60.0),
                 job_tracker=job_tracker,
+                process_map=_make_process_map_with_available_processes(),
+            )
+
+        import asyncio
+
+        popper = asyncio.run(_setup())
+        assert popper._is_hungry(popper._runtime_config.bridge_data) is False
+
+    def test_hungry_is_false_when_post_processing_backlogged(self) -> None:
+        """The fast-pop path also yields to post-processing backpressure."""
+
+        async def _setup() -> JobPopper:
+            job_tracker = JobTracker()
+            await _queue_n_jobs_for_post_processing(job_tracker, 2)
+            return _make_popper(
+                job_tracker=job_tracker,
+                bridge_data=make_mock_bridge_data(post_processing_lane_enabled=True),
                 process_map=_make_process_map_with_available_processes(),
             )
 
