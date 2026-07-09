@@ -98,12 +98,6 @@ completion and re-engage on the next inference completion, popping the worker in
 tick (thrash) and defeating the purpose of letting the slow stage catch up. Half the cap gives the safety
 stage a full margin to work down before more inference work is admitted, and because it is a fraction of the
 same deadline-derived cap it tracks that cap as measured safety speed and the horde ttl move."""
-_POST_PROCESSING_BACKLOG_LIMIT = 2
-"""Post-processing backlog depth that holds image pops while the dedicated lane catches up.
-
-The post-processing lane is single-width; if two post-inference jobs are already waiting/running there,
-another image pop can only deepen the downstream queue and start another horde ttl clock. Intake resumes
-once the lane drains below this limit."""
 
 
 def _select_models_for_pop(
@@ -573,14 +567,6 @@ class JobPopper:
         """Public read of the post-inference backpressure gate, for the governor registry."""
         return self._is_post_inference_backlogged()
 
-    def is_post_processing_backlogged(self) -> bool:
-        """Public read of the post-processing backlog gate, for status and governor readback."""
-        return self._is_post_processing_backlogged()
-
-    def is_safety_backlogged(self) -> bool:
-        """Public read of the safety backlog gate, for status and governor readback."""
-        return self._is_safety_backlogged()
-
     @property
     def is_in_error_backoff(self) -> bool:
         """Whether the pop throttler is backing off the API after recent pop errors."""
@@ -662,9 +648,6 @@ class JobPopper:
     _safety_backlog_log_time: float = 0.0
     """Monotonic-ish wall-clock of the last safety-backlog backpressure log (throttle state)."""
 
-    _post_processing_backlog_log_time: float = 0.0
-    """Monotonic-ish wall-clock of the last post-processing-backlog backpressure log (throttle state)."""
-
     _safety_backpressure_engaged: bool = False
     """Whether safety-backlog backpressure is currently withholding pops (the hysteresis latch state).
 
@@ -690,21 +673,21 @@ class JobPopper:
         return max(_MIN_POST_INFERENCE_BACKLOG * num_safety, capacity)
 
     def _is_post_inference_backlogged(self) -> bool:
-        """Return True if any post-inference lane is too backlogged to admit more work.
+        """Return True if the post-inference (safety) backlog is too deep to admit more work.
 
-        Inference completions can pile up behind either post-processing or safety. If either downstream
-        stage is backed up, a fresh image pop only starts another horde ttl clock for work the worker cannot
-        push through the tail promptly. This combined predicate is read by the pop gate, the fast-pop
-        ("hungry") path, and the orchestration/governor readback so those sites agree within a tick.
+        This is the backpressure the worker previously lacked: inference completions pile into the
+        ungated safety queue, so a safety stage even slightly slower than inference grows that queue until
+        jobs exceed their ttl and the horde aborts them as too slow. Counting the jobs already waiting for
+        (or in) safety against a deadline-derived cap lets the worker stop popping before the backlog ages
+        jobs out, throttling intake to the pipeline's slowest stage instead of spiralling into
+        forced maintenance.
 
-        The safety half is deadline-derived and hysteretic. The post-processing half uses the dedicated
-        lane's fixed single-width shape: two or more post-processing jobs is enough backlog to pause intake,
-        and it releases once the lane drains below that depth.
+        Hysteretic: the gate engages when the backlog reaches the cap and stays engaged until the backlog
+        drains below :data:`_SAFETY_BACKLOG_RELEASE_FRACTION` of that cap, so intake resumes only once the
+        slow stage has made real headway rather than the instant a single job clears. The latch is
+        deterministic in the current backlog, so the several read sites that call this each tick (the pop
+        gate, the hungry check, the orchestration-intent readback) all observe the same verdict.
         """
-        return self._is_post_processing_backlogged() or self._is_safety_backlogged()
-
-    def _is_safety_backlogged(self) -> bool:
-        """Return True if the safety backlog is too deep to admit more work."""
         backlog = len(self._job_tracker.jobs_pending_safety_check) + len(self._job_tracker.jobs_being_safety_checked)
         cap = self._max_safe_safety_backlog()
         if self._safety_backpressure_engaged:
@@ -714,27 +697,6 @@ class JobPopper:
         if backlog > 0 and backlog >= cap:
             self._safety_backpressure_engaged = True
         return self._safety_backpressure_engaged
-
-    _post_processing_backpressure_engaged: bool = False
-    """Whether post-processing-backlog backpressure is currently withholding pops."""
-
-    def _is_post_processing_backlogged(self) -> bool:
-        """Return True if post-processing is enabled and its post-inference backlog has piled up."""
-        bridge_data = self._runtime_config.bridge_data
-        if not bool(getattr(bridge_data, "post_processing_lane_enabled", False)):
-            self._post_processing_backpressure_engaged = False
-            return False
-
-        backlog = len(getattr(self._job_tracker, "jobs_pending_post_processing", ())) + len(
-            getattr(self._job_tracker, "jobs_being_post_processed", ()),
-        )
-        if self._post_processing_backpressure_engaged:
-            if backlog < _POST_PROCESSING_BACKLOG_LIMIT:
-                self._post_processing_backpressure_engaged = False
-            return self._post_processing_backpressure_engaged
-        if backlog >= _POST_PROCESSING_BACKLOG_LIMIT:
-            self._post_processing_backpressure_engaged = True
-        return self._post_processing_backpressure_engaged
 
     @property
     def _lora_disk_permits(self) -> bool:
@@ -951,7 +913,7 @@ class JobPopper:
         # the steady-state pacing governors that assume this pop adds durable queue depth do not apply while
         # the stall lasts. Treat the pop as urgent and let it relax the queue-depth and pop-cadence gates so
         # the bias applied further down (small, non-LoRA) can actually be exercised. Genuinely protective
-        # gates (shutdown, RAM/post-inference backpressure, failure pause, no free process) still apply.
+        # gates (shutdown, RAM/safety backpressure, failure pause, no free process) still apply.
         line_skip_wanted = self._state.wants_line_skip_candidate
         if line_skip_wanted:
             urgent = True
@@ -965,39 +927,11 @@ class JobPopper:
         if self._is_queue_full(bridge_data, extra_allowance=1 if line_skip_wanted else 0):
             return
 
-        # Post-inference backpressure: if a downstream lane is backed up enough that a job admitted now
-        # would likely age in the pipeline tail, stop popping until the backlog drains. Without this the
-        # worker keeps accepting work a slow post-processing/safety stage cannot clear, the backlog grows
-        # unbounded, and the horde aborts the aged jobs as too slow and forces maintenance.
-        post_inference_backlogged = self._is_post_inference_backlogged()
-        if post_inference_backlogged and self._is_post_processing_backlogged():
-            self._state.last_pop_no_jobs_available = False
-            self._state.last_pop_skipped_reasons.pop("safety_backlog", None)
-            self._state.last_pop_skipped_reasons["post_processing_backlog"] = (
-                self._state.last_pop_skipped_reasons.get("post_processing_backlog", 0) + 1
-            )
-            now = time.time()
-            if (now - self._post_processing_backlog_log_time) >= self._SAFETY_BACKLOG_LOG_INTERVAL_SECONDS:
-                self._post_processing_backlog_log_time = now
-                backlog = len(self._job_tracker.jobs_pending_post_processing) + len(
-                    self._job_tracker.jobs_being_post_processed,
-                )
-                stage_ages = self._job_tracker.stage_age_summary()
-                oldest = max(
-                    stage_ages.get(JobStage.PENDING_POST_PROCESSING, (0, 0.0))[1],
-                    stage_ages.get(JobStage.POST_PROCESSING, (0, 0.0))[1],
-                )
-                logger.warning(
-                    f"Withholding job pops: post-processing backlog {backlog} >= "
-                    f"{_POST_PROCESSING_BACKLOG_LIMIT} (oldest post-processing job {oldest:.0f}s). "
-                    "The post-processing lane is slower than inference; intake resumes once it drains below "
-                    f"{_POST_PROCESSING_BACKLOG_LIMIT} jobs.",
-                )
-            return
-
-        self._state.last_pop_skipped_reasons.pop("post_processing_backlog", None)
-
-        if post_inference_backlogged:
+        # Post-inference backpressure: if the safety stage is backed up enough that a job admitted now
+        # would likely age past its ttl waiting for it, stop popping until the backlog drains. Without
+        # this the worker keeps accepting work a slow (often CPU) safety stage cannot clear, the backlog
+        # grows unbounded, and the horde aborts the aged jobs as too slow and forces maintenance.
+        if self._is_post_inference_backlogged():
             self._state.last_pop_no_jobs_available = False
             self._state.last_pop_skipped_reasons["safety_backlog"] = (
                 self._state.last_pop_skipped_reasons.get("safety_backlog", 0) + 1

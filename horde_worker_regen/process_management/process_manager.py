@@ -3820,7 +3820,6 @@ class HordeWorkerProcessManager:
         "allow_lora": "LoRA not offered",
         "allow_post_processing": "post-processing not allowed",
         "allow_painting": "inpainting not allowed",
-        "post_processing_backlog": "post-processing backlogged",
         "safety_backlog": "safety backlogged",
         "kudos": "insufficient kudos",
         "worker_id": "worker-id mismatch",
@@ -3974,22 +3973,11 @@ class HordeWorkerProcessManager:
                 why=why,
             )
 
-        # Post-processing backlog backpressure (pops withheld to let the dedicated lane catch up)
-        pp_backlog = len(self._job_tracker.jobs_pending_post_processing) + len(
-            self._job_tracker.jobs_being_post_processed
-        )
-        if pp_backlog > 0 and self._job_popper.is_post_processing_backlogged():
-            return OrchestrationIntentSnapshot(
-                summary=f"Post-processing backlogged: withholding pops ({pp_backlog} waiting/running).",
-                next_action="Pops resume when the post-processing lane drains below two jobs.",
-                why="The post-processing lane is slower than inference; the worker is letting it catch up.",
-            )
-
         # Safety backlog backpressure (pops withheld to let the safety stage catch up)
         safety_backlog = len(self._job_tracker.jobs_pending_safety_check) + len(
             self._job_tracker.jobs_being_safety_checked
         )
-        if safety_backlog > 0 and self._job_popper.is_safety_backlogged():
+        if safety_backlog > 0 and getattr(self._job_popper, "_is_post_inference_backlogged", lambda: False)():
             return OrchestrationIntentSnapshot(
                 summary=f"Safety backlogged: withholding pops ({safety_backlog} waiting).",
                 next_action="Pops resume when the safety stage catches up.",
@@ -4250,22 +4238,15 @@ class HordeWorkerProcessManager:
             ),
         )
 
-        pp_backlogged = self._job_popper.is_post_processing_backlogged()
-        safety_backlogged = self._job_popper.is_safety_backlogged()
-        backlogged = pp_backlogged or safety_backlogged
-        reason = None
-        if pp_backlogged and safety_backlogged:
-            reason = "post-processing and safety are backlogged; holding pops so jobs do not age past their deadline"
-        elif pp_backlogged:
-            reason = "post-processing lane backlogged; holding pops until it drains below two jobs"
-        elif safety_backlogged:
-            reason = "safety stage backlogged; holding pops so jobs do not age past their deadline"
+        backlogged = self._job_popper.is_post_inference_backlogged()
         readings.append(
             PopGovernorReading(
                 name="post_inference_backpressure",
                 label="Post-inference backpressure",
                 active=backlogged,
-                reason=reason,
+                reason="safety stage backlogged; holding pops so jobs do not age past their deadline"
+                if backlogged
+                else None,
             ),
         )
 

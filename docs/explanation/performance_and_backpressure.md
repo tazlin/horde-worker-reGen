@@ -3,7 +3,7 @@
 - [Performance and Backpressure](#performance-and-backpressure)
     - [The pop gauntlet](#the-pop-gauntlet)
     - [Megapixelstep backpressure](#megapixelstep-backpressure)
-    - [Post-inference backpressure](#post-inference-backpressure)
+    - [Post-inference (safety) backpressure](#post-inference-safety-backpressure)
     - [Model stickiness](#model-stickiness)
     - [Pop-rate throttling](#pop-rate-throttling)
     - [Queue sizing and the hold-back gate](#queue-sizing-and-the-hold-back-gate)
@@ -43,9 +43,8 @@ call, it runs a series of gates:
    job complete before pulling more.
 5. **Process availability**: at least one safety process and one inference
    process must exist and be healthy.
-6. **Post-inference backpressure**: if the post-processing lane has two or more
-   jobs waiting/running, or the safety backlog cannot clear within the job
-   deadline, skip (see below).
+6. **Post-inference (safety) backpressure**: if the post-inference backlog
+   cannot clear within the job deadline, skip (see below).
 7. **Megapixelstep backpressure**: if pending megapixelsteps exceed the
    configured threshold, skip (see below).
 8. **Pop-rate throttle**: if less than `current_pop_frequency` seconds have
@@ -84,27 +83,19 @@ After one non-running inference job is queued, the usual threshold applies again
 This prevents the worker from accepting a large number of high-resolution jobs
 that would take hours to complete, starving smaller jobs behind them.
 
-## Post-inference backpressure
+## Post-inference (safety) backpressure
 
 Megapixelstep and queue-size backpressure bound the *pre-inference* queue. The
-*post-inference* tail - jobs that have finished generating and are waiting for
-post-processing and/or safety - has different throughput constraints. The
-post-processing lane is single-width, and safety is often a single process
-(CPU-bound when `safety_on_gpu` is off). When inference is faster than either
-downstream stage, the backlog grows until jobs exceed the horde-supplied `ttl`
+*post-inference* queue - jobs that have finished generating and are waiting for
+the safety stage - has a different throughput constraint: safety is often a single
+process, and CPU-bound when `safety_on_gpu` is off. When inference is faster than
+safety, the post-inference backlog grows until jobs exceed the horde-supplied `ttl`
 ("seconds before this job is considered stale and aborted") and the horde aborts
 them as "too slow", counting each as a dropped job.
 
-The popper applies backpressure against both downstream stages. For
-post-processing, if the dedicated lane is enabled and two or more post-processing
-jobs are already waiting/running, image pops pause until that backlog drains below
-two jobs. This keeps the single lane from becoming a ttl-aging queue while it
-catches up. Each withheld pop records a `post_processing_backlog` reason and emits
-a throttled warning naming the depth and oldest post-processing job.
-
-For safety, the popper measures the stage's average wall-clock cost and stops
-popping while the current backlog cannot drain within the job deadline. The
-tolerated safety backlog is
+The popper applies backpressure against this stage too: it measures the safety
+stage's average wall-clock cost and stops popping while the current backlog cannot
+drain within the job deadline. The tolerated backlog is
 
 ```
 max(2 × num_safety, int(ttl × 0.5 × num_safety / avg_safety_seconds))
@@ -114,25 +105,24 @@ where `avg_safety_seconds` is an exponential moving average of measured safety
 checks ([`WorkerState.record_safety_duration`][horde_worker_regen.process_management.config.worker_state.WorkerState.record_safety_duration])
 and `ttl` is the most recent horde-supplied deadline (falling back to conservative
 constants before either is known). The cap is self-tuning with no config knob: a
-faster safety stage or longer deadline raises the tolerated safety backlog; a
-slower one tightens it. The practical effect is that throughput settles at the
-slowest pipeline stage's rate rather than at the rate the GPU produces images.
+faster safety stage or longer deadline raises the tolerated backlog; a slower one
+tightens it. The practical effect is that throughput settles at the slowest pipeline
+stage's rate rather than at the rate the GPU produces images.
 
-The safety gate is **hysteretic**, so it does not thrash. It engages the moment
-the backlog reaches the cap, then stays engaged until the backlog drains **below
-half the cap** (`_SAFETY_BACKLOG_RELEASE_FRACTION`), rather than releasing the
-instant a single job clears. Without the gap, a backlog sitting at the cap would
-re-admit one job on every safety completion and re-engage on the next inference
-completion, popping the worker in and out of backpressure each tick and never
-letting the slow stage make headway. The same latched verdict is read by the pop
-gate, the fast-pop ("hungry") path, and the orchestration-intent readback, so all
-three agree within a tick. Each withheld pop records a `safety_backlog` reason in
-`last_pop_skipped_reasons` (surfaced in the dashboard and support bundle) and a
-throttled `WARN` naming the depth, the self-tuned cap, and the oldest waiting
-safety job. The contract is a bound, not a fault: intake stops and resumes, and
-nothing is aborted. On a box where safety runs on CPU behind two GPU producers
-this is what keeps the in-flight backlog from climbing without limit until jobs
-age out.
+The gate is **hysteretic**, so it does not thrash. It engages the moment the backlog
+reaches the cap, then stays engaged until the backlog drains **below half the cap**
+(`_SAFETY_BACKLOG_RELEASE_FRACTION`), rather than releasing the instant a single job
+clears. Without the gap, a backlog sitting at the cap would re-admit one job on every
+safety completion and re-engage on the next inference completion, popping the worker in
+and out of backpressure each tick and never letting the slow stage make headway. The
+same latched verdict is read by the pop gate, the fast-pop ("hungry") path, and the
+orchestration-intent readback, so all three agree within a tick. Each withheld pop
+records a `safety_backlog` reason in `last_pop_skipped_reasons` (surfaced in the
+dashboard and support bundle) and a throttled `WARN` naming the depth, the self-tuned
+cap, and the oldest waiting safety job. The contract is a bound, not a fault: intake
+stops and resumes, and nothing is aborted. On a box where safety runs on CPU behind
+two GPU producers this is what keeps the in-flight backlog from climbing without limit
+until jobs age out.
 
 Safety placement also yields to this backlog. Any pending or active safety work protects
 an already-on-GPU safety process from being demoted for sampling headroom. If safety has
