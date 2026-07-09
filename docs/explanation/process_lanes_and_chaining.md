@@ -74,10 +74,11 @@ that next sampler so the lane gets the next drain window instead of extending th
 preloading is treated as speculative work in this state and yields to the same pending chain.
 
 The popper protects the lane from growing its own downstream queue without stopping ordinary image work. Once
-two or more post-processing chains are pending/running locally, the next image pop temporarily withholds
-`allow_post_processing` while keeping normal generation capabilities advertised. When the lane drains below
-that point, post-processing is offered again, subject to the normal operator setting, model-readiness gate, and
-fault breaker.
+two or more accepted jobs still need post-processing, the next image pop temporarily withholds
+`allow_post_processing` while keeping normal generation capabilities advertised. The count includes jobs still
+queued or running inference, so back-to-back batched PP jobs are visible before they reach the lane. When the
+commitment count drains below that point, post-processing is offered again, subject to the normal operator
+setting, model-readiness gate, and fault breaker.
 
 A post-processing failure never falls back to raw submission. Requested post-processing is part of the
 worker's contract for that job; if the lane cannot honor it, the worker submits a no-image fault so the horde

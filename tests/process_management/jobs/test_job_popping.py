@@ -129,6 +129,20 @@ async def _queue_n_jobs_for_post_processing(job_tracker: JobTracker, n: int) -> 
         await job_tracker.queue_for_post_processing(job_info)
 
 
+async def _queue_n_popped_jobs_requesting_post_processing(job_tracker: JobTracker, n: int) -> None:
+    """Place ``n`` accepted jobs that have requested post-processing but have not reached the lane."""
+    for index in range(n):
+        await job_tracker.record_popped_job(
+            make_job_pop_response(model=f"accepted_pp_{index}", post_processing=["RealESRGAN_x4plus"], n_iter=8),
+        )
+
+
+async def _queue_n_popped_jobs_without_post_processing(job_tracker: JobTracker, n: int) -> None:
+    """Place ``n`` accepted ordinary image jobs that do not need the post-processing lane."""
+    for index in range(n):
+        await job_tracker.record_popped_job(make_job_pop_response(model=f"accepted_plain_{index}"))
+
+
 class TestApiJobPopGuardClauses:
     """Each guard clause in api_job_pop should short-circuit cleanly."""
 
@@ -426,15 +440,19 @@ class TestPostProcessingBacklogOfferShaping:
     async def _pop_and_capture_request(
         *,
         post_processing_backlog_depth: int,
+        accepted_post_processing_depth: int = 0,
+        accepted_non_post_processing_depth: int = 0,
         post_processing_lane_enabled: bool = True,
         allow_post_processing: bool = True,
         availability: ModelAvailability | None = None,
         urgent: bool = False,
     ) -> tuple[object, WorkerState]:
-        """Drive one pop with a configured post-processing backlog and return the request and state."""
+        """Drive one pop with configured post-processing commitments and return the request and state."""
         job_tracker = JobTracker()
-        await track_popped_job_async(job_tracker, make_mock_job())
+        job_tracker.set_performance_mode_thresholds(1000)
         await job_tracker.increment_jobs_completed()
+        await _queue_n_popped_jobs_requesting_post_processing(job_tracker, accepted_post_processing_depth)
+        await _queue_n_popped_jobs_without_post_processing(job_tracker, accepted_non_post_processing_depth)
         await _queue_n_jobs_for_post_processing(job_tracker, post_processing_backlog_depth)
 
         state = WorkerState(last_job_pop_time=time.time() if urgent else 0.0)
@@ -448,6 +466,7 @@ class TestPostProcessingBacklogOfferShaping:
             bridge_data=make_mock_bridge_data(
                 allow_post_processing=allow_post_processing,
                 post_processing_lane_enabled=post_processing_lane_enabled,
+                queue_size=8,
             ),
             model_availability=availability,
         )
@@ -467,6 +486,34 @@ class TestPostProcessingBacklogOfferShaping:
     async def test_shallow_post_processing_backlog_keeps_post_processing_offer(self) -> None:
         """A single waiting post-processing job is within the lane's ordinary overlap budget."""
         request, _state = await self._pop_and_capture_request(post_processing_backlog_depth=1)
+
+        assert request.allow_post_processing is True
+
+    async def test_accepted_post_processing_jobs_suppress_next_post_processing_offer(self) -> None:
+        """Already-popped post-processing jobs count before they reach the post-processing lane."""
+        request, state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=0,
+            accepted_post_processing_depth=2,
+        )
+
+        assert request.allow_post_processing is False
+        assert state.last_pop_skipped_reasons.get("post_processing_backlog") is None
+
+    async def test_mixed_accepted_and_lane_post_processing_pressure_suppresses_offer(self) -> None:
+        """Accepted PP commitments and lane backlog share one pressure counter."""
+        request, _state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=1,
+            accepted_post_processing_depth=1,
+        )
+
+        assert request.allow_post_processing is False
+
+    async def test_ordinary_accepted_jobs_do_not_suppress_post_processing_offer(self) -> None:
+        """Only jobs that requested post-processing count toward post-processing offer shaping."""
+        request, _state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=0,
+            accepted_non_post_processing_depth=2,
+        )
 
         assert request.allow_post_processing is True
 

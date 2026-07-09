@@ -99,8 +99,8 @@ tick (thrash) and defeating the purpose of letting the slow stage catch up. Half
 stage a full margin to work down before more inference work is admitted, and because it is a fraction of the
 same deadline-derived cap it tracks that cap as measured safety speed and the horde ttl move."""
 
-_POST_PROCESSING_OFFER_BACKLOG_LIMIT = 2
-"""Pending/running post-processing chains at which the next pop stops advertising post-processing.
+_POST_PROCESSING_OFFER_COMMITMENT_LIMIT = 2
+"""Accepted post-processing chains at which the next pop stops advertising post-processing.
 
 This is offer shaping, not intake backpressure. The inference queue can keep accepting ordinary image jobs
 while the single post-processing lane catches up; only the capability that would add more downstream work is
@@ -706,15 +706,27 @@ class JobPopper:
             self._safety_backpressure_engaged = True
         return self._safety_backpressure_engaged
 
-    def _post_processing_backlog_depth(self) -> int:
-        """Return pending plus active post-processing chains currently owned by the worker."""
-        return len(self._job_tracker.jobs_pending_post_processing) + len(self._job_tracker.jobs_being_post_processed)
+    def _post_processing_commitment_depth(self) -> int:
+        """Return accepted jobs that still require the post-processing lane.
+
+        Count jobs before they reach the lane too: a burst of already-popped large PP jobs can otherwise sit in
+        the inference queue and only become visible as post-processing pressure after the worker has accepted
+        several more PP jobs.
+        """
+        accepted_before_lane = sum(
+            1 for job in self._job_tracker.jobs_pending_inference if bool(job.payload.post_processing)
+        )
+        return (
+            accepted_before_lane
+            + len(self._job_tracker.jobs_pending_post_processing)
+            + len(self._job_tracker.jobs_being_post_processed)
+        )
 
     def _should_withhold_post_processing_offer(self, bridge_data: reGenBridgeData) -> bool:
         """Return whether this pop should stop advertising post-processing until the lane catches up."""
         if not bridge_data.post_processing_lane_enabled:
             return False
-        return self._post_processing_backlog_depth() >= _POST_PROCESSING_OFFER_BACKLOG_LIMIT
+        return self._post_processing_commitment_depth() >= _POST_PROCESSING_OFFER_COMMITMENT_LIMIT
 
     @property
     def _lora_disk_permits(self) -> bool:

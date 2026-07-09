@@ -258,11 +258,12 @@ no-image faults. See
 picture, including how lane failures are reported as no-image faults rather than
 silently submitting raw images for jobs that requested post-processing.
 
-When the local post-processing backlog reaches two pending/running chains, the
-image popper temporarily withholds `allow_post_processing` but continues popping
-ordinary generation work. This backlog shaping is separate from the fault breaker:
-it clears automatically as the lane drains and does not mean the worker is unable
-to serve non-post-processing jobs.
+When the worker already has two accepted jobs that still need post-processing,
+the image popper temporarily withholds `allow_post_processing` but continues
+popping ordinary generation work. This count includes jobs still queued or
+running inference, not only jobs already at the lane. The shaping is separate
+from the fault breaker: it clears automatically as the commitments drain and
+does not mean the worker is unable to serve non-post-processing jobs.
 
 `post_processing_fault_breaker_enabled` is the self-protective backstop. If
 post-processing peaks keep failing to host (more than
