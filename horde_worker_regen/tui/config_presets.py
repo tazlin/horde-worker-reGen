@@ -11,7 +11,7 @@ class PresetCategory(StrEnum):
     """High-level grouping for preset changes."""
 
     THROUGHPUT = "Throughput"
-    WORKLOAD = "Workload"
+    WORKLOAD = "Models"
     FEATURES = "Features"
     DOWNLOADS = "LoRA & Downloads"
     SAFETY = "Safety"

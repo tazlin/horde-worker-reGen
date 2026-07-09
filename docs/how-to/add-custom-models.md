@@ -5,7 +5,7 @@ Serving custom models requires the `customizer` role. Request it on
 
 With the role, the easiest path is the dashboard **Config** tab:
 
-1. Open **Config → Workload**.
+1. Open **Config → Models**.
 2. Use **Add custom model...** in the Custom models section.
 3. Enter the served model name, choose the baseline, and enter the local model file path.
 4. Leave **Also add this model name to the Offer list** checked unless you only want to define the model now.

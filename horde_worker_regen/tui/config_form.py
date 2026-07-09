@@ -167,7 +167,7 @@ SECTIONS = (
 # requires long scrolling. Order is the tab order; "Models" is its own tab (the unified panel).
 CONFIG_SUBTABS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Essentials", ("Connection", "Identity", "Roles")),
-    ("Workload", ("Models", "Workload policy")),
+    ("Models", ("Models", "Workload policy")),
     ("Throughput", ("Throughput", "Memory & performance")),
     ("Content", ("Content & safety",)),
     ("Features", ("Features",)),
