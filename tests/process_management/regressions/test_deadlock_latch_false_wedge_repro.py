@@ -178,3 +178,19 @@ async def test_inference_suppression_zeroes_only_the_queue_wedge_term() -> None:
     now = time.time()
     pm._recovery_coordinator.orphan_punt_history = [now] * pm._recovery_coordinator.ORPHAN_PUNT_WEDGE_THRESHOLD
     assert pm._recovery_coordinator.assess_wedge() is True
+
+
+async def test_new_inference_start_counts_as_recovery_episode_progress() -> None:
+    """A recovery episode should not persist as unchanged after accepted work starts running."""
+    pm = make_testable_process_manager()
+    coordinator = pm._recovery_coordinator
+    tracker = pm._job_tracker
+
+    coordinator.episode_progress_baseline = tracker.total_num_completed_jobs
+    coordinator.episode_inference_start_baseline = tracker.total_num_inference_starts
+
+    job = make_job_pop_response(model="resident")
+    await track_popped_job_async(tracker, job)
+    await tracker.mark_inference_started(job)
+
+    assert coordinator.made_progress_since_episode() is True

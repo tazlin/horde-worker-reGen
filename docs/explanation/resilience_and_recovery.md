@@ -210,6 +210,12 @@ manager-side **actions**:
   `run_recovery_supervisor()` runs each control-loop tick and applies the
   returned action.
 
+  A wedge episode is allowed to close only after a clean streak, but the
+  supervisor still credits objective forward movement during the episode. A job
+  completion or a new inference start proves accepted work is moving again, so
+  stale unrecoverable-pool state is cleared instead of carrying a past queue
+  deadlock into another soft reset.
+
 The escalation, in order:
 
 1. **Soft reset (bounded)** (`perform_soft_reset`): rebuild the process pools

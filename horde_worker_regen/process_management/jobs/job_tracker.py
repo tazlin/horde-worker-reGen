@@ -264,6 +264,7 @@ class JobTrackerSnapshot:
 
     num_jobs_faulted: int
     total_num_completed_jobs: int
+    total_num_inference_starts: int
     max_pending_megapixelsteps: int
     triggered_max_pending_megapixelsteps: bool
     triggered_max_pending_megapixelsteps_time: float
@@ -285,6 +286,7 @@ class JobTracker:
 
         self._num_jobs_faulted = 0
         self._total_num_completed_jobs = 0
+        self._total_num_inference_starts = 0
         self._max_pending_megapixelsteps = 25
         self._triggered_max_pending_megapixelsteps_flag = False
         self._triggered_max_pending_megapixelsteps_time_value = 0.0
@@ -700,6 +702,11 @@ class JobTracker:
         return self._total_num_completed_jobs
 
     @property
+    def total_num_inference_starts(self) -> int:
+        """Return the total number of inference attempts dispatched this session."""
+        return self._total_num_inference_starts
+
+    @property
     def num_jobs_faulted(self) -> int:
         """Return the total number of faulted jobs recorded this session."""
         return self._num_jobs_faulted
@@ -719,6 +726,7 @@ class JobTracker:
             job_pop_timestamps=self.job_pop_timestamps,
             num_jobs_faulted=self._num_jobs_faulted,
             total_num_completed_jobs=self._total_num_completed_jobs,
+            total_num_inference_starts=self._total_num_inference_starts,
             max_pending_megapixelsteps=self._max_pending_megapixelsteps,
             triggered_max_pending_megapixelsteps=self._triggered_max_pending_megapixelsteps_flag,
             triggered_max_pending_megapixelsteps_time=self._triggered_max_pending_megapixelsteps_time_value,
@@ -819,6 +827,7 @@ class JobTracker:
             if job.id_ is None:
                 logger.error("Cannot mark a job without a generation ID as in progress")
                 return
+            self._total_num_inference_starts += 1
             logger.debug(f"Job {job.id_} was not tracked when inference started; registering it now")
             self._register(
                 job_id=job.id_,
@@ -831,6 +840,8 @@ class JobTracker:
             if new_tracked is not None:
                 new_tracked.last_dispatched_device_index = device_index
             return
+        if tracked.stage != JobStage.INFERENCE_IN_PROGRESS:
+            self._total_num_inference_starts += 1
         tracked.last_dispatched_device_index = device_index
         self._set_stage(tracked, JobStage.INFERENCE_IN_PROGRESS)
 

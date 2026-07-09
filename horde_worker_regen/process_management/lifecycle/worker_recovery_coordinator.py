@@ -107,6 +107,7 @@ class WorkerRecoveryCoordinator:
         self.limp_by_active = False
         self.episode_saw_unrecoverable_pool = False
         self.episode_progress_baseline: int | None = None
+        self.episode_inference_start_baseline: int | None = None
         self.recovery_event_times: list[float] = []
         self.last_seen_recovery_count = 0
         self.orphan_in_progress_since: dict[GenerationID, float] = {}
@@ -472,10 +473,13 @@ class WorkerRecoveryCoordinator:
         )
 
     def made_progress_since_episode(self) -> bool:
-        """Return whether a job completed since the current wedge episode opened."""
-        if self.episode_progress_baseline is None:
+        """Return whether accepted work moved forward since the current wedge episode opened."""
+        if self.episode_progress_baseline is None or self.episode_inference_start_baseline is None:
             return False
-        return self._job_tracker.total_num_completed_jobs > self.episode_progress_baseline
+        return (
+            self._job_tracker.total_num_completed_jobs > self.episode_progress_baseline
+            or self._job_tracker.total_num_inference_starts > self.episode_inference_start_baseline
+        )
 
     def maybe_abort_on_runaway_recoveries(self) -> bool:
         """Abort if process recoveries are flapping faster than the rolling-window ceiling."""
@@ -532,8 +536,10 @@ class WorkerRecoveryCoordinator:
         if self.recovery_supervisor.is_in_episode:
             if self.episode_progress_baseline is None:
                 self.episode_progress_baseline = self._job_tracker.total_num_completed_jobs
+                self.episode_inference_start_baseline = self._job_tracker.total_num_inference_starts
         else:
             self.episode_progress_baseline = None
+            self.episode_inference_start_baseline = None
             self.episode_saw_unrecoverable_pool = False
         if action is RecoveryAction.SOFT_RESET:
             self.perform_soft_reset()
