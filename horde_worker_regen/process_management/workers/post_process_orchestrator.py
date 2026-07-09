@@ -86,6 +86,7 @@ class PostProcessOrchestrator:
         reserve_ledger: CommittedReserveLedger,
         request_vram_reclaim: Callable[[HordeProcessInfo, int], bool],
         sampling_coresidency_check: Callable[[float], bool] | None = None,
+        whole_card_residency_active: Callable[[], bool] = lambda: False,
     ) -> None:
         """Initialize the orchestrator with references to its dependencies.
 
@@ -102,6 +103,7 @@ class PostProcessOrchestrator:
             request_vram_reclaim: Callback that asks the scheduler to evict idle VRAM on the lane's card.
             sampling_coresidency_check: Given a chain's estimated peak (MB), whether the card can run it
                 alongside the sampling currently in progress. None (unit tests) allows co-running always.
+            whole_card_residency_active: Whether a whole-card residency still owns the lane pause.
         """
         self._process_map = process_map
         self._job_tracker = job_tracker
@@ -112,6 +114,7 @@ class PostProcessOrchestrator:
         self._reserve_ledger = reserve_ledger
         self._request_vram_reclaim = request_vram_reclaim
         self._sampling_coresidency_check = sampling_coresidency_check
+        self._whole_card_residency_active = whole_card_residency_active
         # Overridable so the load simulator can drive the aging window off its virtual clock; monotonic
         # keeps the window immune to wall-clock jumps.
         self._clock = time.monotonic
@@ -290,6 +293,8 @@ class PostProcessOrchestrator:
 
         now = self._clock()
 
+        self._ensure_lane_liveness_for_pending_work()
+
         post_process_process = self._process_map.get_first_available_post_process_process()
         if post_process_process is not None and await self._try_dispatch_first_fittable(
             pending=pending,
@@ -327,6 +332,24 @@ class PostProcessOrchestrator:
         # A no-image fault needs no lane, so age out unservable jobs whether or not the lane is free: a
         # busy or unfittable head must never hold a long-waiting job past its patience window.
         await self._age_out_unfittable(now=now)
+
+    def _ensure_lane_liveness_for_pending_work(self) -> None:
+        """Ask lifecycle for a lane when pending work has no live dispatch target."""
+        if self._process_map.num_post_process_processes() > 0:
+            return
+
+        pause_owner = self._process_lifecycle.post_process_pause_owner
+        if pause_owner is PauseOwner.WHOLE_CARD:
+            if (
+                not self._whole_card_residency_active()
+                and not self._job_tracker.jobs_pending_inference
+                and not self._job_tracker.jobs_in_progress
+            ):
+                self._process_lifecycle.restore_post_process_off_gpu(owner=PauseOwner.WHOLE_CARD)
+            return
+
+        if pause_owner is None:
+            self._process_lifecycle.start_post_process_processes()
 
     async def _try_dispatch_first_fittable(
         self,

@@ -33,8 +33,10 @@ There are two termination paths:
    popping new jobs.
 3. [`InferenceScheduler`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler]
    stops dispatching new inference jobs.
-4. [`SafetyOrchestrator`][horde_worker_regen.process_management.workers.safety_orchestrator.SafetyOrchestrator]
-   stops dispatching new safety checks.
+4. The control loop keeps draining accepted image work after inference: it continues to dispatch pending
+   post-processing and safety checks, submit completed results, replace failed downstream lane processes, and
+   reconcile orphaned downstream jobs until no post-inference image work remains or the timed backstop forces
+   a terminal fault.
 5. [`AlchemyCoordinator`][horde_worker_regen.process_management.jobs.alchemy_popper.AlchemyCoordinator]
    stops its pop/dispatch/submit loop (it checks the shutdown manager each iteration).
 6. [`JobSubmitter`][horde_worker_regen.process_management.jobs.job_submitter.JobSubmitter] continues

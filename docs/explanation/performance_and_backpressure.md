@@ -142,9 +142,11 @@ to stop all image intake. When the worker already has two or more accepted
 post-processing commitments, the next image pop keeps ordinary generation enabled and
 temporarily stops advertising `allow_post_processing`. A commitment includes a queued or
 running inference job that requested post-processing as well as a job already waiting for
-or running on the PP lane, so a burst of large batched PP jobs is counted before the first
-one finishes inference. This gives the single lane a chance to drain without blocking
-non-post-processing jobs that the inference pool can still serve.
+or running on the PP lane, plus graph-backed alchemy forms waiting for or running on that
+same lane. This means a burst of large batched PP jobs is counted before the first one
+finishes inference, and alchemy cannot hide lane occupancy from image-job offer shaping.
+The single lane gets a chance to drain without blocking non-post-processing jobs that the
+inference pool can still serve.
 
 This shaping applies only while the dedicated post-processing lane is enabled. It composes
 after the normal feature-readiness checks and the post-processing fault breaker: if

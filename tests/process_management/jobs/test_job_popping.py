@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Callable
 from unittest.mock import AsyncMock, Mock, patch
 
 from horde_sdk import RequestErrorResponse
@@ -54,6 +55,7 @@ def _make_popper(
     image_models_to_load: list[str] | None = None,
     dry_run_skip_api: bool = False,
     model_availability: ModelAvailability | None = None,
+    post_processing_lane_commitments_provider: Callable[[], int] | None = None,
 ) -> JobPopper:
     """Build a JobPopper with mostly-mocked dependencies."""
     if state is None:
@@ -88,6 +90,7 @@ def _make_popper(
         max_concurrent_inference_processes=max_concurrent_inference_processes,
         dry_run_skip_api=dry_run_skip_api,
         model_availability=model_availability,
+        post_processing_lane_commitments_provider=post_processing_lane_commitments_provider,
     )
 
 
@@ -446,6 +449,7 @@ class TestPostProcessingBacklogOfferShaping:
         allow_post_processing: bool = True,
         availability: ModelAvailability | None = None,
         urgent: bool = False,
+        shared_lane_commitments: int = 0,
     ) -> tuple[object, WorkerState]:
         """Drive one pop with configured post-processing commitments and return the request and state."""
         job_tracker = JobTracker()
@@ -469,6 +473,7 @@ class TestPostProcessingBacklogOfferShaping:
                 queue_size=8,
             ),
             model_availability=availability,
+            post_processing_lane_commitments_provider=lambda: shared_lane_commitments,
         )
 
         await popper.api_job_pop(urgent=urgent)
@@ -516,6 +521,15 @@ class TestPostProcessingBacklogOfferShaping:
         )
 
         assert request.allow_post_processing is True
+
+    async def test_graph_alchemy_lane_commitments_suppress_post_processing_offer(self) -> None:
+        """Graph alchemy occupies the same post-processing lane and counts toward offer shaping."""
+        request, _state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=0,
+            shared_lane_commitments=2,
+        )
+
+        assert request.allow_post_processing is False
 
     async def test_disabled_lane_does_not_apply_backlog_offer_shaping(self) -> None:
         """A stale pending-post-processing count is ignored when no dedicated lane is active."""

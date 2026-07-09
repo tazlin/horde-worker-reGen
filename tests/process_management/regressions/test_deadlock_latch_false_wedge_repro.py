@@ -188,6 +188,7 @@ async def test_new_inference_start_counts_as_recovery_episode_progress() -> None
 
     coordinator.episode_progress_baseline = tracker.total_num_completed_jobs
     coordinator.episode_inference_start_baseline = tracker.total_num_inference_starts
+    coordinator.episode_post_processing_progress_baseline = tracker.total_num_post_processing_progress
 
     job = make_job_pop_response(model="resident")
     await track_popped_job_async(tracker, job)

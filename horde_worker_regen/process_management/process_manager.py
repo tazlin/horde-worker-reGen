@@ -1272,6 +1272,7 @@ class HordeWorkerProcessManager:
                     pp_reserve_mb=pp_reserve_mb,
                 )
             ),
+            whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
         )
         self._post_process_orchestrator.set_vram_arbiter(self._vram_arbiter)
 
@@ -1347,6 +1348,11 @@ class HordeWorkerProcessManager:
             model_metadata=self._model_metadata,
             whole_card_residency_active=self._inference_scheduler.is_whole_card_residency_active,
             admission_baseline_provider=self.latest_baseline_estimate_mb,
+            post_processing_lane_commitments_provider=lambda: getattr(
+                getattr(self, "_alchemy_coordinator", None),
+                "num_graph_forms_waiting_or_running",
+                0,
+            ),
         )
 
         # Tracks the live spell and session totals of every pop/scheduling governor, fed once per control-loop
@@ -2967,6 +2973,21 @@ class HordeWorkerProcessManager:
             self._process_lifecycle.replace_hung_processes()
             await asyncio.sleep(0.2)
 
+        while self._has_post_inference_image_work() and not self._state.shut_down:
+            await asyncio.sleep(0.2)
+            await self.receive_and_handle_process_messages()
+            if len(self._job_tracker.jobs_pending_safety_check) > 0:
+                await self.start_evaluate_safety()
+            if len(self._job_tracker.jobs_pending_post_processing) > 0:
+                await self.start_post_processing()
+            await self._job_submitter.api_submit_job()
+            self._process_lifecycle.replace_hung_processes()
+            self._process_lifecycle._replace_all_safety_process()
+            self._process_lifecycle._replace_all_post_process_process()
+            await self._recovery_coordinator.reconcile_orphaned_safety_jobs()
+            await self._recovery_coordinator.reconcile_orphaned_post_process_jobs()
+            await asyncio.sleep(0.2)
+
         self._gpu_sampler.stop()
         self._wddm_paging_monitor.stop()
         self._process_lifecycle.end_inference_processes(force=True)
@@ -2986,6 +3007,16 @@ class HordeWorkerProcessManager:
     def detect_deadlock(self) -> None:
         """Detect if there are jobs in the queue but no processes doing anything."""
         self._message_dispatcher.detect_deadlock()
+
+    def _has_post_inference_image_work(self) -> bool:
+        """Return whether accepted image work remains after the inference stage."""
+        return bool(
+            self._job_tracker.jobs_pending_safety_check
+            or self._job_tracker.jobs_being_safety_checked
+            or self._job_tracker.jobs_pending_post_processing
+            or self._job_tracker.jobs_being_post_processed
+            or self._job_tracker.jobs_pending_submit
+        )
 
     _DISK_SAMPLE_INTERVAL_SECONDS = 30.0
 

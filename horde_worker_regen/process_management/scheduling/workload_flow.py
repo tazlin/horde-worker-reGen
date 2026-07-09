@@ -70,8 +70,8 @@ def capabilities_for_workload(kind: WorkloadKind) -> WorkerCapability:
 def capability_for_alchemy_form(form: str) -> WorkerCapability:
     """Return the single capability a process must declare to serve the given alchemy form.
 
-    Graph-backed forms (upscalers, facefixers, strip_background) run on inference processes; every other
-    form (caption, interrogation, nsfw) runs on the CLIP stack in the safety process. This is the one
+    Graph-backed forms (upscalers, facefixers, strip_background) run on the post-processing lane; every
+    other form (caption, interrogation, nsfw) runs on the CLIP stack in the safety process. This is the one
     place the form-to-capability routing fact lives.
     """
     if is_upscaler_form(form) or is_facefixer_form(form) or is_strip_background_form(form):

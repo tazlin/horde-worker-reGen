@@ -58,25 +58,27 @@ class TestStartPostProcessing:
         await process_manager.start_post_processing()
 
     async def test_no_lane_process_leaves_job_pending(self) -> None:
-        """A queued job stays pending when no lane process is available."""
+        """A queued job requests lane startup and stays pending until a lane is available."""
         process_manager = make_testable_process_manager()
+        process_manager._process_lifecycle.start_post_process_processes = Mock(return_value=False)  # type: ignore[method-assign]
         job_info = _make_pp_job_info()
         await process_manager._job_tracker.queue_for_post_processing(job_info)
 
         await process_manager.start_post_processing()
 
+        process_manager._process_lifecycle.start_post_process_processes.assert_called_once()
         assert job_info in process_manager._job_tracker.jobs_pending_post_processing
         assert job_info not in process_manager._job_tracker.jobs_being_post_processed
 
     async def test_absent_lane_ages_job_out_to_no_image_fault(self) -> None:
         """With no lane process (and no deliberate pause), a pending job's patience clock starts.
 
-        Deferral records are otherwise only created against a live lane process; without this arming, a
-        job queued while the lane is dead (crash, failed restart) would never age out and would wait
-        forever, wedging the drain. Once the patience window elapses the job is reported faulted without
-        images so the horde reissues it to another worker.
+        The orchestrator asks lifecycle to restore the lane, but if the lane still is not present after that
+        request the job must age out rather than wait forever. Once the patience window elapses the job is
+        reported faulted without images so the horde reissues it to another worker.
         """
         process_manager = make_testable_process_manager()
+        process_manager._process_lifecycle.start_post_process_processes = Mock(return_value=False)  # type: ignore[method-assign]
         job_info = _make_pp_job_info()
         await process_manager._job_tracker.queue_for_post_processing(job_info)
 
@@ -148,6 +150,7 @@ class TestStartPostProcessing:
         process_manager = make_testable_process_manager()
         process_manager._process_lifecycle._post_process_gpu_paused = True
         process_manager._process_lifecycle._post_process_pause_owner = PauseOwner.WHOLE_CARD
+        process_manager._post_process_orchestrator._whole_card_residency_active = lambda: True  # type: ignore[method-assign]
         job_info = _make_pp_job_info()
         await process_manager._job_tracker.queue_for_post_processing(job_info)
 

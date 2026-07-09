@@ -212,9 +212,13 @@ manager-side **actions**:
 
   A wedge episode is allowed to close only after a clean streak, but the
   supervisor still credits objective forward movement during the episode. A job
-  completion or a new inference start proves accepted work is moving again, so
-  stale unrecoverable-pool state is cleared instead of carrying a past queue
-  deadlock into another soft reset.
+  completion or a new inference start proves upstream accepted work is moving
+  again, so stale unrecoverable-pool state is cleared instead of carrying a past
+  queue deadlock into another soft reset. When accepted post-processing work is
+  still pending or running, though, upstream starts are not enough: only a
+  post-processing drain transition (dispatch to the lane, requeue after a lost
+  attempt, processed result moving to safety, or no-image fault) proves that the
+  downstream lane itself is making headway.
 
 The escalation, in order:
 

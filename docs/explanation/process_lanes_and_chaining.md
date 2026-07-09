@@ -63,6 +63,15 @@ chain from parking the queue:
 - **One-shot reclaim**: an unfittable job asks the scheduler to evict idle VRAM once per starvation episode,
   not once per scheduling tick, so deferral does not churn idle inference residency in a loop.
 
+Pending post-processing work also owns lane liveness. If the queue is non-empty and no `POST_PROCESS` process
+exists, the orchestrator asks lifecycle to start the lane; lifecycle still owns the actual admission checks
+(the operator setting, GPU-start headroom, pending starts, and deliberate off-GPU pauses). If the lane remains
+absent after that request, the same admission-patience clock runs so the job cannot sit in
+`PENDING_POST_PROCESSING` forever. The exception is an active whole-card residency pause: that pause is expected
+to restore itself when the resident model releases the card, so the patience clock stays unarmed while residency
+is still active. If a whole-card pause is left behind after residency and inference work have drained, pending
+post-processing restores that owner-scoped pause and then re-enters the normal lane-start path.
+
 The overlap gate is keyed to active sampling on the lane's card, not to every job in the inference
 `IN_PROGRESS` stage. A job that is only blocked in `DOWNLOADING_AUX_MODEL` holds an in-flight slot but is not
 using the GPU for denoising, so already-popped post-processing work is admitted and drained before any
@@ -76,9 +85,10 @@ preloading is treated as speculative work in this state and yields to the same p
 The popper protects the lane from growing its own downstream queue without stopping ordinary image work. Once
 two or more accepted jobs still need post-processing, the next image pop temporarily withholds
 `allow_post_processing` while keeping normal generation capabilities advertised. The count includes jobs still
-queued or running inference, so back-to-back batched PP jobs are visible before they reach the lane. When the
-commitment count drains below that point, post-processing is offered again, subject to the normal operator
-setting, model-readiness gate, and fault breaker.
+queued or running inference and graph-backed alchemy forms waiting for or running on the same lane, so
+back-to-back batched PP jobs and alchemy lane occupancy are visible before the image job reaches the lane.
+When the commitment count drains below that point, post-processing is offered again, subject to the normal
+operator setting, model-readiness gate, and fault breaker.
 
 A post-processing failure never falls back to raw submission. Requested post-processing is part of the
 worker's contract for that job; if the lane cannot honor it, the worker submits a no-image fault so the horde
@@ -133,5 +143,6 @@ stage did not complete.
 5. **Submit**: unchanged; the chain closes out (`SUBMIT_COMPLETE`) when the job finalizes.
 
 Graph alchemy forms (standalone upscale/facefix/strip_background jobs) ride the same lane via the
-`ALCHEMY_GRAPH` capability; CLIP forms (caption/interrogation/nsfw) stay on the safety process. The alchemy
-coordinator did not change: only the capability-to-process mapping moved.
+`ALCHEMY_GRAPH` capability and count as lane commitments while they are pending or in flight; CLIP forms
+(caption/interrogation/nsfw) stay on the safety process. The alchemy coordinator owns its own pop/submit
+loop, but the image popper reads its graph-lane commitment count for post-processing offer shaping.

@@ -265,6 +265,7 @@ class JobTrackerSnapshot:
     num_jobs_faulted: int
     total_num_completed_jobs: int
     total_num_inference_starts: int
+    total_num_post_processing_progress: int
     max_pending_megapixelsteps: int
     triggered_max_pending_megapixelsteps: bool
     triggered_max_pending_megapixelsteps_time: float
@@ -287,6 +288,7 @@ class JobTracker:
         self._num_jobs_faulted = 0
         self._total_num_completed_jobs = 0
         self._total_num_inference_starts = 0
+        self._total_num_post_processing_progress = 0
         self._max_pending_megapixelsteps = 25
         self._triggered_max_pending_megapixelsteps_flag = False
         self._triggered_max_pending_megapixelsteps_time_value = 0.0
@@ -707,6 +709,11 @@ class JobTracker:
         return self._total_num_inference_starts
 
     @property
+    def total_num_post_processing_progress(self) -> int:
+        """Return the total number of post-processing drain transitions this session."""
+        return self._total_num_post_processing_progress
+
+    @property
     def num_jobs_faulted(self) -> int:
         """Return the total number of faulted jobs recorded this session."""
         return self._num_jobs_faulted
@@ -727,6 +734,7 @@ class JobTracker:
             num_jobs_faulted=self._num_jobs_faulted,
             total_num_completed_jobs=self._total_num_completed_jobs,
             total_num_inference_starts=self._total_num_inference_starts,
+            total_num_post_processing_progress=self._total_num_post_processing_progress,
             max_pending_megapixelsteps=self._max_pending_megapixelsteps,
             triggered_max_pending_megapixelsteps=self._triggered_max_pending_megapixelsteps_flag,
             triggered_max_pending_megapixelsteps_time=self._triggered_max_pending_megapixelsteps_time_value,
@@ -1019,6 +1027,7 @@ class JobTracker:
                 f"{tracked.stage.name}; keeping its existing result.",
             )
             return
+        self._total_num_post_processing_progress += 1
         tracked.job_info = job_info
         tracked.post_process_process_id = None
         tracked.post_process_launch_identifier = None
@@ -1038,6 +1047,7 @@ class JobTracker:
             )
             return
         if self._set_stage(tracked, JobStage.POST_PROCESSING):
+            self._total_num_post_processing_progress += 1
             tracked.post_process_process_id = process_id
             tracked.post_process_launch_identifier = process_launch_identifier
 
@@ -1076,6 +1086,7 @@ class JobTracker:
             return False
         requeued = self._set_stage(tracked, JobStage.PENDING_POST_PROCESSING)
         if requeued:
+            self._total_num_post_processing_progress += 1
             tracked.post_process_process_id = None
             tracked.post_process_launch_identifier = None
         return requeued
@@ -1129,6 +1140,7 @@ class JobTracker:
         if tracked is None:
             logger.error(f"Job {job_info.sdk_api_job_info.id_} is not tracked; cannot fault it")
             return
+        previous_stage = tracked.stage
         job_info.fault_job()
         tracked.job_info = job_info
         self._job_faults.setdefault(tracked.job_id, []).append(
@@ -1143,6 +1155,9 @@ class JobTracker:
                 f"Refusing to fault post-inference job {job_info.sdk_api_job_info.id_} from stage "
                 f"{tracked.stage.name}; keeping its existing state.",
             )
+            return
+        if previous_stage in (JobStage.PENDING_POST_PROCESSING, JobStage.POST_PROCESSING):
+            self._total_num_post_processing_progress += 1
 
     async def begin_safety_check(self, job_info: HordeJobInfo) -> None:
         """Begin the safety check process for a job."""

@@ -337,6 +337,7 @@ class JobPopper:
     _max_threads_ceiling: int
     _card_runtimes: dict[int, CardRuntime]
     _model_metadata: ModelMetadata | None
+    _post_processing_lane_commitments_provider: Callable[[], int]
 
     def __init__(
         self,
@@ -356,6 +357,7 @@ class JobPopper:
         model_metadata: ModelMetadata | None = None,
         whole_card_residency_active: Callable[[], bool] | None = None,
         admission_baseline_provider: Callable[[int | None], float | None] | None = None,
+        post_processing_lane_commitments_provider: Callable[[], int] | None = None,
     ) -> None:
         """Initialize with all required dependencies for job popping.
 
@@ -376,6 +378,11 @@ class JobPopper:
         `admission_baseline_provider` supplies the shared device baseline for model serviceability offer
         shaping. A missing provider or uncaptured baseline reads as zero and only defers the exclusion until
         the arithmetic is known.
+
+        `post_processing_lane_commitments_provider` reports non-image work that also occupies the dedicated
+        post-processing lane (currently graph alchemy). It is added to image-job post-processing commitments
+        for offer shaping, so the worker does not accept more image post-processing work while the shared lane
+        is already committed elsewhere.
         """
         self._state = state
         self._process_map = process_map
@@ -389,6 +396,11 @@ class JobPopper:
         self._serviceability_exclusion_logged: set[str] = set()
         self._whole_card_residency_active = (
             whole_card_residency_active if whole_card_residency_active is not None else (lambda: False)
+        )
+        self._post_processing_lane_commitments_provider = (
+            post_processing_lane_commitments_provider
+            if post_processing_lane_commitments_provider is not None
+            else (lambda: 0)
         )
         self._large_model_pop_governor = LargeModelPopGovernor()
 
@@ -711,15 +723,22 @@ class JobPopper:
 
         Count jobs before they reach the lane too: a burst of already-popped large PP jobs can otherwise sit in
         the inference queue and only become visible as post-processing pressure after the worker has accepted
-        several more PP jobs.
+        several more PP jobs. Graph alchemy forms share the same single lane, so an injected provider adds
+        their pending/running count without coupling the popper to the alchemy coordinator.
         """
         accepted_before_lane = sum(
             1 for job in self._job_tracker.jobs_pending_inference if bool(job.payload.post_processing)
         )
+        try:
+            shared_lane_commitments = max(0, int(self._post_processing_lane_commitments_provider()))
+        except Exception as e:  # advisory shaping must never break image popping
+            logger.debug(f"Post-processing lane commitment read failed: {type(e).__name__} {e}")
+            shared_lane_commitments = 0
         return (
             accepted_before_lane
             + len(self._job_tracker.jobs_pending_post_processing)
             + len(self._job_tracker.jobs_being_post_processed)
+            + shared_lane_commitments
         )
 
     def _should_withhold_post_processing_offer(self, bridge_data: reGenBridgeData) -> bool:

@@ -108,6 +108,7 @@ class WorkerRecoveryCoordinator:
         self.episode_saw_unrecoverable_pool = False
         self.episode_progress_baseline: int | None = None
         self.episode_inference_start_baseline: int | None = None
+        self.episode_post_processing_progress_baseline: int | None = None
         self.recovery_event_times: list[float] = []
         self.last_seen_recovery_count = 0
         self.orphan_in_progress_since: dict[GenerationID, float] = {}
@@ -474,7 +475,16 @@ class WorkerRecoveryCoordinator:
 
     def made_progress_since_episode(self) -> bool:
         """Return whether accepted work moved forward since the current wedge episode opened."""
-        if self.episode_progress_baseline is None or self.episode_inference_start_baseline is None:
+        if (
+            self.episode_progress_baseline is None
+            or self.episode_inference_start_baseline is None
+            or self.episode_post_processing_progress_baseline is None
+        ):
+            return False
+        if self._job_tracker.total_num_post_processing_progress > self.episode_post_processing_progress_baseline:
+            return True
+        if self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed:
+            # A downstream post-processing drain stall is not disproved by starting more upstream inference.
             return False
         return (
             self._job_tracker.total_num_completed_jobs > self.episode_progress_baseline
@@ -537,9 +547,11 @@ class WorkerRecoveryCoordinator:
             if self.episode_progress_baseline is None:
                 self.episode_progress_baseline = self._job_tracker.total_num_completed_jobs
                 self.episode_inference_start_baseline = self._job_tracker.total_num_inference_starts
+                self.episode_post_processing_progress_baseline = self._job_tracker.total_num_post_processing_progress
         else:
             self.episode_progress_baseline = None
             self.episode_inference_start_baseline = None
+            self.episode_post_processing_progress_baseline = None
             self.episode_saw_unrecoverable_pool = False
         if action is RecoveryAction.SOFT_RESET:
             self.perform_soft_reset()

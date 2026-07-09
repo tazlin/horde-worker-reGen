@@ -10,7 +10,7 @@ form is admitted only when *effective* free VRAM/RAM (measured free minus what i
 alchemy work has already committed) covers the form's predicted cost. The two flows therefore
 cannot independently admit against the same free VRAM the way two separate gates once could.
 
-Graph forms (upscalers, facefixers, strip_background) are dispatched to inference processes;
+Graph forms (upscalers, facefixers, strip_background) are dispatched to the post-processing lane;
 text-output forms (caption, interrogation, nsfw, vectorize) to the safety process. Dispatch is keyed
 on :class:`WorkerCapability`, not process type.
 """
@@ -419,6 +419,17 @@ class AlchemyCoordinator:
         return len(self._in_flight)
 
     @property
+    def num_graph_forms_waiting_or_running(self) -> int:
+        """Graph-backed forms still waiting for or occupying the shared post-processing lane."""
+        pending = sum(
+            1 for spec in self._pending_forms if required_capability(spec.form) is WorkerCapability.ALCHEMY_GRAPH
+        )
+        running = sum(
+            1 for spec in self._in_flight.values() if required_capability(spec.form) is WorkerCapability.ALCHEMY_GRAPH
+        )
+        return pending + running
+
+    @property
     def num_forms_awaiting_submit(self) -> int:
         """Forms with a result, waiting for API submission."""
         return len(self._pending_submits)
@@ -530,9 +541,9 @@ class AlchemyCoordinator:
         if not bridge_data.alchemy_allow_concurrent:
             return len(self._job_tracker.jobs_pending_inference) == 0
 
-        # Concurrent mode: graph forms share inference lanes with image generation, so only
-        # take a lane image work does not currently need. (CLIP-only forms run on the safety
-        # process and don't contend for image lanes, so they skip this check.)
+        # Concurrent mode: graph forms share a GPU-bearing lane with image work's post-processing tail, so
+        # only pop them while image generation has a spare dispatch lane. CLIP-only forms run on the safety
+        # process and don't contend for image lanes, so they skip this check.
         offers_graph = any(required_capability(form) is WorkerCapability.ALCHEMY_GRAPH for form in offered)
         if offers_graph and not self._has_spare_image_lane():
             return False
@@ -808,8 +819,8 @@ class AlchemyCoordinator:
 
         The per-form cost is charged by what the form actually allocates, not a flat figure:
 
-        - **Graph forms** (upscalers, facefixers, strip_background) load a post-processor onto an inference
-          process, so they reserve the estimator's current VRAM prediction (floored by
+        - **Graph forms** (upscalers, facefixers, strip_background) run on the post-processing process, so
+          they reserve the estimator's current VRAM prediction (floored by
           ``alchemy_vram_headroom_mb``). Those weights are also kept resident in system RAM, so the form
           additionally reserves ``alchemy_ram_headroom_mb`` of RAM. That RAM hold is what the image
           scheduler's RAM gate and this coordinator's own :meth:`_has_ram_headroom` subtract, so neither
