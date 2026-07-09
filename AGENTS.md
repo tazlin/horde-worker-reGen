@@ -13,6 +13,9 @@ linking a reader to a doc page over duplicating it here.
 >   `how-to/`, `tutorials/`, and `reference/` pages (e.g. `explanation/performance_and_backpressure.md`,
 >   `reference/codebase-map.md`, `reference/logs.md`). When you change a subsystem, find the page that
 >   describes it and bring it in line; do not assume a reviewer will.
+> - **Keep `docs/reference/codebase-map.md` current when the code shape changes.** If you add, remove, move,
+>   or rename an important module/package, entry point, process role/lane, manager/coordinator, CLI, durable
+>   state file, or major supporting top-level package, update the codebase map in the same change.
 > - **API reference pages auto-generate** from docstrings via `docs/build_docs.py`. After adding or
 >   removing a module under `horde_worker_regen/`, run `uv run --no-sync python docs/build_docs.py` and
 >   commit the regenerated stub(s). The page content still comes from your docstrings, so write them.
