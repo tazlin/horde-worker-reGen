@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
-from tests.process_management.conftest import make_mock_process_info
+from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
+from tests.process_management.conftest import make_mock_bridge_data, make_mock_process_info
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 
@@ -13,6 +15,18 @@ def _idle_resident(process_id: int, *, model: str, reserved_mb: int) -> object:
     info = make_mock_process_info(process_id, model_name=model, state=HordeProcessState.WAITING_FOR_JOB)
     info.process_reserved_mb = reserved_mb
     return info
+
+
+def _scheduler_with_reclaimable_lanes(*, process_map: ProcessMap, bridge_data: object) -> InferenceScheduler:
+    """Build a scheduler whose lane lifecycle flags are plain booleans for reclaim-candidate tests."""
+    scheduler = _make_inference_scheduler(process_map=process_map, bridge_data=bridge_data)  # type: ignore[arg-type]
+    scheduler._process_lifecycle.is_safety_gpu_paused = False
+    scheduler._process_lifecycle.is_post_process_gpu_paused = False
+    scheduler._process_lifecycle.is_vae_lane_gpu_paused = False
+    scheduler._process_lifecycle.is_component_gpu_paused = False
+    scheduler._process_lifecycle.vae_lane_enabled.return_value = False
+    scheduler._process_lifecycle.component_lane_enabled.return_value = False
+    return scheduler
 
 
 def test_busy_inference_process_is_not_a_reclaim_candidate() -> None:
@@ -79,3 +93,114 @@ def test_calibration_event_increments_the_counter() -> None:
     scheduler.record_calibration_event(rung, promised_mb=2000.0, realized_mb=100.0)
 
     assert scheduler._reclaim_calibration_events == 1
+
+
+def test_safety_off_gpu_rung_respects_residency_safety_setting() -> None:
+    """A safety process is not a safety-off-GPU candidate when safety teardown is disabled for residency."""
+    safety = make_mock_process_info(
+        10,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.SAFETY,
+    )
+    safety.process_reserved_mb = 3044  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({10: safety}),
+        bridge_data=make_mock_bridge_data(
+            safety_on_gpu=True,
+            whole_card_residency_safety_off_gpu=False,
+        ),
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert candidates.safety is None
+
+
+def test_safety_off_gpu_rung_is_available_when_operator_allows_safety_teardown() -> None:
+    """The safety-off-GPU rung remains available when both safety GPU placement and teardown are enabled."""
+    safety = make_mock_process_info(
+        10,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.SAFETY,
+    )
+    safety.process_reserved_mb = 3044  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({10: safety}),
+        bridge_data=make_mock_bridge_data(
+            safety_on_gpu=True,
+            whole_card_residency_safety_off_gpu=True,
+        ),
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert candidates.safety is not None
+    assert candidates.safety.kind is ReclaimRungKind.SAFETY_OFF_GPU
+
+
+def test_safety_off_gpu_rung_is_absent_when_safety_is_configured_cpu_side() -> None:
+    """A CPU-side safety configuration must not create an on-GPU safety teardown candidate."""
+    safety = make_mock_process_info(
+        10,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.SAFETY,
+    )
+    safety.process_reserved_mb = 3044  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({10: safety}),
+        bridge_data=make_mock_bridge_data(
+            safety_on_gpu=False,
+            whole_card_residency_safety_off_gpu=True,
+        ),
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert candidates.safety is None
+
+
+def test_post_processing_lane_rung_is_absent_when_lane_is_disabled() -> None:
+    """A disabled post-processing lane does not produce a lane-pause candidate from stale process state."""
+    post_process = make_mock_process_info(
+        1,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.POST_PROCESS,
+    )
+    post_process.process_reserved_mb = 1288  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({1: post_process}),
+        bridge_data=make_mock_bridge_data(
+            allow_post_processing=False,
+            post_processing_lane_enabled=False,
+        ),
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert all(candidate.kind is not ReclaimRungKind.PAUSE_PP_LANE for candidate in candidates.lanes)
+
+
+def test_post_processing_lane_rung_is_available_when_lane_is_enabled() -> None:
+    """An enabled idle post-processing lane remains available as a reclaim candidate."""
+    post_process = make_mock_process_info(
+        1,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.POST_PROCESS,
+    )
+    post_process.process_reserved_mb = 1288  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({1: post_process}),
+        bridge_data=make_mock_bridge_data(
+            allow_post_processing=True,
+            post_processing_lane_enabled=True,
+        ),
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert any(candidate.kind is ReclaimRungKind.PAUSE_PP_LANE for candidate in candidates.lanes)

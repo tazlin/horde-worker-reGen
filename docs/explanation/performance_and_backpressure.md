@@ -4,6 +4,7 @@
     - [The pop gauntlet](#the-pop-gauntlet)
     - [Megapixelstep backpressure](#megapixelstep-backpressure)
     - [Post-inference (safety) backpressure](#post-inference-safety-backpressure)
+    - [Post-processing offer shaping](#post-processing-offer-shaping)
     - [Model stickiness](#model-stickiness)
     - [Pop-rate throttling](#pop-rate-throttling)
     - [Queue sizing and the hold-back gate](#queue-sizing-and-the-hold-back-gate)
@@ -133,6 +134,22 @@ blocks growth), safety is restored to GPU service instead of leaving the backlog
 slower CPU path. On multi-GPU workers the same headroom-aware card choice is used, so a
 second card with room can take the safety context; on single-GPU workers the same rule
 applies to the one card.
+
+## Post-processing offer shaping
+
+The post-processing lane is also downstream of inference, but its backlog is not a reason
+to stop all image intake. When the worker already has two or more pending/running
+post-processing chains, the next image pop keeps ordinary generation enabled and
+temporarily stops advertising `allow_post_processing`. This gives the single lane a
+chance to drain without blocking non-post-processing jobs that the inference pool can
+still serve.
+
+This shaping applies only while the dedicated post-processing lane is enabled. It composes
+after the normal feature-readiness checks and the post-processing fault breaker: if
+post-processing models are missing, the operator disabled post-processing, or the breaker
+latched the feature off, the feature remains unadvertised regardless of backlog. Unlike
+safety backpressure, this does not record a skipped-pop reason because the pop still goes
+out.
 
 ## Model stickiness
 
@@ -547,8 +564,11 @@ It reclaims **LIFO** (most-recently-materialized tenant first). The driver demot
 allocator, so the newest idle resident is both the likeliest squatter and the cheapest to give back (its
 weights are still warm in RAM). The rung order is fixed: unload the newest idle resident model, then release
 the reclaimable allocator caches on idle processes (reserved-minus-allocated at or above the release
-threshold), then evict the older idle residents, then pause the post-processing, VAE, and component lanes in
-turn, then move safety off the GPU. An **actively-sampling process is never a rung**: it is the one process
+threshold), then evict the older idle residents, then pause the enabled lane rungs in order
+(post-processing, VAE, then component), then move safety off the GPU when the operator has allowed safety
+to leave the GPU for whole-card/reclaim pressure. A disabled post-processing lane, or a worker that is not
+offering post-processing at all, is not a pause candidate. An **actively-sampling process is never a rung**:
+it is the one process
 the driver did not demote, and tearing it down would trade a slow job for a faulted one. Both the candidate
 assembly and the targeted unload refuse a busy process, so immunity holds at two layers.
 
@@ -968,8 +988,9 @@ both limiters are off by default (zero / inherited-zero durations) and independe
 ### Governor observability
 
 These limiters, whole-card residency, and the other conditions that hold back or reshape pops (post-inference
-backpressure, the unservable-model holdback, the consecutive-failure and self-throttle pauses, pop
-error-backoff, the LoRA pop backoff, the megapixelstep wait, model stickiness) are all *governors*. They funnel
+backpressure, post-processing offer shaping, the unservable-model holdback, the consecutive-failure and
+self-throttle pauses, pop error-backoff, the LoRA pop backoff, the megapixelstep wait, model stickiness) are
+all *governors*. They funnel
 into one
 [`PopGovernorRegistry`][horde_worker_regen.process_management.scheduling.pop_governor_registry.PopGovernorRegistry],
 fed once per control-loop tick, which tracks each governor's current *spell* (when it engaged, why, how much

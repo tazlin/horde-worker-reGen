@@ -99,6 +99,14 @@ tick (thrash) and defeating the purpose of letting the slow stage catch up. Half
 stage a full margin to work down before more inference work is admitted, and because it is a fraction of the
 same deadline-derived cap it tracks that cap as measured safety speed and the horde ttl move."""
 
+_POST_PROCESSING_OFFER_BACKLOG_LIMIT = 2
+"""Pending/running post-processing chains at which the next pop stops advertising post-processing.
+
+This is offer shaping, not intake backpressure. The inference queue can keep accepting ordinary image jobs
+while the single post-processing lane catches up; only the capability that would add more downstream work is
+temporarily withheld.
+"""
+
 
 def _select_models_for_pop(
     bridge_data: reGenBridgeData,
@@ -698,6 +706,16 @@ class JobPopper:
             self._safety_backpressure_engaged = True
         return self._safety_backpressure_engaged
 
+    def _post_processing_backlog_depth(self) -> int:
+        """Return pending plus active post-processing chains currently owned by the worker."""
+        return len(self._job_tracker.jobs_pending_post_processing) + len(self._job_tracker.jobs_being_post_processed)
+
+    def _should_withhold_post_processing_offer(self, bridge_data: reGenBridgeData) -> bool:
+        """Return whether this pop should stop advertising post-processing until the lane catches up."""
+        if not bridge_data.post_processing_lane_enabled:
+            return False
+        return self._post_processing_backlog_depth() >= _POST_PROCESSING_OFFER_BACKLOG_LIMIT
+
     @property
     def _lora_disk_permits(self) -> bool:
         """Whether the worker-wide LoRA disk guard currently permits advertising LoRA support.
@@ -1103,6 +1121,9 @@ class JobPopper:
             pop_allow_controlnet = is_offered(readiness, GatedFeature.CONTROLNET)
             pop_allow_sdxl_controlnet = is_offered(readiness, GatedFeature.SDXL_CONTROLNET)
             pop_allow_post_processing = is_offered(readiness, GatedFeature.POST_PROCESSING)
+
+        if pop_allow_post_processing and self._should_withhold_post_processing_offer(bridge_data):
+            pop_allow_post_processing = False
 
         try:
             job_pop_request = ImageGenerateJobPopRequest(

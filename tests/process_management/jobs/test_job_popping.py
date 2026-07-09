@@ -117,6 +117,18 @@ async def _queue_n_jobs_for_safety(job_tracker: JobTracker, n: int) -> None:
         await job_tracker.queue_for_safety(job_info)
 
 
+async def _queue_n_jobs_for_post_processing(job_tracker: JobTracker, n: int) -> None:
+    """Place ``n`` jobs into the pending post-processing stage."""
+    for _ in range(n):
+        job = Mock()
+        job.id_ = uuid.uuid4()
+        job.model = "stable_diffusion"
+        job.payload.post_processing = ["RealESRGAN_x4plus"]
+        job_info = Mock()
+        job_info.sdk_api_job_info = job
+        await job_tracker.queue_for_post_processing(job_info)
+
+
 class TestApiJobPopGuardClauses:
     """Each guard clause in api_job_pop should short-circuit cleanly."""
 
@@ -405,6 +417,103 @@ class TestPostProcessingBreakerSuppression:
         request = await self._pop_and_capture_request(state=WorkerState())
 
         assert request.allow_post_processing is True
+
+
+class TestPostProcessingBacklogOfferShaping:
+    """Post-processing pressure narrows the advertised feature set without stopping unrelated intake."""
+
+    @staticmethod
+    async def _pop_and_capture_request(
+        *,
+        post_processing_backlog_depth: int,
+        post_processing_lane_enabled: bool = True,
+        allow_post_processing: bool = True,
+        availability: ModelAvailability | None = None,
+        urgent: bool = False,
+    ) -> tuple[object, WorkerState]:
+        """Drive one pop with a configured post-processing backlog and return the request and state."""
+        job_tracker = JobTracker()
+        await track_popped_job_async(job_tracker, make_mock_job())
+        await job_tracker.increment_jobs_completed()
+        await _queue_n_jobs_for_post_processing(job_tracker, post_processing_backlog_depth)
+
+        state = WorkerState(last_job_pop_time=time.time() if urgent else 0.0)
+        session = Mock()
+        session.submit_request = AsyncMock(return_value=RequestErrorResponse(message="no jobs"))
+        popper = _make_popper(
+            state=state,
+            job_tracker=job_tracker,
+            process_map=_make_process_map_with_available_processes(),
+            horde_client_session=session,
+            bridge_data=make_mock_bridge_data(
+                allow_post_processing=allow_post_processing,
+                post_processing_lane_enabled=post_processing_lane_enabled,
+            ),
+            model_availability=availability,
+        )
+
+        await popper.api_job_pop(urgent=urgent)
+
+        session.submit_request.assert_awaited_once()
+        return session.submit_request.call_args.args[0], state
+
+    async def test_deep_post_processing_backlog_suppresses_only_post_processing_offer(self) -> None:
+        """A saturated post-processing tail should not stop normal image pops."""
+        request, state = await self._pop_and_capture_request(post_processing_backlog_depth=2)
+
+        assert request.allow_post_processing is False
+        assert state.last_pop_skipped_reasons.get("post_processing_backlog") is None
+
+    async def test_shallow_post_processing_backlog_keeps_post_processing_offer(self) -> None:
+        """A single waiting post-processing job is within the lane's ordinary overlap budget."""
+        request, _state = await self._pop_and_capture_request(post_processing_backlog_depth=1)
+
+        assert request.allow_post_processing is True
+
+    async def test_disabled_lane_does_not_apply_backlog_offer_shaping(self) -> None:
+        """A stale pending-post-processing count is ignored when no dedicated lane is active."""
+        request, _state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=2,
+            post_processing_lane_enabled=False,
+        )
+
+        assert request.allow_post_processing is True
+
+    async def test_backlog_offer_shaping_runs_after_readiness_allows_feature(self) -> None:
+        """Readiness may allow post-processing while backlog pressure still suppresses the next offer."""
+        availability = ModelAvailability()
+        availability.update(
+            present={"stable_diffusion"},
+            currently_downloading=None,
+            pending=(),
+            failed=(),
+            post_processing_present=True,
+        )
+
+        request, _state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=2,
+            availability=availability,
+        )
+
+        assert request.allow_post_processing is False
+
+    async def test_urgent_pop_still_suppresses_post_processing_offer(self) -> None:
+        """The line-skip/urgent path may bypass cadence, but not the post-processing offer shape."""
+        request, _state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=2,
+            urgent=True,
+        )
+
+        assert request.allow_post_processing is False
+
+    async def test_configured_post_processing_off_stays_off_with_or_without_backlog(self) -> None:
+        """Backlog pressure must not re-enable a feature disabled by configuration."""
+        request, _state = await self._pop_and_capture_request(
+            post_processing_backlog_depth=0,
+            allow_post_processing=False,
+        )
+
+        assert request.allow_post_processing is False
 
 
 class TestPopAhead:
@@ -1546,9 +1655,9 @@ class TestAuxDownloadLineSkipPopBias:
 
     async def test_armed_flag_caps_oversized_max_power(self) -> None:
         """An armed flag caps a large configured max_power down to the line-skip resolution ceiling."""
-        request = await self._pop_and_capture_request(state=_armed_state(), max_power=64)
-
         ceiling = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
+        request = await self._pop_and_capture_request(state=_armed_state(), max_power=ceiling + 1)
+
         assert request.max_pixels == ceiling * 8 * 64 * 64
 
     async def test_armed_flag_caps_extreme_max_power(self) -> None:
@@ -1641,10 +1750,11 @@ class TestAuxDownloadLineSkipGateRelaxation:
         job_tracker = JobTracker()
         await _queue_head_model_jobs(job_tracker, 2)
         await job_tracker.increment_jobs_completed()
+        ceiling = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
         bridge = make_mock_bridge_data(
             image_models_to_load=["stable_diffusion", "sibling_model"],
             allow_lora=True,
-            max_power=64,
+            max_power=ceiling + 1,
         )
         popper, session = _make_line_skip_popper(state=_armed_state(), job_tracker=job_tracker, bridge_data=bridge)
 
@@ -1652,7 +1762,6 @@ class TestAuxDownloadLineSkipGateRelaxation:
 
         session.submit_request.assert_awaited_once()
         request: ImageGenerateJobPopRequest = session.submit_request.call_args.args[0]
-        ceiling = line_skip_pop_max_power(high_performance_mode=False, moderate_performance_mode=False)
         assert request.allow_lora is False
         assert request.max_pixels == ceiling * 8 * 64 * 64
 

@@ -5024,9 +5024,12 @@ class InferenceScheduler:
     def _reclaim_lane_candidates(self, device_index: int | None) -> tuple[LaneReclaimCandidate, ...]:
         """Build the lane-pause rungs in fixed escalation order for lanes currently on the GPU."""
         lifecycle = self._process_lifecycle
+        bridge_data = self._runtime_config.bridge_data
         lanes: list[LaneReclaimCandidate] = []
         if (
-            not lifecycle.is_post_process_gpu_paused
+            bridge_data.allow_post_processing
+            and bridge_data.post_processing_lane_enabled
+            and not lifecycle.is_post_process_gpu_paused
             and self._process_map.num_post_process_processes(device_index=device_index) > 0
         ):
             lanes.append(
@@ -5063,8 +5066,13 @@ class InferenceScheduler:
         return tuple(lanes)
 
     def _reclaim_safety_candidate(self, device_index: int | None) -> LaneReclaimCandidate | None:
-        """Build the safety-off-GPU rung when safety is configured on-GPU and not already paused."""
-        if not self._runtime_config.bridge_data.safety_on_gpu or self._process_lifecycle.is_safety_gpu_paused:
+        """Build the safety-off-GPU rung when the operator allows safety to leave the GPU."""
+        bridge_data = self._runtime_config.bridge_data
+        if (
+            not bridge_data.safety_on_gpu
+            or not bridge_data.whole_card_residency_safety_off_gpu
+            or self._process_lifecycle.is_safety_gpu_paused
+        ):
             return None
         reserved_mb = self._reserved_mb_for_type(HordeProcessType.SAFETY, device_index)
         return LaneReclaimCandidate(

@@ -389,6 +389,9 @@ while a safety check is pending or active (no mid-backlog churn), and re-promoti
 while a whole-card residency still needs safety off its card or the device-free governor is holding growth, so
 this policy fights neither the residency machinery nor the cliff brake.
 
+The verified reclaim ladder uses the same operator permission as whole-card safety movement: if
+`whole_card_residency_safety_off_gpu` is false, safety is not added as a reclaim rung even when it is on GPU.
+
 **Placement is headroom-aware across cards, not a fixed device 0.** One identity
 ([`_choose_safety_gpu_card`][horde_worker_regen.process_management.scheduling.inference_scheduler.InferenceScheduler])
 picks the driven card with the most verified headroom (measured device-free when reported, else card total less

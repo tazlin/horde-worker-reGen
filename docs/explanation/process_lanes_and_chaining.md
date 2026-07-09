@@ -45,7 +45,8 @@ The lane replaces prediction with structure:
 - The lane reports VRAM like an inference process. Its sample participates in `ProcessMap.get_free_vram_mb`,
   so the parent sees the same low-free-VRAM condition that would make ComfyUI tile or stream.
 - Idle reclaim commands apply to the lane too: under pressure, the scheduler can ask an idle `POST_PROCESS`
-  process to unload modules from VRAM/RAM. Active post-processing is never interrupted for reclaim.
+  process to unload modules from VRAM/RAM. Active post-processing is never interrupted for reclaim. The lane
+  is considered for whole-lane pause only when post-processing is enabled and the worker is still offering it.
 
 Admission to the lane is governed so a chain the card cannot host never wedges it. The orchestrator admits
 a job only when its estimated peak plus the VRAM reserve fits the lane card's free VRAM (with the budget on;
@@ -71,6 +72,12 @@ for later pending work whose estimated peak can co-reside. If no pending chain c
 sampler has just drained and the next sampler would also be unable to co-reside, the inference scheduler holds
 that next sampler so the lane gets the next drain window instead of extending the never-idle period. Model
 preloading is treated as speculative work in this state and yields to the same pending chain.
+
+The popper protects the lane from growing its own downstream queue without stopping ordinary image work. Once
+two or more post-processing chains are pending/running locally, the next image pop temporarily withholds
+`allow_post_processing` while keeping normal generation capabilities advertised. When the lane drains below
+that point, post-processing is offered again, subject to the normal operator setting, model-readiness gate, and
+fault breaker.
 
 A post-processing failure never falls back to raw submission. Requested post-processing is part of the
 worker's contract for that job; if the lane cannot honor it, the worker submits a no-image fault so the horde

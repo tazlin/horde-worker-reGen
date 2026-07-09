@@ -249,13 +249,20 @@ forecast and charges each active post-processing job's estimated upscale/face-fi
 peak through the shared committed-reserve ledger until its result returns. Under
 pressure, the scheduler can evict idle inference models and ask an idle
 post-processing lane to unload its modules from VRAM/RAM before starting more
-work. A pending chain that fits the card once drained gets the next drain window before a fresh sampler that
+work; the whole lane is a pause candidate only while post-processing is enabled
+and still offered. A pending chain that fits the card once drained gets the next drain window before a fresh sampler that
 would be unable to co-reside with it, and speculative model preloads yield to the same drain window so they
 do not recreate the pressure the lane is waiting to clear. Only structurally unhostable chains become
 no-image faults. See
 [Process lanes and job chaining](process_lanes_and_chaining.md) for the full
 picture, including how lane failures are reported as no-image faults rather than
 silently submitting raw images for jobs that requested post-processing.
+
+When the local post-processing backlog reaches two pending/running chains, the
+image popper temporarily withholds `allow_post_processing` but continues popping
+ordinary generation work. This backlog shaping is separate from the fault breaker:
+it clears automatically as the lane drains and does not mean the worker is unable
+to serve non-post-processing jobs.
 
 `post_processing_fault_breaker_enabled` is the self-protective backstop. If
 post-processing peaks keep failing to host (more than
