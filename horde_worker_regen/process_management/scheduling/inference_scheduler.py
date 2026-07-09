@@ -6528,9 +6528,9 @@ class InferenceScheduler:
 
         The counterpart of the orchestrator's chain-admission gate: together they time-slice a card that
         cannot hold a sampling peak and an upscale chain at once. Active chains hold dispatch until their
-        result lands. Pending chains can also hold dispatch while another sampler is already occupying the
-        lane card; otherwise a fresh sampler can keep the card never-idle and prevent the pending lane work
-        from ever getting its turn.
+        result lands. Pending chains can also hold dispatch before the next sampler starts; otherwise a
+        fresh sampler can keep the card never-idle and prevent the pending lane work from ever getting its
+        turn.
         """
         device_index = process_with_model.device_index if process_with_model is not None else None
 
@@ -6564,8 +6564,6 @@ class InferenceScheduler:
         pending_pp_reserve_mb = self._pending_post_processing_reserve_mb(device_index=device_index)
         if pending_pp_reserve_mb <= 0:
             return False
-        if self._process_map.num_busy_with_inference(device_index=device_index) <= 0:
-            return False
 
         sampling_peak_mb = self._sampling_peak_mb(next_job)
         affordable = self.pp_sampling_coresidency_affordable(
@@ -6577,8 +6575,8 @@ class InferenceScheduler:
             self._pp_mutex_hold_logged = True
             logger.info(
                 f"Holding dispatch of {next_job.model}: pending post-processing "
-                f"({pending_pp_reserve_mb:.0f}MB estimated) is waiting behind active sampling and this job's "
-                "sampling peak cannot share the card; dispatching when the lane has a drain window.",
+                f"({pending_pp_reserve_mb:.0f}MB estimated) needs the next drain window and this job's "
+                "sampling peak cannot share the card; dispatching after the lane gets its turn.",
             )
         if affordable:
             self._pp_mutex_hold_logged = False

@@ -958,6 +958,64 @@ class TestStartInference:
         assert result is False
         assert next_job not in job_tracker.jobs_in_progress
         assert target_process.last_control_flag != HordeControlFlag.START_INFERENCE
+
+    async def test_pending_post_processing_holds_next_sampler_after_card_goes_idle(self, monkeypatch: object) -> None:
+        """A feasible pending chain gets the next card turn after sampling drains."""
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            _sched_mod,
+            "predict_job_sampling_vram_mb",
+            lambda _job, _baseline: 8000.0,
+        )
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            _sched_mod,
+            "predict_job_post_processing_vram_mb",
+            lambda _job, _baseline_name: 4000.0,
+        )
+        target_process = make_mock_process_info(
+            0,
+            model_name="stable_diffusion",
+            state=HordeProcessState.PRELOADED_MODEL,
+        )
+        post_process_lane = make_mock_process_info(
+            7,
+            model_name=None,
+            state=HordeProcessState.WAITING_FOR_JOB,
+            process_type=HordeProcessType.POST_PROCESS,
+        )
+        process_map = ProcessMap({0: target_process, 7: post_process_lane})
+        horde_model_map = HordeModelMap(root={})
+        horde_model_map.update_entry(
+            horde_model_name="stable_diffusion",
+            load_state=ModelLoadState.LOADED_IN_RAM,
+            process_id=0,
+        )
+        job_tracker = JobTracker()
+        next_job = make_job_pop_response("stable_diffusion")
+        await track_popped_job_async(job_tracker, next_job)
+
+        pp_job = make_job_pop_response("stable_diffusion", post_processing=["RealESRGAN_x4plus"])
+        pp_job_info = HordeJobInfo(
+            sdk_api_job_info=pp_job,
+            job_image_results=[HordeImageResult(image_bytes=b"raw-image")],
+            state=GENERATION_STATE.ok,
+            censored=False,
+            time_popped=time.time(),
+        )
+        await job_tracker.queue_for_post_processing(pp_job_info)
+
+        inference_scheduler = _make_inference_scheduler(
+            process_map=process_map,
+            horde_model_map=horde_model_map,
+            job_tracker=job_tracker,
+            max_concurrent=2,
+        )
+        inference_scheduler.pp_sampling_coresidency_affordable = Mock(return_value=False)  # type: ignore[method-assign]
+
+        result = await inference_scheduler.start_inference()
+
+        assert result is False
+        assert next_job not in job_tracker.jobs_in_progress
+        assert target_process.last_control_flag != HordeControlFlag.START_INFERENCE
         inference_scheduler.pp_sampling_coresidency_affordable.assert_called_once_with(
             sampling_peak_mb=8000.0,
             pp_reserve_mb=4000.0,

@@ -67,9 +67,9 @@ The overlap gate is keyed to active sampling on the lane's card, not to every jo
 using the GPU for denoising, so already-popped post-processing work is admitted and drained before any
 line-skip candidate is launched to keep the card busy during that download. If sampling is active and one
 pending chain cannot safely co-run with it, the orchestrator records that chain's deferral but keeps scanning
-for later pending work whose estimated peak can co-reside. If no pending chain can co-run and the lane is
-waiting behind an active sampler, the inference scheduler holds the next sampler that would also be unable to
-co-reside, giving the lane a drain window instead of extending the never-idle period.
+for later pending work whose estimated peak can co-reside. If no pending chain can co-run, or if the current
+sampler has just drained and the next sampler would also be unable to co-reside, the inference scheduler holds
+that next sampler so the lane gets the next drain window instead of extending the never-idle period.
 
 A post-processing failure never falls back to raw submission. Requested post-processing is part of the
 worker's contract for that job; if the lane cannot honor it, the worker submits a no-image fault so the horde

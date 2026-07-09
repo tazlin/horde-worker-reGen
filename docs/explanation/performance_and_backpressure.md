@@ -305,9 +305,9 @@ Already-popped post-processing work has priority over the line-skip dispatch whi
 downloading auxiliary models. The post-processing overlap gate waits for active sampling on the PP lane's
 card, not for the broader in-progress job stage, so a `DOWNLOADING_AUX_MODEL` slot does not make the PP lane
 idle. The control loop drains pending PP work first; the line-skip job is then free to use the card once the
-lane has no immediately admissible image post-processing work. When active sampling keeps all pending PP
-chains from co-running, the next sampler that would also be non-co-resident waits, so the current sampler can
-finish and open a lane drain window instead of extending the PP backlog.
+lane has no immediately admissible image post-processing work. When pending PP chains cannot co-run with
+sampling, the next sampler that would also be non-co-resident waits, including just after the current sampler
+finishes, so the lane gets the next drain window instead of extending the PP backlog.
 
 ### Concurrent-overlap gating
 
