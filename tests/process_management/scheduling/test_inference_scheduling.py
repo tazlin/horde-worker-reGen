@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from unittest.mock import Mock
 
 import pytest
@@ -57,6 +58,7 @@ def _make_inference_scheduler(
     max_inference: int = 2,
     card_runtimes: dict[int, CardRuntime] | None = None,
     model_metadata: ModelMetadata | None = None,
+    post_processing_lane_commitments_provider: Callable[[], int] | None = None,
 ) -> InferenceScheduler:
     """Build an InferenceScheduler with mostly-mocked dependencies."""
     if state is None:
@@ -88,6 +90,7 @@ def _make_inference_scheduler(
         max_concurrent_inference_processes=max_concurrent,
         max_inference_processes=max_inference,
         lru=LRUCache(max_inference),
+        post_processing_lane_commitments_provider=post_processing_lane_commitments_provider,
         card_runtimes=card_runtimes,
     )
 

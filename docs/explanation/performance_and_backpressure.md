@@ -570,11 +570,12 @@ weights are still warm in RAM). The rung order is fixed: unload the newest idle 
 the reclaimable allocator caches on idle processes (reserved-minus-allocated at or above the release
 threshold), then evict the older idle residents, then pause the enabled lane rungs in order
 (post-processing, VAE, then component), then move safety off the GPU when the operator has allowed safety
-to leave the GPU for whole-card/reclaim pressure. A disabled post-processing lane, or a worker that is not
-offering post-processing at all, is not a pause candidate. An **actively-sampling process is never a rung**:
-it is the one process
-the driver did not demote, and tearing it down would trade a slow job for a faulted one. Both the candidate
-assembly and the targeted unload refuse a busy process, so immunity holds at two layers.
+to leave the GPU for whole-card/reclaim pressure. A disabled post-processing lane, a worker that is not
+offering post-processing at all, a non-idle `POST_PROCESS` process, or queued shared-lane work (image
+post-processing or graph-backed alchemy) is not a pause candidate. An **actively-sampling process is never a
+rung**: it is the one process the driver did not demote, and tearing it down would trade a slow job for a
+faulted one. Both the candidate assembly and the targeted unload refuse a busy process, so immunity holds at
+two layers.
 
 It **verifies**. A real release shows up in NVML device-used within a sample or two, so after issuing a rung
 the engine watches the next one or two governor samples and compares the realized device-free gain against
@@ -615,6 +616,13 @@ pause offers no such guarantee (a card stuck saturated may never recover to HEAL
 back), so a job stranded behind one runs the normal admission-patience countdown and, if the lane has not
 returned within the window, takes the existing raw-image fallback (faulted without images so the horde reissues
 it) rather than sitting in `PENDING_POST_PROCESSING` forever and wedging the drain.
+
+The post-processing drain uses a fresh arbiter snapshot. The control loop refreshes the frozen device picture
+immediately before asking the lane admission gate to run, then refreshes it again before the normal governance
+and inference-scheduling pass. When the scheduler is holding sampling so a pending chain can drain, that chain
+is the head of the drain queue; its arbiter request therefore carries head-of-queue priority for the
+foreign-pressure or phantom-ledger reality admit after reclaim is exhausted. Without that priority, dispatch can
+wait for the lane while the lane waits behind a generic non-head denial.
 
 ### The per-step floor: fast crawl detection
 

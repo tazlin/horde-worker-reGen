@@ -131,6 +131,7 @@ class PostProcessOrchestrator:
     def _arbiter_admits_post_processing(
         self,
         *,
+        completed_job_info: HordeJobInfo,
         post_process_process: HordeProcessInfo,
         reserve_vram_mb: float,
     ) -> bool:
@@ -152,10 +153,12 @@ class PostProcessOrchestrator:
         verdict = arbiter.evaluate(
             VramRequest(
                 kind=VramRequestKind.PP_JOB,
-                job_label="post_process",
+                job_label=f"post_process:{completed_job_info.sdk_api_job_info.id_}",
                 baseline=None,
                 device_index=post_process_process.device_index,
+                target_process_id=post_process_process.process_id,
                 candidate_delta_mb=reserve_vram_mb,
+                is_head_of_queue=True,
             ),
         )
         return verdict.admits
@@ -401,6 +404,7 @@ class PostProcessOrchestrator:
                 continue
 
             if self._arbiter_admits_post_processing(
+                completed_job_info=completed_job_info,
                 post_process_process=post_process_process,
                 reserve_vram_mb=reserve_vram_mb,
             ):

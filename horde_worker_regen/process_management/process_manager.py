@@ -1233,6 +1233,11 @@ class HordeWorkerProcessManager:
             lru=self._lru,
             performance_model=self._performance_model,
             reserve_ledger=self._reserve_ledger,
+            post_processing_lane_commitments_provider=lambda: getattr(
+                getattr(self, "_alchemy_coordinator", None),
+                "num_graph_forms_waiting_or_running",
+                0,
+            ),
         )
         # Feed the startup-measured per-process VRAM overhead to the scheduler's streaming forecast, so it
         # can estimate the free VRAM achievable under sole residency (total - one process's context) and,
@@ -1795,6 +1800,11 @@ class HordeWorkerProcessManager:
     async def start_post_processing(self) -> None:
         """Dispatch the next job pending post-processing to the dedicated lane, if any."""
         await self._post_process_orchestrator.start_post_processing()
+
+    async def _start_post_processing_with_fresh_vram_snapshot(self) -> None:
+        """Refresh the arbiter's device picture, then drive the post-processing drain."""
+        self._begin_vram_arbiter_cycle()
+        await self.start_post_processing()
 
     def _disaggregation_loader_identity(self, job_info: HordeJobInfo) -> HordeStageModelMixin:
         """Build the model-identity fields a disaggregated stage loads a subset of, from a job."""
@@ -2749,7 +2759,7 @@ class HordeWorkerProcessManager:
                 await self.start_evaluate_safety()
 
             if len(self._job_tracker.jobs_pending_post_processing) > 0:
-                await self.start_post_processing()
+                await self._start_post_processing_with_fresh_vram_snapshot()
 
             if self.bridge_data.enable_pipeline_disaggregation:
                 await self.drive_disaggregation()
@@ -2979,7 +2989,7 @@ class HordeWorkerProcessManager:
             if len(self._job_tracker.jobs_pending_safety_check) > 0:
                 await self.start_evaluate_safety()
             if len(self._job_tracker.jobs_pending_post_processing) > 0:
-                await self.start_post_processing()
+                await self._start_post_processing_with_fresh_vram_snapshot()
             await self._job_submitter.api_submit_job()
             self._process_lifecycle.replace_hung_processes()
             self._process_lifecycle._replace_all_safety_process()

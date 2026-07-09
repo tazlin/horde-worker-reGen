@@ -459,6 +459,7 @@ class InferenceScheduler:
     _ram_pressure_notified: bool
     _scheduler_diagnostic_log_state: dict[str, tuple[tuple[object, ...], float, int]]
     _last_preload_admission: LatestPreloadAdmission | None
+    _post_processing_lane_commitments_provider: Callable[[], int]
 
     def __init__(
         self,
@@ -476,6 +477,7 @@ class InferenceScheduler:
         lru: LRUCache,
         performance_model: PerformanceModel | None = None,
         reserve_ledger: CommittedReserveLedger | None = None,
+        post_processing_lane_commitments_provider: Callable[[], int] | None = None,
     ) -> None:
         """Initialize the scheduler with references to the components it needs to manage.
 
@@ -505,6 +507,9 @@ class InferenceScheduler:
                 workload flow contributes to, so image generation and alchemy cannot independently admit
                 against the same free VRAM. When ``None`` (unit tests driving the scheduler alone) a private
                 ledger is created, so the scheduler still accounts for its own post-processing reserve.
+            post_processing_lane_commitments_provider (Callable[[], int] | None): Optional count of
+                non-JobTracker work already committed to the shared post-processing lane, such as
+                graph-backed alchemy forms waiting for or running on that lane.
         """
         self._state = state
         self._process_map = process_map
@@ -513,6 +518,7 @@ class InferenceScheduler:
         self._process_lifecycle = process_lifecycle
         self._runtime_config = runtime_config
         self._model_metadata = model_metadata
+        self._post_processing_lane_commitments_provider = post_processing_lane_commitments_provider or (lambda: 0)
         # Per-card runtime plan for multi-GPU routing. A single entry (or None) means single-GPU, where the
         # dispatch path stays card-agnostic and byte-identical to before multi-GPU existed.
         self._card_runtimes: dict[int, CardRuntime] = card_runtimes if card_runtimes is not None else {}
@@ -5021,6 +5027,31 @@ class InferenceScheduler:
             return process_info.vram_materialized_monotonic
         return now_monotonic - (now_wall - process_info.last_received_timestamp)
 
+    def _post_processing_lane_has_committed_work(self) -> bool:
+        """Return true if the shared post-processing lane has queued or active work.
+
+        Image post-processing lives in JobTracker. Graph-backed alchemy shares the same child process but
+        owns its queue in AlchemyCoordinator, so the manager wires that count in through a provider.
+        """
+        if self._job_tracker.jobs_pending_post_processing or self._job_tracker.jobs_being_post_processed:
+            return True
+        try:
+            return self._post_processing_lane_commitments_provider() > 0
+        except Exception:
+            logger.exception("Failed to read post-processing lane commitments; preserving the lane this cycle")
+            return True
+
+    def _has_idle_post_process_process_for_reclaim(self, device_index: int | None) -> bool:
+        """Return true when a post-processing process is live, idle, and on the requested card."""
+        for process_info in self._process_map.values():
+            if process_info.process_type != HordeProcessType.POST_PROCESS:
+                continue
+            if device_index is not None and process_info.device_index != device_index:
+                continue
+            if process_info.can_accept_job():
+                return True
+        return False
+
     def _reclaim_lane_candidates(self, device_index: int | None) -> tuple[LaneReclaimCandidate, ...]:
         """Build the lane-pause rungs in fixed escalation order for lanes currently on the GPU."""
         lifecycle = self._process_lifecycle
@@ -5030,7 +5061,8 @@ class InferenceScheduler:
             bridge_data.allow_post_processing
             and bridge_data.post_processing_lane_enabled
             and not lifecycle.is_post_process_gpu_paused
-            and self._process_map.num_post_process_processes(device_index=device_index) > 0
+            and not self._post_processing_lane_has_committed_work()
+            and self._has_idle_post_process_process_for_reclaim(device_index)
         ):
             lanes.append(
                 LaneReclaimCandidate(

@@ -73,6 +73,25 @@ async def test_shutdown_drain_drives_post_processing_queue_before_teardown() -> 
     process_manager.start_post_processing.assert_awaited()
 
 
+async def test_post_processing_drain_refreshes_vram_snapshot_before_admission() -> None:
+    """The manager refreshes the arbiter picture before asking the PP admission gate to decide."""
+    process_manager = make_testable_process_manager(post_processing_lane_enabled=True)
+    calls: list[str] = []
+
+    def _record_snapshot() -> None:
+        calls.append("snapshot")
+
+    async def _record_post_processing() -> None:
+        calls.append("post_processing")
+
+    process_manager._begin_vram_arbiter_cycle = Mock(side_effect=_record_snapshot)  # type: ignore[method-assign]
+    process_manager.start_post_processing = AsyncMock(side_effect=_record_post_processing)  # type: ignore[method-assign]
+
+    await process_manager._start_post_processing_with_fresh_vram_snapshot()
+
+    assert calls == ["snapshot", "post_processing"]
+
+
 async def test_inference_start_does_not_clear_recovery_episode_while_post_processing_is_stuck() -> None:
     """SOS progress accounting must distinguish upstream starts from post-processing drain progress."""
     process_manager = make_testable_process_manager(post_processing_lane_enabled=True)

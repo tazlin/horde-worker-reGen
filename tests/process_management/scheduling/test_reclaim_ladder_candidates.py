@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeProcessState
+import time
+from collections.abc import Callable
+
+from horde_sdk.ai_horde_api import GENERATION_STATE
+
+from horde_worker_regen.process_management.ipc.messages import HordeControlFlag, HordeImageResult, HordeProcessState
+from horde_worker_regen.process_management.jobs.job_models import HordeJobInfo
+from horde_worker_regen.process_management.jobs.job_tracker import JobTracker
 from horde_worker_regen.process_management.lifecycle.horde_process import HordeProcessType
 from horde_worker_regen.process_management.lifecycle.process_map import ProcessMap
 from horde_worker_regen.process_management.resources.reclaim_ladder import ReclaimRungKind
 from horde_worker_regen.process_management.scheduling.inference_scheduler import InferenceScheduler
-from tests.process_management.conftest import make_mock_bridge_data, make_mock_process_info
+from tests.process_management.conftest import make_job_pop_response, make_mock_bridge_data, make_mock_process_info
 from tests.process_management.scheduling.test_inference_scheduling import _make_inference_scheduler
 
 
@@ -17,9 +24,20 @@ def _idle_resident(process_id: int, *, model: str, reserved_mb: int) -> object:
     return info
 
 
-def _scheduler_with_reclaimable_lanes(*, process_map: ProcessMap, bridge_data: object) -> InferenceScheduler:
+def _scheduler_with_reclaimable_lanes(
+    *,
+    process_map: ProcessMap,
+    bridge_data: object,
+    job_tracker: JobTracker | None = None,
+    post_processing_lane_commitments_provider: Callable[[], int] | None = None,
+) -> InferenceScheduler:
     """Build a scheduler whose lane lifecycle flags are plain booleans for reclaim-candidate tests."""
-    scheduler = _make_inference_scheduler(process_map=process_map, bridge_data=bridge_data)  # type: ignore[arg-type]
+    scheduler = _make_inference_scheduler(
+        process_map=process_map,
+        bridge_data=bridge_data,  # type: ignore[arg-type]
+        job_tracker=job_tracker,
+        post_processing_lane_commitments_provider=post_processing_lane_commitments_provider,
+    )
     scheduler._process_lifecycle.is_safety_gpu_paused = False
     scheduler._process_lifecycle.is_post_process_gpu_paused = False
     scheduler._process_lifecycle.is_vae_lane_gpu_paused = False
@@ -27,6 +45,17 @@ def _scheduler_with_reclaimable_lanes(*, process_map: ProcessMap, bridge_data: o
     scheduler._process_lifecycle.vae_lane_enabled.return_value = False
     scheduler._process_lifecycle.component_lane_enabled.return_value = False
     return scheduler
+
+
+def _pp_job_info() -> HordeJobInfo:
+    """Build a minimal generated job that requested image post-processing."""
+    return HordeJobInfo(
+        sdk_api_job_info=make_job_pop_response(post_processing=["RealESRGAN_x4plus"]),
+        job_image_results=[HordeImageResult(image_bytes=b"raw-image")],
+        state=GENERATION_STATE.ok,
+        censored=False,
+        time_popped=time.time(),
+    )
 
 
 def test_busy_inference_process_is_not_a_reclaim_candidate() -> None:
@@ -204,3 +233,95 @@ def test_post_processing_lane_rung_is_available_when_lane_is_enabled() -> None:
     candidates = scheduler.build_reclaim_ladder_candidates(None)
 
     assert any(candidate.kind is ReclaimRungKind.PAUSE_PP_LANE for candidate in candidates.lanes)
+
+
+def test_busy_post_processing_lane_is_not_a_pause_rung() -> None:
+    """A lane actively post-processing image work is not reclaimable as an idle lane."""
+    post_process = make_mock_process_info(
+        1,
+        model_name=None,
+        state=HordeProcessState.POST_PROCESSING,
+        process_type=HordeProcessType.POST_PROCESS,
+    )
+    post_process.process_reserved_mb = 1288  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({1: post_process}),
+        bridge_data=make_mock_bridge_data(
+            allow_post_processing=True,
+            post_processing_lane_enabled=True,
+        ),
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert all(candidate.kind is not ReclaimRungKind.PAUSE_PP_LANE for candidate in candidates.lanes)
+
+
+def test_graph_alchemy_running_on_post_processing_lane_is_not_a_pause_rung() -> None:
+    """A lane running graph-backed alchemy is busy even though it is not in JobTracker."""
+    post_process = make_mock_process_info(
+        1,
+        model_name=None,
+        state=HordeProcessState.ALCHEMY_STARTING,
+        process_type=HordeProcessType.POST_PROCESS,
+    )
+    post_process.process_reserved_mb = 1288  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({1: post_process}),
+        bridge_data=make_mock_bridge_data(
+            allow_post_processing=True,
+            post_processing_lane_enabled=True,
+        ),
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert all(candidate.kind is not ReclaimRungKind.PAUSE_PP_LANE for candidate in candidates.lanes)
+
+
+async def test_pending_image_post_processing_keeps_lane_out_of_pause_rungs() -> None:
+    """Queued image post-processing owns lane liveness, so the ladder must not cycle the idle process."""
+    post_process = make_mock_process_info(
+        1,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.POST_PROCESS,
+    )
+    post_process.process_reserved_mb = 1288  # type: ignore[attr-defined]
+    job_tracker = JobTracker()
+    await job_tracker.queue_for_post_processing(_pp_job_info())
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({1: post_process}),
+        bridge_data=make_mock_bridge_data(
+            allow_post_processing=True,
+            post_processing_lane_enabled=True,
+        ),
+        job_tracker=job_tracker,
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert all(candidate.kind is not ReclaimRungKind.PAUSE_PP_LANE for candidate in candidates.lanes)
+
+
+def test_graph_alchemy_commitment_keeps_idle_post_processing_lane_out_of_pause_rungs() -> None:
+    """Queued graph alchemy shares the PP lane, so the lane is not idle from the reclaim ladder's view."""
+    post_process = make_mock_process_info(
+        1,
+        model_name=None,
+        state=HordeProcessState.WAITING_FOR_JOB,
+        process_type=HordeProcessType.POST_PROCESS,
+    )
+    post_process.process_reserved_mb = 1288  # type: ignore[attr-defined]
+    scheduler = _scheduler_with_reclaimable_lanes(
+        process_map=ProcessMap({1: post_process}),
+        bridge_data=make_mock_bridge_data(
+            allow_post_processing=True,
+            post_processing_lane_enabled=True,
+        ),
+        post_processing_lane_commitments_provider=lambda: 1,
+    )
+
+    candidates = scheduler.build_reclaim_ladder_candidates(None)
+
+    assert all(candidate.kind is not ReclaimRungKind.PAUSE_PP_LANE for candidate in candidates.lanes)

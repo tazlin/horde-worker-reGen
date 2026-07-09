@@ -45,13 +45,18 @@ The lane replaces prediction with structure:
 - The lane reports VRAM like an inference process. Its sample participates in `ProcessMap.get_free_vram_mb`,
   so the parent sees the same low-free-VRAM condition that would make ComfyUI tile or stream.
 - Idle reclaim commands apply to the lane too: under pressure, the scheduler can ask an idle `POST_PROCESS`
-  process to unload modules from VRAM/RAM. Active post-processing is never interrupted for reclaim. The lane
-  is considered for whole-lane pause only when post-processing is enabled and the worker is still offering it.
+  process to unload modules from VRAM/RAM. Active post-processing is never interrupted for reclaim, and a
+  queued image post-processing job or graph-backed alchemy form keeps the lane out of whole-lane pause
+  candidates. The lane is considered for whole-lane pause only when post-processing is enabled, the worker is
+  still offering it, the process is idle, and no shared-lane work is committed.
 
 Admission to the lane is governed so a chain the card cannot host never wedges it. The orchestrator admits
 a job only when its estimated peak plus the VRAM reserve fits the lane card's free VRAM (with the budget on;
-see [Performance and backpressure](performance_and_backpressure.md)), and three behaviors keep an unfittable
-chain from parking the queue:
+see [Performance and backpressure](performance_and_backpressure.md)). The manager refreshes the arbiter's
+device-memory snapshot immediately before driving the lane, and the selected post-processing job is priced as
+the head of the drain queue: once inference dispatch is being held to let the lane run, the lane must be able
+to take the same reality-based admit a head-of-queue model would get after reclaim is exhausted. Three
+behaviors keep an unfittable chain from parking the queue:
 
 - **Queue scan**: the first *fittable* pending job is dispatched, so an unfittable head never blocks the
   fittable jobs queued behind it. The same rule applies when active sampling temporarily blocks one chain's

@@ -405,6 +405,49 @@ class TestStartPostProcessing:
         assert idle_inference.last_control_flag is not None
         assert lane.pipe_connection.send.call_count == 0
 
+    async def test_post_processing_head_can_admit_against_reality_after_reclaim_exhausts(
+        self,
+        monkeypatch: object,
+    ) -> None:
+        """A PP drain-head can take the arbiter's reality admit when the card physically has room.
+
+        The inference scheduler may be holding new sampling because this PP job needs the next drain window.
+        In that state the PP request is the head of its own drain queue; pricing it as a generic non-head
+        request disables the arbiter's foreign-pressure reality admit and can leave both sides waiting.
+        """
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            post_process_orchestrator_module,
+            "predict_job_post_processing_vram_mb",
+            lambda *_args, **_kwargs: 5000.0,
+        )
+        process_manager = make_testable_process_manager(enable_vram_budget=True, vram_reserve_mb=1500)
+        lane = _make_lane_process()
+        process_manager._process_map.clear()
+        process_manager._process_map.update({7: lane})
+
+        # Capacity is (24000 - 1000) - 1200 = 21800MB. The ledger identity rejects
+        # 18000 + 5000, but own committed load fits and the truthful free reading can seat the PP chain.
+        foreign_pressure = DeviceVramState(
+            total_vram_mb=24000.0,
+            baseline_mb=1000.0,
+            committed_vram_mb=18000.0,
+            planned_unmaterialized_mb=0.0,
+            committed_is_stale=False,
+            device_free_mb=8000.0,
+        )
+        process_manager._vram_arbiter.begin_cycle(
+            MeasuredVramSnapshot(devices={lane.device_index or 0: foreign_pressure})
+        )
+
+        job_info = _make_pp_job_info(["RealESRGAN_x4plus"])
+        await process_manager._job_tracker.queue_for_post_processing(job_info)
+
+        await process_manager.start_post_processing()
+
+        assert job_info not in process_manager._job_tracker.jobs_pending_post_processing
+        assert job_info in process_manager._job_tracker.jobs_being_post_processed
+        assert lane.pipe_connection.send.call_count == 1
+
     async def test_chain_over_lane_cap_faults_clean_without_dispatch(self, monkeypatch: object) -> None:
         """A chain estimated above the lane's cap is faulted at the gate, never dispatched into an OOM.
 
