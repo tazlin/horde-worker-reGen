@@ -695,7 +695,7 @@ extra_model_directories: []
 # Example:
 # custom_models:
 #   - name: "my-custom-model"
-#     baseline: "stable_diffusion"
+#     baseline: "stable_diffusion_1"
 #     filepath: "/path/to/model.safetensors"
 custom_models: []
 

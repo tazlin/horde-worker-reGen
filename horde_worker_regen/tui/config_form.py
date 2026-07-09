@@ -1285,19 +1285,19 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
     # -- Concurrency --
     ConfigField(
         "max_threads",
-        "Max threads",
+        "Concurrent image jobs",
         FieldKind.INT,
         "Concurrency",
-        "Parallel jobs on this card (global default applies if not overridden).",
+        "Image jobs that may sample at the same time on this card (global default applies if not overridden).",
         minimum=1,
         maximum=16,
     ),
     ConfigField(
         "queue_size",
-        "Queue size",
+        "Preload queue slots",
         FieldKind.INT,
         "Concurrency",
-        "Extra jobs buffered for this card. Raises system RAM use.",
+        "Extra staged jobs/models for this card. Raises system RAM use.",
         minimum=0,
         maximum=4,
     ),
@@ -1356,38 +1356,42 @@ GPU_OVERRIDE_FIELDS: list[ConfigField] = [
         "Let this card swap in popular models on demand beyond its configured list.",
     ),
     # -- Feature flags --
-    ConfigField("allow_lora", "Allow LoRA", FieldKind.BOOL, "Features", "Accept LoRA jobs on this card."),
+    ConfigField("allow_lora", "Offer LoRA jobs", FieldKind.BOOL, "Features", "Accept LoRA jobs on this card."),
     ConfigField(
-        "allow_controlnet", "Allow ControlNet", FieldKind.BOOL, "Features", "Accept ControlNet jobs on this card."
+        "allow_controlnet",
+        "Offer ControlNet jobs",
+        FieldKind.BOOL,
+        "Features",
+        "Accept ControlNet jobs on this card.",
     ),
     ConfigField(
         "allow_sdxl_controlnet",
-        "Allow SDXL ControlNet",
+        "Offer SDXL ControlNet jobs",
         FieldKind.BOOL,
         "Features",
         "Accept SDXL ControlNet jobs on this card (heavy; requires allow_controlnet).",
     ),
     ConfigField(
         "allow_post_processing",
-        "Allow post-processing",
+        "Offer post-processing jobs",
         FieldKind.BOOL,
         "Features",
         "Accept upscaling / face-fixing jobs on this card.",
     ),
     ConfigField(
         "allow_painting",
-        "Allow inpainting",
+        "Offer inpainting jobs",
         FieldKind.BOOL,
         "Features",
         "Accept inpainting jobs on this card (forced off if img2img is off).",
     ),
     ConfigField(
-        "allow_img2img", "Allow img2img", FieldKind.BOOL, "Features", "Accept jobs that supply a source image."
+        "allow_img2img", "Offer img2img jobs", FieldKind.BOOL, "Features", "Accept jobs that supply a source image."
     ),
     ConfigField("nsfw", "Allow NSFW", FieldKind.BOOL, "Features", "Serve NSFW requests on this card."),
     ConfigField(
         "max_power",
-        "Max power",
+        "Max resolution",
         FieldKind.INT,
         "Features",
         "Max resolution for this card = 64*64*8*max_power px (8=512², 32=1024²).",

@@ -1,8 +1,9 @@
-"""A modal that browses image models in a table: click the ＋/✕ cell to mark, click elsewhere to inspect."""
+"""A modal that browses image models in a table: click the mark cell to add/remove, click elsewhere to inspect."""
 
 from __future__ import annotations
 
 import webbrowser
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from rich.console import Group, RenderableType
@@ -21,20 +22,22 @@ from textual.widgets.data_table import ColumnKey
 from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
 from horde_worker_regen.tui.formatters import human_bytes
 from horde_worker_regen.tui.model_catalog import ModelInfo, friendly_baseline
+from horde_worker_regen.tui.widgets.confirm_modal import ConfirmModal
 
 if TYPE_CHECKING:
     from _typeshed import SupportsRichComparison
 
-_ADD = "＋ Mark"
-_REMOVE = "✕ Unmark"
+_MARK_ADD = "＋ Add"
+_MARK_REMOVE = "− Remove"
+_CLEAR_MARK = "✕ Clear"
 _NAME_WIDTH = 56
 
 # (header, width) for every table column; the index also drives sorting (see ``_sort_value``).
 _MARKER_COL = 0
 _COLUMNS: tuple[tuple[str, int], ...] = (
-    (" ", 10),  # mark state: ＋ Mark (addable) / ✕ Unmark (marked) / ✓ in <list> (already present)
+    ("Mark", 10),  # mark state: add/remove/clear mark
     ("Model", _NAME_WIDTH),
-    ("In config", 10),
+    ("In config", 14),
     ("Baseline", 10),
     ("Disk", 10),
     ("Flags", 12),
@@ -43,6 +46,14 @@ _COLUMNS: tuple[tuple[str, int], ...] = (
 _DISK_ALL = ""
 _DISK_ON = "on"
 _DISK_OFF = "off"
+
+
+@dataclass(frozen=True)
+class ModelPickerResult:
+    """The model-list edits chosen in membership mode."""
+
+    add: list[str]
+    remove: list[str]
 
 
 class _PickerTable(DataTable):
@@ -54,8 +65,8 @@ class _PickerTable(DataTable):
     toggle we read the clicked row and column from the event's render metadata, defer to the base
     handler so the cursor, scroll, and highlight all behave normally, then post our own message.
 
-    The message is posted only for a click on the marker column (the cell that renders ＋ Mark / ✕
-    Unmark), so clicking any other cell merely moves the cursor: that drives the detail panel via
+    The message is posted only for a click on the marker column (the cell that renders add/remove
+    actions), so clicking any other cell merely moves the cursor: that drives the detail panel via
     ``CellHighlighted`` and lets a user inspect a model without marking it.
     """
 
@@ -75,11 +86,11 @@ class _PickerTable(DataTable):
             self.post_message(self.RowToggled(row))
 
 
-class ModelPickerModal(ModalScreen[list[str] | None]):
-    """Browse and mark image models to add; dismisses with the chosen names or None."""
+class ModelPickerModal(ModalScreen[ModelPickerResult | list[str] | None]):
+    """Browse and mark image models to add/remove; dismisses with the chosen edits or None."""
 
     BINDINGS = [
-        Binding("space", "toggle_add", "Mark / unmark"),
+        Binding("space", "toggle_add", "Toggle mark"),
         Binding("o", "open_homepage", "Open homepage"),
         Binding("escape", "cancel", "Cancel"),
     ]
@@ -155,9 +166,9 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
 
         - **Membership** (``in_target`` / ``in_other`` given): every model stays visible and an
           "In config" column shows whether it is already in the list being edited (``in_target``) or
-          the sibling list (``in_other``). Models already in ``in_target`` are shown as present and are
-          not re-addable; marking any other model adds it (the delta). This is what the config editor
-          uses so the resulting set is obvious at a glance.
+          the sibling list (``in_other``). Marking an existing target member removes it from that list;
+          marking any other model adds it. This is what the config editor uses so the resulting delta is
+          obvious at a glance.
         - **Hide** (``exclude`` given): the supplied names are hidden from the table. The first-run
           wizard uses this, since it has a single list and replaces the selection wholesale.
         """
@@ -165,12 +176,14 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         self._exclude = exclude or set()
         self._in_target = in_target or set()
         self._in_other = in_other or set()
+        self._membership_mode = in_target is not None or in_other is not None
         self._target_label = target_label
         self._other_label = other_label
         self._all_models: list[ModelInfo] = []
         self._by_name: dict[str, ModelInfo] = {}
         self._visible: list[ModelInfo] = []
-        self._chosen: set[str] = set()
+        self._marked_add: set[str] = set()
+        self._marked_remove: set[str] = set()
         self._current: ModelInfo | None = None
         self._loaded = False
         self._free_disk_bytes: int | None = None
@@ -183,7 +196,7 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         """Lay out the filters, search, model table with a detail panel, and buttons."""
         with Vertical(id="picker-dialog"):
             yield Label(
-                "Click ＋/✕ to mark  ·  click a row to inspect  ·  click a header to sort",
+                "Click Mark to add/remove  ·  click a row to inspect  ·  click a header to sort",
                 classes="dialog-title",
             )
             with Horizontal(id="picker-filters"):
@@ -196,7 +209,7 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
                 )
                 yield Checkbox("Show NSFW", value=True, id="picker-nsfw")
                 yield Checkbox("Inpainting only", value=False, id="picker-inpaint")
-                yield Checkbox("Marked only", value=False, id="picker-marked-only")
+                yield Checkbox("Show marks only", value=False, id="picker-marked-only")
             yield Input(placeholder="search name, description, tags…", id="picker-search")
             with Horizontal(id="picker-body"):
                 yield _PickerTable(id="picker-table", cursor_type="cell", zebra_stripes=True)
@@ -205,7 +218,9 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
             yield Static("Loading model reference…", id="picker-status")
             yield Static("", id="picker-disk")
             with Horizontal(classes="dialog-buttons"):
-                yield Button("Add marked", variant="primary", id="picker-add")
+                yield Button(
+                    "Apply marks" if self._membership_mode else "Add marked", variant="success", id="picker-add"
+                )
                 yield Button("Mark all shown", id="picker-mark-all")
                 yield Button("Clear marks", id="picker-clear-marks")
                 yield Button("Refresh", id="picker-refresh")
@@ -278,13 +293,19 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         return Text("-", style="grey50")
 
     def _marker_for(self, model: ModelInfo) -> str:
-        """The leading-cell marker: already in the target list, marked to add, or addable."""
+        """The leading-cell marker: add/remove/clear mark for the current model."""
+        if model.name in self._marked_add or model.name in self._marked_remove:
+            return _CLEAR_MARK
         if model.name in self._in_target:
-            return f"✓ in {self._target_label}"
-        return _REMOVE if model.name in self._chosen else _ADD
+            return _MARK_REMOVE
+        return _MARK_ADD
 
     def _in_config_cell(self, model: ModelInfo) -> Text:
         """Whether the model is already in the list being edited or in the sibling list."""
+        if model.name in self._marked_add:
+            return Text(f"add -> {self._target_label}", style="bold green")
+        if model.name in self._marked_remove:
+            return Text(f"remove -> {self._target_label}", style="bold red")
         if model.name in self._in_target:
             return Text(self._target_label, style="green")
         if model.name in self._in_other:
@@ -316,8 +337,9 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         """The sort key for a model under the active column (index ``self._sort_index``)."""
         name = model.name.lower()
         if self._sort_index == _MARKER_COL:
-            chosen = model.name in self._chosen or model.name in self._in_target
-            return (not chosen, name)
+            marked = model.name in self._marked_add or model.name in self._marked_remove
+            in_target = model.name in self._in_target
+            return (not marked, not in_target, name)
         if self._sort_index == 2:  # In config
             rank = 0 if model.name in self._in_target else 1 if model.name in self._in_other else 2
             return (rank, name)
@@ -348,7 +370,7 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
             and (disk_filter == _DISK_ALL or model.on_disk == (disk_filter == _DISK_ON))
             and (show_nsfw or not model.nsfw)
             and (not inpaint_only or model.inpainting)
-            and (not marked_only or model.name in self._chosen)
+            and (not marked_only or model.name in self._marked_add or model.name in self._marked_remove)
             and self._matches_search(model, search)
         ]
         self._visible.sort(key=self._sort_value, reverse=self._sort_reverse)
@@ -374,10 +396,14 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
 
     def _refresh_status(self) -> None:
         """Update the status line with the visible, marked, and already-in-list counts."""
+        add_count = len(self._marked_add)
+        remove_count = len(self._marked_remove)
         text = Text.assemble(
             (f"{len(self._visible)} shown (of {len(self._all_models)})", "grey70"),
             ("  ·  ", "grey50"),
-            (f"{len(self._chosen)} marked to add", "grey70"),
+            (f"{add_count} add mark(s)", "green" if add_count else "grey70"),
+            ("  ·  ", "grey50"),
+            (f"{remove_count} remove mark(s)", "red" if remove_count else "grey70"),
         )
         if self._in_target:
             text.append("  ·  ", style="grey50")
@@ -386,13 +412,14 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         self.query_one("#picker-disk", Static).update(self._disk_footer())
 
     def _disk_footer(self) -> Text:
-        """A disk-budget line for the resulting list (its current members plus the marked additions)."""
+        """A disk-budget line for the resulting list after add/remove marks are applied."""
         base = self._in_target if self._in_target else self._exclude
+        resulting = (base - self._marked_remove) | self._marked_add
         present_bytes = 0
         to_download_bytes = 0
         num_present = 0
         num_to_download = 0
-        for name in base | self._chosen:
+        for name in resulting:
             model = self._by_name.get(name)
             if model is None:
                 continue  # A meta command or a name absent from the reference; it cannot be sized.
@@ -482,23 +509,22 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
         return Group(*parts)
 
     def _toggle(self, row: int) -> None:
-        """Mark/unmark the model at table ``row`` for adding, updating its marker cell.
-
-        A model already in the target list is shown as present and cannot be re-added here, so it is
-        left untouched.
-        """
+        """Toggle an add/remove mark for the model at table ``row``."""
         if not 0 <= row < len(self._visible):
             return
         model = self._visible[row]
-        if model.name in self._in_target:
-            return
-        if model.name in self._chosen:
-            self._chosen.discard(model.name)
+        if model.name in self._marked_add:
+            self._marked_add.discard(model.name)
+        elif model.name in self._marked_remove:
+            self._marked_remove.discard(model.name)
+        elif model.name in self._in_target and self._membership_mode:
+            self._marked_remove.add(model.name)
         else:
-            self._chosen.add(model.name)
+            self._marked_add.add(model.name)
         self.query_one("#picker-table", DataTable).update_cell_at(
             Coordinate(row, _MARKER_COL), self._marker_for(model)
         )
+        self.query_one("#picker-table", DataTable).update_cell_at(Coordinate(row, 2), self._in_config_cell(model))
         self._refresh_status()
 
     def on_data_table_cell_highlighted(self, event: DataTable.CellHighlighted) -> None:
@@ -549,27 +575,57 @@ class ModelPickerModal(ModalScreen[list[str] | None]):
             self._apply_filters()
 
     def _mark_all_shown(self) -> None:
-        """Mark every currently-visible, still-addable model for adding."""
+        """Mark every visible model: additions for absent models, removals for target members."""
         for model in self._visible:
-            if model.name not in self._in_target:
-                self._chosen.add(model.name)
+            if model.name in self._in_target and self._membership_mode:
+                self._marked_remove.add(model.name)
+                self._marked_add.discard(model.name)
+            elif model.name not in self._in_target:
+                self._marked_add.add(model.name)
+                self._marked_remove.discard(model.name)
         self._apply_filters()
 
     def _clear_marks(self) -> None:
-        """Unmark every model marked for adding."""
-        self._chosen.clear()
+        """Clear every add/remove mark."""
+        self._marked_add.clear()
+        self._marked_remove.clear()
         self._apply_filters()
 
+    def _has_marks(self) -> bool:
+        """Whether any add/remove marks are currently staged."""
+        return bool(self._marked_add or self._marked_remove)
+
+    def _confirm_clear_marks(self) -> None:
+        """Ask before clearing staged marks."""
+        if not self._has_marks():
+            return
+        self.app.push_screen(
+            ConfirmModal(
+                "Clear all staged add/remove marks? This keeps the underlying config lists unchanged.",
+                confirm_label="Yes, clear marks",
+                cancel_label="No, keep marks",
+            ),
+            self._on_clear_marks_confirmed,
+        )
+
+    def _on_clear_marks_confirmed(self, confirmed: bool) -> None:
+        """Clear marks only after confirmation."""
+        if confirmed:
+            self._clear_marks()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        """Return the marked names on Add, bulk-mark/clear, refresh the catalog, or cancel."""
+        """Apply marks, bulk-mark/clear, refresh the catalog, or cancel."""
         if event.button.id == "picker-cancel":
             self.dismiss(None)
         elif event.button.id == "picker-add":
-            self.dismiss(sorted(self._chosen))
+            if self._membership_mode:
+                self.dismiss(ModelPickerResult(add=sorted(self._marked_add), remove=sorted(self._marked_remove)))
+            else:
+                self.dismiss(sorted(self._marked_add))
         elif event.button.id == "picker-mark-all":
             self._mark_all_shown()
         elif event.button.id == "picker-clear-marks":
-            self._clear_marks()
+            self._confirm_clear_marks()
         elif event.button.id == "picker-refresh":
             self.query_one("#picker-status", Static).update("Refreshing model reference…")
             self.run_worker(lambda: self._load_models(force=True), thread=True, exclusive=True)

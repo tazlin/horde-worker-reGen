@@ -48,6 +48,7 @@ from horde_worker_regen.tui.config_form import (
 )
 from horde_worker_regen.tui.config_presets import BUILT_IN_PRESETS, ConfigPreset, PresetChange, diff_preset
 from horde_worker_regen.tui.config_validation import ConfigValidationSeverity, validate_config_interlocks
+from horde_worker_regen.tui.widgets.custom_model_builder import CustomModelBuilderModal, CustomModelBuilderResult
 from horde_worker_regen.tui.widgets.gpu_overrides_editor import GpuOverridesEditor
 from horde_worker_regen.tui.widgets.model_list_editor import ModelListEditor
 from horde_worker_regen.tui.widgets.model_manager import ModelManagerView
@@ -68,6 +69,9 @@ _GPU_SUBTAB_ID = "cfgtab-per-gpu"
 
 # Which sub-tab a section lives on, so a validation error can name (and jump to) the right page.
 _SECTION_TO_SUBTAB: dict[str, str] = {section: label for label, sections in CONFIG_SUBTABS for section in sections}
+_ADVANCED_SECTIONS: set[str] = {
+    section for label, sections in CONFIG_SUBTABS if label == "Advanced" for section in sections
+}
 
 # Only fields whose section is bundled into a sub-tab get widgets in ``compose``. A section that is
 # absent from ``CONFIG_SUBTABS`` (e.g. the developer-only "Dry-run" flags, which stay editable via YAML
@@ -192,6 +196,12 @@ class ConfigPresetModal(ModalScreen[dict[str, object] | None]):
         height: 1fr;
         overflow-x: auto;
     }
+    ConfigPresetModal .preset-group {
+        color: $accent;
+        text-style: bold;
+        padding: 1 1 0 1;
+        min-width: 140;
+    }
     ConfigPresetModal .preset-row {
         height: auto;
         min-width: 140;
@@ -222,10 +232,15 @@ class ConfigPresetModal(ModalScreen[dict[str, object] | None]):
                     body.display = preset is first
                     if preset.warnings:
                         yield Static("  ".join(preset.warnings), classes="config-guidance")
+                    seen_categories: set[str] = set()
                     for change in preset.changes:
+                        category = change.category.value
+                        if category not in seen_categories:
+                            seen_categories.add(category)
+                            yield Label(category, classes="preset-group")
                         yield self._preset_checkbox(preset, change)
             with Horizontal(id="config-preset-actions"):
-                yield Button("Apply checked changes", id="config-preset-apply", variant="primary")
+                yield Button("Apply checked changes", id="config-preset-apply", variant="success")
                 yield Button("Cancel", id="config-preset-cancel", variant="default")
 
     def _preset_checkbox(self, preset: ConfigPreset, change: PresetChange) -> Checkbox:
@@ -239,7 +254,9 @@ class ConfigPresetModal(ModalScreen[dict[str, object] | None]):
         ):
             selected = False
         restart = " restart" if change.requires_restart else ""
-        label = f"{change.category.value}: {change.key}: {current!r} -> {change.value!r}{restart} - {change.rationale}"
+        field = _FIELD_BY_KEY.get(change.key)
+        label_key = field.label if field is not None else change.key
+        label = f"{label_key}: {current!r} -> {change.value!r}{restart} - {change.rationale}"
         checkbox = Checkbox(
             label,
             value=selected,
@@ -344,8 +361,34 @@ class ConfigEditorView(Vertical):
         text-style: italic;
         padding: 1 1 0 1;
     }
+    ConfigEditorView #config-effective-summary {
+        padding: 0 1;
+        color: $text-muted;
+    }
+    ConfigEditorView #config-change-summary {
+        padding: 0 1;
+        color: $accent;
+    }
+    ConfigEditorView #config-live-warnings {
+        padding: 0 1;
+        color: $warning;
+    }
+    ConfigEditorView .config-advanced-banner {
+        margin: 0 1 1 1;
+        padding: 0 1;
+        border-left: thick $warning;
+        color: $warning;
+        height: auto;
+    }
     ConfigEditorView TextArea {
         height: 5;
+    }
+    ConfigEditorView .config-inline-actions {
+        height: 3;
+        padding-top: 1;
+    }
+    ConfigEditorView .config-inline-actions Button {
+        margin-right: 1;
     }
     ConfigEditorView #config-status {
         padding: 0 1;
@@ -386,6 +429,9 @@ class ConfigEditorView(Vertical):
             "⟳ marks fields that only take effect on restart",
             id="config-status",
         )
+        yield Static("", id="config-effective-summary")
+        yield Static("", id="config-change-summary")
+        yield Static("", id="config-live-warnings")
 
         with TabbedContent(id="config-subtabs"):
             for label, sections in CONFIG_SUBTABS:
@@ -417,6 +463,11 @@ class ConfigEditorView(Vertical):
         yield Rule()
         if section in SECTION_GUIDANCE:
             yield Static(SECTION_GUIDANCE[section], classes="config-guidance")
+        if section in _ADVANCED_SECTIONS:
+            yield Static(
+                "Advanced: change these only when a log message, benchmark, or support instruction points here.",
+                classes="config-advanced-banner",
+            )
         for field in section_fields:
             yield self._compose_field(field)
         if section == _THROUGHPUT_SECTION:
@@ -482,10 +533,20 @@ class ConfigEditorView(Vertical):
             )
         elif field.kind in (FieldKind.STR_LIST, FieldKind.YAML):
             text = format_yaml_value(value) if field.kind is FieldKind.YAML else "\n".join(str(item) for item in value)
-            control = Vertical(
+            children: list[object] = [
                 Label(label_text),
                 Static(field.help, classes="config-help"),
                 TextArea(text=text, id=widget_id),
+            ]
+            if field.key == "custom_models":
+                children.append(
+                    Horizontal(
+                        Button("Add custom model...", id="cfg-custom_models-add", variant="default"),
+                        classes="config-inline-actions",
+                    )
+                )
+            control = Vertical(
+                *children,
                 classes="config-field",
             )
         else:
@@ -638,6 +699,8 @@ class ConfigEditorView(Vertical):
             self._reload_from_disk()
         elif event.button.id == "config-preset":
             self._open_preset_modal()
+        elif event.button.id == "cfg-custom_models-add":
+            self._open_custom_model_builder()
         elif event.button.id == "config-save":
             self._save()
         elif event.button.id == "config-restart" and self._save():
@@ -857,6 +920,32 @@ class ConfigEditorView(Vertical):
         """Open the built-in preset preview and apply selected changes to live widgets."""
         self.app.push_screen(ConfigPresetModal(self._current_config_state_for_preset()), self._apply_preset_changes)
 
+    def _open_custom_model_builder(self) -> None:
+        """Open the custom-model builder and append its result to the YAML field."""
+        self.app.push_screen(CustomModelBuilderModal(), self._apply_custom_model_builder_result)
+
+    def _apply_custom_model_builder_result(self, result: CustomModelBuilderResult | None) -> None:
+        """Append a custom model record and optionally add it to the offer list."""
+        if result is None:
+            return
+        field = _FIELD_BY_KEY["custom_models"]
+        try:
+            current = coerce_value(field, self.query_one("#cfg-custom_models", TextArea).text)
+        except ValueError as error:
+            self._set_status(f"Fix Custom models YAML before adding another entry: {error}", "red")
+            return
+        entries = list(current) if isinstance(current, list) else []
+        entries.append(result.record)
+        self.query_one("#cfg-custom_models", TextArea).text = format_yaml_value(entries)
+        if result.add_to_models_to_load:
+            with contextlib.suppress(Exception):
+                self.query_one(f"#mle-root-{MODELS_TO_LOAD_KEY}", ModelListEditor).add_entry(result.record["name"])
+        self._refresh_action_variants()
+        self._set_status(
+            f"Added custom model {result.record['name']!r} to the form; save + restart to use it.",
+            "yellow",
+        )
+
     def _apply_preset_changes(self, changes: dict[str, object] | None) -> None:
         """Apply selected preset values to widgets without saving to disk."""
         if not changes:
@@ -992,3 +1081,132 @@ class ConfigEditorView(Vertical):
             self.query_one("#config-restart", Button).variant = (
                 "warning" if self._restart_locked_dirty() else "default"
             )
+        self._refresh_config_summaries()
+
+    def _refresh_config_summaries(self) -> None:
+        """Refresh persistent operator guidance above the config tabs."""
+        with contextlib.suppress(Exception):
+            state = self._current_config_state_for_preset()
+            self.query_one("#config-effective-summary", Static).update(self._effective_summary(state))
+            self.query_one("#config-change-summary", Static).update(self._change_summary())
+            self._refresh_live_warnings(state)
+
+    def _effective_summary(self, state: dict[str, object]) -> Text:
+        """A compact, plain-language summary of what this config currently serves."""
+        dreamer = bool(state.get("dreamer"))
+        alchemist = bool(state.get("alchemist"))
+        if dreamer and alchemist:
+            role = "image + alchemy"
+        elif dreamer:
+            role = "image generation"
+        elif alchemist:
+            role = "alchemy only"
+        else:
+            role = "nothing enabled"
+
+        load_rules = [str(item) for item in state.get(MODELS_TO_LOAD_KEY, []) or []]
+        model_text = "default TOP 2" if not load_rules else ", ".join(load_rules[:2])
+        if len(load_rules) > 2:
+            model_text += f" +{len(load_rules) - 2}"
+
+        threads = self._state_int(state, "max_threads", 1)
+        queue = self._state_int(state, "queue_size", 0)
+        process_text = (
+            "extra-slow: 1 inference context"
+            if bool(state.get("extra_slow_worker"))
+            else (f"up to {threads + queue} inference context(s)/GPU")
+        )
+        feature_bits = [
+            f"LoRA {'on' if bool(state.get('allow_lora')) else 'off'}",
+            f"ControlNet {'on' if bool(state.get('allow_controlnet')) else 'off'}",
+            f"post-processing {'on' if bool(state.get('allow_post_processing')) else 'off'}",
+        ]
+        if bool(state.get("allow_sdxl_controlnet")):
+            feature_bits.append("SDXL add-ons on")
+        if bool(state.get("load_large_models")):
+            feature_bits.append("large models allowed")
+
+        text = Text("Current: ", style="bold")
+        text.append(role, style="cyan" if dreamer or alchemist else "red")
+        text.append(f"  |  {process_text}  |  models: {model_text}  |  ")
+        text.append(" / ".join(feature_bits))
+        return text
+
+    def _change_summary(self) -> Text:
+        """Show dirty-field names, and separately call out restart-required edits."""
+        dirty_labels, restart_labels = self._dirty_field_labels()
+        if not dirty_labels:
+            return Text("No unsaved changes.", style="grey62")
+        text = Text("Unsaved: ", style="bold yellow")
+        text.append(self._limited_labels(dirty_labels), style="yellow")
+        if restart_labels:
+            text.append("  |  restart required for: ", style="bold dark_orange")
+            text.append(self._limited_labels(restart_labels), style="dark_orange")
+        else:
+            text.append("  |  no restart-only fields changed", style="grey62")
+        return text
+
+    def _dirty_field_labels(self) -> tuple[list[str], list[str]]:
+        """Return all dirty field labels and the subset that require restart."""
+        try:
+            current = self._widget_state()
+        except Exception:  # noqa: BLE001 - summary is advisory only
+            return [], []
+        baseline = self._clean_state
+        if baseline is None:
+            return [], []
+        by_key = {field.key: field for field in _RENDERED_FIELDS}
+        dirty: list[str] = []
+        restart: list[str] = []
+        for key, value in current.items():
+            if baseline.get(key) == value:
+                continue
+            field = by_key.get(key)
+            label = field.label if field is not None else key
+            dirty.append(label)
+            if field is not None and field.requires_restart:
+                restart.append(label)
+        gpu_editor = self._gpu_editor()
+        if gpu_editor is not None and gpu_editor.is_dirty():
+            dirty.append("Per-GPU settings")
+            restart.append("Per-GPU settings")
+        return dirty, restart
+
+    @staticmethod
+    def _limited_labels(labels: list[str], *, limit: int = 4) -> str:
+        """Compact a label list for single-line summaries."""
+        if len(labels) <= limit:
+            return ", ".join(labels)
+        return f"{', '.join(labels[:limit])} +{len(labels) - limit}"
+
+    @staticmethod
+    def _state_int(state: dict[str, object], key: str, default: int) -> int:
+        """Read an int-ish value from live state."""
+        try:
+            return int(state.get(key, default) or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _refresh_live_warnings(self, state: dict[str, object]) -> None:
+        """Render persistent validation warnings/errors without blocking in-progress edits."""
+        issues = validate_config_interlocks(state)
+        target = self.query_one("#config-live-warnings", Static)
+        if not issues:
+            target.display = False
+            target.update("")
+            return
+        target.display = True
+        errors = [issue.message for issue in issues if issue.severity is ConfigValidationSeverity.ERROR]
+        warnings = [issue.message for issue in issues if issue.severity is ConfigValidationSeverity.WARNING]
+        shown = errors[:3] if errors else warnings[:3]
+        prefix = "Blocking config issue" if len(shown) == 1 else "Blocking config issues"
+        style = "bold red"
+        if not errors:
+            prefix = "Config warning" if len(shown) == 1 else "Config warnings"
+            style = "yellow"
+        extra = len(errors or warnings) - len(shown)
+        text = Text(f"{prefix}: ", style=style)
+        text.append("; ".join(shown), style=style)
+        if extra > 0:
+            text.append(f" (+{extra} more)", style=style)
+        target.update(text)

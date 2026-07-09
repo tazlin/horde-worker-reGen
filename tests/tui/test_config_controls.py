@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import pytest
 from textual.app import App, ComposeResult
+from textual.widgets import Button
 
 from horde_worker_regen.tui.widgets.meta_builder import MetaBuilderModal
 from horde_worker_regen.tui.widgets.model_list_editor import ModelListEditor
+from horde_worker_regen.tui.widgets.model_picker import ModelPickerResult
 
 
 class _EditorHost(App[None]):
@@ -40,6 +42,45 @@ async def test_model_list_editor_add_remove_dedup() -> None:
         editor.set_values([])
         await pilot.pause()
         assert editor.values() == []
+
+
+@pytest.mark.e2e
+async def test_model_list_clear_requires_confirmation() -> None:
+    """The Clear button asks before removing every in-progress entry."""
+    editor = ModelListEditor("models_to_load", ["top 2", "Deliberate"])
+    app = _EditorHost(editor)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.click("#mle-clear-models_to_load")
+        await pilot.pause()
+
+        confirm = app.screen
+        assert confirm.query_one("#confirm-yes", Button).variant == "error"
+        assert confirm.query_one("#confirm-no", Button).variant == "success"
+        assert editor.values() == ["top 2", "Deliberate"]
+
+        await pilot.click("#confirm-no")
+        await pilot.pause()
+        assert editor.values() == ["top 2", "Deliberate"]
+
+        await pilot.click("#mle-clear-models_to_load")
+        await pilot.pause()
+        await pilot.click("#confirm-yes")
+        await pilot.pause()
+        assert editor.values() == []
+
+
+@pytest.mark.e2e
+async def test_model_list_applies_picker_add_and_remove_marks() -> None:
+    """Picker membership results can add new models and remove existing exact model entries."""
+    editor = ModelListEditor("models_to_load", ["Deliberate", "Spicy Model", "top 2"])
+    app = _EditorHost(editor)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        editor._on_picker_result(ModelPickerResult(add=["AlbedoBase XL (SDXL)"], remove=["Spicy Model"]))
+        await pilot.pause()
+
+    assert editor.values() == ["Deliberate", "top 2", "AlbedoBase XL (SDXL)"]
 
 
 class _MetaHost(App[None]):

@@ -563,12 +563,20 @@ class GpuOverridesEditor(Vertical):
         return current != self._clean_state
 
     def _widget_state(self) -> dict[str, object]:
-        """A raw snapshot of every multi-GPU widget keyed by id, for change detection."""
+        """Snapshot config-owned GPU state, ignoring live-only cards that still inherit everything.
+
+        The running worker can report detected cards after the Config page opens. Those cards are useful
+        editing affordances, but their mere presence is live state, not a user config change. A detected
+        card enters the dirty snapshot only once it is explicitly driven, already configured on disk, or
+        has at least one Override toggle enabled in the current form.
+        """
         state: dict[str, object] = {
             "gpu-driven": tuple(sorted(self._driven)),
             "gpucfg-gpu_pop_balance_threshold": self.query_one("#gpucfg-gpu_pop_balance_threshold", Input).value,
         }
         for index in self._section_indices():
+            if index not in self._driven and index not in self._configured and not self._card_has_override(index):
+                continue
             for field in GPU_OVERRIDE_FIELDS:
                 with contextlib.suppress(Exception):
                     toggle = self.query_one(f"#gpuovr-{index}-{field.key}", Switch)
@@ -578,6 +586,14 @@ class GpuOverridesEditor(Vertical):
                         control.text if isinstance(control, TextArea) else control.value  # type: ignore[union-attr]
                     )
         return state
+
+    def _card_has_override(self, index: int) -> bool:
+        """Whether a mounted card has any enabled per-field override toggle."""
+        for field in GPU_OVERRIDE_FIELDS:
+            with contextlib.suppress(Exception):
+                if self.query_one(f"#gpuovr-{index}-{field.key}", Switch).value:
+                    return True
+        return False
 
     def apply_to(self, data: Any) -> list[tuple[ConfigField, str]]:  # noqa: ANN401 - ruamel CommentedMap
         """Validate and write the multi-GPU block into ``data``; return per-field validation errors.

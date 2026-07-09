@@ -7,13 +7,14 @@ from collections.abc import Callable
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 from textual.app import App
 from textual.coordinate import Coordinate
 from textual.screen import Screen
-from textual.widgets import Checkbox, DataTable, Input, Select
+from textual.widgets import Button, Checkbox, DataTable, Input, Select
 
 from horde_worker_regen.tui.model_catalog import ModelInfo
-from horde_worker_regen.tui.widgets.model_picker import _MARKER_COL, ModelPickerModal
+from horde_worker_regen.tui.widgets.model_picker import _MARKER_COL, ModelPickerModal, ModelPickerResult
 
 _MODELS = [
     ModelInfo(
@@ -34,7 +35,9 @@ _MODELS = [
 
 def _render(renderable: object) -> str:
     """Render a Rich renderable to plain text."""
-    console = Console(width=60)
+    if isinstance(renderable, Text):
+        return renderable.plain
+    console = Console(width=60, color_system=None)
     with console.capture() as capture:
         console.print(renderable)
     return capture.get()
@@ -80,17 +83,21 @@ def test_detail_for_shows_full_record_with_homepage() -> None:
 def test_marker_and_in_config_membership() -> None:
     """In membership mode the marker and In-config cells reflect both lists."""
     modal = ModelPickerModal(in_target={"Deliberate"}, in_other={"Spicy Model"})
-    # A model already in the target list is shown as present and is not re-addable.
-    assert modal._marker_for(_MODELS[0]) == "✓ in load"
+    # A model already in the target list can be marked for removal.
+    assert modal._marker_for(_MODELS[0]) == "− Remove"
     assert _render(modal._in_config_cell(_MODELS[0])).strip() == "load"
     # A model in the sibling list is still addable, and shows its membership.
-    assert modal._marker_for(_MODELS[2]) == "＋ Mark"
+    assert modal._marker_for(_MODELS[2]) == "＋ Add"
     assert _render(modal._in_config_cell(_MODELS[2])).strip() == "skip"
     # An uninvolved model is plain-addable with no membership.
-    assert modal._marker_for(_MODELS[1]) == "＋ Mark"
+    assert modal._marker_for(_MODELS[1]) == "＋ Add"
     assert _render(modal._in_config_cell(_MODELS[1])).strip() == "-"
-    modal._chosen.add(_MODELS[1].name)
-    assert modal._marker_for(_MODELS[1]) == "✕ Unmark"
+    modal._marked_add.add(_MODELS[1].name)
+    assert modal._marker_for(_MODELS[1]) == "✕ Clear"
+    assert _render(modal._in_config_cell(_MODELS[1])).strip() == "add -> load"
+    modal._marked_remove.add(_MODELS[0].name)
+    assert modal._marker_for(_MODELS[0]) == "✕ Clear"
+    assert _render(modal._in_config_cell(_MODELS[0])).strip() == "remove -> load"
 
 
 def test_matches_search_spans_metadata() -> None:
@@ -127,14 +134,14 @@ class _PickerHost(App[None]):
 
     def __init__(self, screen_factory: Callable[[], Screen] | None = None) -> None:
         super().__init__()
-        self.result: list[str] | None = None
+        self.result: ModelPickerResult | list[str] | None = None
         self.result_set = False
         self._screen_factory = screen_factory or (lambda: ModelPickerModal(exclude=set()))
 
     def on_mount(self) -> None:
         self.push_screen(self._screen_factory(), self._store)
 
-    def _store(self, value: list[str] | None) -> None:
+    def _store(self, value: ModelPickerResult | list[str] | None) -> None:
         self.result = value
         self.result_set = True
 
@@ -177,10 +184,10 @@ async def test_model_picker_filters_and_marking(monkeypatch: pytest.MonkeyPatch)
         modal.query_one("#picker-search", Input).value = "albedo"
         await _wait_for_rows(pilot, table, 1)
 
-        # Marking the single visible row flips its marker cell to the unmark label.
+        # Marking the single visible row flips its marker cell to the clear-mark label.
         modal._toggle(0)
         await pilot.pause()
-        assert str(table.get_cell_at(Coordinate(0, 0))) == "✕ Unmark"
+        assert str(table.get_cell_at(Coordinate(0, 0))) == "✕ Clear"
 
         await pilot.click("#picker-add")
         await pilot.pause()
@@ -191,7 +198,7 @@ async def test_model_picker_filters_and_marking(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.mark.e2e
 async def test_model_picker_membership_shows_and_blocks_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Members of the target list stay visible, show as present, and cannot be re-added."""
+    """Members of the target list stay visible and can be marked for removal."""
     from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
 
     CATALOG_CACHE.reset()
@@ -207,17 +214,19 @@ async def test_model_picker_membership_shows_and_blocks_target(monkeypatch: pyte
         await _wait_for_rows(pilot, table, 3)  # nothing is hidden in membership mode
 
         # Default sort is by name: AlbedoBase, Deliberate, Spicy Model.
-        assert str(table.get_cell_at(Coordinate(1, 0))) == "✓ in load"
-        modal._toggle(1)  # toggling a target member is a no-op
+        assert str(table.get_cell_at(Coordinate(1, 0))) == "− Remove"
+        modal._toggle(1)  # mark Deliberate for removal
         await pilot.pause()
-        assert str(table.get_cell_at(Coordinate(1, 0))) == "✓ in load"
+        assert str(table.get_cell_at(Coordinate(1, 0))) == "✕ Clear"
+        assert _render(table.get_cell_at(Coordinate(1, 2))).strip() == "remove -> load"
 
         modal._toggle(0)  # mark AlbedoBase (not in either list)
         await pilot.pause()
+        assert _render(table.get_cell_at(Coordinate(0, 2))).strip() == "add -> load"
         await pilot.click("#picker-add")
         await pilot.pause()
 
-    assert app.result == ["AlbedoBase XL (SDXL)"]
+    assert app.result == ModelPickerResult(add=["AlbedoBase XL (SDXL)"], remove=["Deliberate"])
 
 
 @pytest.mark.e2e
@@ -247,13 +256,13 @@ async def test_model_picker_single_click_marker_cell_toggles_row(monkeypatch: py
         # Offset (3, 1): column 0 (marker) of the first data row, below the header at y=0.
         await pilot.click(table, offset=Offset(3, 1))
         await pilot.pause()
-        assert str(table.get_cell_at(Coordinate(0, 0))) == "✕ Unmark"
-        assert modal._visible[0].name in modal._chosen
+        assert str(table.get_cell_at(Coordinate(0, 0))) == "✕ Clear"
+        assert modal._visible[0].name in modal._marked_add
 
         await pilot.click(table, offset=Offset(3, 1))
         await pilot.pause()
-        assert str(table.get_cell_at(Coordinate(0, 0))) == "＋ Mark"
-        assert modal._visible[0].name not in modal._chosen
+        assert str(table.get_cell_at(Coordinate(0, 0))) == "＋ Add"
+        assert modal._visible[0].name not in modal._marked_add
 
 
 @pytest.mark.e2e
@@ -287,8 +296,9 @@ async def test_model_picker_single_click_outside_marker_inspects_without_marking
         assert table.cursor_coordinate.column != _MARKER_COL
         assert table.cursor_coordinate.row == 1
         assert modal._current is modal._visible[1]
-        assert str(table.get_cell_at(Coordinate(1, 0))) == "＋ Mark"
-        assert modal._chosen == set()
+        assert str(table.get_cell_at(Coordinate(1, 0))) == "＋ Add"
+        assert modal._marked_add == set()
+        assert modal._marked_remove == set()
 
 
 @pytest.mark.e2e
@@ -330,3 +340,44 @@ async def test_model_picker_disk_and_marked_filters(monkeypatch: pytest.MonkeyPa
         modal.query_one("#picker-marked-only", Checkbox).value = True
         await _wait_for_rows(pilot, table, 1)
         assert str(table.get_cell_at(Coordinate(0, 1))) == marked_name
+
+
+@pytest.mark.e2e
+async def test_model_picker_clear_marks_requires_confirmation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear marks opens a red/green confirmation before dropping staged add/remove marks."""
+    from horde_worker_regen.tui.catalog_cache import CATALOG_CACHE
+
+    CATALOG_CACHE.reset()
+    monkeypatch.setattr("horde_worker_regen.tui.catalog_cache.load_image_models", lambda: list(_MODELS))
+    monkeypatch.setattr("horde_worker_regen.tui.catalog_cache.free_model_bytes", lambda: None)
+
+    app = _PickerHost(lambda: ModelPickerModal(in_target={"Deliberate"}))
+    async with app.run_test(size=(150, 44)) as pilot:
+        await pilot.pause()
+        modal = app.screen
+        assert isinstance(modal, ModelPickerModal)
+        table = modal.query_one("#picker-table", DataTable)
+        await _wait_for_rows(pilot, table, 3)
+
+        modal._toggle(0)  # mark add
+        modal._toggle(1)  # mark remove (Deliberate)
+        await pilot.pause()
+        assert modal._marked_add
+        assert modal._marked_remove
+
+        await pilot.click("#picker-clear-marks")
+        await pilot.pause()
+        confirm = app.screen
+        assert confirm.query_one("#confirm-yes", Button).variant == "error"
+        assert confirm.query_one("#confirm-no", Button).variant == "success"
+        assert modal._has_marks()
+
+        await pilot.click("#confirm-no")
+        await pilot.pause()
+        assert modal._has_marks()
+
+        await pilot.click("#picker-clear-marks")
+        await pilot.pause()
+        await pilot.click("#confirm-yes")
+        await pilot.pause()
+        assert not modal._has_marks()

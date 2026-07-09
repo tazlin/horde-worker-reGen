@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.widgets import Static
+from textual.containers import Grid
+from textual.widgets import Static, Switch
 
 from horde_worker_regen.tui.model_catalog import ModelInfo
 from horde_worker_regen.tui.widgets.model_manager import ModelManagerView
@@ -65,3 +66,17 @@ async def test_manager_renders_effective_preview_when_catalog_injected() -> None
         headline = _plain(view.query_one("#mm-headline", Static).render())
         assert "EFFECTIVE" in headline
         assert "2 will load" in headline
+
+
+@pytest.mark.e2e
+async def test_resolution_controls_stack_on_80_column_layout() -> None:
+    """The Resolve/policy control band remains usable on a narrow terminal."""
+    view = ModelManagerView(["top 2"], [], load_large_models=False, only_on_disk=True)
+    app = _Host(view)
+    async with app.run_test(size=(80, 40)) as pilot:
+        await pilot.pause()
+
+        controls = view.query_one("#mm-resolution-controls", Grid)
+        assert controls.styles.grid_size_columns == 1
+        assert view.query_one("#cfg-load_large_models", Switch).value is False
+        assert view.query_one("#cfg-only_models_on_disk", Switch).value is True

@@ -5,11 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.widgets import Button, Input, Select, Switch, TabbedContent
+from textual.widgets import Button, Input, Select, Static, Switch, TabbedContent, TextArea
 
+from horde_worker_regen.process_management.ipc.supervisor_channel import CardSnapshot
 from horde_worker_regen.tui.config_form import load_config
 from horde_worker_regen.tui.widgets.config_editor import ConfigEditorView
+from horde_worker_regen.tui.widgets.custom_model_builder import CustomModelBuilderResult
+from horde_worker_regen.tui.widgets.model_list_editor import ModelListEditor
 
 
 class _EditorHarness(App[None]):
@@ -28,6 +32,12 @@ async def _mount(tmp_path: Path, yaml_text: str) -> tuple[_EditorHarness, Path]:
     path = tmp_path / "bridgeData.yaml"
     path.write_text(yaml_text, encoding="utf-8")
     return _EditorHarness(path), path
+
+
+def _plain(static: Static) -> str:
+    """Return visible Static content without Rich styling."""
+    renderable = static.render()
+    return renderable.plain if isinstance(renderable, Text) else str(renderable)
 
 
 @pytest.mark.e2e
@@ -145,6 +155,37 @@ async def test_save_succeeds_with_unrendered_dry_run_field_present(tmp_path: Pat
     assert reloaded["max_threads"] == 4
     # The YAML-only developer flag is preserved verbatim, neither dropped nor coerced.
     assert reloaded["dry_run_skip_inference"] is True
+
+
+@pytest.mark.e2e
+async def test_live_gpu_detection_does_not_make_config_dirty(tmp_path: Path) -> None:
+    """A worker-reported GPU card is live state, not an unsaved Per-GPU config edit."""
+    app, _path = await _mount(tmp_path, 'api_key: "x"\ndreamer_name: "Good Name"\n')
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        assert editor.is_dirty() is False
+
+        editor.update_cards(
+            [
+                CardSnapshot(
+                    device_index=0,
+                    device_name="NVIDIA GeForce RTX 4090",
+                    total_vram_mb=24576.0,
+                    free_vram_mb=18432.0,
+                    target_process_count=1,
+                    max_concurrent_inference=1,
+                )
+            ]
+        )
+        await pilot.pause()
+
+        assert editor.is_dirty() is False
+        assert "No unsaved changes" in _plain(editor.query_one("#config-change-summary", Static))
+
+        editor.query_one("#gpuovr-0-max_threads", Switch).value = True
+        await pilot.pause()
+        assert editor.is_dirty() is True
 
 
 @pytest.mark.e2e
@@ -308,6 +349,45 @@ async def test_preset_changes_apply_to_live_form_before_save(tmp_path: Path) -> 
 
 
 @pytest.mark.e2e
+async def test_custom_model_builder_appends_yaml_and_offer_list(tmp_path: Path) -> None:
+    """The custom model builder writes the required schema and can add the model to the offer list."""
+    app, path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "Good Name"\ncustom_models: []\nmodels_to_load: []\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        assert editor.query_one("#cfg-custom_models-add", Button)
+
+        editor._apply_custom_model_builder_result(
+            CustomModelBuilderResult(
+                record={
+                    "name": "My Custom SDXL",
+                    "baseline": "stable_diffusion_xl",
+                    "filepath": "D:\\models\\my_custom.safetensors",
+                },
+                add_to_models_to_load=True,
+            )
+        )
+        await pilot.pause()
+
+        assert "My Custom SDXL" in editor.query_one("#cfg-custom_models", TextArea).text
+        assert editor.query_one("#mle-root-models_to_load", ModelListEditor).values() == ["My Custom SDXL"]
+        assert editor._save() is True
+
+    reloaded = load_config(path)
+    assert reloaded["custom_models"] == [
+        {
+            "name": "My Custom SDXL",
+            "baseline": "stable_diffusion_xl",
+            "filepath": "D:\\models\\my_custom.safetensors",
+        }
+    ]
+    assert list(reloaded["models_to_load"]) == ["My Custom SDXL"]
+
+
+@pytest.mark.e2e
 async def test_optional_sampling_lease_slots_can_be_cleared(tmp_path: Path) -> None:
     """The form accepts a blank sampling-lease slot count, meaning it tracks max_threads."""
     app, path = await _mount(
@@ -340,14 +420,41 @@ async def test_action_bar_separates_presets_and_highlights_restart_edits(tmp_pat
         assert editor.query_one("#config-preset", Button).variant == "default"
         assert editor.query_one("#config-actions-separator") is not None
         assert editor.query_one("#config-restart", Button).variant == "default"
+        assert "image generation" in _plain(editor.query_one("#config-effective-summary", Static))
+        assert "No unsaved changes" in _plain(editor.query_one("#config-change-summary", Static))
 
         editor.query_one("#cfg-max_batch", Input).value = "2"
         await pilot.pause()
         assert editor.query_one("#config-restart", Button).variant == "default"
+        assert "no restart-only fields changed" in _plain(editor.query_one("#config-change-summary", Static))
 
         editor.query_one("#cfg-max_threads", Input).value = "2"
         await pilot.pause()
         assert editor.query_one("#config-restart", Button).variant == "warning"
+        change_summary = _plain(editor.query_one("#config-change-summary", Static))
+        assert "restart required for" in change_summary
+        assert "Concurrent image jobs" in change_summary
+
+
+@pytest.mark.e2e
+async def test_live_validation_warnings_are_persistent_before_save(tmp_path: Path) -> None:
+    """Interlocked config problems appear in a persistent warning strip before Save is pressed."""
+    app, _path = await _mount(
+        tmp_path,
+        'api_key: "x"\ndreamer_name: "Good Name"\nallow_img2img: true\nallow_painting: true\n',
+    )
+    async with app.run_test() as pilot:
+        editor = app.query_one(ConfigEditorView)
+        await pilot.pause()
+        warning_strip = editor.query_one("#config-live-warnings", Static)
+        assert warning_strip.display is False
+
+        editor.query_one("#cfg-allow_img2img", Switch).value = False
+        await pilot.pause()
+
+        assert warning_strip.display is True
+        assert "Blocking config issue" in _plain(warning_strip)
+        assert "inpainting requires" in _plain(warning_strip)
 
 
 @pytest.mark.e2e

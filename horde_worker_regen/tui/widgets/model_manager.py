@@ -75,17 +75,6 @@ class ModelManagerView(Vertical):
         height: auto;
         padding: 0 1;
     }
-    ModelManagerView #mm-resolve-row {
-        height: 3;
-    }
-    ModelManagerView #mm-resolve-row Button {
-        margin-right: 1;
-    }
-    ModelManagerView #mm-resolve-status {
-        width: 1fr;
-        content-align: left middle;
-        height: 3;
-    }
     ModelManagerView #mm-rules-grid {
         height: auto;
         width: 100%;
@@ -108,14 +97,44 @@ class ModelManagerView(Vertical):
         padding: 0 1 1 1;
         height: auto;
     }
-    ModelManagerView #mm-large-row, ModelManagerView #mm-ondisk-row {
-        height: 3;
-        padding: 0 1;
+    ModelManagerView #mm-resolution-controls {
+        height: auto;
+        width: 100%;
+        layout: grid;
+        grid-size: 3;
+        grid-gutter: 0 2;
+        padding: 0 1 1 1;
+        margin-bottom: 1;
+        border-left: thick $accent;
     }
-    ModelManagerView #mm-large-row Label, ModelManagerView #mm-ondisk-row Label {
+    ModelManagerView .mm-control-card {
+        height: auto;
+        padding-top: 1;
+    }
+    ModelManagerView #mm-resolve-row {
+        height: 3;
+    }
+    ModelManagerView #mm-resolve-row Button {
+        margin-right: 1;
+    }
+    ModelManagerView #mm-resolve-status {
         width: 1fr;
         content-align: left middle;
         height: 3;
+    }
+    ModelManagerView .mm-policy-row {
+        height: 3;
+    }
+    ModelManagerView .mm-policy-row Label {
+        width: auto;
+        padding-right: 2;
+        content-align: left middle;
+        height: 3;
+    }
+    ModelManagerView .mm-policy-help {
+        color: $text-muted;
+        padding-left: 1;
+        height: auto;
     }
     """
 
@@ -148,9 +167,32 @@ class ModelManagerView(Vertical):
             yield Static(id="mm-headline")
             yield VerticalScroll(Static(id="mm-effective-body"), id="mm-effective")
             yield Static(id="mm-warnings")
-            with Horizontal(id="mm-resolve-row"):
-                yield Button("Resolve ⟳", id="mm-resolve", variant="primary")
-                yield Static(id="mm-resolve-status")
+            yield Label("Resolution controls", classes="mm-rules-label")
+            with Grid(id="mm-resolution-controls"):
+                with Vertical(classes="mm-control-card"):
+                    with Horizontal(id="mm-resolve-row"):
+                        yield Button("Resolve ⟳", id="mm-resolve", variant="default")
+                        yield Static(id="mm-resolve-status")
+                    yield Static(
+                        "Expands TOP/BOTTOM/ALL rules and refreshes the effective model list.",
+                        classes="mm-policy-help",
+                    )
+                with Vertical(classes="mm-control-card"):
+                    with Horizontal(classes="mm-policy-row"):
+                        yield Label("Include large models")
+                        yield Switch(value=self._load_large, id="cfg-load_large_models")
+                    yield Static(
+                        "Allows Flux, Cascade, Qwen, and similar large models in TOP/ALL results.",
+                        classes="mm-policy-help",
+                    )
+                with Vertical(classes="mm-control-card"):
+                    with Horizontal(classes="mm-policy-row"):
+                        yield Label("Only models already on disk")
+                        yield Switch(value=self._only_on_disk, id="cfg-only_models_on_disk")
+                    yield Static(
+                        "Drops anything not downloaded yet instead of starting a model download.",
+                        classes="mm-policy-help",
+                    )
             with Grid(id="mm-rules-grid"):
                 with Vertical(classes="mm-rule-card"):
                     yield Label("Offer list", classes="mm-rules-label")
@@ -168,16 +210,10 @@ class ModelManagerView(Vertical):
                         classes="mm-rules-help",
                     )
                     yield ModelListEditor("models_to_skip", self._skip_values, sibling_values=self._load_editor_values)
-            with Horizontal(id="mm-large-row"):
-                yield Label("Include large models (Flux, Cascade) in 'all' / 'top' commands")
-                yield Switch(value=self._load_large, id="cfg-load_large_models")
-            with Horizontal(id="mm-ondisk-row"):
-                yield Label("Only models already on disk (never download; drop the rest)")
-                yield Switch(value=self._only_on_disk, id="cfg-only_models_on_disk")
 
     def on_mount(self) -> None:
         """Render the initial hint, then adopt the catalog from the shared cache (warmed at startup)."""
-        self._apply_rule_columns()
+        self._apply_responsive_columns()
         self._recompute()
         self._adopt_from_cache()
         if self._catalog is None:
@@ -186,13 +222,16 @@ class ModelManagerView(Vertical):
 
     def on_resize(self) -> None:
         """Keep the rule editors readable on narrow terminals and compact on wide ones."""
-        self._apply_rule_columns()
+        self._apply_responsive_columns()
 
-    def _apply_rule_columns(self) -> None:
-        """Use two rule columns only when each column has enough space for its controls."""
+    def _apply_responsive_columns(self) -> None:
+        """Keep control/rule grids readable at 80 columns and compact on wide terminals."""
         with contextlib.suppress(Exception):
-            grid = self.query_one("#mm-rules-grid", Grid)
-            grid.styles.grid_size_columns = 2 if self.size.width >= 104 else 1
+            controls = self.query_one("#mm-resolution-controls", Grid)
+            controls.styles.grid_size_columns = 3 if self.size.width >= 118 else 1
+        with contextlib.suppress(Exception):
+            rules = self.query_one("#mm-rules-grid", Grid)
+            rules.styles.grid_size_columns = 2 if self.size.width >= 104 else 1
 
     def update_worker_models(self, active_models: list[str]) -> None:
         """Note how many models a running worker currently has loaded (None/empty clears the note)."""

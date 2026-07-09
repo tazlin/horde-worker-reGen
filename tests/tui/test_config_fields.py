@@ -54,12 +54,12 @@ def test_custom_models_yaml_validation() -> None:
     """The custom model editor accepts a list of mappings with required keys."""
     value = coerce_value(
         _BY_KEY["custom_models"],
-        '- name: "my model"\n  baseline: "stable_diffusion"\n  filepath: "/models/my.safetensors"\n',
+        '- name: "my model"\n  baseline: "stable_diffusion_1"\n  filepath: "/models/my.safetensors"\n',
     )
 
-    assert value == [{"name": "my model", "baseline": "stable_diffusion", "filepath": "/models/my.safetensors"}]
+    assert value == [{"name": "my model", "baseline": "stable_diffusion_1", "filepath": "/models/my.safetensors"}]
     with pytest.raises(ValueError, match="must include filepath"):
-        coerce_value(_BY_KEY["custom_models"], '- name: "bad"\n  baseline: "stable_diffusion"\n')
+        coerce_value(_BY_KEY["custom_models"], '- name: "bad"\n  baseline: "stable_diffusion_1"\n')
 
 
 def test_pipeline_disaggregation_field_is_hidden_advanced() -> None:

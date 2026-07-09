@@ -55,26 +55,31 @@ config changes should run from `bridgeData.yaml` rather than environment variabl
 
 The dashboard's **Config** tab is the preferred editor for operator-facing
 settings. It keeps advanced and restart-locked fields away from the everyday
-pages, preserves comments and untouched YAML keys, and shows a live process-count
-preview for the throughput levers (`max_threads`, `queue_size`, and the model
-set). A plain **Save** writes only fields that actually changed; **Save + restart
-worker** is only needed for fields marked with the restart marker.
+pages, preserves comments and untouched YAML keys, and shows a persistent summary
+of what the current form serves (roles, model rules, major feature flags, and
+rough process count). A separate unsaved-change strip names the edited fields and
+calls out which ones require **Save + restart worker**. A plain **Save** writes
+only fields that actually changed; **Save + restart worker** is only needed for
+fields marked with the restart marker.
 
-Before writing the file, the editor runs import-light interlock checks so
-configuration mistakes are caught even when no worker process is running. Errors
-block the save and jump to the relevant tab; warnings allow the save but are
-shown in the status line. The guarded combinations include inpainting without
-img2img, SDXL ControlNet without ControlNet, post-processing enabled while the
-post-processing lane is off, LoRA or `TOP`/`ALL` model rules without a CivitAI
-token, both worker roles disabled, extra-slow mode combined with incompatible
-throughput settings, and exact model names present in both load and skip lists.
+The editor also runs import-light interlock checks while the form is being edited
+and again before writing the file, so configuration mistakes are caught even when
+no worker process is running. Persistent warnings stay visible above the tabs;
+blocking errors still stop the save and jump to the relevant tab. The guarded
+combinations include inpainting without img2img, SDXL ControlNet without
+ControlNet, post-processing enabled while the post-processing lane is off, LoRA
+or `TOP`/`ALL` model rules without a CivitAI token, both worker roles disabled,
+extra-slow mode combined with incompatible throughput settings, and exact model
+names present in both load and skip lists.
 
 The **Apply preset** action offers built-in hardware starting points (for example
 4090/64 GB SDXL balanced, 4090/64 GB large-model, 2080/32 GB SD1.5-safe, and
 midrange 12-16 GB balanced). Applying a preset does not save immediately. The
-operator sees every setting the preset would change, each change is individually
-checkable, and changes such as enabling LoRA are left unchecked when their
-precondition (a CivitAI token) is missing.
+operator sees every setting the preset would change, grouped by category, each
+change is individually checkable, and changes such as enabling LoRA are left
+unchecked when their precondition (a CivitAI token) is missing. Advanced sections
+carry an explicit warning banner because their defaults are meant to be left
+alone unless a log message, benchmark, or support instruction points there.
 
 ## Critical sections
 
@@ -223,8 +228,12 @@ preloads and is less aggressive about keeping models in VRAM.
 ### Custom models
 
 `custom_models` allows the worker to accept jobs for model names not in the
-standard horde model reference. These are added to the pop request alongside the
-configured `image_models_to_load`.
+standard horde model reference. Each entry contains `name`, `baseline`, and
+`filepath`; at startup the worker writes those records into hordelib's custom
+model reference and adds the custom names to the pop request alongside the
+configured `image_models_to_load`. The Config tab includes an **Add custom
+model...** builder that writes this YAML shape and can also add the new model
+name to the Offer list.
 
 ### The dedicated post-processing lane
 

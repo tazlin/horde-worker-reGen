@@ -12,8 +12,9 @@ from textual.widgets import Button, Input, Static
 
 from horde_worker_regen.tui.formatters import human_bytes
 from horde_worker_regen.tui.model_catalog import DiskSummary, disk_summary, is_meta_instruction
+from horde_worker_regen.tui.widgets.confirm_modal import ConfirmModal
 from horde_worker_regen.tui.widgets.meta_builder import MetaBuilderModal
-from horde_worker_regen.tui.widgets.model_picker import ModelPickerModal
+from horde_worker_regen.tui.widgets.model_picker import ModelPickerModal, ModelPickerResult
 
 
 class ModelListEditor(Vertical):
@@ -109,8 +110,8 @@ class ModelListEditor(Vertical):
             yield Input(placeholder="type a model name or meta command…", id=f"mle-input-{self._key}")
             yield Button("Add", id=f"mle-add-{self._key}")
         with Horizontal(classes="mle-controls mle-controls-secondary"):
-            yield Button("Pick models…", id=f"mle-pick-{self._key}", variant="primary")
-            yield Button("Build meta…", id=f"mle-meta-{self._key}", variant="success")
+            yield Button("Pick models…", id=f"mle-pick-{self._key}", variant="default")
+            yield Button("Build meta…", id=f"mle-meta-{self._key}", variant="default")
             yield Button("Clear", id=f"mle-clear-{self._key}", variant="warning")
         if self._show_disk_total:
             yield Static("", classes="mle-disk", id=f"mle-disk-{self._key}")
@@ -144,6 +145,16 @@ class ModelListEditor(Vertical):
                 self._values.append(candidate)
                 changed = True
         if changed:
+            self._rebuild()
+
+    def remove_entries(self, entries: list[str]) -> None:
+        """Remove exact entries from the list."""
+        remove_set = set(entries)
+        if not remove_set:
+            return
+        new_values = [entry for entry in self._values if entry not in remove_set]
+        if new_values != self._values:
+            self._values = new_values
             self._rebuild()
 
     def _rebuild(self) -> None:
@@ -218,7 +229,7 @@ class ModelListEditor(Vertical):
         elif button_id == f"mle-meta-{self._key}":
             self.app.push_screen(MetaBuilderModal(), self._on_meta_result)
         elif button_id == f"mle-clear-{self._key}":
-            self.set_values([])
+            self._confirm_clear()
         elif button_id.startswith(f"mle-rm-{self._key}-"):
             index = int(button_id.rsplit("-", 1)[1])
             if 0 <= index < len(self._values):
@@ -251,10 +262,35 @@ class ModelListEditor(Vertical):
             self._on_picker_result,
         )
 
-    def _on_picker_result(self, result: list[str] | None) -> None:
-        """Add models chosen in the picker modal."""
-        if result:
+    def _on_picker_result(self, result: ModelPickerResult | list[str] | None) -> None:
+        """Apply model-list edits chosen in the picker modal."""
+        if isinstance(result, ModelPickerResult):
+            self.remove_entries(result.remove)
+            self.add_entries(result.add)
+        elif result:
             self.add_entries(result)
+
+    def _confirm_clear(self) -> None:
+        """Ask before clearing all entries."""
+        if not self._values:
+            return
+        self.app.push_screen(
+            ConfirmModal(
+                f"Clear every entry from {self._display_name()}? This removes unsaved model-rule edits in this list.",
+                confirm_label="Yes, clear list",
+                cancel_label="No, keep list",
+            ),
+            self._on_clear_confirmed,
+        )
+
+    def _on_clear_confirmed(self, confirmed: bool) -> None:
+        """Clear only after confirmation."""
+        if confirmed:
+            self.set_values([])
+
+    def _display_name(self) -> str:
+        """Human label for confirmation messages."""
+        return "Offer list" if self._key == "models_to_load" else "Exclusion list"
 
     def _on_meta_result(self, result: str | None) -> None:
         """Add a meta instruction built in the meta-builder modal."""
